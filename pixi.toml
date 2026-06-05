@@ -9,3 +9,8 @@ version = "0.1.0"
 
 [dependencies]
 mojo = ">=1.0.0b1,<2"
+python = ">=3.10,<3.13"
+pytorch = ">=2.2"
+numpy = ">=1.26"
+transformers = ">=4.40"
+tiktoken = ">=0.6"

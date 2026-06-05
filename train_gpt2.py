@@ -13,7 +13,7 @@ from torch import Tensor
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
-import torch.nn.functional.init as init
+import torch.nn.init as init
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import destroy_process_group, init_process_group
@@ -62,7 +62,7 @@ def scaled_dot_product_attention(
     )  # We can't use K.T because the batch_size and num_heads need to stay in place.
     # For single head attention the tensors would be in the shape [B, C, T] so we could use K.T
 
-    scores = QK / torch.sqrt(d_k)
+    scores = QK / math.sqrt(d_k)
 
     # Apply a mask (most commonly causal) if provided
     if mask is not None:
@@ -106,7 +106,7 @@ class Linear(nn.Module):
         self.out_features = out_features
 
         # Weight is stored in the form (out, in) to speed up backpropogation.
-        self.weight = nn.Paramater(
+        self.weight = nn.Parameter(
             torch.empty((out_features, in_features), **factory_kwargs)
         )
         # Init the weights with a kaiming uniform
@@ -115,13 +115,13 @@ class Linear(nn.Module):
 
         # The forward pass can be made slightly faster if you store the weights in (in, out)
         # However since pytorch only saves the view transpose itself is essentally free O(1)
-        # The tensor is becomes incontigous after the tranpose op.
+        # The tensor is becomes noncontiguous after the transpose op.
 
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
             # Init the bias (single dim) with a variation of the kaiming uniform
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / torch.sqrt(fan_in) if fan_in > 0 else 0
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             init.uniform_(self.bias, -bound, bound)
             # NOTE: This will need to be hand implemented in the target language
         else:
@@ -132,26 +132,26 @@ class Linear(nn.Module):
 
 
 class LayerNorm(nn.Module):
-    __constants__ = ["in_features", "epislon"]
+    __constants__ = ["in_features", "epsilon"]
     in_features: int
-    epislon: torch.float
+    epsilon: torch.float
     gamma: Tensor
     beta: Tensor
 
     def __init__(
         self,
         in_features: int,
-        epislon: torch.float = 1e-5,
+        epsilon: torch.float = 1e-5,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.in_features = in_features
-        self.epislon = epislon
+        self.epsilon = epsilon
 
-        self.gamma = nn.Paramater(torch.ones((in_features), **factory_kwargs))
-        self.beta = nn.Paramater(torch.zeros((in_features), **factory_kwargs))
+        self.gamma = nn.Parameter(torch.ones((in_features), **factory_kwargs))
+        self.beta = nn.Parameter(torch.zeros((in_features), **factory_kwargs))
 
     def forward(self, x: Tensor) -> Tensor:
         # Compute the mean across the feature dimension
@@ -159,7 +159,7 @@ class LayerNorm(nn.Module):
         # Stabilize x
         stabilized_x = x - u
         # Square root of variance
-        sqrt_sigma = torch.sqrt(sigma + self.epislon)
+        sqrt_sigma = torch.sqrt(sigma + self.epsilon)
 
         return (stabilized_x / sqrt_sigma) * self.gamma + self.beta
 
@@ -189,7 +189,7 @@ class GeLU(nn.Module):
             * (
                 1.0
                 + torch.tanh(
-                    torch.sqrt(2.0 / math.pi) * (x + GELU_CONSTANT * torch.pow(x, 3))
+                    math.sqrt(2.0 / math.pi) * (x + GELU_CONSTANT * torch.pow(x, 3))
                 )
             )
         )
@@ -336,8 +336,8 @@ class MultiHeadAttention(nn.Module):
         out, _ = scaled_dot_product_attention(Q, K, V, mask=mask)
 
         # Concatinate the Heads back together back to [batch_size, seq_len, num_heads, d_head]
-        out = out.transpose(1, 2).contigious()
-        # Tensor must be modified in memory and made contigious
+        out = out.transpose(1, 2).contiguous()
+        # Tensor must be modified in memory and made contiguous
 
         # Flatten the num_heads dimension to [batch_size, seq_len, d_model]
         out = out.view(batch_size, seq_len, d_model)
@@ -360,13 +360,14 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int) -> None:
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
         # K, Q, V projections for all heads in batch
         self.c_attn = Linear(d_model, 3 * d_model, bias=False)
         # Output projection
         self.c_proj = Linear(d_model, d_model, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1  # Compatibility with Karpathy.
-        # Register a hook to the output projection to store the attention weights
-        self.c_proj.register_forward_hook(self.store_attention_weights)
         # Causal mask for self-attention
         self.register_buffer(
             "bias", torch.tril(torch.ones(1, 1, 1, 1)).view(1, 1, 1, 1)
@@ -378,14 +379,14 @@ class CausalSelfAttention(nn.Module):
         )  # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(
+        q, k, v = qkv.split(self.d_model, dim=2)
+        k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(
             1, 2
         )  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
+        q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(
             1, 2
         )  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(
+        v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(
             1, 2
         )  # (B, nh, T, hs)
         if FLASH:
@@ -488,7 +489,7 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        self.tranformer = nn.ModuleDict(
+        self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
                 wpe=nn.Embedding(config.block_size, config.n_embd),
@@ -496,11 +497,11 @@ class GPT(nn.Module):
                     [
                         KarpathyBlock(
                             d_model=config.n_embd,
-                            num_heads=config.num_heads,
+                            num_heads=config.n_head,
                             hidden_dim=4 * config.n_embd,
                         )
+                        for _ in range(config.n_layer)
                     ]
-                    for _ in range(config.n_layer)
                 ),
                 ln_f=LayerNorm(config.n_embd),
             )
@@ -510,7 +511,7 @@ class GPT(nn.Module):
         self.lm_head.LLMC_SKIP_INIT = 1  # Don't init this one, we tie weights.
         self.transformer.wte.weight = (
             self.lm_head.weight
-        )  # paperswith code weight tieing
+        )  # paperswithcode weight tying
 
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(43)
@@ -522,7 +523,7 @@ class GPT(nn.Module):
             std = (
                 0.02
                 if not hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG")
-                else 0.02 / torch.sqrt(2 * self.config.n_layer)
+                else 0.02 / math.sqrt(2 * self.config.n_layer)
             )
             # We skip initilizing lm_head that shares params with wte
             if not hasattr(module, "LLMC_SKIP_INIT"):
@@ -550,13 +551,13 @@ class GPT(nn.Module):
         token_emb = self.transformer.wte(
             idx
         )  # Token embeddings of shape [B, T, n_embd]
-        possition_emb = self.tranformer.wpe(
+        position_emb = self.transformer.wpe(
             pos
         )  # Positioning embeddings pf shape [t, n_embd]
 
-        x = token_emb + possition_emb
+        x = token_emb + position_emb
 
-        for block in self.tranformer.h:
+        for block in self.transformer.h:
             x = block(x)
 
         x = self.transformer.ln_f(x)
@@ -579,14 +580,14 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type: str) -> "GPT":
-        """Loades pretrained GPT-2 model weights from huggingface"""
+        """Loads pretrained GPT-2 model weights from huggingface"""
         assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
-        from transformers import GPT2LMHeadModel  # Inline imports are not prefered.
+        from transformers import GPT2LMHeadModel  # Inline imports are not preferred.
 
         # n_layer, n_head, and n_embed are determined by model model_type
         config_args = {
             "gpt2": dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            "gpt2=medium": dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
+            "gpt2-medium": dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
             "gpt2-large": dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
             "gpt2-xl": dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
         }[model_type]
@@ -707,7 +708,7 @@ class GPT(nn.Module):
         self,
         idx: Tensor,
         max_new_tokens: int,
-        temprature: torch.float = 1.0,
+        temperature: torch.float = 1.0,
         top_k: int | None = None,
     ):
         for _ in range(max_new_tokens):
@@ -721,8 +722,8 @@ class GPT(nn.Module):
             # Forward the model for the next logits
             logits, _ = self(idx_cond)
 
-            # Pluck logits and scale by the desired temprature
-            logits = logits[:, -1, :] / temprature
+            # Pluck logits and scale by the desired temperature
+            logits = logits[:, -1, :] / temperature
 
             # Optionally crop the logits to only the top k options
             if top_k is not None:
@@ -827,7 +828,7 @@ class DistributedDataLoader:
 
     def advance(self) -> None:
         self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.cureent_position = self.process_rank * self.B * self.T
+        self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
     def next_batch(self) -> tuple[Tensor, Tensor]:
@@ -840,7 +841,7 @@ class DistributedDataLoader:
         # Advance the start pointer in the current shard
         self.current_position += B * T * self.num_processes
         # If loading the next batch would be out of bounds advance the shard
-        if self.current_position + (B * T * self.num_prosesses + 1) > len(self.tokens):
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
         return x, y
 
@@ -848,7 +849,7 @@ class DistributedDataLoader:
 """
 Python to C bridge utilities for saving params/grads/activations to .bin files.
 
-This might need to be addapted to mojo.
+This might need to be adapted to mojo.
 """
 
 
@@ -878,7 +879,7 @@ def write_fp8(tensor: Tensor, file: str) -> None:
     file.write(b)
 
 
-# TODO: This is a copy of Karpathy's code, it needs to be addapted to my classes.
+# TODO: This is a copy of Karpathy's code, it needs to be adapted to my classes.
 def write_tensor(
     model_tensors: list[Tensor], L: int, file: str, dtype: torch.dtype
 ) -> None:
@@ -922,8 +923,8 @@ def write_tensor(
 def pad_vocab(tensor: Tensor, multiple: int = 128, value: int = 0) -> Tensor:
     """
     The dimension of the vocab size in GPT-2 is 50,257 which is unfortunatly a
-    very unfirendly number for many matrix operations on the GPU. So we pad to
-    the nearest friendiler multiple, e.g. 50,304 if the multiple is 128 when we
+    very unfriendly number for many matrix operations on the GPU. So we pad to
+    the nearest friendlier multiple, e.g. 50,304 if the multiple is 128 when we
     export to .bin files. This is a NOOP algorithmically and is only done to make
     tensor operations more efficient.
     """
@@ -968,7 +969,7 @@ def write_model(model: GPT, file: str, dtype: torch.dtype) -> None:
 
     # 3) Write the parameters to the file
     with open(file, "wb") as f:
-        file.write(header.numpy().tobytes())
+        f.write(header.numpy().tobytes())
         write_tensor(params, model.config.n_layer, f, dtype)  # Params
     print(f"Wrote {file}")
 
@@ -978,7 +979,7 @@ def write_state(
 ) -> None:
     """
     Write state is used to debug. It contains information about the input, logits, loss, and the param gradients.
-    This can be used for checking the computation corecction in the target language.
+    This can be used for checking the computation correctness in the target language.
     """
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = MAGIC_NUMBER
@@ -997,11 +998,11 @@ def write_state(
     # Write the file
     with open(file, "wb") as f:
         # Header
-        file.write(header.numpy().tobytes())
+        f.write(header.numpy().tobytes())
         # Input X
-        file.write(x.cpu().numpy().astype(np.int32).tobytes())  # [B, T]
+        f.write(x.cpu().numpy().astype(np.int32).tobytes())  # [B, T]
         # Target Y
-        file.write(y.cpu().numpy().astype(np.int32).tobytes())  # [B, T]
+        f.write(y.cpu().numpy().astype(np.int32).tobytes())  # [B, T]
         # Logits
         write_fp32(logits.cpu(), f)
         # Loss
@@ -1036,7 +1037,7 @@ def write_tokenizer(encoder, file: str) -> None:
 if __name__ == "__main__":
     import time
     import argparse
-    import ticktoken
+    import tiktoken
 
     print_zero_rank(
         f"Running pytorch {torch.__version__} on {torch.cuda.get_device_name()}"
@@ -1178,7 +1179,7 @@ if __name__ == "__main__":
 
     args = parse_args(argparse.ArgumentParser())
 
-    # Args Error Handling and conveniance variables
+    # Args Error Handling and convenience variables
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024, "sequence length must be between 1 and 1024"
     assert args.dtype in {"float32", "float16", "bfloat16", "float8"}, "invalid dtype"
@@ -1193,11 +1194,11 @@ if __name__ == "__main__":
         "d48",
     }, "invalid model"
 
-    # Setup Distributed Data Parallel. Tourch run sets this environment variable.
+    # Setup Distributed Data Parallel. Torch run sets this environment variable.
     ddp = int(os.environ.get("RANK", -1) != -1)  # Is this a ddp run?
 
     if ddp:
-        # Use of DDP at the moment demands CUDA, set the device appropratly. (This might now be not true)
+        # Use of DDP at the moment demands CUDA, set the device appropriately. (This might now be not true)
         assert torch.cuda.is_available(), "DDP requires CUDA for now"
         init_process_group(backend="nccl")
         ddp_rank = int(os.environ.get("RANK", 0))
@@ -1284,7 +1285,7 @@ if __name__ == "__main__":
     print_zero_rank(f"Using Flash Attention: {FLASH}")
 
     # Init and write the tokenizer
-    enc = ticktoken.get_encoding("gpt2")
+    enc = tiktoken.get_encoding("gpt2")
     if master_process and args.write_tensors:
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
@@ -1380,7 +1381,7 @@ if __name__ == "__main__":
         # Save x, y, logits, loss, and parameter gradients, for debugging C
         # Always store these in fp32 to have an accurate reference (?)
         write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
-        # Eeset the train_loader for the optimization below
+        # Reset the train_loader for the optimization below
         train_loader.reset()
 
     """
@@ -1402,7 +1403,7 @@ if __name__ == "__main__":
     print_zero_rank(f"=> Weight decay: {args.weight_decay}")
     print_zero_rank(f"=> Learning rate: {args.learning_rate}")
 
-    # Learning Rate Decay Scheduler (cosign with warmup)
+    # Learning Rate Decay Scheduler (cosine with warmup)
     def get_lr(
         iteration: int, lr: torch.float, decay: torch.float, warmup: int, num_iters: int
     ) -> torch.float:
@@ -1436,7 +1437,7 @@ if __name__ == "__main__":
         torch.cpu.reset_peak_memory_stats()
 
     timings = []
-    nomr = -1.0
+    norm = -1.0
     num_iters = args.num_iterations
     val_loss_every = args.val_loss_every
     val_max_steps = args.val_max_steps
@@ -1472,9 +1473,9 @@ if __name__ == "__main__":
             start_ids = [enc.eot_token]
             xg = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
             max_new_tokens = 32
-            temprature = 1.0
+            temperature = 1.0
             top_k = 40
-            yg = raw_model.generate(xg, max_new_tokens, temprature, top_k)
+            yg = raw_model.generate(xg, max_new_tokens, temperature, top_k)
             print_zero_rank("--------------------------------")
             print_zero_rank(enc.decode(yg[0].tolist()))
             print_zero_rank("--------------------------------")
@@ -1495,7 +1496,7 @@ if __name__ == "__main__":
         if args.overfit_single_batch:
             train_loader.reset()
 
-        # Micro-batch loop where we do geradient accumulation to reach the desired total batch size
+        # Micro-batch loop where we do gradient accumulation to reach the desired total batch size
         lossf = 0.0
         for micro_step in range(grad_accum_steps):
             # Fetch a batch
