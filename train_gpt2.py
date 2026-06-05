@@ -509,9 +509,7 @@ class GPT(nn.Module):
 
         self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.LLMC_SKIP_INIT = 1  # Don't init this one, we tie weights.
-        self.transformer.wte.weight = (
-            self.lm_head.weight
-        )  # paperswithcode weight tying
+        self.transformer.wte.weight = self.lm_head.weight  # paperswithcode weight tying
 
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(43)
