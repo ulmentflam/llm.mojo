@@ -1,3 +1,9 @@
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# Python
+__pycache__
+
+# DS_store
+
