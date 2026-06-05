@@ -1,3 +1,4 @@
+import os
 import math
 import glob
 import struct
@@ -10,8 +11,12 @@ import numpy as np
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
+import torch.distributed as dist
+import torch._inductor.config as config
 import torch.nn.functional.init as init
 from torch.distributed.optim import ZeroRedundancyOptimizer
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import destroy_process_group, init_process_group
 
 
 """
@@ -256,13 +261,40 @@ class MLP(nn.Module):
             GeLU(),
             Linear(hidden_dim, input_dim),
         ]
-        ordered_layers[-1].LLMC_RESIDUAL_SCALE_FLAG = 1  # Compatibility with Karpathy.
         if dropout:
             ordered_layers.append(Dropout(dropout))
         self.layers = Sequential(*ordered_layers)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.layers(x)
+
+
+class KarpathyMLP(nn.Module):
+    __constants__ = ["input_dim", "hidden_dim", "out_dim"]
+    input_dim: int
+    hidden_dim: int
+    out_dim: int
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+    ) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.c_fc = Linear(input_dim, hidden_dim, bias=False)
+        self.gelu = GeLU()
+        self.c_proj = Linear(hidden_dim, out_dim, bias=False)
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1  # Compatibility with Karpathy.
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
 
 
 class MultiHeadAttention(nn.Module):
@@ -314,6 +346,67 @@ class MultiHeadAttention(nn.Module):
         return self.out_proj(out)
 
 
+# Using a global to toggle flash-attention
+FLASH = 0
+
+
+# The purpose if this class is to name match the attention class vars for GPT-2
+class CausalSelfAttention(nn.Module):
+    __constants__ = ["d_model", "num_heads", "d_head"]
+    d_model: int
+    num_heads: int
+    d_head: int
+
+    def __init__(self, d_model: int, num_heads: int) -> None:
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        # K, Q, V projections for all heads in batch
+        self.c_attn = Linear(d_model, 3 * d_model, bias=False)
+        # Output projection
+        self.c_proj = Linear(d_model, d_model, bias=False)
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1  # Compatibility with Karpathy.
+        # Register a hook to the output projection to store the attention weights
+        self.c_proj.register_forward_hook(self.store_attention_weights)
+        # Causal mask for self-attention
+        self.register_buffer(
+            "bias", torch.tril(torch.ones(1, 1, 1, 1)).view(1, 1, 1, 1)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, T, C = (
+            x.size()
+        )  # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        if FLASH:
+            # Flash Attention via PyTorch
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(
+                self.bias[:, :, :T, :T] == 0, float("-inf")
+            )  # Karpathy's Causal Masking, not-preferred but will work fine.
+            att = F.softmax(att, dim=-1)
+            y = att @ v  # [B, nh, T, T] x [B, nh, T, hs] -> [B, nh, T, hs]
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, C)
+        )  # Re-assemble all head outputs side by side.
+        # Output projection
+        y = self.c_proj(y)
+        return y
+
+
 # GPT2Block, no additional linear, normalization before mlp
 # updated with my special class for residual given the new world of mHC we live in.
 class Block(nn.Module):
@@ -346,6 +439,35 @@ class Block(nn.Module):
         return x
 
 
+class KarpathyBlock(nn.Module):
+    __constants__ = ["d_model", "num_heads", "hidden_dim"]
+    d_model: int
+    num_heads: int
+    hidden_dim: int
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        hidden_dim: int,
+        dropout: Optional[torch.float] = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.hidden_dim = hidden_dim
+
+        self.ln_1 = LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, num_heads)
+        self.ln_2 = LayerNorm(d_model)
+        self.mlp = KarpathyMLP(d_model, hidden_dim, d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
 """
 GPT For Causal LM
 """
@@ -372,7 +494,7 @@ class GPT(nn.Module):
                 wpe=nn.Embedding(config.block_size, config.n_embd),
                 h=nn.ModuleList(
                     [
-                        Block(
+                        KarpathyBlock(
                             d_model=config.n_embd,
                             num_heads=config.num_heads,
                             hidden_dim=4 * config.n_embd,
@@ -909,3 +1031,545 @@ def write_tokenizer(encoder, file: str) -> None:
             )  # Writes the lenght as a 1-byte unsigned int (c++ struct utils)
             f.write(b)
         print(f"Wrote {file}")
+
+
+if __name__ == "__main__":
+    import time
+    import argparse
+    import ticktoken
+
+    print_zero_rank(
+        f"Running pytorch {torch.__version__} on {torch.cuda.get_device_name()}"
+    )
+
+    # GROSS! This should be handled by a real config parser.....
+    def parse_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
+        # default settings will overfit a tiny batch of data
+        # and save model weights and debug state to disk on the first iteration
+        # file system input / output
+        parser.add_argument(
+            "--input_bin",
+            type=str,
+            default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin",
+            help="input .bin to train on",
+        )
+        parser.add_argument(
+            "--input_val_bin",
+            type=str,
+            default="",
+            help="input .bin to eval validation loss on",
+        )
+        parser.add_argument(
+            "--output_dir",
+            type=str,
+            default="",
+            help="output directory to which to write logs and checkpoints",
+        )
+        parser.add_argument(
+            "--model",
+            type=str,
+            default="gpt2",
+            help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48",
+        )
+        # token layout for each step of the optimization
+        parser.add_argument(
+            "--batch_size",
+            type=int,
+            default=4,
+            help="batch size, in units of #batch dimensions",
+        )
+        parser.add_argument(
+            "--sequence_length", type=int, default=64, help="sequence length"
+        )
+        parser.add_argument(
+            "--total_batch_size",
+            type=int,
+            default=256,
+            help="total desired batch size, in units of #tokens",
+        )
+        # workload (number of steps)
+        parser.add_argument(
+            "--num_iterations", type=int, default=10, help="number of iterations to run"
+        )
+        parser.add_argument(
+            "--inference_only", type=int, default=0, help="only run inference"
+        )
+        # optimization
+        parser.add_argument(
+            "--learning_rate",
+            type=float,
+            default=1e-4,
+            help="learning rate warmup iterations",
+        )
+        parser.add_argument(
+            "--warmup_iters",
+            type=int,
+            default=0,
+            help="learning rate warmup iterations",
+        )
+        parser.add_argument(
+            "--learning_rate_decay_frac",
+            type=float,
+            default=1.0,
+            help="learning rate warmup iterations",
+        )
+        parser.add_argument(
+            "--weight_decay", type=float, default=0.0, help="weight decay"
+        )
+        parser.add_argument(
+            "--grad_clip", type=float, default=1.0, help="maximum gradient magnitude"
+        )
+        # evaluation
+        parser.add_argument(
+            "--val_loss_every",
+            type=int,
+            default=0,
+            help="every how mant steps to evaluate val loss?",
+        )
+        parser.add_argument(
+            "--val_max_steps",
+            type=int,
+            default=20,
+            help="how many batches of val to average?",
+        )
+        parser.add_argument(
+            "--sample_every",
+            type=int,
+            default=0,
+            help="how often to sample from the model?",
+        )
+        # debugging
+        parser.add_argument(
+            "--overfit_single_batch",
+            type=int,
+            default=1,
+            help="overfit just one batch of data",
+        )
+        # numerics
+        parser.add_argument(
+            "--tensorcores", type=int, default=0, help="use tensorcores"
+        )
+        # memory management
+        parser.add_argument(
+            "--device",
+            type=str,
+            default="",
+            help="by default we autodetect, or set it here",
+        )
+        parser.add_argument(
+            "--compile", type=int, default=0, help="torch.compile the model"
+        )
+        parser.add_argument("--flash", type=int, default=0, help="use flash attention")
+        parser.add_argument(
+            "--dtype", type=str, default="float32", help="float32|float16|bfloat16"
+        )
+        parser.add_argument(
+            "--zero_stage",
+            type=int,
+            default=0,
+            help="zero redundancy optimizer stage (0/1/2/3)",
+        )
+        # python -> C bridge
+        parser.add_argument(
+            "--write_tensors", type=int, default=1, help="write tensors to disk"
+        )
+        args = parser.parse_args()
+        return args
+
+    args = parse_args(argparse.ArgumentParser())
+
+    # Args Error Handling and conveniance variables
+    B, T = args.batch_size, args.sequence_length
+    assert 1 <= T <= 1024, "sequence length must be between 1 and 1024"
+    assert args.dtype in {"float32", "float16", "bfloat16", "float8"}, "invalid dtype"
+    assert args.model in {
+        "gpt2",
+        "gpt2-medium",
+        "gpt2-large",
+        "gpt2-xl",
+        "d12",
+        "d24",
+        "d36",
+        "d48",
+    }, "invalid model"
+
+    # Setup Distributed Data Parallel. Tourch run sets this environment variable.
+    ddp = int(os.environ.get("RANK", -1) != -1)  # Is this a ddp run?
+
+    if ddp:
+        # Use of DDP at the moment demands CUDA, set the device appropratly. (This might now be not true)
+        assert torch.cuda.is_available(), "DDP requires CUDA for now"
+        init_process_group(backend="nccl")
+        ddp_rank = int(os.environ.get("RANK", 0))
+        ddp_world_size = int(os.environ.get("WORLD_SIZE", 1))
+        ddp_local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # ddp_local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+        # ddp_master_addr = os.environ.get("MASTER_ADDR", "localhost")
+        # ddp_master_port = os.environ.get("MASTER_PORT", "29500")
+        # ddp_device = f"cuda:{ddp_local_rank}"
+        # ddp_num_nodes = int(os.environ.get("NODES", 1))
+        # ddp_num_gpus = int(os.environ.get("GPUS", 1))
+        # ddp_num_cpus = int(os.environ.get("CPUS", 1))
+        # ddp_num_mems = int(os.environ.get("MEMS", 1))
+        # ddp_num_disks = int(os.environ.get("DISKS", 1))
+        device = f"cuda:{ddp_local_rank}"
+        torch.cuda.set_device(device)
+        master_process = (
+            ddp_rank == 0
+        )  # This process is for logging, checkpointing, and so on.
+        seed_offset = 0  # All processes get the exact same seed
+        zero_stage = args.zero_stage  # Zero redundancy optimizer stage
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        zero_stage = 0
+        ddp_world_size = 1
+        master_process = True
+        seed_offset = 0
+        # Select the device
+        if args.device:
+            device = args.device
+        else:
+            # attempt to autodetect the device
+            device = "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+    print(f"Using device: {device}")
+    device_type = "cuda" if "cuda" in device else "cpu"
+
+    # Calculate the gradient accumulation from the desired total batch size and the current run configuration.
+    tokens_per_fwd_bwd = B * T * ddp_world_size
+    assert args.total_batch_size % tokens_per_fwd_bwd == 0, (
+        "total batch size must be divisible by the number of tokens per forward-backward pass"
+    )
+    grad_accum_steps = args.total_batch_size // tokens_per_fwd_bwd
+    print_zero_rank(f"Total desired batch size: {args.total_batch_size}")
+    print_zero_rank(f"=> Gradient accumulation steps: {grad_accum_steps}")
+    print_zero_rank(f"=> Tokens per forward-backward pass: {tokens_per_fwd_bwd}")
+    print_zero_rank(f"=> Batch size: {B}")
+    print_zero_rank(f"=> Sequence length: {T}")
+    print_zero_rank(f"=> World size: {ddp_world_size}")
+    print_zero_rank(f"=> Device: {device}")
+    print_zero_rank(f"=> Device type: {device_type}")
+    print_zero_rank(f"=> Zero stage: {zero_stage}")
+    print_zero_rank(f"=> DDP rank: {ddp_rank}")
+    print_zero_rank(f"=> DDP local rank: {ddp_local_rank}")
+    print_zero_rank(f"=> Master process: {master_process}")
+    print_zero_rank(f"=> Seed offset: {seed_offset}")
+
+    # Set up a context manager following the desired dtype and device.
+    ptdtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float8": torch.float8,
+    }[args.dtype]
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+    # RNG Setup
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+
+    # Set the torch percision mode to use TensorFloat32 for matmuls
+    # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    if args.tensorcores:
+        torch.set_float32_matmul_precision("high")
+
+    # Toggle Flash Attention
+    assert args.flash in {0, 1}, "flash must be 0 or 1"
+    FLASH = args.flash
+    print_zero_rank(f"Using Flash Attention: {FLASH}")
+
+    # Init and write the tokenizer
+    enc = ticktoken.get_encoding("gpt2")
+    if master_process and args.write_tensors:
+        write_tokenizer(enc, "gpt2_tokenizer.bin")
+
+    # Init the model, from scratch or from OpenAI pretrained checkpoint
+    if args.model[0] == "d":
+        # From scratch (random weights)
+        model_config = {
+            "d12": GPTConfig(
+                block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768
+            ),
+            "d24": GPTConfig(
+                block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024
+            ),
+            "d36": GPTConfig(
+                block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280
+            ),
+            "d48": GPTConfig(
+                block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600
+            ),
+        }[args.model]
+        model = GPT(model_config)
+    else:
+        # Load the GPT-2 model weights
+        model = GPT.from_pretrained(args.model)
+
+    # Set Model to train mode/device
+    model.train()
+    model.to(device)
+    if args.compile:
+        if hasattr(config, "coordinate_descent_tuning"):
+            config.coordinate_descent_tuning = True  # suggested by @Chillee
+        print_zero_rank("Compiling the model...")
+        model = torch.compile(model)
+
+    """
+    Our own version of simple DistributedDataLoader
+    """
+
+    # Load Tokens
+    train_loader = DistributedDataLoader(
+        args.input_bin,
+        B,
+        T,
+        ddp_rank,
+        ddp_world_size,
+    )
+    print_zero_rank(
+        f"Loaded {train_loader.ntok_total} tokens from {len(train_loader.files)} files"
+    )
+    print_zero_rank(f"=> Batch size: {B}")
+    print_zero_rank(f"=> Sequence length: {T}")
+    print_zero_rank(f"=> World size: {ddp_world_size}")
+
+    val_loader = None
+    if args.input_val_bin:
+        val_loader = DistributedDataLoader(
+            args.input_val_bin,
+            B,
+            T,
+            ddp_rank,
+            ddp_world_size,
+        )
+        print_zero_rank(
+            f"Loaded {val_loader.ntok_total} tokens from {len(val_loader.files)} files"
+        )
+        print_zero_rank(f"=> Batch size: {B}")
+        print_zero_rank(f"=> Sequence length: {T}")
+        print_zero_rank(f"=> World size: {ddp_world_size}")
+
+    """
+    Pytorch -> C bridge: save some weights and sate for C to load later as referenced.
+    """
+
+    # Do a single forward pass to generate ground truth for our language test.
+    if master_process and args.write_tensors and (not args.inference_only):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        logits, loss = model(x, y)
+        loss.backward()
+        # Save model params
+        model_to_size = {
+            "gpt2": "124M",
+            "gpt2-medium": "355M",
+            "gpt2-large": "774M",
+            "gpt2-xl": "1558M",
+        }
+        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
+        model_size_str = model_to_size[args.model]  # e.g. "124M", or "d12"
+        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
+        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
+        write_model(model, f"gpt2_{model_size_str}_fp16.bin", dtype="float16")
+        write_model(model, f"gpt2_{model_size_str}_fp8.bin", dtype="float8")
+        # Save x, y, logits, loss, and parameter gradients, for debugging C
+        # Always store these in fp32 to have an accurate reference (?)
+        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
+        # Eeset the train_loader for the optimization below
+        train_loader.reset()
+
+    """
+    Training Loop
+    """
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model  # Always holds the raw, unwrapped model
+
+    # Init the optimizer
+    optimizer = raw_model.configure_optimizers(
+        weight_decay=args.weight_decay,
+        learning_rate=args.learning_rate,
+        betas=(0.9, 0.95),
+        device=device,
+        zero_stage=zero_stage,
+    )
+    print_zero_rank(f"Using optimizer: {optimizer.__class__.__name__}")
+    print_zero_rank(f"=> Weight decay: {args.weight_decay}")
+    print_zero_rank(f"=> Learning rate: {args.learning_rate}")
+
+    # Learning Rate Decay Scheduler (cosign with warmup)
+    def get_lr(
+        iteration: int, lr: torch.float, decay: torch.float, warmup: int, num_iters: int
+    ) -> torch.float:
+        # Minimum learning rate
+        min_lr = lr * decay
+        # Linear warmup
+        if iteration < warmup:
+            return lr * (iteration + 1) / warmup
+        # If iteration is after total_iters, return min_lr
+        if iteration > num_iters:
+            return min_lr
+        # If iteration is after warmup, use cosine decay
+        decay_ratio = (iteration - warmup) / (num_iters - warmup)
+        assert 0 <= decay_ratio <= 1, "decay_ration must be between 0 and 1"
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (lr - min_lr)
+
+    # Create the logging directory if it doesn't exist
+    logfile = None
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logfile = os.path.join(args.output_dir, "log.txt")
+        with open(logfile, "w") as f:
+            pass
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    if device == "mps":
+        torch.mps.reset_peak_memory_stats()
+    if device == "cpu":
+        torch.cpu.reset_peak_memory_stats()
+
+    timings = []
+    nomr = -1.0
+    num_iters = args.num_iterations
+    val_loss_every = args.val_loss_every
+    val_max_steps = args.val_max_steps
+    learning_rate = args.learning_rate
+    warmup = args.warmup_iters
+    decay = args.learning_rate_decay_frac
+    sample_every = args.sample_every
+
+    for step in range(num_iters + 1):
+        t_0 = time.time()
+        last_step = step == num_iters
+
+        # Occasionally evaluate the validation loss
+        if val_loss_every > 0 and step % val_loss_every == 0 and val_loader is not None:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss = 0.0
+                for _ in range(val_max_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    _, loss = model(x, y, return_logits=False)
+                    val_loss += loss.item()
+                val_loss /= val_max_steps
+            print_zero_rank(f"Validation loss: {val_loss:.4f}")
+            if master_process and logfile is not None:
+                with open(logfile, "a") as f:
+                    f.write("s:%d tel:%f\n" % (step, val_loss))
+
+        # Occasionally perform model inference on the master process
+        if sample_every > 0 and step % sample_every == 0 and master_process:
+            model.eval()
+            start_ids = [enc.eot_token]
+            xg = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
+            max_new_tokens = 32
+            temprature = 1.0
+            top_k = 40
+            yg = raw_model.generate(xg, max_new_tokens, temprature, top_k)
+            print_zero_rank("--------------------------------")
+            print_zero_rank(enc.decode(yg[0].tolist()))
+            print_zero_rank("--------------------------------")
+
+        # BREAK so se don't train on the last step, just run evaluations or inference
+        if last_step:
+            break
+
+        """
+        Training Step
+        """
+        model.train()
+        optimizer.zero_grad(
+            set_to_none=True
+        )  # Always zero the gradients before doing a forward pass
+
+        # If we want to overfit a single batch, do so here
+        if args.overfit_single_batch:
+            train_loader.reset()
+
+        # Micro-batch loop where we do geradient accumulation to reach the desired total batch size
+        lossf = 0.0
+        for micro_step in range(grad_accum_steps):
+            # Fetch a batch
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+
+            if ddp:
+                # We only want the final micro-step to sync grads in DDP model.
+                # The library way to do this is with model.no_sync() but the context manager bloats the code.
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+
+            # Forward pass
+            with ctx:
+                _, loss = model(x, y, return_logits=False)
+                # Karpathy's NOTE:
+                # we have to scale the loss to account for gradient accumulation,
+                # because the gradients just add on each successive backward().
+                # addition of gradients corresponds to a SUM in the objective, but
+                # instead of a SUM we want MEAN, so we scale the loss here
+                loss = loss / grad_accum_steps
+                lossf += loss.detach()  # track the mean loss
+            if not args.inference_only:
+                loss.backward()
+
+        if ddp:
+            dist.all_reduce(lossf, op=dist.ReduceOp.SUM)
+
+        lossf = lossf.item()
+
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # Determine and set the learning rate for this iteration
+        lr = get_lr(step, learning_rate, decay, warmup, num_iters)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+        # Step the optimizer
+        optimizer.step()
+
+        """
+        Training step complete
+        """
+
+        # Wait on the CPU for all device work to end so we get an accurate per-iteration timing
+        if device == "cuda":
+            torch.cuda.synchronize()
+        if device == "mps":
+            torch.mps.synchronize()
+        if device == "cpu":
+            torch.cpu.synchronize()
+
+        # Time and Print
+        t_1 = time.time()
+
+        # The 0th interation is often an outlier (much slower) => skip logging it
+        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t_1 - t_0)
+        print_zero_rank(
+            f"step {step + 1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t_1 - t_0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
+        )
+
+        # Log to the logfile
+        if master_process and logfile is not None:
+            with open(logfile, "a") as f:
+                f.write("s:%d trl:%f\n" % (step, lossf))
+
+        # Keep track of smooth timings last 20 iterations
+        if step > 0 and step > num_iters - 20:
+            timings.append(t_1 - t_0)
+
+    # Print the average of the last 20 timings to get somting smooth-esque
+    timings = timings[-20:]
+    print_zero_rank(f"Average of last 20 timings: {sum(timings) / len(timings):.2f} ms")
+    print_zero_rank(
+        f"Peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB"
+    )
+
+    # Cleanup
+    if ddp:
+        destroy_process_group()
