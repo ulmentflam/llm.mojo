@@ -3,8 +3,8 @@ import math
 import glob
 import struct
 import inspect
-from typing import Optional
 from dataclasses import dataclass
+from typing import BinaryIO, Optional, Any
 
 import torch
 import numpy as np
@@ -134,14 +134,14 @@ class Linear(nn.Module):
 class LayerNorm(nn.Module):
     __constants__ = ["in_features", "epsilon"]
     in_features: int
-    epsilon: torch.float
+    epsilon: float
     gamma: Tensor
     beta: Tensor
 
     def __init__(
         self,
         in_features: int,
-        epsilon: torch.float = 1e-5,
+        epsilon: float = 1e-5,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> None:
@@ -173,7 +173,7 @@ class ReLU(nn.Module):
 
 
 # NOTE: Find out how OpenAI derived this number.
-GELU_CONSTANT: torch.float = 0.044715
+GELU_CONSTANT: float = 0.044715
 
 
 class GeLU(nn.Module):
@@ -209,9 +209,9 @@ class Sequential(nn.Module):
 
 class Dropout(nn.Module):
     __constants__ = ["probability"]
-    probability: torch.float
+    probability: float
 
-    def __init__(self, probability: torch.float = 0.5) -> None:
+    def __init__(self, probability: float = 0.5) -> None:
         super().__init__()
         assert 0 <= probability < 1, "Dropout must be between [0, 1)"
         self.probability = probability
@@ -250,13 +250,13 @@ class MLP(nn.Module):
         input_dim: int,
         hidden_dim: int,
         out_dim: int,
-        dropout: Optional[torch.float] = None,
+        dropout: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.out_dim = out_dim
-        ordered_layers = [
+        ordered_layers: list[nn.Module] = [
             Linear(input_dim, hidden_dim),
             GeLU(),
             Linear(hidden_dim, input_dim),
@@ -352,25 +352,32 @@ FLASH = 0
 
 # The purpose if this class is to name match the attention class vars for GPT-2
 class CausalSelfAttention(nn.Module):
-    __constants__ = ["d_model", "num_heads", "d_head"]
+    __constants__ = ["d_model", "num_heads", "d_head", "block_size"]
     d_model: int
     num_heads: int
     d_head: int
+    block_size: int
 
-    def __init__(self, d_model: int, num_heads: int) -> None:
+    def __init__(self, d_model: int, num_heads: int, block_size: int) -> None:
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_head = d_model // num_heads
+        self.block_size = block_size
         # K, Q, V projections for all heads in batch
         self.c_attn = Linear(d_model, 3 * d_model, bias=False)
         # Output projection
         self.c_proj = Linear(d_model, d_model, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1  # Compatibility with Karpathy.
-        # Causal mask for self-attention
+        # Causal mask for self-attention: lower-triangular [1, 1, block_size, block_size]
+        # so it broadcasts against attention scores of shape [B, num_heads, T, T] and
+        # masks out positions j > i for each query i.
         self.register_buffer(
-            "bias", torch.tril(torch.ones(1, 1, 1, 1)).view(1, 1, 1, 1)
+            "bias",
+            torch.tril(torch.ones(block_size, block_size)).view(
+                1, 1, block_size, block_size
+            ),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -421,7 +428,7 @@ class Block(nn.Module):
         d_model: int,
         num_heads: int,
         hidden_dim: int,
-        dropout: Optional[torch.float] = None,
+        dropout: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -441,25 +448,28 @@ class Block(nn.Module):
 
 
 class KarpathyBlock(nn.Module):
-    __constants__ = ["d_model", "num_heads", "hidden_dim"]
+    __constants__ = ["d_model", "num_heads", "hidden_dim", "block_size"]
     d_model: int
     num_heads: int
     hidden_dim: int
+    block_size: int
 
     def __init__(
         self,
         d_model: int,
         num_heads: int,
         hidden_dim: int,
-        dropout: Optional[torch.float] = None,
+        block_size: int,
+        dropout: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
+        self.block_size = block_size
 
         self.ln_1 = LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, num_heads)
+        self.attn = CausalSelfAttention(d_model, num_heads, block_size)
         self.ln_2 = LayerNorm(d_model)
         self.mlp = KarpathyMLP(d_model, hidden_dim, d_model)
 
@@ -499,6 +509,7 @@ class GPT(nn.Module):
                             d_model=config.n_embd,
                             num_heads=config.n_head,
                             hidden_dim=4 * config.n_embd,
+                            block_size=config.block_size,
                         )
                         for _ in range(config.n_layer)
                     ]
@@ -644,9 +655,9 @@ class GPT(nn.Module):
 
     def configure_optimizers(
         self,
-        weight_decay: torch.float,
-        learning_rate: torch.float,
-        betas: torch.float,
+        weight_decay: float,
+        learning_rate: float,
+        betas: tuple[float, float],
         device: torch.device,
         zero_stage: int,
     ) -> torch.optim.Optimizer:
@@ -706,7 +717,7 @@ class GPT(nn.Module):
         self,
         idx: Tensor,
         max_new_tokens: int,
-        temperature: torch.float = 1.0,
+        temperature: float = 1.0,
         top_k: int | None = None,
     ):
         for _ in range(max_new_tokens):
@@ -772,7 +783,7 @@ def _peek_data_shard(filename: str) -> int:
     return ntok
 
 
-def _load_data_shard(filename: str) -> bytes:
+def _load_data_shard(filename: str) -> np.ndarray:
     with open(filename, "rb") as f:
         # Read the header for ntok first
         ntok = _read_header(f)
@@ -825,7 +836,7 @@ class DistributedDataLoader:
         self.current_position = self.process_rank * self.B * self.T
 
     def advance(self) -> None:
-        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_shard = ((self.current_shard or 0) + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
@@ -851,13 +862,13 @@ This might need to be adapted to mojo.
 """
 
 
-def write_fp32(tensor: Tensor, file: str) -> None:
+def write_fp32(tensor: Tensor, file: BinaryIO) -> None:
     t = tensor.detach().cpu().to(torch.float32)
     b = t.numpy().tobytes()
     file.write(b)
 
 
-def write_bf16(tensor: Tensor, file: str) -> None:
+def write_bf16(tensor: Tensor, file: BinaryIO) -> None:
     t = tensor.detach().cpu().to(torch.bfloat16)
     # Numpy doesn't have bf16 datatype so we have to trick it into int16
     t = t.view(torch.int16)
@@ -865,21 +876,21 @@ def write_bf16(tensor: Tensor, file: str) -> None:
     file.write(b)
 
 
-def write_fp16(tensor: Tensor, file: str) -> None:
+def write_fp16(tensor: Tensor, file: BinaryIO) -> None:
     t = tensor.detach().cpu().to(torch.float16)
     b = t.numpy().tobytes()
     file.write(b)
 
 
-def write_fp8(tensor: Tensor, file: str) -> None:
-    t = tensor.detach().cpu().to(torch.float8)
-    b = t.numpy().tobytes()
-    file.write(b)
+# def write_fp8(tensor: Tensor, file: BinaryIO) -> None:
+#     t = tensor.detach().cpu().to(torch.float8)
+#     b = t.numpy().tobytes()
+#     file.write(b)
 
 
 # TODO: This is a copy of Karpathy's code, it needs to be adapted to my classes.
 def write_tensor(
-    model_tensors: list[Tensor], L: int, file: str, dtype: torch.dtype
+    model_tensors: dict[str, Tensor], L: int, file: BinaryIO, dtype: str
 ) -> None:
     # Writes the GPT-2 model weights to a binary file.
     assert dtype in {"float32", "bfloat16", "float16", "float8"}
@@ -887,7 +898,7 @@ def write_tensor(
         "float32": write_fp32,
         "bfloat16": write_bf16,
         "float16": write_fp16,
-        "float8": write_fp8,
+        # "float8": write_fp8,
     }
     write_fn = write_fns[dtype]
     write_fn(model_tensors["transformer.wte.weight"], file)  # [V, C]
@@ -940,7 +951,7 @@ def pad_vocab(tensor: Tensor, multiple: int = 128, value: int = 0) -> Tensor:
     return padded
 
 
-def write_model(model: GPT, file: str, dtype: torch.dtype) -> None:
+def write_model(model: Any, file: str, dtype: str) -> None:
     # Everything we need to instantiate the model.
     # 1) Header is: version int, GPTConfig ints, padding to 1024 bytes
     assert dtype in {"float32", "bfloat16", "float16", "float8"}
@@ -1263,7 +1274,7 @@ if __name__ == "__main__":
         "float32": torch.float32,
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
-        "float8": torch.float8,
+        # "float8": torch.float8,
     }[args.dtype]
     ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
@@ -1403,8 +1414,8 @@ if __name__ == "__main__":
 
     # Learning Rate Decay Scheduler (cosine with warmup)
     def get_lr(
-        iteration: int, lr: torch.float, decay: torch.float, warmup: int, num_iters: int
-    ) -> torch.float:
+        iteration: int, lr: float, decay: float, warmup: int, num_iters: int
+    ) -> float:
         # Minimum learning rate
         min_lr = lr * decay
         # Linear warmup
@@ -1493,7 +1504,7 @@ if __name__ == "__main__":
             train_loader.reset()
 
         # Micro-batch loop where we do gradient accumulation to reach the desired total batch size
-        lossf = 0.0
+        lossf: Tensor = torch.tensor(0.0, device=device)
         for micro_step in range(grad_accum_steps):
             # Fetch a batch
             x, y = train_loader.next_batch()
@@ -1520,8 +1531,6 @@ if __name__ == "__main__":
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.SUM)
 
-        lossf = lossf.item()
-
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         # Determine and set the learning rate for this iteration
         lr = get_lr(step, learning_rate, decay, warmup, num_iters)
@@ -1546,13 +1555,13 @@ if __name__ == "__main__":
         # The 0th interation is often an outlier (much slower) => skip logging it
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t_1 - t_0)
         print_zero_rank(
-            f"step {step + 1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t_1 - t_0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
+            f"step {step + 1:4d}/{args.num_iterations} | train loss {lossf.item():.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t_1 - t_0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
         )
 
         # Log to the logfile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
-                f.write("s:%d trl:%f\n" % (step, lossf))
+                f.write("s:%d trl:%f\n" % (step, lossf.item()))
 
         # Keep track of smooth timings last 20 iterations
         if step > 0 and step > num_iters - 20:

@@ -14,3 +14,6 @@ pytorch = ">=2.2"
 numpy = ">=1.26"
 transformers = ">=4.40"
 tiktoken = ">=0.6"
+
+[pypi-dependencies]
+pyrefly = ">=0.16"

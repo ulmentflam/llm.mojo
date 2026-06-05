@@ -87,7 +87,7 @@ format-cuda:
 	fi
 
 typecheck:
-	uvx pyrefly check $(PYTHON_SOURCES)
+	pixi run pyrefly check $(PYTHON_SOURCES)
 
 clean:
 	rm -rf .ruff_cache .pyrefly_cache
