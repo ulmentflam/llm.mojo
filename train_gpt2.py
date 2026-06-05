@@ -1,4 +1,6 @@
 import math
+import glob
+import struct
 import inspect
 from typing import Optional
 from dataclasses import dataclass
@@ -10,6 +12,16 @@ from torch import Tensor
 import torch.nn.functional as F
 import torch.nn.functional.init as init
 from torch.distributed.optim import ZeroRedundancyOptimizer
+
+
+"""
+Print Helper
+"""
+
+
+def print_zero_rank(*args, **kwargs) -> None:
+    if torch.distributed.get_rank() == 0:
+        print(*args, **kwargs)
 
 
 """
@@ -535,10 +547,10 @@ class GPT(nn.Module):
 
         num_decay_params = sum(p.numel() for p in decay_params)
         num_no_decay_params = sum(p.numel() for p in no_decay_params)
-        print(
+        print_zero_rank(
             f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
         )
-        print(
+        print_zero_rank(
             f"num non-decayed parameter tensors: {len(no_decay_params)}, with {num_no_decay_params:,} parameters"
         )
 
@@ -548,10 +560,10 @@ class GPT(nn.Module):
         fused_avaliable = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_avaliable and device == "cuda"
 
-        print(f"Using fused AdamW: {use_fused}")
+        print_zero_rank(f"Using fused AdamW: {use_fused}")
 
         if zero_stage == 1:
-            print("Using ZeroRedundancyOptimizer")
+            print_zero_rank("Using ZeroRedundancyOptimizer")
             optimizer = ZeroRedundancyOptimizer(
                 **optim_groups[0],
                 optimizer_class=torch.optim.AdamW,
@@ -561,7 +573,7 @@ class GPT(nn.Module):
             )
             optimizer.add_param_group(optim_groups[1])
         else:
-            print("Using regular AdamW")
+            print_zero_rank("Using regular AdamW")
             optimizer = torch.optim.AdamW(
                 optim_groups, lr=learning_rate, betas=betas, fused=use_fused
             )
@@ -647,3 +659,253 @@ def _load_data_shard(filename: str) -> bytes:
         tokens = np.frombuffer(f.read(), dtype=np.uint16)
     assert len(tokens) == ntok, "Number of tokens read does not match header"
     return tokens
+
+
+class DistributedDataLoader:
+    def __init__(
+        self,
+        filename_pattern: str,
+        B: int,
+        T: int,
+        process_rank: int,
+        num_processes: int,
+    ) -> None:
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, (
+            f"did not find any files that match the pattern {filename_pattern}"
+        )
+
+        # Load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for f_name in self.files:
+            shard_ntok = _peek_data_shard(f_name)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += shard_ntok
+        self.ntok_total = ntok_total
+        print_zero_rank(
+            f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files"
+        )
+
+        # Kick off
+        self.current_shard = None
+        self.reset()
+
+    def reset(self) -> None:
+        # If shard zero is loaded, then don't need to reload it, just reset the pointer.
+        if self.current_shard != 0:
+            self.current_shard = 0
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_position = self.process_rank * self.B * self.T
+
+    def advance(self) -> None:
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.cureent_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self) -> tuple[Tensor, Tensor]:
+        B = self.B
+        T = self.T
+        buffer = self.tokens[self.current_position : self.current_position + B * T + 1]
+        buffer = torch.tensor(buffer.astype(np.int32), dtype=torch.long)
+        x = (buffer[:-1]).view(B, T)  # Inputs
+        y = (buffer[1:]).view(B, T)  # Targets
+        # Advance the start pointer in the current shard
+        self.current_position += B * T * self.num_processes
+        # If loading the next batch would be out of bounds advance the shard
+        if self.current_position + (B * T * self.num_prosesses + 1) > len(self.tokens):
+            self.advance()
+        return x, y
+
+
+"""
+Python to C bridge utilities for saving params/grads/activations to .bin files.
+
+This might need to be addapted to mojo.
+"""
+
+
+def write_fp32(tensor: Tensor, file: str) -> None:
+    t = tensor.detach().cpu().to(torch.float32)
+    b = t.numpy().tobytes()
+    file.write(b)
+
+
+def write_bf16(tensor: Tensor, file: str) -> None:
+    t = tensor.detach().cpu().to(torch.bfloat16)
+    # Numpy doesn't have bf16 datatype so we have to trick it into int16
+    t = t.view(torch.int16)
+    b = t.numpy().tobytes()
+    file.write(b)
+
+
+def write_fp16(tensor: Tensor, file: str) -> None:
+    t = tensor.detach().cpu().to(torch.float16)
+    b = t.numpy().tobytes()
+    file.write(b)
+
+
+def write_fp8(tensor: Tensor, file: str) -> None:
+    t = tensor.detach().cpu().to(torch.float8)
+    b = t.numpy().tobytes()
+    file.write(b)
+
+
+# TODO: This is a copy of Karpathy's code, it needs to be addapted to my classes.
+def write_tensor(
+    model_tensors: list[Tensor], L: int, file: str, dtype: torch.dtype
+) -> None:
+    # Writes the GPT-2 model weights to a binary file.
+    assert dtype in {"float32", "bfloat16", "float16", "float8"}
+    write_fns = {
+        "float32": write_fp32,
+        "bfloat16": write_bf16,
+        "float16": write_fp16,
+        "float8": write_fp8,
+    }
+    write_fn = write_fns[dtype]
+    write_fn(model_tensors["transformer.wte.weight"], file)  # [V, C]
+    write_fn(model_tensors["transformer.wpe.weight"], file)  # [T, C]
+    for i in range(L):  # [L, C]
+        write_fn(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+        write_fn(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+    for i in range(L):  # [L, 3C, C]
+        write_fn(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+    for i in range(L):  # [L, 3C]
+        write_fn(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
+    for i in range(L):  # [L, C, C]
+        write_fn(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
+    for i in range(L):  # [L, C]
+        write_fn(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+        write_fn(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+        write_fn(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+    for i in range(L):  # [L, 4C, C]
+        write_fn(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
+    for i in range(L):  # [L, 4C]
+        write_fn(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
+    for i in range(L):  # [L, C, 4C]
+        write_fn(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+    for i in range(L):  # [L, C]
+        write_fn(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+    write_fn(model_tensors["transformer.ln_f.weight"], file)  # [C, ]
+    write_fn(model_tensors["transformer.ln_f.bias"], file)  # [C, ]
+
+
+@torch.no_grad()
+def pad_vocab(tensor: Tensor, multiple: int = 128, value: int = 0) -> Tensor:
+    """
+    The dimension of the vocab size in GPT-2 is 50,257 which is unfortunatly a
+    very unfirendly number for many matrix operations on the GPU. So we pad to
+    the nearest friendiler multiple, e.g. 50,304 if the multiple is 128 when we
+    export to .bin files. This is a NOOP algorithmically and is only done to make
+    tensor operations more efficient.
+    """
+    assert tensor.ndim == 2, "Tensor must be 2D"
+    V, C = tensor.shape
+    assert V == 50257, "Vocab size must be 50257"
+    # Calculate the padded vocab size by rounding up to the nearest multiple
+    V_p = ((V + multiple - 1) // multiple) * multiple
+    # Pad the Tensor
+    pad_rows = V_p - V
+    padded = (
+        tensor if pad_rows == 0 else F.pad(tensor, (0, 0, 0, pad_rows), value=value)
+    )
+    assert padded.shape == (V_p, C), "Padded shape mismatch"
+    return padded
+
+
+def write_model(model: GPT, file: str, dtype: torch.dtype) -> None:
+    # Everything we need to instantiate the model.
+    # 1) Header is: version int, GPTConfig ints, padding to 1024 bytes
+    assert dtype in {"float32", "bfloat16", "float16", "float8"}
+    version = {
+        "float32": 3,  # 3: all tensors are fp32, padded vocab
+        "bfloat16": 5,  # 5: all tensors are bf16, padded vocab
+    }[dtype]
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = MAGIC_NUMBER
+    header[1] = version
+    header[2] = model.config.block_size
+    header[3] = model.config.vocab_size
+    header[4] = model.config.n_layer
+    header[5] = model.config.n_head
+    header[6] = model.config.n_embd
+    # 2) the parameters follow the header
+    params = {name: param.cpu() for name, param in model.named_parameters()}
+    # Pad the vocab to a multiple of 128 here at export, for efficiency in C.
+    wte = params["transformer.wte.weight"]  # [V, C]
+    wte_padded = pad_vocab(wte)  # [V_p, C]
+    params["transformer.wte.weight"] = wte_padded  # [V_p, C]
+    print(f"Padded vocab size from {wte.shape[0]} to {wte_padded.shape[0]}")
+    header[7] = wte_padded.shape[0]  # Padded vocabsize stored in the header
+
+    # 3) Write the parameters to the file
+    with open(file, "wb") as f:
+        file.write(header.numpy().tobytes())
+        write_tensor(params, model.config.n_layer, f, dtype)  # Params
+    print(f"Wrote {file}")
+
+
+def write_state(
+    model: GPT, x: Tensor, y: Tensor, logits: Tensor, loss: Tensor, file: str
+) -> None:
+    """
+    Write state is used to debug. It contains information about the input, logits, loss, and the param gradients.
+    This can be used for checking the computation corecction in the target language.
+    """
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = MAGIC_NUMBER
+    header[1] = 2  # Run state version = 2 (1 -> 2 for the padded vocab)
+    header[2] = x.shape[0]  # Batch size
+    header[3] = x.shape[1]  # Temporal extent of the batch (seq_len)
+    grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
+    # Pad the vocab grads here as well, to mirror write_model
+    wte_grad = grads["transformer.wte.weight"]  # [V, C]
+    wte_grad_padded = pad_vocab(wte_grad, value=0)  # [V_p, C]
+    grads["transformer.wte.weight"] = wte_grad_padded  # [V_p, C]
+    print(
+        f"Padded vocab size in reference grads from {wte_grad.shape[0]} to {wte_grad_padded.shape[0]}"
+    )
+
+    # Write the file
+    with open(file, "wb") as f:
+        # Header
+        file.write(header.numpy().tobytes())
+        # Input X
+        file.write(x.cpu().numpy().astype(np.int32).tobytes())  # [B, T]
+        # Target Y
+        file.write(y.cpu().numpy().astype(np.int32).tobytes())  # [B, T]
+        # Logits
+        write_fp32(logits.cpu(), f)
+        # Loss
+        write_fp32(loss.cpu(), f)
+        # Gradients
+        write_tensor(grads, model.config.n_layer, f, "float32")
+    print(f"Wrote {file}")
+
+
+def write_tokenizer(encoder, file: str) -> None:
+    n = encoder.max_token_value + 1
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = MAGIC_NUMBER
+    header[1] = 2  # Tokenizer version = 2 (1 -> 2: includes EOT token)
+    header[2] = n  # Number of tokens
+    header[3] = encoder.eot_token  # EOT token
+
+    # Write the file
+    with open(file, "wb") as f:
+        f.write(header.numpy().tobytes())
+        for i in range(n):
+            b = encoder.decode_bytes([i])
+            length = len(b)
+            assert length < 256, f"Token length {length} exceeds 255"
+            f.write(
+                struct.pack("<B", length)
+            )  # Writes the lenght as a 1-byte unsigned int (c++ struct utils)
+            f.write(b)
+        print(f"Wrote {file}")
