@@ -1431,8 +1431,6 @@ if __name__ == "__main__":
         torch.cuda.reset_peak_memory_stats()
     if device == "mps":
         torch.mps.reset_peak_memory_stats()
-    if device == "cpu":
-        torch.cpu.reset_peak_memory_stats()
 
     timings = []
     norm = -1.0
@@ -1541,8 +1539,6 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
         if device == "mps":
             torch.mps.synchronize()
-        if device == "cpu":
-            torch.cpu.synchronize()
 
         # Time and Print
         t_1 = time.time()
