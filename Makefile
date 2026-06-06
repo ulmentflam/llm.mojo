@@ -1,4 +1,4 @@
-PYTHON_SOURCES := train_gpt2.py
+PYTHON_SOURCES := $(shell find . -name '*.py' -not -path './.pixi/*' -not -path '*/__pycache__/*' 2>/dev/null)
 MOJO_SOURCES := $(shell find . -name '*.mojo' -not -path './.pixi/*' 2>/dev/null)
 C_SOURCES := $(shell find . \( -name '*.c' -o -name '*.h' \) -not -path './.pixi/*' 2>/dev/null)
 CUDA_SOURCES := $(shell find . \( -name '*.cu' -o -name '*.cuh' \) -not -path './.pixi/*' 2>/dev/null)
@@ -33,8 +33,12 @@ check: lint typecheck
 lint: lint-python lint-mojo lint-c lint-cuda
 
 lint-python:
-	uvx ruff check $(PYTHON_SOURCES)
-	uvx ruff format --check $(PYTHON_SOURCES)
+	@if [ -n "$(PYTHON_SOURCES)" ]; then \
+		uvx ruff check $(PYTHON_SOURCES); \
+		uvx ruff format --check $(PYTHON_SOURCES); \
+	else \
+		echo "No .py files found, skipping python lint."; \
+	fi
 
 lint-mojo:
 	@if [ -n "$(MOJO_SOURCES)" ]; then \
@@ -62,8 +66,12 @@ lint-cuda:
 format: format-python format-mojo format-c format-cuda
 
 format-python:
-	uvx ruff check --fix $(PYTHON_SOURCES)
-	uvx ruff format $(PYTHON_SOURCES)
+	@if [ -n "$(PYTHON_SOURCES)" ]; then \
+		uvx ruff check --fix $(PYTHON_SOURCES); \
+		uvx ruff format $(PYTHON_SOURCES); \
+	else \
+		echo "No .py files found, skipping python format."; \
+	fi
 
 format-mojo:
 	@if [ -n "$(MOJO_SOURCES)" ]; then \
@@ -87,7 +95,11 @@ format-cuda:
 	fi
 
 typecheck:
-	pixi run pyrefly check $(PYTHON_SOURCES)
+	@if [ -n "$(PYTHON_SOURCES)" ]; then \
+		pixi run pyrefly check $(PYTHON_SOURCES); \
+	else \
+		echo "No .py files found, skipping python typecheck."; \
+	fi
 
 clean:
 	rm -rf .ruff_cache .pyrefly_cache
