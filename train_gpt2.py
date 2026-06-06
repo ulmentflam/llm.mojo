@@ -607,7 +607,7 @@ class GPT(nn.Module):
             loss = None
 
         if not return_logits:
-            loss = None
+            logits = None
 
         return logits, loss
 
