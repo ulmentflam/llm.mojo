@@ -21,8 +21,8 @@ DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".tinyshakespeare")
 
 TINY_SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 FILE_NAME = "tiny_shakespeare.txt"
-VAL_FILE_NAME = "tiny_shakespeare_val.txt"
-TRAIN_FILE_NAME = "tiny_shakespeare_train.txt"
+VAL_FILE_NAME = "tiny_shakespeare_val.bin"
+TRAIN_FILE_NAME = "tiny_shakespeare_train.bin"
 VAL_SIZE = 32768
 
 

@@ -26,7 +26,10 @@ Print Helper
 
 
 def print_zero_rank(*args, **kwargs) -> None:
-    if torch.distributed.get_rank() == 0:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            print(*args, **kwargs)
+    else:
         print(*args, **kwargs)
 
 
@@ -129,7 +132,10 @@ class Linear(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: Tensor) -> Tensor:
-        return x @ self.weight.T + self.bias
+        out = x @ self.weight.T
+        if self.bias is not None:
+            out = out + self.bias
+        return out
 
 
 class LayerNorm(nn.Module):
@@ -286,9 +292,9 @@ class KarpathyMLP(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.out_dim = out_dim
-        self.c_fc = Linear(input_dim, hidden_dim, bias=False)
+        self.c_fc = Linear(input_dim, hidden_dim)
         self.gelu = GeLU()
-        self.c_proj = Linear(hidden_dim, out_dim, bias=False)
+        self.c_proj = Linear(hidden_dim, out_dim)
         setattr(
             self.c_proj, "LLMC_RESIDUAL_SCALE_FLAG", 1
         )  # Compatibility with Karpathy.
@@ -370,9 +376,9 @@ class CausalSelfAttention(nn.Module):
         self.d_head = d_model // num_heads
         self.block_size = block_size
         # K, Q, V projections for all heads in batch
-        self.c_attn = Linear(d_model, 3 * d_model, bias=False)
+        self.c_attn = Linear(d_model, 3 * d_model)
         # Output projection
-        self.c_proj = Linear(d_model, d_model, bias=False)
+        self.c_proj = Linear(d_model, d_model)
         setattr(
             self.c_proj, "LLMC_RESIDUAL_SCALE_FLAG", 1
         )  # Compatibility with Karpathy.
@@ -651,24 +657,37 @@ class GPT(nn.Module):
             "mlp.c_proj.weight",
         ]
 
+        # HF's nn.LayerNorm uses weight/bias; our LayerNorm uses gamma/beta.
+        # Map HF param names ending in .weight/.bias on LayerNorms to local gamma/beta.
+        ln_suffixes = ("ln_1", "ln_2", "ln_f")
+
+        def hf_to_local(key: str) -> str:
+            for ln in ln_suffixes:
+                if key.endswith(f".{ln}.weight"):
+                    return key[: -len(".weight")] + ".gamma"
+                if key.endswith(f".{ln}.bias"):
+                    return key[: -len(".bias")] + ".beta"
+            return key
+
         # OpenAI checkpoints use a "Conv1D" module, but we are only wanting to use a vanilla linear.
         # This means we have to transpose these weights.
         assert len(sd_keys_hf) == len(sd_keys), (
             f"Key Mismatch: {len(sd_keys_hf)} != {len(sd_keys)}"
         )
         for k in sd_keys_hf:
+            local_k = hf_to_local(k)
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights for transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape, (
+                assert sd_hf[k].shape[::-1] == sd[local_k].shape, (
                     f"Transpose Shape Mismatch {k}"
                 )
                 with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
+                    sd[local_k].copy_(sd_hf[k].t())
             else:
                 # Copy over the other paramaters
-                assert sd_hf[k].shape == sd[k].shape
+                assert sd_hf[k].shape == sd[local_k].shape
                 with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+                    sd[local_k].copy_(sd_hf[k])
         return model
 
     def configure_optimizers(
@@ -901,10 +920,12 @@ def write_fp16(tensor: Tensor, file: BinaryIO) -> None:
     file.write(b)
 
 
-# def write_fp8(tensor: Tensor, file: BinaryIO) -> None:
-#     t = tensor.detach().cpu().to(torch.float8)
-#     b = t.numpy().tobytes()
-#     file.write(b)
+def write_fp8(tensor: Tensor, file: BinaryIO) -> None:
+    t = tensor.detach().cpu().to(torch.float8_e4m3fn)
+    # Numpy doesn't have an fp8 datatype, so view as int8 (both are 1 byte).
+    t = t.view(torch.int8)
+    b = t.numpy().tobytes()
+    file.write(b)
 
 
 # TODO: This is a copy of Karpathy's code, it needs to be adapted to my classes.
@@ -917,14 +938,14 @@ def write_tensor(
         "float32": write_fp32,
         "bfloat16": write_bf16,
         "float16": write_fp16,
-        # "float8": write_fp8,
+        "float8": write_fp8,
     }
     write_fn = write_fns[dtype]
     write_fn(model_tensors["transformer.wte.weight"], file)  # [V, C]
     write_fn(model_tensors["transformer.wpe.weight"], file)  # [T, C]
     for i in range(L):  # [L, C]
-        write_fn(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
-        write_fn(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+        write_fn(model_tensors[f"transformer.h.{i}.ln_1.gamma"], file)
+        write_fn(model_tensors[f"transformer.h.{i}.ln_1.beta"], file)
     for i in range(L):  # [L, 3C, C]
         write_fn(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
     for i in range(L):  # [L, 3C]
@@ -933,8 +954,8 @@ def write_tensor(
         write_fn(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L):  # [L, C]
         write_fn(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
-        write_fn(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
-        write_fn(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+        write_fn(model_tensors[f"transformer.h.{i}.ln_2.gamma"], file)
+        write_fn(model_tensors[f"transformer.h.{i}.ln_2.beta"], file)
     for i in range(L):  # [L, 4C, C]
         write_fn(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
     for i in range(L):  # [L, 4C]
@@ -943,8 +964,8 @@ def write_tensor(
         write_fn(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
     for i in range(L):  # [L, C]
         write_fn(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
-    write_fn(model_tensors["transformer.ln_f.weight"], file)  # [C, ]
-    write_fn(model_tensors["transformer.ln_f.bias"], file)  # [C, ]
+    write_fn(model_tensors["transformer.ln_f.gamma"], file)  # [C, ]
+    write_fn(model_tensors["transformer.ln_f.beta"], file)  # [C, ]
 
 
 @torch.no_grad()
@@ -977,6 +998,8 @@ def write_model(model: Any, file: str, dtype: str) -> None:
     version = {
         "float32": 3,  # 3: all tensors are fp32, padded vocab
         "bfloat16": 5,  # 5: all tensors are bf16, padded vocab
+        "float16": 7,  # 7: all tensors are fp16, padded vocab
+        "float8": 9,  # 9: all tensors are fp8 (e4m3fn), padded vocab
     }[dtype]
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = MAGIC_NUMBER
@@ -1071,9 +1094,14 @@ if __name__ == "__main__":
     import argparse
     import tiktoken
 
-    print_zero_rank(
-        f"Running pytorch {torch.__version__} on {torch.cuda.get_device_name()}"
-    )
+    if torch.cuda.is_available():
+        device_name = torch.cuda.get_device_name()
+    elif torch.backends.mps.is_available():
+        device_name = "mps"
+    else:
+        device_name = "cpu"
+
+    print_zero_rank(f"Running pytorch {torch.__version__} on {device_name}")
 
     # GROSS! This should be handled by a real config parser.....
     def parse_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
