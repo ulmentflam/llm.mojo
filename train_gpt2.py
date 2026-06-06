@@ -786,7 +786,7 @@ def _read_header(f) -> int:
             "---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README"
         )
         print(
-            "---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try"
+            "---> HINT: For example re-run: `python data/tinyshakespeare.py`, then re-try"
         )
         exit(1)
 
@@ -1083,7 +1083,7 @@ if __name__ == "__main__":
         parser.add_argument(
             "--input_bin",
             type=str,
-            default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin",
+            default="data/.tinyshakespeare/tiny_shakespeare_val.bin",
             help="input .bin to train on",
         )
         parser.add_argument(
