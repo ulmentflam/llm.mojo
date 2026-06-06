@@ -2,6 +2,9 @@
 .pixi/*
 !.pixi/config.toml
 
+# Dataset caches (hidden dirs under data/)
+data/.*/
+
 # ---------- macOS ----------
 .DS_Store
 .AppleDouble

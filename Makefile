@@ -1,7 +1,7 @@
-PYTHON_SOURCES := $(shell find . -name '*.py' -not -path './.pixi/*' -not -path '*/__pycache__/*' 2>/dev/null)
-MOJO_SOURCES := $(shell find . -name '*.mojo' -not -path './.pixi/*' 2>/dev/null)
-C_SOURCES := $(shell find . \( -name '*.c' -o -name '*.h' \) -not -path './.pixi/*' 2>/dev/null)
-CUDA_SOURCES := $(shell find . \( -name '*.cu' -o -name '*.cuh' \) -not -path './.pixi/*' 2>/dev/null)
+PYTHON_SOURCES := $(shell find . -name '*.py' -not -path './.pixi/*' -not -path './data/.*/*' -not -path '*/__pycache__/*' 2>/dev/null)
+MOJO_SOURCES := $(shell find . -name '*.mojo' -not -path './.pixi/*' -not -path './data/.*/*' 2>/dev/null)
+C_SOURCES := $(shell find . \( -name '*.c' -o -name '*.h' \) -not -path './.pixi/*' -not -path './data/.*/*' 2>/dev/null)
+CUDA_SOURCES := $(shell find . \( -name '*.cu' -o -name '*.cuh' \) -not -path './.pixi/*' -not -path './data/.*/*' 2>/dev/null)
 
 .PHONY: help lint lint-python lint-mojo lint-c lint-cuda \
         format format-python format-mojo format-c format-cuda \
