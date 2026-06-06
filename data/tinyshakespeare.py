@@ -1,4 +1,4 @@
-# bin/python data/tinyshakespeare.py
+#!/usr/bin/env python3
 """
 Downloads and tokenizes the Tiny Shakespeare dataset.
 - The download is from Karpathy's github repository.
