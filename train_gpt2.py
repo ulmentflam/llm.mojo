@@ -4,7 +4,7 @@ import glob
 import struct
 import inspect
 from dataclasses import dataclass
-from typing import BinaryIO, Optional, Any
+from typing import BinaryIO, Optional, Any, cast
 
 import torch
 import numpy as np
@@ -288,7 +288,9 @@ class KarpathyMLP(nn.Module):
         self.c_fc = Linear(input_dim, hidden_dim, bias=False)
         self.gelu = GeLU()
         self.c_proj = Linear(hidden_dim, out_dim, bias=False)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1  # Compatibility with Karpathy.
+        setattr(
+            self.c_proj, "LLMC_RESIDUAL_SCALE_FLAG", 1
+        )  # Compatibility with Karpathy.
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.c_fc(x)
@@ -357,6 +359,7 @@ class CausalSelfAttention(nn.Module):
     num_heads: int
     d_head: int
     block_size: int
+    bias: Tensor
 
     def __init__(self, d_model: int, num_heads: int, block_size: int) -> None:
         super().__init__()
@@ -369,7 +372,9 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = Linear(d_model, 3 * d_model, bias=False)
         # Output projection
         self.c_proj = Linear(d_model, d_model, bias=False)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1  # Compatibility with Karpathy.
+        setattr(
+            self.c_proj, "LLMC_RESIDUAL_SCALE_FLAG", 1
+        )  # Compatibility with Karpathy.
         # Causal mask for self-attention: lower-triangular [1, 1, block_size, block_size]
         # so it broadcasts against attention scores of shape [B, num_heads, T, T] and
         # masks out positions j > i for each query i.
@@ -494,32 +499,44 @@ class GPTConfig:
     n_embd: int = 768
 
 
+class Transformer(nn.Module):
+    wte: nn.Embedding
+    wpe: nn.Embedding
+    h: nn.ModuleList
+    ln_f: LayerNorm
+
+    def __init__(self, config: GPTConfig) -> None:
+        super().__init__()
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.wpe = nn.Embedding(config.block_size, config.n_embd)
+        self.h = nn.ModuleList(
+            [
+                KarpathyBlock(
+                    d_model=config.n_embd,
+                    num_heads=config.n_head,
+                    hidden_dim=4 * config.n_embd,
+                    block_size=config.block_size,
+                )
+                for _ in range(config.n_layer)
+            ]
+        )
+        self.ln_f = LayerNorm(config.n_embd)
+
+
 class GPT(nn.Module):
+    transformer: Transformer
+    lm_head: Linear
+
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         self.config = config
 
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
-                wpe=nn.Embedding(config.block_size, config.n_embd),
-                h=nn.ModuleList(
-                    [
-                        KarpathyBlock(
-                            d_model=config.n_embd,
-                            num_heads=config.n_head,
-                            hidden_dim=4 * config.n_embd,
-                            block_size=config.block_size,
-                        )
-                        for _ in range(config.n_layer)
-                    ]
-                ),
-                ln_f=LayerNorm(config.n_embd),
-            )
-        )
+        self.transformer = Transformer(config)
 
         self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
-        self.lm_head.LLMC_SKIP_INIT = 1  # Don't init this one, we tie weights.
+        setattr(
+            self.lm_head, "LLMC_SKIP_INIT", 1
+        )  # Don't init this one, we tie weights.
         self.transformer.wte.weight = self.lm_head.weight  # paperswithcode weight tying
 
         self.init_rng = torch.Generator()
@@ -690,15 +707,16 @@ class GPT(nn.Module):
         # NOTE: I haven't implemented AdamW from scratch in this project so I can get to the mojo code faster.
 
         fused_avaliable = "fused" in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_avaliable and device == "cuda"
+        use_fused = fused_avaliable and device.type == "cuda"
 
         print_zero_rank(f"Using fused AdamW: {use_fused}")
 
         if zero_stage == 1:
             print_zero_rank("Using ZeroRedundancyOptimizer")
             optimizer = ZeroRedundancyOptimizer(
-                **optim_groups[0],
+                decay_params,
                 optimizer_class=torch.optim.AdamW,
+                weight_decay=weight_decay,
                 lr=learning_rate,
                 betas=betas,
                 fused=use_fused,
@@ -995,7 +1013,11 @@ def write_state(
     header[1] = 2  # Run state version = 2 (1 -> 2 for the padded vocab)
     header[2] = x.shape[0]  # Batch size
     header[3] = x.shape[1]  # Temporal extent of the batch (seq_len)
-    grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
+    grads = {
+        name: param.grad.cpu()
+        for name, param in model.named_parameters()
+        if param.grad is not None
+    }
     # Pad the vocab grads here as well, to mirror write_model
     wte_grad = grads["transformer.wte.weight"]  # [V, C]
     wte_grad_padded = pad_vocab(wte_grad, value=0)  # [V_p, C]
@@ -1299,6 +1321,7 @@ if __name__ == "__main__":
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
     # Init the model, from scratch or from OpenAI pretrained checkpoint
+    model: nn.Module
     if args.model[0] == "d":
         # From scratch (random weights)
         model_config = {
@@ -1327,7 +1350,7 @@ if __name__ == "__main__":
         if hasattr(config, "coordinate_descent_tuning"):
             config.coordinate_descent_tuning = True  # suggested by @Chillee
         print_zero_rank("Compiling the model...")
-        model = torch.compile(model)
+        model = cast(nn.Module, torch.compile(model))
 
     """
     Our own version of simple DistributedDataLoader
@@ -1389,7 +1412,14 @@ if __name__ == "__main__":
         write_model(model, f"gpt2_{model_size_str}_fp8.bin", dtype="float8")
         # Save x, y, logits, loss, and parameter gradients, for debugging C
         # Always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
+        write_state(
+            cast(GPT, model),
+            x,
+            y,
+            logits,
+            loss,
+            f"gpt2_{model_size_str}_debug_state.bin",
+        )
         # Reset the train_loader for the optimization below
         train_loader.reset()
 
@@ -1398,14 +1428,16 @@ if __name__ == "__main__":
     """
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module if ddp else model  # Always holds the raw, unwrapped model
+    raw_model: GPT = cast(
+        GPT, model.module if ddp else model
+    )  # Always holds the raw, unwrapped model
 
     # Init the optimizer
     optimizer = raw_model.configure_optimizers(
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
         betas=(0.9, 0.95),
-        device=device,
+        device=torch.device(device),
         zero_stage=zero_stage,
     )
     print_zero_rank(f"Using optimizer: {optimizer.__class__.__name__}")
@@ -1441,7 +1473,7 @@ if __name__ == "__main__":
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     if device == "mps":
-        torch.mps.reset_peak_memory_stats()
+        getattr(torch.mps, "reset_peak_memory_stats", lambda: None)()
 
     timings = []
     norm = -1.0
