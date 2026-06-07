@@ -900,6 +900,27 @@ This might need to be adapted to mojo.
 """
 
 
+def _uint32(value: int) -> bytes:
+    LITTLE_ENDIAN_UNSIGNED_INT_32 = "<I"
+    return struct.pack(
+        LITTLE_ENDIAN_UNSIGNED_INT_32, value
+    )  # little-endian unsigned int 32
+
+
+def _int32(value: int) -> bytes:
+    LITTLE_ENDIAN_SIGNED_INT_32 = "<i"
+    return struct.pack(
+        LITTLE_ENDIAN_SIGNED_INT_32, value
+    )  # little-endian signed int 32
+
+
+def _int32_array(ndim: int, values: list[int]) -> bytes:
+    LITTLE_ENDIAN_SIGNED_INT_32_ARRAY = "<%di"
+    return struct.pack(
+        LITTLE_ENDIAN_SIGNED_INT_32_ARRAY % ndim, *values
+    )  # little-endian signed int 32 * ndim
+
+
 def write_fp32(tensor: Tensor, file: BinaryIO) -> None:
     t = tensor.detach().cpu().to(torch.float32)
     b = t.numpy().tobytes()
@@ -968,6 +989,39 @@ def write_tensor(
     write_fn(model_tensors["transformer.ln_f.beta"], file)  # [C, ]
 
 
+def write_activations(
+    activations: dict[str, Tensor], file: BinaryIO, dtype: str = "float32"
+) -> None:
+    """
+    Writes captured forward activations and their grads. Two blobs per entry
+    (activation, then grad). Entries are sorted by name.
+    """
+    assert dtype in {"float32", "bfloat16", "float16", "float8"}
+    write_fns = {
+        "float32": write_fp32,
+        "bfloat16": write_bf16,
+        "float16": write_fp16,
+        "float8": write_fp8,
+    }
+    write_fn = write_fns[dtype]
+    names = sorted(activations.keys())
+    file.write(_uint32(len(names)))  # uint32 count
+    for name in names:
+        act = activations[name]
+        grad = act.grad
+        assert grad is not None, (
+            f"activation {name!r} has no grad — call capture_activations() before "
+            f"forward and backward() before write_activations()"
+        )
+        name_bytes = name.encode("utf-8")
+        file.write(_uint32(len(name_bytes)))  # uint32 name length
+        file.write(name_bytes)
+        file.write(_int32(act.ndim))  # int32 ndim
+        file.write(_int32_array(act.ndim, list(act.shape)))  # int32 * ndim shape
+        write_fn(act.detach().cpu(), file)  # activation blob
+        write_fn(grad.cpu(), file)  # grad blob
+
+
 @torch.no_grad()
 def pad_vocab(tensor: Tensor, multiple: int = 128, value: int = 0) -> Tensor:
     """
@@ -1026,7 +1080,13 @@ def write_model(model: Any, file: str, dtype: str) -> None:
 
 
 def write_state(
-    model: GPT, x: Tensor, y: Tensor, logits: Tensor, loss: Tensor, file: str
+    model: GPT,
+    x: Tensor,
+    y: Tensor,
+    logits: Tensor,
+    loss: Tensor,
+    activations: dict[str, Tensor],
+    file: str,
 ) -> None:
     """
     Write state is used to debug. It contains information about the input, logits, loss, and the param gradients.
@@ -1034,7 +1094,9 @@ def write_state(
     """
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = MAGIC_NUMBER
-    header[1] = 2  # Run state version = 2 (1 -> 2 for the padded vocab)
+    header[1] = (
+        3  # Run state version = 3 (1 -> 2 for the padded vocab, 2 -> 3 for the activations)
+    )
     header[2] = x.shape[0]  # Batch size
     header[3] = x.shape[1]  # Temporal extent of the batch (seq_len)
     grads = {
@@ -1064,6 +1126,9 @@ def write_state(
         write_fp32(loss.cpu(), f)
         # Gradients
         write_tensor(grads, model.config.n_layer, f, "float32")
+        # Activations + activation grads
+        write_activations(activations, f, "float32")
+
     print(f"Wrote {file}")
 
 
@@ -1087,6 +1152,47 @@ def write_tokenizer(encoder, file: str) -> None:
             )  # Writes the lenght as a 1-byte unsigned int (c++ struct utils)
             f.write(b)
         print(f"Wrote {file}")
+
+
+def capture_activations(model: GPT) -> tuple[dict[str, Tensor], list]:
+    """
+    Registers forward hooks on a curated set of submodules so each module's output
+    tensor and its activation grad survive the backward pass.
+
+    lm_head is intentionally skipped — its output is the `logits` tensor, already
+    written explicitly in write_state. The GPT root and the Transformer wrapper
+    are skipped too (GPT returns a (logits, loss) tuple; Transformer has no own
+    forward), so we hand-pick the modules that produce a single Tensor.
+    """
+    activations: dict[str, Tensor] = {}
+    handles: list = []
+
+    def capture_forward(name: str):
+        def hook(
+            _module: nn.Module, _input: tuple[Tensor, ...], output: Tensor
+        ) -> None:
+            output.retain_grad()
+            activations[name] = output
+
+        return hook
+
+    targets: dict[str, nn.Module] = {
+        "transformer.wte": model.transformer.wte,
+        "transformer.wpe": model.transformer.wpe,
+        "transformer.ln_f": model.transformer.ln_f,
+    }
+    for i, block in enumerate(model.transformer.h):
+        kblock = cast(KarpathyBlock, block)
+        targets[f"transformer.h.{i}.ln_1"] = kblock.ln_1
+        targets[f"transformer.h.{i}.attn"] = kblock.attn
+        targets[f"transformer.h.{i}.ln_2"] = kblock.ln_2
+        targets[f"transformer.h.{i}.mlp"] = kblock.mlp
+        targets[f"transformer.h.{i}"] = kblock  # post-residual stream output
+
+    for name, module in targets.items():
+        handles.append(module.register_forward_hook(capture_forward(name)))
+
+    return activations, handles
 
 
 if __name__ == "__main__":
@@ -1424,8 +1530,11 @@ if __name__ == "__main__":
     if master_process and args.write_tensors and (not args.inference_only):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
+        activations, handles = capture_activations(cast(GPT, model))
         logits, loss = model(x, y)
         loss.backward()
+        for h in handles:
+            h.remove()
         # Save model params
         model_to_size = {
             "gpt2": "124M",
@@ -1447,6 +1556,7 @@ if __name__ == "__main__":
             y,
             logits,
             loss,
+            activations,
             f"gpt2_{model_size_str}_debug_state.bin",
         )
         # Reset the train_loader for the optimization below
