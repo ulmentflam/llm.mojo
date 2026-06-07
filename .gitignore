@@ -5,6 +5,9 @@
 # Dataset caches (hidden dirs under data/)
 data/.*/
 
+# Model artifacts (regenerable via `python train_gpt2.py --write_tensors`)
+*.bin
+
 # ---------- macOS ----------
 .DS_Store
 .AppleDouble
