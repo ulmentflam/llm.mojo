@@ -42,7 +42,21 @@ lint-python:
 
 lint-mojo:
 	@if [ -n "$(MOJO_SOURCES)" ]; then \
-		pixi run mojo format --check $(MOJO_SOURCES); \
+		fail=0; \
+		tmpdir=$$(mktemp -d); \
+		trap "rm -rf $$tmpdir" EXIT; \
+		i=0; \
+		for f in $(MOJO_SOURCES); do \
+			i=$$((i+1)); \
+			tmp="$$tmpdir/file_$$i.mojo"; \
+			cp "$$f" "$$tmp"; \
+			pixi run mojo format -q "$$tmp"; \
+			if ! diff -q "$$f" "$$tmp" >/dev/null; then \
+				echo "needs formatting: $$f"; \
+				fail=1; \
+			fi; \
+		done; \
+		exit $$fail; \
 	else \
 		echo "No .mojo files found, skipping mojo lint."; \
 	fi
