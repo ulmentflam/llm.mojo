@@ -117,8 +117,9 @@ def adamw_update_cpu[
 
         @parameter
         def _simd[w: Int](local: Int):
+            var idx = base + local
             _adamw_update[dtype, w](
-                base + local,
+                idx,
                 params_ptr,
                 grads_ptr,
                 m_ptr,
@@ -129,11 +130,9 @@ def adamw_update_cpu[
             )
 
         # TODO: Mojo 1.0.0b1 vectorize requires its closure to be typed
-        # `fn[w: Int](idx: Int) unified -> None`, but the `unified` function
-        # effect isn't recognized in this beta (compiler only accepts
-        # raises|capturing|thin|register_passable). Until `unified` ships,
-        # we emulate vectorize's main-loop + scalar-tail dispatch by hand,
-        # invoking the same `_simd[w](local)` closure vectorize would.
+        # `def[w: Int](idx: Int) unified -> None`, but the `unified` function
+        # effect isn't recognized in this beta. Until `unified` ships,
+        # we emulate vectorize's main-loop + scalar-tail dispatch by hand.
         #
         # When `unified` lands:
         #   1. Convert `_simd` from `@parameter def` to:
@@ -151,6 +150,8 @@ def adamw_update_cpu[
             local += width
         for tail in range(simd_end, count):
             _simd[1](tail)
+        # TODO: Replace above with
+        # vectorize[width, unroll_factor=UNROLL](count, _simd)
 
     sync_parallelize[_chunk](num_chunks)
 
@@ -173,9 +174,6 @@ def adamw_update_gpu[
     beta1_correction: Scalar[DType.float32],
     beta2_correction: Scalar[DType.float32],
 ) -> None:
-    # AdamWConfig isn't passed across the GPU-kernel boundary directly
-    # (compile_function's signature_func inference doesn't flow through
-    # struct types cleanly); rebuild it locally per-thread.
     var config = AdamWConfig[dtype](
         learning_rate=learning_rate,
         beta1=beta1,
@@ -197,7 +195,7 @@ def adamw_update_gpu[
             beta2_correction,
         )
     elif idx < num_params:
-        # Last vector straddles num_params — handle the remainder one element at a time.
+        # Last vector straddles num_params so handle the remainder one element at a time.
         for i in range(idx, num_params):
             _adamw_update[dtype, 1](
                 i,
@@ -305,10 +303,6 @@ struct AdamWUpdate:
         v_memory: MutableInputTensor[
             dtype=DType.float32, rank=1, static_spec=...
         ],
-        # MAX delivers `t` as a 0-d uint32 tensor via
-        # `ops.constant(t, DType.uint32, ...)` in the bridge — received here
-        # as UInt32 (a Scalar). Passed straight through; the bias-correction
-        # math in `adamw_update` does the Float32 promotion via `Float32(t)`.
         t: UInt32,
         grads: InputTensor[dtype=dtype, rank=1, static_spec=...],
         learning_rate: Scalar[dtype],
