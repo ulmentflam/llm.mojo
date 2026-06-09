@@ -70,7 +70,7 @@ def _adamw_update[
 ](
     idx: Int,
     params_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grads_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    grads_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     m_ptr: UnsafePointer[Float32, MutAnyOrigin],
     v_ptr: UnsafePointer[Float32, MutAnyOrigin],
     config: AdamWConfig[dtype],
@@ -109,7 +109,7 @@ def adamw_update_cpu[
 ](
     num_params: Int,
     params_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grads_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    grads_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     m_ptr: UnsafePointer[Float32, MutAnyOrigin],
     v_ptr: UnsafePointer[Float32, MutAnyOrigin],
     config: AdamWConfig[dtype],
@@ -159,7 +159,7 @@ def adamw_update_gpu[
 ](
     num_params: Int,
     params_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grads_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    grads_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     m_ptr: UnsafePointer[Float32, MutAnyOrigin],
     v_ptr: UnsafePointer[Float32, MutAnyOrigin],
     learning_rate: Scalar[dtype],
@@ -213,7 +213,7 @@ def adamw_update[
 ](
     num_params: Int,
     params_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grads_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    grads_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     m_ptr: UnsafePointer[Float32, MutAnyOrigin],
     v_ptr: UnsafePointer[Float32, MutAnyOrigin],
     t: UInt32,

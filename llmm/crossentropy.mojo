@@ -30,8 +30,8 @@ def _crossentropy_ohe_fwd[
 ](
     idx: Int,
     losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
     batch_size: Int,  # Our B
     seq_len: Int,  # Our T
     vocab_size_padded: Int,  # Our Vp
@@ -53,8 +53,8 @@ def crossentropy_ohe_fwd_cpu[
     dtype: DType,
 ](
     losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
     batch_size: Int,  # Our B
     seq_len: Int,  # Our T
     vocab_size_padded: Int,  # Our Vp
@@ -97,8 +97,8 @@ def crossentropy_ohe_fwd_gpu[
     dtype: DType,
 ](
     losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
     batch_size: Int,  # Our B
     seq_len: Int,  # Our T
     vocab_size_padded: Int,  # Our Vp
@@ -121,8 +121,8 @@ def crossentropy_ohe_fwd[
     target: StaticString,
 ](
     losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
     batch_size: Int,  # Our B
     seq_len: Int,  # Our T
     vocab_size_padded: Int,  # Our Vp
@@ -141,7 +141,8 @@ def crossentropy_ohe_fwd[
         comptime BLOCK_SIZE = 256
         var dev_ctx = ctx.get_device_context()
         # Each thread handles the a batch_size * seq_len element. Unlike our adamw op that also handles width elements.
-        var num_threads = (batch_size * seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        # One GPU thread per (b, t) output — no SIMD width, so num_threads = B*T.
+        var num_threads = batch_size * seq_len
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
         comptime gpu_kernel = crossentropy_ohe_fwd_gpu[dtype]
@@ -163,14 +164,16 @@ def crossentropy_ohe_fwd[
         raise Error("Invalid target")
 
 
-@compliler.register("crossentropy_ohe_fwd")
+@compiler.register("crossentropy_ohe_fwd")
 struct CrossEntropyOHEFwd:
     @staticmethod
     def execute[
         dtype: DType,
         target: StaticString,
     ](
-        losses: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
+        losses: MutableInputTensor[
+            dtype=DType.float32, rank=1, static_spec=...
+        ],
         probs: InputTensor[dtype=dtype, rank=1, static_spec=...],
         targets: InputTensor[dtype=DType.int32, rank=1, static_spec=...],
         batch_size: Int,  # Our B
@@ -211,13 +214,13 @@ def _crossentropy_ohe_bwd[
     dtype: DType,
 ](
     idx: Int,
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
     batch_size: Int,  # Our B
     seq_len: Int,  # Our T
-    vocab_size: Int,  # Our V
+    vocab_size_padded: Int,  # Our Vp — only used as row stride here
 ) -> None:
     var target_idx = Int(targets_ptr[idx])
     var prob = probs_ptr[idx * vocab_size_padded + target_idx].cast[
@@ -231,10 +234,10 @@ def _crossentropy_ohe_bwd[
 def crossentropy_ohe_bwd_cpu[
     dtype: DType,
 ](
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
     batch_size: Int,  # Our B
     seq_len: Int,  # Our T
     vocab_size_padded: Int,  # Our Vp
@@ -266,10 +269,10 @@ def crossentropy_ohe_bwd_cpu[
 def crossentropy_ohe_bwd_gpu[
     dtype: DType,
 ](
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
     batch_size: Int,  # Our B
     seq_len: Int,  # Our T
     vocab_size_padded: Int,  # Our Vp
@@ -292,13 +295,14 @@ def crossentropy_ohe_bwd[
     dtype: DType,
     target: StaticString,
 ](
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
     batch_size: Int,  # Our B
     seq_len: Int,  # Our T
     vocab_size_padded: Int,  # Our Vp
+    ctx: DeviceContextPtr,
 ) capturing raises:
     comptime if is_cpu[target]():
         crossentropy_ohe_bwd_cpu[dtype](
@@ -314,7 +318,8 @@ def crossentropy_ohe_bwd[
         # Duplicated gpu dispatch code from the fwd op.
         comptime BLOCK_SIZE = 256
         var dev_ctx = ctx.get_device_context()
-        var num_threads = (batch_size * seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        # One GPU thread per (b, t) output — no SIMD width, so num_threads = B*T.
+        var num_threads = batch_size * seq_len
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
         comptime gpu_kernel = crossentropy_ohe_bwd_gpu[dtype]
         var compiled = dev_ctx.compile_function[
@@ -336,16 +341,14 @@ def crossentropy_ohe_bwd[
         raise Error("Invalid target")
 
 
-@compliler.register("crossentropy_ohe_bwd")
+@compiler.register("crossentropy_ohe_bwd")
 struct CrossEntropyOHEBwd:
     @staticmethod
     def execute[
         dtype: DType,
         target: StaticString,
     ](
-        d_losses: MutableInputTensor[
-            dtype=DType.float32, rank=1, static_spec=...
-        ],
+        d_losses: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
         d_probs: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
         probs: InputTensor[dtype=dtype, rank=1, static_spec=...],
         targets: InputTensor[dtype=DType.int32, rank=1, static_spec=...],
