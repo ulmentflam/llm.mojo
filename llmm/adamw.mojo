@@ -4,7 +4,7 @@ from std.sys import simd_width_of
 from std.memory import UnsafePointer
 from std.math import fma, sqrt, ceildiv
 from std.gpu.host.info import is_cpu, is_gpu
-from runtime.asyncrt import DeviceContextPtr
+from std.runtime.asyncrt import DeviceContextPtr
 from std.gpu import block_dim, block_idx, thread_idx
 from std.algorithm import vectorize, sync_parallelize
 from tensor.managed_tensor_slice import (
@@ -13,11 +13,11 @@ from tensor.managed_tensor_slice import (
 
 
 # ===----------------------------------------------------------------------=== #
-# Constants and Type Aliases
+# Constants and Comptime Variables
 # ===----------------------------------------------------------------------=== #
 
-alias CHUNK_SIZE = 4096
-alias UNROLL = 4
+comptime CHUNK_SIZE = 4096
+comptime UNROLL = 4
 
 
 # ===----------------------------------------------------------------------=== #
@@ -25,13 +25,26 @@ alias UNROLL = 4
 # ===----------------------------------------------------------------------=== #
 
 
+# NOTE: If we reuse this function, we can move it to a shared file.
+@always_inline
 def lerp[
-    dtype: DType, out_dtype: DType
+    start_dtype: DType,
+    end_dtype: DType,
+    weight_dtype: DType,
+    width: Int,
 ](
-    start: Scalar[dtype], end: Scalar[out_dtype], weight: Scalar[dtype]
-) -> Scalar[out_dtype]:
-    var w = Scalar[out_dtype](weight)
-    var s = Scalar[out_dtype](start)
+    start: SIMD[start_dtype, width],
+    end: SIMD[end_dtype, width],
+    weight: SIMD[weight_dtype, 1],
+) -> SIMD[end_dtype, width]:
+    """Linear interpolation: (1 - weight) * start + weight * end.
+
+    Inputs are cast to `end_dtype` (the accumulator) and `weight` is broadcast
+    to full width, so callers can pass mixed-precision values
+    (e.g., bf16 grad + fp32 moment + bf16 beta) without having to cast.
+    """
+    var s = start.cast[end_dtype]()
+    var w = SIMD[end_dtype, width](weight.cast[end_dtype]())
     return fma(w, end, fma(-w, s, s))
 
 
@@ -69,26 +82,21 @@ def _adamw_update[
     var m = (m_ptr + idx).load[width=width]()
     var v = (v_ptr + idx).load[width=width]()
 
-    # First moment (momentum).
-    # Kept in Float32 to avoid precision loss.
+    # First moment (momentum). Kept in Float32 to avoid precision loss.
+    # `grad` is cast once to fp32 so squaring (for v) doesn't over/underflow
+    # in low-precision dtypes; lerp handles the beta cast internally.
     var grad_fp32 = grad.cast[DType.float32]()
-    var beta1_fp32 = Scalar[DType.float32](config.beta1)
-    m = beta1_fp32 * m + (Scalar[DType.float32](1) - beta1_fp32) * grad_fp32
+    m = lerp(grad_fp32, m, config.beta1)
     (m_ptr + idx).store[width=width](m)
     m *= beta1_correction
 
-    # Second moment (RMSProp).
-    # Also kept in Float32 to avoid precision loss.
-    var beta2_fp32 = Scalar[DType.float32](config.beta2)
-    v = beta2_fp32 * v + (Scalar[DType.float32](1) - beta2_fp32) * (
-        grad_fp32 * grad_fp32
-    )
+    # Second moment (RMSProp). Also kept in Float32 to avoid precision loss.
+    v = lerp(grad_fp32 * grad_fp32, v, config.beta2)
     (v_ptr + idx).store[width=width](v)
     v *= beta2_correction
 
     # Decoupled weight decay update (this is what distinguishes AdamW from Adam).
-    var eps_fp32 = Scalar[DType.float32](config.eps)
-    var step_fp32 = m / (sqrt(v) + eps_fp32)
+    var step_fp32 = m / (sqrt(v) + config.eps.cast[DType.float32]())
     var step = step_fp32.cast[dtype]()
     param -= config.learning_rate * (step + config.weight_decay * param)
     # TODO: Karpathy adds a stochastic rounding function here for low-precision params.
@@ -115,8 +123,19 @@ def adamw_update_cpu[
         var base = c * CHUNK_SIZE
         var count = min(CHUNK_SIZE, num_params - base)
 
-        @parameter
-        def _simd[w: Int](local: Int):
+        @always_inline
+        def _simd[
+            w: Int
+        ](local: Int) {
+            params_ptr,
+            grads_ptr,
+            m_ptr,
+            v_ptr,
+            config,
+            beta1_correction,
+            beta2_correction,
+            base,
+        }:
             var idx = base + local
             _adamw_update[dtype, w](
                 idx,
@@ -129,29 +148,7 @@ def adamw_update_cpu[
                 beta2_correction,
             )
 
-        # TODO: Mojo 1.0.0b1 vectorize requires its closure to be typed
-        # `def[w: Int](idx: Int) unified -> None`, but the `unified` function
-        # effect isn't recognized in this beta. Until `unified` ships,
-        # we emulate vectorize's main-loop + scalar-tail dispatch by hand.
-        #
-        # When `unified` lands:
-        #   1. Convert `_simd` from `@parameter def` to:
-        #          @always_inline
-        #          def _simd[w: Int](local: Int) unified {
-        #              params_ptr, grads_ptr, mut m_ptr, mut v_ptr,
-        #              config, beta1_correction, beta2_correction, base,
-        #          }: _adamw_update[dtype, w](...)
-        #   2. Replace the manual main-loop + tail below with one line:
-        #          vectorize[width, unroll_factor=UNROLL](count, _simd)
-        var simd_end = count - (count % width)
-        var local = 0
-        while local < simd_end:
-            _simd[width](local)
-            local += width
-        for tail in range(simd_end, count):
-            _simd[1](tail)
-        # TODO: Replace above with
-        # vectorize[width, unroll_factor=UNROLL](count, _simd)
+        vectorize[width, unroll_factor=UNROLL](count, _simd)
 
     sync_parallelize[_chunk](num_chunks)
 
@@ -236,9 +233,8 @@ def adamw_update[
         Scalar[DType.float32](1) - beta2_fp32**t_fp32
     )
 
-    @parameter
-    if is_cpu[target]():
-        alias simd_width = simd_width_of[dtype]()
+    comptime if is_cpu[target]():
+        comptime simd_width = simd_width_of[dtype]()
         adamw_update_cpu[dtype, simd_width](
             num_params,
             params_ptr,
@@ -250,14 +246,14 @@ def adamw_update[
             beta2_correction,
         )
     elif is_gpu[target]():
-        alias BLOCK_SIZE = 256
+        comptime BLOCK_SIZE = 256
         var dev_ctx = ctx.get_device_context()
         # Each thread handles `width` elements, so the total thread count is
         # ceil(n / width) and the grid is ceil(num_threads / BLOCK_SIZE).
         var num_threads = (num_params + width - 1) // width
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
-        alias gpu_kernel = adamw_update_gpu[dtype, width]
+        comptime gpu_kernel = adamw_update_gpu[dtype, width]
         var compiled = dev_ctx.compile_function[
             func=gpu_kernel, signature_func=gpu_kernel
         ]()

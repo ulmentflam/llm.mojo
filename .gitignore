@@ -8,6 +8,9 @@ data/.*/
 # Model artifacts (regenerable via `python train_gpt2.py --write_tensors`)
 *.bin
 
+# Generated test fixtures (rebuild with `make test-fixtures`)
+tests/fixtures/
+
 # ---------- macOS ----------
 .DS_Store
 .AppleDouble

@@ -5,7 +5,8 @@ CUDA_SOURCES := $(shell find . \( -name '*.cu' -o -name '*.cuh' \) -not -path '.
 
 .PHONY: help lint lint-python lint-mojo lint-c lint-cuda \
         format format-python format-mojo format-c format-cuda \
-        typecheck check clean
+        typecheck check clean build-mojo \
+        test test-python test-mojo test-fixtures
 
 .DEFAULT_GOAL := help
 
@@ -26,9 +27,23 @@ help:
 	@echo "  format-c      Format C sources with clang-format"
 	@echo "  format-cuda   Format CUDA sources with clang-format"
 	@echo "  typecheck     Type-check Python sources with pyrefly"
+	@echo "  build-mojo    Compile the llmm package; surfaces Mojo warnings and parse errors"
+	@echo "  test          Run Mojo + Python test suites"
+	@echo "  test-mojo     Run pure-Mojo unit tests with mojo test"
+	@echo "  test-python   Run pytest equivalence + property tests"
+	@echo "  test-fixtures Regenerate tests/fixtures/*.npz from PyTorch reference"
 	@echo "  clean         Remove cache directories"
 
-check: lint typecheck
+check: lint typecheck build-mojo
+
+build-mojo:
+	@if [ -d llmm ]; then \
+		tmpdir=$$(mktemp -d); \
+		trap "rm -rf $$tmpdir" EXIT; \
+		pixi run mojo package llmm -o "$$tmpdir/llmm.mojopkg"; \
+	else \
+		echo "No llmm package found, skipping mojo build."; \
+	fi
 
 lint: lint-python lint-mojo lint-c lint-cuda
 
@@ -115,5 +130,25 @@ typecheck:
 		echo "No .py files found, skipping python typecheck."; \
 	fi
 
+test: test-mojo test-python
+
+test-mojo:
+	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
+		fail=0; \
+		for f in tests/test_*.mojo; do \
+			echo "==> $$f"; \
+			pixi run mojo run -I . "$$f" || fail=1; \
+		done; \
+		exit $$fail; \
+	else \
+		echo "No mojo tests found, skipping."; \
+	fi
+
+test-python:
+	pixi run pytest tests/ -v
+
+test-fixtures:
+	pixi run python -m tests.reference dump
+
 clean:
-	rm -rf .ruff_cache .pyrefly_cache
+	rm -rf .ruff_cache .pyrefly_cache tests/fixtures
