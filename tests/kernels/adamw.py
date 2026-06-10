@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from tests._max_bridge import ConstScalar, MutableBuf, ReadTensor, run_custom_op
+from tests._max_bridge import MutableBuf, ReadTensor, ScalarArg, run_custom_op
 
 if TYPE_CHECKING:
     from max.driver import Device
@@ -42,14 +42,14 @@ def step(
             MutableBuf(params, dtype_name),
             MutableBuf(m, "float32"),
             MutableBuf(v, "float32"),
-            ConstScalar(int(t), "uint32"),
+            ScalarArg(int(t), "uint32"),
             ReadTensor(grads, dtype_name),
-            ConstScalar(hp.lr, dtype_name),
-            ConstScalar(hp.beta1, dtype_name),
-            ConstScalar(hp.beta2, dtype_name),
-            ConstScalar(hp.eps, dtype_name),
-            ConstScalar(hp.weight_decay, dtype_name),
-            ConstScalar(hp.grad_scale, dtype_name),
+            ScalarArg(hp.lr, dtype_name),
+            ScalarArg(hp.beta1, dtype_name),
+            ScalarArg(hp.beta2, dtype_name),
+            ScalarArg(hp.eps, dtype_name),
+            ScalarArg(hp.weight_decay, dtype_name),
+            ScalarArg(hp.grad_scale, dtype_name),
         ],
         device=device,
     )
