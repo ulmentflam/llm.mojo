@@ -21,6 +21,8 @@ from typing import Iterable
 import numpy as np
 import torch
 
+from tests._dtypes import NP_STORAGE_DTYPES, TORCH_DTYPES, to_storage
+
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -52,20 +54,12 @@ class Case:
 
     @property
     def torch_dtype(self) -> torch.dtype:
-        return {
-            "float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-        }[self.dtype]
+        return TORCH_DTYPES[self.dtype]
 
     @property
     def np_dtype(self) -> np.dtype:
-        # bfloat16 has no numpy dtype — store as uint16 view alongside an fp32 copy.
-        return {
-            "float32": np.dtype("float32"),
-            "bfloat16": np.dtype("uint16"),
-            "float16": np.dtype("float16"),
-        }[self.dtype]
+        # bfloat16 has no numpy dtype — stored as a uint16 view (see tests/_dtypes.py).
+        return NP_STORAGE_DTYPES[self.dtype]
 
 
 # Default catalogue. Add cases here as the optimizer grows new code paths.
@@ -151,10 +145,7 @@ def simulate(case: Case) -> dict[str, np.ndarray]:
 
 
 def _to_storable(t: torch.Tensor, case: Case) -> np.ndarray:
-    """numpy has no bfloat16 — round-trip through uint16 view for storage."""
-    if case.dtype == "bfloat16":
-        return t.to(torch.bfloat16).view(torch.uint16).cpu().numpy()
-    return t.to(case.torch_dtype).cpu().numpy()
+    return to_storage(t.detach().to(torch.float32).cpu().numpy(), case.dtype)
 
 
 def dump(cases: Iterable[Case] = CASES, out_dir: Path = FIXTURES_DIR) -> None:

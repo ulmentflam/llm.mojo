@@ -32,9 +32,9 @@ def _crossentropy_ohe_fwd[
     losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    batch_size: Int,  # Our B
-    seq_len: Int,  # Our T
-    vocab_size_padded: Int,  # Our Vp
+    batch_size: Int64,  # Our B
+    seq_len: Int64,  # Our T
+    vocab_size_padded: Int64,  # Our Vp
 ) -> None:
     # Load the target at the current index as an int64 which is the index of the target token in the vocabulary.
     var target_idx = Int(targets_ptr[idx])
@@ -42,7 +42,9 @@ def _crossentropy_ohe_fwd[
     # This is equal to setting the pointer offset to b * T * Vp + t * Vp in the iterative loop.
     # This is because you can arrange it as Vp * (b * T + t) which in our thread parallized loop is equal to idx
     # Then when we look at the target_idx, we are just adding that as the offset. (Similar to the ptr arithmitc aboe)
-    var prob = probs_ptr[idx * vocab_size_padded + target_idx].cast[
+    # Int(vocab_size_padded) is load-bearing: without it the offset math
+    # falls back to a deprecated implicit Int -> Int64 conversion.
+    var prob = probs_ptr[idx * Int(vocab_size_padded) + target_idx].cast[
         DType.float32
     ]()
     # Store the log of the probability to the losses pointer.
@@ -55,21 +57,21 @@ def crossentropy_ohe_fwd_cpu[
     losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    batch_size: Int,  # Our B
-    seq_len: Int,  # Our T
-    vocab_size_padded: Int,  # Our Vp
+    batch_size: Int64,  # Our B
+    seq_len: Int64,  # Our T
+    vocab_size_padded: Int64,  # Our Vp
 ) -> None:
     # NOTE: This function is uniquely different from the standard cross-entropu loss calculation.
     # Instead of neeeding to sum over the full vocabulary, we can just use the one-hot nature of
     # the probabilities to calculate the loss of the targets where softmax is 1.0 and the rest are 0.0.
     # This means we can calculate the loss in a single vectorized operation
 
-    var num_chunks = (batch_size * seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
+    var num_chunks = Int((batch_size * seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE)
 
     @parameter
     def _chunk(c: Int):
         var base = c * CHUNK_SIZE
-        var total = batch_size * seq_len  # Our B * T
+        var total = Int(batch_size * seq_len)  # Our B * T
         var count = min(
             CHUNK_SIZE, total - base
         )  # Used to count our local iterator for this thread.
@@ -99,12 +101,12 @@ def crossentropy_ohe_fwd_gpu[
     losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    batch_size: Int,  # Our B
-    seq_len: Int,  # Our T
-    vocab_size_padded: Int,  # Our Vp
+    batch_size: Int64,  # Our B
+    seq_len: Int64,  # Our T
+    vocab_size_padded: Int64,  # Our Vp
 ) -> None:
-    var idx = block_idx.x * block_dim.x + thread_idx.x
-    if idx < batch_size * seq_len:
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if idx < Int(batch_size * seq_len):
         _crossentropy_ohe_fwd[dtype](
             idx,
             losses_ptr,
@@ -123,9 +125,9 @@ def crossentropy_ohe_fwd[
     losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    batch_size: Int,  # Our B
-    seq_len: Int,  # Our T
-    vocab_size_padded: Int,  # Our Vp
+    batch_size: Int64,  # Our B
+    seq_len: Int64,  # Our T
+    vocab_size_padded: Int64,  # Our Vp
     ctx: DeviceContextPtr,
 ) capturing raises:
     comptime if is_cpu[target]():
@@ -142,7 +144,7 @@ def crossentropy_ohe_fwd[
         var dev_ctx = ctx.get_device_context()
         # Each thread handles the a batch_size * seq_len element. Unlike our adamw op that also handles width elements.
         # One GPU thread per (b, t) output — no SIMD width, so num_threads = B*T.
-        var num_threads = batch_size * seq_len
+        var num_threads = Int(batch_size * seq_len)
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
         comptime gpu_kernel = crossentropy_ohe_fwd_gpu[dtype]
@@ -176,21 +178,23 @@ struct CrossEntropyOHEFwd:
         ],
         probs: InputTensor[dtype=dtype, rank=1, static_spec=...],
         targets: InputTensor[dtype=DType.int32, rank=1, static_spec=...],
-        batch_size: Int,  # Our B
-        seq_len: Int,  # Our T
-        vocab_size_padded: Int,  # Our Vp
+        # MAX binds runtime scalars to Scalar[...] params only (a plain Int
+        # is rejected at graph load), hence Int64 shape args.
+        batch_size: Int64,  # Our B
+        seq_len: Int64,  # Our T
+        vocab_size_padded: Int64,  # Our Vp
         ctx: DeviceContextPtr,
     ) capturing raises:
-        if losses.size() != batch_size * seq_len:
+        if losses.size() != Int(batch_size * seq_len):
             raise Error(
                 "losses must have the same size as batch_size * seq_len"
             )
-        if probs.size() != batch_size * seq_len * vocab_size_padded:
+        if probs.size() != Int(batch_size * seq_len * vocab_size_padded):
             raise Error(
                 "probs must have the same size as batch_size * seq_len *"
                 " vocab_size_padded"
             )
-        if targets.size() != batch_size * seq_len:
+        if targets.size() != Int(batch_size * seq_len):
             raise Error(
                 "targets must have the same size as batch_size * seq_len"
             )
@@ -218,17 +222,16 @@ def _crossentropy_ohe_bwd[
     d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    batch_size: Int,  # Our B
-    seq_len: Int,  # Our T
-    vocab_size_padded: Int,  # Our Vp — only used as row stride here
+    batch_size: Int64,  # Our B
+    seq_len: Int64,  # Our T
+    vocab_size_padded: Int64,  # Our Vp — only used as row stride here
 ) -> None:
     var target_idx = Int(targets_ptr[idx])
-    var prob = probs_ptr[idx * vocab_size_padded + target_idx].cast[
-        DType.float32
-    ]()
+    var target_offset = idx * Int(vocab_size_padded) + target_idx
+    var prob = probs_ptr[target_offset].cast[DType.float32]()
     var d_loss = d_losses_ptr[idx].cast[DType.float32]()
     var d_prob = -d_loss / prob
-    d_probs_ptr[idx * vocab_size_padded + target_idx] = d_prob.cast[dtype]()
+    d_probs_ptr[target_offset] = d_prob.cast[dtype]()
 
 
 def crossentropy_ohe_bwd_cpu[
@@ -238,16 +241,16 @@ def crossentropy_ohe_bwd_cpu[
     d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    batch_size: Int,  # Our B
-    seq_len: Int,  # Our T
-    vocab_size_padded: Int,  # Our Vp
+    batch_size: Int64,  # Our B
+    seq_len: Int64,  # Our T
+    vocab_size_padded: Int64,  # Our Vp
 ) -> None:
-    var num_chunks = (batch_size * seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
+    var num_chunks = Int((batch_size * seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE)
 
     @parameter
     def _chunk(c: Int):
         var base = c * CHUNK_SIZE
-        var total = batch_size * seq_len
+        var total = Int(batch_size * seq_len)
         var count = min(CHUNK_SIZE, total - base)
 
         for local in range(count):
@@ -273,12 +276,12 @@ def crossentropy_ohe_bwd_gpu[
     d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    batch_size: Int,  # Our B
-    seq_len: Int,  # Our T
-    vocab_size_padded: Int,  # Our Vp
+    batch_size: Int64,  # Our B
+    seq_len: Int64,  # Our T
+    vocab_size_padded: Int64,  # Our Vp
 ) -> None:
-    var idx = block_idx.x * block_dim.x + thread_idx.x
-    if idx < batch_size * seq_len:
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if idx < Int(batch_size * seq_len):
         _crossentropy_ohe_bwd[dtype](
             idx,
             d_losses_ptr,
@@ -299,9 +302,9 @@ def crossentropy_ohe_bwd[
     d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    batch_size: Int,  # Our B
-    seq_len: Int,  # Our T
-    vocab_size_padded: Int,  # Our Vp
+    batch_size: Int64,  # Our B
+    seq_len: Int64,  # Our T
+    vocab_size_padded: Int64,  # Our Vp
     ctx: DeviceContextPtr,
 ) capturing raises:
     comptime if is_cpu[target]():
@@ -319,7 +322,7 @@ def crossentropy_ohe_bwd[
         comptime BLOCK_SIZE = 256
         var dev_ctx = ctx.get_device_context()
         # One GPU thread per (b, t) output — no SIMD width, so num_threads = B*T.
-        var num_threads = batch_size * seq_len
+        var num_threads = Int(batch_size * seq_len)
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
         comptime gpu_kernel = crossentropy_ohe_bwd_gpu[dtype]
         var compiled = dev_ctx.compile_function[
@@ -352,26 +355,28 @@ struct CrossEntropyOHEBwd:
         d_probs: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
         probs: InputTensor[dtype=dtype, rank=1, static_spec=...],
         targets: InputTensor[dtype=DType.int32, rank=1, static_spec=...],
-        batch_size: Int,  # Our B
-        seq_len: Int,  # Our T
-        vocab_size_padded: Int,  # Our Vp
+        # MAX binds runtime scalars to Scalar[...] params only (a plain Int
+        # is rejected at graph load), hence Int64 shape args.
+        batch_size: Int64,  # Our B
+        seq_len: Int64,  # Our T
+        vocab_size_padded: Int64,  # Our Vp
         ctx: DeviceContextPtr,
     ) capturing raises:
-        if d_losses.size() != batch_size * seq_len:
+        if d_losses.size() != Int(batch_size * seq_len):
             raise Error(
                 "d_losses must have the same size as batch_size * seq_len"
             )
-        if d_probs.size() != batch_size * seq_len * vocab_size_padded:
+        if d_probs.size() != Int(batch_size * seq_len * vocab_size_padded):
             raise Error(
                 "d_probs must have the same size as batch_size * seq_len *"
                 " vocab_size_padded"
             )
-        if probs.size() != batch_size * seq_len * vocab_size_padded:
+        if probs.size() != Int(batch_size * seq_len * vocab_size_padded):
             raise Error(
                 "probs must have the same size as batch_size * seq_len *"
                 " vocab_size_padded"
             )
-        if targets.size() != batch_size * seq_len:
+        if targets.size() != Int(batch_size * seq_len):
             raise Error(
                 "targets must have the same size as batch_size * seq_len"
             )

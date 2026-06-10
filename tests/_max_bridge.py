@@ -89,7 +89,7 @@ class ScalarArg:
     hyperparameter sweep reuses one compiled model."""
 
     value: Union[int, float]
-    dtype_name: str  # "float32" | "bfloat16" | "float16" | "uint32"
+    dtype_name: str  # "float32" | "bfloat16" | "float16" | "uint32" | "int32" | "int64"
 
 
 KernelArg = Union[MutableBuf, ReadTensor, ScalarArg]
@@ -103,6 +103,8 @@ def max_dtype(name: str):
         "bfloat16": DType.bfloat16,
         "float16": DType.float16,
         "uint32": DType.uint32,
+        "int32": DType.int32,
+        "int64": DType.int64,
     }[name]
 
 
@@ -266,6 +268,8 @@ def _scalar_buffer(value: Union[int, float], dtype_name: str):
         "float32": np.float32,
         "float16": np.float16,
         "uint32": np.uint32,
+        "int32": np.int32,
+        "int64": np.int64,
     }[dtype_name]
     return Buffer.from_numpy(np.array(value, dtype=np_dtype))
 

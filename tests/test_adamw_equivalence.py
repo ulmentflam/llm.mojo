@@ -11,17 +11,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tests.conftest import DTYPE_TOLERANCES
+from tests._dtypes import DTYPE_TOLERANCES, from_storage
 from tests.kernels import adamw
 from tests.reference import CASES, Case, simulate
-
-
-def _bf16_to_fp32(arr: np.ndarray, dtype_name: str) -> np.ndarray:
-    if dtype_name != "bfloat16":
-        return arr.astype(np.float32)
-    import torch
-
-    return torch.from_numpy(arr).view(torch.bfloat16).to(torch.float32).numpy()
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
@@ -48,7 +40,7 @@ def test_matches_torch_trajectory(case: Case):
         )
 
         expected = ref["trajectory"][step]
-        got = _bf16_to_fp32(out.params, case.dtype)
+        got = from_storage(out.params, case.dtype)
         max_abs = float(np.max(np.abs(got - expected)))
         assert max_abs <= tol["atol"] + tol["rtol"] * float(np.max(np.abs(expected))), (
             f"{case.name} diverged at step {step + 1}: "

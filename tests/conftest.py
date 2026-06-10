@@ -1,19 +1,14 @@
-"""pytest fixtures + tolerances shared across the AdamW test suite."""
+"""pytest fixtures shared across the kernel test suite.
+
+Dtype maps, storage conversions, and comparison tolerances live in
+`tests/_dtypes.py` — import from there, not from conftest.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
-
-# Per-dtype tolerances for max-abs-diff against the PyTorch reference.
-# These start conservative — tighten as the kernel matures. Loosen only with
-# a written rationale (the looser the tolerance, the less the test catches).
-DTYPE_TOLERANCES: dict[str, dict[str, float]] = {
-    "float32": {"atol": 1e-6, "rtol": 1e-5},
-    "float16": {"atol": 1e-3, "rtol": 1e-2},
-    "bfloat16": {"atol": 5e-3, "rtol": 2e-2},
-}
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
