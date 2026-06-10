@@ -1,0 +1,2 @@
+# latexindent settings for docs/*.tex (used by make format-latex / lint-latex)
+defaultIndent: "  "

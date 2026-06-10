@@ -1,0 +1,344 @@
+% =============================================================================
+% The Mathematics of Backpropagation
+%
+% Companion notes to llm.mojo: one section per op in the GPT-2 forward pass,
+% in llm.c order. Each section states the forward computation (the anchor),
+% then leaves a Derivation block to work the backward pass by hand, and a
+% Result block to record the final gradient(s) once derived.
+%
+% Build:  make docs                      (from the repo root)
+%         latexmk -pdf backprop.tex      (from docs/, equivalent)
+% =============================================================================
+\documentclass[journal]{IEEEtran}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage[colorlinks=true, linkcolor=blue!50!black]{hyperref}
+
+% -----------------------------------------------------------------------------
+% Macros
+% -----------------------------------------------------------------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+
+% Partial and total derivatives: \pdv{f}{x}, \dv{f}{x}
+\newcommand{\pdv}[2]{\frac{\partial #1}{\partial #2}}
+\newcommand{\dv}[2]{\frac{\mathrm{d} #1}{\mathrm{d} #2}}
+
+% Upstream gradient of the loss w.r.t. a tensor: \dL{x} renders dL/dx.
+% This is the quantity every backward kernel receives or produces.
+\newcommand{\dL}[1]{\pdv{L}{#1}}
+
+% One-hot indicator and Kronecker delta
+\newcommand{\ind}[1]{\mathbb{1}\!\left[#1\right]}
+\newcommand{\kron}[2]{\delta_{#1 #2}}
+
+% softmax / layernorm / gelu as upright operators
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\layernorm}{layernorm}
+\DeclareMathOperator{\gelu}{GELU}
+\DeclareMathOperator{\erf}{erf}
+
+% Workspace marker for unfinished derivations
+\newcommand{\TODO}[1]{\textcolor{red!70!black}{\textbf{TODO:} #1}}
+
+% Derivation / Result blocks
+\theoremstyle{definition}
+\newtheorem*{derivation}{Derivation}
+\newtheorem*{result}{Result}
+
+\title{The Mathematics of Backpropagation:\\
+       Companion Derivations for \texttt{llm.mojo}}
+\author{Evan~Owen}
+\markboth{The Mathematics of Backpropagation}{Owen}
+
+% =============================================================================
+\begin{document}
+\maketitle
+
+\begin{abstract}
+  Working derivations of the backward pass for every operation in the GPT-2
+  forward pass, as implemented by the \texttt{llm.mojo} kernels. Sections are
+  ordered by backward-derivation pedagogy---starting from the scalar loss and
+  working toward the inputs---rather than by \texttt{llm.c} forward order, so
+  that each gradient is derived only after the one it depends on. Each section
+  anchors on the forward computation and leaves the derivation as structured
+  workspace.
+\end{abstract}
+
+\tableofcontents
+
+% =============================================================================
+\section{Notation and Conventions}\label{sec:notation}
+
+Shapes follow the kernel code, as collected in Table~\ref{tab:notation}.
+
+\begin{table*}[t]
+  \centering
+  \caption{Symbols and their corresponding kernel parameters.}
+  \label{tab:notation}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    Symbol & Code                         & Meaning                              \\
+    \midrule
+    $B$    & \texttt{batch\_size}         & batch size                           \\
+    $T$    & \texttt{seq\_len}            & sequence length                      \\
+    $C$    & \texttt{channels}            & model width (embedding dim)          \\
+    $V$    & \texttt{vocab\_size}         & real vocabulary size                 \\
+    $V_p$  & \texttt{vocab\_size\_padded} & padded vocabulary (row stride)       \\
+    $H$    & \texttt{num\_heads}          & attention heads, head size $h = C/H$ \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+Indices: $b$ over batch, $t$ over positions, $i, j, k$ over channels or vocab
+entries. A row of activations at one position is $x_{bt} \in \R^{C}$.
+
+\paragraph{The backward convention.}
+Every op receives the upstream gradient $\dL{y}$ of the scalar loss $L$ with
+respect to its output $y$, and must produce $\dL{x}$ for each input $x$ (and
+$\dL{w}$ for each parameter) via the chain rule
+\begin{equation}
+  \dL{x_i} \;=\; \sum_j \dL{y_j}\,\pdv{y_j}{x_i}.
+  \label{eq:chain}
+\end{equation}
+Gradients into shared inputs \emph{accumulate} ($\mathrel{+}=$) because a
+tensor used by several consumers receives a contribution from each.
+
+\paragraph{Reading order.}
+The forward pass runs encoder $\to$ layernorm $\to$ attention $\to$ matmul
+$\to$ GELU $\to$ softmax $\to$ cross-entropy. The sections below instead
+follow the order in which gradients are \emph{derived}: starting at the loss
+(\S\ref{sec:crossentropy}) and moving back toward the embeddings
+(\S\ref{sec:encoder}), each op reusing the upstream gradient established by
+the section before it. \S\ref{sec:full} then reassembles these pieces into
+the end-to-end backward pass.
+
+\TODO{Decide and record: numerator vs.\ denominator layout, and where
+  transposes land in the matmul gradients as a consequence.}
+
+% =============================================================================
+\section{Warm-up: Scalar Chain Rule on a Tiny Network}\label{sec:warmup}
+
+A two-step composition to fix conventions before the tensor ops:
+$z = wx + b$, $a = \sigma(z)$, $L = \tfrac{1}{2}(a - y)^2$.
+
+\begin{derivation}
+  Backward through the loss, then the sigmoid:
+  \begin{align}
+    \dL{a}     & = a - y                                                              \\
+    \dL{z}     & = \dL{a} \cdot \pdv{a}{z}                                            \\
+    \pdv{a}{z} & = \sigma(z) \cdot (1-\sigma(z))
+    \intertext{and since $a = \sigma(z)$,}
+    \dL{z}     & = (a - y) \cdot \pdv{a}{z} = (a - y) \cdot a \cdot (1-a).
+    \intertext{For the weight:}
+    \dL{w}     & = \dL{a} \cdot \pdv{a}{z} \cdot \pdv{z}{w} = \dL{z} \cdot \pdv{z}{w} \\
+    \pdv{z}{w} & = x                                                                  \\
+    \dL{w}     & = \dL{z} \cdot x = (a - y) \cdot a \cdot (1-a) \cdot x.
+    \intertext{For the bias:}
+    \dL{b}     & = \dL{a} \cdot \pdv{a}{z} \cdot \pdv{z}{b} = \dL{z} \cdot \pdv{z}{b} \\
+    \pdv{z}{b} & = 1                                                                  \\
+    \dL{b}     & = \dL{z} = (a - y) \cdot a \cdot (1-a).
+    \intertext{For the input:}
+    \dL{x}     & = \dL{a} \cdot \pdv{a}{z} \cdot \pdv{z}{x} = \dL{z} \cdot \pdv{z}{x} \\
+    \pdv{z}{x} & = w                                                                  \\
+    \dL{x}     & = \dL{z} \cdot w = (a - y) \cdot a \cdot (1-a) \cdot w.
+  \end{align}
+\end{derivation}
+
+\begin{result}
+  One chain back through the network, fanning out at the affine inputs:
+  \begin{equation}
+    \dL{a} \;\to\; \dL{z} \;\to\; \Bigl\{\dL{w},\; \dL{b},\; \dL{x}\Bigr\}
+  \end{equation}
+  with $\dL{z} = (a - y) \cdot a \cdot (1-a)$ computed once and reused:
+  $\dL{w} = \dL{z} \cdot x$, \quad $\dL{b} = \dL{z}$, \quad
+  $\dL{x} = \dL{z} \cdot w$.
+\end{result}
+
+% =============================================================================
+\section{Cross-Entropy Loss}\label{sec:crossentropy}
+
+Forward (\texttt{crossentropy\_ohe\_fwd}): given probabilities
+$p_{bt} \in \R^{V_p}$ and a target token $y_{bt} \in \{0,\dots,V-1\}$,
+\begin{equation}
+  L_{bt} \;=\; -\log p_{bt,\,y_{bt}}.
+  \label{eq:ce-fwd}
+\end{equation}
+The one-hot structure means only the target column participates.
+
+\subsection{Backward w.r.t.\ the probabilities}
+
+\begin{derivation}
+  \TODO{Differentiate \eqref{eq:ce-fwd} w.r.t.\ $p_{bt,i}$; note which
+    entries of $\dL{p_{bt}}$ are nonzero and compare against the
+    assign-only-the-target-column behavior of \texttt{crossentropy\_ohe\_bwd}.}
+\end{derivation}
+
+\begin{result}
+  \TODO{$\dL{p_{bt,i}} = \;?$}
+\end{result}
+
+% =============================================================================
+\section{Softmax}\label{sec:softmax}
+
+Forward: from logits $\ell_{bt} \in \R^{V_p}$ (real entries $i < V$),
+\begin{equation}
+  p_{bt,i} \;=\; \frac{e^{\ell_{bt,i} - m_{bt}}}{\sum_{j<V} e^{\ell_{bt,j} - m_{bt}}},
+  \qquad m_{bt} = \max_{j<V} \ell_{bt,j}.
+  \label{eq:softmax-fwd}
+\end{equation}
+
+\subsection{The Jacobian}
+
+\begin{derivation}
+  \TODO{Derive $\pdv{p_i}{\ell_j}$ for $i = j$ and $i \neq j$; show the
+    max-subtraction does not change the derivative.}
+\end{derivation}
+
+\begin{result}
+  \TODO{$\pdv{p_i}{\ell_j} = \;?$ (express with $\kron{i}{j}$).}
+\end{result}
+
+\subsection{Fused softmax + cross-entropy}
+
+The composition is the case that matters for the model: backprop through
+\eqref{eq:ce-fwd} and \eqref{eq:softmax-fwd} together and watch the
+Jacobian collapse.
+
+\begin{derivation}
+  \TODO{Chain the cross-entropy gradient through the softmax Jacobian and
+    simplify to the famous one-liner. This is the math behind the planned
+    fused kernel.}
+\end{derivation}
+
+\begin{result}
+  \TODO{$\dL{\ell_{bt,i}} = \;?$ (and note the padded region $i \geq V$).}
+\end{result}
+
+% =============================================================================
+\section{Linear Layer (Matmul)}\label{sec:matmul}
+
+Forward: $Y = XW^{\top} + b$ with $X \in \R^{(B\cdot T)\times C_{\text{in}}}$,
+$W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, $b \in \R^{C_{\text{out}}}$.
+
+\begin{derivation}
+  \TODO{Derive $\dL{X}$, $\dL{W}$, $\dL{b}$ from \eqref{eq:chain}; check
+    every shape. Note where the reduction over $B\cdot T$ appears.}
+\end{derivation}
+
+\begin{result}
+  \TODO{$\dL{X} = \;?$, \quad $\dL{W} = \;?$, \quad $\dL{b} = \;?$}
+\end{result}
+
+% =============================================================================
+\section{GELU}\label{sec:gelu}
+
+Forward (tanh approximation, as in llm.c):
+\begin{equation}
+  \gelu(x) \;=\; \tfrac{1}{2}\,x\left(1 + \tanh\!\left[\sqrt{2/\pi}\,
+      (x + 0.044715\,x^{3})\right]\right).
+  \label{eq:gelu-fwd}
+\end{equation}
+
+\begin{derivation}
+  \TODO{Differentiate \eqref{eq:gelu-fwd}. Elementwise, so the chain rule is
+    a pointwise product.}
+\end{derivation}
+
+\begin{result}
+  \TODO{$\gelu'(x) = \;?$}
+\end{result}
+
+% =============================================================================
+\section{LayerNorm}\label{sec:layernorm}
+
+Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
+\begin{equation}
+  \begin{aligned}
+    \mu & = \tfrac{1}{C}\sum_i x_i,
+    \qquad
+    \sigma^2 = \tfrac{1}{C}\sum_i (x_i - \mu)^2,                                 \\
+    y_i & = \gamma_i\,\frac{x_i - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \beta_i.
+  \end{aligned}
+  \label{eq:ln-fwd}
+\end{equation}
+
+\begin{derivation}
+  \TODO{The interesting one: $\mu$ and $\sigma^2$ both depend on every
+    $x_j$, so $\pdv{y_i}{x_j}$ has three terms. Work it via
+    $\hat{x}_i = (x_i - \mu)/\sqrt{\sigma^2 + \varepsilon}$.}
+\end{derivation}
+
+\begin{result}
+  \TODO{$\dL{x_j} = \;?$, \quad $\dL{\gamma_i} = \;?$, \quad $\dL{\beta_i} = \;?$}
+\end{result}
+
+% =============================================================================
+\section{Attention}\label{sec:attention}
+
+Forward, per head: $A = \softmax\!\big(QK^{\top}/\sqrt{h} + M\big)$,
+$Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
+
+\begin{derivation}
+  \TODO{Backprop in stages: $\dL{V}$ and $\dL{A}$ from $Y = AV$; then
+    $\dL{(QK^{\top})}$ through the row-wise softmax (reuse
+    \S\ref{sec:softmax}); then $\dL{Q}$, $\dL{K}$. Track $\sqrt{h}$ and the
+    mask.}
+\end{derivation}
+
+\begin{result}
+  \TODO{Gradient for each of $Q$, $K$, $V$.}
+\end{result}
+
+% =============================================================================
+\section{Embeddings (Encoder)}\label{sec:encoder}
+
+Forward: $x_{bt} = W_{E}[\,\mathrm{tok}_{bt}\,] + W_{P}[\,t\,]$.
+
+\begin{derivation}
+  \TODO{Gradients of a gather are a scatter-add; multiple $(b,t)$ hitting
+    the same token row accumulate. Connect to the $\mathrel{+}=$ convention
+    of \S\ref{sec:notation}.}
+\end{derivation}
+
+\begin{result}
+  \TODO{$\dL{W_E} = \;?$, \quad $\dL{W_P} = \;?$}
+\end{result}
+
+% =============================================================================
+\section{The Full Backward Pass}\label{sec:full}
+
+Compose \S\ref{sec:crossentropy}--\S\ref{sec:encoder} in reverse forward
+order, including the residual stream (where gradients add) and weight tying
+between $W_E$ and the LM head.
+
+\TODO{Write the end-to-end gradient flow for one transformer block, then
+  the whole model.}
+
+% =============================================================================
+\appendices
+\section{Gradient Checking}\label{app:gradcheck}
+
+Numerical check used to validate every derivation above:
+\begin{equation}
+  \pdv{L}{\theta_i} \;\approx\;
+  \frac{L(\theta + \epsilon e_i) - L(\theta - \epsilon e_i)}{2\epsilon}.
+\end{equation}
+
+\TODO{Record per-dtype tolerances and how they relate to
+  \texttt{tests/\_dtypes.py}.}
+
+\section{Useful Identities}\label{app:identities}
+
+\begin{itemize}
+  \item $\dv{}{x}\log x = 1/x$; \quad $\dv{}{x} e^{x} = e^{x}$; \quad
+        $\dv{}{x}\tanh x = 1 - \tanh^2 x$.
+  \item log-sum-exp and its gradient: $\nabla \log \sum_j e^{x_j} = \softmax(x)$.
+  \item \TODO{Collect identities as they get used.}
+\end{itemize}
+
+\end{document}
