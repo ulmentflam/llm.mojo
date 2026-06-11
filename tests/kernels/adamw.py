@@ -42,7 +42,7 @@ def step(
             MutableBuf(params, dtype_name),
             MutableBuf(m, "float32"),
             MutableBuf(v, "float32"),
-            ScalarArg(int(t), "uint32"),
+            ScalarArg(t, "uint32"),
             ReadTensor(grads, dtype_name),
             ScalarArg(hp.lr, dtype_name),
             ScalarArg(hp.beta1, dtype_name),

@@ -4,8 +4,12 @@ Common utilities for data processing.
 
 from typing import Any
 
+# pyrefly: ignore[untyped-import]  requests ships no stubs; types-requests
+# is not in the pixi env.
 import requests
 import numpy as np
+
+# pyrefly: ignore[untyped-import]  same for types-tqdm.
 from tqdm import tqdm
 
 
