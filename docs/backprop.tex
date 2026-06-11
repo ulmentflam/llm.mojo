@@ -168,9 +168,20 @@ predicted probabilities $p_{bt} \in \R^{V_p}$:
   L_{bt} \;=\; -\sum_{i<V} y_{bt,i} \log p_{bt,i}.
   \label{eq:ce-std}
 \end{equation}
-For language modeling the target is one-hot, $y_{bt,i} = \ind{i = y_{bt}}$
-with target token $y_{bt} \in \{0,\dots,V-1\}$, so every term but one
-vanishes and \eqref{eq:ce-std} collapses to the form computed by
+For language modeling the target distribution is one-hot. Writing
+$\ind{P}$ for the indicator of a condition $P$,
+\begin{equation}
+  \ind{P} \;=\;
+  \begin{cases}
+    1 & P \text{ is true},  \\
+    0 & P \text{ is false},
+  \end{cases}
+  \label{eq:indicator}
+\end{equation}
+the target with token $y_{bt} \in \{0,\dots,V-1\}$ is
+$y_{bt,i} = \ind{i = y_{bt}}$: all probability mass on the target token,
+zero elsewhere. Every term of \eqref{eq:ce-std} but one then vanishes,
+and the loss collapses to the form computed by
 \texttt{crossentropy\_ohe\_fwd}:
 \begin{equation}
   L_{bt} \;=\; -\log p_{bt,\,y_{bt}}.
@@ -180,10 +191,46 @@ vanishes and \eqref{eq:ce-std} collapses to the form computed by
 \subsection{Backward w.r.t.\ the probabilities}
 
 \begin{derivation}
-  Differentiating the standard form \eqref{eq:ce-std}, only the $i$-th term
-  of the sum involves $p_{bt,i}$:
+  Break the standard form \eqref{eq:ce-std} out term by term:
+  \begin{multline}
+    L_{bt} = -\bigl(
+    y_{bt,0}\log p_{bt,0}
+    + y_{bt,1}\log p_{bt,1} \\
+    + y_{bt,2}\log p_{bt,2}
+    + \cdots
+    + y_{bt,V-1}\log p_{bt,V-1}
+    \bigr).
+    \label{eq:ce-std-expanded}
+  \end{multline}
+  Differentiating with respect to one coordinate $p_{bt,i}$, every term
+  of the broken-out sum except the $i$-th is constant, so only its
+  derivative survives:
+  \begin{align}
+    \dL{p_{bt,i}}
+     & = -\pdv{}{p_{bt,i}}\bigl(
+    y_{bt,0}\log p_{bt,0} + \cdots
+    + y_{bt,i}\log p_{bt,i} \notag                  \\
+     & \qquad\qquad + \cdots
+    + y_{bt,V-1}\log p_{bt,V-1}
+    \bigr) \notag                                   \\
+     & = -\,y_{bt,i}\,\pdv{}{p_{bt,i}}\log p_{bt,i}.
+    \label{eq:ce-surviving}
+  \end{align}
+  The surviving factor is the derivative of the logarithm,
   \begin{equation}
-    \dL{p_{bt,i}} \;=\; -\frac{y_{bt,i}}{p_{bt,i}}.
+    \dv{}{x}\log x \;=\; \frac{1}{x}
+    \qquad\Longrightarrow\qquad
+    \pdv{}{p_{bt,i}}\log p_{bt,i} \;=\; \frac{1}{p_{bt,i}},
+    \label{eq:dlog}
+  \end{equation}
+  giving the standard-sum gradient, valid for \emph{any} target
+  distribution $y_{bt}$:
+  \begin{equation}
+    \dL{p_{bt,i}}
+    \;=\;
+    -\,\pdv{}{p_{bt,i}} \sum_{j<V} y_{bt,j} \log p_{bt,j}
+    \;=\;
+    -\frac{y_{bt,i}}{p_{bt,i}}.
     \label{eq:ce-std-bwd}
   \end{equation}
   Substituting the one-hot target $y_{bt,i} = \ind{i = y_{bt}}$,
@@ -216,16 +263,236 @@ Forward: from logits $\ell_{bt} \in \R^{V_p}$ (real entries $i < V$),
 
 \subsection{The Jacobian}
 
-\begin{derivation}
-  \TODO{Derive $\pdv{p_i}{\ell_j}$ for $i = j$ and $i \neq j$; show the
-    max-subtraction does not change the derivative.}
-  \begin{align}
+Row indices $bt$ are dropped throughout: each row is an independent
+softmax, so the Jacobian is per-row.
 
+\begin{derivation}
+  The object here is the Jacobian entry $\pdv{p_i}{\ell_j}$ alone: how
+  one probability moves with one logit. The loss enters only in the
+  subsections that follow, where an upstream gradient is chained through
+  these entries. Before differentiating: the max-subtraction in
+  \eqref{eq:softmax-fwd} cancels, because for any constant $c$
+  \begin{equation}
+    \frac{e^{\ell_i - c}}{\sum_{j<V} e^{\ell_j - c}}
+    \;=\;
+    \frac{e^{-c}\,e^{\ell_i}}{e^{-c}\sum_{j<V} e^{\ell_j}}
+    \;=\;
+    \frac{e^{\ell_i}}{\sum_{j<V} e^{\ell_j}},
+    \label{eq:softmax-shift}
+  \end{equation}
+  so $m_{bt}$ does not change the derivative and the unshifted form can be
+  differentiated. Break the denominator sum out in the same format:
+  \begin{equation}
+    p_i = \frac{e^{\ell_i}}{S},
+    \qquad
+    S = e^{\ell_0} + e^{\ell_1} + e^{\ell_2} + \cdots + e^{\ell_{V-1}}.
+    \label{eq:softmax-S}
+  \end{equation}
+  Every entry comes from the quotient rule: for $u/v$ and a scalar
+  argument $x$,
+  \begin{equation}
+    \pdv{}{x}\,\frac{u}{v}
+    \;=\;
+    \frac{\pdv{u}{x}\,v \;-\; u\,\pdv{v}{x}}{v^{2}}.
+    \label{eq:quotient}
+  \end{equation}
+  Work the $2\times2$ block of entries in $p_1, p_2$ and
+  $\ell_1, \ell_2$ explicitly before generalizing.
+
+  \paragraph{Entry $\pdv{p_1}{\ell_1}$}
+  Here $u = e^{\ell_1}$ and $v = S$, and \emph{both} move with $\ell_1$:
+  \begin{align}
+    \pdv{u}{\ell_1} & = \pdv{}{\ell_1}\,e^{\ell_1} = e^{\ell_1},
+    \label{eq:q11-u}                                               \\
+    \pdv{v}{\ell_1} & = \pdv{}{\ell_1}\bigl(e^{\ell_0} + e^{\ell_1}
+    + e^{\ell_2} + \cdots + e^{\ell_{V-1}}\bigr) = e^{\ell_1},
+    \label{eq:q11-v}
   \end{align}
+  every term of the broken-out sum except $e^{\ell_1}$ being constant.
+  Substituting \eqref{eq:q11-u} and \eqref{eq:q11-v} into the quotient
+  rule \eqref{eq:quotient} with the values filled in:
+  \begin{align}
+    \pdv{p_1}{\ell_1}
+     & = \frac{e^{\ell_1}\bigl(e^{\ell_0} + e^{\ell_1} + \cdots
+        + e^{\ell_{V-1}}\bigr)
+    - e^{\ell_1}\,e^{\ell_1}}
+    {\bigl(e^{\ell_0} + e^{\ell_1} + \cdots + e^{\ell_{V-1}}\bigr)^{2}}
+    \notag                                                         \\
+     & = \frac{e^{\ell_1}\,S - e^{\ell_1}\,e^{\ell_1}}{S^{2}}
+    = \frac{e^{\ell_1}}{S}
+    - \left(\frac{e^{\ell_1}}{S}\right)^{\!2} \notag               \\
+     & = p_1 - p_1^{2} \;=\; p_1\,(1 - p_1).
+    \label{eq:q11}
+  \end{align}
+
+  \paragraph{Entry $\pdv{p_1}{\ell_2}$}
+  Now the numerator does \emph{not} move: $u = e^{\ell_1}$ is constant
+  in $\ell_2$, so $\pdv{u}{\ell_2} = 0$, while again exactly one term of
+  the broken-out denominator survives:
+  \begin{equation}
+    \pdv{v}{\ell_2} = \pdv{}{\ell_2}\bigl(e^{\ell_0} + e^{\ell_1}
+    + e^{\ell_2} + \cdots + e^{\ell_{V-1}}\bigr) = e^{\ell_2}.
+    \label{eq:q12-v}
+  \end{equation}
+  Substituting into \eqref{eq:quotient} with the values filled in:
+  \begin{align}
+    \pdv{p_1}{\ell_2}
+     & = \frac{0 \cdot \bigl(e^{\ell_0} + e^{\ell_1} + \cdots
+        + e^{\ell_{V-1}}\bigr)
+    - e^{\ell_1}\,e^{\ell_2}}
+    {\bigl(e^{\ell_0} + e^{\ell_1} + \cdots + e^{\ell_{V-1}}\bigr)^{2}}
+    \notag                                                         \\
+     & = -\,\frac{e^{\ell_1}}{S}\cdot\frac{e^{\ell_2}}{S}
+    \;=\; -\,p_1\,p_2.
+    \label{eq:q12}
+  \end{align}
+
+  \paragraph{Entries $\pdv{p_2}{\ell_1}$ and $\pdv{p_2}{\ell_2}$}
+  The same two computations with the indices swapped. For
+  $\pdv{p_2}{\ell_1}$: $u = e^{\ell_2}$ is constant in $\ell_1$ and
+  $\pdv{v}{\ell_1} = e^{\ell_1}$ by \eqref{eq:q11-v}; for
+  $\pdv{p_2}{\ell_2}$ both numerator and denominator move, exactly as in
+  \eqref{eq:q11}:
+  \begin{align}
+    \pdv{p_2}{\ell_1}
+     & = \frac{0 \cdot S - e^{\ell_2}\,e^{\ell_1}}{S^{2}}
+    = -\,p_2\,p_1,
+    \label{eq:q21}                                          \\
+    \pdv{p_2}{\ell_2}
+     & = \frac{e^{\ell_2}\,S - e^{\ell_2}\,e^{\ell_2}}{S^{2}}
+    = p_2\,(1 - p_2).
+    \label{eq:q22}
+  \end{align}
+
+  \paragraph{The pattern}
+  Arranged as a block of the Jacobian, the four entries are
+  \begin{equation}
+    \begin{pmatrix}
+      \pdv{p_1}{\ell_1} & \pdv{p_1}{\ell_2} \\[6pt]
+      \pdv{p_2}{\ell_1} & \pdv{p_2}{\ell_2}
+    \end{pmatrix}
+    =
+    \begin{pmatrix}
+      p_1\,(1-p_1) & -\,p_1\,p_2  \\[2pt]
+      -\,p_2\,p_1  & p_2\,(1-p_2)
+    \end{pmatrix}:
+    \label{eq:softmax-block}
+  \end{equation}
+  diagonal entries $p_i\,(1 - p_i)$, off-diagonal entries
+  $-\,p_i\,p_j$. The general entry repeats the same quotient rule. Each
+  $v$-derivative above is one instance of the general fact that exactly
+  one term of the broken-out $S$ involves $\ell_j$:
+  \begin{equation}
+    \pdv{S}{\ell_j}
+    = \pdv{}{\ell_j}\bigl(e^{\ell_0} + \cdots + e^{\ell_j} + \cdots
+    + e^{\ell_{V-1}}\bigr)
+    = e^{\ell_j}.
+    \label{eq:softmax-dS}
+  \end{equation}
+  The diagonal case $j = i$ repeats \eqref{eq:q11} (the numerator also
+  moves):
+  \begin{align}
+    \pdv{p_i}{\ell_i}
+     & = \frac{e^{\ell_i}\,S - e^{\ell_i}\,e^{\ell_i}}{S^2}
+    = \frac{e^{\ell_i}}{S}
+    - \left(\frac{e^{\ell_i}}{S}\right)^{\!2} \notag       \\
+     & = p_i - p_i^2 = p_i\,(1 - p_i).
+    \label{eq:softmax-diag}
+  \end{align}
+  The off-diagonal case $j \neq i$ repeats \eqref{eq:q12} (the numerator
+  $e^{\ell_i}$ is constant in $\ell_j$):
+  \begin{equation}
+    \pdv{p_i}{\ell_j}
+    = \frac{0 \cdot S - e^{\ell_i}\,e^{\ell_j}}{S^2}
+    = -\,p_i\,p_j.
+    \label{eq:softmax-offdiag}
+  \end{equation}
 \end{derivation}
 
 \begin{result}
-  \TODO{$\pdv{p_i}{\ell_j} = \;?$ (express with $\kron{i}{j}$).}
+  The two cases combine into one expression via the Kronecker delta, the
+  standard notation for an entry of the identity matrix. It is the indicator
+  \eqref{eq:indicator} specialized to an index equality,
+  $\kron{i}{j} = \ind{i = j}$:
+  \begin{equation}
+    \kron{i}{j} \;=\;
+    \begin{cases}
+      1 & i = j,    \\
+      0 & i \neq j,
+    \end{cases}
+    \label{eq:kron}
+  \end{equation}
+  which selects the diagonal case:
+  \begin{equation}
+    \pdv{p_i}{\ell_j} \;=\; p_i\,\bigl(\kron{i}{j} - p_j\bigr).
+    \label{eq:softmax-jac}
+  \end{equation}
+  Check against \eqref{eq:softmax-diag} and \eqref{eq:softmax-offdiag}:
+  $j = i$ gives $p_i\,(1 - p_i)$, and $j \neq i$ gives $-\,p_i\,p_j$.
+\end{result}
+
+\subsection{Backward w.r.t.\ the logits}
+
+\begin{derivation}
+  The upstream gradient $\dL{p}$ enters through the chain rule
+  \eqref{eq:chain} summed over the row, one full column of the
+  Jacobian \eqref{eq:softmax-jac} per output $i$. Broken out:
+  \begin{align}
+    \dL{\ell_i}
+     & = \sum_{j<V} \dL{p_j}\,\pdv{p_j}{\ell_i} \notag                  \\
+     & = \dL{p_0}\pdv{p_0}{\ell_i}
+    + \dL{p_1}\pdv{p_1}{\ell_i}
+    + \dL{p_2}\pdv{p_2}{\ell_i} \notag                                  \\
+     & \qquad + \cdots + \dL{p_{V-1}}\pdv{p_{V-1}}{\ell_i}.
+    \label{eq:softmax-chain}
+  \end{align}
+  Substitute \eqref{eq:softmax-diag} and \eqref{eq:softmax-offdiag}; the
+  $j = i$ term is the diagonal case, every other term is off-diagonal:
+  \begin{align}
+    \dL{\ell_i}
+     & = \dL{p_i}\,p_i\,(1 - p_i)
+    + \sum_{j \neq i} \dL{p_j}\,(-\,p_j\,p_i) \notag \\
+     & = p_i\,\dL{p_i}
+    - p_i\,p_i\,\dL{p_i}
+    - p_i \sum_{j \neq i} \dL{p_j}\,p_j.
+    \intertext{The middle term is exactly the missing $j = i$ element of
+    the sum, so it re-absorbs:}
+    \dL{\ell_i}
+     & = p_i\,\dL{p_i} - p_i \sum_{j<V} \dL{p_j}\,p_j,
+  \end{align}
+  where the remaining sum is the same one for every $i$ in the row.
+  Broken out in the same format, it is
+  \begin{multline}
+    \sum_{j<V} \dL{p_j}\,p_j
+    = \dL{p_0}\,p_0 + \dL{p_1}\,p_1 \\
+    + \dL{p_2}\,p_2 + \cdots + \dL{p_{V-1}}\,p_{V-1}.
+    \label{eq:softmax-dot}
+  \end{multline}
+\end{derivation}
+
+\begin{result}
+  \begin{equation}
+    \dL{\ell_i} \;=\;
+    p_i \left(\dL{p_i} - \sum_{j<V} \dL{p_j}\,p_j\right),
+    \qquad i < V,
+    \label{eq:softmax-bwd}
+  \end{equation}
+  and $\dL{\ell_i} = 0$ for the padded region $i \geq V$. Summing
+  \eqref{eq:softmax-bwd} over the row, the leading $p_i$ distributes into
+  both terms; the probabilities multiplying the (constant) dot product
+  sum to one, leaving two copies of the same dot product:
+  \begin{align}
+    \sum_{i<V} \dL{\ell_i}
+     & = \sum_{i<V} p_i\,\dL{p_i}
+    - \Bigl(\sum_{i<V} p_i\Bigr)
+    \sum_{j<V} \dL{p_j}\,p_j \notag \\
+     & = \sum_{i<V} p_i\,\dL{p_i}
+    - \sum_{j<V} \dL{p_j}\,p_j
+    \;=\; 0.
+    \label{eq:softmax-zerosum}
+  \end{align}
+  The gradient row always sums to zero, consistent with the shift
+  invariance \eqref{eq:softmax-shift}.
 \end{result}
 
 \subsection{Fused softmax + cross-entropy}
@@ -235,13 +502,91 @@ The composition is the case that matters for the model: backprop through
 Jacobian collapse.
 
 \begin{derivation}
-  \TODO{Chain the cross-entropy gradient through the softmax Jacobian and
-    simplify to the famous one-liner. This is the math behind the planned
-    fused kernel.}
+  Write out the chain per logit coordinate, full indices restored
+  (upstream index $i$ over the probabilities, $j$ over the logits):
+  \begin{equation}
+    \dL{\ell_{bt,j}}
+    \;=\;
+    \sum_{i<V} \dL{p_{bt,i}}\,\pdv{p_{bt,i}}{\ell_{bt,j}}.
+    \label{eq:fused-chain}
+  \end{equation}
+  Substitute what is already known into the combined equation: the
+  cross-entropy gradient \eqref{eq:ce-bwd} for the first factor and the
+  Jacobian \eqref{eq:softmax-jac} for the second:
+  \begin{align}
+    \dL{\ell_{bt,j}}
+     & = \sum_{i<V}
+    \left(-\frac{\ind{i = y_{bt}}}{p_{bt,i}}\right)
+    p_{bt,i}\,\bigl(\kron{i}{j} - p_{bt,j}\bigr)
+    \intertext{The $p_{bt,i}$ in the denominator cancels against the
+      $p_{bt,i}$ the Jacobian contributes:}
+     & = -\sum_{i<V} \ind{i = y_{bt}}\,
+    \bigl(\kron{i}{j} - p_{bt,j}\bigr)
+    \intertext{and the one-hot indicator keeps exactly one term of the
+      sum, $i = y_{bt}$:}
+     & = -\bigl(\kron{y_{bt}}{j} - p_{bt,j}\bigr)
+    = p_{bt,j} - \ind{j = y_{bt}}.
+    \label{eq:fused-collapse}
+  \end{align}
 \end{derivation}
 
 \begin{result}
-  \TODO{$\dL{\ell_{bt,i}} = \;?$ (and note the padded region $i \geq V$).}
+  \begin{equation}
+    \dL{\ell_{bt,j}} \;=\; p_{bt,j} - \ind{j = y_{bt}},
+    \qquad j < V,
+    \label{eq:fused-bwd}
+  \end{equation}
+  and $\dL{\ell_{bt,j}} = 0$ for the padded region $j \geq V$. The
+  Jacobian collapsed entirely: no sum over the row survives in
+  \eqref{eq:fused-bwd}.
+
+  Cross-check via the general backward \eqref{eq:softmax-bwd}: with the
+  cross-entropy upstream \eqref{eq:ce-bwd}, the dot product evaluates to
+  \begin{equation}
+    \sum_{j<V} \dL{p_{bt,j}}\,p_{bt,j}
+    = \sum_{j<V} \left(-\frac{\ind{j = y_{bt}}}{p_{bt,j}}\right) p_{bt,j}
+    = -1,
+    \label{eq:fused-dot}
+  \end{equation}
+  a constant: for a one-hot target the row-wide weighted sum is known
+  before reading a single element. Substituting $-1$ for the dot product
+  in \eqref{eq:softmax-bwd}, the $p_{bt,i}$ outside the parentheses
+  cancels the reciprocal inside them:
+  \begin{align}
+    \dL{\ell_{bt,i}}
+     & = p_{bt,i}\left(\dL{p_{bt,i}} - (-1)\right) \notag      \\
+     & = p_{bt,i}
+    \left(-\frac{\ind{i = y_{bt}}}{p_{bt,i}} + 1\right) \notag \\
+     & = p_{bt,i} - \ind{i = y_{bt}},
+    \label{eq:fused-check}
+  \end{align}
+  agreeing with \eqref{eq:fused-bwd}: chaining through the Jacobian
+  directly and substituting into the general backward are two routes to
+  the same gradient. The zero-sum check of \S\ref{sec:softmax} also
+  holds: the probabilities sum to one, and the indicator fires exactly
+  once per row:
+  \begin{equation}
+    \sum_{j<V} \bigl(p_{bt,j} - \ind{j = y_{bt}}\bigr)
+    \;=\; 1 - 1 \;=\; 0.
+    \label{eq:fused-zerosum}
+  \end{equation}
+
+  The collapse did not need one-hotness. It needed only the standard-sum
+  gradient \eqref{eq:ce-std-bwd} and the fact that the target is a
+  distribution, $\sum_{i<V} y_{bt,i} = 1$. Repeating
+  \eqref{eq:fused-chain} with a general target distribution,
+  \begin{align}
+    \dL{\ell_{bt,j}}
+     & = \sum_{i<V}
+    \left(-\frac{y_{bt,i}}{p_{bt,i}}\right)
+    p_{bt,i}\,\bigl(\kron{i}{j} - p_{bt,j}\bigr) \notag \\
+     & = -\,y_{bt,j} + p_{bt,j}\sum_{i<V} y_{bt,i}
+    \;=\; p_{bt,j} - y_{bt,j},
+    \label{eq:fused-general}
+  \end{align}
+  the one-hot result \eqref{eq:fused-bwd} being the special case
+  $y_{bt,j} = \ind{j = y_{bt}}$. Softmax + cross-entropy always
+  backpropagates as \emph{predicted minus target}.
 \end{result}
 
 % =============================================================================

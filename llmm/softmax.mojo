@@ -43,18 +43,17 @@ def _softmax_comp_max[
 
 
 @always_inline
-def _softmax_fwd_cpu[
+def _softmax_phase_1_and_2_cpu[
     dtype: DType, width: Int
 ](
     idx: Int,
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     vocab_size: Int,  # Our V
     vocab_size_padded: Int,  # Our Vp, padding is garbage
-) -> None:
-    # Finite MIN, not -inf: when V < width the vector loop never runs, and
-    # the lane merge would compute 0 * exp(-inf - -inf) = NaN. With MIN the
-    # merge yields s_row = 0 and the tail recurrence starts cleanly.
+) -> Tuple[Scalar[DType.float32], Scalar[DType.float32]]:
+    """Phase 1 (fused online max/sum over V) and phase 2 (lane merge) of
+    the row softmax. Returns (m_row, s_row), ready for any epilogue:
+    normalize, loss, or the fused classifier gradient."""
     var m = SIMD[DType.float32, width](Scalar[DType.float32].MIN_FINITE)
     var s = SIMD[DType.float32, width](0.0)
 
@@ -77,6 +76,24 @@ def _softmax_fwd_cpu[
         var new_idx = idx * vocab_size_padded + i
         _softmax_comp_max[dtype, 1](new_idx, logits_ptr, s_row, m_row)
 
+    return (m_row, s_row)
+
+
+@always_inline
+def _softmax_fwd_cpu[
+    dtype: DType, width: Int
+](
+    idx: Int,
+    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    vocab_size: Int,  # Our V
+    vocab_size_padded: Int,  # Our Vp, padding is garbage
+) -> None:
+    var stats = _softmax_phase_1_and_2_cpu[dtype, width](
+        idx, logits_ptr, vocab_size, vocab_size_padded
+    )
+    var m_row = stats[0]
+    var s_row = stats[1]
     var inv_s = Scalar[DType.float32](1) / s_row
 
     @always_inline
@@ -136,6 +153,55 @@ def softmax_fwd_cpu[
 
 
 @always_inline
+def _softmax_phase_1_and_2_gpu[
+    dtype: DType, BLOCK_SIZE: Int, width: Int = 4
+](
+    row: Int,
+    tid: Int,
+    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    vocab_size: Int,
+    vocab_size_padded: Int,
+) -> Tuple[Scalar[DType.float32], Scalar[DType.float32]]:
+    """Phase 1 (per-thread online max/sum over the block-strided row) and
+    phase 2 (per-thread merge, then block merge) of the row softmax.
+    Returns (m_row, s_row) broadcast to every thread of the block.
+
+    NOTE: contains block.max/block.sum, which synchronize the whole
+    block, so every thread must call this the same number of times."""
+    comptime BLOCK_SPAN = BLOCK_SIZE * width
+
+    var m = SIMD[DType.float32, width](Scalar[DType.float32].MIN_FINITE)
+    var s = SIMD[DType.float32, width](0.0)
+    var m_tail = Scalar[DType.float32].MIN_FINITE
+    var s_tail = Scalar[DType.float32](0.0)
+
+    for tile_base in range(0, vocab_size, BLOCK_SPAN):
+        var lane_base = tile_base + tid * width
+        if lane_base + width <= vocab_size:
+            var idx = row * vocab_size_padded + lane_base
+            _softmax_comp_max[dtype, width](idx, logits_ptr, s, m)
+        elif lane_base < vocab_size:
+            # Ragged edge of the last tile
+            # This is so every thread keeps the same tile trip count for the reductions.
+            for i in range(lane_base, vocab_size):
+                var idx = row * vocab_size_padded + i
+                _softmax_comp_max[dtype, 1](idx, logits_ptr, s_tail, m_tail)
+
+    # Per-thread merge
+    var m_thread = max(m.reduce_max(), m_tail)
+    var s_thread = (
+        s * exp(m - SIMD[DType.float32, width](m_thread))
+    ).reduce_add() + s_tail * exp(m_tail - m_thread)
+
+    # Merge across the block
+    var m_row = block.max[block_size=BLOCK_SIZE](m_thread)
+    s_thread = s_thread * exp(m_thread - m_row)
+    var s_row = block.sum[block_size=BLOCK_SIZE](s_thread)
+
+    return (m_row, s_row)
+
+
+@always_inline
 def _softmax_fwd_gpu[
     dtype: DType, BLOCK_SIZE: Int, width: Int = 4
 ](
@@ -154,36 +220,14 @@ def _softmax_fwd_gpu[
     # Grid strided over the rows of the dispatched batch.
     # Each block walks rows at a stride of grid_dim.x until the rows are exhausted.
     # No need for a check that row < num_rows because the grid is bound to the range.
-    # NOTE: block.max/block.sum synchronize the whole block, so every thread
-    # must reach them the same number of times.
+    # NOTE: the phase 1+2 helper synchronizes the whole block, so every
+    # thread must take the same trip count through this loop.
     for row in range(block_row, num_rows, stride):
-        var m = SIMD[DType.float32, width](Scalar[DType.float32].MIN_FINITE)
-        var s = SIMD[DType.float32, width](0.0)
-        var m_tail = Scalar[DType.float32].MIN_FINITE
-        var s_tail = Scalar[DType.float32](0.0)
-
-        for tile_base in range(0, vocab_size, BLOCK_SPAN):
-            var lane_base = tile_base + tid * width
-            if lane_base + width <= vocab_size:
-                var idx = row * vocab_size_padded + lane_base
-                _softmax_comp_max[dtype, width](idx, logits_ptr, s, m)
-            elif lane_base < vocab_size:
-                # Ragged edge of the last tile
-                # This is so every thread keeps the same tile trip count for the reductions.
-                for i in range(lane_base, vocab_size):
-                    var idx = row * vocab_size_padded + i
-                    _softmax_comp_max[dtype, 1](idx, logits_ptr, s_tail, m_tail)
-
-        # Per-thread merge
-        var m_thread = max(m.reduce_max(), m_tail)
-        var s_thread = (
-            s * exp(m - SIMD[DType.float32, width](m_thread))
-        ).reduce_add() + s_tail * exp(m_tail - m_thread)
-
-        # Merge across the block
-        var m_row = block.max[block_size=BLOCK_SIZE](m_thread)
-        s_thread = s_thread * exp(m_thread - m_row)
-        var s_row = block.sum[block_size=BLOCK_SIZE](s_thread)
+        var stats = _softmax_phase_1_and_2_gpu[dtype, BLOCK_SIZE, width](
+            row, tid, logits_ptr, vocab_size, vocab_size_padded
+        )
+        var m_row = stats[0]
+        var s_row = stats[1]
 
         # Normalize the row with the same tiling, recomputing exp instead of
         # round-tripping the intermediate x - max through global memory.
