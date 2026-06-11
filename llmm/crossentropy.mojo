@@ -17,14 +17,13 @@ from tensor.managed_tensor_slice import (
 # ===----------------------------------------------------------------------=== #
 
 comptime CHUNK_SIZE = 4096
-comptime UNROLL = 4
-
 
 # ===----------------------------------------------------------------------=== #
 # Cross-entropy Loss One-Hot Encoding Forward
 # ===----------------------------------------------------------------------=== #
 
 
+@always_inline
 def _crossentropy_ohe_fwd[
     dtype: DType,
 ](
@@ -214,6 +213,7 @@ struct CrossEntropyOHEFwd:
 # ===----------------------------------------------------------------------=== #
 
 
+@always_inline
 def _crossentropy_ohe_bwd[
     dtype: DType,
 ](

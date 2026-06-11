@@ -162,24 +162,46 @@ $z = wx + b$, $a = \sigma(z)$, $L = \tfrac{1}{2}(a - y)^2$.
 % =============================================================================
 \section{Cross-Entropy Loss}\label{sec:crossentropy}
 
-Forward (\texttt{crossentropy\_ohe\_fwd}): given probabilities
-$p_{bt} \in \R^{V_p}$ and a target token $y_{bt} \in \{0,\dots,V-1\}$,
+Standard cross-entropy between a target distribution $y_{bt} \in \R^{V}$ and
+predicted probabilities $p_{bt} \in \R^{V_p}$:
+\begin{equation}
+  L_{bt} \;=\; -\sum_{i<V} y_{bt,i} \log p_{bt,i}.
+  \label{eq:ce-std}
+\end{equation}
+For language modeling the target is one-hot, $y_{bt,i} = \ind{i = y_{bt}}$
+with target token $y_{bt} \in \{0,\dots,V-1\}$, so every term but one
+vanishes and \eqref{eq:ce-std} collapses to the form computed by
+\texttt{crossentropy\_ohe\_fwd}:
 \begin{equation}
   L_{bt} \;=\; -\log p_{bt,\,y_{bt}}.
   \label{eq:ce-fwd}
 \end{equation}
-The one-hot structure means only the target column participates.
 
 \subsection{Backward w.r.t.\ the probabilities}
 
 \begin{derivation}
-  \TODO{Differentiate \eqref{eq:ce-fwd} w.r.t.\ $p_{bt,i}$; note which
-    entries of $\dL{p_{bt}}$ are nonzero and compare against the
-    assign-only-the-target-column behavior of \texttt{crossentropy\_ohe\_bwd}.}
+  Differentiating the standard form \eqref{eq:ce-std}, only the $i$-th term
+  of the sum involves $p_{bt,i}$:
+  \begin{equation}
+    \dL{p_{bt,i}} \;=\; -\frac{y_{bt,i}}{p_{bt,i}}.
+    \label{eq:ce-std-bwd}
+  \end{equation}
+  Substituting the one-hot target $y_{bt,i} = \ind{i = y_{bt}}$,
+  \eqref{eq:ce-fwd} depends only on the target coordinate $p_{bt,\,y_{bt}}$:
+  \begin{equation}
+    \dL{p_{bt,i}} =
+    \begin{cases}
+      -\dfrac{1}{p_{bt,\,y_{bt}}} & i = y_{bt},       \\
+      0                           & \text{otherwise}.
+    \end{cases}
+  \end{equation}
 \end{derivation}
 
 \begin{result}
-  \TODO{$\dL{p_{bt,i}} = \;?$}
+  \begin{equation}
+    \dL{p_{bt,i}} \;=\; -\frac{\ind{i = y_{bt}}}{p_{bt,i}}.
+    \label{eq:ce-bwd}
+  \end{equation}
 \end{result}
 
 % =============================================================================
@@ -197,6 +219,9 @@ Forward: from logits $\ell_{bt} \in \R^{V_p}$ (real entries $i < V$),
 \begin{derivation}
   \TODO{Derive $\pdv{p_i}{\ell_j}$ for $i = j$ and $i \neq j$; show the
     max-subtraction does not change the derivative.}
+  \begin{align}
+
+  \end{align}
 \end{derivation}
 
 \begin{result}
