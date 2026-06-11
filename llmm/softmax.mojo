@@ -43,7 +43,7 @@ def _softmax_comp_max[
 
 
 @always_inline
-def _softmax_phase_1_and_2_cpu[
+def softmax_phase_1_and_2_cpu[
     dtype: DType, width: Int
 ](
     idx: Int,
@@ -89,7 +89,7 @@ def _softmax_fwd_cpu[
     vocab_size: Int,  # Our V
     vocab_size_padded: Int,  # Our Vp, padding is garbage
 ) -> None:
-    var stats = _softmax_phase_1_and_2_cpu[dtype, width](
+    var stats = softmax_phase_1_and_2_cpu[dtype, width](
         idx, logits_ptr, vocab_size, vocab_size_padded
     )
     var m_row = stats[0]
@@ -153,7 +153,7 @@ def softmax_fwd_cpu[
 
 
 @always_inline
-def _softmax_phase_1_and_2_gpu[
+def softmax_phase_1_and_2_gpu[
     dtype: DType, BLOCK_SIZE: Int, width: Int = 4
 ](
     row: Int,
@@ -223,7 +223,7 @@ def _softmax_fwd_gpu[
     # NOTE: the phase 1+2 helper synchronizes the whole block, so every
     # thread must take the same trip count through this loop.
     for row in range(block_row, num_rows, stride):
-        var stats = _softmax_phase_1_and_2_gpu[dtype, BLOCK_SIZE, width](
+        var stats = softmax_phase_1_and_2_gpu[dtype, BLOCK_SIZE, width](
             row, tid, logits_ptr, vocab_size, vocab_size_padded
         )
         var m_row = stats[0]

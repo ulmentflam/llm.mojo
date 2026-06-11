@@ -209,10 +209,10 @@ and the loss collapses to the form computed by
     \dL{p_{bt,i}}
      & = -\pdv{}{p_{bt,i}}\bigl(
     y_{bt,0}\log p_{bt,0} + \cdots
-    + y_{bt,i}\log p_{bt,i} \notag                  \\
+    + y_{bt,i}\log p_{bt,i} \notag                   \\
      & \qquad\qquad + \cdots
     + y_{bt,V-1}\log p_{bt,V-1}
-    \bigr) \notag                                   \\
+    \bigr) \notag                                    \\
      & = -\,y_{bt,i}\,\pdv{}{p_{bt,i}}\log p_{bt,i}.
     \label{eq:ce-surviving}
   \end{align}
@@ -303,7 +303,7 @@ softmax, so the Jacobian is per-row.
   Here $u = e^{\ell_1}$ and $v = S$, and \emph{both} move with $\ell_1$:
   \begin{align}
     \pdv{u}{\ell_1} & = \pdv{}{\ell_1}\,e^{\ell_1} = e^{\ell_1},
-    \label{eq:q11-u}                                               \\
+    \label{eq:q11-u}                                                \\
     \pdv{v}{\ell_1} & = \pdv{}{\ell_1}\bigl(e^{\ell_0} + e^{\ell_1}
     + e^{\ell_2} + \cdots + e^{\ell_{V-1}}\bigr) = e^{\ell_1},
     \label{eq:q11-v}
@@ -314,13 +314,13 @@ softmax, so the Jacobian is per-row.
   \begin{align}
     \pdv{p_1}{\ell_1}
      & = \frac{e^{\ell_1}\bigl(e^{\ell_0} + e^{\ell_1} + \cdots
-        + e^{\ell_{V-1}}\bigr)
-    - e^{\ell_1}\,e^{\ell_1}}
+      + e^{\ell_{V-1}}\bigr)
+      - e^{\ell_1}\,e^{\ell_1}}
     {\bigl(e^{\ell_0} + e^{\ell_1} + \cdots + e^{\ell_{V-1}}\bigr)^{2}}
-    \notag                                                         \\
+    \notag                                                      \\
      & = \frac{e^{\ell_1}\,S - e^{\ell_1}\,e^{\ell_1}}{S^{2}}
     = \frac{e^{\ell_1}}{S}
-    - \left(\frac{e^{\ell_1}}{S}\right)^{\!2} \notag               \\
+    - \left(\frac{e^{\ell_1}}{S}\right)^{\!2} \notag            \\
      & = p_1 - p_1^{2} \;=\; p_1\,(1 - p_1).
     \label{eq:q11}
   \end{align}
@@ -338,10 +338,10 @@ softmax, so the Jacobian is per-row.
   \begin{align}
     \pdv{p_1}{\ell_2}
      & = \frac{0 \cdot \bigl(e^{\ell_0} + e^{\ell_1} + \cdots
-        + e^{\ell_{V-1}}\bigr)
-    - e^{\ell_1}\,e^{\ell_2}}
+      + e^{\ell_{V-1}}\bigr)
+      - e^{\ell_1}\,e^{\ell_2}}
     {\bigl(e^{\ell_0} + e^{\ell_1} + \cdots + e^{\ell_{V-1}}\bigr)^{2}}
-    \notag                                                         \\
+    \notag                                                    \\
      & = -\,\frac{e^{\ell_1}}{S}\cdot\frac{e^{\ell_2}}{S}
     \;=\; -\,p_1\,p_2.
     \label{eq:q12}
@@ -357,7 +357,7 @@ softmax, so the Jacobian is per-row.
     \pdv{p_2}{\ell_1}
      & = \frac{0 \cdot S - e^{\ell_2}\,e^{\ell_1}}{S^{2}}
     = -\,p_2\,p_1,
-    \label{eq:q21}                                          \\
+    \label{eq:q21}                                            \\
     \pdv{p_2}{\ell_2}
      & = \frac{e^{\ell_2}\,S - e^{\ell_2}\,e^{\ell_2}}{S^{2}}
     = p_2\,(1 - p_2).
@@ -395,7 +395,7 @@ softmax, so the Jacobian is per-row.
     \pdv{p_i}{\ell_i}
      & = \frac{e^{\ell_i}\,S - e^{\ell_i}\,e^{\ell_i}}{S^2}
     = \frac{e^{\ell_i}}{S}
-    - \left(\frac{e^{\ell_i}}{S}\right)^{\!2} \notag       \\
+    - \left(\frac{e^{\ell_i}}{S}\right)^{\!2} \notag        \\
      & = p_i - p_i^2 = p_i\,(1 - p_i).
     \label{eq:softmax-diag}
   \end{align}
@@ -439,10 +439,10 @@ softmax, so the Jacobian is per-row.
   Jacobian \eqref{eq:softmax-jac} per output $i$. Broken out:
   \begin{align}
     \dL{\ell_i}
-     & = \sum_{j<V} \dL{p_j}\,\pdv{p_j}{\ell_i} \notag                  \\
+     & = \sum_{j<V} \dL{p_j}\,\pdv{p_j}{\ell_i} \notag      \\
      & = \dL{p_0}\pdv{p_0}{\ell_i}
     + \dL{p_1}\pdv{p_1}{\ell_i}
-    + \dL{p_2}\pdv{p_2}{\ell_i} \notag                                  \\
+    + \dL{p_2}\pdv{p_2}{\ell_i} \notag                      \\
      & \qquad + \cdots + \dL{p_{V-1}}\pdv{p_{V-1}}{\ell_i}.
     \label{eq:softmax-chain}
   \end{align}
@@ -451,12 +451,12 @@ softmax, so the Jacobian is per-row.
   \begin{align}
     \dL{\ell_i}
      & = \dL{p_i}\,p_i\,(1 - p_i)
-    + \sum_{j \neq i} \dL{p_j}\,(-\,p_j\,p_i) \notag \\
+    + \sum_{j \neq i} \dL{p_j}\,(-\,p_j\,p_i) \notag   \\
      & = p_i\,\dL{p_i}
     - p_i\,p_i\,\dL{p_i}
     - p_i \sum_{j \neq i} \dL{p_j}\,p_j.
     \intertext{The middle term is exactly the missing $j = i$ element of
-    the sum, so it re-absorbs:}
+      the sum, so it re-absorbs:}
     \dL{\ell_i}
      & = p_i\,\dL{p_i} - p_i \sum_{j<V} \dL{p_j}\,p_j,
   \end{align}
