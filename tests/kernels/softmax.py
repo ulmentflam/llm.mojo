@@ -54,6 +54,43 @@ def forward(
     return out_probs
 
 
+def backward(
+    *,
+    d_probs: np.ndarray,  # (B*T*Vp,) flattened, kernel dtype (storage form)
+    probs: np.ndarray,  # (B*T*Vp,) flattened, kernel dtype (storage form)
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    vocab_size_padded: int,
+    dtype_name: str,
+    d_logits: np.ndarray | None = None,
+    device: "Device | None" = None,
+) -> np.ndarray:
+    """One softmax_bwd pass end-to-end through MAX.
+
+    `d_logits` is the mutable output buffer (kernel dtype, shape
+    (B*T*Vp,)). The kernel writes only the first V columns of each row and
+    leaves the padded tail untouched — callers zero (or sentinel-fill) the
+    buffer themselves. Returns the post-execution d_logits.
+    """
+    if d_logits is None:
+        d_logits = np.zeros_like(probs)
+    (out_d_logits,) = run_custom_op(
+        kernel_name="softmax_bwd",
+        args=[
+            MutableBuf(d_logits, dtype_name),
+            ReadTensor(d_probs, dtype_name),
+            ReadTensor(probs, dtype_name),
+            ScalarArg(int(batch_size), "int64"),
+            ScalarArg(int(seq_len), "int64"),
+            ScalarArg(int(vocab_size), "int64"),
+            ScalarArg(int(vocab_size_padded), "int64"),
+        ],
+        device=device,
+    )
+    return out_d_logits
+
+
 # Compiled-graph cache for the Modular reference, keyed like the bridge's
 # model cache: shape + dtype + device. One entry per test case shape.
 _MODULAR_CACHE: dict[tuple, tuple] = {}
