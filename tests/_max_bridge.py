@@ -133,7 +133,9 @@ _SESSION_CACHE: dict[tuple, "InferenceSession"] = {}
 _DEFAULT_DEVICE: "Device | None" = None
 
 
-def _signature(kernel_name: str, args: list[KernelArg], device) -> tuple:
+def _signature(
+    kernel_name: str, args: list[KernelArg], device, parameters: dict | None
+) -> tuple:
     parts: list[tuple] = []
     for a in args:
         if isinstance(a, MutableBuf):
@@ -142,10 +144,13 @@ def _signature(kernel_name: str, args: list[KernelArg], device) -> tuple:
             parts.append(("read", a.dtype_name, a.array.shape))
         else:
             parts.append(("scalar", a.dtype_name))
-    return (kernel_name, type(device).__name__, str(device), tuple(parts))
+    params = tuple(sorted((parameters or {}).items()))
+    return (kernel_name, type(device).__name__, str(device), tuple(parts), params)
 
 
-def _compile_model(kernel_name: str, args: list[KernelArg], device):
+def _compile_model(
+    kernel_name: str, args: list[KernelArg], device, parameters: dict | None
+):
     from max.driver import CPU
     from max.engine import InferenceSession
     from max.graph import BufferType, DeviceRef, Graph, TensorType, ops
@@ -167,7 +172,12 @@ def _compile_model(kernel_name: str, args: list[KernelArg], device):
             input_types.append(TensorType(t, shape=[], device=cpu_ref))
 
     def forward(*graph_inputs):
-        ops.inplace_custom(name=kernel_name, device=dev_ref, values=list(graph_inputs))
+        ops.inplace_custom(
+            name=kernel_name,
+            device=dev_ref,
+            values=list(graph_inputs),
+            parameters=parameters or None,
+        )
         return ()
 
     # Graph construction with `custom_extensions=[...]` triggers kernel
@@ -198,6 +208,7 @@ def run_custom_op(
     kernel_name: str,
     args: list[KernelArg],
     device: "Device | None" = None,
+    parameters: dict | None = None,
 ) -> list[np.ndarray]:
     """Compile (cached), load, and execute a registered custom op.
 
@@ -205,6 +216,12 @@ def run_custom_op(
     parameters. Tensors and scalars alike become graph inputs, fed at
     execution time. Returns the post-execution numpy view of each
     `MutableBuf`, in the order they appear in `args`.
+
+    `parameters` are compile-time op parameters (bool | int | str | DType)
+    matched by name to comptime parameters the kernel's `execute` declares
+    beyond dtype/target (verified against this MAX version by
+    ~/Workspace/scripts/probe_graph_parameters.py). Each distinct value
+    compiles (and caches) its own model.
     """
     if device is None:
         global _DEFAULT_DEVICE
@@ -221,10 +238,10 @@ def run_custom_op(
             "you add a kernel that returns outputs by value."
         )
 
-    key = _signature(kernel_name, args, device)
+    key = _signature(kernel_name, args, device, parameters)
     model = _MODEL_CACHE.get(key)
     if model is None:
-        session, model = _compile_model(kernel_name, args, device)
+        session, model = _compile_model(kernel_name, args, device, parameters)
         _SESSION_CACHE[key] = session
         _MODEL_CACHE[key] = model
 
