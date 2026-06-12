@@ -16,6 +16,7 @@ numpy = ">=1.26"
 transformers = ">=4.40"
 tiktoken = ">=0.6"
 pytest = ">=8.0"
+pytest-xdist = ">=3"
 
 [pypi-dependencies]
 pyrefly = ">=0.16"

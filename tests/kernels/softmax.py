@@ -92,7 +92,8 @@ def backward(
 
 
 # Compiled-graph cache for the Modular reference, keyed like the bridge's
-# model cache: shape + dtype + device. One entry per test case shape.
+# model cache: dtype + rank + device (dims are symbolic, so every test
+# case shape shares one entry).
 _MODULAR_CACHE: dict[tuple, tuple] = {}
 
 
@@ -114,7 +115,9 @@ def modular_forward(
     if device is None:
         device = pick_device()
 
-    key = (dtype_name, x.shape, type(device).__name__, str(device))
+    # Symbolic dims, like the bridge's _MODEL_CACHE: one compile per
+    # dtype/rank/device serves every case shape.
+    key = (dtype_name, x.ndim, type(device).__name__, str(device))
     cached = _MODULAR_CACHE.get(key)
     if cached is None:
         dev_ref = DeviceRef.from_device(device)
@@ -122,7 +125,11 @@ def modular_forward(
             "modular_softmax_reference",
             forward=lambda t: (ops.softmax(t, axis=-1),),
             input_types=[
-                TensorType(max_dtype(dtype_name), shape=list(x.shape), device=dev_ref)
+                TensorType(
+                    max_dtype(dtype_name),
+                    shape=[f"dim{d}" for d in range(x.ndim)],
+                    device=dev_ref,
+                )
             ],
         )
         session = InferenceSession(devices=[device])

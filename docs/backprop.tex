@@ -97,6 +97,81 @@ Shapes follow the kernel code, as collected in Table~\ref{tab:notation}.
 Indices: $b$ over batch, $t$ over positions, $i, j, k$ over channels or vocab
 entries. A row of activations at one position is $x_{bt} \in \R^{C}$.
 
+\paragraph{Linear algebra in index form.}
+A matrix entry is named (row, column): $A_{ij}$ is row $i$, column $j$.
+Three definitions cover every matrix manipulation in this document.
+The transpose relabels entries by swapping the index roles:
+\begin{equation}
+  (A^{\top})_{ij} \;=\; A_{ji}.
+  \label{eq:transpose}
+\end{equation}
+The matrix product contracts the inner pair of indices: the entry of
+$AB$ at (row $i$, column $k$) multiplies row $i$ of $A$ against column
+$k$ of $B$,
+\begin{equation}
+  (AB)_{ik} \;=\; \sum_j A_{ij}\,B_{jk}.
+  \label{eq:matprod}
+\end{equation}
+Read \eqref{eq:matprod} in reverse to \emph{recognize} products: a sum
+over one shared index is a matrix product exactly when the summed index
+sits as the column of the left factor and the row of the right factor.
+When it sits anywhere else, a transpose \eqref{eq:transpose} moves it
+into place. This is where every transpose in a backward pass comes
+from.
+Adding a vector to a matrix broadcasts the vector over rows:
+\begin{equation}
+  (M + b)_{ni} \;=\; M_{ni} + b_i.
+  \label{eq:broadcast}
+\end{equation}
+
+\paragraph{Indexed variables under differentiation.}
+The entries of a vector or matrix are independent scalar variables, and
+entries of two different tensors are unrelated (their cross-derivatives
+are $0$). The derivative of one entry with respect to another is
+therefore $1$ when both name the same entry and $0$ otherwise, recorded
+by the Kronecker delta:
+\begin{equation}
+  \kron{i}{j} \;=\;
+  \begin{cases}
+    1 & i = j,    \\
+    0 & i \neq j.
+  \end{cases}
+  \label{eq:kron}
+\end{equation}
+For a vector, same entry is one index equality. For a matrix it is the
+conjunction of two, row \emph{and} column. A product of deltas encodes
+that conjunction: it is $1 \cdot 1$ when both match, and carries a
+factor of $0$ otherwise,
+\begin{equation}
+  \pdv{x_j}{x_i} \;=\; \kron{j}{i},
+  \qquad
+  \pdv{W_{ij}}{W_{kl}} \;=\; \kron{i}{k}\,\kron{j}{l}.
+  \label{eq:entry-dv}
+\end{equation}
+Two concrete matrix instances:
+\begin{equation}
+  \pdv{W_{12}}{W_{12}} = \kron{1}{1}\,\kron{2}{2} = 1 \cdot 1 = 1,
+  \quad
+  \pdv{W_{12}}{W_{21}} = \kron{1}{2}\,\kron{2}{1} = 0 \cdot 0 = 0.
+  \label{eq:entry-dv-example}
+\end{equation}
+A derivative that is nothing but deltas can look stranded on the page.
+It is the complete answer: the deltas record which entry was picked,
+and scalar calculus never shows the case because it has exactly one
+variable. Deltas exit a derivation by being consumed by a sum. With
+$l$ fixed and any values $A_j$, every term of the broken-out sum
+carries a zero delta except $j = l$:
+\begin{align}
+  \sum_{j} \kron{j}{l}\,A_j
+   & = \kron{0}{l}\,A_0 + \kron{1}{l}\,A_1
+  + \cdots + \kron{l}{l}\,A_l + \cdots \notag \\
+   & = A_l.
+  \label{eq:sift}
+\end{align}
+This \emph{sifting} identity recurs in every derivation below. A delta
+whose indices are not summed cannot be consumed; it remains in the
+answer, still meaning these two indices must agree.
+
 \paragraph{The backward convention.}
 Every op receives the upstream gradient $\dL{y}$ of the scalar loss $L$ with
 respect to its output $y$, and must produce $\dL{x}$ for each input $x$ (and
@@ -178,6 +253,8 @@ $\ind{P}$ for the indicator of a condition $P$,
   \end{cases}
   \label{eq:indicator}
 \end{equation}
+(the Kronecker delta \eqref{eq:kron} is this indicator specialized to
+an index equality, $\kron{i}{j} = \ind{i = j}$),
 the target with token $y_{bt} \in \{0,\dots,V-1\}$ is
 $y_{bt,i} = \ind{i = y_{bt}}$: all probability mass on the target token,
 zero elsewhere. Every term of \eqref{eq:ce-std} but one then vanishes,
@@ -191,6 +268,9 @@ and the loss collapses to the form computed by
 \subsection{Backward w.r.t.\ the probabilities}
 
 \begin{derivation}
+  Index roles: $i$ names the probed coordinate of $p_{bt}$, $j$ the
+  summed one. Rows are independent, and within a row the coordinates of
+  $p_{bt}$ are independent variables obeying \eqref{eq:entry-dv}.
   Break the standard form \eqref{eq:ce-std} out term by term:
   \begin{multline}
     L_{bt} = -\bigl(
@@ -222,6 +302,18 @@ and the loss collapses to the form computed by
     \qquad\Longrightarrow\qquad
     \pdv{}{p_{bt,i}}\log p_{bt,i} \;=\; \frac{1}{p_{bt,i}},
     \label{eq:dlog}
+  \end{equation}
+  In delta form the same two steps are \eqref{eq:entry-dv} followed by
+  the sift \eqref{eq:sift}: each term of the sum differentiates to
+  $(y_{bt,j}/p_{bt,j})\,\kron{j}{i}$, and the sum collapses to the
+  single term $j = i$,
+  \begin{equation}
+    \dL{p_{bt,i}}
+    \;=\;
+    -\sum_{j<V} \frac{y_{bt,j}}{p_{bt,j}}\,\kron{j}{i}
+    \;=\;
+    -\frac{y_{bt,i}}{p_{bt,i}},
+    \label{eq:ce-delta-form}
   \end{equation}
   giving the standard-sum gradient, valid for \emph{any} target
   distribution $y_{bt}$:
@@ -268,7 +360,10 @@ softmax, so the Jacobian is per-row.
 
 \begin{derivation}
   The object here is the Jacobian entry $\pdv{p_i}{\ell_j}$ alone: how
-  one probability moves with one logit. The loss enters only in the
+  one probability moves with one logit. Index roles: $i$ names the
+  probed probability, $j$ the probed logit, and the logits of a row are
+  independent variables obeying \eqref{eq:entry-dv},
+  $\pdv{\ell_a}{\ell_j} = \kron{a}{j}$. The loss enters only in the
   subsections that follow, where an upstream gradient is chained through
   these entries. Before differentiating: the max-subtraction in
   \eqref{eq:softmax-fwd} cancels, because for any constant $c$
@@ -381,11 +476,13 @@ softmax, so the Jacobian is per-row.
   diagonal entries $p_i\,(1 - p_i)$, off-diagonal entries
   $-\,p_i\,p_j$. The general entry repeats the same quotient rule. Each
   $v$-derivative above is one instance of the general fact that exactly
-  one term of the broken-out $S$ involves $\ell_j$:
+  one term of the broken-out $S$ involves $\ell_j$. In delta form, each
+  term differentiates by \eqref{eq:entry-dv} and the sum sifts
+  \eqref{eq:sift}:
   \begin{equation}
     \pdv{S}{\ell_j}
-    = \pdv{}{\ell_j}\bigl(e^{\ell_0} + \cdots + e^{\ell_j} + \cdots
-    + e^{\ell_{V-1}}\bigr)
+    = \sum_{a<V} \pdv{}{\ell_j}\,e^{\ell_a}
+    = \sum_{a<V} e^{\ell_a}\,\kron{a}{j}
     = e^{\ell_j}.
     \label{eq:softmax-dS}
   \end{equation}
@@ -410,19 +507,8 @@ softmax, so the Jacobian is per-row.
 \end{derivation}
 
 \begin{result}
-  The two cases combine into one expression via the Kronecker delta, the
-  standard notation for an entry of the identity matrix. It is the indicator
-  \eqref{eq:indicator} specialized to an index equality,
-  $\kron{i}{j} = \ind{i = j}$:
-  \begin{equation}
-    \kron{i}{j} \;=\;
-    \begin{cases}
-      1 & i = j,    \\
-      0 & i \neq j,
-    \end{cases}
-    \label{eq:kron}
-  \end{equation}
-  which selects the diagonal case:
+  The two cases combine into one expression via the Kronecker delta
+  \eqref{eq:kron}, which selects the diagonal case:
   \begin{equation}
     \pdv{p_i}{\ell_j} \;=\; p_i\,\bigl(\kron{i}{j} - p_j\bigr).
     \label{eq:softmax-jac}
@@ -436,7 +522,9 @@ softmax, so the Jacobian is per-row.
 \begin{derivation}
   The upstream gradient $\dL{p}$ enters through the chain rule
   \eqref{eq:chain} summed over the row, one full column of the
-  Jacobian \eqref{eq:softmax-jac} per output $i$. Broken out:
+  Jacobian \eqref{eq:softmax-jac} per output $i$. The summed index $j$
+  runs over the upstream coordinates; the free index $i$ names the
+  logit gradient entry being produced. Broken out:
   \begin{align}
     \dL{\ell_i}
      & = \sum_{j<V} \dL{p_j}\,\pdv{p_j}{\ell_i} \notag      \\
@@ -502,8 +590,9 @@ The composition is the case that matters for the model: backprop through
 Jacobian collapse.
 
 \begin{derivation}
-  Write out the chain per logit coordinate, full indices restored
-  (upstream index $i$ over the probabilities, $j$ over the logits):
+  Write out the chain per logit coordinate, full indices restored: the
+  summed index $i$ runs over the probabilities, and the free index $j$
+  names the logit gradient entry being produced:
   \begin{equation}
     \dL{\ell_{bt,j}}
     \;=\;
@@ -596,12 +685,190 @@ Forward: $Y = XW^{\top} + b$ with $X \in \R^{(B\cdot T)\times C_{\text{in}}}$,
 $W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, $b \in \R^{C_{\text{out}}}$.
 
 \begin{derivation}
-  \TODO{Derive $\dL{X}$, $\dL{W}$, $\dL{b}$ from \eqref{eq:chain}; check
-    every shape. Note where the reduction over $B\cdot T$ appears.}
+  Index form throughout: $n$ runs over the $N = B \cdot T$ flattened rows
+  ($n = bt$), $j$ over $C_{\text{in}}$, and $i$ over $C_{\text{out}}$.
+  Read every entry as (row, column):
+  $X_{nj}$ is (position $n$, in-channel $j$);
+  $W_{ij}$ is (out-channel $i$, in-channel $j$);
+  $Y_{ni}$ is (position $n$, out-channel $i$);
+  $b_i$ has the single index (out-channel $i$).
+
+  Differentiation needs a \emph{second}, independent set of index
+  names. Asking how $Y_{ni}$ moves when one entry of $X$ moves must
+  allow the moving entry to be any entry, so the probe entry gets fresh
+  indices: $X_{mk}$ (position $m$, in-channel $k$), and likewise
+  $W_{kl}$ (out-channel $k$, in-channel $l$) and $b_k$. Keeping the
+  target indices $(n, i)$ and the probe indices distinct asks every
+  combination of which-output against which-input at once.
+
+  \paragraph{The transpose under differentiation}
+  By the transpose definition \eqref{eq:transpose},
+  $(W^{\top})_{ji} = W_{ij}$: the same independent variables, relabeled.
+  Applying \eqref{eq:entry-dv} through the relabeling, the transpose
+  changes nothing except which of $W$'s indices is compared with which
+  probe index:
+  \begin{equation}
+    \pdv{(W^{\top})_{ji}}{W_{kl}}
+    \;=\;
+    \pdv{W_{ij}}{W_{kl}}
+    \;=\;
+    \kron{i}{k}\,\kron{j}{l}.
+    \label{eq:transpose-dv}
+  \end{equation}
+  With \eqref{eq:transpose} absorbed and the bias broadcast
+  \eqref{eq:broadcast} written out, the forward in indices is
+  \begin{align}
+    Y_{ni}
+     & = \sum_{j<C_{\text{in}}} X_{nj}\,(W^{\top})_{ji} + b_i
+    = \sum_{j<C_{\text{in}}} X_{nj}\,W_{ij} + b_i \notag      \\
+     & = X_{n0}\,W_{i0} + X_{n1}\,W_{i1}
+    + \cdots + X_{n,C_{\text{in}}-1}\,W_{i,C_{\text{in}}-1}
+    + b_i.
+    \label{eq:matmul-fwd-idx}
+  \end{align}
+
+  \paragraph{Local derivative $\pdv{Y}{X}$}
+  Target $Y_{ni}$ (position $n$, out-channel $i$); probe $X_{mk}$
+  (position $m$, in-channel $k$): four free indices, every pair of
+  output entry against input entry at once. Differentiate the
+  broken-out form \eqref{eq:matmul-fwd-idx} term by term. $W$ and $b$
+  are constants here, and each $X_{nj}$ obeys \eqref{eq:entry-dv}:
+  \begin{align}
+    \pdv{Y_{ni}}{X_{mk}}
+     & = \sum_{j<C_{\text{in}}} W_{ij}\,\pdv{X_{nj}}{X_{mk}}
+    = \sum_{j<C_{\text{in}}} W_{ij}\,\kron{n}{m}\,\kron{j}{k} \notag \\
+     & = \kron{n}{m} \sum_{j<C_{\text{in}}} W_{ij}\,\kron{j}{k}
+    = \kron{n}{m}\,W_{ik}.
+    \label{eq:matmul-dydx}
+  \end{align}
+  The row delta $\kron{n}{m}$ contains no $j$, so it factors out of the
+  sum; the column delta sifts the sum down to $j = k$ by
+  \eqref{eq:sift}. $\kron{n}{m}$ survives because neither $n$ nor $m$
+  is summed here: it waits for the chain rule, recording that row $n$
+  of $Y$ reads only row $m = n$ of $X$.
+
+  \paragraph{Local derivative $\pdv{Y}{W}$}
+  Target $Y_{ni}$, probe $W_{kl}$ (out-channel $k$, in-channel $l$).
+  Now $X$ is the constant and each $W_{ij}$ obeys
+  \eqref{eq:transpose-dv}:
+  \begin{align}
+    \pdv{Y_{ni}}{W_{kl}}
+     & = \sum_{j<C_{\text{in}}} X_{nj}\,\pdv{W_{ij}}{W_{kl}}
+    = \sum_{j<C_{\text{in}}} X_{nj}\,\kron{i}{k}\,\kron{j}{l} \notag \\
+     & = \kron{i}{k} \sum_{j<C_{\text{in}}} X_{nj}\,\kron{j}{l}
+    = \kron{i}{k}\,X_{nl}.
+    \label{eq:matmul-dydw}
+  \end{align}
+  The same shape with the roles swapped: the out-channel delta
+  $\kron{i}{k}$ has no $j$ and factors out unconsumed, while the
+  in-channel delta sifts $j$ down to $l$.
+
+  \paragraph{Local derivative $\pdv{Y}{b}$, and its gotcha}
+  The bias term in \eqref{eq:matmul-fwd-idx} is a bare $b_i$, and $b$
+  is a vector, so \eqref{eq:entry-dv} needs only one index pair:
+  \begin{equation}
+    \pdv{Y_{ni}}{b_k} \;=\; \pdv{b_i}{b_k} \;=\; \kron{i}{k},
+    \label{eq:matmul-dydb}
+  \end{equation}
+  with no dependence on $n$ at all. That is the broadcast: the
+  \emph{same} $b_k$ appears in every one of the $N$ rows of $Y$, so
+  $b_k$ has $N$ distinct output coordinates moving with it. The local
+  derivative looks as innocent as the scalar warm-up
+  (\S\ref{sec:warmup}, $\pdv{z}{b} = 1$). That is exactly what makes it a
+  trap. The fan-out is invisible here. It reappears only in the chain
+  rule, as a sum that is easy to forget.
+
+  \paragraph{Chain rule}
+  $L$ depends on every entry of $Y$, so \eqref{eq:chain} sums over both
+  of the \emph{output's} indices $(n, i)$. The probe indices are the
+  free ones: they name which gradient entry is being produced.
+  \begin{equation}
+    \dL{\theta}
+    \;=\;
+    \sum_{n<N} \sum_{i<C_{\text{out}}}
+    \dL{Y_{ni}}\,\pdv{Y_{ni}}{\theta}.
+    \label{eq:matmul-chain}
+  \end{equation}
+  For the input, substitute \eqref{eq:matmul-dydx}. The surviving row
+  delta now meets the $n$ sum and sifts it down to $n = m$; nothing
+  constrains $i$, so the $i$ sum remains as the contraction with $W$:
+  \begin{align}
+    \dL{X_{mk}}
+     & = \sum_{n<N} \sum_{i<C_{\text{out}}}
+    \dL{Y_{ni}}\,\kron{n}{m}\,W_{ik} \notag          \\
+     & = \sum_{i<C_{\text{out}}} \dL{Y_{mi}}\,W_{ik}
+    = \Bigl(\dL{Y}\,W\Bigr)_{mk},
+    \label{eq:matmul-dx-idx}
+  \end{align}
+  free indices $(m, k)$ on both sides: row $m$, in-channel $k$ of the
+  input gradient. The last step is the recognition rule of
+  \eqref{eq:matprod}: the summed $i$ sits as the column of $\dL{Y}$
+  (entry $\dL{Y_{mi}}$) and the row of $W$ (entry $W_{ik}$), so the sum
+  is a plain product with no transpose.
+  For the weight, substitute \eqref{eq:matmul-dydw}. The out-channel
+  delta sifts the $i$ sum down to $i = k$, but nothing constrains $n$,
+  so the $n$ sum \emph{survives}:
+  \begin{align}
+    \dL{W_{kl}}
+     & = \sum_{n<N} \sum_{i<C_{\text{out}}}
+    \dL{Y_{ni}}\,\kron{i}{k}\,X_{nl} \notag \\
+     & = \sum_{n<N} \dL{Y_{nk}}\,X_{nl}
+    = \left(\dL{Y}^{\top} X\right)_{kl},
+    \label{eq:matmul-dw-idx}
+  \end{align}
+  free indices $(k, l)$: out-channel $k$, in-channel $l$, the entry
+  layout of $W$ itself. Here the recognition rule of \eqref{eq:matprod}
+  forces a transpose: the summed $n$ sits as the \emph{row} of both
+  $\dL{Y}$ and $X$. Transposing the left factor moves it,
+  $(\dL{Y}^{\top})_{kn} = \dL{Y_{nk}}$ by \eqref{eq:transpose}, and the
+  sum becomes a product.
+  For the bias, substitute \eqref{eq:matmul-dydb}. The delta sifts the
+  $i$ sum; the local derivative never mentioned $n$, so the whole $n$
+  sum survives. Broken out:
+  \begin{align}
+    \dL{b_k}
+     & = \sum_{n<N} \sum_{i<C_{\text{out}}}
+    \dL{Y_{ni}}\,\kron{i}{k}
+    = \sum_{n<N} \dL{Y_{nk}} \notag              \\
+     & = \dL{Y_{0k}} + \dL{Y_{1k}} + \dL{Y_{2k}}
+    + \cdots + \dL{Y_{N-1,k}}.
+    \label{eq:matmul-db-idx}
+  \end{align}
+  This is the gotcha of \eqref{eq:matmul-dydb} coming due: the local
+  derivative was a lone $\kron{i}{k}$, but the gradient is a full
+  reduction over all $B \cdot T$ rows. In the scalar warm-up the same
+  formula holds with $N = 1$, which is why $\dL{b} = \dL{z}$ there: the
+  sum was present all along, with one term.
 \end{derivation}
 
 \begin{result}
-  \TODO{$\dL{X} = \;?$, \quad $\dL{W} = \;?$, \quad $\dL{b} = \;?$}
+  \begin{equation}
+    \dL{X} = \dL{Y}\,W,
+    \qquad
+    \dL{W} = \dL{Y}^{\top} X,
+    \qquad
+    \dL{b_k} = \sum_{n<N} \dL{Y_{nk}}.
+    \label{eq:matmul-bwd}
+  \end{equation}
+  Shape checks, with $\dL{Y} \in \R^{N \times C_{\text{out}}}$:
+  $(N \times C_{\text{out}})(C_{\text{out}} \times C_{\text{in}})
+    = N \times C_{\text{in}}$ for $\dL{X}$;
+  $(C_{\text{out}} \times N)(N \times C_{\text{in}})
+    = C_{\text{out}} \times C_{\text{in}}$ for $\dL{W}$;
+  $\dL{b} \in \R^{C_{\text{out}}}$.
+
+  The reduction over $B \cdot T$ appears in $\dL{W}$ and $\dL{b}$ (every
+  position contributes to the same shared parameter: the $\mathrel{+}=$
+  convention of \S\ref{sec:notation}) and not in $\dL{X}$ (each row of
+  the input gets its own gradient row).
+
+  Transpose bookkeeping: the forward carries the transpose
+  ($Y = XW^{\top}$), and two consequences follow. The input gradient
+  needs \emph{no} transpose ($\dL{X} = \dL{Y}\,W$, not
+  $\dL{Y}\,W^{\top}$). And $\dL{W}$ comes out directly in $W$'s own
+  $(C_{\text{out}} \times C_{\text{in}})$ layout, ready for the
+  optimizer. Both facts fall out of
+  \eqref{eq:transpose-dv} rather than being conventions to memorize.
 \end{result}
 
 % =============================================================================
@@ -614,13 +881,112 @@ Forward (tanh approximation, as in llm.c):
   \label{eq:gelu-fwd}
 \end{equation}
 
+Name the inner argument once; everything chains through it:
+\begin{equation}
+  \begin{aligned}
+    u(x)     & = \sqrt{2/\pi}\,\bigl(x + 0.044715\,x^{3}\bigr), \\
+    \gelu(x) & = \tfrac{1}{2}\,x\,\bigl(1 + \tanh u\bigr).
+  \end{aligned}
+  \label{eq:gelu-u}
+\end{equation}
+
 \begin{derivation}
-  \TODO{Differentiate \eqref{eq:gelu-fwd}. Elementwise, so the chain rule is
-    a pointwise product.}
+  The object is the scalar derivative $\gelu'(x)$. How it enters the
+  chain rule is recorded in the result.
+
+  \paragraph{Product rule on the definition}
+  \eqref{eq:gelu-u} is a product of $\tfrac{1}{2}x$ and
+  $(1 + \tanh u)$:
+  \begin{equation}
+    \gelu'(x)
+    \;=\;
+    \tfrac{1}{2}\bigl(1 + \tanh u\bigr)
+    + \tfrac{1}{2}\,x\,\pdv{}{x}\tanh u.
+    \label{eq:gelu-product}
+  \end{equation}
+
+  \paragraph{The tanh derivative via $\operatorname{sech}^2$}
+  The derivative of $\tanh$ is $\operatorname{sech}^{2}$, and the inner
+  function chains through it:
+  \begin{equation}
+    \pdv{}{x}\tanh u
+    \;=\;
+    \operatorname{sech}^{2}(u)\,u'(x),
+    \label{eq:gelu-sech}
+  \end{equation}
+  with the polynomial derivative of the inner argument
+  \begin{align}
+    u'(x)
+     & = \sqrt{2/\pi}\,\bigl(1 + 3 \cdot 0.044715\,x^{2}\bigr) \notag \\
+     & = \sqrt{2/\pi}\,\bigl(1 + 0.134145\,x^{2}\bigr).
+    \label{eq:gelu-du}
+  \end{align}
+
+  \paragraph{Converting $\operatorname{sech}^2$ to $1 - \tanh^2$}
+  Divide the hyperbolic Pythagorean identity
+  $\cosh^{2} u - \sinh^{2} u = 1$ through by $\cosh^{2} u$:
+  \begin{equation}
+    1 - \tanh^{2} u \;=\; \operatorname{sech}^{2} u,
+    \label{eq:sech-tanh}
+  \end{equation}
+  so \eqref{eq:gelu-sech} needs no separate $\operatorname{sech}$
+  evaluation:
+  \begin{equation}
+    \pdv{}{x}\tanh u
+    \;=\;
+    \bigl(1 - \tanh^{2} u\bigr)\,u'(x).
+    \label{eq:gelu-tanhprime}
+  \end{equation}
+
+  \paragraph{The derivative rolls into the definition}
+  $\tanh$ differentiates into a function of itself,
+  $\tanh' = 1 - \tanh^{2}$, and $\tanh u$ already sits inside the
+  forward \eqref{eq:gelu-u}. Solving the definition for it (for
+  $x \neq 0$):
+  \begin{equation}
+    1 + \tanh u = \frac{2\,\gelu(x)}{x}
+    \;\Longrightarrow\;
+    \tanh u = \frac{2\,\gelu(x)}{x} - 1.
+    \label{eq:gelu-self}
+  \end{equation}
+  Substituting \eqref{eq:gelu-tanhprime} into
+  \eqref{eq:gelu-product}, every quantity the derivative needs is
+  either $x$ itself or the $\tanh u$ the forward already computed:
+  \begin{align}
+    \gelu'(x)
+     & = \tfrac{1}{2}\bigl(1 + \tanh u\bigr)
+    + \tfrac{1}{2}\,x\,\bigl(1 - \tanh^{2} u\bigr)\,u'(x) \notag \\
+     & = \frac{\gelu(x)}{x}
+    + \tfrac{1}{2}\,x\,\bigl(1 - \tanh^{2} u\bigr)\,u'(x).
+    \label{eq:gelu-rolled}
+  \end{align}
 \end{derivation}
 
 \begin{result}
-  \TODO{$\gelu'(x) = \;?$}
+  \begin{equation}
+    \gelu'(x)
+    \;=\;
+    \tfrac{1}{2}\bigl(1 + \tanh u\bigr)
+    + \tfrac{1}{2}\,x\,\bigl(1 - \tanh^{2} u\bigr)\,u'(x),
+    \label{eq:gelu-bwd}
+  \end{equation}
+  with $u$ and $u'$ from \eqref{eq:gelu-u} and \eqref{eq:gelu-du}. One
+  evaluation of $\tanh u$ serves both terms: the self-reference
+  $\tanh' = 1 - \tanh^{2}$ \eqref{eq:sech-tanh} replaces
+  $\operatorname{sech}$, and via \eqref{eq:gelu-self} the first
+  term is the forward output divided by $x$. At $x = 0$ use
+  \eqref{eq:gelu-bwd} directly: $u(0) = 0$ and $\tanh 0 = 0$ give
+  $\gelu'(0) = \tfrac{1}{2}$ (the $\gelu(x)/x$ form of
+  \eqref{eq:gelu-rolled} is singular there).
+
+  GELU is elementwise: one output coordinate moves with exactly one
+  input coordinate. By \eqref{eq:entry-dv} the Jacobian is diagonal,
+  \begin{equation}
+    \pdv{\gelu(x_a)}{x_b} \;=\; \gelu'(x_a)\,\kron{a}{b},
+    \label{eq:gelu-diag}
+  \end{equation}
+  and the chain rule \eqref{eq:chain} sifts \eqref{eq:sift} to a
+  pointwise product: $\dL{x_a} = \dL{y_a}\,\gelu'(x_a)$.
 \end{result}
 
 % =============================================================================

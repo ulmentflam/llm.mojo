@@ -5,11 +5,15 @@ from a typed list of positional arguments (`MutableBuf`, `ReadTensor`,
 `ScalarArg`), compiles, executes, and returns post-step numpy views of
 every mutable buffer.
 
-Compiled models are cached on (kernel name, device, arg signature) —
-scalars are runtime 0-d tensor inputs rather than baked constants, so a
-multi-step trajectory (varying `t`, same shapes/dtypes) compiles exactly
-once. This is what keeps the equivalence suite fast; don't switch scalars
-back to `ops.constant` without re-measuring.
+Compiled models are cached on (kernel name, device, dtypes/ranks,
+parameters) — tensor dims are symbolic graph dims and scalars are runtime
+0-d tensor inputs rather than baked constants, so neither a new shape nor
+a new scalar value recompiles: a multi-step trajectory (varying `t`) and a
+multi-case shape sweep each compile exactly once per kernel/dtype. This is
+what keeps the equivalence suite fast; don't switch scalars back to
+`ops.constant` or dims back to concrete shapes without re-measuring
+(symbolic-dim support verified against this MAX version by
+~/Workspace/scripts/probe_symbolic_dims.py).
 
 Per-kernel wrappers (e.g., `tests.kernels.adamw.step`) live under
 `tests/kernels/` and just package their kernel's parameters into the right
@@ -44,6 +48,9 @@ if TYPE_CHECKING:
     from max.engine import InferenceSession, Model
 
 
+# Source dir by default; conftest's _packaged_kernels fixture reassigns
+# this to a per-session prebuilt .mojopkg so MAX never repackages the
+# sources into its shared (and race-prone) temp mojo_pkg cache.
 MOJO_KERNELS_DIR = Path(__file__).resolve().parents[1] / "llmm"
 
 
@@ -124,10 +131,11 @@ def pick_device():
 
 
 # Compiled-model cache. Keyed on everything that shapes the graph:
-# kernel name, device, and each arg's (kind, dtype, shape). Scalar *values*
-# are deliberately absent — they're runtime inputs, so 65 optimizer steps
-# hit one entry. Sessions are cached alongside models because a model is
-# only valid while its session lives.
+# kernel name, device, and each arg's (kind, dtype, rank). Shapes and
+# scalar *values* are deliberately absent — dims are symbolic and scalars
+# are runtime inputs, so 65 optimizer steps and a multi-shape case sweep
+# each hit one entry. Sessions are cached alongside models because a model
+# is only valid while its session lives.
 _MODEL_CACHE: dict[tuple, "Model"] = {}
 _SESSION_CACHE: dict[tuple, "InferenceSession"] = {}
 _DEFAULT_DEVICE: "Device | None" = None
@@ -139,13 +147,21 @@ def _signature(
     parts: list[tuple] = []
     for a in args:
         if isinstance(a, MutableBuf):
-            parts.append(("mut", a.dtype_name, a.array.shape))
+            parts.append(("mut", a.dtype_name, a.array.ndim))
         elif isinstance(a, ReadTensor):
-            parts.append(("read", a.dtype_name, a.array.shape))
+            parts.append(("read", a.dtype_name, a.array.ndim))
         else:
             parts.append(("scalar", a.dtype_name))
     params = tuple(sorted((parameters or {}).items()))
     return (kernel_name, type(device).__name__, str(device), tuple(parts), params)
+
+
+def _symbolic_shape(slot: int, arr: np.ndarray) -> list[str]:
+    """All-distinct named dims for graph input `slot`. The kernels learn
+    their true sizes at runtime (scalar args / .size()), so the graph needs
+    no cross-input dim constraints — and shape-free input types are what
+    let one compiled model serve every test-case shape (see _MODEL_CACHE)."""
+    return [f"arg{slot}_dim{d}" for d in range(arr.ndim)]
 
 
 def _compile_model(
@@ -159,15 +175,20 @@ def _compile_model(
     cpu_ref = DeviceRef.from_device(CPU())
 
     # Every arg — tensor or scalar — is a graph input, in kernel order.
-    # Scalars are 0-d tensors pinned to CPU (mirroring where the old
-    # `ops.constant` scalars lived).
+    # Tensor dims are symbolic (see _symbolic_shape) so the model binds
+    # shapes at execute time. Scalars are 0-d tensors pinned to CPU
+    # (mirroring where the old `ops.constant` scalars lived).
     input_types: list = []
-    for a in args:
+    for slot, a in enumerate(args):
         t = max_dtype(a.dtype_name)
         if isinstance(a, MutableBuf):
-            input_types.append(BufferType(t, shape=list(a.array.shape), device=dev_ref))
+            input_types.append(
+                BufferType(t, shape=_symbolic_shape(slot, a.array), device=dev_ref)
+            )
         elif isinstance(a, ReadTensor):
-            input_types.append(TensorType(t, shape=list(a.array.shape), device=dev_ref))
+            input_types.append(
+                TensorType(t, shape=_symbolic_shape(slot, a.array), device=dev_ref)
+            )
         else:
             input_types.append(TensorType(t, shape=[], device=cpu_ref))
 
@@ -241,7 +262,15 @@ def run_custom_op(
     key = _signature(kernel_name, args, device, parameters)
     model = _MODEL_CACHE.get(key)
     if model is None:
-        session, model = _compile_model(kernel_name, args, device, parameters)
+        try:
+            session, model = _compile_model(kernel_name, args, device, parameters)
+        except KernelSignatureMismatch:
+            # MAX occasionally fails a load nondeterministically ("Failed to
+            # compile the model ... should have been caught during
+            # construction") on a graph that compiles fine seconds later.
+            # One retry separates that flake from a real signature mismatch,
+            # which fails identically both times.
+            session, model = _compile_model(kernel_name, args, device, parameters)
         _SESSION_CACHE[key] = session
         _MODEL_CACHE[key] = model
 

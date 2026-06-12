@@ -194,6 +194,10 @@ test-mojo:
 		echo "No mojo tests found, skipping."; \
 	fi
 
+# Sequential: parallel (-n 6 --dist loadfile) measured only ~10% faster at
+# best and slower under any other load — MAX compiles are already
+# multi-threaded, so workers oversubscribe the cores. Measurements in
+# tests/conftest.py.
 test-python:
 	pixi run pytest tests/ -v
 

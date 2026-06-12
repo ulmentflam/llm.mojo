@@ -21,6 +21,8 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceAttribute
 from std.runtime.asyncrt import DeviceContextPtr, parallelism_level
 
+from llmm.gelu import gelu, gelu_grad
+
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
@@ -86,8 +88,7 @@ def matmul_fwd[
 
         comptime if use_gelu:
             (pre_gelu_ptr + offset).store(v.cast[dtype]())
-            # TODO: Implement gelu and add it here
-            # (out_ptr + offset).store(gelu(v).cast[dtype]())
+            (out_ptr + offset).store(gelu(v).cast[dtype]())
         else:
             (out_ptr + offset).store(v.cast[dtype]())
 
@@ -392,8 +393,12 @@ def matmul_d_input_bwd[
         ](idx: IndexList[2], val: SIMD[c_dtype, width]) -> None:
             var offset = idx[0] * in_channels + idx[1]
             var v = val.cast[DType.float32]()
-            # TODO: Implement gelu_grad or bwd and apply it here
-            # v *= gelu_grad(pre_gelu[offset])
+            var pre_gelu = (
+                (pre_gelu_ptr + offset)
+                .load[width=width]()
+                .cast[DType.float32]()
+            )
+            v *= gelu_grad(pre_gelu)
             (d_input_ptr + offset).store(v.cast[dtype]())
 
         matmul[
@@ -673,11 +678,14 @@ struct MatmulBwd:
         )
         # The use_gelu=False instantiation contains no loads from pre_gelu
         # (comptime-dead code), so a dummy buffer of any size is sound there.
+        # pre_gelu here is the pre-activation of this matmul's INPUT (llm.c
+        # composition: d_input = (d_output @ W) * gelu'(pre_gelu)), so it has
+        # d_input's shape, not the forward's (B*T, OC).
         comptime if use_gelu:
-            if pre_gelu.size() != Int(batch_size * seq_len * output_channels):
+            if pre_gelu.size() != Int(batch_size * seq_len * channels):
                 raise Error(
                     "pre_gelu must have the same size as batch_size * seq_len"
-                    " * output_channels"
+                    " * channels"
                 )
         matmul_bwd[dtype, target, use_gelu=use_gelu, accumulate=accumulate](
             d_input.unsafe_ptr(),

@@ -7,12 +7,13 @@ with d_output. Properties beyond plain closeness:
   *  accumulate=True (llm.c beta=1 contract): calling backward twice must
      exactly double d_weight/d_bias while d_input is overwritten, and
      accumulate=False must overwrite garbage-filled grad buffers.
-  *  use_gelu forward: pre_gelu must equal the bias-added matmul. The GELU
-     application itself is still a kernel TODO, so `out` is deliberately
-     not asserted on that path yet.
+  *  use_gelu forward: out = gelu(x @ W^T + b) and pre_gelu must hold the
+     bias-added matmul (the value the backward consumes).
   *  use_gelu backward: d_weight/d_bias consume d_output directly and are
-     gelu-independent; they must match the plain backward even before
-     gelu_grad lands. d_input on that path is pending the same TODO.
+     gelu-independent; d_input applies gelu'(pre_gelu), where pre_gelu is
+     the pre-activation of the op's INPUT (llm.c composition: this matmul
+     follows the gelu, so the fused epilogue replaces a separate
+     gelu_backward pass).
 
 Inputs are round-tripped through the kernel dtype so the kernel and the
 reference consume bit-identical values (mismatches are then kernel
@@ -175,8 +176,8 @@ def test_forward_matches_torch(case: Case) -> None:
 
 @pytest.mark.parametrize("case", CASES, ids=_ids)
 def test_forward_gelu_pre_gelu_matches_linear(case: Case) -> None:
-    """pre_gelu must hold the bias-added matmul. `out` is not asserted:
-    the gelu application in the kernel epilogue is still a TODO."""
+    """pre_gelu must hold the bias-added matmul. `out` is asserted
+    separately in test_forward_gelu_out_matches_torch."""
     x, w, b, _ = _make_operands(case)
     _, pre_gelu = _run_forward(case, x, w, b, use_gelu=True)
     expected = torch.from_numpy(x) @ torch.from_numpy(w).T + torch.from_numpy(b)
@@ -243,17 +244,6 @@ def test_backward_no_accumulate_overwrites(case: Case) -> None:
     assert d_input.shape == (rows, case.channels)
 
 
-GELU_FWD_TODO = (
-    "kernel gelu TODO: the use_gelu forward epilogue stores only pre_gelu;"
-    " enable once gelu(v) lands in matmul_fwd"
-)
-GELU_BWD_TODO = (
-    "kernel gelu_grad TODO: the use_gelu d_input epilogue stores the raw"
-    " matmul; enable once gelu_grad lands in matmul_d_input_bwd"
-)
-
-
-@pytest.mark.skip(reason=GELU_FWD_TODO)
 @pytest.mark.parametrize("case", CASES, ids=_ids)
 def test_forward_gelu_out_matches_torch(case: Case) -> None:
     """out must be gelu(x @ W^T + b), llm.c tanh approximation."""
@@ -264,7 +254,6 @@ def test_forward_gelu_out_matches_torch(case: Case) -> None:
     np.testing.assert_allclose(out, expected.numpy(), **TOLERANCES[case.dtype])
 
 
-@pytest.mark.skip(reason=GELU_BWD_TODO)
 @pytest.mark.parametrize("case", CASES, ids=_ids)
 def test_backward_gelu_d_input_matches_torch(case: Case) -> None:
     """llm.c composition: the op's x input is the POST-gelu activation
@@ -297,18 +286,19 @@ def test_backward_gelu_d_input_matches_torch(case: Case) -> None:
 @pytest.mark.parametrize("case", CASES, ids=_ids)
 def test_backward_gelu_weight_and_bias_grads(case: Case) -> None:
     """d_weight/d_bias are gelu-independent (they consume d_output
-    directly), so the use_gelu path must already match torch. d_input on
-    this path is pending the kernel's gelu_grad TODO and is not asserted."""
+    directly), so the use_gelu path must match the plain torch grads no
+    matter what pre_gelu holds; x stands in for the (B*T, C)
+    pre-activation. d_input on this path is asserted in
+    test_backward_gelu_d_input_matches_torch."""
     x, w, b, d_out = _make_operands(case)
     _, ref_dw, ref_db = _torch_grads(x, w, b, d_out)
-    _, pre_gelu = _run_forward(case, x, w, b, use_gelu=True)
     _, d_weight, d_bias = _run_backward(
         case,
         d_out,
         x,
         w,
         use_gelu=True,
-        pre_gelu=to_storage(pre_gelu, case.dtype),
+        pre_gelu=to_storage(x, case.dtype),
     )
     tol = TOLERANCES[case.dtype]
     np.testing.assert_allclose(d_weight, ref_dw, **tol)

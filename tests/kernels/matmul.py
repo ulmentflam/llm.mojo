@@ -42,8 +42,7 @@ def forward(
     """(out, pre_gelu) through the registered matmul_fwd op.
 
     out = x @ weight^T + bias; with use_gelu, pre_gelu holds that value and
-    out gets gelu(pre_gelu). NOTE: until the kernel's gelu TODO lands, the
-    use_gelu=True epilogue writes only pre_gelu; `out` is unwritten there.
+    out gets gelu(pre_gelu).
     """
     rows = batch_size * seq_len
     storage = NP_STORAGE_DTYPES[dtype_name]
@@ -81,7 +80,8 @@ def backward(
     dtype_name: str,
     use_gelu: bool = False,
     accumulate: bool = True,
-    pre_gelu: np.ndarray | None = None,  # required when use_gelu
+    pre_gelu: np.ndarray
+    | None = None,  # (B*T, C) pre-activation of x; required when use_gelu
     d_input: np.ndarray | None = None,
     d_weight: np.ndarray | None = None,
     d_bias: np.ndarray | None = None,
