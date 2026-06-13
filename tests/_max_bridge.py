@@ -37,9 +37,14 @@ After reading `max.graph.ops.custom` + the production op
 
 from __future__ import annotations
 
+import hashlib
+import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Literal, Union
 
 import numpy as np
 
@@ -48,10 +53,132 @@ if TYPE_CHECKING:
     from max.engine import InferenceSession, Model
 
 
-# Source dir by default; conftest's _packaged_kernels fixture reassigns
-# this to a per-session prebuilt .mojopkg so MAX never repackages the
-# sources into its shared (and race-prone) temp mojo_pkg cache.
+# Source dir by default; `_ensure_packaged` reassigns this to a prebuilt
+# .mojopkg before any compile so MAX never repackages the sources into its
+# shared (and race-prone) temp mojo_pkg cache. Compiling custom_extensions
+# from the SOURCE dir makes MAX repackage it into one shared temp .mojopkg
+# (/var/folders/.../.modular_*/mojo_pkg/, content-hashed name) on every
+# Graph build, rewritten non-atomically and read back immediately. That
+# file is the root of the nondeterministic "Failed to compile the model"
+# flakes: a single process can read its own half-written package, and
+# concurrent pytest runs tear each other's down (observed corrupt "invalid
+# magic bytes" leftovers that poison later runs until deleted). A prebuilt
+# package is loaded directly — the temp dir is never created (verified).
 MOJO_KERNELS_DIR = Path(__file__).resolve().parents[1] / "llmm"
+_SOURCE_KERNELS_DIR = MOJO_KERNELS_DIR
+
+# Persistent compiled-model cache (tests/.mef_cache/<fingerprint>/). A MAX
+# model compile costs 4-10s per (kernel, dtype, parameters) and the suite
+# triggers ~30 of them: that was ~90% of a cold suite's wall clock. A
+# compiled model exported as MEF reloads in milliseconds with outputs
+# verified bit-identical and symbolic dims intact
+# (~/Workspace/scripts/probe_mef_cache.py), so each compile is paid once
+# per kernel-source change, not once per pytest run. The fingerprint dir
+# name hashes the llmm/*.mojo sources, the MAX version, the mojo binary,
+# and _MEF_SCHEMA: editing a kernel lands in a fresh dir, and stale dirs
+# are pruned. Set LLMM_DISABLE_MEF_CACHE=1 to force full recompiles.
+# `mojo package` output is NOT bit-stable across identical sources
+# (verified), hence hashing sources rather than the package.
+_MEF_CACHE_ROOT = Path(__file__).resolve().parent / ".mef_cache"
+_MEF_SCHEMA = 1  # bump when _compile_model's graph construction changes
+_MEF_CACHE_DIR: "Path | None | Literal[False]" = False  # False = unresolved
+
+
+def _mef_cache_dir() -> "Path | None":
+    """Fingerprint-named cache dir for this kernel-source + toolchain state,
+    or None when disabled / sources unlocatable. Resolved once per process;
+    stale sibling fingerprints are pruned on first resolution."""
+    global _MEF_CACHE_DIR
+    if _MEF_CACHE_DIR is not False:
+        return _MEF_CACHE_DIR
+    _MEF_CACHE_DIR = None
+    if os.environ.get("LLMM_DISABLE_MEF_CACHE"):
+        return None
+    sources = sorted(_SOURCE_KERNELS_DIR.rglob("*.mojo"))
+    if not sources:
+        return None
+    h = hashlib.sha256()
+    h.update(f"schema={_MEF_SCHEMA}".encode())
+    try:
+        from max import _core
+
+        h.update(f"max={_core.__version__}".encode())
+    except Exception:
+        h.update(b"max=unknown")
+    mojo = shutil.which("mojo")
+    if mojo:
+        st = Path(mojo).resolve().stat()
+        h.update(f"mojo={st.st_size}:{st.st_mtime_ns}".encode())
+    for f in sources:
+        h.update(f.relative_to(_SOURCE_KERNELS_DIR).as_posix().encode())
+        h.update(f.read_bytes())
+    cache = _MEF_CACHE_ROOT / h.hexdigest()[:16]
+    cache.mkdir(parents=True, exist_ok=True)
+    for sibling in _MEF_CACHE_ROOT.iterdir():
+        if sibling != cache:
+            shutil.rmtree(sibling, ignore_errors=True)
+    _MEF_CACHE_DIR = cache
+    return cache
+
+
+def _ensure_packaged(echo_warnings: bool = False) -> Path:
+    """Build llmm.mojopkg once (per kernel-source state) and reuse it.
+
+    Lazy: a fully MEF-cached run never compiles a graph, so it never pays
+    for packaging either. The package lands in the fingerprint cache dir
+    (reused across runs); with the cache disabled it falls back to a
+    per-process temp dir. Written via temp file + os.replace so concurrent
+    pytest processes can't read a half-written package.
+
+    With echo_warnings (the `make build-mojo` path), mojo's compile
+    warnings are forwarded to stderr instead of swallowed.
+    """
+    global MOJO_KERNELS_DIR
+    if MOJO_KERNELS_DIR.suffix == ".mojopkg" and MOJO_KERNELS_DIR.exists():
+        return MOJO_KERNELS_DIR
+    cache = _mef_cache_dir()
+    if cache is None:
+        target = Path(tempfile.mkdtemp(prefix="llmm_pkg_")) / "llmm.mojopkg"
+    else:
+        target = cache / "llmm.mojopkg"
+        if target.exists():
+            MOJO_KERNELS_DIR = target
+            return target
+    # The package embeds its module name from the build-time FILENAME
+    # (a `llmm.tmp123.mojopkg` build leaves kernels under `llmm.tmp123.*`,
+    # which MAX's generated code then can't resolve), so the temp build
+    # must be named exactly llmm.mojopkg; uniqueness comes from a
+    # per-process scratch dir beside the target (same filesystem, so the
+    # final os.replace stays atomic).
+    scratch = target.parent / f".pkg_build{os.getpid()}"
+    scratch.mkdir(parents=True, exist_ok=True)
+    tmp = scratch / target.name
+    try:
+        proc = subprocess.run(
+            ["mojo", "package", str(_SOURCE_KERNELS_DIR), "-o", str(tmp)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        os.replace(tmp, target)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "`mojo` not on PATH; run the suite via `pixi run pytest` or "
+            "activate the pixi env (see CLAUDE notes)."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"mojo package failed:\n{e.stderr}") from e
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if echo_warnings and proc.stderr:
+        import sys
+
+        noise = ("Crashpad",)
+        for line in proc.stderr.splitlines():
+            if not any(n in line for n in noise):
+                print(line, file=sys.stderr)
+    MOJO_KERNELS_DIR = target
+    return target
 
 
 class KernelSignatureMismatch(RuntimeError):
@@ -209,7 +336,7 @@ def _compile_model(
             kernel_name,
             forward=forward,
             input_types=input_types,
-            custom_extensions=[MOJO_KERNELS_DIR],
+            custom_extensions=[_ensure_packaged()],
         )
         session = InferenceSession(devices=[device])
         model = session.load(graph)
@@ -222,6 +349,46 @@ def _compile_model(
             f"arguments map to the kernel.\nUnderlying error: {e}"
         ) from e
     return session, model
+
+
+def _load_cached_mef(
+    kernel_name: str, key: tuple, device
+) -> "tuple[InferenceSession | None, Model | None, Path | None]":
+    """(session, model, mef_path) for `key` from the disk cache.
+
+    model is None on a miss (corrupt or version-stale files load-fail and
+    count as misses; the subsequent compile overwrites them). mef_path is
+    where a freshly compiled model should be exported, or None when the
+    cache is disabled.
+    """
+    cache = _mef_cache_dir()
+    if cache is None:
+        return None, None, None
+    sig = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+    mef = cache / f"{kernel_name}-{sig}.mef"
+    if mef.exists():
+        from max.engine import InferenceSession
+
+        try:
+            session = InferenceSession(devices=[device])
+            return session, session.load(mef), mef
+        except Exception:
+            pass
+    return None, None, mef
+
+
+def _export_mef(model: "Model", mef: "Path | None") -> None:
+    """Persist a freshly compiled model for future runs. Best-effort (the
+    suite just recompiles next run if it fails); temp file + os.replace so
+    concurrent pytest processes never see a partial write."""
+    if mef is None:
+        return
+    tmp = mef.with_name(f"{mef.name}.tmp{os.getpid()}")
+    try:
+        model._export_mef(str(tmp))
+        os.replace(tmp, mef)
+    except Exception:
+        tmp.unlink(missing_ok=True)
 
 
 def run_custom_op(
@@ -262,15 +429,18 @@ def run_custom_op(
     key = _signature(kernel_name, args, device, parameters)
     model = _MODEL_CACHE.get(key)
     if model is None:
-        try:
-            session, model = _compile_model(kernel_name, args, device, parameters)
-        except KernelSignatureMismatch:
-            # MAX occasionally fails a load nondeterministically ("Failed to
-            # compile the model ... should have been caught during
-            # construction") on a graph that compiles fine seconds later.
-            # One retry separates that flake from a real signature mismatch,
-            # which fails identically both times.
-            session, model = _compile_model(kernel_name, args, device, parameters)
+        session, model, mef = _load_cached_mef(kernel_name, key, device)
+        if model is None or session is None:
+            try:
+                session, model = _compile_model(kernel_name, args, device, parameters)
+            except KernelSignatureMismatch:
+                # MAX occasionally fails a load nondeterministically ("Failed
+                # to compile the model ... should have been caught during
+                # construction") on a graph that compiles fine seconds later.
+                # One retry separates that flake from a real signature
+                # mismatch, which fails identically both times.
+                session, model = _compile_model(kernel_name, args, device, parameters)
+            _export_mef(model, mef)
         _SESSION_CACHE[key] = session
         _MODEL_CACHE[key] = model
 
@@ -346,3 +516,11 @@ def _from_device_buffer(buf, dtype_name: str) -> np.ndarray:
         # Pull back via dlpack and reinterpret as uint16 for numpy storage.
         return torch.from_dlpack(buf).view(torch.uint16).cpu().numpy()
     return buf.to_numpy()
+
+
+if __name__ == "__main__":
+    # `python -m tests._max_bridge`: the build half of the test chain.
+    # Builds (or reuses) llmm.mojopkg in the persistent cache and prints
+    # its path, so `make build-mojo` produces exactly the artifact the
+    # test step consumes; rerunning with unchanged sources is a no-op.
+    print(_ensure_packaged(echo_warnings=True))

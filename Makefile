@@ -24,7 +24,7 @@ help:
 	@echo "  lint-cuda     Lint CUDA sources with clang-format and clang-tidy"
 	@echo "  lint-latex    Lint LaTeX sources with latexindent (check only)"
 	@echo "  typecheck     Type-check Python sources with pyrefly"
-	@echo "  build-mojo    Compile the llmm package; surfaces Mojo warnings and parse errors"
+	@echo "  build-mojo    Compile llmm.mojopkg into the test cache; surfaces Mojo warnings"
 	@echo ""
 	@echo "Formatting:"
 	@echo "  format        Format Python, Mojo, C, CUDA, and LaTeX sources"
@@ -50,11 +50,14 @@ help:
 
 check: lint typecheck build-mojo
 
+# Builds llmm.mojopkg into the persistent cache the pytest suite consumes
+# (tests/.mef_cache/<source-fingerprint>/llmm.mojopkg, via the bridge so
+# the fingerprint logic lives in one place). Content-addressed: a no-op
+# when sources are unchanged, so chaining it before test-python costs
+# nothing on warm runs while keeping the two steps independently runnable.
 build-mojo:
 	@if [ -d llmm ]; then \
-		tmpdir=$$(mktemp -d); \
-		trap "rm -rf $$tmpdir" EXIT; \
-		pixi run mojo package llmm -o "$$tmpdir/llmm.mojopkg"; \
+		pixi run python -m tests._max_bridge; \
 	else \
 		echo "No llmm package found, skipping mojo build."; \
 	fi
@@ -197,8 +200,10 @@ test-mojo:
 # Sequential: parallel (-n 6 --dist loadfile) measured only ~10% faster at
 # best and slower under any other load — MAX compiles are already
 # multi-threaded, so workers oversubscribe the cores. Measurements in
-# tests/conftest.py.
-test-python:
+# tests/conftest.py. Compiled models persist in tests/.mef_cache (see
+# tests/_max_bridge.py): warm runs take seconds, and only a kernel-source
+# change pays compiles again.
+test-python: build-mojo
 	pixi run pytest tests/ -v
 
 test-fixtures:
@@ -211,4 +216,4 @@ docs-clean:
 	latexmk -c -quiet -cd docs/backprop.tex
 
 clean:
-	rm -rf .ruff_cache .pyrefly_cache tests/fixtures
+	rm -rf .ruff_cache .pyrefly_cache tests/fixtures tests/.mef_cache

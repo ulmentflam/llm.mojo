@@ -11,6 +11,9 @@ data/.*/
 # Generated test fixtures (rebuild with `make test-fixtures`)
 tests/fixtures/
 
+# Compiled-model cache for the pytest suite (see tests/_max_bridge.py)
+tests/.mef_cache/
+
 # ---------- macOS ----------
 .DS_Store
 .AppleDouble
