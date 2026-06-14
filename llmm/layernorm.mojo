@@ -875,6 +875,10 @@ def layernorm_bwd[
         comptime BLOCK_SIZE = 256
         comptime SM_OVERPROVISION = 32
         comptime width = 4
+        # NOTE: This two kernel method needs to be profiled on the GPU.
+        # Karpathy uses a single kernel to compute the gradient of the input, weight, and bias.
+        # In theory this should be faster than the two kernel method, but mojo's compiler is very smart
+        # and it might be able to optimize the two kernel method to be as fast as the single kernel method.
         var device_ctx = ctx.get_device_context()
         var num_rows = Int(batch_size * seq_len)
         var num_sm = device_ctx.get_attribute(
