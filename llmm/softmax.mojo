@@ -181,7 +181,7 @@ def softmax_phase_1_and_2_gpu[
             var idx = row * vocab_size_padded + lane_base
             _softmax_comp_max[dtype, width](idx, logits_ptr, s, m)
         elif lane_base < vocab_size:
-            # Ragged edge of the last tile
+            # Ragged edge of the last tile.
             # This is so every thread keeps the same tile trip count for the reductions.
             for i in range(lane_base, vocab_size):
                 var idx = row * vocab_size_padded + i
