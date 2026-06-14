@@ -995,22 +995,73 @@ Name the inner argument once; everything chains through it:
 Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
 \begin{equation}
   \begin{aligned}
-    \mu & = \tfrac{1}{C}\sum_i x_i,
+    \mu & = \tfrac{1}{C}\sum_j x_j,
     \qquad
-    \sigma^2 = \tfrac{1}{C}\sum_i (x_i - \mu)^2,                                 \\
-    y_i & = \gamma_i\,\frac{x_i - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \beta_i.
+    \sigma^2 = \tfrac{1}{C}\sum_j (x_j - \mu)^2 + \varepsilon,                                 \\
+    \hat{x}_i & = \frac{x_i - \mu}{\sqrt{\sigma^2}}, \\
+    y_i & = \gamma_i\,\hat{x}_i + \beta_i.
   \end{aligned}
   \label{eq:ln-fwd}
 \end{equation}
 
 \begin{derivation}
-  \TODO{The interesting one: $\mu$ and $\sigma^2$ both depend on every
-    $x_j$, so $\pdv{y_i}{x_j}$ has three terms. Work it via
-    $\hat{x}_i = (x_i - \mu)/\sqrt{\sigma^2 + \varepsilon}$.}
+  We compute the partial derivatives of the output $y_i$ with respect to its
+  parameters and inputs. Note that $y_i$ depends on every $x_j$ in the row
+  through the statistics $\mu$ and $\sigma^2$.
+
+  \paragraph{Parameter partials}
+  The output $y_i$ depends only on its own channel's scale and shift:
+  \begin{equation}
+    \pdv{y_i}{\gamma_i} = \frac{x_i - \mu}{\sqrt{\sigma^2}},
+    \qquad
+    \pdv{y_i}{\beta_i} = 1.
+    \label{eq:ln-dydparam}
+  \end{equation}
+
+  \paragraph{Input partials}
+  To find the Jacobian $\pdv{y_j}{x_i}$, we first differentiate the row
+  statistics. Each $x_i$ contributes $1/C$ to the mean and $2(x_i - \mu)/C$
+  to the variance:
+  \begin{equation}
+    \pdv{\mu}{x_i} = \frac{1}{C},
+    \qquad
+    \pdv{\sigma^2}{x_i} = \frac{2(x_i - \mu)}{C}.
+    \label{eq:ln-dstats}
+  \end{equation}
+  Now differentiate the normalized value $\hat{x}_j$ with respect to $x_i$
+  using the quotient rule on $\hat{x}_j = (x_j - \mu)(\sigma^2)^{-1/2}$:
+  \begin{align}
+    \pdv{\hat{x}_j}{x_i}
+     & = \pdv{}{x_i} \left( \frac{x_j - \mu}{\sqrt{\sigma^2}} \right) \notag \\
+     & = \frac{(\kron{j}{i} - \frac{1}{C})\sqrt{\sigma^2} - (x_j - \mu)\frac{1}{2}(\sigma^2)^{-1/2}\pdv{\sigma^2}{x_i}}{\sigma^2} \notag \\
+     & = \frac{1}{\sqrt{\sigma^2}} \left( \kron{j}{i} - \frac{1}{C} - \frac{(x_j - \mu)(x_i - \mu)}{C\sigma^2} \right).
+    \label{eq:ln-dxhatdx}
+  \end{align}
+  The partial $\pdv{y_j}{x_i} = \gamma_j \pdv{\hat{x}_j}{x_i}$ records how
+  every output in the row is affected by a change in $x_i$.
 \end{derivation}
 
 \begin{result}
-  \TODO{$\dL{x_j} = \;?$, \quad $\dL{\gamma_i} = \;?$, \quad $\dL{\beta_i} = \;?$}
+  The total gradient for each quantity is the sum of its contributions to the
+  loss through every output $y_j$, substituting the partials derived above:
+  \begin{align}
+    \dL{\gamma_i} & = \dL{y_i}\,\pdv{y_i}{\gamma_i} = \dL{y_i}\,\frac{x_i - \mu}{\sqrt{\sigma^2}}, \\
+    \dL{\beta_i}  & = \dL{y_i}\,\pdv{y_i}{\beta_i} = \dL{y_i}.
+  \end{align}
+  For the input $x_i$, we sum over the entire row $j \in \{0, \dots, C-1\}$.
+  Expanding the Kronecker delta $\kron{j}{i}$ into its indicator form
+  $\ind{j=i}$ to clarify the sifting:
+  \begin{align}
+    \dL{x_i}
+     & = \sum_j \dL{y_j} \pdv{y_j}{x_i} \notag \\
+     & = \sum_j \dL{y_j} \left[ \frac{\gamma_j}{\sqrt{\sigma^2}} \left( \kron{j}{i} - \frac{1}{C} - \frac{(x_i - \mu)(x_j - \mu)}{C\sigma^2} \right) \right] \notag \\
+     & = \frac{1}{\sqrt{\sigma^2}} \left( \sum_j \gamma_j \dL{y_j} \ind{j=i} - \frac{1}{C} \sum_j \gamma_j \dL{y_j} - \frac{x_i - \mu}{C\sqrt{\sigma^2}} \sum_j \gamma_j \dL{y_j} \frac{x_j - \mu}{\sqrt{\sigma^2}} \right) \notag \\
+     & = \frac{1}{\sqrt{\sigma^2}} \left( \gamma_i \dL{y_i} - \frac{1}{C} \sum_j \gamma_j \dL{y_j} - \frac{x_i - \mu}{C\sqrt{\sigma^2}} \sum_j \gamma_j \dL{y_j} \frac{x_j - \mu}{\sqrt{\sigma^2}} \right).
+    \label{eq:ln-bwd}
+  \end{align}
+  The row-wide sums $\sum \gamma_j \dL{y_j} / C$ and $\sum \gamma_j \dL{y_j} \hat{x}_j / C$
+  match the row statistics $s_1$ and $s_2$ computed in the first pass of
+  \texttt{layernorm\_bwd}.
 \end{result}
 
 % =============================================================================
