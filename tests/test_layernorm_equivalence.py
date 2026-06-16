@@ -340,3 +340,113 @@ def test_backward_accumulates(case: Case):
         rtol=tol["rtol"] * 10,
         err_msg=f"{case.name}: dBeta did not accumulate",
     )
+
+
+# ---------------------------------------------------------------------------
+# Fused Residual Forward Tests
+# ---------------------------------------------------------------------------
+
+
+def _make_fused_inputs(
+    case: Case,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    g = torch.Generator().manual_seed(case.seed)
+    bt = case.batch_size * case.seq_len
+    x1 = torch.randn(bt, case.channels, generator=g) * 2.0
+    x2 = torch.randn(bt, case.channels, generator=g) * 1.5
+    gamma = torch.randn(case.channels, generator=g) * 0.1 + 1.0
+    beta = torch.randn(case.channels, generator=g) * 0.1
+
+    # Round-trip through the kernel dtype
+    x1 = x1.to(TORCH_DTYPES[case.dtype]).to(torch.float32)
+    x2 = x2.to(TORCH_DTYPES[case.dtype]).to(torch.float32)
+    gamma = gamma.to(TORCH_DTYPES[case.dtype]).to(torch.float32)
+    beta = beta.to(TORCH_DTYPES[case.dtype]).to(torch.float32)
+
+    return x1.numpy(), x2.numpy(), gamma.numpy(), beta.numpy()
+
+
+def _run_fused_residual_kernel(
+    case: Case, x1: np.ndarray, x2: np.ndarray, gamma: np.ndarray, beta: np.ndarray
+):
+    bt = case.batch_size * case.seq_len
+    mean = np.zeros(bt, dtype=np.float32)
+    rstd = np.zeros(bt, dtype=np.float32)
+
+    return layernorm.layernorm_fused_residual_forward(
+        x1=to_storage(x1.reshape(bt, case.channels), case.dtype),
+        x2=to_storage(x2.reshape(bt, case.channels), case.dtype),
+        gamma=to_storage(gamma, case.dtype),
+        beta=to_storage(beta, case.dtype),
+        mean=mean,
+        rstd=rstd,
+        batch_size=case.batch_size,
+        seq_len=case.seq_len,
+        channels=case.channels,
+        epsilon=case.epsilon,
+        dtype_name=case.dtype,
+    )
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
+def test_layernorm_fused_residual_forward(case: Case):
+    x1, x2, gamma, beta = _make_fused_inputs(case)
+    residual_expected = x1 + x2
+    # Round-trip the addition through the kernel dtype since the kernel does the addition in kernel dtype
+    residual_expected_torch = (
+        torch.from_numpy(residual_expected)
+        .to(TORCH_DTYPES[case.dtype])
+        .to(torch.float32)
+    )
+    normed_expected = _reference(
+        residual_expected_torch.numpy(), gamma, beta, case.epsilon
+    )
+
+    # Reference mean and rstd of residual_expected
+    mean_expected = residual_expected_torch.mean(dim=-1).numpy()
+    var_expected = residual_expected_torch.var(dim=-1, unbiased=False).numpy()
+    rstd_expected = 1.0 / np.sqrt(var_expected + case.epsilon)
+
+    # Got
+    got_res, got_normed, got_mean, got_rstd = _run_fused_residual_kernel(
+        case, x1, x2, gamma, beta
+    )
+
+    bt = case.batch_size * case.seq_len
+    got_res_v = from_storage(got_res, case.dtype).reshape(bt, case.channels)
+    got_normed_v = from_storage(got_normed, case.dtype).reshape(bt, case.channels)
+
+    tol = DTYPE_TOLERANCES[case.dtype]
+    # Check residual
+    np.testing.assert_allclose(
+        got_res_v,
+        residual_expected_torch.numpy(),
+        atol=tol["atol"],
+        rtol=tol["rtol"],
+        err_msg=f"{case.name}: fused residual output diverged",
+    )
+
+    # Check normed
+    np.testing.assert_allclose(
+        got_normed_v,
+        normed_expected,
+        atol=tol["atol"],
+        rtol=tol["rtol"],
+        err_msg=f"{case.name}: fused normed output diverged",
+    )
+
+    # Check mean and rstd
+    np.testing.assert_allclose(
+        got_mean,
+        mean_expected,
+        atol=1e-5 if case.dtype == "float32" else 1e-2,
+        rtol=1e-5 if case.dtype == "float32" else 1e-2,
+        err_msg=f"{case.name}: fused mean diverged",
+    )
+    np.testing.assert_allclose(
+        got_rstd,
+        rstd_expected,
+        atol=1e-5 if case.dtype == "float32" else 1e-2,
+        rtol=1e-5 if case.dtype == "float32" else 1e-2,
+        err_msg=f"{case.name}: fused rstd diverged",
+    )

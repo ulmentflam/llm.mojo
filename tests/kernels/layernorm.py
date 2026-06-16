@@ -59,6 +59,52 @@ def forward(
     return out, out_mean, out_rstd
 
 
+def layernorm_fused_residual_forward(
+    *,
+    x1: np.ndarray,  # (B*T, C) flattened, kernel dtype (storage form)
+    x2: np.ndarray,  # (B*T, C) flattened, kernel dtype (storage form)
+    gamma: np.ndarray,  # (C,) flattened, kernel dtype (storage form)
+    beta: np.ndarray,  # (C,) flattened, kernel dtype (storage form)
+    mean: np.ndarray,  # (B*T,) float32
+    rstd: np.ndarray,  # (B*T,) float32
+    batch_size: int,
+    seq_len: int,
+    channels: int,
+    epsilon: float,
+    dtype_name: str,
+    residual: np.ndarray | None = None,
+    normed: np.ndarray | None = None,
+    device: "Device | None" = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """One layernorm_fused_residual_fwd pass end-to-end through MAX.
+
+    Returns (residual, normed, mean, rstd).
+    """
+    if residual is None:
+        residual = np.zeros_like(x1)
+    if normed is None:
+        normed = np.zeros_like(x1)
+    (out_residual, out_normed, out_mean, out_rstd) = run_custom_op(
+        kernel_name="layernorm_fused_residual_fwd",
+        args=[
+            MutableBuf(residual, dtype_name),
+            MutableBuf(normed, dtype_name),
+            ReadTensor(x1, dtype_name),
+            ReadTensor(x2, dtype_name),
+            ReadTensor(gamma, dtype_name),
+            ReadTensor(beta, dtype_name),
+            ScalarArg(epsilon, "float32"),
+            MutableBuf(mean, "float32"),
+            MutableBuf(rstd, "float32"),
+            ScalarArg(batch_size, "int64"),
+            ScalarArg(seq_len, "int64"),
+            ScalarArg(channels, "int64"),
+        ],
+        device=device,
+    )
+    return out_residual, out_normed, out_mean, out_rstd
+
+
 def backward(
     *,
     d_output: np.ndarray,  # (B*T, C) flattened

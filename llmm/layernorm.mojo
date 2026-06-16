@@ -420,6 +420,447 @@ struct LayerNormFwd:
 
 
 # ===----------------------------------------------------------------------=== #
+# LayerNorm Fused Residual Forward
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def _layernorm_fused_residual_fwd_cpu[
+    dtype: DType,
+    width: Int,
+](
+    idx: Int,
+    residual_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    normed_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    inp1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    inp2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    epsilon: Scalar[DType.float32],
+    mean_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    channels: Int,
+) -> None:
+    var row_offset = idx * channels
+
+    # Phase 1: Compute the mean and write to residual.
+    var i = 0
+    var sum_vec = SIMD[DType.float32, width](0.0)
+    while i + width <= channels:
+        var val1 = (inp1_ptr + row_offset + i).load[width=width]()
+        var val2 = (inp2_ptr + row_offset + i).load[width=width]()
+        var sum_val = val1 + val2
+        (residual_ptr + row_offset + i).store(sum_val)
+        sum_vec += sum_val.cast[DType.float32]()
+        i += width
+    var mean = sum_vec.reduce_add()
+
+    # Handle the tail of the mean.
+    for j in range(i, channels):
+        var val1 = (inp1_ptr + row_offset + j).load[width=1]()
+        var val2 = (inp2_ptr + row_offset + j).load[width=1]()
+        var sum_val = val1 + val2
+        (residual_ptr + row_offset + j).store(sum_val)
+        mean += sum_val.cast[DType.float32]()
+
+    mean /= Float32(channels)
+
+    # Phase 2: Compute the variance.
+    i = 0
+    var var_vec = SIMD[DType.float32, width](0.0)
+    var mean_vec = SIMD[DType.float32, width](mean)
+    while i + width <= channels:
+        var x = (
+            (residual_ptr + row_offset + i)
+            .load[width=width]()
+            .cast[DType.float32]()
+        )
+        var diff = x - mean_vec
+        var_vec = fma(diff, diff, var_vec)
+        i += width
+    var variance = var_vec.reduce_add()
+
+    # Handle the tail of the variance.
+    for j in range(i, channels):
+        var x = (
+            (residual_ptr + row_offset + j)
+            .load[width=1]()
+            .cast[DType.float32]()
+        )
+        var diff = x - mean
+        variance = fma(diff, diff, variance)
+    variance /= Float32(channels)
+
+    var rstd = rsqrt(variance + epsilon)
+
+    # Phase 3: Normalize and Apply weights.
+    i = 0
+    var rstd_vec = SIMD[DType.float32, width](rstd)
+    while i + width <= channels:
+        var x = (
+            (residual_ptr + row_offset + i)
+            .load[width=width]()
+            .cast[DType.float32]()
+        )
+        var g = (gamma_ptr + i).load[width=width]().cast[DType.float32]()
+        var b = (beta_ptr + i).load[width=width]().cast[DType.float32]()
+
+        var n = rstd_vec * (x - mean_vec)
+        var o = fma(n, g, b)
+        (normed_ptr + row_offset + i).store(o.cast[dtype]())
+        i += width
+
+    # Handle the tail of the output.
+    for j in range(i, channels):
+        var x = (
+            (residual_ptr + row_offset + j)
+            .load[width=1]()
+            .cast[DType.float32]()
+        )
+        var g = gamma_ptr[j].cast[DType.float32]()
+        var b = beta_ptr[j].cast[DType.float32]()
+
+        var n = rstd * (x - mean)
+        var o = n * g + b
+        (normed_ptr + row_offset + j).store(o.cast[dtype]())
+
+    # Store the Mean and RSTD for the backward pass.
+    mean_ptr[idx] = mean
+    rstd_ptr[idx] = rstd
+
+
+def layernorm_fused_residual_fwd_cpu[
+    dtype: DType,
+    width: Int,
+](
+    residual_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    normed_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    inp1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    inp2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    epsilon: Scalar[DType.float32],
+    mean_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    batch_size: Int64,
+    seq_len: Int64,
+    channels: Int64,
+) -> None:
+    var total = Int(batch_size * seq_len)
+    var num_workers = min(total, parallelism_level())
+    var rows_per_worker = ceildiv(total, num_workers)
+
+    @parameter
+    def _worker(w: Int):
+        var base = w * rows_per_worker
+        var count = min(rows_per_worker, total - base)
+        for local in range(count):
+            var idx = base + local
+            _layernorm_fused_residual_fwd_cpu[dtype, width](
+                idx,
+                residual_ptr,
+                normed_ptr,
+                inp1_ptr,
+                inp2_ptr,
+                gamma_ptr,
+                beta_ptr,
+                epsilon,
+                mean_ptr,
+                rstd_ptr,
+                Int(channels),
+            )
+
+    sync_parallelize[_worker](num_workers)
+
+
+@always_inline
+def _layernorm_fused_residual_fwd_gpu[
+    dtype: DType,
+    BLOCK_SIZE: Int,
+    width: Int = 4,
+](
+    num_rows: Int,
+    tid: Int,
+    stride: Int,
+    block_row: Int,
+    residual_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    normed_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    inp1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    inp2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    epsilon: Scalar[DType.float32],
+    mean_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    channels: Int,
+) -> None:
+    comptime BLOCK_SPAN = BLOCK_SIZE * width
+
+    for row in range(block_row, num_rows, stride):
+        # Pass 1: Add input tensors, store to residual, and compute mean
+        var sum_thread = SIMD[DType.float32, width](0.0)
+        var sum_tail = Scalar[DType.float32](0.0)
+
+        for tile_base in range(0, channels, BLOCK_SPAN):
+            var lane_base = tile_base + tid * width
+            if lane_base + width <= channels:
+                var idx = row * channels + lane_base
+                var val1 = (inp1_ptr + idx).load[width=width]()
+                var val2 = (inp2_ptr + idx).load[width=width]()
+                var sum_val = val1 + val2
+                (residual_ptr + idx).store(sum_val)
+                sum_thread += sum_val.cast[DType.float32]()
+            elif lane_base < channels:
+                for i in range(lane_base, channels):
+                    var idx = row * channels + i
+                    var val1 = (inp1_ptr + idx).load[width=1]()
+                    var val2 = (inp2_ptr + idx).load[width=1]()
+                    var sum_val = val1 + val2
+                    (residual_ptr + idx).store(sum_val)
+                    sum_tail += sum_val.cast[DType.float32]()
+
+        var mean_thread = sum_thread.reduce_add() + sum_tail
+        var mean = block.sum[block_size=BLOCK_SIZE](mean_thread) / Float32(
+            channels
+        )
+
+        # Pass 2: Variance
+        var var_thread = SIMD[DType.float32, width](0.0)
+        var var_tail = Scalar[DType.float32](0.0)
+        var mean_vec = SIMD[DType.float32, width](mean)
+        for tile_base in range(0, channels, BLOCK_SPAN):
+            var lane_base = tile_base + tid * width
+            if lane_base + width <= channels:
+                var idx = row * channels + lane_base
+                var x = (
+                    (residual_ptr + idx)
+                    .load[width=width]()
+                    .cast[DType.float32]()
+                )
+                var diff = x - mean_vec
+                var_thread = fma(diff, diff, var_thread)
+            elif lane_base < channels:
+                for i in range(lane_base, channels):
+                    var idx = row * channels + i
+                    var x = (
+                        (residual_ptr + idx)
+                        .load[width=1]()
+                        .cast[DType.float32]()
+                    )
+                    var diff = x - mean
+                    var_tail = fma(diff, diff, var_tail)
+
+        var variance_thread = var_thread.reduce_add() + var_tail
+        var variance = block.sum[block_size=BLOCK_SIZE](
+            variance_thread
+        ) / Float32(channels)
+        var rstd = rsqrt(variance + epsilon)
+
+        # Pass 3: Output (Normed)
+        var rstd_vec = SIMD[DType.float32, width](rstd)
+        for tile_base in range(0, channels, BLOCK_SPAN):
+            var lane_base = tile_base + tid * width
+            if lane_base + width <= channels:
+                var idx = row * channels + lane_base
+                var x = (
+                    (residual_ptr + idx)
+                    .load[width=width]()
+                    .cast[DType.float32]()
+                )
+                var g = (
+                    (gamma_ptr + lane_base)
+                    .load[width=width]()
+                    .cast[DType.float32]()
+                )
+                var b = (
+                    (beta_ptr + lane_base)
+                    .load[width=width]()
+                    .cast[DType.float32]()
+                )
+                var n = rstd_vec * (x - mean_vec)
+                var o = fma(n, g, b)
+                (normed_ptr + idx).store(o.cast[dtype]())
+            elif lane_base < channels:
+                for i in range(lane_base, channels):
+                    var idx = row * channels + i
+                    var x = (
+                        (residual_ptr + idx)
+                        .load[width=1]()
+                        .cast[DType.float32]()
+                    )
+                    var g = gamma_ptr[i].cast[DType.float32]()
+                    var b = beta_ptr[i].cast[DType.float32]()
+                    var n = rstd * (x - mean)
+                    var o = n * g + b
+                    (normed_ptr + idx).store(o.cast[dtype]())
+
+        # Store the Mean and RSTD
+        if tid == 0:
+            mean_ptr[row] = mean
+            rstd_ptr[row] = rstd
+
+
+def layernorm_fused_residual_fwd_gpu[
+    dtype: DType,
+    BLOCK_SIZE: Int,
+    width: Int = 4,
+](
+    residual_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    normed_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    inp1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    inp2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    epsilon: Scalar[DType.float32],
+    mean_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    batch_size: Int64,
+    seq_len: Int64,
+    channels: Int64,
+) -> None:
+    _layernorm_fused_residual_fwd_gpu[dtype, BLOCK_SIZE, width](
+        Int(batch_size * seq_len),
+        Int(thread_idx.x),
+        Int(grid_dim.x),
+        Int(block_idx.x),
+        residual_ptr,
+        normed_ptr,
+        inp1_ptr,
+        inp2_ptr,
+        gamma_ptr,
+        beta_ptr,
+        epsilon,
+        mean_ptr,
+        rstd_ptr,
+        Int(channels),
+    )
+
+
+def layernorm_fused_residual_fwd[
+    dtype: DType,
+    target: StaticString,
+](
+    residual_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    normed_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    inp1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    inp2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    epsilon: Scalar[DType.float32],
+    mean_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    batch_size: Int64,
+    seq_len: Int64,
+    channels: Int64,
+    ctx: DeviceContext,
+) capturing raises:
+    comptime if is_cpu[target]():
+        comptime width = simd_width_of[dtype]()
+        layernorm_fused_residual_fwd_cpu[dtype, width](
+            residual_ptr,
+            normed_ptr,
+            inp1_ptr,
+            inp2_ptr,
+            gamma_ptr,
+            beta_ptr,
+            epsilon,
+            mean_ptr,
+            rstd_ptr,
+            batch_size,
+            seq_len,
+            channels,
+        )
+    elif is_gpu[target]():
+        comptime BLOCK_SIZE = 256
+        comptime SM_OVERPROVISION = 32
+        var device_ctx = ctx
+        var num_rows = Int(batch_size * seq_len)
+        var num_sm = device_ctx.get_attribute(
+            DeviceAttribute.MULTIPROCESSOR_COUNT
+        )
+        var num_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
+
+        comptime gpu_kernel = layernorm_fused_residual_fwd_gpu[
+            dtype, BLOCK_SIZE
+        ]
+        var compiled = device_ctx.compile_function[gpu_kernel]()
+        device_ctx.enqueue_function(
+            compiled,
+            residual_ptr,
+            normed_ptr,
+            inp1_ptr,
+            inp2_ptr,
+            gamma_ptr,
+            beta_ptr,
+            epsilon,
+            mean_ptr,
+            rstd_ptr,
+            batch_size,
+            seq_len,
+            channels,
+            grid_dim=(num_blocks,),
+            block_dim=(BLOCK_SIZE,),
+        )
+    else:
+        raise Error("Invalid target")
+
+
+@compiler.register("layernorm_fused_residual_fwd")
+struct LayerNormFusedResidualFwd:
+    @staticmethod
+    def execute[
+        dtype: DType,
+        target: StaticString,
+    ](
+        residual: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
+        normed: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
+        x1: InputTensor[dtype=dtype, rank=2, static_spec=...],
+        x2: InputTensor[dtype=dtype, rank=2, static_spec=...],
+        gamma: InputTensor[dtype=dtype, rank=1, static_spec=...],
+        beta: InputTensor[dtype=dtype, rank=1, static_spec=...],
+        epsilon: Scalar[DType.float32],
+        mean: MutableInputTensor[dtype=DType.float32, rank=1, static_spec=...],
+        rstd: MutableInputTensor[dtype=DType.float32, rank=1, static_spec=...],
+        batch_size: Int64,  # Our B
+        seq_len: Int64,  # Our T
+        channels: Int64,  # Our C
+        ctx: DeviceContext,
+    ) capturing raises:
+        if residual.size() != Int(batch_size * seq_len * channels):
+            raise Error("residual size mismatch")
+        if normed.size() != Int(batch_size * seq_len * channels):
+            raise Error("normed size mismatch")
+        if x1.size() != Int(batch_size * seq_len * channels):
+            raise Error("x1 size mismatch")
+        if x2.size() != Int(batch_size * seq_len * channels):
+            raise Error("x2 size mismatch")
+        if gamma.size() != Int(channels):
+            raise Error("gamma size mismatch")
+        if beta.size() != Int(channels):
+            raise Error("beta size mismatch")
+        if mean.size() != Int(batch_size * seq_len):
+            raise Error("mean size mismatch")
+        if rstd.size() != Int(batch_size * seq_len):
+            raise Error("rstd size mismatch")
+
+        layernorm_fused_residual_fwd[dtype, target](
+            residual.unsafe_ptr(),
+            normed.unsafe_ptr(),
+            x1.unsafe_ptr(),
+            x2.unsafe_ptr(),
+            gamma.unsafe_ptr(),
+            beta.unsafe_ptr(),
+            epsilon,
+            mean.unsafe_ptr(),
+            rstd.unsafe_ptr(),
+            batch_size,
+            seq_len,
+            channels,
+            ctx,
+        )
+
+
+# ===----------------------------------------------------------------------=== #
 # LayerNorm Backward
 # ===----------------------------------------------------------------------=== #
 
