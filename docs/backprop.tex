@@ -52,7 +52,7 @@
 
 \title{The Mathematics of Backpropagation:\\
        Companion Derivations for \texttt{llm.mojo}}
-\author{Evan~Owen}
+\author{Evan~Owen\\ \texttt{evan@jwo3.io}\\ Georgia Institute of Technology}
 \markboth{The Mathematics of Backpropagation}{Owen}
 
 % =============================================================================
@@ -97,39 +97,38 @@ Shapes follow the kernel code, as collected in Table~\ref{tab:notation}.
 Indices: $b$ over batch, $t$ over positions, $i, j, k$ over channels or vocab
 entries. A row of activations at one position is $x_{bt} \in \R^{C}$.
 
+\paragraph{Why index form?}
+Matrix calculus obscures backpropagation under transposes and Kronecker products. This document writes every relation in \emph{index form} (element-by-element), reducing tensor operations to scalar calculus. Treating entries as independent scalar variables allows standard derivative rules. Matching indices then reassembles scalar equations back into matrix form.
+
 \paragraph{Linear algebra in index form.}
-A matrix entry is named (row, column): $A_{ij}$ is row $i$, column $j$.
-Three definitions cover every matrix manipulation in this document.
-The transpose relabels entries by swapping the index roles:
+A matrix entry is named (row, column): $A_{ij}$ is row $i$, column $j$. Three definitions cover every matrix manipulation in this document. The transpose swaps index roles:
 \begin{equation}
   (A^{\top})_{ij} \;=\; A_{ji}.
   \label{eq:transpose}
 \end{equation}
-The matrix product contracts the inner pair of indices: the entry of
-$AB$ at (row $i$, column $k$) multiplies row $i$ of $A$ against column
-$k$ of $B$,
+The matrix product contracts the inner indices:
 \begin{equation}
   (AB)_{ik} \;=\; \sum_j A_{ij}\,B_{jk}.
   \label{eq:matprod}
 \end{equation}
-Read \eqref{eq:matprod} in reverse to \emph{recognize} products: a sum
-over one shared index is a matrix product exactly when the summed index
-sits as the column of the left factor and the row of the right factor.
-When it sits anywhere else, a transpose \eqref{eq:transpose} moves it
-into place. This is where every transpose in a backward pass comes
-from.
+In code, this summation represents a loop over the shared dimension $j$:
+\begin{verbatim}
+val = 0.0
+for j in range(width):
+    val += A[i, j] * B[j, k]
+\end{verbatim}
+Reversing \eqref{eq:matprod} identifies matrix products. Summing over a shared index yields a product when the index is the left factor's column and the right factor's row. Elsewhere, a transpose \eqref{eq:transpose} restores this alignment. This generates every transpose in the backward pass.
 Adding a vector to a matrix broadcasts the vector over rows:
 \begin{equation}
   (M + b)_{ni} \;=\; M_{ni} + b_i.
   \label{eq:broadcast}
 \end{equation}
 
+\paragraph{Target and probe indices.}
+Differentiating a tensor expression requires distinct names for the output (\emph{target}) indices and the differentiation (\emph{probe}) indices. Perturbing $X_{mk}$ to find the change in $Y_{ni}$ requires independent letters ($m, k \neq n, i$). Reusing indices would restrict the perturbation to matching coordinate pairs. Independent probe indices evaluate the derivative of any output coordinate with respect to any input coordinate.
+
 \paragraph{Indexed variables under differentiation.}
-The entries of a vector or matrix are independent scalar variables, and
-entries of two different tensors are unrelated (their cross-derivatives
-are $0$). The derivative of one entry with respect to another is
-therefore $1$ when both name the same entry and $0$ otherwise, recorded
-by the Kronecker delta:
+Entries of distinct tensors are unrelated; their cross-derivatives vanish. The derivative of a tensor entry with respect to another is $1$ for identical coordinates and $0$ otherwise. The Kronecker delta records this relation:
 \begin{equation}
   \kron{i}{j} \;=\;
   \begin{cases}
@@ -138,10 +137,7 @@ by the Kronecker delta:
   \end{cases}
   \label{eq:kron}
 \end{equation}
-For a vector, same entry is one index equality. For a matrix it is the
-conjunction of two, row \emph{and} column. A product of deltas encodes
-that conjunction: it is $1 \cdot 1$ when both match, and carries a
-factor of $0$ otherwise,
+For a vector, one index pair determines equality; for a matrix, both row and column must match. A product of deltas encodes this conjunction:
 \begin{equation}
   \pdv{x_j}{x_i} \;=\; \kron{j}{i},
   \qquad
@@ -155,45 +151,37 @@ Two concrete matrix instances:
   \pdv{W_{12}}{W_{21}} = \kron{1}{2}\,\kron{2}{1} = 0 \cdot 0 = 0.
   \label{eq:entry-dv-example}
 \end{equation}
-A derivative that is nothing but deltas can look stranded on the page.
-It is the complete answer: the deltas record which entry was picked,
-and scalar calculus never shows the case because it has exactly one
-variable. Deltas exit a derivation by being consumed by a sum. With
-$l$ fixed and any values $A_j$, every term of the broken-out sum
-carries a zero delta except $j = l$:
+Deltas exit derivations by collapsing sums. For fixed $l$, the Kronecker delta sifts the summation:
 \begin{align}
-  \sum_{j} \kron{j}{l}\,A_j
-   & = \kron{0}{l}\,A_0 + \kron{1}{l}\,A_1
-  + \cdots + \kron{l}{l}\,A_l + \cdots \notag \\
-   & = A_l.
+  \sum_{j} \kron{j}{l}\,A_j \;=\; A_l.
   \label{eq:sift}
 \end{align}
-This \emph{sifting} identity recurs in every derivation below. A delta
-whose indices are not summed cannot be consumed; it remains in the
-answer, still meaning these two indices must agree.
+This sifting acts as a conditional check inside a loop:
+\begin{verbatim}
+sum_val = 0.0
+for j in range(N):
+    if j == l:
+        sum_val += 1.0 * A[j]
+    else:
+        sum_val += 0.0 * A[j]
+# sum_val is now exactly A[l]
+\end{verbatim}
+Unsummed deltas remain in the final expression, enforcing index equality.
 
 \paragraph{The backward convention.}
-Every op receives the upstream gradient $\dL{y}$ of the scalar loss $L$ with
-respect to its output $y$, and must produce $\dL{x}$ for each input $x$ (and
-$\dL{w}$ for each parameter) via the chain rule
+Each operation receives the upstream gradient $\dL{y}$ of the scalar loss $L$ and computes the downstream gradient $\dL{x}$ (or parameter gradient $\dL{w}$) via the chain rule:
 \begin{equation}
   \dL{x_i} \;=\; \sum_j \dL{y_j}\,\pdv{y_j}{x_i}.
   \label{eq:chain}
 \end{equation}
-Gradients into shared inputs \emph{accumulate} ($\mathrel{+}=$) because a
-tensor used by several consumers receives a contribution from each.
+This sum accumulates gradients from all output coordinates $y_j$ that depend on $x_i$. Shared inputs or parameters (such as tied weights or broadcast biases) accumulate gradients across all active positions via in-place addition ($\mathrel{+}=$).
+
+\paragraph{Layout and transposes.}
+The \emph{numerator layout} convention matches the shape of the gradient $\dL{X}$ to the source tensor $X$. Index-level rearrangements then generate transposes automatically, avoiding memorized matrix identities.
 
 \paragraph{Reading order.}
-The forward pass runs encoder $\to$ layernorm $\to$ attention $\to$ matmul
-$\to$ GELU $\to$ softmax $\to$ cross-entropy. The sections below instead
-follow the order in which gradients are \emph{derived}: starting at the loss
-(\S\ref{sec:crossentropy}) and moving back toward the embeddings
-(\S\ref{sec:encoder}), each op reusing the upstream gradient established by
-the section before it. \S\ref{sec:full} then reassembles these pieces into
-the end-to-end backward pass.
+While the forward pass runs encoder $\to$ layernorm $\to$ attention $\to$ matmul $\to$ GELU $\to$ softmax $\to$ cross-entropy, these derivations follow the backward flow. Starting at the loss (\S\ref{sec:crossentropy}) and ending at the embeddings (\S\ref{sec:encoder}), each section consumes the upstream gradient from the previous section. \S\ref{sec:full} reassembles the complete backward pass.
 
-\TODO{Decide and record: numerator vs.\ denominator layout, and where
-  transposes land in the matmul gradients as a consequence.}
 
 % =============================================================================
 \section{Warm-up: Scalar Chain Rule on a Tiny Network}\label{sec:warmup}
@@ -1280,16 +1268,79 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
 % =============================================================================
 \section{Embeddings (Encoder)}\label{sec:encoder}
 
-Forward: $x_{bt} = W_{E}[\,\mathrm{tok}_{bt}\,] + W_{P}[\,t\,]$.
+Forward: $x_{bt} = W_{E}[\,\mathrm{tok}_{bt}\,] + W_{P}[\,t\,]$, or in index form:
+\begin{equation}
+  x_{bt, c} \;=\; W_{E,\, \mathrm{tok}_{bt},\, c} + W_{P,\, t,\, c},
+  \label{eq:enc-fwd}
+\end{equation}
+where token indices $\mathrm{tok}_{bt} \in \{0, \dots, V-1\}$, token embeddings $W_E \in \R^{V \times C}$, position embeddings $W_P \in \R^{T \times C}$, and channel index $c < C$.
 
 \begin{derivation}
-  \TODO{Gradients of a gather are a scatter-add; multiple $(b,t)$ hitting
-    the same token row accumulate. Connect to the $\mathrel{+}=$ convention
-    of \S\ref{sec:notation}.}
+  Index roles: $b$ batch, $t$ sequence position, $c$ channel. Probing introduces independent indices $k < T$ (position), $v < V$ (vocab token), and $j < C$ (channel).
+
+  \paragraph{Gradient w.r.t.\ position embeddings}
+  Probing $W_{P,\, k,\, j}$ (position $k$, channel $j$), the token lookup is constant. The position term differentiates via \eqref{eq:entry-dv}:
+  \begin{equation}
+    \pdv{W_{P,\, t,\, c}}{W_{P,\, k,\, j}} \;=\; \kron{t}{k}\,\kron{c}{j},
+    \label{eq:enc-dxdwp-local}
+  \end{equation}
+  leaving the local derivative:
+  \begin{equation}
+    \pdv{x_{bt, c}}{W_{P,\, k,\, j}} \;=\; \kron{t}{k}\,\kron{c}{j}.
+    \label{eq:enc-dxdwp}
+  \end{equation}
+  Chaining upstream $\dL{x_{bt, c}}$ via \eqref{eq:chain}:
+  \begin{align}
+    \dL{W_{P,\, k,\, j}}
+     & = \sum_{b<B} \sum_{t<T} \sum_{c<C} \dL{x_{bt, c}}\,\pdv{x_{bt, c}}{W_{P,\, k,\, j}} \notag \\
+     & = \sum_{b<B} \sum_{t<T} \sum_{c<C} \dL{x_{bt, c}}\,\kron{t}{k}\,\kron{c}{j}.
+  \end{align}
+  The Kronecker deltas sift and collapse the sums over $t$ and $c$ to $t = k$ and $c = j$. The batch sum survives unconstrained:
+  \begin{equation}
+    \dL{W_{P,\, k,\, j}} \;=\; \sum_{b<B} \dL{x_{bk, j}},
+    \label{eq:enc-wp-bwd-idx}
+  \end{equation}
+  with free indices $(k, j)$. Sharing $W_{P, t}$ across batches reduces the gradient over the batch dimension $b$.
+
+  \paragraph{Gradient w.r.t.\ token embeddings}
+  Probing $W_{E,\, v,\, j}$ (vocab token $v$, channel $j$) requires comparing the lookup index $\mathrm{tok}_{bt}$ against $v$. In indicator form:
+  \begin{equation}
+    W_{E,\, \mathrm{tok}_{bt},\, c} \;=\; \sum_{u<V} \ind{\mathrm{tok}_{bt} = u}\,W_{E,\, u,\, c}.
+  \end{equation}
+  Differentiating with respect to $W_{E,\, v,\, j}$:
+  \begin{align}
+    \pdv{W_{E,\, \mathrm{tok}_{bt},\, c}}{W_{E,\, v,\, j}}
+     & = \sum_{u<V} \ind{\mathrm{tok}_{bt} = u}\,\pdv{W_{E,\, u,\, c}}{W_{E,\, v,\, j}} \notag \\
+     & = \sum_{u<V} \ind{\mathrm{tok}_{bt} = u}\,\kron{u}{v}\,\kron{c}{j} \notag \\
+     & = \ind{\mathrm{tok}_{bt} = v}\,\kron{c}{j},
+    \label{eq:enc-dxdwe-local}
+  \end{align}
+  leaving the local derivative:
+  \begin{equation}
+    \pdv{x_{bt, c}}{W_{E,\, v,\, j}} \;=\; \ind{\mathrm{tok}_{bt} = v}\,\kron{c}{j}.
+    \label{eq:enc-dxdwe}
+  \end{equation}
+  Chaining upstream $\dL{x_{bt, c}}$ via \eqref{eq:chain}:
+  \begin{align}
+    \dL{W_{E,\, v,\, j}}
+     & = \sum_{b<B} \sum_{t<T} \sum_{c<C} \dL{x_{bt, c}}\,\pdv{x_{bt, c}}{W_{E,\, v,\, j}} \notag \\
+     & = \sum_{b<B} \sum_{t<T} \sum_{c<C} \dL{x_{bt, c}}\,\ind{\mathrm{tok}_{bt} = v}\,\kron{c}{j}.
+  \end{align}
+  The delta $\kron{c}{j}$ sifts the sum over $c$ to $j$, while the indicator filters the remaining sums over $b$ and $t$:
+  \begin{equation}
+    \dL{W_{E,\, v,\, j}} \;=\; \sum_{b<B} \sum_{t<T} \dL{x_{bt, j}}\,\ind{\mathrm{tok}_{bt} = v},
+    \label{eq:enc-we-bwd-idx}
+  \end{equation}
+  with free indices $(v, j)$. This scatter-add accumulates upstream gradients at matching token locations, following the $\mathrel{+}=$ convention of \S\ref{sec:notation}.
 \end{derivation}
 
 \begin{result}
-  \TODO{$\dL{W_E} = \;?$, \quad $\dL{W_P} = \;?$}
+  The token and positional embedding gradients are:
+  \begin{align}
+    \dL{W_{E,\, v,\, c}} \; & =\; \sum_{b<B} \sum_{t<T} \dL{x_{bt, c}}\,\ind{\mathrm{tok}_{bt} = v}, \label{eq:enc-we-bwd} \\
+    \dL{W_{P,\, t,\, c}} \; & =\; \sum_{b<B} \dL{x_{bt, c}}. \label{eq:enc-wp-bwd}
+  \end{align}
+  $\dL{W_P}$ reduces the upstream gradient over the batch dimension, while $\dL{W_E}$ accumulates contributions via scatter-add at active token locations.
 \end{result}
 
 % =============================================================================

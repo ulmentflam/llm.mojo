@@ -1,0 +1,629 @@
+import compiler
+from layout import Layout
+from std.math import ceildiv
+from std.sys import simd_width_of
+from std.memory import UnsafePointer
+from extensibility import InputTensor
+from std.gpu.host import DeviceContext
+from std.gpu.memory import AddressSpace
+from std.gpu.host import DeviceAttribute
+from std.gpu.host.info import is_cpu, is_gpu
+from layout.layout_tensor import LayoutTensor
+from extensibility.managed_tensor_slice import (
+    _MutableInputTensor as MutableInputTensor,
+)
+from std.runtime.asyncrt import parallelism_level
+from std.algorithm import vectorize, sync_parallelize
+from std.gpu import (
+    barrier,
+    block_dim,
+    block_idx,
+    grid_dim,
+    thread_idx,
+    WARP_SIZE,
+)
+
+
+# ===----------------------------------------------------------------------=== #
+# Encoder Forward Helpers
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def _encoder_forward_vector_slice[
+    dtype: DType,
+    width: Int,
+](
+    out_row_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    wte_row_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    wpe_row_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    c: Int,
+) -> None:
+    var wte_val = (wte_row_ptr + c).load[width=width]()
+    var wpe_val = (wpe_row_ptr + c).load[width=width]()
+    (out_row_ptr + c).store(wte_val + wpe_val)
+
+
+def encoder_forward_cpu[
+    dtype: DType,
+    width: Int,
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    inp_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    wte_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    wpe_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    batch_size: Int,
+    seq_len: Int,
+    channels: Int,
+) -> None:
+    var total_rows = batch_size * seq_len
+    var num_workers = min(total_rows, parallelism_level())
+    var rows_per_worker = ceildiv(total_rows, num_workers)
+
+    @parameter
+    def _worker(w: Int):
+        var base_row = w * rows_per_worker
+        var count_row = min(rows_per_worker, total_rows - base_row)
+
+        for local_row in range(count_row):
+            var bt = base_row + local_row
+            var t = bt % seq_len
+            var ix = Int((inp_ptr + bt).load())
+
+            var out_row = out_ptr + bt * channels
+            var wte_row = wte_ptr + ix * channels
+            var wpe_row = wpe_ptr + t * channels
+
+            @always_inline
+            def _simd[simd_w: Int](c: Int) {out_row, wte_row, wpe_row}:
+                _encoder_forward_vector_slice[dtype, simd_w](
+                    out_row, wte_row, wpe_row, c
+                )
+
+            vectorize[width, unroll_factor=4](channels, _simd)
+
+    sync_parallelize[_worker](num_workers)
+
+
+@always_inline
+def encoder_forward_gpu_kernel[
+    dtype: DType,
+    width: Int,
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    inp_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    wte_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    wpe_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    seq_len: Int,
+    channels: Int,
+    total_elements: Int,
+) -> None:
+    var global_idx = (
+        Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    ) * width
+    if global_idx >= total_elements:
+        return
+
+    var bt = global_idx // channels
+    var t = bt % seq_len
+    var c = global_idx % channels
+
+    var ix = Int((inp_ptr + bt).load())
+
+    _encoder_forward_vector_slice[dtype, width](
+        out_ptr + bt * channels,
+        wte_ptr + ix * channels,
+        wpe_ptr + t * channels,
+        c,
+    )
+
+
+def encoder_forward_gpu[
+    dtype: DType,
+    BLOCK_SIZE: Int,
+    width: Int = 4,
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    inp_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    wte_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    wpe_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    batch_size: Int,
+    seq_len: Int,
+    channels: Int,
+) -> None:
+    var total_elements = batch_size * seq_len * channels
+    encoder_forward_gpu_kernel[dtype, width](
+        out_ptr, inp_ptr, wte_ptr, wpe_ptr, seq_len, channels, total_elements
+    )
+
+
+# ===----------------------------------------------------------------------=== #
+# Encoder Forward Dispatcher
+# ===----------------------------------------------------------------------=== #
+
+
+def encoder_forward[
+    dtype: DType,
+    target: StaticString,
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    inp_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    wte_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    wpe_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    batch_size: Int,
+    seq_len: Int,
+    channels: Int,
+    ctx: DeviceContext,
+) capturing raises:
+    comptime if is_cpu[target]():
+        comptime width = simd_width_of[dtype]()
+        encoder_forward_cpu[dtype, width](
+            out_ptr,
+            inp_ptr,
+            wte_ptr,
+            wpe_ptr,
+            batch_size,
+            seq_len,
+            channels,
+        )
+    elif is_gpu[target]():
+        comptime BLOCK_SIZE = 256
+        comptime width = 4
+        var device_ctx = ctx
+        var total_elements = batch_size * seq_len * channels
+        var num_threads = (total_elements + width - 1) // width
+        var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
+
+        comptime gpu_kernel = encoder_forward_gpu[dtype, BLOCK_SIZE, width]
+        var compiled = device_ctx.compile_function[gpu_kernel]()
+        device_ctx.enqueue_function(
+            compiled,
+            out_ptr,
+            inp_ptr,
+            wte_ptr,
+            wpe_ptr,
+            batch_size,
+            seq_len,
+            channels,
+            grid_dim=(num_blocks,),
+            block_dim=(BLOCK_SIZE,),
+        )
+    else:
+        raise Error("Invalid target")
+
+
+@compiler.register("encoder_fwd")
+struct EncoderFwd:
+    @staticmethod
+    def execute[
+        dtype: DType,
+        target: StaticString,
+    ](
+        output: MutableInputTensor[dtype=dtype, rank=3, static_spec=...],
+        inp: InputTensor[dtype=DType.int32, rank=2, static_spec=...],
+        wte: InputTensor[dtype=dtype, rank=2, static_spec=...],
+        wpe: InputTensor[dtype=dtype, rank=2, static_spec=...],
+        batch_size: Int64,
+        seq_len: Int64,
+        channels: Int64,
+        ctx: DeviceContext,
+    ) capturing raises:
+        if output.size() != Int(batch_size * seq_len * channels):
+            raise Error("output size mismatch")
+        if inp.size() != Int(batch_size * seq_len):
+            raise Error("inp size mismatch")
+        if wpe.size() != Int(seq_len * channels):
+            raise Error("wpe size mismatch")
+
+        encoder_forward[dtype, target](
+            output.unsafe_ptr(),
+            inp.unsafe_ptr(),
+            wte.unsafe_ptr(),
+            wpe.unsafe_ptr(),
+            Int(batch_size),
+            Int(seq_len),
+            Int(channels),
+            ctx,
+        )
+
+
+# ===----------------------------------------------------------------------=== #
+# Encoder Backward Helpers
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def _accumulate_token_gradients[
+    dtype: DType,
+    width: Int,
+](
+    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    start_idx: Int,
+    bucket_size: Int,
+    channels: Int,
+    c: Int,
+    start_item: Int,
+    step_size: Int,
+) -> SIMD[DType.float32, width]:
+    var accum = SIMD[DType.float32, width](0.0)
+    var item = start_item
+    while item < bucket_size:
+        var bt = Int((workload_indices_ptr + start_idx + item).load())
+        var dout_val = (
+            (dout_ptr + bt * channels + c)
+            .load[width=width]()
+            .cast[DType.float32]()
+        )
+        accum += dout_val
+        item += step_size
+    return accum
+
+
+@always_inline
+def _write_dwte_accumulation[
+    dtype: DType,
+    width: Int,
+](
+    dwte_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dwte_offset: Int,
+    accum: SIMD[DType.float32, width],
+) -> None:
+    var prev_dwte = (
+        (dwte_ptr + dwte_offset).load[width=width]().cast[DType.float32]()
+    )
+    (dwte_ptr + dwte_offset).store((prev_dwte + accum).cast[dtype]())
+
+
+# ===----------------------------------------------------------------------=== #
+# Encoder Backward
+# ===----------------------------------------------------------------------=== #
+
+
+def wte_backward_cpu[
+    dtype: DType,
+    width: Int,
+    BUCKET_IDX_SIZE: Int = 4,
+](
+    dwte_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    bucket_info_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    num_buckets: Int,
+    channels: Int,
+) -> None:
+    var num_workers = min(num_buckets, parallelism_level())
+    var buckets_per_worker = ceildiv(num_buckets, num_workers)
+
+    @parameter
+    def _worker(w: Int):
+        var base = w * buckets_per_worker
+        var count = min(buckets_per_worker, num_buckets - base)
+
+        for local in range(count):
+            var bucket_idx = base + local
+
+            var info = (bucket_info_ptr + bucket_idx * BUCKET_IDX_SIZE).load[
+                width=BUCKET_IDX_SIZE
+            ]()
+            var start_idx = Int(info[0])
+            var size = Int(info[1])
+            var token_idx = Int(info[2])
+            var channel_group = Int(info[3])
+
+            var c_per_warp = WARP_SIZE * width
+            var c_base = channel_group * c_per_warp
+
+            var c_end = min(c_base + c_per_warp, channels)
+            var c_len = c_end - c_base
+
+            if c_len > 0:
+
+                @always_inline
+                def _simd[
+                    simd_w: Int
+                ](c_offset: Int) {
+                    dout_ptr,
+                    workload_indices_ptr,
+                    dwte_ptr,
+                    start_idx,
+                    size,
+                    token_idx,
+                    channels,
+                    c_base,
+                }:
+                    var c = c_base + c_offset
+
+                    var accum = _accumulate_token_gradients[dtype, simd_w](
+                        dout_ptr,
+                        workload_indices_ptr,
+                        start_idx,
+                        size,
+                        channels,
+                        c,
+                        start_item=0,
+                        step_size=1,
+                    )
+
+                    _write_dwte_accumulation[dtype, simd_w](
+                        dwte_ptr,
+                        token_idx * channels + c,
+                        accum,
+                    )
+
+                vectorize[width, unroll_factor=4](c_len, _simd)
+
+    sync_parallelize[_worker](num_workers)
+
+
+def wpe_backward_cpu[
+    dtype: DType,
+    width: Int,
+](
+    dwpe_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    batch_size: Int,
+    seq_len: Int,
+    channels: Int,
+) -> None:
+    var num_workers = min(seq_len, parallelism_level())
+    var t_per_worker = ceildiv(seq_len, num_workers)
+
+    @parameter
+    def _worker(w: Int):
+        var base_t = w * t_per_worker
+        var count_t = min(t_per_worker, seq_len - base_t)
+
+        for local_t in range(count_t):
+            var t = base_t + local_t
+            var dwpe_row = dwpe_ptr + t * channels
+
+            @always_inline
+            def _simd[
+                simd_w: Int
+            ](c: Int) {dwpe_row, dout_ptr, batch_size, seq_len, channels, t}:
+                var accum = SIMD[DType.float32, simd_w](0.0)
+                for b in range(batch_size):
+                    var dout_val = (
+                        (dout_ptr + (b * seq_len + t) * channels + c)
+                        .load[width=simd_w]()
+                        .cast[DType.float32]()
+                    )
+                    accum += dout_val
+
+                var prev_dwpe = (
+                    (dwpe_row + c).load[width=simd_w]().cast[DType.float32]()
+                )
+                (dwpe_row + c).store((prev_dwpe + accum).cast[dtype]())
+
+            vectorize[width, unroll_factor=4](channels, _simd)
+
+    sync_parallelize[_worker](num_workers)
+
+
+@always_inline
+def wte_backward_gpu_kernel[
+    dtype: DType,
+    BLOCK_SIZE: Int,
+    width: Int = 4,
+](
+    dwte_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    bucket_info_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    channels: Int,
+) -> None:
+    var bucket = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var warp_id = tid // WARP_SIZE
+    var lane_id = tid % WARP_SIZE
+    var c_per_warp = WARP_SIZE * width
+
+    var info = (bucket_info_ptr + bucket * 4).load[width=4]()
+    var start_idx = Int(info[0])
+    var bucket_size = Int(info[1])
+    var token_idx = Int(info[2])
+    var channel_group = Int(info[3])
+
+    var c = channel_group * c_per_warp + lane_id * width
+    if c >= channels:
+        return
+
+    var num_warps = BLOCK_SIZE // WARP_SIZE
+    if warp_id >= bucket_size:
+        return
+
+    var accum = _accumulate_token_gradients[dtype, width](
+        dout_ptr,
+        workload_indices_ptr,
+        start_idx,
+        bucket_size,
+        channels,
+        c,
+        start_item=warp_id,
+        step_size=num_warps,
+    )
+
+    comptime SMEM_SIZE = BLOCK_SIZE * width
+    var accum_shared = LayoutTensor[
+        DType.float32,
+        Layout.row_major(SMEM_SIZE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var accum_shared_ptr = rebind[
+        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+    ](accum_shared.ptr)
+
+    for k in range(width):
+        accum_shared_ptr[tid * width + k] = accum[k]
+
+    barrier()
+
+    if warp_id == 0:
+        var final_accum = SIMD[DType.float32, width](0.0)
+        for w in range(num_warps):
+            if w < bucket_size:
+                var partner_tid = w * WARP_SIZE + lane_id
+                var val = SIMD[DType.float32, width](0.0)
+                for k in range(width):
+                    val[k] = accum_shared_ptr[partner_tid * width + k]
+                final_accum += val
+
+        _write_dwte_accumulation[dtype, width](
+            dwte_ptr,
+            token_idx * channels + c,
+            final_accum,
+        )
+
+
+@always_inline
+def wpe_backward_gpu_kernel[
+    dtype: DType,
+    BLOCK_SIZE: Int,
+    width: Int = 4,
+](
+    dwpe_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    batch_size: Int,
+    seq_len: Int,
+    channels: Int,
+) -> None:
+    var t = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var c_per_block = BLOCK_SIZE * width
+
+    for tile_base in range(0, channels, c_per_block):
+        var c = tile_base + tid * width
+        if c >= channels:
+            break
+
+        var accum = SIMD[DType.float32, width](0.0)
+        for b in range(batch_size):
+            var dout_val = (
+                (dout_ptr + (b * seq_len + t) * channels + c)
+                .load[width=width]()
+                .cast[DType.float32]()
+            )
+            accum += dout_val
+
+        var offset = t * channels + c
+        var prev_dwpe = (
+            (dwpe_ptr + offset).load[width=width]().cast[DType.float32]()
+        )
+        (dwpe_ptr + offset).store((prev_dwpe + accum).cast[dtype]())
+
+
+def encoder_backward[
+    dtype: DType,
+    target: StaticString,
+](
+    dwte_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dwpe_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    bucket_info_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    num_buckets: Int,
+    batch_size: Int,
+    seq_len: Int,
+    channels: Int,
+    ctx: DeviceContext,
+) capturing raises:
+    comptime if is_cpu[target]():
+        comptime width = simd_width_of[dtype]()
+        wte_backward_cpu[dtype, width](
+            dwte_ptr,
+            bucket_info_ptr,
+            workload_indices_ptr,
+            dout_ptr,
+            num_buckets,
+            channels,
+        )
+        wpe_backward_cpu[dtype, width](
+            dwpe_ptr,
+            dout_ptr,
+            batch_size,
+            seq_len,
+            channels,
+        )
+    elif is_gpu[target]():
+        comptime BLOCK_SIZE = 256
+        comptime width = 4
+        var device_ctx = ctx
+
+        if num_buckets > 0:
+            comptime wte_kernel = wte_backward_gpu_kernel[
+                dtype, BLOCK_SIZE, width
+            ]
+            var wte_compiled = device_ctx.compile_function[wte_kernel]()
+            device_ctx.enqueue_function(
+                wte_compiled,
+                dwte_ptr,
+                bucket_info_ptr,
+                workload_indices_ptr,
+                dout_ptr,
+                channels,
+                grid_dim=(num_buckets,),
+                block_dim=(BLOCK_SIZE,),
+            )
+
+        if seq_len > 0:
+            comptime wpe_kernel = wpe_backward_gpu_kernel[
+                dtype, BLOCK_SIZE, width
+            ]
+            var wpe_compiled = device_ctx.compile_function[wpe_kernel]()
+            device_ctx.enqueue_function(
+                wpe_compiled,
+                dwpe_ptr,
+                dout_ptr,
+                batch_size,
+                seq_len,
+                channels,
+                grid_dim=(seq_len,),
+                block_dim=(BLOCK_SIZE,),
+            )
+    else:
+        raise Error("Invalid target")
+
+
+@compiler.register("encoder_bwd")
+struct EncoderBwd:
+    @staticmethod
+    def execute[
+        dtype: DType,
+        target: StaticString,
+    ](
+        dwte: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
+        dwpe: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
+        bucket_info: InputTensor[dtype=DType.int32, rank=2, static_spec=...],
+        workload_indices: InputTensor[
+            dtype=DType.int32, rank=1, static_spec=...
+        ],
+        dout: InputTensor[dtype=dtype, rank=3, static_spec=...],
+        num_buckets: Int64,
+        batch_size: Int64,
+        seq_len: Int64,
+        channels: Int64,
+        ctx: DeviceContext,
+    ) capturing raises:
+        if dwte.size() != Int(dwte.shape()[0]) * Int(channels):
+            raise Error("dwte size mismatch")
+        if dwpe.size() != Int(seq_len * channels):
+            raise Error("dwpe size mismatch")
+        if bucket_info.size() != Int(num_buckets * 4):
+            raise Error("bucket_info size mismatch")
+        if dout.size() != Int(batch_size * seq_len * channels):
+            raise Error("dout size mismatch")
+
+        encoder_backward[dtype, target](
+            dwte.unsafe_ptr(),
+            dwpe.unsafe_ptr(),
+            bucket_info.unsafe_ptr(),
+            workload_indices.unsafe_ptr(),
+            dout.unsafe_ptr(),
+            Int(num_buckets),
+            Int(batch_size),
+            Int(seq_len),
+            Int(channels),
+            ctx,
+        )
