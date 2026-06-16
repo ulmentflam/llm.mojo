@@ -1,17 +1,18 @@
 import compiler
-from tensor import InputTensor
 from std.sys import simd_width_of
 from std.memory import UnsafePointer
+from extensibility import InputTensor
+from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceAttribute
 from std.gpu.primitives import block
-from std.math import fma, sqrt, ceildiv, exp
+from std.math import fma, ceildiv, exp
 from std.gpu.host.info import is_cpu, is_gpu
-from std.algorithm import vectorize, sync_parallelize
-from tensor.managed_tensor_slice import (
+from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from std.algorithm import vectorize, sync_parallelize
+from std.runtime.asyncrt import parallelism_level
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceAttribute
-from std.runtime.asyncrt import DeviceContextPtr, parallelism_level
 
 
 # ===----------------------------------------------------------------------=== #
@@ -289,7 +290,7 @@ def softmax_fwd[
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
     vocab_size_padded: Int64,  # Our Vp
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime simd_width = simd_width_of[dtype]()
@@ -304,7 +305,7 @@ def softmax_fwd[
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
         comptime SM_OVERPROVISION = 32
-        var device_ctx = ctx.get_device_context()
+        var device_ctx = ctx
         var num_rows = Int(batch_size * seq_len)
         var num_sm = device_ctx.get_attribute(
             DeviceAttribute.MULTIPROCESSOR_COUNT
@@ -312,9 +313,7 @@ def softmax_fwd[
         var num_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
 
         comptime gpu_kernel = softmax_fwd_gpu[dtype, BLOCK_SIZE]
-        var compiled = device_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
             probs_ptr,
@@ -343,7 +342,7 @@ struct SoftmaxFwd:
         seq_len: Int64,  # Our T
         vocab_size: Int64,  # Our V
         vocab_size_padded: Int64,  # Our Vp
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if probs.size() != Int(batch_size * seq_len * vocab_size_padded):
             raise Error(
@@ -574,7 +573,7 @@ def softmax_bwd[
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
     vocab_size_padded: Int64,  # Our Vp
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime simd_width = simd_width_of[dtype]()
@@ -590,7 +589,7 @@ def softmax_bwd[
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
         comptime SM_OVERPROVISION = 32
-        var device_ctx = ctx.get_device_context()
+        var device_ctx = ctx
         var num_rows = Int(batch_size * seq_len)
         var num_sm = device_ctx.get_attribute(
             DeviceAttribute.MULTIPROCESSOR_COUNT
@@ -598,9 +597,7 @@ def softmax_bwd[
         var num_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
 
         comptime gpu_kernel = softmax_bwd_gpu[dtype, BLOCK_SIZE]
-        var compiled = device_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
             d_logits_ptr,
@@ -631,7 +628,7 @@ struct SoftmaxBwd:
         seq_len: Int64,  # Our T
         vocab_size: Int64,  # Our V
         vocab_size_padded: Int64,  # Our Vp
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if d_logits.size() != Int(batch_size * seq_len * vocab_size_padded):
             raise Error(

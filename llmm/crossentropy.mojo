@@ -1,15 +1,15 @@
 import compiler
-from tensor import InputTensor
 from std.sys import simd_width_of
+from std.math import ceildiv, log
 from std.memory import UnsafePointer
-from std.math import fma, sqrt, ceildiv, log
+from extensibility import InputTensor
+from std.gpu.host import DeviceContext
+from std.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
-from std.runtime.asyncrt import DeviceContextPtr
-from std.gpu import block_dim, block_idx, thread_idx
-from std.algorithm import vectorize, sync_parallelize
-from tensor.managed_tensor_slice import (
+from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from std.gpu import block_dim, block_idx, thread_idx
 
 
 # ===----------------------------------------------------------------------=== #
@@ -127,7 +127,7 @@ def crossentropy_ohe_fwd[
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) capturing raises:
     comptime if is_cpu[target]():
         crossentropy_ohe_fwd_cpu[dtype](
@@ -140,16 +140,14 @@ def crossentropy_ohe_fwd[
         )
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
-        var dev_ctx = ctx.get_device_context()
+        var dev_ctx = ctx
         # Each thread handles the a batch_size * seq_len element. Unlike our adamw op that also handles width elements.
         # One GPU thread per (b, t) output — no SIMD width, so num_threads = B*T.
         var num_threads = Int(batch_size * seq_len)
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
         comptime gpu_kernel = crossentropy_ohe_fwd_gpu[dtype]
-        var compiled = dev_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = dev_ctx.compile_function[gpu_kernel]()
         dev_ctx.enqueue_function(
             compiled,
             losses_ptr,
@@ -182,7 +180,7 @@ struct CrossEntropyOHEFwd:
         batch_size: Int64,  # Our B
         seq_len: Int64,  # Our T
         vocab_size_padded: Int64,  # Our Vp
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if losses.size() != Int(batch_size * seq_len):
             raise Error(
@@ -305,7 +303,7 @@ def crossentropy_ohe_bwd[
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) capturing raises:
     comptime if is_cpu[target]():
         crossentropy_ohe_bwd_cpu[dtype](
@@ -320,14 +318,12 @@ def crossentropy_ohe_bwd[
     elif is_gpu[target]():
         # Duplicated gpu dispatch code from the fwd op.
         comptime BLOCK_SIZE = 256
-        var dev_ctx = ctx.get_device_context()
+        var dev_ctx = ctx
         # One GPU thread per (b, t) output — no SIMD width, so num_threads = B*T.
         var num_threads = Int(batch_size * seq_len)
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
         comptime gpu_kernel = crossentropy_ohe_bwd_gpu[dtype]
-        var compiled = dev_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = dev_ctx.compile_function[gpu_kernel]()
         dev_ctx.enqueue_function(
             compiled,
             d_losses_ptr,
@@ -360,7 +356,7 @@ struct CrossEntropyOHEBwd:
         batch_size: Int64,  # Our B
         seq_len: Int64,  # Our T
         vocab_size_padded: Int64,  # Our Vp
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if d_losses.size() != Int(batch_size * seq_len):
             raise Error(

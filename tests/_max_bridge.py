@@ -19,7 +19,7 @@ Per-kernel wrappers (e.g., `tests.kernels.adamw.step`) live under
 `tests/kernels/` and just package their kernel's parameters into the right
 arg list. Add new kernels there; do not add per-kernel boilerplate here.
 
-## How MAX 26.3 delivers runtime args to a registered op
+## How MAX 26.5 / Mojo 1.0.0b3 delivers runtime args to a registered op
 
 After reading `max.graph.ops.custom` + the production op
 `mo.scatter_set_constant` (MOGGKernelAPI.mojo:1300-1318 / kernels.py:3737-3766):

@@ -1,17 +1,17 @@
 import compiler
-from tensor import InputTensor
 from std.sys import simd_width_of
 from std.memory import UnsafePointer
-from std.gpu.primitives import block
-from std.math import fma, sqrt, ceildiv, exp, tanh, pi
+from extensibility import InputTensor
+from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceAttribute
+from std.math import sqrt, ceildiv, tanh, pi
 from std.gpu.host.info import is_cpu, is_gpu
-from std.algorithm import vectorize, sync_parallelize
-from tensor.managed_tensor_slice import (
+from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from std.runtime.asyncrt import parallelism_level
+from std.algorithm import vectorize, sync_parallelize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceAttribute
-from std.runtime.asyncrt import DeviceContextPtr, parallelism_level
 
 
 # ===----------------------------------------------------------------------=== #
@@ -105,7 +105,7 @@ def gelu_fwd[
 ](
     output: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
     x: InputTensor[dtype=dtype, rank=2, static_spec=...],
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) raises -> None:
     comptime width = simd_width_of[dtype]()
     comptime if is_cpu[target]():
@@ -114,16 +114,14 @@ def gelu_fwd[
         )
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
-        var device_ctx = ctx.get_device_context()
+        var device_ctx = ctx
         # Each thread handles `width` elements with no grid-stride loop, so
         # the grid must cover every width-wide tile.
         var num_threads = ceildiv(x.size(), width)
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
         comptime gpu_kernel = gelu_fwd_gpu[dtype, width]
-        var compiled = device_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
             output.unsafe_ptr(),
@@ -145,7 +143,7 @@ struct GeluFwd:
     ](
         output: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
         x: InputTensor[dtype=dtype, rank=2, static_spec=...],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if output.size() != x.size():
             raise Error("output and x must have the same size")
@@ -239,7 +237,7 @@ def gelu_bwd[
 ](
     output: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
     x: InputTensor[dtype=dtype, rank=2, static_spec=...],
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) raises -> None:
     comptime width = simd_width_of[dtype]()
     comptime if is_cpu[target]():
@@ -248,16 +246,14 @@ def gelu_bwd[
         )
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
-        var device_ctx = ctx.get_device_context()
+        var device_ctx = ctx
         # Each thread handles `width` elements with no grid-stride loop, so
         # the grid must cover every width-wide tile.
         var num_threads = ceildiv(x.size(), width)
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
         comptime gpu_kernel = gelu_bwd_gpu[dtype, width]
-        var compiled = device_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
             output.unsafe_ptr(),
@@ -279,7 +275,7 @@ struct GeluBwd:
     ](
         output: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
         x: InputTensor[dtype=dtype, rank=2, static_spec=...],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if output.size() != x.size():
             raise Error("output and x must have the same size")

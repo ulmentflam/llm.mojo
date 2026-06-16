@@ -995,11 +995,11 @@ Name the inner argument once; everything chains through it:
 Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
 \begin{equation}
   \begin{aligned}
-    \mu & = \tfrac{1}{C}\sum_j x_j,
+    \mu       & = \tfrac{1}{C}\sum_j x_j,
     \qquad
-    \sigma^2 = \tfrac{1}{C}\sum_j (x_j - \mu)^2 + \varepsilon,                                 \\
-    \hat{x}_i & = \frac{x_i - \mu}{\sqrt{\sigma^2}}, \\
-    y_i & = \gamma_i\,\hat{x}_i + \beta_i.
+    \sigma^2 = \tfrac{1}{C}\sum_j (x_j - \mu)^2 + \varepsilon, \\
+    \hat{x}_i & = \frac{x_i - \mu}{\sqrt{\sigma^2}},           \\
+    y_i       & = \gamma_i\,\hat{x}_i + \beta_i.
   \end{aligned}
   \label{eq:ln-fwd}
 \end{equation}
@@ -1032,7 +1032,7 @@ Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
   using the quotient rule on $\hat{x}_j = (x_j - \mu)(\sigma^2)^{-1/2}$:
   \begin{align}
     \pdv{\hat{x}_j}{x_i}
-     & = \pdv{}{x_i} \left( \frac{x_j - \mu}{\sqrt{\sigma^2}} \right) \notag \\
+     & = \pdv{}{x_i} \left( \frac{x_j - \mu}{\sqrt{\sigma^2}} \right) \notag                                                             \\
      & = \frac{(\kron{j}{i} - \frac{1}{C})\sqrt{\sigma^2} - (x_j - \mu)\frac{1}{2}(\sigma^2)^{-1/2}\pdv{\sigma^2}{x_i}}{\sigma^2} \notag \\
      & = \frac{1}{\sqrt{\sigma^2}} \left( \kron{j}{i} - \frac{1}{C} - \frac{(x_j - \mu)(x_i - \mu)}{C\sigma^2} \right).
     \label{eq:ln-dxhatdx}
@@ -1053,10 +1053,12 @@ Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
   $\ind{j=i}$ to clarify the sifting:
   \begin{align}
     \dL{x_i}
-     & = \sum_j \dL{y_j} \pdv{y_j}{x_i} \notag \\
-     & = \sum_j \dL{y_j} \left[ \frac{\gamma_j}{\sqrt{\sigma^2}} \left( \kron{j}{i} - \frac{1}{C} - \frac{(x_i - \mu)(x_j - \mu)}{C\sigma^2} \right) \right] \notag \\
-     & = \frac{1}{\sqrt{\sigma^2}} \left( \sum_j \gamma_j \dL{y_j} \ind{j=i} - \frac{1}{C} \sum_j \gamma_j \dL{y_j} - \frac{x_i - \mu}{C\sqrt{\sigma^2}} \sum_j \gamma_j \dL{y_j} \frac{x_j - \mu}{\sqrt{\sigma^2}} \right) \notag \\
-     & = \frac{1}{\sqrt{\sigma^2}} \left( \gamma_i \dL{y_i} - \frac{1}{C} \sum_j \gamma_j \dL{y_j} - \frac{x_i - \mu}{C\sqrt{\sigma^2}} \sum_j \gamma_j \dL{y_j} \frac{x_j - \mu}{\sqrt{\sigma^2}} \right).
+     & = \sum_j \dL{y_j} \pdv{y_j}{x_i} \notag                                                                                                            \\
+     & = \sum_j \dL{y_j} \left[ \frac{\gamma_j}{\sqrt{\sigma^2}} \left( \kron{j}{i} - \frac{1}{C} - \frac{\hat{x}_i\,\hat{x}_j}{C} \right) \right] \notag \\
+     & = \frac{1}{\sqrt{\sigma^2}} \left( \sum_j \gamma_j\,\dL{y_j}\,\ind{j=i} - \frac{1}{C} \sum_j \gamma_j\,\dL{y_j} \right. \notag                     \\
+     & \qquad\qquad \left. - \frac{\hat{x}_i}{C} \sum_j \gamma_j\,\dL{y_j}\,\hat{x}_j \right) \notag                                                      \\
+     & = \frac{1}{\sqrt{\sigma^2}} \left( \gamma_i\,\dL{y_i} - \frac{1}{C} \sum_j \gamma_j\,\dL{y_j} \right. \notag                                       \\
+     & \qquad\qquad \left. - \frac{\hat{x}_i}{C} \sum_j \gamma_j\,\dL{y_j}\,\hat{x}_j \right).
     \label{eq:ln-bwd}
   \end{align}
   The row-wide sums $\sum \gamma_j \dL{y_j} / C$ and $\sum \gamma_j \dL{y_j} \hat{x}_j / C$
@@ -1071,14 +1073,208 @@ Forward, per head: $A = \softmax\!\big(QK^{\top}/\sqrt{h} + M\big)$,
 $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
 
 \begin{derivation}
-  \TODO{Backprop in stages: $\dL{V}$ and $\dL{A}$ from $Y = AV$; then
-    $\dL{(QK^{\top})}$ through the row-wise softmax (reuse
-    \S\ref{sec:softmax}); then $\dL{Q}$, $\dL{K}$. Track $\sqrt{h}$ and the
-    mask.}
+  Index form throughout: $i$ runs over query positions $T$ ($i < T$), $j$ over key/value positions $T$ ($j < T$), and $d$ over the head dimension $h$ ($d < h$).
+  Batch and head indices are dropped throughout: each head is independent, so the gradients are derived per-head.
+  The channel size of the query and key projection within each head is the head dimension $h$, which corresponds to the standard notation $d_k$ used in the literature (scaling the attention scores by $1/\sqrt{d_k}$).
+  The head dimension is obtained as $h = C/H$, where $C$ is the total channel width (embedding dimension) and $H$ is the number of attention heads (see Table~\ref{tab:notation} in \S\ref{sec:notation}).
+  The scaling factor is written as $1/\sqrt{h}$ to match the head dimension symbol in the kernel code.
+  Read every entry as (row, column):
+  $Q_{id}$ is (query position $i$, channel $d$);
+  $K_{jd}$ is (key position $j$, channel $d$);
+  $V_{jd}$ is (value position $j$, channel $d$);
+  $Y_{id}$ is (output position $i$, channel $d$);
+  $S_{ij}$ is the raw score at (query position $i$, key position $j$);
+  $A_{ij}$ is the attention probability at (query position $i$, key position $j$).
+
+  The forward pass computes the raw causal score matrix $S \in \R^{T \times T}$:
+  \begin{equation}
+    S_{ij} \;=\; \begin{cases}
+      \frac{1}{\sqrt{h}} \sum_{d<h} Q_{id} K_{jd} & j \leq i, \\
+      -\infty                                     & j > i.
+    \end{cases}
+    \label{eq:att-score-fwd}
+  \end{equation}
+  The attention probability matrix $A \in \R^{T \times T}$ is obtained by applying the row-wise softmax to $S$:
+  \begin{equation}
+    A_{ij} \;=\; \softmax(S_{i,\cdot})_j \;=\; \frac{e^{S_{ij} - L_i}}{\sum_{l \leq i} e^{S_{il} - L_i}},
+    \label{eq:att-prob-fwd}
+  \end{equation}
+  where $L_i = \log \sum_{l \leq i} e^{S_{il}}$ is the log-sum-exp (LSE) value for row $i$. By definition, $A_{ij} = 0$ for $j > i$.
+  The head output $Y \in \R^{T \times h}$ is the matrix product:
+  \begin{equation}
+    Y_{id} \;=\; \sum_{j<T} A_{ij} V_{jd} \quad \implies \quad Y \;=\; A V.
+    \label{eq:att-output-fwd}
+  \end{equation}
+
+  Differentiation requires a second, independent set of index names to avoid index collisions.
+  The probe indices are $m$ for position and $k$ for channel.
+
+  \paragraph{Local derivative $\pdv{Y}{V}$}
+  Target $Y_{id}$ (query position $i$, channel $d$), probe $V_{mk}$ (key position $m$, channel $k$):
+  \begin{align}
+    \pdv{Y_{id}}{V_{mk}}
+     & = \pdv{}{V_{mk}} \sum_{a<T} A_{ia}\,V_{ad} \notag    \\
+     & = \sum_{a<T} A_{ia}\,\kron{a}{m}\,\kron{d}{k} \notag \\
+     & = A_{im}\,\kron{d}{k}.
+    \label{eq:att-dydv}
+  \end{align}
+  The column delta sifts the sum down to $a = m$, forcing channel index $d = k$.
+  Chaining the upstream gradient $\dL{Y}$:
+  \begin{align}
+    \dL{V_{mk}}
+     & = \sum_{i<T} \sum_{d<h} \dL{Y_{id}}\,\pdv{Y_{id}}{V_{mk}} \notag \\
+     & = \sum_{i<T} \sum_{d<h} \dL{Y_{id}}\,A_{im}\,\kron{d}{k} \notag  \\
+     & = \sum_{i<T} A_{im}\,\dL{Y_{ik}} \notag                          \\
+     & = \sum_{i<T} (A^{\top})_{mi}\,\dL{Y_{ik}}
+    = \Bigl( A^{\top}\,\dL{Y} \Bigr)_{mk}.
+    \label{eq:att-chain-dv}
+  \end{align}
+  This yields the value gradient matrix product $\dL{V} = A^{\top}\,\dL{Y}$.
+
+  \paragraph{Local derivative $\pdv{Y}{A}$}
+  Target $Y_{id}$, probe $A_{mj}$ (query position $m$, key position $j$):
+  \begin{align}
+    \pdv{Y_{id}}{A_{mj}}
+     & = \pdv{}{A_{mj}} \sum_{a<T} A_{ia}\,V_{ad} \notag    \\
+     & = \sum_{a<T} \kron{i}{m}\,\kron{a}{j}\,V_{ad} \notag \\
+     & = \kron{i}{m}\,V_{jd}.
+    \label{eq:att-dyda}
+  \end{align}
+  The row delta $\kron{i}{m}$ aligns output position $i$ with probed query position $m$; the column delta sifts $a$ to $j$.
+  Chaining the upstream gradient:
+  \begin{align}
+    \dL{A_{mj}}
+     & = \sum_{i<T} \sum_{d<h} \dL{Y_{id}}\,\pdv{Y_{id}}{A_{mj}} \notag \\
+     & = \sum_{i<T} \sum_{d<h} \dL{Y_{id}}\,\kron{i}{m}\,V_{jd} \notag  \\
+     & = \sum_{d<h} \dL{Y_{md}}\,V_{jd}
+    = \Bigl( \dL{Y}\,V^{\top} \Bigr)_{mj}.
+    \label{eq:att-chain-da}
+  \end{align}
+  This yields the attention probability gradient matrix product $\dL{A} = \dL{Y}\,V^{\top}$.
+
+  \paragraph{Backpropagation through row-wise Softmax}
+  Each row of the attention matrix $A$ is an independent softmax over the row of raw scores $S$. Reusing the softmax result \eqref{eq:softmax-bwd} directly for each row $i$:
+  \begin{equation}
+    \dL{S_{ij}} \;=\; A_{ij}\,\left( \dL{A_{ij}} - D_i \right),
+    \label{eq:att-ds-local}
+  \end{equation}
+  where the row-wise dot product statistics term is defined as:
+  \begin{equation}
+    D_i \;=\; \sum_{k<T} \dL{A_{ik}}\,A_{ik}.
+    \label{eq:att-di-def}
+  \end{equation}
+  Standard backpropagation materializes the full $T \times T$ gradient matrix $\dL{A}$ and computes $D_i$ row-by-row before evaluating $\dL{S_{ij}}$.
+
+  \paragraph{Local derivative $\pdv{S}{Q}$}
+  Target score $S_{ij}$, probe query $Q_{mk}$ (query position $m$, channel $k$):
+  \begin{align}
+    \pdv{S_{ij}}{Q_{mk}}
+     & = \pdv{}{Q_{mk}} \left( \frac{1}{\sqrt{h}} \sum_{d<h} Q_{id}\,K_{jd} \right) \notag \\
+     & = \frac{1}{\sqrt{h}} \sum_{d<h} \kron{i}{m}\,\kron{d}{k}\,K_{jd} \notag             \\
+     & = \frac{1}{\sqrt{h}}\,\kron{i}{m}\,K_{jk},
+    \label{eq:att-dsdq}
+  \end{align}
+  where the Kronecker deltas $\kron{i}{m}$ and $\kron{d}{k}$ enforce query position and channel alignment, sifting the channel sum down to $d = k$.
+  Chaining the score gradient:
+  \begin{align}
+    \dL{Q_{mk}}
+     & = \sum_{i<T} \sum_{j<T} \dL{S_{ij}}\,\pdv{S_{ij}}{Q_{mk}} \notag                    \\
+     & = \sum_{i<T} \sum_{j<T} \dL{S_{ij}}\,\frac{1}{\sqrt{h}}\,\kron{i}{m}\,K_{jk} \notag \\
+     & = \frac{1}{\sqrt{h}} \sum_{j<T} \dL{S_{mj}}\,K_{jk} \notag                          \\
+     & = \left( \frac{1}{\sqrt{h}}\,\dL{S}\,K \right)_{mk},
+    \label{eq:att-chain-dq}
+  \end{align}
+  where the query position delta sifts the outer sum over $i$ down to $i = m$, leaving the contraction over the key position index $j$, recognized as a standard matrix product $\dL{Q} = \frac{1}{\sqrt{h}}\,\dL{S}\,K$.
+
+  \paragraph{Local derivative $\pdv{S}{K}$}
+  Target score $S_{ij}$, probe key $K_{mk}$ (key position $m$, channel $k$):
+  \begin{align}
+    \pdv{S_{ij}}{K_{mk}}
+     & = \pdv{}{K_{mk}} \left( \frac{1}{\sqrt{h}} \sum_{d<h} Q_{id}\,K_{jd} \right) \notag \\
+     & = \frac{1}{\sqrt{h}} \sum_{d<h} Q_{id}\,\kron{j}{m}\,\kron{d}{k} \notag             \\
+     & = \frac{1}{\sqrt{h}}\,\kron{j}{m}\,Q_{ik},
+    \label{eq:att-dsdk}
+  \end{align}
+  where the row delta $\kron{j}{m}$ indicates key position alignment, and the channel delta sifts the sum down to $d = k$.
+  Chaining the score gradient:
+  \begin{align}
+    \dL{K_{mk}}
+     & = \sum_{i<T} \sum_{j<T} \dL{S_{ij}}\,\pdv{S_{ij}}{K_{mk}} \notag                    \\
+     & = \sum_{i<T} \sum_{j<T} \dL{S_{ij}}\,\frac{1}{\sqrt{h}}\,\kron{j}{m}\,Q_{ik} \notag \\
+     & = \frac{1}{\sqrt{h}} \sum_{i<T} \dL{S_{im}}\,Q_{ik} \notag                          \\
+     & = \frac{1}{\sqrt{h}} \sum_{i<T} (\dL{S}^{\top})_{mi}\,Q_{ik} \notag                 \\
+     & = \left( \frac{1}{\sqrt{h}}\,\dL{S}^{\top}\,Q \right)_{mk},
+    \label{eq:att-chain-dk}
+  \end{align}
+  where the key position delta sifts the inner sum over $j$ down to $j = m$, leaving the contraction over the query position index $i$, recognized as the matrix product of the transposed score gradient $\dL{S}^{\top}$ and query matrix $Q$, yielding $\dL{K} = \frac{1}{\sqrt{h}}\,\dL{S}^{\top}\,Q$.
+  Due to the causal mask, the gradient $\dL{S_{ij}} = 0$ for $j > i$.
+
+  \paragraph{FlashAttention-2 Simplification: Softmax Statistics Contraction}
+  To avoid materializing the intermediate $T \times T$ matrices $\dL{A}$ and $\dL{S}$ in DRAM, FlashAttention-2 \cite{flashattention2} simplifies the softmax statistics term $D_i$.
+  Substituting the definition of $\dL{A_{ik}} = \sum_{d<h} \dL{Y_{id}}\,V_{kd}$ from \eqref{eq:att-chain-da} into the definition of $D_i$ \eqref{eq:att-di-def}:
+  \begin{align}
+    D_i
+     & = \sum_{k<T} \left( \sum_{d<h} \dL{Y_{id}}\,V_{kd} \right)\,A_{ik} \notag \\
+     & = \sum_{d<h} \dL{Y_{id}}\,\left( \sum_{k<T} A_{ik}\,V_{kd} \right) \notag \\
+     & = \sum_{d<h} \dL{Y_{id}}\,Y_{id},
+    \label{eq:att-di-contract}
+  \end{align}
+  where the sum over key positions $k$ in the second line is replaced by the forward pass output $Y_{id}$ using \eqref{eq:att-output-fwd}.
+  This contraction is a key mathematical optimization: the row statistics term $D_i$ is simply the row-wise dot product of the output $Y$ and its gradient $\dL{Y}$.
+  Precomputing $D_i \in \R^T$ directly from the output tensors enables evaluating the score gradients $\dL{S_{ij}}$ block-by-block in SRAM:
+  \begin{equation}
+    \dL{S_{ij}} \;=\; A_{ij}\,\left( \sum_{d<h} \dL{Y_{id}}\,V_{jd} - D_i \right),
+    \label{eq:att-ds-final}
+  \end{equation}
+  completely eliminating the need to write the large $\dL{A}$ matrix to DRAM.
+
+  \paragraph{FlashAttention-2 Memory-Efficient Block Tiling}
+  Standard backpropagation requires materializing the $T \times T$ matrices $S$, $A$, $\dL{A}$, and $\dL{S}$ in DRAM, creating a massive $O(T^2)$ memory footprint.
+  FlashAttention-2 avoids this bottleneck by tiling the sequence dimension and executing the backward pass in SRAM using two passes:
+  \begin{enumerate}
+    \item \textbf{Pass 1 ($dQ$ Computation):} Query positions are tiled into blocks of size $B_r$ (indexing rows $i$). For each block:
+          \begin{itemize}
+            \item Load $Q_i$, $\dL{Y}_i$, $Y_i$, and $L_i$ (the LSE vector) from DRAM to SRAM.
+            \item Compute the row scaling term $D_i = \sum_{d<h} \dL{Y}_{id}\,Y_{id}$ in SRAM.
+            \item Loop over key/value blocks $j$ of size $B_c$: load $K_j, V_j$ to SRAM, compute the score block $S_{ij} = Q_i K_j^{\top}/\sqrt{h}$, mask elements where $j > i$, apply softmax $A_{ij} = \exp(S_{ij} - L_i)$, compute the gradient slice $\dL{S_{ij}} = A_{ij} (\dL{Y}_i V_j^{\top} - D_i)$, and accumulate:
+                  \begin{equation}
+                    \dL{Q_i} \;\mathrel{+}=\; \frac{1}{\sqrt{h}}\,\dL{S_{ij}}\,K_j.
+                  \end{equation}
+            \item Write the fully accumulated $\dL{Q_i}$ to DRAM once the loop over $j$ completes.
+          \end{itemize}
+    \item \textbf{Pass 2 ($dK$ and $dV$ Computation):} Key and value positions are tiled into blocks of size $B_c$ (indexing columns $j$). For each block:
+          \begin{itemize}
+            \item Load $K_j, V_j$ to SRAM and initialize local accumulators $\dL{K_j} = 0, \dL{V_j} = 0$.
+            \item Loop over query blocks $i$ of size $B_r$: load $Q_i$, $\dL{Y}_i$, $Y_i$, and $L_i$, compute $D_i$, reconstruct the local slices $A_{ij}$ and $\dL{S_{ij}}$, and accumulate:
+                  \begin{align}
+                    \dL{V_j} \;\mathrel{+} & =\; A_{ij}^{\top}\,\dL{Y}_i,                     \\
+                    \dL{K_j} \;\mathrel{+} & =\; \frac{1}{\sqrt{h}}\,\dL{S_{ij}}^{\top}\,Q_i.
+                  \end{align}
+            \item Write the fully accumulated $\dL{K_j}$ and $\dL{V_j}$ to DRAM once the loop over $i$ completes.
+          \end{itemize}
+  \end{enumerate}
+  Both passes are completely contention-free (Pass 1 parallelizes over $i$, Pass 2 over $j$) and run without any global atomic operations.
 \end{derivation}
 
 \begin{result}
-  \TODO{Gradient for each of $Q$, $K$, $V$.}
+  For each head, the gradients w.r.t.\ Queries $Q$, Keys $K$, and Values $V$ are:
+  \begin{align}
+    \dL{Q} \; & =\; \frac{1}{\sqrt{h}}\,\dL{S}\,K,        \\
+    \dL{K} \; & =\; \frac{1}{\sqrt{h}}\,\dL{S}^{\top}\,Q, \\
+    \dL{V} \; & =\; A^{\top}\,\dL{Y},
+  \end{align}
+  where the causal-masked score gradient $\dL{S} \in \R^{T \times T}$ is:
+  \begin{equation}
+    \dL{S_{ij}} \;=\; \begin{cases}
+      A_{ij} \left( \dL{A_{ij}} - D_i \right) & j \leq i, \\
+      0                                       & j > i,
+    \end{cases}
+  \end{equation}
+  with the intermediate term and scaling statistics:
+  \begin{align}
+    \dL{A_{ij}} \; & =\; \sum_{d<h} \dL{Y_{id}}\,V_{jd}, \\
+    D_i \;         & =\; \sum_{d<h} \dL{Y_{id}}\,Y_{id}.
+  \end{align}
 \end{result}
 
 % =============================================================================
@@ -1127,5 +1323,10 @@ Numerical check used to validate every derivation above:
   \item log-sum-exp and its gradient: $\nabla \log \sum_j e^{x_j} = \softmax(x)$.
   \item \TODO{Collect identities as they get used.}
 \end{itemize}
+
+\begin{thebibliography}{1}
+  \bibitem{flashattention2}
+  T.~Dao, ``FlashAttention-2: Faster attention with better parallelism and work partitioning,'' \emph{arXiv preprint arXiv:2307.08691}, 2023.
+\end{thebibliography}
 
 \end{document}

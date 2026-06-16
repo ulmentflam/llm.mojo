@@ -1,15 +1,15 @@
 import compiler
-from tensor import InputTensor
 from std.sys import simd_width_of
 from std.memory import UnsafePointer
+from extensibility import InputTensor
+from std.gpu.host import DeviceContext
 from std.math import fma, sqrt, ceildiv
 from std.gpu.host.info import is_cpu, is_gpu
-from std.runtime.asyncrt import DeviceContextPtr
-from std.gpu import block_dim, block_idx, thread_idx
-from std.algorithm import vectorize, sync_parallelize
-from tensor.managed_tensor_slice import (
+from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from std.gpu import block_dim, block_idx, thread_idx
+from std.algorithm import vectorize, sync_parallelize
 
 
 # ===----------------------------------------------------------------------=== #
@@ -218,7 +218,7 @@ def adamw_update[
     v_ptr: UnsafePointer[Float32, MutAnyOrigin],
     t: UInt32,
     config: AdamWConfig[dtype],
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) capturing raises:
     # Bias correction math runs in Float32 to match the moment storage.
     # `Float32(t)` is a constructor promotion (not a numeric cast), the
@@ -247,16 +247,14 @@ def adamw_update[
         )
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
-        var dev_ctx = ctx.get_device_context()
+        var dev_ctx = ctx
         # Each thread handles `width` elements, so the total thread count is
         # ceil(n / width) and the grid is ceil(num_threads / BLOCK_SIZE).
         var num_threads = (num_params + width - 1) // width
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
         comptime gpu_kernel = adamw_update_gpu[dtype, width]
-        var compiled = dev_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = dev_ctx.compile_function[gpu_kernel]()
         dev_ctx.enqueue_function(
             compiled,
             num_params,
@@ -307,7 +305,7 @@ struct AdamWUpdate:
         eps: Scalar[dtype],
         weight_decay: Scalar[dtype],
         grad_scale: Scalar[dtype],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if params.size() != grads.size():
             raise Error("params and grads must have the same length")

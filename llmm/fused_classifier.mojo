@@ -1,16 +1,17 @@
 import compiler
-from tensor import InputTensor
 from std.sys import simd_width_of
 from std.memory import UnsafePointer
+from extensibility import InputTensor
+from std.gpu.host import DeviceContext
 from std.math import ceildiv, exp, log
+from std.gpu.host import DeviceAttribute
 from std.gpu.host.info import is_cpu, is_gpu
-from std.algorithm import vectorize, sync_parallelize
-from tensor.managed_tensor_slice import (
+from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from std.runtime.asyncrt import parallelism_level
+from std.algorithm import vectorize, sync_parallelize
 from std.gpu import barrier, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceAttribute
-from std.runtime.asyncrt import DeviceContextPtr, parallelism_level
 
 from llmm.softmax import softmax_phase_1_and_2_cpu, softmax_phase_1_and_2_gpu
 
@@ -249,7 +250,7 @@ def fused_classifier[
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
     vocab_size_padded: Int64,  # Our Vp
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime simd_width = simd_width_of[dtype]()
@@ -267,7 +268,7 @@ def fused_classifier[
         # Duplicated gpu dispatch code from the softmax ops.
         comptime BLOCK_SIZE = 256
         comptime SM_OVERPROVISION = 32
-        var device_ctx = ctx.get_device_context()
+        var device_ctx = ctx
         var num_rows = Int(batch_size * seq_len)
         var num_sm = device_ctx.get_attribute(
             DeviceAttribute.MULTIPROCESSOR_COUNT
@@ -277,9 +278,7 @@ def fused_classifier[
         comptime gpu_kernel = fused_classifier_gpu[
             dtype, BLOCK_SIZE, write_d_logits=write_d_logits
         ]
-        var compiled = device_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
             logits_ptr,
@@ -319,7 +318,7 @@ struct FusedClassifier:
         seq_len: Int64,  # Our T
         vocab_size: Int64,  # Our V
         vocab_size_padded: Int64,  # Our Vp
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if vocab_size > vocab_size_padded:
             raise Error("vocab_size must not exceed vocab_size_padded")
@@ -369,7 +368,7 @@ struct FusedClassifierFwd:
         seq_len: Int64,  # Our T
         vocab_size: Int64,  # Our V
         vocab_size_padded: Int64,  # Our Vp
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if vocab_size > vocab_size_padded:
             raise Error("vocab_size must not exceed vocab_size_padded")

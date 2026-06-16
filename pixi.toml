@@ -1,6 +1,6 @@
 [workspace]
 authors = ["ulmentflam <johnwowen3@gmail.com>"]
-channels = ["https://conda.modular.com/max", "conda-forge"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "llm.mojo"
 platforms = ["osx-arm64"]
 version = "0.1.0"
@@ -8,8 +8,8 @@ version = "0.1.0"
 [tasks]
 
 [dependencies]
-mojo = ">=1.0.0b1,<2"
-max = ">=26.3"
+mojo = "1.0.0b3.*"
+max = "26.5.*"
 python = ">=3.10,<3.13"
 pytorch = ">=2.2"
 numpy = ">=1.26"

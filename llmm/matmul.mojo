@@ -1,25 +1,23 @@
 import compiler
-from layout.coord import Idx
+from std.math import ceildiv
 from layout import TileTensor
-from tensor import InputTensor
 from linalg.matmul import matmul
 from std.sys import simd_width_of
 from std.gpu.primitives import block
-from std.memory import alloc, UnsafePointer
-from layout.tile_layout import row_major
-from linalg.transpose import transpose
 from linalg.matmul.vendor import blas
-from std.math import fma, sqrt, ceildiv, exp
-from std.gpu.host.info import is_cpu, is_gpu
 from std.utils.index import IndexList
-from std.algorithm import vectorize, sync_parallelize
-
-from tensor.managed_tensor_slice import (
+from extensibility import InputTensor
+from linalg.transpose import transpose
+from layout.tile_layout import row_major
+from std.memory import alloc, UnsafePointer
+from std.gpu.host.info import is_cpu, is_gpu
+from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from std.runtime.asyncrt import parallelism_level
+from std.algorithm import vectorize, sync_parallelize
+from std.gpu.host import DeviceContext, DeviceAttribute
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceAttribute
-from std.runtime.asyncrt import DeviceContextPtr, parallelism_level
 
 from llmm.gelu import gelu, gelu_grad
 
@@ -50,36 +48,37 @@ def matmul_fwd[
     seq_len: Int64,
     channels: Int64,
     output_channels: Int64,
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) raises -> None:
     var rows = Int(batch_size * seq_len)  # M in matmul
     var in_channels = Int(channels)  # K in matmul
     var out_channels = Int(output_channels)  # N in matmul
+    comptime elem_dtype = dtype
 
     var c = TileTensor(
         Span[Scalar[dtype], MutAnyOrigin](
             ptr=out_ptr, length=rows * out_channels
         ),
-        row_major(Idx(rows), Idx(out_channels)),
+        row_major(rows, out_channels),
     )
     var a = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
             ptr=input_ptr, length=rows * in_channels
         ),
-        row_major(Idx(rows), Idx(in_channels)),
+        row_major(rows, in_channels),
     )
     var b = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
             ptr=weight_ptr, length=out_channels * in_channels
         ),
-        row_major(Idx(out_channels), Idx(in_channels)),
+        row_major(out_channels, in_channels),
     )
 
     @parameter
     @always_inline
     def epilogue[
-        c_dtype: DType, width: Int, *, alignment: Int = 1
-    ](idx: IndexList[2], val: SIMD[c_dtype, width]) -> None:
+        dtype: DType, width: SIMDSize, *, alignment: Int = 1
+    ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
         var offset = idx[0] * out_channels + idx[1]
         var v = (
             val.cast[DType.float32]()
@@ -87,10 +86,12 @@ def matmul_fwd[
         )
 
         comptime if use_gelu:
-            (pre_gelu_ptr + offset).store(v.cast[dtype]())
-            (out_ptr + offset).store(gelu(v).cast[dtype]())
+            (pre_gelu_ptr + offset).store(v.cast[elem_dtype]())
+            (out_ptr + offset).store(
+                gelu[DType.float32, width](v).cast[elem_dtype]()
+            )
         else:
-            (out_ptr + offset).store(v.cast[dtype]())
+            (out_ptr + offset).store(v.cast[elem_dtype]())
 
     matmul[transpose_b=True, elementwise_lambda_fn=epilogue, target=target](
         c, a, b, ctx=ctx
@@ -114,7 +115,7 @@ struct MatmulFwd:
         seq_len: Int64,
         channels: Int64,
         output_channels: Int64,
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if output.size() != Int(batch_size * seq_len * output_channels):
             raise Error(
@@ -303,7 +304,7 @@ def matmul_bias_bwd[
     batch_size: Int64,
     seq_len: Int64,
     output_channels: Int64,
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) raises -> None:
     comptime if is_cpu[target]():
         comptime simd_width = simd_width_of[DType.float32]()
@@ -317,7 +318,7 @@ def matmul_bias_bwd[
         comptime BLOCK_SIZE = 256
         comptime SM_OVERPROVISION = 32
         comptime width = 4
-        var device_ctx = ctx.get_device_context()
+        var device_ctx = ctx
         var num_tiles = ceildiv(Int(output_channels), width)
         var num_sm = device_ctx.get_attribute(
             DeviceAttribute.MULTIPROCESSOR_COUNT
@@ -327,9 +328,7 @@ def matmul_bias_bwd[
         comptime gpu_kernel = matmul_bias_bwd_gpu[
             dtype, BLOCK_SIZE, accumulate, width
         ]
-        var compiled = device_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
             d_bias_ptr,
@@ -357,31 +356,32 @@ def matmul_d_input_bwd[
     seq_len: Int64,
     channels: Int64,
     output_channels: Int64,
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) raises -> None:
     """Computes d_input = d_output @ weight. Overwrites d_input: llm.c overwrites
     activation grads; only weight/bias grads accumulate across micro-steps."""
     var rows = Int(batch_size * seq_len)
     var in_channels = Int(channels)
     var out_channels = Int(output_channels)
+    comptime elem_dtype = dtype
 
     var c_d_input = TileTensor(
         Span[Scalar[dtype], MutAnyOrigin](
             ptr=d_input_ptr, length=rows * in_channels
         ),
-        row_major(Idx(rows), Idx(in_channels)),
+        row_major(rows, in_channels),
     )
     var a_d_output = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
             ptr=d_output_ptr, length=rows * out_channels
         ),
-        row_major(Idx(rows), Idx(out_channels)),
+        row_major(rows, out_channels),
     )
     var b_weight = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
             ptr=weight_ptr, length=out_channels * in_channels
         ),
-        row_major(Idx(out_channels), Idx(in_channels)),
+        row_major(out_channels, in_channels),
     )
 
     comptime if use_gelu:
@@ -389,8 +389,8 @@ def matmul_d_input_bwd[
         @parameter
         @always_inline
         def d_input_epilogue[
-            c_dtype: DType, width: Int, *, alignment: Int = 1
-        ](idx: IndexList[2], val: SIMD[c_dtype, width]) -> None:
+            dtype: DType, width: SIMDSize, *, alignment: Int = 1
+        ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
             var offset = idx[0] * in_channels + idx[1]
             var v = val.cast[DType.float32]()
             var pre_gelu = (
@@ -398,8 +398,8 @@ def matmul_d_input_bwd[
                 .load[width=width]()
                 .cast[DType.float32]()
             )
-            v *= gelu_grad(pre_gelu)
-            (d_input_ptr + offset).store(v.cast[dtype]())
+            v *= gelu_grad[DType.float32, width](pre_gelu)
+            (d_input_ptr + offset).store(v.cast[elem_dtype]())
 
         matmul[
             transpose_b=False,
@@ -457,7 +457,7 @@ def matmul_d_weight_bwd[
     seq_len: Int64,  # T
     channels: Int64,  # C
     output_channels: Int64,  # OC
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) raises -> None:
     """Computes d_weight = d_output^T @ input. linalg.matmul rejects transpose_a (#6626), so
     GPU goes through the vendor BLAS (transposed A is native and beta folds
@@ -471,25 +471,25 @@ def matmul_d_weight_bwd[
         Span[Scalar[dtype], MutAnyOrigin](
             ptr=d_weight_ptr, length=out_channels * in_channels
         ),
-        row_major(Idx(out_channels), Idx(in_channels)),
+        row_major(out_channels, in_channels),
     )
     var a_d_output = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
             ptr=d_output_ptr, length=rows * out_channels
         ),
-        row_major(Idx(rows), Idx(out_channels)),
+        row_major(rows, out_channels),
     )
     var b_input = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
             ptr=input_ptr, length=rows * in_channels
         ),
-        row_major(Idx(rows), Idx(in_channels)),
+        row_major(rows, in_channels),
     )
 
     comptime if is_gpu[target]():
         # Backend resolves per vendor.
         blas.matmul(
-            ctx.get_device_context(),
+            ctx,
             c_d_weight,
             a_d_output,
             b_input,
@@ -502,7 +502,7 @@ def matmul_d_weight_bwd[
             Span[Scalar[dtype], MutAnyOrigin](
                 ptr=scratch_ptr, length=out_channels * rows
             ),
-            row_major(Idx(out_channels), Idx(rows)),
+            row_major(out_channels, rows),
         )
         var perms = alloc[Scalar[DType.int]](2)
         perms[0] = 1
@@ -518,16 +518,19 @@ def matmul_d_weight_bwd[
             var temp = alloc[Scalar[dtype]](out_channels * in_channels)
             var c_temp = TileTensor(
                 Span[Scalar[dtype], MutAnyOrigin](
-                    ptr=temp, length=out_channels * in_channels
+                    ptr=temp.as_unsafe_any_origin(),
+                    length=out_channels * in_channels,
                 ),
-                row_major(Idx(out_channels), Idx(in_channels)),
+                row_major(out_channels, in_channels),
             )
             matmul[transpose_b=False, target=target](
                 c_temp, scratch_t, b_input, ctx=ctx
             )
             comptime simd_width = simd_width_of[DType.float32]()
             _add_into[dtype, simd_width](
-                d_weight_ptr, temp, out_channels * in_channels
+                d_weight_ptr,
+                temp.as_unsafe_any_origin(),
+                out_channels * in_channels,
             )
             temp.free()
         else:
@@ -554,7 +557,7 @@ def matmul_bwd[
     seq_len: Int64,
     channels: Int64,
     output_channels: Int64,
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) raises -> None:
     matmul_bias_bwd[dtype, target, accumulate](
         d_bias_ptr,
@@ -661,7 +664,7 @@ struct MatmulBwd:
         seq_len: Int64,
         channels: Int64,
         output_channels: Int64,
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         _check_bwd_sizes(
             d_input.size(),

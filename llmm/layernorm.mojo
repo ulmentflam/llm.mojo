@@ -1,17 +1,18 @@
 import compiler
-from tensor import InputTensor
 from std.sys import simd_width_of
-from std.gpu.primitives import block
+from extensibility import InputTensor
+from std.gpu.host import DeviceContext
 from std.gpu.host import DeviceAttribute
+from std.gpu.primitives import block
+from std.math import fma, ceildiv, rsqrt
 from std.memory import alloc, UnsafePointer
 from std.gpu.host.info import is_cpu, is_gpu
-from std.math import fma, sqrt, ceildiv, rsqrt
-from std.algorithm import vectorize, sync_parallelize
-from tensor.managed_tensor_slice import (
+from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from std.algorithm import sync_parallelize
+from std.runtime.asyncrt import parallelism_level
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.runtime.asyncrt import DeviceContextPtr, parallelism_level
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
@@ -324,7 +325,7 @@ def layernorm_fwd[
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
@@ -343,7 +344,7 @@ def layernorm_fwd[
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
         comptime SM_OVERPROVISION = 32
-        var device_ctx = ctx.get_device_context()
+        var device_ctx = ctx
         var num_rows = Int(batch_size * seq_len)
         var num_sm = device_ctx.get_attribute(
             DeviceAttribute.MULTIPROCESSOR_COUNT
@@ -351,9 +352,7 @@ def layernorm_fwd[
         var num_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
 
         comptime gpu_kernel = layernorm_fwd_gpu[dtype, BLOCK_SIZE]
-        var compiled = device_ctx.compile_function[
-            func=gpu_kernel, signature_func=gpu_kernel
-        ]()
+        var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
             output_ptr,
@@ -390,7 +389,7 @@ struct LayerNormFwd:
         batch_size: Int64,  # Our B
         seq_len: Int64,  # Our T
         channels: Int64,  # Our C
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if output.size() != Int(batch_size * seq_len * channels):
             raise Error("output size mismatch")
@@ -451,7 +450,7 @@ def _layernorm_bwd_cpu[
     # partials (dgamma_partial_ptr/dbeta_partial_ptr index by channel only,
     # not by row). The caller owns one such pair per worker, so the row loop
     # races nothing and needs no atomics; the partials are summed into
-    # d_gamma/d_beta once the workers join. This is a very similar approach to 
+    # d_gamma/d_beta once the workers join. This is a very similar approach to
     # the one used in the implementation of matmul. This is done in lue of using
     # atomics to accumulate the gradient of the weight and bias like in Karpathy's implementation.
 
@@ -575,8 +574,8 @@ def layernorm_bwd_cpu[
                 mean_ptr,
                 rstd_ptr,
                 d_input_ptr,
-                dgamma_row,
-                dbeta_row,
+                dgamma_row.as_unsafe_any_origin(),
+                dbeta_row.as_unsafe_any_origin(),
                 c,
             )
 
@@ -854,7 +853,7 @@ def layernorm_bwd[
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
-    ctx: DeviceContextPtr,
+    ctx: DeviceContext,
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
@@ -879,7 +878,7 @@ def layernorm_bwd[
         # Karpathy uses a single kernel to compute the gradient of the input, weight, and bias.
         # In theory this should be faster than the two kernel method, but mojo's compiler is very smart
         # and it might be able to optimize the two kernel method to be as fast as the single kernel method.
-        var device_ctx = ctx.get_device_context()
+        var device_ctx = ctx
         var num_rows = Int(batch_size * seq_len)
         var num_sm = device_ctx.get_attribute(
             DeviceAttribute.MULTIPROCESSOR_COUNT
@@ -888,9 +887,7 @@ def layernorm_bwd[
         # Kernel 1: d_input, one block per row tile (reduces over channels).
         var num_row_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
         comptime dinput_kernel = layernorm_bwd_gpu[dtype, BLOCK_SIZE, width]
-        var dinput_compiled = device_ctx.compile_function[
-            func=dinput_kernel, signature_func=dinput_kernel
-        ]()
+        var dinput_compiled = device_ctx.compile_function[dinput_kernel]()
         device_ctx.enqueue_function(
             dinput_compiled,
             d_output_ptr,
@@ -915,9 +912,7 @@ def layernorm_bwd[
         comptime dparam_kernel = layernorm_dgamma_dbeta_gpu[
             dtype, BLOCK_SIZE, width
         ]
-        var dparam_compiled = device_ctx.compile_function[
-            func=dparam_kernel, signature_func=dparam_kernel
-        ]()
+        var dparam_compiled = device_ctx.compile_function[dparam_kernel]()
         device_ctx.enqueue_function(
             dparam_compiled,
             d_output_ptr,
@@ -958,7 +953,7 @@ struct LayerNormBwd:
         batch_size: Int64,  # Our B
         seq_len: Int64,  # Our T
         channels: Int64,  # Our C
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) capturing raises:
         if d_output.size() != Int(batch_size * seq_len * channels):
             raise Error("d_output size mismatch")
