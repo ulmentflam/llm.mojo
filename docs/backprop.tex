@@ -68,7 +68,7 @@ Companion Derivations for \texttt{llm.mojo}
 
 \begin{abstract}
   This document presents working derivations of the backward pass for every
-  operation in the GPT-2 forward pass, as implemented in the \texttt{llm.mojo}
+  operation in the GPT-2~\cite{gpt2} forward pass, as implemented in the \texttt{llm.mojo}
   kernels. The project is directly inspired by Andrej Karpathy's \texttt{llm.c}~\cite{llmc}.
   We order the sections by backward-derivation pedagogy, starting from the scalar loss
   and working toward the inputs, rather than by the forward execution order of \texttt{llm.c}.
@@ -722,7 +722,7 @@ We express the forward pass as $Y = XW^{\top} + b$ with $X \in \R^{(B\cdot T)\ti
 % =============================================================================
 \section{GELU}\label{sec:gelu}
 
-The Gaussian Error Linear Unit (GELU) activation function, proposed by Hendrycks and Gimpel \cite{gelu}, scales the input by the cumulative normal distribution function $\gelu(x) = x \Phi(x)$. Because the exact CDF involves the non-elementary error function, we express the forward pass using the fast hyperbolic tangent approximation introduced by Page \cite{page} and adopted by OpenAI in GPT-2 and GPT-3:
+The Gaussian Error Linear Unit (GELU) activation function, proposed by Hendrycks and Gimpel \cite{gelu}, scales the input by the cumulative normal distribution function $\gelu(x) = x \Phi(x)$. Because the exact CDF involves the non-elementary error function, we express the forward pass using the fast hyperbolic tangent approximation introduced by Page \cite{page} and adopted by OpenAI in GPT-2~\cite{gpt2} and GPT-3:
 \begin{equation}
   \gelu(x) \;=\; \tfrac{1}{2}\,x\left(1 + \tanh\!\left[\sqrt{2/\pi}\,
       (x + 0.044715\,x^{3})\right]\right).
@@ -1440,6 +1440,9 @@ Our verification tests enforce the relative (\texttt{rtol}) and absolute (\textt
 \begin{thebibliography}{1}
   \bibitem{llmc}
   A.~Karpathy, ``llm.c: LLM training in simple, raw C/CUDA,'' 2024. [Online]. Available: \url{https://github.com/karpathy/llm.c}
+
+  \bibitem{gpt2}
+  A.~Radford, J.~Wu, R.~Child, D.~Luan, D.~Amodei, and I.~Sutskever, ``Language Models are Unsupervised Multitask Learners,'' OpenAI blog, vol. 1, no. 8, p. 9, 2019. [Online]. Available: \url{https://d4mucfpruotyw.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf}
 
   \bibitem{flashattention2}
   T.~Dao, ``FlashAttention-2: Faster attention with better parallelism and work partitioning,'' \emph{arXiv preprint arXiv:2307.08691}, 2023. [Online]. Available: \url{https://arxiv.org/abs/2307.08691}
