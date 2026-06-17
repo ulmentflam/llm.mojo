@@ -9,7 +9,10 @@
 % Build:  make docs                      (from the repo root)
 %         latexmk -pdf backprop.tex      (from docs/, equivalent)
 % =============================================================================
-\documentclass[journal]{IEEEtran}
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf}
+
+\let\proof\relax
+\let\endproof\relax
 
 \usepackage{amsmath, amssymb, amsthm}
 \usepackage{mathtools}
@@ -17,6 +20,9 @@
 \usepackage{xcolor}
 \usepackage{booktabs}
 \usepackage[colorlinks=true, linkcolor=blue!50!black]{hyperref}
+
+\IEEEoverridecommandlockouts
+\overrideIEEEmargins
 
 % -----------------------------------------------------------------------------
 % Macros
@@ -50,23 +56,25 @@
 \newtheorem*{derivation}{Derivation}
 \newtheorem*{result}{Result}
 
-\title{The Mathematics of Backpropagation:\\
-       Companion Derivations for \texttt{llm.mojo}}
-\author{Evan~Owen\\ \texttt{evan@jwo3.io}\\ Georgia Institute of Technology}
-\markboth{The Mathematics of Backpropagation}{Owen}
+\title{\LARGE \bf
+The Mathematics of Backpropagation:\\
+Companion Derivations for \texttt{llm.mojo}
+}
+\author{John W. Owen III}
 
 % =============================================================================
 \begin{document}
 \maketitle
 
 \begin{abstract}
-  Working derivations of the backward pass for every operation in the GPT-2
-  forward pass, as implemented by the \texttt{llm.mojo} kernels. Sections are
-  ordered by backward-derivation pedagogy---starting from the scalar loss and
-  working toward the inputs---rather than by \texttt{llm.c} forward order, so
-  that each gradient is derived only after the one it depends on. Each section
-  anchors on the forward computation and leaves the derivation as structured
-  workspace.
+  This document presents working derivations of the backward pass for every
+  operation in the GPT-2 forward pass, as implemented in the \texttt{llm.mojo}
+  kernels. The project is directly inspired by Andrej Karpathy's \texttt{llm.c}~\cite{llmc}.
+  We order the sections by backward-derivation pedagogy, starting from the scalar loss
+  and working toward the inputs, rather than by the forward execution order of \texttt{llm.c}.
+  This structure ensures that we derive each gradient only after deriving the gradient on
+  which it depends. Each section anchors on the forward computation and provides a structured
+  workspace for the derivation. The companion source code is available at \url{https://github.com/ulmentflam/llm.mojo}.
 \end{abstract}
 
 \tableofcontents
@@ -74,28 +82,25 @@
 % =============================================================================
 \section{Notation and Conventions}\label{sec:notation}
 
-Shapes follow the kernel code, as collected in Table~\ref{tab:notation}.
+Tensor shapes in these derivations follow the parameters of the implementation, which Table~\ref{tab:notation} summarizes. We define the index conventions as $b$ for the batch, $t$ for sequence positions, and $i, j, k$ for channels or vocabulary entries. A row of activations at a single sequence position is denoted by the vector $x_{bt} \in \R^{C}$.
 
-\begin{table*}[t]
+\begin{table}[t]
   \centering
   \caption{Symbols and their corresponding kernel parameters.}
   \label{tab:notation}
   \begin{tabular}{@{}lll@{}}
     \toprule
-    Symbol & Code                         & Meaning                              \\
+    Symbol & Code                         & Meaning                       \\
     \midrule
-    $B$    & \texttt{batch\_size}         & batch size                           \\
-    $T$    & \texttt{seq\_len}            & sequence length                      \\
-    $C$    & \texttt{channels}            & model width (embedding dim)          \\
-    $V$    & \texttt{vocab\_size}         & real vocabulary size                 \\
-    $V_p$  & \texttt{vocab\_size\_padded} & padded vocabulary (row stride)       \\
-    $H$    & \texttt{num\_heads}          & attention heads, head size $h = C/H$ \\
+    $B$    & \texttt{batch\_size}         & batch size                    \\
+    $T$    & \texttt{seq\_len}            & sequence length               \\
+    $C$    & \texttt{channels}            & model width (embed dim)       \\
+    $V$    & \texttt{vocab\_size}         & real vocabulary size          \\
+    $V_p$  & \texttt{vocab\_size\_padded} & padded vocab (stride)         \\
+    $H$    & \texttt{num\_heads}          & attention heads, head $h=C/H$ \\
     \bottomrule
   \end{tabular}
-\end{table*}
-
-Indices: $b$ over batch, $t$ over positions, $i, j, k$ over channels or vocab
-entries. A row of activations at one position is $x_{bt} \in \R^{C}$.
+\end{table}
 
 \paragraph{Why index form?}
 Matrix calculus obscures backpropagation under transposes and Kronecker products. This document writes every relation in \emph{index form} (element-by-element), reducing tensor operations to scalar calculus. Treating entries as independent scalar variables allows standard derivative rules. Matching indices then reassembles scalar equations back into matrix form.
@@ -128,7 +133,7 @@ Adding a vector to a matrix broadcasts the vector over rows:
 Differentiating a tensor expression requires distinct names for the output (\emph{target}) indices and the differentiation (\emph{probe}) indices. Perturbing $X_{mk}$ to find the change in $Y_{ni}$ requires independent letters ($m, k \neq n, i$). Reusing indices would restrict the perturbation to matching coordinate pairs. Independent probe indices evaluate the derivative of any output coordinate with respect to any input coordinate.
 
 \paragraph{Indexed variables under differentiation.}
-Entries of distinct tensors are unrelated; their cross-derivatives vanish. The derivative of a tensor entry with respect to another is $1$ for identical coordinates and $0$ otherwise. The Kronecker delta records this relation:
+Entries of distinct tensors are unrelated; their cross-derivatives vanish. The derivative of a tensor entry with respect to another is one for identical coordinates and zero otherwise. The Kronecker delta records this relation:
 \begin{equation}
   \kron{i}{j} \;=\;
   \begin{cases}
@@ -184,28 +189,28 @@ While the forward pass runs encoder $\to$ layernorm $\to$ attention $\to$ matmul
 
 
 % =============================================================================
-\section{Warm-up: Scalar Chain Rule on a Tiny Network}\label{sec:warmup}
+\section{Scalar Example: Chain Rule on a Tiny Network}\label{sec:example}
 
-A two-step composition to fix conventions before the tensor ops:
-$z = wx + b$, $a = \sigma(z)$, $L = \tfrac{1}{2}(a - y)^2$.
+We introduce a two-step composition to fix conventions before the tensor operations:
+$z = wx + b$, $a = \sigma(z)$, and $L = \tfrac{1}{2}(a - y)^2$.
 
 \begin{derivation}
-  Backward through the loss, then the sigmoid:
+  We propagate the gradient backward through the loss, then the sigmoid:
   \begin{align}
     \dL{a}     & = a - y                                                              \\
     \dL{z}     & = \dL{a} \cdot \pdv{a}{z}                                            \\
     \pdv{a}{z} & = \sigma(z) \cdot (1-\sigma(z))
-    \intertext{and since $a = \sigma(z)$,}
+    \intertext{Because $a = \sigma(z)$,}
     \dL{z}     & = (a - y) \cdot \pdv{a}{z} = (a - y) \cdot a \cdot (1-a).
-    \intertext{For the weight:}
+    \intertext{We compute the gradient for the weight:}
     \dL{w}     & = \dL{a} \cdot \pdv{a}{z} \cdot \pdv{z}{w} = \dL{z} \cdot \pdv{z}{w} \\
     \pdv{z}{w} & = x                                                                  \\
     \dL{w}     & = \dL{z} \cdot x = (a - y) \cdot a \cdot (1-a) \cdot x.
-    \intertext{For the bias:}
+    \intertext{We compute the gradient for the bias:}
     \dL{b}     & = \dL{a} \cdot \pdv{a}{z} \cdot \pdv{z}{b} = \dL{z} \cdot \pdv{z}{b} \\
     \pdv{z}{b} & = 1                                                                  \\
     \dL{b}     & = \dL{z} = (a - y) \cdot a \cdot (1-a).
-    \intertext{For the input:}
+    \intertext{We compute the gradient for the input:}
     \dL{x}     & = \dL{a} \cdot \pdv{a}{z} \cdot \pdv{z}{x} = \dL{z} \cdot \pdv{z}{x} \\
     \pdv{z}{x} & = w                                                                  \\
     \dL{x}     & = \dL{z} \cdot w = (a - y) \cdot a \cdot (1-a) \cdot w.
@@ -213,11 +218,11 @@ $z = wx + b$, $a = \sigma(z)$, $L = \tfrac{1}{2}(a - y)^2$.
 \end{derivation}
 
 \begin{result}
-  One chain back through the network, fanning out at the affine inputs:
+  The gradient propagates in a single chain back through the network, fanning out at the affine inputs:
   \begin{equation}
     \dL{a} \;\to\; \dL{z} \;\to\; \Bigl\{\dL{w},\; \dL{b},\; \dL{x}\Bigr\}
   \end{equation}
-  with $\dL{z} = (a - y) \cdot a \cdot (1-a)$ computed once and reused:
+  where we compute and reuse $\dL{z} = (a - y) \cdot a \cdot (1-a)$:
   $\dL{w} = \dL{z} \cdot x$, \quad $\dL{b} = \dL{z}$, \quad
   $\dL{x} = \dL{z} \cdot w$.
 \end{result}
@@ -225,14 +230,12 @@ $z = wx + b$, $a = \sigma(z)$, $L = \tfrac{1}{2}(a - y)^2$.
 % =============================================================================
 \section{Cross-Entropy Loss}\label{sec:crossentropy}
 
-Standard cross-entropy between a target distribution $y_{bt} \in \R^{V}$ and
-predicted probabilities $p_{bt} \in \R^{V_p}$:
+We define the standard cross-entropy between a target distribution $y_{bt} \in \R^{V}$ and predicted probabilities $p_{bt} \in \R^{V_p}$ as:
 \begin{equation}
   L_{bt} \;=\; -\sum_{i<V} y_{bt,i} \log p_{bt,i}.
   \label{eq:ce-std}
 \end{equation}
-For language modeling the target distribution is one-hot. Writing
-$\ind{P}$ for the indicator of a condition $P$,
+For language modeling, the target distribution is one-hot. Writing $\ind{P}$ for the indicator of a condition $P$:
 \begin{equation}
   \ind{P} \;=\;
   \begin{cases}
@@ -241,13 +244,7 @@ $\ind{P}$ for the indicator of a condition $P$,
   \end{cases}
   \label{eq:indicator}
 \end{equation}
-(the Kronecker delta \eqref{eq:kron} is this indicator specialized to
-an index equality, $\kron{i}{j} = \ind{i = j}$),
-the target with token $y_{bt} \in \{0,\dots,V-1\}$ is
-$y_{bt,i} = \ind{i = y_{bt}}$: all probability mass on the target token,
-zero elsewhere. Every term of \eqref{eq:ce-std} but one then vanishes,
-and the loss collapses to the form computed by
-\texttt{crossentropy\_ohe\_fwd}:
+(where the Kronecker delta \eqref{eq:kron} is this indicator specialized to index equality, $\kron{i}{j} = \ind{i = j}$), the target with token $y_{bt} \in \{0,\dots,V-1\}$ is $y_{bt,i} = \ind{i = y_{bt}}$, placing all probability mass on the target token and zero elsewhere. Every term of \eqref{eq:ce-std} except one vanishes, collapsing the loss to the form that \texttt{crossentropy\_ohe\_fwd} computes:
 \begin{equation}
   L_{bt} \;=\; -\log p_{bt,\,y_{bt}}.
   \label{eq:ce-fwd}
@@ -256,10 +253,7 @@ and the loss collapses to the form computed by
 \subsection{Backward w.r.t.\ the probabilities}
 
 \begin{derivation}
-  Index roles: $i$ names the probed coordinate of $p_{bt}$, $j$ the
-  summed one. Rows are independent, and within a row the coordinates of
-  $p_{bt}$ are independent variables obeying \eqref{eq:entry-dv}.
-  Break the standard form \eqref{eq:ce-std} out term by term:
+  We assign index $i$ to the probed coordinate of $p_{bt}$ and index $j$ to the summed coordinate. Because rows are independent, the coordinates of $p_{bt}$ within a row act as independent variables obeying \eqref{eq:entry-dv}. We expand the standard form \eqref{eq:ce-std} term by term:
   \begin{multline}
     L_{bt} = -\bigl(
     y_{bt,0}\log p_{bt,0}
@@ -270,9 +264,7 @@ and the loss collapses to the form computed by
     \bigr).
     \label{eq:ce-std-expanded}
   \end{multline}
-  Differentiating with respect to one coordinate $p_{bt,i}$, every term
-  of the broken-out sum except the $i$-th is constant, so only its
-  derivative survives:
+  When we differentiate with respect to one coordinate $p_{bt,i}$, every term of the expanded sum except the $i$-th term is constant, so only its derivative survives:
   \begin{align}
     \dL{p_{bt,i}}
      & = -\pdv{}{p_{bt,i}}\bigl(
@@ -284,27 +276,23 @@ and the loss collapses to the form computed by
      & = -\,y_{bt,i}\,\pdv{}{p_{bt,i}}\log p_{bt,i}.
     \label{eq:ce-surviving}
   \end{align}
-  The surviving factor is the derivative of the logarithm,
+  The surviving factor is the derivative of the logarithm:
   \begin{equation}
     \dv{}{x}\log x \;=\; \frac{1}{x}
     \qquad\Longrightarrow\qquad
-    \pdv{}{p_{bt,i}}\log p_{bt,i} \;=\; \frac{1}{p_{bt,i}},
+    \pdv{}{p_{bt,i}}\log p_{bt,i} \;=\; \frac{1}{p_{bt,i}}.
     \label{eq:dlog}
   \end{equation}
-  In delta form the same two steps are \eqref{eq:entry-dv} followed by
-  the sift \eqref{eq:sift}: each term of the sum differentiates to
-  $(y_{bt,j}/p_{bt,j})\,\kron{j}{i}$, and the sum collapses to the
-  single term $j = i$,
+  In delta form, we apply \eqref{eq:entry-dv} followed by the sifting property \eqref{eq:sift}: each term of the sum differentiates to $(y_{bt,j}/p_{bt,j})\,\kron{j}{i}$, which collapses the sum to the single term where $j = i$:
   \begin{equation}
     \dL{p_{bt,i}}
     \;=\;
-    -\sum_{j<V} \frac{y_{bt,j}}{p_{bt,j}}\,\kron{j}{i}
+    \sum_{j<V} -\frac{y_{bt,j}}{p_{bt,j}}\,\kron{j}{i}
     \;=\;
     -\frac{y_{bt,i}}{p_{bt,i}},
     \label{eq:ce-delta-form}
   \end{equation}
-  giving the standard-sum gradient, valid for \emph{any} target
-  distribution $y_{bt}$:
+  yielding the standard-sum gradient, which remains valid for \emph{any} target distribution $y_{bt}$:
   \begin{equation}
     \dL{p_{bt,i}}
     \;=\;
@@ -313,8 +301,7 @@ and the loss collapses to the form computed by
     -\frac{y_{bt,i}}{p_{bt,i}}.
     \label{eq:ce-std-bwd}
   \end{equation}
-  Substituting the one-hot target $y_{bt,i} = \ind{i = y_{bt}}$,
-  \eqref{eq:ce-fwd} depends only on the target coordinate $p_{bt,\,y_{bt}}$:
+  When we substitute the one-hot target $y_{bt,i} = \ind{i = y_{bt}}$, the loss \eqref{eq:ce-fwd} depends only on the target coordinate $p_{bt,\,y_{bt}}$:
   \begin{equation}
     \dL{p_{bt,i}} =
     \begin{cases}
@@ -334,7 +321,7 @@ and the loss collapses to the form computed by
 % =============================================================================
 \section{Softmax}\label{sec:softmax}
 
-Forward: from logits $\ell_{bt} \in \R^{V_p}$ (real entries $i < V$),
+We express the forward pass from logits $\ell_{bt} \in \R^{V_p}$ with real entries $i < V$ as:
 \begin{equation}
   p_{bt,i} \;=\; \frac{e^{\ell_{bt,i} - m_{bt}}}{\sum_{j<V} e^{\ell_{bt,j} - m_{bt}}},
   \qquad m_{bt} = \max_{j<V} \ell_{bt,j}.
@@ -343,18 +330,10 @@ Forward: from logits $\ell_{bt} \in \R^{V_p}$ (real entries $i < V$),
 
 \subsection{The Jacobian}
 
-Row indices $bt$ are dropped throughout: each row is an independent
-softmax, so the Jacobian is per-row.
+We drop the row indices $bt$ throughout this section because each row represents an independent softmax, making the Jacobian per-row.
 
 \begin{derivation}
-  The object here is the Jacobian entry $\pdv{p_i}{\ell_j}$ alone: how
-  one probability moves with one logit. Index roles: $i$ names the
-  probed probability, $j$ the probed logit, and the logits of a row are
-  independent variables obeying \eqref{eq:entry-dv},
-  $\pdv{\ell_a}{\ell_j} = \kron{a}{j}$. The loss enters only in the
-  subsections that follow, where an upstream gradient is chained through
-  these entries. Before differentiating: the max-subtraction in
-  \eqref{eq:softmax-fwd} cancels, because for any constant $c$
+  We seek the Jacobian entry $\pdv{p_i}{\ell_j}$, which describes how one probability changes with respect to one logit. We assign index $i$ to the probed probability and index $j$ to the probed logit. The logits within a row are independent variables obeying \eqref{eq:entry-dv}, $\pdv{\ell_a}{\ell_j} = \kron{a}{j}$. The loss enters only in the subsequent sections, where we chain an upstream gradient through these entries. Before differentiating, we note that the max-subtraction in \eqref{eq:softmax-fwd} cancels because for any constant $c$:
   \begin{equation}
     \frac{e^{\ell_i - c}}{\sum_{j<V} e^{\ell_j - c}}
     \;=\;
@@ -363,27 +342,24 @@ softmax, so the Jacobian is per-row.
     \frac{e^{\ell_i}}{\sum_{j<V} e^{\ell_j}},
     \label{eq:softmax-shift}
   \end{equation}
-  so $m_{bt}$ does not change the derivative and the unshifted form can be
-  differentiated. Break the denominator sum out in the same format:
+  allowing us to differentiate the unshifted form. We expand the denominator sum in the same format:
   \begin{equation}
     p_i = \frac{e^{\ell_i}}{S},
     \qquad
     S = e^{\ell_0} + e^{\ell_1} + e^{\ell_2} + \cdots + e^{\ell_{V-1}}.
     \label{eq:softmax-S}
   \end{equation}
-  Every entry comes from the quotient rule: for $u/v$ and a scalar
-  argument $x$,
+  We compute each entry using the quotient rule for a fraction $u/v$ with scalar argument $x$:
   \begin{equation}
     \pdv{}{x}\,\frac{u}{v}
     \;=\;
     \frac{\pdv{u}{x}\,v \;-\; u\,\pdv{v}{x}}{v^{2}}.
     \label{eq:quotient}
   \end{equation}
-  Work the $2\times2$ block of entries in $p_1, p_2$ and
-  $\ell_1, \ell_2$ explicitly before generalizing.
+  We calculate the two-by-two block of entries for $p_1, p_2$ and $\ell_1, \ell_2$ explicitly before generalizing.
 
   \paragraph{Entry $\pdv{p_1}{\ell_1}$}
-  Here $u = e^{\ell_1}$ and $v = S$, and \emph{both} move with $\ell_1$:
+  In this case, $u = e^{\ell_1}$ and $v = S$, and both variables vary with $\ell_1$:
   \begin{align}
     \pdv{u}{\ell_1} & = \pdv{}{\ell_1}\,e^{\ell_1} = e^{\ell_1},
     \label{eq:q11-u}                                                \\
@@ -391,9 +367,7 @@ softmax, so the Jacobian is per-row.
     + e^{\ell_2} + \cdots + e^{\ell_{V-1}}\bigr) = e^{\ell_1},
     \label{eq:q11-v}
   \end{align}
-  every term of the broken-out sum except $e^{\ell_1}$ being constant.
-  Substituting \eqref{eq:q11-u} and \eqref{eq:q11-v} into the quotient
-  rule \eqref{eq:quotient} with the values filled in:
+  where every term of the expanded sum except $e^{\ell_1}$ is constant. Substituting \eqref{eq:q11-u} and \eqref{eq:q11-v} into the quotient rule \eqref{eq:quotient} yields:
   \begin{align}
     \pdv{p_1}{\ell_1}
      & = \frac{e^{\ell_1}\bigl(e^{\ell_0} + e^{\ell_1} + \cdots
@@ -409,15 +383,13 @@ softmax, so the Jacobian is per-row.
   \end{align}
 
   \paragraph{Entry $\pdv{p_1}{\ell_2}$}
-  Now the numerator does \emph{not} move: $u = e^{\ell_1}$ is constant
-  in $\ell_2$, so $\pdv{u}{\ell_2} = 0$, while again exactly one term of
-  the broken-out denominator survives:
+  Here, the numerator does not change: $u = e^{\ell_1}$ is constant with respect to $\ell_2$, which gives $\pdv{u}{\ell_2} = 0$. Again, only one term of the expanded denominator sum survives:
   \begin{equation}
     \pdv{v}{\ell_2} = \pdv{}{\ell_2}\bigl(e^{\ell_0} + e^{\ell_1}
     + e^{\ell_2} + \cdots + e^{\ell_{V-1}}\bigr) = e^{\ell_2}.
     \label{eq:q12-v}
   \end{equation}
-  Substituting into \eqref{eq:quotient} with the values filled in:
+  Substituting these values into \eqref{eq:quotient} yields:
   \begin{align}
     \pdv{p_1}{\ell_2}
      & = \frac{0 \cdot \bigl(e^{\ell_0} + e^{\ell_1} + \cdots
@@ -431,11 +403,7 @@ softmax, so the Jacobian is per-row.
   \end{align}
 
   \paragraph{Entries $\pdv{p_2}{\ell_1}$ and $\pdv{p_2}{\ell_2}$}
-  The same two computations with the indices swapped. For
-  $\pdv{p_2}{\ell_1}$: $u = e^{\ell_2}$ is constant in $\ell_1$ and
-  $\pdv{v}{\ell_1} = e^{\ell_1}$ by \eqref{eq:q11-v}; for
-  $\pdv{p_2}{\ell_2}$ both numerator and denominator move, exactly as in
-  \eqref{eq:q11}:
+  We perform the same two computations with the indices swapped. For $\pdv{p_2}{\ell_1}$, $u = e^{\ell_2}$ is constant with respect to $\ell_1$, and $\pdv{v}{\ell_1} = e^{\ell_1}$ by \eqref{eq:q11-v}. For $\pdv{p_2}{\ell_2}$, both the numerator and the denominator vary, matching \eqref{eq:q11}:
   \begin{align}
     \pdv{p_2}{\ell_1}
      & = \frac{0 \cdot S - e^{\ell_2}\,e^{\ell_1}}{S^{2}}
@@ -448,7 +416,7 @@ softmax, so the Jacobian is per-row.
   \end{align}
 
   \paragraph{The pattern}
-  Arranged as a block of the Jacobian, the four entries are
+  Arranging these four entries as a block of the Jacobian yields:
   \begin{equation}
     \begin{pmatrix}
       \pdv{p_1}{\ell_1} & \pdv{p_1}{\ell_2} \\[6pt]
@@ -461,12 +429,7 @@ softmax, so the Jacobian is per-row.
     \end{pmatrix}:
     \label{eq:softmax-block}
   \end{equation}
-  diagonal entries $p_i\,(1 - p_i)$, off-diagonal entries
-  $-\,p_i\,p_j$. The general entry repeats the same quotient rule. Each
-  $v$-derivative above is one instance of the general fact that exactly
-  one term of the broken-out $S$ involves $\ell_j$. In delta form, each
-  term differentiates by \eqref{eq:entry-dv} and the sum sifts
-  \eqref{eq:sift}:
+  this block contains diagonal entries $p_i\,(1 - p_i)$ and off-diagonal entries $-\,p_i\,p_j$. The derivation of the general entry follows the same quotient rule. Each derivative of $v$ above illustrates the general fact that exactly one term of the expanded sum $S$ depends on $\ell_j$. In delta form, we differentiate each term using \eqref{eq:entry-dv} and collapse the sum via sifting \eqref{eq:sift}:
   \begin{equation}
     \pdv{S}{\ell_j}
     = \sum_{a<V} \pdv{}{\ell_j}\,e^{\ell_a}
@@ -474,8 +437,7 @@ softmax, so the Jacobian is per-row.
     = e^{\ell_j}.
     \label{eq:softmax-dS}
   \end{equation}
-  The diagonal case $j = i$ repeats \eqref{eq:q11} (the numerator also
-  moves):
+  The diagonal case $j = i$ repeats \eqref{eq:q11} because the numerator also varies:
   \begin{align}
     \pdv{p_i}{\ell_i}
      & = \frac{e^{\ell_i}\,S - e^{\ell_i}\,e^{\ell_i}}{S^2}
@@ -484,8 +446,7 @@ softmax, so the Jacobian is per-row.
      & = p_i - p_i^2 = p_i\,(1 - p_i).
     \label{eq:softmax-diag}
   \end{align}
-  The off-diagonal case $j \neq i$ repeats \eqref{eq:q12} (the numerator
-  $e^{\ell_i}$ is constant in $\ell_j$):
+  The off-diagonal case $j \neq i$ repeats \eqref{eq:q12} because the numerator $e^{\ell_i}$ is constant with respect to $\ell_j$:
   \begin{equation}
     \pdv{p_i}{\ell_j}
     = \frac{0 \cdot S - e^{\ell_i}\,e^{\ell_j}}{S^2}
@@ -508,11 +469,7 @@ softmax, so the Jacobian is per-row.
 \subsection{Backward w.r.t.\ the logits}
 
 \begin{derivation}
-  The upstream gradient $\dL{p}$ enters through the chain rule
-  \eqref{eq:chain} summed over the row, one full column of the
-  Jacobian \eqref{eq:softmax-jac} per output $i$. The summed index $j$
-  runs over the upstream coordinates; the free index $i$ names the
-  logit gradient entry being produced. Broken out:
+  We apply the upstream gradient $\dL{p}$ through the chain rule \eqref{eq:chain} summed over the row, using one column of the Jacobian \eqref{eq:softmax-jac} for each output $i$. The summation index $j$ runs over the upstream coordinates, while the free index $i$ denotes the logit gradient entry. Expanding this sum yields:
   \begin{align}
     \dL{\ell_i}
      & = \sum_{j<V} \dL{p_j}\,\pdv{p_j}{\ell_i} \notag      \\
@@ -522,8 +479,7 @@ softmax, so the Jacobian is per-row.
      & \qquad + \cdots + \dL{p_{V-1}}\pdv{p_{V-1}}{\ell_i}.
     \label{eq:softmax-chain}
   \end{align}
-  Substitute \eqref{eq:softmax-diag} and \eqref{eq:softmax-offdiag}; the
-  $j = i$ term is the diagonal case, every other term is off-diagonal:
+  We substitute \eqref{eq:softmax-diag} and \eqref{eq:softmax-offdiag}, separating the diagonal term $j = i$ from the off-diagonal terms:
   \begin{align}
     \dL{\ell_i}
      & = \dL{p_i}\,p_i\,(1 - p_i)
@@ -531,13 +487,11 @@ softmax, so the Jacobian is per-row.
      & = p_i\,\dL{p_i}
     - p_i\,p_i\,\dL{p_i}
     - p_i \sum_{j \neq i} \dL{p_j}\,p_j.
-    \intertext{The middle term is exactly the missing $j = i$ element of
-      the sum, so it re-absorbs:}
+    \intertext{Because the middle term corresponds exactly to the missing $j = i$ term of the sum, we absorb it back into the summation:}
     \dL{\ell_i}
      & = p_i\,\dL{p_i} - p_i \sum_{j<V} \dL{p_j}\,p_j,
   \end{align}
-  where the remaining sum is the same one for every $i$ in the row.
-  Broken out in the same format, it is
+  where the remaining sum is identical for every $i$ in the row. Expanding this term yields:
   \begin{multline}
     \sum_{j<V} \dL{p_j}\,p_j
     = \dL{p_0}\,p_0 + \dL{p_1}\,p_1 \\
@@ -553,10 +507,7 @@ softmax, so the Jacobian is per-row.
     \qquad i < V,
     \label{eq:softmax-bwd}
   \end{equation}
-  and $\dL{\ell_i} = 0$ for the padded region $i \geq V$. Summing
-  \eqref{eq:softmax-bwd} over the row, the leading $p_i$ distributes into
-  both terms; the probabilities multiplying the (constant) dot product
-  sum to one, leaving two copies of the same dot product:
+  and $\dL{\ell_i} = 0$ for the padded region $i \geq V$. When we sum \eqref{eq:softmax-bwd} over the row, the leading factor $p_i$ distributes into both terms. The probabilities multiplying the constant dot product sum to one, leaving two copies of the dot product:
   \begin{align}
     \sum_{i<V} \dL{\ell_i}
      & = \sum_{i<V} p_i\,\dL{p_i}
@@ -567,40 +518,31 @@ softmax, so the Jacobian is per-row.
     \;=\; 0.
     \label{eq:softmax-zerosum}
   \end{align}
-  The gradient row always sums to zero, consistent with the shift
-  invariance \eqref{eq:softmax-shift}.
+  The gradient row sums to zero, which reflects the shift invariance \eqref{eq:softmax-shift}.
 \end{result}
 
 \subsection{Fused softmax + cross-entropy}
 
-The composition is the case that matters for the model: backprop through
-\eqref{eq:ce-fwd} and \eqref{eq:softmax-fwd} together and watch the
-Jacobian collapse.
+This composition represents the primary use case for the model. Backpropagating through \eqref{eq:ce-fwd} and \eqref{eq:softmax-fwd} simultaneously collapses the Jacobian.
 
 \begin{derivation}
-  Write out the chain per logit coordinate, full indices restored: the
-  summed index $i$ runs over the probabilities, and the free index $j$
-  names the logit gradient entry being produced:
+  We write the chain rule per logit coordinate, restoring the full indices. The summation index $i$ runs over the probabilities, while the free index $j$ denotes the logit gradient entry:
   \begin{equation}
     \dL{\ell_{bt,j}}
     \;=\;
     \sum_{i<V} \dL{p_{bt,i}}\,\pdv{p_{bt,i}}{\ell_{bt,j}}.
     \label{eq:fused-chain}
   \end{equation}
-  Substitute what is already known into the combined equation: the
-  cross-entropy gradient \eqref{eq:ce-bwd} for the first factor and the
-  Jacobian \eqref{eq:softmax-jac} for the second:
+  We substitute the cross-entropy gradient \eqref{eq:ce-bwd} for the first factor and the Jacobian \eqref{eq:softmax-jac} for the second factor into the combined equation:
   \begin{align}
     \dL{\ell_{bt,j}}
      & = \sum_{i<V}
     \left(-\frac{\ind{i = y_{bt}}}{p_{bt,i}}\right)
     p_{bt,i}\,\bigl(\kron{i}{j} - p_{bt,j}\bigr)
-    \intertext{The $p_{bt,i}$ in the denominator cancels against the
-      $p_{bt,i}$ the Jacobian contributes:}
+    \intertext{The factor $p_{bt,i}$ in the denominator cancels with the factor $p_{bt,i}$ from the Jacobian:}
      & = -\sum_{i<V} \ind{i = y_{bt}}\,
     \bigl(\kron{i}{j} - p_{bt,j}\bigr)
-    \intertext{and the one-hot indicator keeps exactly one term of the
-      sum, $i = y_{bt}$:}
+    \intertext{and the one-hot indicator isolates the single term where $i = y_{bt}$:}
      & = -\bigl(\kron{y_{bt}}{j} - p_{bt,j}\bigr)
     = p_{bt,j} - \ind{j = y_{bt}}.
     \label{eq:fused-collapse}
@@ -613,22 +555,16 @@ Jacobian collapse.
     \qquad j < V,
     \label{eq:fused-bwd}
   \end{equation}
-  and $\dL{\ell_{bt,j}} = 0$ for the padded region $j \geq V$. The
-  Jacobian collapsed entirely: no sum over the row survives in
-  \eqref{eq:fused-bwd}.
+  and $\dL{\ell_{bt,j}} = 0$ for the padded region $j \geq V$. The Jacobian collapses entirely, removing the sum over the row in \eqref{eq:fused-bwd}.
 
-  Cross-check via the general backward \eqref{eq:softmax-bwd}: with the
-  cross-entropy upstream \eqref{eq:ce-bwd}, the dot product evaluates to
+  We verify this result via the general backward formula \eqref{eq:softmax-bwd}. With the cross-entropy upstream gradient \eqref{eq:ce-bwd}, the dot product evaluates to:
   \begin{equation}
     \sum_{j<V} \dL{p_{bt,j}}\,p_{bt,j}
     = \sum_{j<V} \left(-\frac{\ind{j = y_{bt}}}{p_{bt,j}}\right) p_{bt,j}
     = -1,
     \label{eq:fused-dot}
   \end{equation}
-  a constant: for a one-hot target the row-wide weighted sum is known
-  before reading a single element. Substituting $-1$ for the dot product
-  in \eqref{eq:softmax-bwd}, the $p_{bt,i}$ outside the parentheses
-  cancels the reciprocal inside them:
+  which is a constant. For a one-hot target, we determine the row-wide weighted sum before reading any element. Substituting $-1$ for the dot product in \eqref{eq:softmax-bwd}, the factor $p_{bt,i}$ outside the parentheses cancels the reciprocal inside:
   \begin{align}
     \dL{\ell_{bt,i}}
      & = p_{bt,i}\left(\dL{p_{bt,i}} - (-1)\right) \notag      \\
@@ -637,21 +573,14 @@ Jacobian collapse.
      & = p_{bt,i} - \ind{i = y_{bt}},
     \label{eq:fused-check}
   \end{align}
-  agreeing with \eqref{eq:fused-bwd}: chaining through the Jacobian
-  directly and substituting into the general backward are two routes to
-  the same gradient. The zero-sum check of \S\ref{sec:softmax} also
-  holds: the probabilities sum to one, and the indicator fires exactly
-  once per row:
+  demonstrating that chaining through the Jacobian directly and substituting into the general backward formula represent two equivalent routes to the same gradient. The zero-sum property of \S\ref{sec:softmax} also holds because the probabilities sum to one, and the indicator fires exactly once per row:
   \begin{equation}
     \sum_{j<V} \bigl(p_{bt,j} - \ind{j = y_{bt}}\bigr)
     \;=\; 1 - 1 \;=\; 0.
     \label{eq:fused-zerosum}
   \end{equation}
 
-  The collapse did not need one-hotness. It needed only the standard-sum
-  gradient \eqref{eq:ce-std-bwd} and the fact that the target is a
-  distribution, $\sum_{i<V} y_{bt,i} = 1$. Repeating
-  \eqref{eq:fused-chain} with a general target distribution,
+  The collapse does not require a one-hot target. It requires only the standard-sum gradient \eqref{eq:ce-std-bwd} and the assumption that the target is a probability distribution satisfying $\sum_{i<V} y_{bt,i} = 1$. Repeating \eqref{eq:fused-chain} with a general target distribution:
   \begin{align}
     \dL{\ell_{bt,j}}
      & = \sum_{i<V}
@@ -661,40 +590,21 @@ Jacobian collapse.
     \;=\; p_{bt,j} - y_{bt,j},
     \label{eq:fused-general}
   \end{align}
-  the one-hot result \eqref{eq:fused-bwd} being the special case
-  $y_{bt,j} = \ind{j = y_{bt}}$. Softmax + cross-entropy always
-  backpropagates as \emph{predicted minus target}.
+  where the one-hot result \eqref{eq:fused-bwd} is the special case where $y_{bt,j} = \ind{j = y_{bt}}$. Thus, softmax paired with cross-entropy always backpropagates as \emph{predicted minus target}.
 \end{result}
 
 % =============================================================================
 \section{Linear Layer (Matmul)}\label{sec:matmul}
 
-Forward: $Y = XW^{\top} + b$ with $X \in \R^{(B\cdot T)\times C_{\text{in}}}$,
-$W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, $b \in \R^{C_{\text{out}}}$.
+We express the forward pass as $Y = XW^{\top} + b$ with $X \in \R^{(B\cdot T)\times C_{\text{in}}}$, $W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, and $b \in \R^{C_{\text{out}}}$.
 
 \begin{derivation}
-  Index form throughout: $n$ runs over the $N = B \cdot T$ flattened rows
-  ($n = bt$), $j$ over $C_{\text{in}}$, and $i$ over $C_{\text{out}}$.
-  Read every entry as (row, column):
-  $X_{nj}$ is (position $n$, in-channel $j$);
-  $W_{ij}$ is (out-channel $i$, in-channel $j$);
-  $Y_{ni}$ is (position $n$, out-channel $i$);
-  $b_i$ has the single index (out-channel $i$).
+  We write the equations in index form: $n$ runs over the $N = B \cdot T$ flattened rows ($n = bt$), $j$ runs over $C_{\text{in}}$, and $i$ runs over $C_{\text{out}}$. We interpret every matrix entry as (row, column): $X_{nj}$ is (position $n$, in-channel $j$); $W_{ij}$ is (out-channel $i$, in-channel $j$); $Y_{ni}$ is (position $n$, out-channel $i$); and $b_i$ has the single index (out-channel $i$).
 
-  Differentiation needs a \emph{second}, independent set of index
-  names. Asking how $Y_{ni}$ moves when one entry of $X$ moves must
-  allow the moving entry to be any entry, so the probe entry gets fresh
-  indices: $X_{mk}$ (position $m$, in-channel $k$), and likewise
-  $W_{kl}$ (out-channel $k$, in-channel $l$) and $b_k$. Keeping the
-  target indices $(n, i)$ and the probe indices distinct asks every
-  combination of which-output against which-input at once.
+  Differentiation requires a second, independent set of index names. To determine how $Y_{ni}$ changes when one entry of $X$ varies, we must allow the perturbed entry to be any element. Thus, the probe entry receives fresh indices: $X_{mk}$ (position $m$, in-channel $k$), and similarly $W_{kl}$ (out-channel $k$, in-channel $l$) and $b_k$. Keeping the target indices $(n, i)$ and the probe indices distinct evaluates every combination of output and input simultaneously.
 
   \paragraph{The transpose under differentiation}
-  By the transpose definition \eqref{eq:transpose},
-  $(W^{\top})_{ji} = W_{ij}$: the same independent variables, relabeled.
-  Applying \eqref{eq:entry-dv} through the relabeling, the transpose
-  changes nothing except which of $W$'s indices is compared with which
-  probe index:
+  By the transpose definition \eqref{eq:transpose}, we write $(W^{\top})_{ji} = W_{ij}$, which relabels the same independent variables. Applying \eqref{eq:entry-dv} through the relabeled indices, we find that the transpose changes only which index of $W$ we compare with the probe index:
   \begin{equation}
     \pdv{(W^{\top})_{ji}}{W_{kl}}
     \;=\;
@@ -703,8 +613,7 @@ $W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, $b \in \R^{C_{\text{out}}}$.
     \kron{i}{k}\,\kron{j}{l}.
     \label{eq:transpose-dv}
   \end{equation}
-  With \eqref{eq:transpose} absorbed and the bias broadcast
-  \eqref{eq:broadcast} written out, the forward in indices is
+  After absorbing \eqref{eq:transpose} and writing out the broadcast bias \eqref{eq:broadcast}, we express the forward pass in index form as:
   \begin{align}
     Y_{ni}
      & = \sum_{j<C_{\text{in}}} X_{nj}\,(W^{\top})_{ji} + b_i
@@ -716,11 +625,7 @@ $W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, $b \in \R^{C_{\text{out}}}$.
   \end{align}
 
   \paragraph{Local derivative $\pdv{Y}{X}$}
-  Target $Y_{ni}$ (position $n$, out-channel $i$); probe $X_{mk}$
-  (position $m$, in-channel $k$): four free indices, every pair of
-  output entry against input entry at once. Differentiate the
-  broken-out form \eqref{eq:matmul-fwd-idx} term by term. $W$ and $b$
-  are constants here, and each $X_{nj}$ obeys \eqref{eq:entry-dv}:
+  With target $Y_{ni}$ (position $n$, out-channel $i$) and probe $X_{mk}$ (position $m$, in-channel $k$), we consider four free indices, representing every pair of output and input entries. We differentiate the expanded form \eqref{eq:matmul-fwd-idx} term by term. Because $W$ and $b$ act as constants, and each $X_{nj}$ obeys \eqref{eq:entry-dv}, we obtain:
   \begin{align}
     \pdv{Y_{ni}}{X_{mk}}
      & = \sum_{j<C_{\text{in}}} W_{ij}\,\pdv{X_{nj}}{X_{mk}}
@@ -729,16 +634,10 @@ $W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, $b \in \R^{C_{\text{out}}}$.
     = \kron{n}{m}\,W_{ik}.
     \label{eq:matmul-dydx}
   \end{align}
-  The row delta $\kron{n}{m}$ contains no $j$, so it factors out of the
-  sum; the column delta sifts the sum down to $j = k$ by
-  \eqref{eq:sift}. $\kron{n}{m}$ survives because neither $n$ nor $m$
-  is summed here: it waits for the chain rule, recording that row $n$
-  of $Y$ reads only row $m = n$ of $X$.
+  Because the row delta $\kron{n}{m}$ does not depend on $j$, we factor it out of the sum. The column delta sifts the sum to $j = k$ via \eqref{eq:sift}. The delta $\kron{n}{m}$ survives because we do not sum over $n$ or $m$ here. This term remains for the chain rule, indicating that row $n$ of $Y$ depends only on row $m = n$ of $X$.
 
   \paragraph{Local derivative $\pdv{Y}{W}$}
-  Target $Y_{ni}$, probe $W_{kl}$ (out-channel $k$, in-channel $l$).
-  Now $X$ is the constant and each $W_{ij}$ obeys
-  \eqref{eq:transpose-dv}:
+  With target $Y_{ni}$ and probe $W_{kl}$ (out-channel $k$, in-channel $l$), $X$ acts as the constant and each $W_{ij}$ obeys \eqref{eq:transpose-dv}:
   \begin{align}
     \pdv{Y_{ni}}{W_{kl}}
      & = \sum_{j<C_{\text{in}}} X_{nj}\,\pdv{W_{ij}}{W_{kl}}
@@ -747,29 +646,18 @@ $W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, $b \in \R^{C_{\text{out}}}$.
     = \kron{i}{k}\,X_{nl}.
     \label{eq:matmul-dydw}
   \end{align}
-  The same shape with the roles swapped: the out-channel delta
-  $\kron{i}{k}$ has no $j$ and factors out unconsumed, while the
-  in-channel delta sifts $j$ down to $l$.
+  This calculation mirrors the previous derivation with the roles swapped: the out-channel delta $\kron{i}{k}$ does not depend on $j$ and factors out, while the in-channel delta sifts the sum over $j$ to $l$.
 
-  \paragraph{Local derivative $\pdv{Y}{b}$, and its gotcha}
-  The bias term in \eqref{eq:matmul-fwd-idx} is a bare $b_i$, and $b$
-  is a vector, so \eqref{eq:entry-dv} needs only one index pair:
+  \paragraph{Local derivative $\pdv{Y}{b}$ and its broadcast behavior}
+  The bias term in \eqref{eq:matmul-fwd-idx} is $b_i$. Because $b$ is a vector, \eqref{eq:entry-dv} requires only one index pair:
   \begin{equation}
     \pdv{Y_{ni}}{b_k} \;=\; \pdv{b_i}{b_k} \;=\; \kron{i}{k},
     \label{eq:matmul-dydb}
   \end{equation}
-  with no dependence on $n$ at all. That is the broadcast: the
-  \emph{same} $b_k$ appears in every one of the $N$ rows of $Y$, so
-  $b_k$ has $N$ distinct output coordinates moving with it. The local
-  derivative looks as innocent as the scalar warm-up
-  (\S\ref{sec:warmup}, $\pdv{z}{b} = 1$). That is exactly what makes it a
-  trap. The fan-out is invisible here. It reappears only in the chain
-  rule, as a sum that is easy to forget.
+  which does not depend on $n$. This independence reflects the broadcast operation: the same $b_k$ appears in every one of the $N$ rows of $Y$, meaning that $b_k$ affects $N$ distinct output coordinates. While this local derivative resembles the scalar example (\S\ref{sec:example}, $\pdv{z}{b} = 1$), the broadcast behavior introduces a sum in the chain rule that we must not omit.
 
   \paragraph{Chain rule}
-  $L$ depends on every entry of $Y$, so \eqref{eq:chain} sums over both
-  of the \emph{output's} indices $(n, i)$. The probe indices are the
-  free ones: they name which gradient entry is being produced.
+  Because $L$ depends on every entry of $Y$, the chain rule \eqref{eq:chain} sums over both output indices $(n, i)$. The probe indices act as the free indices, specifying the gradient entry we compute:
   \begin{equation}
     \dL{\theta}
     \;=\;
@@ -777,42 +665,29 @@ $W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, $b \in \R^{C_{\text{out}}}$.
     \dL{Y_{ni}}\,\pdv{Y_{ni}}{\theta}.
     \label{eq:matmul-chain}
   \end{equation}
-  For the input, substitute \eqref{eq:matmul-dydx}. The surviving row
-  delta now meets the $n$ sum and sifts it down to $n = m$; nothing
-  constrains $i$, so the $i$ sum remains as the contraction with $W$:
+  For the input gradient, we substitute \eqref{eq:matmul-dydx} into the chain rule. The surviving row delta sifts the sum over $n$ to $m$. Because no delta constrains $i$, the sum over $i$ remains as a contraction with $W$:
   \begin{align}
     \dL{X_{mk}}
      & = \sum_{n<N} \sum_{i<C_{\text{out}}}
     \dL{Y_{ni}}\,\kron{n}{m}\,W_{ik} \notag          \\
      & = \sum_{i<C_{\text{out}}} \dL{Y_{mi}}\,W_{ik}
-    = \Bigl(\dL{Y}\,W\Bigr)_{mk},
+    = \Bigl(\dL{Y}\,W\Bigr)_{mk}.
     \label{eq:matmul-dx-idx}
   \end{align}
-  free indices $(m, k)$ on both sides: row $m$, in-channel $k$ of the
-  input gradient. The last step is the recognition rule of
-  \eqref{eq:matprod}: the summed $i$ sits as the column of $\dL{Y}$
-  (entry $\dL{Y_{mi}}$) and the row of $W$ (entry $W_{ik}$), so the sum
-  is a plain product with no transpose.
-  For the weight, substitute \eqref{eq:matmul-dydw}. The out-channel
-  delta sifts the $i$ sum down to $i = k$, but nothing constrains $n$,
-  so the $n$ sum \emph{survives}:
+  This expression has free indices $(m, k)$ on both sides, corresponding to row $m$, in-channel $k$ of the input gradient. The final step applies the recognition rule of \eqref{eq:matprod}: the summed index $i$ is the column of $\dL{Y}$ (in $\dL{Y_{mi}}$) and the row of $W$ (in $W_{ik}$), meaning the sum represents a matrix product without transposing either factor.
+
+  For the weight gradient, we substitute \eqref{eq:matmul-dydw} into the chain rule. The out-channel delta sifts the sum over $i$ to $k$, but because no delta constrains $n$, the sum over $n$ survives:
   \begin{align}
     \dL{W_{kl}}
      & = \sum_{n<N} \sum_{i<C_{\text{out}}}
     \dL{Y_{ni}}\,\kron{i}{k}\,X_{nl} \notag \\
      & = \sum_{n<N} \dL{Y_{nk}}\,X_{nl}
-    = \left(\dL{Y}^{\top} X\right)_{kl},
+    = \left(\dL{Y}^{\top} X\right)_{kl}.
     \label{eq:matmul-dw-idx}
   \end{align}
-  free indices $(k, l)$: out-channel $k$, in-channel $l$, the entry
-  layout of $W$ itself. Here the recognition rule of \eqref{eq:matprod}
-  forces a transpose: the summed $n$ sits as the \emph{row} of both
-  $\dL{Y}$ and $X$. Transposing the left factor moves it,
-  $(\dL{Y}^{\top})_{kn} = \dL{Y_{nk}}$ by \eqref{eq:transpose}, and the
-  sum becomes a product.
-  For the bias, substitute \eqref{eq:matmul-dydb}. The delta sifts the
-  $i$ sum; the local derivative never mentioned $n$, so the whole $n$
-  sum survives. Broken out:
+  This expression has free indices $(k, l)$, which match the out-channel $k$ and in-channel $l$ layout of $W$. Here, the recognition rule of \eqref{eq:matprod} requires a transpose because the summed index $n$ is the row of both $\dL{Y}$ and $X$. Transposing the left factor yields $(\dL{Y}^{\top})_{kn} = \dL{Y_{nk}}$ via \eqref{eq:transpose}, which expresses the sum as a matrix product.
+
+  For the bias gradient, we substitute \eqref{eq:matmul-dydb} into the chain rule. The delta sifts the sum over $i$. Because the local derivative does not depend on $n$, the sum over $n$ survives. Expanding this sum yields:
   \begin{align}
     \dL{b_k}
      & = \sum_{n<N} \sum_{i<C_{\text{out}}}
@@ -822,54 +697,39 @@ $W \in \R^{C_{\text{out}}\times C_{\text{in}}}$, $b \in \R^{C_{\text{out}}}$.
     + \cdots + \dL{Y_{N-1,k}}.
     \label{eq:matmul-db-idx}
   \end{align}
-  This is the gotcha of \eqref{eq:matmul-dydb} coming due: the local
-  derivative was a lone $\kron{i}{k}$, but the gradient is a full
-  reduction over all $B \cdot T$ rows. In the scalar warm-up the same
-  formula holds with $N = 1$, which is why $\dL{b} = \dL{z}$ there: the
-  sum was present all along, with one term.
+  This demonstrates the consequence of the broadcast behavior described in \eqref{eq:matmul-dydb}: although the local derivative is simply $\kron{i}{k}$, the gradient requires a summation over all $B \cdot T$ rows. In the scalar example (\S\ref{sec:example}), the same relation holds with $N = 1$. The sum still exists there, but collapses to a single term, yielding $\dL{b} = \dL{z}$.
 \end{derivation}
 
 \begin{result}
-  \begin{equation}
-    \dL{X} = \dL{Y}\,W,
-    \qquad
-    \dL{W} = \dL{Y}^{\top} X,
-    \qquad
-    \dL{b_k} = \sum_{n<N} \dL{Y_{nk}}.
+  \begin{align}
+    \dL{X}   & =\; \dL{Y}\,W,              \\
+    \dL{W}   & =\; \dL{Y}^{\top} X,        \\
+    \dL{b_k} & =\; \sum_{n<N} \dL{Y_{nk}}.
     \label{eq:matmul-bwd}
-  \end{equation}
-  Shape checks, with $\dL{Y} \in \R^{N \times C_{\text{out}}}$:
+  \end{align}
+  We verify the dimensions of each gradient with $\dL{Y} \in \R^{N \times C_{\text{out}}}$:
   $(N \times C_{\text{out}})(C_{\text{out}} \times C_{\text{in}})
     = N \times C_{\text{in}}$ for $\dL{X}$;
   $(C_{\text{out}} \times N)(N \times C_{\text{in}})
     = C_{\text{out}} \times C_{\text{in}}$ for $\dL{W}$;
   $\dL{b} \in \R^{C_{\text{out}}}$.
 
-  The reduction over $B \cdot T$ appears in $\dL{W}$ and $\dL{b}$ (every
-  position contributes to the same shared parameter: the $\mathrel{+}=$
-  convention of \S\ref{sec:notation}) and not in $\dL{X}$ (each row of
-  the input gets its own gradient row).
+  The reduction over the $B \cdot T$ dimension occurs in $\dL{W}$ and $\dL{b}$ because every position contributes to the shared parameters (using the $\mathrel{+}=$ convention of \S\ref{sec:notation}). In contrast, we compute a separate gradient row for each input row in $\dL{X}$.
 
-  Transpose bookkeeping: the forward carries the transpose
-  ($Y = XW^{\top}$), and two consequences follow. The input gradient
-  needs \emph{no} transpose ($\dL{X} = \dL{Y}\,W$, not
-  $\dL{Y}\,W^{\top}$). And $\dL{W}$ comes out directly in $W$'s own
-  $(C_{\text{out}} \times C_{\text{in}})$ layout, ready for the
-  optimizer. Both facts fall out of
-  \eqref{eq:transpose-dv} rather than being conventions to memorize.
+  Because the forward pass contains the transpose ($Y = XW^{\top}$), two consequences follow. First, computing the input gradient requires no transpose ($\dL{X} = \dL{Y}\,W$, rather than $\dL{Y}\,W^{\top}$). Second, we obtain $\dL{W}$ directly in the original layout of $W$ ($C_{\text{out}} \times C_{\text{in}}$). Both properties derive from \eqref{eq:transpose-dv} rather than arbitrary conventions.
 \end{result}
 
 % =============================================================================
 \section{GELU}\label{sec:gelu}
 
-Forward (tanh approximation, as in llm.c):
+The Gaussian Error Linear Unit (GELU) activation function, proposed by Hendrycks and Gimpel \cite{gelu}, scales the input by the cumulative normal distribution function $\gelu(x) = x \Phi(x)$. Because the exact CDF involves the non-elementary error function, we express the forward pass using the fast hyperbolic tangent approximation introduced by Page \cite{page} and adopted by OpenAI in GPT-2 and GPT-3:
 \begin{equation}
   \gelu(x) \;=\; \tfrac{1}{2}\,x\left(1 + \tanh\!\left[\sqrt{2/\pi}\,
       (x + 0.044715\,x^{3})\right]\right).
   \label{eq:gelu-fwd}
 \end{equation}
 
-Name the inner argument once; everything chains through it:
+We define the inner argument $u(x)$ to simplify the chain rule:
 \begin{equation}
   \begin{aligned}
     u(x)     & = \sqrt{2/\pi}\,\bigl(x + 0.044715\,x^{3}\bigr), \\
@@ -879,12 +739,10 @@ Name the inner argument once; everything chains through it:
 \end{equation}
 
 \begin{derivation}
-  The object is the scalar derivative $\gelu'(x)$. How it enters the
-  chain rule is recorded in the result.
+  We compute the scalar derivative $\gelu'(x)$. The result describes its role in the chain rule.
 
-  \paragraph{Product rule on the definition}
-  \eqref{eq:gelu-u} is a product of $\tfrac{1}{2}x$ and
-  $(1 + \tanh u)$:
+  \paragraph{Product rule}
+  We apply the product rule to \eqref{eq:gelu-u}:
   \begin{equation}
     \gelu'(x)
     \;=\;
@@ -894,15 +752,14 @@ Name the inner argument once; everything chains through it:
   \end{equation}
 
   \paragraph{The tanh derivative via $\operatorname{sech}^2$}
-  The derivative of $\tanh$ is $\operatorname{sech}^{2}$, and the inner
-  function chains through it:
+  The derivative of $\tanh$ is $\operatorname{sech}^{2}$, which requires chaining the derivative of the inner function:
   \begin{equation}
     \pdv{}{x}\tanh u
     \;=\;
     \operatorname{sech}^{2}(u)\,u'(x),
     \label{eq:gelu-sech}
   \end{equation}
-  with the polynomial derivative of the inner argument
+  with the polynomial derivative of the inner argument:
   \begin{align}
     u'(x)
      & = \sqrt{2/\pi}\,\bigl(1 + 3 \cdot 0.044715\,x^{2}\bigr) \notag \\
@@ -911,14 +768,12 @@ Name the inner argument once; everything chains through it:
   \end{align}
 
   \paragraph{Converting $\operatorname{sech}^2$ to $1 - \tanh^2$}
-  Divide the hyperbolic Pythagorean identity
-  $\cosh^{2} u - \sinh^{2} u = 1$ through by $\cosh^{2} u$:
+  Dividing the hyperbolic Pythagorean identity $\cosh^{2} u - \sinh^{2} u = 1$ by $\cosh^{2} u$ yields:
   \begin{equation}
     1 - \tanh^{2} u \;=\; \operatorname{sech}^{2} u,
     \label{eq:sech-tanh}
   \end{equation}
-  so \eqref{eq:gelu-sech} needs no separate $\operatorname{sech}$
-  evaluation:
+  so \eqref{eq:gelu-sech} needs no separate $\operatorname{sech}$ evaluation:
   \begin{equation}
     \pdv{}{x}\tanh u
     \;=\;
@@ -926,20 +781,15 @@ Name the inner argument once; everything chains through it:
     \label{eq:gelu-tanhprime}
   \end{equation}
 
-  \paragraph{The derivative rolls into the definition}
-  $\tanh$ differentiates into a function of itself,
-  $\tanh' = 1 - \tanh^{2}$, and $\tanh u$ already sits inside the
-  forward \eqref{eq:gelu-u}. Solving the definition for it (for
-  $x \neq 0$):
+  \paragraph{Simplifying the derivative}
+  Because $\tanh$ differentiates into a function of itself ($\tanh' = 1 - \tanh^{2}$), and $\tanh u$ appears in the forward expression \eqref{eq:gelu-u}, we solve for it when $x \neq 0$:
   \begin{equation}
     1 + \tanh u = \frac{2\,\gelu(x)}{x}
     \;\Longrightarrow\;
     \tanh u = \frac{2\,\gelu(x)}{x} - 1.
     \label{eq:gelu-self}
   \end{equation}
-  Substituting \eqref{eq:gelu-tanhprime} into
-  \eqref{eq:gelu-product}, every quantity the derivative needs is
-  either $x$ itself or the $\tanh u$ the forward already computed:
+  We substitute \eqref{eq:gelu-tanhprime} into \eqref{eq:gelu-product}. This ensures that every quantity in the derivative is either the input $x$ or the value $\tanh u$ computed during the forward pass:
   \begin{align}
     \gelu'(x)
      & = \tfrac{1}{2}\bigl(1 + \tanh u\bigr)
@@ -958,29 +808,20 @@ Name the inner argument once; everything chains through it:
     + \tfrac{1}{2}\,x\,\bigl(1 - \tanh^{2} u\bigr)\,u'(x),
     \label{eq:gelu-bwd}
   \end{equation}
-  with $u$ and $u'$ from \eqref{eq:gelu-u} and \eqref{eq:gelu-du}. One
-  evaluation of $\tanh u$ serves both terms: the self-reference
-  $\tanh' = 1 - \tanh^{2}$ \eqref{eq:sech-tanh} replaces
-  $\operatorname{sech}$, and via \eqref{eq:gelu-self} the first
-  term is the forward output divided by $x$. At $x = 0$ use
-  \eqref{eq:gelu-bwd} directly: $u(0) = 0$ and $\tanh 0 = 0$ give
-  $\gelu'(0) = \tfrac{1}{2}$ (the $\gelu(x)/x$ form of
-  \eqref{eq:gelu-rolled} is singular there).
+  where we compute $u$ and $u'$ via \eqref{eq:gelu-u} and \eqref{eq:gelu-du}. A single evaluation of $\tanh u$ serves both terms because the self-reference $\tanh' = 1 - \tanh^{2}$ \eqref{eq:sech-tanh} replaces $\operatorname{sech}$, and \eqref{eq:gelu-self} expresses the first term as the forward output divided by $x$. At $x = 0$, we use \eqref{eq:gelu-bwd} directly: $u(0) = 0$ and $\tanh 0 = 0$ yield $\gelu'(0) = \tfrac{1}{2}$, avoiding the singularity in the $\gelu(x)/x$ term of \eqref{eq:gelu-rolled}.
 
-  GELU is elementwise: one output coordinate moves with exactly one
-  input coordinate. By \eqref{eq:entry-dv} the Jacobian is diagonal,
+  GELU operates elementwise: each output coordinate depends only on its corresponding input coordinate. By \eqref{eq:entry-dv}, the Jacobian is diagonal:
   \begin{equation}
     \pdv{\gelu(x_a)}{x_b} \;=\; \gelu'(x_a)\,\kron{a}{b},
     \label{eq:gelu-diag}
   \end{equation}
-  and the chain rule \eqref{eq:chain} sifts \eqref{eq:sift} to a
-  pointwise product: $\dL{x_a} = \dL{y_a}\,\gelu'(x_a)$.
+  and the chain rule \eqref{eq:chain} collapses the sum via sifting \eqref{eq:sift} to a pointwise product: $\dL{x_a} = \dL{y_a}\,\gelu'(x_a)$.
 \end{result}
 
 % =============================================================================
 \section{LayerNorm}\label{sec:layernorm}
 
-Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
+Layer normalization, proposed by Ba et al.\ \cite{layernorm}, stabilizes training dynamics by normalizing activations across the channel dimension within each sequence position. We compute the forward pass at each position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$ as:
 \begin{equation}
   \begin{aligned}
     \mu       & = \tfrac{1}{C}\sum_j x_j,
@@ -993,12 +834,10 @@ Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
 \end{equation}
 
 \begin{derivation}
-  We compute the partial derivatives of the output $y_i$ with respect to its
-  parameters and inputs. Note that $y_i$ depends on every $x_j$ in the row
-  through the statistics $\mu$ and $\sigma^2$.
+  We compute the partial derivatives of the output $y_i$ with respect to its parameters and inputs. The output $y_i$ depends on every $x_j$ in the row through the statistics $\mu$ and $\sigma^2$.
 
   \paragraph{Parameter partials}
-  The output $y_i$ depends only on its own channel's scale and shift:
+  The output $y_i$ depends only on the scale and shift parameters of its corresponding channel:
   \begin{equation}
     \pdv{y_i}{\gamma_i} = \frac{x_i - \mu}{\sqrt{\sigma^2}},
     \qquad
@@ -1007,17 +846,14 @@ Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
   \end{equation}
 
   \paragraph{Input partials}
-  To find the Jacobian $\pdv{y_j}{x_i}$, we first differentiate the row
-  statistics. Each $x_i$ contributes $1/C$ to the mean and $2(x_i - \mu)/C$
-  to the variance:
+  To find the Jacobian $\pdv{y_j}{x_i}$, we first differentiate the row statistics. Each input element $x_i$ contributes $1/C$ to the mean and $2(x_i - \mu)/C$ to the variance:
   \begin{equation}
     \pdv{\mu}{x_i} = \frac{1}{C},
     \qquad
     \pdv{\sigma^2}{x_i} = \frac{2(x_i - \mu)}{C}.
     \label{eq:ln-dstats}
   \end{equation}
-  Now differentiate the normalized value $\hat{x}_j$ with respect to $x_i$
-  using the quotient rule on $\hat{x}_j = (x_j - \mu)(\sigma^2)^{-1/2}$:
+  We differentiate the normalized value $\hat{x}_j$ with respect to $x_i$ using the quotient rule on $\hat{x}_j = (x_j - \mu)(\sigma^2)^{-1/2}$:
   \begin{align}
     \pdv{\hat{x}_j}{x_i}
      & = \pdv{}{x_i} \left( \frac{x_j - \mu}{\sqrt{\sigma^2}} \right) \notag                                                             \\
@@ -1025,20 +861,16 @@ Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
      & = \frac{1}{\sqrt{\sigma^2}} \left( \kron{j}{i} - \frac{1}{C} - \frac{(x_j - \mu)(x_i - \mu)}{C\sigma^2} \right).
     \label{eq:ln-dxhatdx}
   \end{align}
-  The partial $\pdv{y_j}{x_i} = \gamma_j \pdv{\hat{x}_j}{x_i}$ records how
-  every output in the row is affected by a change in $x_i$.
+  The partial derivative $\pdv{y_j}{x_i} = \gamma_j \pdv{\hat{x}_j}{x_i}$ describes how a change in $x_i$ affects every output in the row.
 \end{derivation}
 
 \begin{result}
-  The total gradient for each quantity is the sum of its contributions to the
-  loss through every output $y_j$, substituting the partials derived above:
+  We compute the total gradient for each quantity by summing its contributions to the loss across all outputs $y_j$, substituting the partial derivatives derived above:
   \begin{align}
     \dL{\gamma_i} & = \dL{y_i}\,\pdv{y_i}{\gamma_i} = \dL{y_i}\,\frac{x_i - \mu}{\sqrt{\sigma^2}}, \\
     \dL{\beta_i}  & = \dL{y_i}\,\pdv{y_i}{\beta_i} = \dL{y_i}.
   \end{align}
-  For the input $x_i$, we sum over the entire row $j \in \{0, \dots, C-1\}$.
-  Expanding the Kronecker delta $\kron{j}{i}$ into its indicator form
-  $\ind{j=i}$ to clarify the sifting:
+  For the input gradient $\dL{x_i}$, we sum over the entire row $j \in \{0, \dots, C-1\}$. We expand the Kronecker delta $\kron{j}{i}$ into its indicator form $\ind{j=i}$ to clarify the sifting process:
   \begin{align}
     \dL{x_i}
      & = \sum_j \dL{y_j} \pdv{y_j}{x_i} \notag                                                                                                            \\
@@ -1049,32 +881,18 @@ Forward, per position $x \in \R^{C}$ with scale $\gamma$ and shift $\beta$:
      & \qquad\qquad \left. - \frac{\hat{x}_i}{C} \sum_j \gamma_j\,\dL{y_j}\,\hat{x}_j \right).
     \label{eq:ln-bwd}
   \end{align}
-  The row-wide sums $\sum \gamma_j \dL{y_j} / C$ and $\sum \gamma_j \dL{y_j} \hat{x}_j / C$
-  match the row statistics $s_1$ and $s_2$ computed in the first pass of
-  \texttt{layernorm\_bwd}.
+  The row-wide sums $\sum \gamma_j \dL{y_j} / C$ and $\sum \gamma_j \dL{y_j} \hat{x}_j / C$ match the row statistics $s_1$ and $s_2$ that the first pass of \texttt{layernorm\_bwd} computes.
 \end{result}
 
 % =============================================================================
 \section{Attention}\label{sec:attention}
 
-Forward, per head: $A = \softmax\!\big(QK^{\top}/\sqrt{h} + M\big)$,
-$Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
+Multi-head self-attention, the central building block of the Transformer architecture \cite{attention}, allows sequence elements to dynamically route information by computing scaled dot-product attention over queries, keys, and values. We express the forward pass for each head as $A = \softmax\!\big(QK^{\top}/\sqrt{h} + M\big)$ and $Y = AV$, with causal mask $M$ and projections $Q = XW_Q$, $K = XW_K$, and $V = XW_V$.
 
 \begin{derivation}
-  Index form throughout: $i$ runs over query positions $T$ ($i < T$), $j$ over key/value positions $T$ ($j < T$), and $d$ over the head dimension $h$ ($d < h$).
-  Batch and head indices are dropped throughout: each head is independent, so the gradients are derived per-head.
-  The channel size of the query and key projection within each head is the head dimension $h$, which corresponds to the standard notation $d_k$ used in the literature (scaling the attention scores by $1/\sqrt{d_k}$).
-  The head dimension is obtained as $h = C/H$, where $C$ is the total channel width (embedding dimension) and $H$ is the number of attention heads (see Table~\ref{tab:notation} in \S\ref{sec:notation}).
-  The scaling factor is written as $1/\sqrt{h}$ to match the head dimension symbol in the kernel code.
-  Read every entry as (row, column):
-  $Q_{id}$ is (query position $i$, channel $d$);
-  $K_{jd}$ is (key position $j$, channel $d$);
-  $V_{jd}$ is (value position $j$, channel $d$);
-  $Y_{id}$ is (output position $i$, channel $d$);
-  $S_{ij}$ is the raw score at (query position $i$, key position $j$);
-  $A_{ij}$ is the attention probability at (query position $i$, key position $j$).
+  We write the equations in index form: $i$ runs over query positions $T$ ($i < T$), $j$ runs over key/value positions $T$ ($j < T$), and $d$ runs over the head dimension $h$ ($d < h$). We drop the batch and head indices throughout this section because each head is independent, allowing us to derive the gradients per-head. The channel size of the query and key projections within each head is the head dimension $h$, corresponding to the standard notation $d_k$ in the literature (which scales the attention scores by $1/\sqrt{d_k}$). We obtain the head dimension as $h = C/H$, where $C$ is the total channel width (embedding dimension) and $H$ is the number of attention heads (see Table~\ref{tab:notation} in \S\ref{sec:notation}). We write the scaling factor as $1/\sqrt{h}$ to match the head dimension symbol in the kernel code. We interpret each entry as (row, column): $Q_{id}$ is (query position $i$, channel $d$); $K_{jd}$ is (key position $j$, channel $d$); $V_{jd}$ is (value position $j$, channel $d$); $Y_{id}$ is (output position $i$, channel $d$); $S_{ij}$ is the raw score at (query position $i$, key position $j$); and $A_{ij}$ is the attention probability at (query position $i$, key position $j$).
 
-  The forward pass computes the raw causal score matrix $S \in \R^{T \times T}$:
+  The forward pass computes the raw causal score matrix $S \in \R^{T \times T}$ as:
   \begin{equation}
     S_{ij} \;=\; \begin{cases}
       \frac{1}{\sqrt{h}} \sum_{d<h} Q_{id} K_{jd} & j \leq i, \\
@@ -1082,23 +900,21 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
     \end{cases}
     \label{eq:att-score-fwd}
   \end{equation}
-  The attention probability matrix $A \in \R^{T \times T}$ is obtained by applying the row-wise softmax to $S$:
+  We obtain the attention probability matrix $A \in \R^{T \times T}$ by applying the row-wise softmax to $S$:
   \begin{equation}
     A_{ij} \;=\; \softmax(S_{i,\cdot})_j \;=\; \frac{e^{S_{ij} - L_i}}{\sum_{l \leq i} e^{S_{il} - L_i}},
     \label{eq:att-prob-fwd}
   \end{equation}
-  where $L_i = \log \sum_{l \leq i} e^{S_{il}}$ is the log-sum-exp (LSE) value for row $i$. By definition, $A_{ij} = 0$ for $j > i$.
-  The head output $Y \in \R^{T \times h}$ is the matrix product:
+  where $L_i = \log \sum_{l \leq i} e^{S_{il}}$ is the log-sum-exp (LSE) value for row $i$. By definition, $A_{ij} = 0$ for $j > i$. The head output $Y \in \R^{T \times h}$ is the matrix product:
   \begin{equation}
     Y_{id} \;=\; \sum_{j<T} A_{ij} V_{jd} \quad \implies \quad Y \;=\; A V.
     \label{eq:att-output-fwd}
   \end{equation}
 
-  Differentiation requires a second, independent set of index names to avoid index collisions.
-  The probe indices are $m$ for position and $k$ for channel.
+  Differentiation requires a second, independent set of index names to avoid collisions. We choose the probe indices $m$ for position and $k$ for channel.
 
   \paragraph{Local derivative $\pdv{Y}{V}$}
-  Target $Y_{id}$ (query position $i$, channel $d$), probe $V_{mk}$ (key position $m$, channel $k$):
+  With target $Y_{id}$ (query position $i$, channel $d$) and probe $V_{mk}$ (key position $m$, channel $k$), we differentiate:
   \begin{align}
     \pdv{Y_{id}}{V_{mk}}
      & = \pdv{}{V_{mk}} \sum_{a<T} A_{ia}\,V_{ad} \notag    \\
@@ -1106,8 +922,7 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
      & = A_{im}\,\kron{d}{k}.
     \label{eq:att-dydv}
   \end{align}
-  The column delta sifts the sum down to $a = m$, forcing channel index $d = k$.
-  Chaining the upstream gradient $\dL{Y}$:
+  The Kronecker deltas act as coordinate checks: $\kron{d}{k}$ restricts the channel index to $d=k$, while $\kron{a}{m}$ collapses the sum over position $a$ to the single term where $a=m$. We chain the upstream gradient $\dL{Y}$ using the multivariable chain rule \eqref{eq:chain}:
   \begin{align}
     \dL{V_{mk}}
      & = \sum_{i<T} \sum_{d<h} \dL{Y_{id}}\,\pdv{Y_{id}}{V_{mk}} \notag \\
@@ -1117,10 +932,10 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
     = \Bigl( A^{\top}\,\dL{Y} \Bigr)_{mk}.
     \label{eq:att-chain-dv}
   \end{align}
-  This yields the value gradient matrix product $\dL{V} = A^{\top}\,\dL{Y}$.
+  In the third step, the channel delta $\kron{d}{k}$ sifts the sum over $d$ to $k$. In the fourth step, we write $A_{im} = (A^{\top})_{mi}$ to transpose the attention matrix; this aligns the summed index $i$ as the inner dimension of the matrix product, matching the recognition rule of \eqref{eq:matprod} to yield $\dL{V} = A^{\top}\,\dL{Y}$.
 
   \paragraph{Local derivative $\pdv{Y}{A}$}
-  Target $Y_{id}$, probe $A_{mj}$ (query position $m$, key position $j$):
+  With target $Y_{id}$ and probe $A_{mj}$ (query position $m$, key position $j$):
   \begin{align}
     \pdv{Y_{id}}{A_{mj}}
      & = \pdv{}{A_{mj}} \sum_{a<T} A_{ia}\,V_{ad} \notag    \\
@@ -1128,8 +943,7 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
      & = \kron{i}{m}\,V_{jd}.
     \label{eq:att-dyda}
   \end{align}
-  The row delta $\kron{i}{m}$ aligns output position $i$ with probed query position $m$; the column delta sifts $a$ to $j$.
-  Chaining the upstream gradient:
+  The delta $\kron{i}{m}$ aligns the target query position $i$ with the probed position $m$, while $\kron{a}{j}$ sifts the sum over $a$ to $j$. We chain the upstream gradient:
   \begin{align}
     \dL{A_{mj}}
      & = \sum_{i<T} \sum_{d<h} \dL{Y_{id}}\,\pdv{Y_{id}}{A_{mj}} \notag \\
@@ -1138,10 +952,10 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
     = \Bigl( \dL{Y}\,V^{\top} \Bigr)_{mj}.
     \label{eq:att-chain-da}
   \end{align}
-  This yields the attention probability gradient matrix product $\dL{A} = \dL{Y}\,V^{\top}$.
+  Here, the delta $\kron{i}{m}$ sifts the sum over $i$ to $m$. The remaining sum contracts over the channel index $d$, representing the row of $\dL{Y}$ and the column of $V^{\top}$ (via $(V^{\top})_{dj} = V_{jd}$), which matches the matrix multiplication definition \eqref{eq:matprod} and yields $\dL{A} = \dL{Y}\,V^{\top}$.
 
   \paragraph{Backpropagation through row-wise Softmax}
-  Each row of the attention matrix $A$ is an independent softmax over the row of raw scores $S$. Reusing the softmax result \eqref{eq:softmax-bwd} directly for each row $i$:
+  Each row of the attention matrix $A$ is an independent softmax over the corresponding row of raw scores $S$. Applying the softmax gradient result \eqref{eq:softmax-bwd} directly to each row $i$ yields:
   \begin{equation}
     \dL{S_{ij}} \;=\; A_{ij}\,\left( \dL{A_{ij}} - D_i \right),
     \label{eq:att-ds-local}
@@ -1151,10 +965,10 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
     D_i \;=\; \sum_{k<T} \dL{A_{ik}}\,A_{ik}.
     \label{eq:att-di-def}
   \end{equation}
-  Standard backpropagation materializes the full $T \times T$ gradient matrix $\dL{A}$ and computes $D_i$ row-by-row before evaluating $\dL{S_{ij}}$.
+  Standard backpropagation materializes the full $T \times T$ gradient matrix $\dL{A}$ and computes the row-wise statistics $D_i$ before evaluating $\dL{S_{ij}}$.
 
   \paragraph{Local derivative $\pdv{S}{Q}$}
-  Target score $S_{ij}$, probe query $Q_{mk}$ (query position $m$, channel $k$):
+  With target score $S_{ij}$ and probe query $Q_{mk}$ (query position $m$, channel $k$):
   \begin{align}
     \pdv{S_{ij}}{Q_{mk}}
      & = \pdv{}{Q_{mk}} \left( \frac{1}{\sqrt{h}} \sum_{d<h} Q_{id}\,K_{jd} \right) \notag \\
@@ -1162,8 +976,7 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
      & = \frac{1}{\sqrt{h}}\,\kron{i}{m}\,K_{jk},
     \label{eq:att-dsdq}
   \end{align}
-  where the Kronecker deltas $\kron{i}{m}$ and $\kron{d}{k}$ enforce query position and channel alignment, sifting the channel sum down to $d = k$.
-  Chaining the score gradient:
+  where the Kronecker deltas $\kron{i}{m}$ and $\kron{d}{k}$ enforce query position and channel alignment, sifting the channel sum to $d = k$. We chain the score gradient:
   \begin{align}
     \dL{Q_{mk}}
      & = \sum_{i<T} \sum_{j<T} \dL{S_{ij}}\,\pdv{S_{ij}}{Q_{mk}} \notag                    \\
@@ -1172,10 +985,10 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
      & = \left( \frac{1}{\sqrt{h}}\,\dL{S}\,K \right)_{mk},
     \label{eq:att-chain-dq}
   \end{align}
-  where the query position delta sifts the outer sum over $i$ down to $i = m$, leaving the contraction over the key position index $j$, recognized as a standard matrix product $\dL{Q} = \frac{1}{\sqrt{h}}\,\dL{S}\,K$.
+  where the query position delta sifts the outer sum over $i$ to $m$. The remaining sum over key position $j$ represents the inner product contraction between the rows of $\dL{S}$ and the columns of $K$, yielding $\dL{Q} = \frac{1}{\sqrt{h}}\,\dL{S}\,K$.
 
   \paragraph{Local derivative $\pdv{S}{K}$}
-  Target score $S_{ij}$, probe key $K_{mk}$ (key position $m$, channel $k$):
+  With target score $S_{ij}$ and probe key $K_{mk}$ (key position $m$, channel $k$):
   \begin{align}
     \pdv{S_{ij}}{K_{mk}}
      & = \pdv{}{K_{mk}} \left( \frac{1}{\sqrt{h}} \sum_{d<h} Q_{id}\,K_{jd} \right) \notag \\
@@ -1183,8 +996,7 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
      & = \frac{1}{\sqrt{h}}\,\kron{j}{m}\,Q_{ik},
     \label{eq:att-dsdk}
   \end{align}
-  where the row delta $\kron{j}{m}$ indicates key position alignment, and the channel delta sifts the sum down to $d = k$.
-  Chaining the score gradient:
+  where the row delta $\kron{j}{m}$ indicates key position alignment, and the channel delta sifts the sum to $d = k$. We chain the score gradient:
   \begin{align}
     \dL{K_{mk}}
      & = \sum_{i<T} \sum_{j<T} \dL{S_{ij}}\,\pdv{S_{ij}}{K_{mk}} \notag                    \\
@@ -1194,12 +1006,10 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
      & = \left( \frac{1}{\sqrt{h}}\,\dL{S}^{\top}\,Q \right)_{mk},
     \label{eq:att-chain-dk}
   \end{align}
-  where the key position delta sifts the inner sum over $j$ down to $j = m$, leaving the contraction over the query position index $i$, recognized as the matrix product of the transposed score gradient $\dL{S}^{\top}$ and query matrix $Q$, yielding $\dL{K} = \frac{1}{\sqrt{h}}\,\dL{S}^{\top}\,Q$.
-  Due to the causal mask, the gradient $\dL{S_{ij}} = 0$ for $j > i$.
+  where the key position delta sifts the inner sum over $j$ down to $j = m$. The remaining sum over query position $i$ contracts the column dimension of $\dL{S}$ with the row dimension of $Q$. To express this as a matrix multiplication, we transpose $\dL{S}$ so that the summed index $i$ sits as the column index of the left factor, which yields the matrix product $\dL{K} = \frac{1}{\sqrt{h}}\,\dL{S}^{\top}\,Q$.
 
   \paragraph{FlashAttention-2 Simplification: Softmax Statistics Contraction}
-  To avoid materializing the intermediate $T \times T$ matrices $\dL{A}$ and $\dL{S}$ in DRAM, FlashAttention-2 \cite{flashattention2} simplifies the softmax statistics term $D_i$.
-  Substituting the definition of $\dL{A_{ik}} = \sum_{d<h} \dL{Y_{id}}\,V_{kd}$ from \eqref{eq:att-chain-da} into the definition of $D_i$ \eqref{eq:att-di-def}:
+  To avoid materializing the intermediate $T \times T$ matrices $\dL{A}$ and $\dL{S}$ in DRAM, FlashAttention-2 \cite{flashattention2} simplifies the softmax statistics term $D_i$. We substitute the definition of $\dL{A_{ik}} = \sum_{d<h} \dL{Y_{id}}\,V_{kd}$ from \eqref{eq:att-chain-da} into the definition of $D_i$ \eqref{eq:att-di-def} to obtain:
   \begin{align}
     D_i
      & = \sum_{k<T} \left( \sum_{d<h} \dL{Y_{id}}\,V_{kd} \right)\,A_{ik} \notag \\
@@ -1207,41 +1017,38 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
      & = \sum_{d<h} \dL{Y_{id}}\,Y_{id},
     \label{eq:att-di-contract}
   \end{align}
-  where the sum over key positions $k$ in the second line is replaced by the forward pass output $Y_{id}$ using \eqref{eq:att-output-fwd}.
-  This contraction is a key mathematical optimization: the row statistics term $D_i$ is simply the row-wise dot product of the output $Y$ and its gradient $\dL{Y}$.
-  Precomputing $D_i \in \R^T$ directly from the output tensors enables evaluating the score gradients $\dL{S_{ij}}$ block-by-block in SRAM:
+  where the forward pass output $Y_{id}$ replaces the sum over key positions $k$ in the second line via \eqref{eq:att-output-fwd}. This contraction yields a key mathematical optimization: the row statistics term $D_i$ is the row-wise dot product of the output $Y$ and its gradient $\dL{Y}$. Precomputing $D_i \in \R^T$ directly from the output tensors allows us to evaluate the score gradients $\dL{S_{ij}}$ block-by-block in SRAM:
   \begin{equation}
     \dL{S_{ij}} \;=\; A_{ij}\,\left( \sum_{d<h} \dL{Y_{id}}\,V_{jd} - D_i \right),
     \label{eq:att-ds-final}
   \end{equation}
-  completely eliminating the need to write the large $\dL{A}$ matrix to DRAM.
+  eliminating the need to write the large $\dL{A}$ matrix to DRAM.
 
   \paragraph{FlashAttention-2 Memory-Efficient Block Tiling}
-  Standard backpropagation requires materializing the $T \times T$ matrices $S$, $A$, $\dL{A}$, and $\dL{S}$ in DRAM, creating a massive $O(T^2)$ memory footprint.
-  FlashAttention-2 avoids this bottleneck by tiling the sequence dimension and executing the backward pass in SRAM using two passes:
+  Standard backpropagation materializes the $T \times T$ matrices $S$, $A$, $\dL{A}$, and $\dL{S}$ in DRAM, which creates a massive $O(T^2)$ memory footprint. FlashAttention-2 avoids this bottleneck by tiling the sequence dimension and executing the backward pass in SRAM in two passes:
   \begin{enumerate}
-    \item \textbf{Pass 1 ($dQ$ Computation):} Query positions are tiled into blocks of size $B_r$ (indexing rows $i$). For each block:
+    \item \textbf{Pass 1 ($dQ$ Computation):} We tile query positions into blocks of size $B_r$ (indexing rows $i$). For each block, we:
           \begin{itemize}
-            \item Load $Q_i$, $\dL{Y}_i$, $Y_i$, and $L_i$ (the LSE vector) from DRAM to SRAM.
-            \item Compute the row scaling term $D_i = \sum_{d<h} \dL{Y}_{id}\,Y_{id}$ in SRAM.
-            \item Loop over key/value blocks $j$ of size $B_c$: load $K_j, V_j$ to SRAM, compute the score block $S_{ij} = Q_i K_j^{\top}/\sqrt{h}$, mask elements where $j > i$, apply softmax $A_{ij} = \exp(S_{ij} - L_i)$, compute the gradient slice $\dL{S_{ij}} = A_{ij} (\dL{Y}_i V_j^{\top} - D_i)$, and accumulate:
+            \item load $Q_i$, $\dL{Y}_i$, $Y_i$, and $L_i$ (the LSE vector) from DRAM to SRAM;
+            \item compute the row scaling term $D_i = \sum_{d<h} \dL{Y}_{id}\,Y_{id}$ in SRAM;
+            \item loop over key/value blocks $j$ of size $B_c$: load $K_j, V_j$ to SRAM, compute the score block $S_{ij} = Q_i K_j^{\top}/\sqrt{h}$, mask elements where $j > i$, apply softmax $A_{ij} = \exp(S_{ij} - L_i)$, compute the gradient slice $\dL{S_{ij}} = A_{ij} (\dL{Y}_i V_j^{\top} - D_i)$, and accumulate:
                   \begin{equation}
                     \dL{Q_i} \;\mathrel{+}=\; \frac{1}{\sqrt{h}}\,\dL{S_{ij}}\,K_j.
                   \end{equation}
-            \item Write the fully accumulated $\dL{Q_i}$ to DRAM once the loop over $j$ completes.
+            \item write the fully accumulated $\dL{Q_i}$ to DRAM once the loop over $j$ completes.
           \end{itemize}
-    \item \textbf{Pass 2 ($dK$ and $dV$ Computation):} Key and value positions are tiled into blocks of size $B_c$ (indexing columns $j$). For each block:
+    \item \textbf{Pass 2 ($dK$ and $dV$ Computation):} We tile key and value positions into blocks of size $B_c$ (indexing columns $j$). For each block, we:
           \begin{itemize}
-            \item Load $K_j, V_j$ to SRAM and initialize local accumulators $\dL{K_j} = 0, \dL{V_j} = 0$.
-            \item Loop over query blocks $i$ of size $B_r$: load $Q_i$, $\dL{Y}_i$, $Y_i$, and $L_i$, compute $D_i$, reconstruct the local slices $A_{ij}$ and $\dL{S_{ij}}$, and accumulate:
+            \item load $K_j, V_j$ to SRAM and initialize local accumulators $\dL{K_j} = 0, \dL{V_j} = 0$;
+            \item loop over query blocks $i$ of size $B_r$: load $Q_i$, $\dL{Y}_i$, $Y_i$, and $L_i$, compute $D_i$, reconstruct the local slices $A_{ij}$ and $\dL{S_{ij}}$, and accumulate:
                   \begin{align}
                     \dL{V_j} \;\mathrel{+} & =\; A_{ij}^{\top}\,\dL{Y}_i,                     \\
                     \dL{K_j} \;\mathrel{+} & =\; \frac{1}{\sqrt{h}}\,\dL{S_{ij}}^{\top}\,Q_i.
                   \end{align}
-            \item Write the fully accumulated $\dL{K_j}$ and $\dL{V_j}$ to DRAM once the loop over $i$ completes.
+            \item write the fully accumulated $\dL{K_j}$ and $\dL{V_j}$ to DRAM once the loop over $i$ completes.
           \end{itemize}
   \end{enumerate}
-  Both passes are completely contention-free (Pass 1 parallelizes over $i$, Pass 2 over $j$) and run without any global atomic operations.
+  Both passes are contention-free (Pass 1 parallelizes over $i$, while Pass 2 parallelizes over $j$) and execute without global atomic operations.
 \end{derivation}
 
 \begin{result}
@@ -1268,70 +1075,70 @@ $Y = AV$, with causal mask $M$ and $Q = XW_Q$, etc.
 % =============================================================================
 \section{Embeddings (Encoder)}\label{sec:encoder}
 
-Forward: $x_{bt} = W_{E}[\,\mathrm{tok}_{bt}\,] + W_{P}[\,t\,]$, or in index form:
+The input representation encodes both token vocabulary identity and sequence position. Following the standard language modeling paradigm \cite{embeddings, attention}, the forward pass computes the input sequence embeddings $x_{bt}$ by adding token and position embeddings, or in index form:
 \begin{equation}
   x_{bt, c} \;=\; W_{E,\, \mathrm{tok}_{bt},\, c} + W_{P,\, t,\, c},
   \label{eq:enc-fwd}
 \end{equation}
-where token indices $\mathrm{tok}_{bt} \in \{0, \dots, V-1\}$, token embeddings $W_E \in \R^{V \times C}$, position embeddings $W_P \in \R^{T \times C}$, and channel index $c < C$.
+where token indices satisfy $\mathrm{tok}_{bt} \in \{0, \dots, V-1\}$, token embeddings occupy $W_E \in \R^{V \times C}$, position embeddings occupy $W_P \in \R^{T \times C}$, and the channel index is $c < C$.
 
 \begin{derivation}
-  Index roles: $b$ batch, $t$ sequence position, $c$ channel. Probing introduces independent indices $k < T$ (position), $v < V$ (vocab token), and $j < C$ (channel).
+  Let $b$, $t$, and $c$ denote the batch, sequence position, and channel indices. We introduce independent probe indices $k < T$ (position), $v < V$ (vocab token), and $j < C$ (channel).
 
   \paragraph{Gradient w.r.t.\ position embeddings}
-  Probing $W_{P,\, k,\, j}$ (position $k$, channel $j$), the token lookup is constant. The position term differentiates via \eqref{eq:entry-dv}:
+  To compute the gradient w.r.t.\ position embeddings, we probe $W_{P,\, k,\, j}$ (position $k$, channel $j$). Because the token lookup remains constant, we differentiate the position term using \eqref{eq:entry-dv}:
   \begin{equation}
     \pdv{W_{P,\, t,\, c}}{W_{P,\, k,\, j}} \;=\; \kron{t}{k}\,\kron{c}{j},
     \label{eq:enc-dxdwp-local}
   \end{equation}
-  leaving the local derivative:
+  which yields the local derivative:
   \begin{equation}
     \pdv{x_{bt, c}}{W_{P,\, k,\, j}} \;=\; \kron{t}{k}\,\kron{c}{j}.
     \label{eq:enc-dxdwp}
   \end{equation}
-  Chaining upstream $\dL{x_{bt, c}}$ via \eqref{eq:chain}:
+  We chain the upstream gradient $\dL{x_{bt, c}}$ using \eqref{eq:chain}:
   \begin{align}
     \dL{W_{P,\, k,\, j}}
      & = \sum_{b<B} \sum_{t<T} \sum_{c<C} \dL{x_{bt, c}}\,\pdv{x_{bt, c}}{W_{P,\, k,\, j}} \notag \\
      & = \sum_{b<B} \sum_{t<T} \sum_{c<C} \dL{x_{bt, c}}\,\kron{t}{k}\,\kron{c}{j}.
   \end{align}
-  The Kronecker deltas sift and collapse the sums over $t$ and $c$ to $t = k$ and $c = j$. The batch sum survives unconstrained:
+  The Kronecker deltas act as switches that vanish for all terms except where the indices match: $\kron{t}{k}$ is non-zero only when $t = k$, and $\kron{c}{j}$ is non-zero only when $c = j$. These deltas sift the summation, collapsing the double sum over position $t$ and channel $c$ to a single term where $t$ is replaced by $k$ and $c$ is replaced by $j$. The sum over the batch dimension $b$ remains because the positional embeddings $W_P$ are shared across all batches, meaning they receive gradient updates from every batch element:
   \begin{equation}
     \dL{W_{P,\, k,\, j}} \;=\; \sum_{b<B} \dL{x_{bk, j}},
     \label{eq:enc-wp-bwd-idx}
   \end{equation}
-  with free indices $(k, j)$. Sharing $W_{P, t}$ across batches reduces the gradient over the batch dimension $b$.
+  with free indices $(k, j)$. Because the network shares $W_{P, t}$ across batches, the gradient reduces over the batch dimension $b$.
 
   \paragraph{Gradient w.r.t.\ token embeddings}
-  Probing $W_{E,\, v,\, j}$ (vocab token $v$, channel $j$) requires comparing the lookup index $\mathrm{tok}_{bt}$ against $v$. In indicator form:
+  To compute the gradient w.r.t.\ token embeddings, we probe $W_{E,\, v,\, j}$ (vocab token $v$, channel $j$), which requires comparing the lookup index $\mathrm{tok}_{bt}$ against $v$. We write the embedding lookup in indicator form:
   \begin{equation}
     W_{E,\, \mathrm{tok}_{bt},\, c} \;=\; \sum_{u<V} \ind{\mathrm{tok}_{bt} = u}\,W_{E,\, u,\, c}.
   \end{equation}
-  Differentiating with respect to $W_{E,\, v,\, j}$:
+  We differentiate with respect to $W_{E,\, v,\, j}$:
   \begin{align}
     \pdv{W_{E,\, \mathrm{tok}_{bt},\, c}}{W_{E,\, v,\, j}}
      & = \sum_{u<V} \ind{\mathrm{tok}_{bt} = u}\,\pdv{W_{E,\, u,\, c}}{W_{E,\, v,\, j}} \notag \\
-     & = \sum_{u<V} \ind{\mathrm{tok}_{bt} = u}\,\kron{u}{v}\,\kron{c}{j} \notag \\
+     & = \sum_{u<V} \ind{\mathrm{tok}_{bt} = u}\,\kron{u}{v}\,\kron{c}{j} \notag               \\
      & = \ind{\mathrm{tok}_{bt} = v}\,\kron{c}{j},
     \label{eq:enc-dxdwe-local}
   \end{align}
-  leaving the local derivative:
+  which yields the local derivative:
   \begin{equation}
     \pdv{x_{bt, c}}{W_{E,\, v,\, j}} \;=\; \ind{\mathrm{tok}_{bt} = v}\,\kron{c}{j}.
     \label{eq:enc-dxdwe}
   \end{equation}
-  Chaining upstream $\dL{x_{bt, c}}$ via \eqref{eq:chain}:
+  We chain the upstream gradient $\dL{x_{bt, c}}$ using \eqref{eq:chain}:
   \begin{align}
     \dL{W_{E,\, v,\, j}}
-     & = \sum_{b<B} \sum_{t<T} \sum_{c<C} \dL{x_{bt, c}}\,\pdv{x_{bt, c}}{W_{E,\, v,\, j}} \notag \\
+     & = \sum_{b<B} \sum_{t<T} \sum_{c<C} \dL{x_{bt, c}}\,\pdv{x_{bt, c}}{W_{E,\, v,\, j}} \notag   \\
      & = \sum_{b<B} \sum_{t<T} \sum_{c<C} \dL{x_{bt, c}}\,\ind{\mathrm{tok}_{bt} = v}\,\kron{c}{j}.
   \end{align}
-  The delta $\kron{c}{j}$ sifts the sum over $c$ to $j$, while the indicator filters the remaining sums over $b$ and $t$:
+  The delta $\kron{c}{j}$ sifts the sum over channel $c$ to $j$. The indicator function $\ind{\mathrm{tok}_{bt} = v}$ evaluates to $1$ when the active token at position $t$ in batch $b$ equals the vocab index $v$, and $0$ otherwise. When we chain the upstream gradient, this indicator acts as a filter on the remaining sums over batch $b$ and position $t$, accumulating gradients only from the specific sequence positions where token $v$ was present:
   \begin{equation}
     \dL{W_{E,\, v,\, j}} \;=\; \sum_{b<B} \sum_{t<T} \dL{x_{bt, j}}\,\ind{\mathrm{tok}_{bt} = v},
     \label{eq:enc-we-bwd-idx}
   \end{equation}
-  with free indices $(v, j)$. This scatter-add accumulates upstream gradients at matching token locations, following the $\mathrel{+}=$ convention of \S\ref{sec:notation}.
+  with free indices $(v, j)$. This operation scatter-accumulates upstream gradients at matching token locations, following the $\mathrel{+}=$ convention of \S\ref{sec:notation} (often implemented as an index-add or scatter-add operation in deep learning libraries).
 \end{derivation}
 
 \begin{result}
@@ -1340,44 +1147,321 @@ where token indices $\mathrm{tok}_{bt} \in \{0, \dots, V-1\}$, token embeddings 
     \dL{W_{E,\, v,\, c}} \; & =\; \sum_{b<B} \sum_{t<T} \dL{x_{bt, c}}\,\ind{\mathrm{tok}_{bt} = v}, \label{eq:enc-we-bwd} \\
     \dL{W_{P,\, t,\, c}} \; & =\; \sum_{b<B} \dL{x_{bt, c}}. \label{eq:enc-wp-bwd}
   \end{align}
-  $\dL{W_P}$ reduces the upstream gradient over the batch dimension, while $\dL{W_E}$ accumulates contributions via scatter-add at active token locations.
+  The positional embedding gradient $\dL{W_P}$ reduces the upstream gradient over the batch dimension, while the token embedding gradient $\dL{W_E}$ accumulates contributions via scatter-add at active token locations.
 \end{result}
 
 % =============================================================================
 \section{The Full Backward Pass}\label{sec:full}
 
-Compose \S\ref{sec:crossentropy}--\S\ref{sec:encoder} in reverse forward
-order, including the residual stream (where gradients add) and weight tying
-between $W_E$ and the LM head.
+We trace the complete backward pass in reverse order of forward execution. Gradients flow from the cross-entropy loss, back through the language modeling head, through the stack of $N_{\text{layers}}$ transformer blocks, and finally accumulate in the token and position embeddings. We write out the complete, coordinate-level gradient chain in index form.
 
-\TODO{Write the end-to-end gradient flow for one transformer block, then
-  the whole model.}
+\subsection{Top-level Gradient Flow}
 
+We define the total loss $L$ as the mean over all batch elements and sequence positions, $L = \frac{1}{B \cdot T} \sum_{b<B} \sum_{t<T} L_{bt}$. The backward pass begins by differentiating $L$ w.r.t.\ the logits $Z_{bt, v}$ at position $t$ in batch $b$ and vocabulary entry $v < V_p$:
+\begin{equation}
+  \dL{Z_{bt,\, v}} \;=\; \frac{1}{B \cdot T} \left( p_{bt, v} - \ind{v = y_{bt}} \right).
+  \label{eq:full-dlogits}
+\end{equation}
+
+\paragraph{LM Head Layer}
+The logits are computed from the final LayerNorm output $X_{\text{final}, bt, c}$ and LM head weights $W_{\text{LM}, v, c}$ as $Z_{bt, v} = \sum_{c<C} X_{\text{final}, bt, c} W_{\text{LM}, v, c}$. We apply the coordinate-level chain rule to propagate the logit gradient:
+\begin{align}
+  \dL{X_{\text{final},\, bt,\, c}}
+   & = \sum_{v<V_p} \dL{Z_{bt,\, v}}\,W_{\text{LM},\, v,\, c},
+  \label{eq:full-dxfinal}                                                   \\
+  \dL{W_{\text{LM},\, v,\, c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{Z_{bt,\, v}}\,X_{\text{final},\, bt,\, c},
+  \label{eq:full-dwlm}
+\end{align}
+
+\paragraph{Final LayerNorm}
+Let $x^{(N)} \in \R^{B \times T \times C}$ denote the output of the last transformer block. We normalize each row to compute $X_{\text{final}, bt, c} = \gamma_{f, c} \hat{x}^{(N)}_{bt, c} + \beta_{f, c}$. We chain the final LayerNorm gradient back to the block output:
+\begin{align}
+  \dL{\gamma_{f,\, c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{X_{\text{final},\, bt,\, c}}\,\hat{x}^{(N)}_{bt,\, c},
+  \label{eq:full-dgamma-f}                                                              \\
+  \dL{\beta_{f,\, c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{X_{\text{final},\, bt,\, c}},
+  \label{eq:full-dbeta-f}
+\end{align}
+and the input gradient:
+\begin{align}
+  \dL{x^{(N)}_{bt,\, c}}
+   & = \frac{1}{\sqrt{\sigma^2_{bt}}} \left( \gamma_{f, c}\,\dL{X_{\text{final},\, bt,\, c}} \right. \notag                                        \\
+   & \quad - \frac{1}{C} \sum_{k<C} \gamma_{f, k}\,\dL{X_{\text{final},\, bt,\, k}} \notag                                                         \\
+   & \quad \left. - \frac{\hat{x}^{(N)}_{bt,\, c}}{C} \sum_{k<C} \gamma_{f, k}\,\dL{X_{\text{final},\, bt,\, k}}\,\hat{x}^{(N)}_{bt,\, k} \right),
+  \label{eq:full-dxn}
+\end{align}
+where $\sigma^2_{bt}$ is the variance and $\hat{x}^{(N)}_{bt, c}$ is the normalized value of row $x^{(N)}_{bt}$ computed during the forward pass.
+
+\subsection{The Transformer Block Stack}
+
+For layer $l = N - 1$ down to $0$, the block maps the input $x^{(l)}$ to $x^{(l+1)}$ using residual connections \cite{resnet} containing multi-head self-attention \cite{attention} and a multi-layer perceptron:
+\begin{align}
+  x^{\text{mid}, (l)}_{bt,\, c} \; & =\; x^{(l)}_{bt,\, c} + z^{\text{attn}, (l)}_{bt,\, c},            \\
+  x^{(l+1)}_{bt,\, c} \;           & =\; x^{\text{mid}, (l)}_{bt,\, c} + z^{\text{mlp}, (l)}_{bt,\, c},
+\end{align}
+where $z^{\text{attn}, (l)}$ and $z^{\text{mlp}, (l)}$ are the attention and MLP outputs. We backpropagate the block output gradient $\dL{x^{(l+1)}_{bt, c}}$ in two steps.
+
+\paragraph{Step One: The MLP Sub-Layer}
+Due to the residual connection, the upstream gradient w.r.t.\ $z^{\text{mlp}, (l)}$ is $\dL{z^{\text{mlp}, (l)}_{bt,\, c}} = \dL{x^{(l+1)}_{bt,\, c}}$. The MLP sub-layer forward pass evaluates:
+\begin{align}
+  a^{(l)}_{bt,\, c} \;              & =\; \gamma^{(l)}_{2, c}\,\hat{x}^{\text{mid}, (l)}_{bt,\, c} + \beta^{(l)}_{2, c},                        \\
+  h^{\text{fc}, (l)}_{bt,\, i} \;   & =\; \sum_{c<C} a^{(l)}_{bt,\, c}\,W^{\text{fc}, (l)}_{i,\, c} + b^{\text{fc}, (l)}_{i},                   \\
+  h^{\text{gelu}, (l)}_{bt,\, i} \; & =\; \gelu\left( h^{\text{fc}, (l)}_{bt,\, i} \right),                                                     \\
+  z^{\text{mlp}, (l)}_{bt,\, c} \;  & =\; \sum_{i<4C} h^{\text{gelu}, (l)}_{bt,\, i}\,W^{\text{proj}, (l)}_{c,\, i} + b^{\text{proj}, (l)}_{c},
+\end{align}
+for $i < 4C$. We differentiate in reverse order. First, for the projection layer, we contract over the output channel index $c < C$:
+\begin{align}
+  \dL{h^{\text{gelu}, (l)}_{bt,\, i}}
+   & = \sum_{c<C} \dL{z^{\text{mlp}, (l)}_{bt,\, c}}\,W^{\text{proj}, (l)}_{c,\, i},
+  \label{eq:full-dgelu}                                                                          \\
+  \dL{W^{\text{proj}, (l)}_{c,\, i}}
+   & = \sum_{b<B} \sum_{t<T} \dL{z^{\text{mlp}, (l)}_{bt,\, c}}\,h^{\text{gelu}, (l)}_{bt,\, i},
+  \label{eq:full-dwproj}                                                                         \\
+  \dL{b^{\text{proj}, (l)}_{c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{z^{\text{mlp}, (l)}_{bt,\, c}}.
+  \label{eq:full-dbproj}
+\end{align}
+Second, the GELU derivative sifts the activation gradient pointwise:
+\begin{equation}
+  \dL{h^{\text{fc}, (l)}_{bt,\, i}} \;=\; \dL{h^{\text{gelu}, (l)}_{bt,\, i}}\,\gelu'\left( h^{\text{fc}, (l)}_{bt,\, i} \right).
+  \label{eq:full-dfc}
+\end{equation}
+Third, the first linear layer contracts over the hidden dimension $i < 4C$:
+\begin{align}
+  \dL{a^{(l)}_{bt,\, c}}
+   & = \sum_{i<4C} \dL{h^{\text{fc}, (l)}_{bt,\, i}}\,W^{\text{fc}, (l)}_{i,\, c},
+  \label{eq:full-da}                                                               \\
+  \dL{W^{\text{fc}, (l)}_{i,\, c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{h^{\text{fc}, (l)}_{bt,\, i}}\,a^{(l)}_{bt,\, c},
+  \label{eq:full-dwfc}                                                             \\
+  \dL{b^{\text{fc}, (l)}_{i}}
+   & = \sum_{b<B} \sum_{t<T} \dL{h^{\text{fc}, (l)}_{bt,\, i}}.
+  \label{eq:full-dbfc}
+\end{align}
+Fourth, we backpropagate through LayerNorm 2 using stats $\mu^{(2)}_{bt}$ and $\sigma^{2, (2)}_{bt}$:
+\begin{align}
+  \dL{\gamma^{(l)}_{2, c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{a^{(l)}_{bt,\, c}}\,\hat{x}^{\text{mid}, (l)}_{bt,\, c},
+  \label{eq:full-dgamma2}                                                                 \\
+  \dL{\beta^{(l)}_{2, c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{a^{(l)}_{bt,\, c}},
+  \label{eq:full-dbeta2}
+\end{align}
+and the input gradient:
+\begin{align}
+  \dL{x^{\text{mid}, (l)}_{bt,\, c}\Big|_{\text{MLP}}}
+   & = \frac{1}{\sqrt{\sigma^{2, (2)}_{bt}}} \left( \gamma^{(l)}_{2, c}\,\dL{a^{(l)}_{bt,\, c}} \right. \notag                                                         \\
+   & \quad - \frac{1}{C} \sum_{k<C} \gamma^{(l)}_{2, k}\,\dL{a^{(l)}_{bt,\, k}} \notag                                                                                 \\
+   & \quad \left. - \frac{\hat{x}^{\text{mid}, (l)}_{bt,\, c}}{C} \sum_{k<C} \gamma^{(l)}_{2, k}\,\dL{a^{(l)}_{bt,\, k}}\,\hat{x}^{\text{mid}, (l)}_{bt,\, k} \right).
+  \label{eq:full-dxmid-mlp}
+\end{align}
+The total mid-state gradient accumulates both pathways:
+\begin{equation}
+  \dL{x^{\text{mid}, (l)}_{bt,\, c}} \;=\; \dL{x^{(l+1)}_{bt,\, c}} + \dL{x^{\text{mid}, (l)}_{bt,\, c}\Big|_{\text{MLP}}}.
+  \label{eq:full-dxmid}
+\end{equation}
+
+\paragraph{Step Two: The Attention Sub-Layer}
+Due to the residual connection, the upstream gradient w.r.t.\ $z^{\text{attn}, (l)}$ is $\dL{z^{\text{attn}, (l)}_{bt,\, c}} = \dL{x^{\text{mid}, (l)}_{bt,\, c}}$. The attention sub-layer forward pass evaluates:
+\begin{align}
+  h^{\text{attn\_inp}, (l)}_{bt,\, c} \; & =\; \gamma^{(l)}_{1, c}\,\hat{x}^{(l)}_{bt,\, c} + \beta^{(l)}_{1, c},                                        \\
+  qkv^{(l)}_{bt,\, m} \;                 & =\; \sum_{c<C} h^{\text{attn\_inp}, (l)}_{bt,\, c}\,W^{\text{attn}, (l)}_{m,\, c} + b^{\text{attn}, (l)}_{m}, \\
+  z^{\text{attn}, (l)}_{bt,\, c} \;      & =\; \sum_{k<C} Y^{\text{heads}, (l)}_{bt,\, k}\,W^{\text{proj}, (l)}_{c,\, k} + b^{\text{proj}, (l)}_{c},
+\end{align}
+for $m < 3C$. First, we propagate gradients through the output projection:
+\begin{align}
+  \dL{Y^{\text{heads}, (l)}_{bt,\, k}}
+   & = \sum_{c<C} \dL{z^{\text{attn}, (l)}_{bt,\, c}}\,W^{\text{proj}, (l)}_{c,\, k},
+  \label{eq:full-dyheads}                                                                          \\
+  \dL{W^{\text{proj}, (l)}_{c,\, k}}
+   & = \sum_{b<B} \sum_{t<T} \dL{z^{\text{attn}, (l)}_{bt,\, c}}\,Y^{\text{heads}, (l)}_{bt,\, k},
+  \label{eq:full-dwproj-attn}                                                                      \\
+  \dL{b^{\text{proj}, (l)}_{c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{z^{\text{attn}, (l)}_{bt,\, c}}.
+  \label{eq:full-dbproj-attn}
+\end{align}
+Second, we partition the gradient w.r.t.\ the head activations. Let $H$ be the head count, $h = C/H$ be the head dimension, $i < H$ be the head index, and $d < h$ be the head channel index. We extract the head output gradient:
+\begin{equation}
+  \dL{Y^{(l)}_{bt,\, i,\, d}} \;=\; \dL{Y^{\text{heads}, (l)}_{bt,\, i \cdot h + d}}.
+\end{equation}
+We backpropagate through the self-attention mechanism for each head $i$:
+\begin{align}
+  \dL{V^{(l)}_{bj,\, i,\, d}}
+   & = \sum_{t<T} \dL{Y^{(l)}_{bt,\, i,\, d}}\,A^{(l)}_{b,\, i,\, t,\, j},
+  \label{eq:full-dv}                                                       \\
+  \dL{A^{(l)}_{b,\, i,\, t,\, j}}
+   & = \sum_{d<h} \dL{Y^{(l)}_{bt,\, i,\, d}}\,V^{(l)}_{bj,\, i,\, d}.
+  \label{eq:full-da-matrix}
+\end{align}
+The row-wise softmax statistics $D^{(l)}_{b,\, i,\, t}$ contract to:
+\begin{equation}
+  D^{(l)}_{b,\, i,\, t} \;=\; \sum_{d<h} \dL{Y^{(l)}_{bt,\, i,\, d}}\,Y^{(l)}_{bt,\, i,\, d}.
+  \label{eq:full-dstats-attn}
+\end{equation}
+The score gradient $\dL{S^{(l)}_{b,\, i,\, t,\, j}}$ is masked causally:
+\begin{equation}
+  \dL{S^{(l)}_{b,\, i,\, t,\, j}} \;=\; \begin{cases}
+    A^{(l)}_{b,\, i,\, t,\, j}\,\left( \dL{A^{(l)}_{b,\, i,\, t,\, j}} - D^{(l)}_{b,\, i,\, t} \right) & j \leq t, \\
+    0                                                                                                  & j > t.
+  \end{cases}
+  \label{eq:full-ds}
+\end{equation}
+We compute query and key gradients by contracting over the sequence dimensions:
+\begin{align}
+  \dL{Q^{(l)}_{bt,\, i,\, d}}
+   & = \frac{1}{\sqrt{h}} \sum_{j<T} \dL{S^{(l)}_{b,\, i,\, t,\, j}}\,K^{(l)}_{bj,\, i,\, d},
+  \label{eq:full-dq}                                                                          \\
+  \dL{K^{(l)}_{bj,\, i,\, d}}
+   & = \frac{1}{\sqrt{h}} \sum_{t<T} \dL{S^{(l)}_{b,\, i,\, t,\, j}}\,Q^{(l)}_{bt,\, i,\, d}.
+  \label{eq:full-dk}
+\end{align}
+Third, we reassemble the composite projection gradient $\dL{qkv^{(l)}_{bt,\, m}}$:
+\begin{equation}
+  \dL{qkv^{(l)}_{bt,\, m}} \;=\; \begin{cases}
+    \dL{Q^{(l)}_{bt,\, i,\, d}} & m = i \cdot h + d,      \\
+    \dL{K^{(l)}_{bt,\, i,\, d}} & m = C + i \cdot h + d,  \\
+    \dL{V^{(l)}_{bt,\, i,\, d}} & m = 2C + i \cdot h + d,
+  \end{cases}
+  \label{eq:full-dqkv-reassemble}
+\end{equation}
+where $i = \lfloor (m \bmod C) / h \rfloor$ and $d = m \bmod h$.
+Fourth, we backpropagate through the QKV projection layer parameters and inputs:
+\begin{align}
+  \dL{h^{\text{attn\_inp}, (l)}_{bt,\, c}}
+   & = \sum_{m<3C} \dL{qkv^{(l)}_{bt,\, m}}\,W^{\text{attn}, (l)}_{m,\, c},
+  \label{eq:full-dhattninp}                                                                 \\
+  \dL{W^{\text{attn}, (l)}_{m,\, c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{qkv^{(l)}_{bt,\, m}}\,h^{\text{attn\_inp}, (l)}_{bt,\, c},
+  \label{eq:full-dwattn}                                                                    \\
+  \dL{b^{\text{attn}, (l)}_{m}}
+   & = \sum_{b<B} \sum_{t<T} \dL{qkv^{(l)}_{bt,\, m}}.
+  \label{eq:full-dbattn}
+\end{align}
+Fifth, we backpropagate through LayerNorm 1 using stats $\mu^{(1)}_{bt}$ and $\sigma^{2, (1)}_{bt}$:
+\begin{align}
+  \dL{\gamma^{(l)}_{1, c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{h^{\text{attn\_inp}, (l)}_{bt,\, c}}\,\hat{x}^{(l)}_{bt,\, c},
+  \label{eq:full-dgamma1}                                                                       \\
+  \dL{\beta^{(l)}_{1, c}}
+   & = \sum_{b<B} \sum_{t<T} \dL{h^{\text{attn\_inp}, (l)}_{bt,\, c}},
+  \label{eq:full-dbeta1}
+\end{align}
+and the input gradient through the attention pathway:
+\begin{align}
+  \dL{x^{(l)}_{bt,\, c}\Big|_{\text{attn}}}
+   & = \frac{1}{\sqrt{\sigma^{2, (1)}_{bt}}} \left( \gamma^{(l)}_{1, c}\,\dL{h^{\text{attn\_inp}, (l)}_{bt,\, c}} \right. \notag                                 \\
+   & \quad - \frac{1}{C} \sum_{k<C} \gamma^{(l)}_{1, k}\,\dL{h^{\text{attn\_inp}, (l)}_{bt,\, k}} \notag                                                         \\
+   & \quad \left. - \frac{\hat{x}^{(l)}_{bt,\, c}}{C} \sum_{k<C} \gamma^{(l)}_{1, k}\,\dL{h^{\text{attn\_inp}, (l)}_{bt,\, k}}\,\hat{x}^{(l)}_{bt,\, k} \right).
+  \label{eq:full-dx-attn}
+\end{align}
+The total block input gradient accumulates both pathways:
+\begin{equation}
+  \dL{x^{(l)}_{bt,\, c}} \;=\; \dL{x^{\text{mid}, (l)}_{bt,\, c}} + \dL{x^{(l)}_{bt,\, c}\Big|_{\text{attn}}}.
+  \label{eq:full-dx}
+\end{equation}
+
+\subsection{Parameter Accumulation and Weight Tying}
+
+At the bottom of the stack, the gradient w.r.t.\ the input embeddings is $\dL{x^{(0)}_{bt,\, c}}$. The forward embedding layer adds token and position embeddings, $x^{(0)}_{bt, c} = W_{E, \text{tok}_{bt}, c} + W_{P, t, c}$.
+Differentiating w.r.t.\ position embeddings $W_{P, t, c}$ reduces the gradient over the batch dimension $b$:
+\begin{equation}
+  \dL{W_{P,\, t,\, c}} \;=\; \sum_{b<B} \dL{x^{(0)}_{bt,\, c}}.
+  \label{eq:full-dwp}
+\end{equation}
+Differentiating w.r.t.\ token embeddings $W_{E, v, c}$ scatter-accumulates using the indicator function:
+\begin{equation}
+  \dL{W_{E,\, v,\, c}} \;=\; \sum_{b<B} \sum_{t<T} \dL{x^{(0)}_{bt,\, c}}\,\ind{\text{tok}_{bt} = v}.
+  \label{eq:full-dwe}
+\end{equation}
+Because the input token embeddings $W_E$ and LM head weights $W_{\text{LM}}$ tie ($W_E = W_{\text{LM}}$), their gradients sum. The total tied token embedding gradient is:
+\begin{align}
+  \dL{W_{E,\, v,\, c}}_{\text{tied}}
+   & = \sum_{b<B} \sum_{t<T} \left( \dL{x^{(0)}_{bt,\, c}}\,\ind{\text{tok}_{bt} = v} \right. \notag \\
+   & \quad \left. + \, \dL{Z_{bt,\, v}}\,X_{\text{final},\, bt,\, c} \right),
+  \label{eq:full-dwetied-expand}
+\end{align}
+which accumulates contributions from the embedding lookup at the network base and the output projection at the network top.
+
+\section*{AI Use Statement}
+In writing these derivations, we used the following AI tools: Overleaf's spell check and grammar modules to correct spelling and grammar mistakes; Cursor's Code and \LaTeX\ plugins to help with formatting and outlining sections with \LaTeX\ autocompletion; and Cursor's Composer 2.5 for bulk \LaTeX\ fixes and resolving compiler errors. For the mojo code we are not using any AI tools or LSPs.
+
+% =============================================================================
 % =============================================================================
 \appendices
 \section{Gradient Checking}\label{app:gradcheck}
 
-Numerical check used to validate every derivation above:
+We use a central finite difference approximation to check the numerical accuracy of each derivation:
 \begin{equation}
   \pdv{L}{\theta_i} \;\approx\;
   \frac{L(\theta + \epsilon e_i) - L(\theta - \epsilon e_i)}{2\epsilon}.
 \end{equation}
+Our verification tests enforce the relative (\texttt{rtol}) and absolute (\texttt{atol}) tolerances defined in \texttt{tests/\_dtypes.py}, as summarized in Table~\ref{tab:tolerances}.
 
-\TODO{Record per-dtype tolerances and how they relate to
-  \texttt{tests/\_dtypes.py}.}
+\begin{table}[h]
+  \centering
+  \caption{Per-dtype tolerances for PyTorch reference comparison.}
+  \label{tab:tolerances}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    Dtype             & Absolute Tolerance (\texttt{atol}) & Relative Tolerance (\texttt{rtol}) \\
+    \midrule
+    \texttt{float32}  & $10^{-6}$                          & $10^{-5}$                          \\
+    \texttt{float16}  & $10^{-3}$                          & $10^{-2}$                          \\
+    \texttt{bfloat16} & $5 \times 10^{-3}$                 & $2 \times 10^{-2}$                 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
 
 \section{Useful Identities}\label{app:identities}
 
 \begin{itemize}
-  \item $\dv{}{x}\log x = 1/x$; \quad $\dv{}{x} e^{x} = e^{x}$; \quad
-        $\dv{}{x}\tanh x = 1 - \tanh^2 x$.
-  \item log-sum-exp and its gradient: $\nabla \log \sum_j e^{x_j} = \softmax(x)$.
-  \item \TODO{Collect identities as they get used.}
+  \item Derivatives of basic functions:
+        \begin{align*}
+          \dv{}{x}\log x \;  & =\; \frac{1}{x}, \qquad \dv{}{x} e^{x} \;=\; e^{x}, \\
+          \dv{}{x}\tanh x \; & =\; 1 - \tanh^2 x.
+        \end{align*}
+  \item Quotient and product rules:
+        \begin{equation*}
+          \dv{}{x}\left(\frac{u}{v}\right) = \frac{u'v - uv'}{v^2}, \quad
+          \dv{}{x}(uv) = u'v + uv'.
+        \end{equation*}
+  \item Kronecker delta sifting property:
+        \begin{equation*}
+          \sum_j \kron{j}{l}\,A_j \;=\; A_l.
+        \end{equation*}
+  \item Log-sum-exp function and its gradient:
+        \begin{equation*}
+          \pdv{}{x_i} \log \sum_j e^{x_j} \;=\; \frac{e^{x_i}}{\sum_j e^{x_j}} \;=\; \softmax(x)_i.
+        \end{equation*}
 \end{itemize}
 
 \begin{thebibliography}{1}
+  \bibitem{llmc}
+  A.~Karpathy, ``llm.c: LLM training in simple, raw C/CUDA,'' 2024. [Online]. Available: \url{https://github.com/karpathy/llm.c}
+
   \bibitem{flashattention2}
-  T.~Dao, ``FlashAttention-2: Faster attention with better parallelism and work partitioning,'' \emph{arXiv preprint arXiv:2307.08691}, 2023.
+  T.~Dao, ``FlashAttention-2: Faster attention with better parallelism and work partitioning,'' \emph{arXiv preprint arXiv:2307.08691}, 2023. [Online]. Available: \url{https://arxiv.org/abs/2307.08691}
+
+  \bibitem{gelu}
+  D.~Hendrycks and K.~Gimpel, ``Gaussian Error Linear Units (GELUs),'' \emph{arXiv preprint arXiv:1606.08415}, 2016. [Online]. Available: \url{https://arxiv.org/abs/1606.08415}
+
+  \bibitem{page}
+  E.~Page, ``Approximations to the Cumulative Normal Function and its Inverse for Use on a Pocket Calculator,'' \emph{Journal of the Royal Statistical Society. Series C (Applied Statistics)}, vol. 26, no. 1, pp. 75--76, 1977.
+
+  \bibitem{layernorm}
+  J.~L.~Ba, J.~R.~Kiros, and G.~E.~Hinton, ``Layer Normalization,'' \emph{arXiv preprint arXiv:1607.06450}, 2016. [Online]. Available: \url{https://arxiv.org/abs/1607.06450}
+
+  \bibitem{embeddings}
+  Y.~Bengio, R.~Ducharme, P.~Vincent, and C.~Jauvin, ``A Neural Probabilistic Language Model,'' \emph{Journal of Machine Learning Research}, vol. 3, pp. 1137--1155, 2003.
+
+  \bibitem{attention}
+  A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones, A.~N.~Gomez, L.~Kaiser, and I.~Polosukhin, ``Attention Is All You Need,'' in \emph{Advances in Neural Information Processing Systems}, 2017, pp. 5998--6008.
+
+  \bibitem{resnet}
+  K.~He, X.~Zhang, S.~Ren, and J.~Sun, ``Deep Residual Learning for Image Recognition,'' in \emph{IEEE Conference on Computer Vision and Pattern Recognition}, 2016, pp. 770--778.
+
 \end{thebibliography}
 
 \end{document}
