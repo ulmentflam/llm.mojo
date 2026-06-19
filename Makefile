@@ -2,6 +2,11 @@
 MOJO_DIRS := llmm tests
 PYTHON_PATHS := train_gpt2.py tests data
 LATEX_SOURCES := docs/backprop.tex
+ 
+# Auto-detect python library for Mojo standard library python interop.
+# Using relative paths avoids issues with spaces in absolute workspace paths (e.g. iCloud).
+MOJO_PYTHON_LIBRARY ?= $(shell find .pixi/envs/default/lib -maxdepth 1 -name "libpython3.*.dylib" -o -name "libpython3.*.so" 2>/dev/null | head -n 1)
+export MOJO_PYTHON_LIBRARY
 
 SHELL := /bin/bash
 
