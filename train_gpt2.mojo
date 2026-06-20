@@ -16,7 +16,7 @@ from llmm.matmul import matmul_fwd, matmul_bwd
 from llmm.softmax import softmax_fwd, softmax_bwd
 from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
 from llmm.global_norm import global_norm_squared
-from llmm.adamw import adamw_update
+from llmm.adamw import adamw_update, AdamWConfig
 from llmm.fused_classifier import fused_classifier
 
 
@@ -1511,5 +1511,34 @@ struct GPT2[target: StaticString]:
             batch_size,
             seq_len,
             channels,
+            self.ctx,
+        )
+
+    def update(
+        mut self,
+        t: UInt32,
+        learning_rate: Scalar[DType.float32],
+        beta1: Scalar[DType.float32] = Scalar[DType.float32](0.9),
+        beta2: Scalar[DType.float32] = Scalar[DType.float32](0.999),
+        eps: Scalar[DType.float32] = Scalar[DType.float32](1e-8),
+        weight_decay: Scalar[DType.float32] = Scalar[DType.float32](0.0),
+        grad_scale: Scalar[DType.float32] = Scalar[DType.float32](1.0),
+    ) raises:
+        var config = AdamWConfig[GPT2_DTYPE](
+            learning_rate=learning_rate,
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            weight_decay=weight_decay,
+            grad_scale=grad_scale,
+        )
+        adamw_update[GPT2_DTYPE, Self.target](
+            self.num_parameters,
+            self.params_memory,
+            self.grads_memory,
+            self.m_memory,
+            self.v_memory,
+            t,
+            config,
             self.ctx,
         )
