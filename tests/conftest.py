@@ -38,6 +38,19 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    # PyTorch 2.x emits these when `import torch` loads `torch.jit`; the reference
+    # code does not use JIT — suppress the noise across the equivalence suite.
+    config.addinivalue_line(
+        "filterwarnings",
+        "ignore:.*torch.jit.script.*:DeprecationWarning",
+    )
+    config.addinivalue_line(
+        "filterwarnings",
+        "ignore:.*torch.jit.interface.*:DeprecationWarning",
+    )
+
+
 @pytest.fixture(scope="session")
 def fixtures_dir() -> Path:
     from tests.reference import FIXTURES_DIR
