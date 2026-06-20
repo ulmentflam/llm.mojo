@@ -105,6 +105,56 @@ def layernorm_fused_residual_forward(
     return out_residual, out_normed, out_mean, out_rstd
 
 
+def layernorm_fused_residual_backward(
+    *,
+    d_inp1: np.ndarray,  # (B*T, C) flattened, kernel dtype (storage form)
+    d_inp2: np.ndarray,  # (B*T, C) flattened, kernel dtype (storage form)
+    d_output: np.ndarray,  # (B*T, C) flattened, kernel dtype (storage form)
+    residual: np.ndarray,  # (B*T, C) flattened, kernel dtype (storage form)
+    gamma: np.ndarray,  # (C,) flattened, kernel dtype (storage form)
+    mean: np.ndarray,  # (B*T,) float32
+    rstd: np.ndarray,  # (B*T,) float32
+    d_gamma: np.ndarray,  # (C,) float32
+    d_beta: np.ndarray,  # (C,) float32
+    d_residual: np.ndarray,  # (B*T, C) flattened, kernel dtype (storage form)
+    batch_size: int,
+    seq_len: int,
+    channels: int,
+    dtype_name: str,
+    device: "Device | None" = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """One layernorm_fused_residual_bwd pass end-to-end through MAX.
+
+    Accumulates into d_inp1/d_inp2 and d_gamma/d_beta. Overwrites d_residual.
+    """
+    (
+        out_d_inp1,
+        out_d_inp2,
+        out_d_gamma,
+        out_d_beta,
+        out_d_residual,
+    ) = run_custom_op(
+        kernel_name="layernorm_fused_residual_bwd",
+        args=[
+            MutableBuf(d_inp1, dtype_name),
+            MutableBuf(d_inp2, dtype_name),
+            ReadTensor(d_output, dtype_name),
+            ReadTensor(residual, dtype_name),
+            ReadTensor(gamma, dtype_name),
+            ReadTensor(mean, "float32"),
+            ReadTensor(rstd, "float32"),
+            MutableBuf(d_gamma, "float32"),
+            MutableBuf(d_beta, "float32"),
+            MutableBuf(d_residual, dtype_name),
+            ScalarArg(batch_size, "int64"),
+            ScalarArg(seq_len, "int64"),
+            ScalarArg(channels, "int64"),
+        ],
+        device=device,
+    )
+    return out_d_inp1, out_d_inp2, out_d_gamma, out_d_beta, out_d_residual
+
+
 def backward(
     *,
     d_output: np.ndarray,  # (B*T, C) flattened

@@ -450,3 +450,195 @@ def test_layernorm_fused_residual_forward(case: Case):
         rtol=1e-5 if case.dtype == "float32" else 1e-2,
         err_msg=f"{case.name}: fused rstd diverged",
     )
+
+
+# ---------------------------------------------------------------------------
+# Fused Residual Backward Tests
+# ---------------------------------------------------------------------------
+
+
+def _run_fused_residual_bwd(
+    case: Case,
+    d_out: np.ndarray,
+    residual: np.ndarray,
+    gamma: np.ndarray,
+    mean: np.ndarray,
+    rstd: np.ndarray,
+    d_inp1: np.ndarray | None = None,
+    d_inp2: np.ndarray | None = None,
+    d_gamma: np.ndarray | None = None,
+    d_beta: np.ndarray | None = None,
+):
+    bt = case.batch_size * case.seq_len
+    if d_inp1 is None:
+        d_inp1 = np.zeros_like(residual)
+    if d_inp2 is None:
+        d_inp2 = np.zeros_like(residual)
+    if d_gamma is None:
+        d_gamma = np.zeros(case.channels, dtype=np.float32)
+    if d_beta is None:
+        d_beta = np.zeros(case.channels, dtype=np.float32)
+    d_residual = np.zeros_like(residual)
+
+    return layernorm.layernorm_fused_residual_backward(
+        d_inp1=to_storage(d_inp1.reshape(bt, case.channels), case.dtype),
+        d_inp2=to_storage(d_inp2.reshape(bt, case.channels), case.dtype),
+        d_output=to_storage(d_out.reshape(bt, case.channels), case.dtype),
+        residual=to_storage(residual.reshape(bt, case.channels), case.dtype),
+        gamma=to_storage(gamma, case.dtype),
+        mean=mean,
+        rstd=rstd,
+        d_gamma=d_gamma,
+        d_beta=d_beta,
+        d_residual=to_storage(d_residual.reshape(bt, case.channels), case.dtype),
+        batch_size=case.batch_size,
+        seq_len=case.seq_len,
+        channels=case.channels,
+        dtype_name=case.dtype,
+    )
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
+def test_layernorm_fused_residual_backward(case: Case):
+    x1, x2, gamma, beta = _make_fused_inputs(case)
+
+    got_res, _, got_mean, got_rstd = _run_fused_residual_kernel(
+        case, x1, x2, gamma, beta
+    )
+
+    bt = case.batch_size * case.seq_len
+    residual_v = from_storage(got_res, case.dtype).reshape(bt, case.channels)
+
+    x1_t = torch.from_numpy(x1).requires_grad_(True)
+    x2_t = torch.from_numpy(x2).requires_grad_(True)
+    g_t = torch.from_numpy(gamma).requires_grad_(True)
+    b_t = torch.from_numpy(beta).requires_grad_(True)
+
+    res_t = x1_t + x2_t
+    normed_t = torch.nn.functional.layer_norm(
+        res_t, (case.channels,), g_t, b_t, case.epsilon
+    )
+
+    g = torch.Generator().manual_seed(case.seed + 200)
+    dy_t = torch.randn_like(normed_t, generator=g)
+
+    normed_t.backward(dy_t)
+
+    got_d_inp1, got_d_inp2, got_dgamma, got_dbeta, _ = _run_fused_residual_bwd(
+        case,
+        dy_t.detach().numpy(),
+        residual_v,
+        gamma,
+        got_mean,
+        got_rstd,
+    )
+
+    got_d_inp1_v = from_storage(got_d_inp1, case.dtype).reshape(bt, case.channels)
+    got_d_inp2_v = from_storage(got_d_inp2, case.dtype).reshape(bt, case.channels)
+
+    tol = DTYPE_TOLERANCES[case.dtype]
+
+    assert x1_t.grad is not None
+    np.testing.assert_allclose(
+        got_d_inp1_v,
+        x1_t.grad.numpy(),
+        atol=tol["atol"],
+        rtol=tol["rtol"],
+        err_msg=f"{case.name}: fused d_inp1 diverged",
+    )
+
+    assert x2_t.grad is not None
+    np.testing.assert_allclose(
+        got_d_inp2_v,
+        x2_t.grad.numpy(),
+        atol=tol["atol"],
+        rtol=tol["rtol"],
+        err_msg=f"{case.name}: fused d_inp2 diverged",
+    )
+
+    assert g_t.grad is not None
+    np.testing.assert_allclose(
+        got_dgamma,
+        g_t.grad.numpy(),
+        atol=tol["atol"] * 100,
+        rtol=tol["rtol"] * 10,
+        err_msg=f"{case.name}: fused dGamma diverged",
+    )
+
+    assert b_t.grad is not None
+    np.testing.assert_allclose(
+        got_dbeta,
+        b_t.grad.numpy(),
+        atol=tol["atol"] * 100,
+        rtol=tol["rtol"] * 10,
+        err_msg=f"{case.name}: fused dBeta diverged",
+    )
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
+def test_layernorm_fused_residual_backward_accumulates(case: Case):
+    """d_inp1/d_inp2 and d_gamma/d_beta accumulate; d_residual is scratch."""
+    x1, x2, gamma, beta = _make_fused_inputs(case)
+
+    got_res, _, got_mean, got_rstd = _run_fused_residual_kernel(
+        case, x1, x2, gamma, beta
+    )
+
+    bt = case.batch_size * case.seq_len
+    residual_v = from_storage(got_res, case.dtype).reshape(bt, case.channels)
+
+    g = torch.Generator().manual_seed(case.seed + 200)
+    dy = torch.randn(bt, case.channels, generator=g)
+    dy = dy.to(TORCH_DTYPES[case.dtype]).to(torch.float32).numpy()
+
+    d_inp1_1, d_inp2_1, dgamma1, dbeta1, _ = _run_fused_residual_bwd(
+        case, dy, residual_v, gamma, got_mean, got_rstd
+    )
+
+    d_inp1_2, d_inp2_2, dgamma2, dbeta2, _ = _run_fused_residual_bwd(
+        case,
+        dy,
+        residual_v,
+        gamma,
+        got_mean,
+        got_rstd,
+        d_inp1=from_storage(d_inp1_1, case.dtype).reshape(bt, case.channels),
+        d_inp2=from_storage(d_inp2_1, case.dtype).reshape(bt, case.channels),
+        d_gamma=dgamma1.copy(),
+        d_beta=dbeta1.copy(),
+    )
+
+    d_inp1_1_v = from_storage(d_inp1_1, case.dtype).reshape(bt, case.channels)
+    d_inp2_1_v = from_storage(d_inp2_1, case.dtype).reshape(bt, case.channels)
+    d_inp1_2_v = from_storage(d_inp1_2, case.dtype).reshape(bt, case.channels)
+    d_inp2_2_v = from_storage(d_inp2_2, case.dtype).reshape(bt, case.channels)
+
+    tol = DTYPE_TOLERANCES[case.dtype]
+    np.testing.assert_allclose(
+        d_inp1_2_v,
+        2.0 * d_inp1_1_v,
+        atol=tol["atol"],
+        rtol=tol["rtol"],
+        err_msg=f"{case.name}: d_inp1 did not accumulate",
+    )
+    np.testing.assert_allclose(
+        d_inp2_2_v,
+        2.0 * d_inp2_1_v,
+        atol=tol["atol"],
+        rtol=tol["rtol"],
+        err_msg=f"{case.name}: d_inp2 did not accumulate",
+    )
+    np.testing.assert_allclose(
+        dgamma2,
+        2.0 * dgamma1,
+        atol=tol["atol"] * 100,
+        rtol=tol["rtol"] * 10,
+        err_msg=f"{case.name}: fused dGamma did not accumulate",
+    )
+    np.testing.assert_allclose(
+        dbeta2,
+        2.0 * dbeta1,
+        atol=tol["atol"] * 100,
+        rtol=tol["rtol"] * 10,
+        err_msg=f"{case.name}: fused dBeta did not accumulate",
+    )

@@ -13,8 +13,17 @@ from extensibility.managed_tensor_slice import (
 )
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
+from llmm.split import split_fwd, split_bwd
+from llmm.merge import merge_fwd, merge_bwd
 from std.math import fma, sqrt, ceildiv, exp, log, ldexp, floor
-from std.gpu import barrier, block_idx, grid_dim, thread_idx, WARP_SIZE
+from std.gpu import (
+    barrier,
+    block_dim,
+    block_idx,
+    grid_dim,
+    thread_idx,
+    WARP_SIZE,
+)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1038,6 +1047,62 @@ def attention_fwd_gpu[
             Int(head_dim),
             query_tiles,
         )
+
+
+def attention_fwd[
+    dtype: DType,
+    target: StaticString,
+    use_soft_exp: Bool = True,
+    use_conditional_rescale: Bool = True,
+](
+    qkv_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    q_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    k_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    v_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    attn_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    attn_merged_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    batch_size: Int64,
+    num_heads: Int64,
+    seq_len: Int64,
+    head_dim: Int64,
+    ctx: DeviceContext,
+) capturing raises:
+    var qkv_mut = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](qkv_ptr)
+    var dst_ptrs = List[UnsafePointer[Scalar[dtype], MutAnyOrigin]]()
+    dst_ptrs.append(q_ptr)
+    dst_ptrs.append(k_ptr)
+    dst_ptrs.append(v_ptr)
+    split_fwd[dtype, target, num_splits=3](
+        qkv_mut,
+        dst_ptrs,
+        Int(batch_size),
+        Int(seq_len),
+        Int(num_heads),
+        Int(head_dim),
+        ctx,
+    )
+    attention_fwd[dtype, target, use_soft_exp, use_conditional_rescale](
+        attn_ptr,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        log_sum_exp_ptr,
+        batch_size,
+        num_heads,
+        seq_len,
+        head_dim,
+        ctx,
+    )
+    merge_fwd[dtype, target](
+        attn_ptr,
+        attn_merged_ptr,
+        Int(batch_size),
+        Int(seq_len),
+        Int(num_heads),
+        Int(head_dim),
+        ctx,
+    )
 
 
 def attention_fwd[
@@ -2105,6 +2170,73 @@ def attention_bwd_dkv_gpu[
             Int(head_dim),
             query_tiles,
         )
+
+
+def attention_bwd[
+    dtype: DType,
+    target: StaticString,
+    use_soft_exp: Bool = True,
+](
+    d_qkv_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_q_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_k_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_v_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_attn_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_attn_merged_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    q_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    k_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    v_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    attn_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    batch_size: Int64,
+    num_heads: Int64,
+    seq_len: Int64,
+    head_dim: Int64,
+    ctx: DeviceContext,
+) capturing raises:
+    # 1. Split heads backward: split d_attn_merged into d_attn
+    merge_bwd[dtype, target](
+        d_attn_merged_ptr,
+        d_attn_ptr,
+        Int(batch_size),
+        Int(seq_len),
+        Int(num_heads),
+        Int(head_dim),
+        ctx,
+    )
+
+    # 2. Core attention backward
+    attention_bwd[dtype, target, use_soft_exp](
+        d_q_ptr,
+        d_k_ptr,
+        d_v_ptr,
+        d_attn_ptr,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        attn_ptr,
+        log_sum_exp_ptr,
+        batch_size,
+        num_heads,
+        seq_len,
+        head_dim,
+        ctx,
+    )
+
+    # 3. Merge QKV backward: merge d_q, d_k, d_v back into d_qkv
+    var d_dst_ptrs = List[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]]()
+    d_dst_ptrs.append(d_q_ptr)
+    d_dst_ptrs.append(d_k_ptr)
+    d_dst_ptrs.append(d_v_ptr)
+    split_bwd[dtype, target, num_splits=3](
+        d_qkv_ptr,
+        d_dst_ptrs,
+        Int(batch_size),
+        Int(seq_len),
+        Int(num_heads),
+        Int(head_dim),
+        ctx,
+    )
 
 
 def attention_bwd[

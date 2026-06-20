@@ -10,7 +10,7 @@ from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.algorithm import sync_parallelize
+from std.algorithm import sync_parallelize, vectorize
 from std.runtime.asyncrt import parallelism_level
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
@@ -1372,6 +1372,133 @@ def layernorm_bwd[
         raise Error("Invalid target")
 
 
+# ===----------------------------------------------------------------------=== #
+# LayerNorm Fused Residual Backward
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def _layernorm_fused_residual_bwd_broadcast_tile[
+    dtype: DType,
+    width: Int,
+](
+    idx: Int,
+    d_inp1_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_inp2_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_residual_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+) -> None:
+    var grad = (d_residual_ptr + idx).load[width=width]()
+    (d_inp1_ptr + idx).store((d_inp1_ptr + idx).load[width=width]() + grad)
+    (d_inp2_ptr + idx).store((d_inp2_ptr + idx).load[width=width]() + grad)
+
+
+@always_inline
+def _layernorm_fused_residual_bwd_broadcast_cpu[
+    dtype: DType,
+    width: Int,
+](
+    d_inp1_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_inp2_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_residual_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    count: Int,
+) -> None:
+    @always_inline
+    def _simd[w: Int](local: Int) {d_inp1_ptr, d_inp2_ptr, d_residual_ptr}:
+        _layernorm_fused_residual_bwd_broadcast_tile[dtype, w](
+            local, d_inp1_ptr, d_inp2_ptr, d_residual_ptr
+        )
+
+    vectorize[width, unroll_factor=UNROLL](count, _simd)
+
+
+def layernorm_fused_residual_bwd_broadcast_gpu[
+    dtype: DType,
+    width: Int = 4,
+](
+    d_inp1_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_inp2_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_residual_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    count: Int,
+) -> None:
+    var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
+    if idx + width <= count:
+        _layernorm_fused_residual_bwd_broadcast_tile[dtype, width](
+            idx, d_inp1_ptr, d_inp2_ptr, d_residual_ptr
+        )
+    elif idx < count:
+        for i in range(idx, count):
+            _layernorm_fused_residual_bwd_broadcast_tile[dtype, 1](
+                i, d_inp1_ptr, d_inp2_ptr, d_residual_ptr
+            )
+
+
+def layernorm_fused_residual_bwd[
+    dtype: DType,
+    target: StaticString,
+](
+    d_inp1_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_inp2_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    residual_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    mean_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    rstd_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    d_gamma_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    d_beta_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    d_residual_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    batch_size: Int64,
+    seq_len: Int64,
+    channels: Int64,
+    ctx: DeviceContext,
+) capturing raises:
+    layernorm_bwd[dtype, target](
+        d_output_ptr,
+        residual_ptr,
+        gamma_ptr,
+        mean_ptr,
+        rstd_ptr,
+        d_residual_ptr,
+        d_gamma_ptr,
+        d_beta_ptr,
+        batch_size,
+        seq_len,
+        channels,
+        ctx,
+    )
+
+    comptime width = simd_width_of[dtype]()
+    comptime if is_cpu[target]():
+        _layernorm_fused_residual_bwd_broadcast_cpu[dtype, width](
+            d_inp1_ptr,
+            d_inp2_ptr,
+            d_residual_ptr,
+            Int(batch_size * seq_len * channels),
+        )
+    elif is_gpu[target]():
+        comptime BLOCK_SIZE = 256
+        comptime width = 4
+        var device_ctx = ctx
+        var count = Int(batch_size * seq_len * channels)
+        var num_threads = ceildiv(count, width)
+        var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
+
+        comptime gpu_kernel = layernorm_fused_residual_bwd_broadcast_gpu[
+            dtype, width
+        ]
+        var compiled = device_ctx.compile_function[gpu_kernel]()
+        device_ctx.enqueue_function(
+            compiled,
+            d_inp1_ptr,
+            d_inp2_ptr,
+            UnsafePointer[Scalar[dtype], ImmutAnyOrigin](d_residual_ptr),
+            count,
+            grid_dim=(num_blocks,),
+            block_dim=(BLOCK_SIZE,),
+        )
+    else:
+        raise Error("Invalid target")
+
+
 @compiler.register("layernorm_bwd")
 struct LayerNormBwd:
     @staticmethod
@@ -1422,6 +1549,72 @@ struct LayerNormBwd:
             d_x.unsafe_ptr(),
             d_gamma.unsafe_ptr(),
             d_beta.unsafe_ptr(),
+            batch_size,
+            seq_len,
+            channels,
+            ctx,
+        )
+
+
+@compiler.register("layernorm_fused_residual_bwd")
+struct LayerNormFusedResidualBwd:
+    @staticmethod
+    def execute[
+        dtype: DType,
+        target: StaticString,
+    ](
+        d_inp1: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
+        d_inp2: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
+        d_output: InputTensor[dtype=dtype, rank=2, static_spec=...],
+        residual: InputTensor[dtype=dtype, rank=2, static_spec=...],
+        gamma: InputTensor[dtype=dtype, rank=1, static_spec=...],
+        mean: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
+        rstd: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
+        d_gamma: MutableInputTensor[
+            dtype=DType.float32, rank=1, static_spec=...
+        ],
+        d_beta: MutableInputTensor[
+            dtype=DType.float32, rank=1, static_spec=...
+        ],
+        d_residual: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
+        batch_size: Int64,  # Our B
+        seq_len: Int64,  # Our T
+        channels: Int64,  # Our C
+        ctx: DeviceContext,
+    ) capturing raises:
+        var row_elems = Int(batch_size * seq_len * channels)
+        if d_inp1.size() != row_elems:
+            raise Error("d_inp1 size mismatch")
+        if d_inp2.size() != row_elems:
+            raise Error("d_inp2 size mismatch")
+        if d_output.size() != row_elems:
+            raise Error("d_output size mismatch")
+        if residual.size() != row_elems:
+            raise Error("residual size mismatch")
+        if gamma.size() != Int(channels):
+            raise Error("gamma size mismatch")
+        if mean.size() != Int(batch_size * seq_len):
+            raise Error("mean size mismatch")
+        if rstd.size() != Int(batch_size * seq_len):
+            raise Error("rstd size mismatch")
+        if d_gamma.size() != Int(channels):
+            raise Error("d_gamma size mismatch")
+        if d_beta.size() != Int(channels):
+            raise Error("d_beta size mismatch")
+        if d_residual.size() != row_elems:
+            raise Error("d_residual size mismatch")
+
+        layernorm_fused_residual_bwd[dtype, target](
+            d_inp1.unsafe_ptr(),
+            d_inp2.unsafe_ptr(),
+            d_output.unsafe_ptr(),
+            residual.unsafe_ptr(),
+            gamma.unsafe_ptr(),
+            mean.unsafe_ptr(),
+            rstd.unsafe_ptr(),
+            d_gamma.unsafe_ptr(),
+            d_beta.unsafe_ptr(),
+            d_residual.unsafe_ptr(),
             batch_size,
             seq_len,
             channels,

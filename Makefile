@@ -1,5 +1,5 @@
 # Source roots only — never `find .` (crawls .pixi and hangs on iCloud).
-MOJO_DIRS := llmm tests
+MOJO_PATHS := train_gpt2.mojo llmm tests
 PYTHON_PATHS := train_gpt2.py tests data
 LATEX_SOURCES := docs/backprop.tex
  
@@ -88,7 +88,7 @@ lint-mojo:
 			echo "needs formatting: $$f"; \
 			fail=1; \
 		fi; \
-	done < <(find $(MOJO_DIRS) -name '*.mojo' -print0); \
+	done < <(find $(MOJO_PATHS) -name '*.mojo' -print0); \
 	if [ $$i -eq 0 ]; then \
 		echo "No .mojo files found, skipping mojo lint."; \
 	else \
@@ -140,8 +140,8 @@ format-python:
 	@uvx ruff format $(PYTHON_PATHS)
 
 format-mojo:
-	@if find $(MOJO_DIRS) -name '*.mojo' -print -quit 2>/dev/null | grep -q .; then \
-		find $(MOJO_DIRS) -name '*.mojo' -print0 | xargs -0 pixi run mojo format; \
+	@if find $(MOJO_PATHS) -name '*.mojo' -print -quit 2>/dev/null | grep -q .; then \
+		find $(MOJO_PATHS) -name '*.mojo' -print0 | xargs -0 pixi run mojo format; \
 	else \
 		echo "No .mojo files found, skipping mojo format."; \
 	fi

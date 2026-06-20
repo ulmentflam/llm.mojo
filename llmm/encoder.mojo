@@ -23,6 +23,15 @@ from std.gpu import (
     WARP_SIZE,
 )
 
+# ===----------------------------------------------------------------------=== #
+# Constants
+# ===----------------------------------------------------------------------=== #
+
+
+comptime WTE_BUCKET_IDX_SIZE = 4
+comptime WTE_BWD_SIMD_WIDTH = 4
+comptime WTE_C_PER_WARP = 32 * WTE_BWD_SIMD_WIDTH
+
 
 # ===----------------------------------------------------------------------=== #
 # Encoder Forward Helpers
@@ -30,7 +39,7 @@ from std.gpu import (
 
 
 @always_inline
-def _encoder_forward_vector_slice[
+def _encoder_fwd_vector_slice[
     dtype: DType,
     width: Int,
 ](
@@ -44,7 +53,7 @@ def _encoder_forward_vector_slice[
     (out_row_ptr + c).store(wte_val + wpe_val)
 
 
-def encoder_forward_cpu[
+def encoder_fwd_cpu[
     dtype: DType,
     width: Int,
 ](
@@ -76,7 +85,7 @@ def encoder_forward_cpu[
 
             @always_inline
             def _simd[simd_w: Int](c: Int) {out_row, wte_row, wpe_row}:
-                _encoder_forward_vector_slice[dtype, simd_w](
+                _encoder_fwd_vector_slice[dtype, simd_w](
                     out_row, wte_row, wpe_row, c
                 )
 
@@ -86,7 +95,7 @@ def encoder_forward_cpu[
 
 
 @always_inline
-def encoder_forward_gpu_kernel[
+def encoder_fwd_gpu_kernel[
     dtype: DType,
     width: Int,
 ](
@@ -110,7 +119,7 @@ def encoder_forward_gpu_kernel[
 
     var ix = Int((inp_ptr + bt).load())
 
-    _encoder_forward_vector_slice[dtype, width](
+    _encoder_fwd_vector_slice[dtype, width](
         out_ptr + bt * channels,
         wte_ptr + ix * channels,
         wpe_ptr + t * channels,
@@ -118,7 +127,7 @@ def encoder_forward_gpu_kernel[
     )
 
 
-def encoder_forward_gpu[
+def encoder_fwd_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int = 4,
@@ -132,7 +141,7 @@ def encoder_forward_gpu[
     channels: Int,
 ) -> None:
     var total_elements = batch_size * seq_len * channels
-    encoder_forward_gpu_kernel[dtype, width](
+    encoder_fwd_gpu_kernel[dtype, width](
         out_ptr, inp_ptr, wte_ptr, wpe_ptr, seq_len, channels, total_elements
     )
 
@@ -142,7 +151,7 @@ def encoder_forward_gpu[
 # ===----------------------------------------------------------------------=== #
 
 
-def encoder_forward[
+def encoder_fwd[
     dtype: DType,
     target: StaticString,
 ](
@@ -157,7 +166,7 @@ def encoder_forward[
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
-        encoder_forward_cpu[dtype, width](
+        encoder_fwd_cpu[dtype, width](
             out_ptr,
             inp_ptr,
             wte_ptr,
@@ -174,7 +183,7 @@ def encoder_forward[
         var num_threads = (total_elements + width - 1) // width
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
-        comptime gpu_kernel = encoder_forward_gpu[dtype, BLOCK_SIZE, width]
+        comptime gpu_kernel = encoder_fwd_gpu[dtype, BLOCK_SIZE, width]
         var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
@@ -215,7 +224,7 @@ struct EncoderFwd:
         if wpe.size() != Int(seq_len * channels):
             raise Error("wpe size mismatch")
 
-        encoder_forward[dtype, target](
+        encoder_fwd[dtype, target](
             output.unsafe_ptr(),
             inp.unsafe_ptr(),
             wte.unsafe_ptr(),
@@ -225,6 +234,74 @@ struct EncoderFwd:
             Int(channels),
             ctx,
         )
+
+
+# ===----------------------------------------------------------------------=== #
+# Encoder Backward Bucket Builder
+# ===----------------------------------------------------------------------=== #
+
+
+def build_wte_buckets(
+    inputs_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    bucket_info_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    batch_size: Int,
+    seq_len: Int,
+    vocab_size: Int,
+    channels: Int,
+    bucket_info_capacity: Int,
+) raises -> Int:
+    """
+    Build scatter-add buckets for wte backward from the current token batch.
+    """
+    var total_positions = batch_size * seq_len
+    var num_channel_groups = ceildiv(channels, WTE_C_PER_WARP)
+
+    var counts = List[Int]()
+    for _ in range(vocab_size):
+        counts.append(0)
+
+    for bt in range(total_positions):
+        var token = Int(inputs_ptr.load(bt))
+        if token < 0 or token >= vocab_size:
+            raise Error("encoder bucket build: token index out of range")
+        counts[token] = counts[token] + 1
+
+    var offsets = List[Int]()
+    var cursor = 0
+    for token in range(vocab_size):
+        offsets.append(cursor)
+        cursor += counts[token]
+
+    var cursors = List[Int]()
+    for token in range(vocab_size):
+        cursors.append(offsets[token])
+
+    for bt in range(total_positions):
+        var token = Int(inputs_ptr.load(bt))
+        var idx = cursors[token]
+        workload_indices_ptr.store(idx, Scalar[DType.int32](bt))
+        cursors[token] = idx + 1
+
+    var num_buckets = 0
+    for token in range(vocab_size):
+        var size = counts[token]
+        if size == 0:
+            continue
+        var start_idx = offsets[token]
+        for g in range(num_channel_groups):
+            if num_buckets >= bucket_info_capacity:
+                raise Error(
+                    "encoder bucket build: bucket_info capacity exceeded"
+                )
+            var base = num_buckets * WTE_BUCKET_IDX_SIZE
+            bucket_info_ptr.store(base + 0, Scalar[DType.int32](start_idx))
+            bucket_info_ptr.store(base + 1, Scalar[DType.int32](size))
+            bucket_info_ptr.store(base + 2, Scalar[DType.int32](token))
+            bucket_info_ptr.store(base + 3, Scalar[DType.int32](g))
+            num_buckets += 1
+
+    return num_buckets
 
 
 # ===----------------------------------------------------------------------=== #
@@ -514,7 +591,7 @@ def wpe_backward_gpu_kernel[
         (dwpe_ptr + offset).store((prev_dwpe + accum).cast[dtype]())
 
 
-def encoder_backward[
+def encoder_bwd[
     dtype: DType,
     target: StaticString,
 ](
@@ -615,7 +692,7 @@ struct EncoderBwd:
         if dout.size() != Int(batch_size * seq_len * channels):
             raise Error("dout size mismatch")
 
-        encoder_backward[dtype, target](
+        encoder_bwd[dtype, target](
             dwte.unsafe_ptr(),
             dwpe.unsafe_ptr(),
             bucket_info.unsafe_ptr(),
