@@ -1,4 +1,5 @@
 import compiler
+from std.memory import alloc
 from std.math import ceildiv
 from layout import TileTensor
 from linalg.matmul import matmul
@@ -9,7 +10,6 @@ from std.utils.index import IndexList
 from extensibility import InputTensor
 from linalg.transpose import transpose
 from layout.tile_layout import row_major
-from std.memory import alloc, UnsafePointer
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -20,6 +20,7 @@ from std.gpu.host import DeviceContext, DeviceAttribute
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.gelu import gelu, gelu_grad
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -39,11 +40,11 @@ def matmul_fwd[
     target: StaticString,
     use_gelu: Bool = False,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    pre_gelu_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    input_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    weight_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    bias_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    pre_gelu_ptr: MutKernelPtr[dtype],
+    input_ptr: ImmutKernelPtr[dtype],
+    weight_ptr: ImmutKernelPtr[dtype],
+    bias_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
@@ -168,8 +169,8 @@ def _matmul_bias_bwd_gpu[
     accumulate: Bool,
     width: Int,
 ](
-    d_bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_bias_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
     rows: Int,
     out_channels: Int,
     num_tiles: Int,
@@ -224,8 +225,8 @@ def matmul_bias_bwd_gpu[
     accumulate: Bool,
     width: Int = 4,
 ](
-    d_bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_bias_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     output_channels: Int64,
@@ -255,8 +256,8 @@ def matmul_bias_bwd_cpu[
     width: Int,
     accumulate: Bool,
 ](
-    d_bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_bias_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
     rows: Int,  # (B * T) or (batch_size * seq_len)
     out_channels: Int,  # OC
 ) -> None:
@@ -299,8 +300,8 @@ def matmul_bias_bwd[
     target: StaticString,
     accumulate: Bool,
 ](
-    d_bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_bias_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     output_channels: Int64,
@@ -348,10 +349,10 @@ def matmul_d_input_bwd[
     target: StaticString,
     use_gelu: Bool,
 ](
-    d_input_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    weight_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    pre_gelu_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_input_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    weight_ptr: ImmutKernelPtr[dtype],
+    pre_gelu_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
@@ -417,8 +418,8 @@ def _add_into[
     dtype: DType,
     width: Int,
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dst_ptr: MutKernelPtr[dtype],
+    src_ptr: MutKernelPtr[dtype],
     total: Int,
 ) -> None:
     """dst += src elementwise, f32 math, one rounding at the store."""
@@ -449,10 +450,10 @@ def matmul_d_weight_bwd[
     target: StaticString,
     accumulate: Bool,
 ](
-    d_weight_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    input_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    scratch_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_weight_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    input_ptr: ImmutKernelPtr[dtype],
+    scratch_ptr: MutKernelPtr[dtype],
     batch_size: Int64,  # B
     seq_len: Int64,  # T
     channels: Int64,  # C
@@ -529,7 +530,7 @@ def matmul_d_weight_bwd[
             comptime simd_width = simd_width_of[DType.float32]()
             _add_into[dtype, simd_width](
                 d_weight_ptr,
-                temp.as_unsafe_any_origin(),
+                rebind[MutKernelPtr[dtype]](temp.as_unsafe_any_origin()),
                 out_channels * in_channels,
             )
             temp.free()
@@ -545,14 +546,14 @@ def matmul_bwd[
     use_gelu: Bool = False,
     accumulate: Bool = True,
 ](
-    d_input_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_weight_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    input_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    weight_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    pre_gelu_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    scratch_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_input_ptr: MutKernelPtr[dtype],
+    d_weight_ptr: MutKernelPtr[dtype],
+    d_bias_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    input_ptr: ImmutKernelPtr[dtype],
+    weight_ptr: ImmutKernelPtr[dtype],
+    pre_gelu_ptr: ImmutKernelPtr[dtype],
+    scratch_ptr: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,

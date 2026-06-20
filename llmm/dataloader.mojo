@@ -1,7 +1,8 @@
+from std.memory import alloc
 from std.python import Python
-from std.memory import alloc, UnsafePointer
 
 from llmm.sampler import random_permutation
+from llmm.memory import ImmutKernelPtr, MutMemPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -43,8 +44,8 @@ struct DataLoader:
     var tokens_file: FileHandle
 
     # Data buffers.
-    var inputs: UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
-    var targets: UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
+    var inputs: MutMemPtr[DType.int32]
+    var targets: MutMemPtr[DType.int32]
 
     # Random shuffle variables.
     var should_shuffle: Bool
@@ -101,12 +102,8 @@ struct DataLoader:
         self.intra_shard_indices = List[Int]()
 
         # Allocate buffers for the input and target tokens.
-        self.inputs = alloc[Scalar[DType.int32]](
-            batch_size * seq_len
-        ).as_unsafe_any_origin()
-        self.targets = alloc[Scalar[DType.int32]](
-            batch_size * seq_len
-        ).as_unsafe_any_origin()
+        self.inputs = alloc[Scalar[DType.int32]](batch_size * seq_len)
+        self.targets = alloc[Scalar[DType.int32]](batch_size * seq_len)
         self.has_allocated = True
 
         # Import python glob to find all matching shards.

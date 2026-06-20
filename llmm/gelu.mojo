@@ -1,6 +1,5 @@
 import compiler
 from std.sys import simd_width_of
-from std.memory import UnsafePointer
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host import DeviceAttribute
@@ -12,6 +11,7 @@ from extensibility.managed_tensor_slice import (
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -20,7 +20,10 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 comptime UNROLL = 4
 comptime GELU_CONSTANT = 0.044715
-comptime SQRT_TWO_OVER_PI = sqrt(2.0 / pi)
+comptime SQRT_TWO_OVER_PI = 0.7978845608028654
+# NOTE: Apple Silicon has issues with comptime computing sqrt(2.0 / pi) so we hardcode the value.
+# comptime SQRT_TWO_OVER_PI = sqrt(2.0 / pi)
+
 
 # ===----------------------------------------------------------------------=== #
 # GELU Forward
@@ -48,8 +51,8 @@ def _gelu_fwd[
     width: Int,
 ](
     idx: Int,
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    x_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    x_ptr: ImmutKernelPtr[dtype],
 ) -> None:
     var x = (x_ptr + idx).load[width=width]().cast[DType.float32]()
     (out_ptr + idx).store(gelu(x).cast[dtype]())
@@ -59,8 +62,8 @@ def gelu_fwd_gpu[
     dtype: DType,
     width: Int,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    x_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    x_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
 ) -> None:
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
@@ -76,8 +79,8 @@ def gelu_fwd_cpu[
     dtype: DType,
     width: Int,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    x_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    x_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
 ) -> None:
     var num_workers = min(num_params, parallelism_level())
@@ -179,8 +182,8 @@ def _gelu_bwd[
     width: Int,
 ](
     idx: Int,
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    x_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    x_ptr: ImmutKernelPtr[dtype],
 ) -> None:
     var x = (x_ptr + idx).load[width=width]().cast[DType.float32]()
     (out_ptr + idx).store(gelu_grad(x).cast[dtype]())
@@ -190,8 +193,8 @@ def gelu_bwd_gpu[
     dtype: DType,
     width: Int,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    x_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    x_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
 ) -> None:
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
@@ -207,8 +210,8 @@ def gelu_bwd_cpu[
     dtype: DType,
     width: Int,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    x_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    x_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
 ) -> None:
     var num_workers = min(num_params, parallelism_level())

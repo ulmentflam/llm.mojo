@@ -109,7 +109,7 @@ struct Tokenizer:
                 pass
 
     def _load(mut self, mut file: FileHandle) raises:
-        var header = alloc[Int32](HEADER_SIZE).as_unsafe_any_origin()
+        var header = alloc[Int32](HEADER_SIZE)
         read_and_copy[DType.int32](file, header, HEADER_SIZE)
 
         var magic = Int(header.load(0))

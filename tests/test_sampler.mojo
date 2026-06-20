@@ -12,10 +12,11 @@ from std.testing import assert_equal, TestSuite
 from std.memory import alloc, UnsafePointer
 
 from llmm.sampler import sample_softmax
+from llmm.memory import ImmutMemPtr, MutMemPtr
 
 
 def sample_softmax_llmc_reference(
-    logits_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    logits_ptr: ImmutMemPtr[DType.float32],
     n: Int,
     mut coin: Float32,
 ) -> Int:
@@ -33,18 +34,16 @@ def sample_softmax_llmc_reference(
     return n - 1
 
 
-def _alloc_logits(n: Int) -> UnsafePointer[Scalar[DType.float32], MutAnyOrigin]:
-    return alloc[Scalar[DType.float32]](n).as_unsafe_any_origin()
+def _alloc_logits(n: Int) -> MutMemPtr[DType.float32]:
+    return alloc[Scalar[DType.float32]](n)
 
 
 def _assert_matches_reference(
-    logits_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    logits_ptr: MutMemPtr[DType.float32],
     n: Int,
     coin: Float32,
 ) raises:
-    var logits_immut = rebind[
-        UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
-    ](logits_ptr)
+    var logits_immut = rebind[ImmutMemPtr[DType.float32]](logits_ptr)
     var coin_ref = coin
     var coin_got = coin
     var expected = sample_softmax_llmc_reference(logits_immut, n, coin_ref)

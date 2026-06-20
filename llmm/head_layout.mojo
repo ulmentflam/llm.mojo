@@ -1,4 +1,5 @@
 from std.algorithm import vectorize
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
 # NOTE: I am trying this layout to see if it does a decent job of saving code and
@@ -99,19 +100,17 @@ def token_layout_plane0_flat_from_head_layout_flat(
 
 
 @always_inline
-def null_mut_ptr[dtype: DType]() -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+def null_mut_ptr[dtype: DType]() -> MutKernelPtr[dtype]:
     var zero = 0
-    return UnsafePointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=zero)
+    return MutKernelPtr[dtype](unsafe_from_address=zero)
 
 
 @always_inline
 def null_immut_ptr[
     dtype: DType,
-]() -> UnsafePointer[Scalar[dtype], ImmutAnyOrigin]:
+]() -> ImmutKernelPtr[dtype]:
     var zero = 0
-    return UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
-        unsafe_from_address=zero
-    )
+    return ImmutKernelPtr[dtype](unsafe_from_address=zero)
 
 
 @always_inline
@@ -120,8 +119,8 @@ def layout_copy[
     width: Int,
     backward: Bool,
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dst_ptr: MutKernelPtr[dtype],
+    src_ptr: ImmutKernelPtr[dtype],
     dst_flat_index: Int,
     src_flat_index: Int,
 ) -> None:
@@ -141,8 +140,8 @@ def vectorize_layout_copy[
     width: Int,
     backward: Bool,
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dst_ptr: MutKernelPtr[dtype],
+    src_ptr: ImmutKernelPtr[dtype],
     dst_flat_at_head_dim_zero: Int,
     src_flat_at_head_dim_zero: Int,
     head_dim: Int,

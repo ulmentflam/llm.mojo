@@ -1,8 +1,9 @@
-from std.gpu.host import DeviceContext, HostBuffer
-from std.memory import alloc, UnsafePointer, memcpy, memset_zero
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.time import global_perf_counter_ns
 from std.gpu.host.info import is_cpu, is_gpu
+from std.gpu.host import DeviceContext, HostBuffer
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.sys import has_accelerator, has_apple_gpu_accelerator
+from std.memory import alloc, UnsafePointer, memcpy, memset_zero
 
 from llmm.io import read_and_copy
 from llmm.dataloader import DataLoader
@@ -21,7 +22,17 @@ from llmm.global_norm import global_norm_squared
 from llmm.adamw import adamw_update, AdamWConfig
 from llmm.fused_classifier import fused_classifier
 from llmm.scheduler import LearningRateScheduler
-from llmm.tokenizer import Tokenizer
+from llmm.sampler import random_f32, sample_softmax
+from llmm.tokenizer import Tokenizer, safe_print
+from llmm.memory import (
+    ImmutKernelPtr,
+    ImmutMemPtr,
+    MutMemPtr,
+    as_immut_kernel,
+    as_immut_kernel_from_mut,
+    as_mut_kernel,
+    rebind_mut_mem,
+)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -64,109 +75,65 @@ struct Parameters:
 struct ParameterTensors[
     dtype: DType = DType.float32,
 ]:
-    var params_memory: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+    var params_memory: MutMemPtr[Self.dtype]
 
     # Encoder
-    var wte: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (V, C)
-    var wpe: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (max(T), C)
+    var wte: MutMemPtr[Self.dtype]  # (V, C)
+    var wpe: MutMemPtr[Self.dtype]  # (max(T), C)
 
     # Layer Norm 1
-    var ln_1_gamma: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, C)
-    var ln_1_beta: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, C)
+    var ln_1_gamma: MutMemPtr[Self.dtype]  # (L, C)
+    var ln_1_beta: MutMemPtr[Self.dtype]  # (L, C)
 
     # Attention
-    var qkv_weight: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, 3*C, C)
-    var qkv_bias: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, 3*C)
-    var attn_proj_weight: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, C, C)
-    var attn_proj_bias: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, C)
+    var qkv_weight: MutMemPtr[Self.dtype]  # (L, 3*C, C)
+    var qkv_bias: MutMemPtr[Self.dtype]  # (L, 3*C)
+    var attn_proj_weight: MutMemPtr[Self.dtype]  # (L, C, C)
+    var attn_proj_bias: MutMemPtr[Self.dtype]  # (L, C)
 
     # Layer Norm 2
-    var ln_2_gamma: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, C)
-    var ln_2_beta: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, C)
+    var ln_2_gamma: MutMemPtr[Self.dtype]  # (L, C)
+    var ln_2_beta: MutMemPtr[Self.dtype]  # (L, C)
 
     # MLP
-    var fc_weight: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, 4*C, C)
-    var fc_bias: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, 4*C)
-    var proj_weight: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, C, 4*C)
-    var proj_bias: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, C)
+    var fc_weight: MutMemPtr[Self.dtype]  # (L, 4*C, C)
+    var fc_bias: MutMemPtr[Self.dtype]  # (L, 4*C)
+    var proj_weight: MutMemPtr[Self.dtype]  # (L, C, 4*C)
+    var proj_bias: MutMemPtr[Self.dtype]  # (L, C)
 
     # Layer Norm Final
-    var ln_f_gamma: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (C, )
-    var ln_f_beta: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (C, )
+    var ln_f_gamma: MutMemPtr[Self.dtype]  # (C, )
+    var ln_f_beta: MutMemPtr[Self.dtype]  # (C, )
 
     def __init__(out self):
         var zero = 0
-        self.params_memory = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
+        self.params_memory = MutMemPtr[Self.dtype](unsafe_from_address=zero)
 
-        self.wte = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.wpe = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_1_gamma = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_1_beta = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.qkv_weight = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.qkv_bias = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.attn_proj_weight = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.attn_proj_bias = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_2_gamma = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_2_beta = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.fc_weight = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.fc_bias = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.proj_weight = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.proj_bias = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_f_gamma = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_f_beta = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
+        self.wte = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.wpe = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_1_gamma = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_1_beta = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.qkv_weight = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.qkv_bias = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.attn_proj_weight = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.attn_proj_bias = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_2_gamma = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_2_beta = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.fc_weight = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.fc_bias = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.proj_weight = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.proj_bias = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_f_gamma = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_f_beta = MutMemPtr[Self.dtype](unsafe_from_address=zero)
 
     def point_parameters(
         mut self,
         param_sizes: List[Int],
-        params_memory: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
+        params_memory: MutMemPtr[Self.dtype],
     ) -> None:
         self.params_memory = params_memory
 
-        comptime ParamPtr = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+        comptime ParamPtr = MutMemPtr[Self.dtype]
         comptime ParamPtrPtr = UnsafePointer[ParamPtr, MutAnyOrigin]
 
         var ptrs = List[ParamPtrPtr]()
@@ -231,138 +198,78 @@ struct ActivationTensors[
     dtype: DType = DType.float32,
 ]:
     # Encoder
-    var encoded: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (B, T, C)
+    var encoded: MutMemPtr[Self.dtype]  # (B, T, C)
 
     # Layer Norm 1
-    var ln_1: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T, C)
-    var ln_1_mean: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T)
-    var ln_1_rstd: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T)
+    var ln_1: MutMemPtr[Self.dtype]  # (L, B, T, C)
+    var ln_1_mean: MutMemPtr[Self.dtype]  # (L, B, T)
+    var ln_1_rstd: MutMemPtr[Self.dtype]  # (L, B, T)
 
     # Attention
-    var qkv: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T, 3*C)
-    var lse: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, NH, T)
-    var attn: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T, C)
-    var attn_proj: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, B, T, C)
-    var residual_2: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, B, T, C)
+    var qkv: MutMemPtr[Self.dtype]  # (L, B, T, 3*C)
+    var lse: MutMemPtr[Self.dtype]  # (L, B, NH, T)
+    var attn: MutMemPtr[Self.dtype]  # (L, B, T, C)
+    var attn_proj: MutMemPtr[Self.dtype]  # (L, B, T, C)
+    var residual_2: MutMemPtr[Self.dtype]  # (L, B, T, C)
 
     # Layer Norm 2
-    var ln_2: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T, C)
-    var ln_2_mean: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T)
-    var ln_2_rstd: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T)
+    var ln_2: MutMemPtr[Self.dtype]  # (L, B, T, C)
+    var ln_2_mean: MutMemPtr[Self.dtype]  # (L, B, T)
+    var ln_2_rstd: MutMemPtr[Self.dtype]  # (L, B, T)
 
     # MLP
-    var fch: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T, 4*C)
-    var fch_gelu: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, B, T, 4*C)
-    var fc_proj: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, T, C)
-    var residual_3: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, B, T, C)
+    var fch: MutMemPtr[Self.dtype]  # (L, B, T, 4*C)
+    var fch_gelu: MutMemPtr[Self.dtype]  # (L, B, T, 4*C)
+    var fc_proj: MutMemPtr[Self.dtype]  # (L, B, T, C)
+    var residual_3: MutMemPtr[Self.dtype]  # (L, B, T, C)
 
     # Layer Norm Final
-    var ln_f: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (B, T, C)
-    var ln_f_mean: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (B, T)
-    var ln_f_rstd: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (B, T)
-    var logits: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (B, T, V)
-    var losses: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (B, T)
+    var ln_f: MutMemPtr[Self.dtype]  # (B, T, C)
+    var ln_f_mean: MutMemPtr[Self.dtype]  # (B, T)
+    var ln_f_rstd: MutMemPtr[Self.dtype]  # (B, T)
+    var logits: MutMemPtr[Self.dtype]  # (B, T, V)
+    var losses: MutMemPtr[Self.dtype]  # (B, T)
 
     # Scratch / Split-attention
-    var q: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, NH, T, HS)
-    var k: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, NH, T, HS)
-    var v: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]  # (L, B, NH, T, HS)
-    var attn_merged: UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin
-    ]  # (L, B, T, C)
+    var q: MutMemPtr[Self.dtype]  # (L, B, NH, T, HS)
+    var k: MutMemPtr[Self.dtype]  # (L, B, NH, T, HS)
+    var v: MutMemPtr[Self.dtype]  # (L, B, NH, T, HS)
+    var attn_merged: MutMemPtr[Self.dtype]  # (L, B, T, C)
 
     def __init__(out self):
         var zero = 0
-        self.encoded = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_1 = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_1_mean = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_1_rstd = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.qkv = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.lse = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.attn = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.attn_proj = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.residual_2 = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_2 = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_2_mean = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_2_rstd = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.fch = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.fch_gelu = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.fc_proj = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.residual_3 = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_f = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_f_mean = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.ln_f_rstd = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.logits = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.losses = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.q = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.k = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.v = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.attn_merged = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
+        self.encoded = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_1 = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_1_mean = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_1_rstd = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.qkv = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.lse = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.attn = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.attn_proj = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.residual_2 = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_2 = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_2_mean = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_2_rstd = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.fch = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.fch_gelu = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.fc_proj = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.residual_3 = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_f = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_f_mean = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.ln_f_rstd = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.logits = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.losses = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.q = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.k = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.v = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.attn_merged = MutMemPtr[Self.dtype](unsafe_from_address=zero)
 
     def point_activations(
         mut self,
         activation_sizes: List[Int],
-        activations_memory: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
+        activations_memory: MutMemPtr[Self.dtype],
     ) -> None:
-        comptime ActPtr = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+        comptime ActPtr = MutMemPtr[Self.dtype]
         comptime ActPtrPtr = UnsafePointer[ActPtr, MutAnyOrigin]
 
         var ptrs = List[ActPtrPtr]()
@@ -433,39 +340,39 @@ struct GPT2[target: StaticString]:
     # Model weights and their sizes
     var params: ParameterTensors[GPT2_DTYPE]
     var param_sizes: List[Int]
-    var params_memory: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+    var params_memory: MutMemPtr[GPT2_DTYPE]
     var num_parameters: Int
 
     # Gradients of the weights
     var grads: ParameterTensors[GPT2_DTYPE]
-    var grads_memory: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+    var grads_memory: MutMemPtr[GPT2_DTYPE]
 
     # Buffers for AdamW
-    var m_memory: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
-    var v_memory: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+    var m_memory: MutMemPtr[GPT2_DTYPE]
+    var v_memory: MutMemPtr[GPT2_DTYPE]
 
     # Activations of the model, and their sizes
     var acts: ActivationTensors[GPT2_DTYPE]
     var act_sizes: List[Int]
-    var acts_memory: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+    var acts_memory: MutMemPtr[GPT2_DTYPE]
     var num_activations: Int
 
     # Gradients of the activations
     var grad_acts: ActivationTensors[GPT2_DTYPE]
-    var grad_acts_memory: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+    var grad_acts_memory: MutMemPtr[GPT2_DTYPE]
     var num_grads: Int
 
     # Runstate Configurations
     var batch_size: Int  # The batch size of the current forward pass (Our B).
     var seq_len: Int  # The sequence length of the current forward pass (Our T).
-    var inputs: UnsafePointer[
-        Scalar[DType.int32], MutAnyOrigin
+    var inputs: MutMemPtr[
+        DType.int32
     ]  # The input tokens for the current forward pass.
-    var targets: UnsafePointer[
-        Scalar[DType.int32], MutAnyOrigin
+    var targets: MutMemPtr[
+        DType.int32
     ]  # The target tokens for the current forward pass.
-    var bucket_info: UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
-    var workload_indices: UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
+    var bucket_info: MutMemPtr[DType.int32]
+    var workload_indices: MutMemPtr[DType.int32]
     var num_wte_buckets: Int
     var wte_bucket_capacity: Int
     var mean_loss: Float32  # The mean loss for the current forward pass.
@@ -495,12 +402,8 @@ struct GPT2[target: StaticString]:
         )
 
         var zero = 0
-        var NULL_DTYPE_PTR = UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        var NULL_INT32_PTR = UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
+        var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
+        var NULL_INT32_PTR = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
         self.params_memory = NULL_DTYPE_PTR
         self.grads_memory = NULL_DTYPE_PTR
@@ -550,7 +453,7 @@ struct GPT2[target: StaticString]:
             self.act_sizes.append(0)
 
         var model_file = open(self.checkpoint_path, "r")
-        var model_header = alloc[Int32](256).as_unsafe_any_origin()
+        var model_header = alloc[Int32](256)
         read_and_copy[DType.int32](model_file, model_header, 256)
 
         if model_header.load(0) != GPT2_MAGIC:
@@ -575,9 +478,7 @@ struct GPT2[target: StaticString]:
         self.dummy_bias_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.config.padded_vocab_size
         )
-        var dummy_bias_ptr = (
-            self.dummy_bias_buf.unsafe_ptr().as_unsafe_any_origin()
-        )
+        var dummy_bias_ptr = self.dummy_bias_buf.unsafe_ptr()
         for i in range(self.config.padded_vocab_size):
             dummy_bias_ptr.store(i, 0.0)
 
@@ -592,25 +493,17 @@ struct GPT2[target: StaticString]:
 
         # Init Activations and activation gradients (allocated dynamically per batch).
         self.acts = ActivationTensors[GPT2_DTYPE]()
-        self.acts_memory = UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
+        self.acts_memory = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
         self.num_activations = 0
 
         self.grad_acts = ActivationTensors[GPT2_DTYPE]()
-        self.grad_acts_memory = UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
+        self.grad_acts_memory = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
 
         self.batch_size = 0
         self.seq_len = 0
         self.mean_loss = -1.0  # -1.0 designates no loss has been computed yet.
-        self.inputs = UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        self.targets = UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
+        self.inputs = MutMemPtr[DType.int32](unsafe_from_address=zero)
+        self.targets = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
         # Print out the model summary.
         print("Model Summary:")
@@ -671,7 +564,9 @@ struct GPT2[target: StaticString]:
         self.params_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )
-        self.params_memory = self.params_buf.unsafe_ptr().as_unsafe_any_origin()
+        self.params_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.params_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
         self.params.point_parameters(self.param_sizes, self.params_memory)
 
         read_and_copy[GPT2_DTYPE](
@@ -686,7 +581,9 @@ struct GPT2[target: StaticString]:
         self.grads_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )
-        self.grads_memory = self.grads_buf.unsafe_ptr().as_unsafe_any_origin()
+        self.grads_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.grads_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
         self.grads.point_parameters(self.param_sizes, self.grads_memory)
 
         for i in range(self.num_parameters):
@@ -701,8 +598,12 @@ struct GPT2[target: StaticString]:
         self.v_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )
-        self.m_memory = self.m_buf.unsafe_ptr().as_unsafe_any_origin()
-        self.v_memory = self.v_buf.unsafe_ptr().as_unsafe_any_origin()
+        self.m_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.m_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.v_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.v_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
 
         for i in range(self.num_parameters):
             self.m_memory.store(i, 0.0)  # Initialize m to 0.0
@@ -761,8 +662,10 @@ struct GPT2[target: StaticString]:
         self.grad_acts_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_activations
         )
-        self.acts_memory = self.acts_buf.unsafe_ptr().as_unsafe_any_origin()
-        self.grad_acts_memory = (
+        self.acts_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.acts_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.grad_acts_memory = rebind_mut_mem[GPT2_DTYPE](
             self.grad_acts_buf.unsafe_ptr().as_unsafe_any_origin()
         )
 
@@ -772,8 +675,12 @@ struct GPT2[target: StaticString]:
         self.targets_buf = self.ctx.enqueue_create_host_buffer[DType.int32](
             self.batch_size * self.seq_len
         )
-        self.inputs = self.inputs_buf.unsafe_ptr().as_unsafe_any_origin()
-        self.targets = self.targets_buf.unsafe_ptr().as_unsafe_any_origin()
+        self.inputs = rebind_mut_mem[DType.int32](
+            self.inputs_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.targets = rebind_mut_mem[DType.int32](
+            self.targets_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
 
         # Encoder backward scratch: one bucket per (token, channel_group).
         var wte_c_per_warp = 128
@@ -785,10 +692,10 @@ struct GPT2[target: StaticString]:
         self.workload_indices_buf = self.ctx.enqueue_create_host_buffer[
             DType.int32
         ](B * T)
-        self.bucket_info = (
+        self.bucket_info = rebind_mut_mem[DType.int32](
             self.bucket_info_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-        self.workload_indices = (
+        self.workload_indices = rebind_mut_mem[DType.int32](
             self.workload_indices_buf.unsafe_ptr().as_unsafe_any_origin()
         )
         self.num_wte_buckets = 0
@@ -797,13 +704,13 @@ struct GPT2[target: StaticString]:
         self.grad_acts.point_activations(self.act_sizes, self.grad_acts_memory)
         self.has_allocated_acts = True
 
-    def build_encoder_buckets(mut self) raises:
+    def build_encoder_buckets(mut self, batch_size: Int, seq_len: Int) raises:
         self.num_wte_buckets = build_wte_buckets(
-            UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin](self.inputs),
-            self.bucket_info,
-            self.workload_indices,
-            self.batch_size,
-            self.seq_len,
+            as_immut_kernel_from_mut[DType.int32](self.inputs),
+            as_mut_kernel[DType.int32](self.bucket_info),
+            as_mut_kernel[DType.int32](self.workload_indices),
+            batch_size,
+            seq_len,
             self.config.vocab_size,
             self.config.channels,
             self.wte_bucket_capacity,
@@ -811,18 +718,14 @@ struct GPT2[target: StaticString]:
 
     def forward(
         mut self,
-        inputs: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-        targets: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+        inputs: MutMemPtr[DType.int32],
+        targets: MutMemPtr[DType.int32],
         batch_size: Int,
         seq_len: Int,
     ) raises:
         var zero = 0
-        var NULL_DTYPE_PTR = UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
-        var NULL_INT32_PTR = UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
+        var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
+        var NULL_INT32_PTR = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
         if (
             not self.has_allocated_params
@@ -867,19 +770,19 @@ struct GPT2[target: StaticString]:
         if targets != NULL_INT32_PTR:
             memcpy(dest=self.targets, src=targets, count=batch_size * seq_len)
 
-        self.build_encoder_buckets()
+        self.build_encoder_buckets(batch_size, seq_len)
 
         #########################################################
         # Forward Pass
         #########################################################
 
-        var residual: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+        var residual: MutMemPtr[GPT2_DTYPE]
         # Forward the encoder.
         encoder_fwd[GPT2_DTYPE, Self.target](
-            self.acts.encoded,
-            self.inputs,
-            self.params.wte,
-            self.params.wpe,
+            as_mut_kernel[GPT2_DTYPE](self.acts.encoded),
+            as_immut_kernel_from_mut[DType.int32](self.inputs),
+            as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
+            as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wpe),
             batch_size,
             seq_len,
             channels,
@@ -966,13 +869,13 @@ struct GPT2[target: StaticString]:
             # 1. LayerNorm 1 / Residual Fused
             if layer == 0:
                 layernorm_fwd[GPT2_DTYPE, Self.target](
-                    l_ln_1,
-                    residual,
-                    l_ln_1_gamma,
-                    l_ln_1_beta,
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_mut_kernel[GPT2_DTYPE](residual),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_beta),
                     EPSILON,
-                    l_ln_1_mean,
-                    l_ln_1_rstd,
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1_mean),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1_rstd),
                     Int64(batch_size),
                     Int64(seq_len),
                     Int64(channels),
@@ -988,15 +891,15 @@ struct GPT2[target: StaticString]:
                     + (layer - 1) * batch_size * seq_len * channels
                 )
                 layernorm_fused_residual_fwd[GPT2_DTYPE, Self.target](
-                    residual,
-                    l_ln_1,
-                    prev_residual_2,
-                    prev_fc_proj,
-                    l_ln_1_gamma,
-                    l_ln_1_beta,
+                    as_mut_kernel[GPT2_DTYPE](residual),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_mut_kernel[GPT2_DTYPE](prev_residual_2),
+                    as_mut_kernel[GPT2_DTYPE](prev_fc_proj),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_beta),
                     EPSILON,
-                    l_ln_1_mean,
-                    l_ln_1_rstd,
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1_mean),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1_rstd),
                     Int64(batch_size),
                     Int64(seq_len),
                     Int64(channels),
@@ -1005,11 +908,11 @@ struct GPT2[target: StaticString]:
 
             # Matmul QKV.
             matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                l_qkv,
-                NULL_DTYPE_PTR,
-                l_ln_1,
-                l_qkv_weight,
-                l_qkv_bias,
+                as_mut_kernel[GPT2_DTYPE](l_qkv),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_bias),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -1020,13 +923,13 @@ struct GPT2[target: StaticString]:
             # Attention Forward (handles QKV Split/Transpose and Merge Heads internally).
             var head_dim = channels // num_heads
             attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
-                l_qkv,
-                l_q,
-                l_k,
-                l_v,
-                l_attn,
-                l_attn_merged,
-                l_lse,
+                as_mut_kernel[GPT2_DTYPE](l_qkv),
+                as_mut_kernel[GPT2_DTYPE](l_q),
+                as_mut_kernel[GPT2_DTYPE](l_k),
+                as_mut_kernel[GPT2_DTYPE](l_v),
+                as_mut_kernel[GPT2_DTYPE](l_attn),
+                as_mut_kernel[GPT2_DTYPE](l_attn_merged),
+                as_mut_kernel[GPT2_DTYPE](l_lse),
                 Int64(batch_size),
                 Int64(num_heads),
                 Int64(seq_len),
@@ -1036,11 +939,11 @@ struct GPT2[target: StaticString]:
 
             # Matmul Attn Proj
             matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                l_attn_proj,
-                NULL_DTYPE_PTR,
-                l_attn_merged,
-                l_attn_proj_weight,
-                l_attn_proj_bias,
+                as_mut_kernel[GPT2_DTYPE](l_attn_proj),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](l_attn_merged),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_bias),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -1050,15 +953,15 @@ struct GPT2[target: StaticString]:
 
             # LayerNorm 2 & Residual.
             layernorm_fused_residual_fwd[GPT2_DTYPE, Self.target](
-                l_residual_2,
-                l_ln_2,
-                residual,
-                l_attn_proj,
-                l_ln_2_gamma,
-                l_ln_2_beta,
+                as_mut_kernel[GPT2_DTYPE](l_residual_2),
+                as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                as_mut_kernel[GPT2_DTYPE](residual),
+                as_mut_kernel[GPT2_DTYPE](l_attn_proj),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_2_gamma),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_2_beta),
                 EPSILON,
-                l_ln_2_mean,
-                l_ln_2_rstd,
+                as_mut_kernel[GPT2_DTYPE](l_ln_2_mean),
+                as_mut_kernel[GPT2_DTYPE](l_ln_2_rstd),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -1067,11 +970,11 @@ struct GPT2[target: StaticString]:
 
             # Matmul FC (fused GELU).
             matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=True](
-                l_fch_gelu,
-                l_fch,
-                l_ln_2,
-                l_fc_weight,
-                l_fc_bias,
+                as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                as_mut_kernel[GPT2_DTYPE](l_fch),
+                as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -1081,11 +984,11 @@ struct GPT2[target: StaticString]:
 
             # Matmul Proj.
             matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                l_fc_proj,
-                NULL_DTYPE_PTR,
-                l_fch_gelu,
-                l_proj_weight,
-                l_proj_bias,
+                as_mut_kernel[GPT2_DTYPE](l_fc_proj),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(4 * channels),
@@ -1107,15 +1010,15 @@ struct GPT2[target: StaticString]:
             + (num_layers - 1) * batch_size * seq_len * channels
         )
         layernorm_fused_residual_fwd[GPT2_DTYPE, Self.target](
-            last_residual_3,
-            self.acts.ln_f,
-            last_residual_2,
-            last_fc_proj,
-            self.params.ln_f_gamma,
-            self.params.ln_f_beta,
+            as_mut_kernel[GPT2_DTYPE](last_residual_3),
+            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
+            as_mut_kernel[GPT2_DTYPE](last_residual_2),
+            as_mut_kernel[GPT2_DTYPE](last_fc_proj),
+            as_immut_kernel_from_mut[GPT2_DTYPE](self.params.ln_f_gamma),
+            as_immut_kernel_from_mut[GPT2_DTYPE](self.params.ln_f_beta),
             EPSILON,
-            self.acts.ln_f_mean,
-            self.acts.ln_f_rstd,
+            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f_mean),
+            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f_rstd),
             Int64(batch_size),
             Int64(seq_len),
             Int64(channels),
@@ -1124,11 +1027,13 @@ struct GPT2[target: StaticString]:
 
         # Output Logits
         matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
-            self.acts.logits,
-            NULL_DTYPE_PTR,
-            self.acts.ln_f,
-            self.params.wte,
-            self.dummy_bias_buf.unsafe_ptr().as_unsafe_any_origin(),
+            as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+            as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
+            as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
+            rebind[ImmutKernelPtr[GPT2_DTYPE]](
+                self.dummy_bias_buf.unsafe_ptr().as_unsafe_any_origin()
+            ),
             Int64(batch_size),
             Int64(seq_len),
             Int64(channels),
@@ -1140,12 +1045,12 @@ struct GPT2[target: StaticString]:
         # Fused classifier (cross entropy loss).
         if targets != NULL_INT32_PTR:
             fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=False](
-                self.acts.logits,
-                self.acts.losses,
-                UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin](
-                    unsafe_from_address=zero
+                as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+                as_mut_kernel[GPT2_DTYPE](self.acts.losses),
+                as_immut_kernel[DType.float32](
+                    ImmutMemPtr[DType.float32](unsafe_from_address=zero)
                 ),
-                self.targets,
+                as_immut_kernel_from_mut[DType.int32](self.targets),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(vocab_size),
@@ -1178,9 +1083,7 @@ struct GPT2[target: StaticString]:
         self.zero_gradients()
 
         var zero = 0
-        var NULL_DTYPE_PTR = UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin](
-            unsafe_from_address=zero
-        )
+        var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
 
         var batch_size = self.batch_size
         var seq_len = self.seq_len
@@ -1207,12 +1110,10 @@ struct GPT2[target: StaticString]:
 
         # Fused classifier backward writes d_logits in-place into acts.logits.
         fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=True](
-            self.acts.logits,
-            self.acts.losses,
-            UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin](
-                self.grad_acts.losses
-            ),
-            self.targets,
+            as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+            as_mut_kernel[GPT2_DTYPE](self.acts.losses),
+            as_immut_kernel_from_mut[DType.float32](self.grad_acts.losses),
+            as_immut_kernel_from_mut[DType.int32](self.targets),
             Int64(batch_size),
             Int64(seq_len),
             Int64(vocab_size),
@@ -1222,14 +1123,14 @@ struct GPT2[target: StaticString]:
 
         # LM head matmul backward.
         matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-            self.grad_acts.ln_f,
-            self.grads.wte,
-            NULL_DTYPE_PTR,
-            self.acts.logits,
-            self.acts.ln_f,
-            self.params.wte,
-            NULL_DTYPE_PTR,
-            self.grad_acts.logits,
+            as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
+            as_mut_kernel[GPT2_DTYPE](self.grads.wte),
+            as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+            as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
+            as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
+            as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+            as_mut_kernel[GPT2_DTYPE](self.grad_acts.logits),
             Int64(batch_size),
             Int64(seq_len),
             Int64(channels),
@@ -1248,16 +1149,18 @@ struct GPT2[target: StaticString]:
         var d_last_fc_proj = self.grad_acts.fc_proj + last_layer * layer_stride
 
         layernorm_fused_residual_bwd[GPT2_DTYPE, Self.target](
-            d_last_residual_2,
-            d_last_fc_proj,
-            self.grad_acts.ln_f,
-            last_residual_3,
-            self.params.ln_f_gamma,
-            self.acts.ln_f_mean,
-            self.acts.ln_f_rstd,
-            self.grads.ln_f_gamma,
-            self.grads.ln_f_beta,
-            self.grad_acts.residual_3 + last_layer * layer_stride,
+            as_mut_kernel[GPT2_DTYPE](d_last_residual_2),
+            as_mut_kernel[GPT2_DTYPE](d_last_fc_proj),
+            as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
+            as_mut_kernel[GPT2_DTYPE](last_residual_3),
+            as_immut_kernel_from_mut[GPT2_DTYPE](self.params.ln_f_gamma),
+            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f_mean),
+            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f_rstd),
+            as_mut_kernel[GPT2_DTYPE](self.grads.ln_f_gamma),
+            as_mut_kernel[GPT2_DTYPE](self.grads.ln_f_beta),
+            as_mut_kernel[GPT2_DTYPE](
+                self.grad_acts.residual_3 + last_layer * layer_stride
+            ),
             Int64(batch_size),
             Int64(seq_len),
             Int64(channels),
@@ -1350,7 +1253,7 @@ struct GPT2[target: StaticString]:
             )
             var d_l_fc_proj = self.grad_acts.fc_proj + layer_offset
 
-            var d_block_input: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+            var d_block_input: MutMemPtr[GPT2_DTYPE]
             if layer == 0:
                 d_block_input = self.grad_acts.encoded
             else:
@@ -1360,14 +1263,14 @@ struct GPT2[target: StaticString]:
 
             # MLP projection backward.
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                d_l_fch_gelu,
-                d_l_proj_weight,
-                d_l_proj_bias,
-                d_l_fc_proj,
-                l_fch_gelu,
-                l_proj_weight,
-                NULL_DTYPE_PTR,
-                d_l_attn,
+                as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
+                as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
+                as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
+                as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](d_l_attn),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(4 * channels),
@@ -1377,14 +1280,14 @@ struct GPT2[target: StaticString]:
 
             # MLP FC backward (fused GELU).
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
-                d_l_ln_2,
-                d_l_fc_weight,
-                d_l_fc_bias,
-                d_l_fch_gelu,
-                l_ln_2,
-                l_fc_weight,
-                l_fch,
-                d_l_fch,
+                as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
+                as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
+                as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
+                as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                as_mut_kernel[GPT2_DTYPE](l_fch),
+                as_mut_kernel[GPT2_DTYPE](d_l_fch),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -1394,16 +1297,18 @@ struct GPT2[target: StaticString]:
 
             # LayerNorm 2 fused residual backward.
             layernorm_fused_residual_bwd[GPT2_DTYPE, Self.target](
-                d_block_input,
-                d_l_attn_proj,
-                d_l_ln_2,
-                l_residual_2,
-                l_ln_2_gamma,
-                l_ln_2_mean,
-                l_ln_2_rstd,
-                d_l_ln_2_gamma,
-                d_l_ln_2_beta,
-                self.grad_acts.residual_2 + layer_offset,
+                as_mut_kernel[GPT2_DTYPE](d_block_input),
+                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
+                as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
+                as_mut_kernel[GPT2_DTYPE](l_residual_2),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_2_gamma),
+                as_mut_kernel[GPT2_DTYPE](l_ln_2_mean),
+                as_mut_kernel[GPT2_DTYPE](l_ln_2_rstd),
+                as_mut_kernel[GPT2_DTYPE](d_l_ln_2_gamma),
+                as_mut_kernel[GPT2_DTYPE](d_l_ln_2_beta),
+                as_mut_kernel[GPT2_DTYPE](
+                    self.grad_acts.residual_2 + layer_offset
+                ),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -1412,14 +1317,14 @@ struct GPT2[target: StaticString]:
 
             # Attention projection backward.
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                d_l_attn_merged,
-                d_l_attn_proj_weight,
-                d_l_attn_proj_bias,
-                d_l_attn_proj,
-                l_attn_merged,
-                l_attn_proj_weight,
-                NULL_DTYPE_PTR,
-                d_l_qkv,
+                as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
+                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
+                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_bias),
+                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
+                as_mut_kernel[GPT2_DTYPE](l_attn_merged),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](d_l_qkv),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -1429,17 +1334,17 @@ struct GPT2[target: StaticString]:
 
             # Attention backward.
             attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
-                d_l_qkv,
-                d_l_q,
-                d_l_k,
-                d_l_v,
-                d_l_attn,
-                d_l_attn_merged,
-                l_q,
-                l_k,
-                l_v,
-                l_attn,
-                l_lse,
+                as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                as_mut_kernel[GPT2_DTYPE](d_l_q),
+                as_mut_kernel[GPT2_DTYPE](d_l_k),
+                as_mut_kernel[GPT2_DTYPE](d_l_v),
+                as_mut_kernel[GPT2_DTYPE](d_l_attn),
+                as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
+                as_mut_kernel[GPT2_DTYPE](l_q),
+                as_mut_kernel[GPT2_DTYPE](l_k),
+                as_mut_kernel[GPT2_DTYPE](l_v),
+                as_mut_kernel[GPT2_DTYPE](l_attn),
+                as_mut_kernel[GPT2_DTYPE](l_lse),
                 Int64(batch_size),
                 Int64(num_heads),
                 Int64(seq_len),
@@ -1449,14 +1354,14 @@ struct GPT2[target: StaticString]:
 
             # QKV matmul backward.
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                d_l_ln_1,
-                d_l_qkv_weight,
-                d_l_qkv_bias,
-                d_l_qkv,
-                l_ln_1,
-                l_qkv_weight,
-                NULL_DTYPE_PTR,
-                d_l_fch_gelu,
+                as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
+                as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
+                as_mut_kernel[GPT2_DTYPE](d_l_qkv_bias),
+                as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -1467,14 +1372,14 @@ struct GPT2[target: StaticString]:
             # LayerNorm 1 backward.
             if layer == 0:
                 layernorm_bwd[GPT2_DTYPE, Self.target](
-                    d_l_ln_1,
-                    l_ln_1,
-                    l_ln_1_gamma,
-                    l_ln_1_mean,
-                    l_ln_1_rstd,
-                    d_block_input,
-                    d_l_ln_1_gamma,
-                    d_l_ln_1_beta,
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1_mean),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1_rstd),
+                    as_mut_kernel[GPT2_DTYPE](d_block_input),
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1_gamma),
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1_beta),
                     Int64(batch_size),
                     Int64(seq_len),
                     Int64(channels),
@@ -1483,16 +1388,24 @@ struct GPT2[target: StaticString]:
             else:
                 var prev_layer_offset = (layer - 1) * layer_stride
                 layernorm_fused_residual_bwd[GPT2_DTYPE, Self.target](
-                    self.grad_acts.residual_2 + prev_layer_offset,
-                    self.grad_acts.fc_proj + prev_layer_offset,
-                    d_l_ln_1,
-                    self.acts.residual_3 + prev_layer_offset,
-                    l_ln_1_gamma,
-                    l_ln_1_mean,
-                    l_ln_1_rstd,
-                    d_l_ln_1_gamma,
-                    d_l_ln_1_beta,
-                    self.grad_acts.residual_3 + prev_layer_offset,
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.grad_acts.residual_2 + prev_layer_offset
+                    ),
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.grad_acts.fc_proj + prev_layer_offset
+                    ),
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.acts.residual_3 + prev_layer_offset
+                    ),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1_mean),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1_rstd),
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1_gamma),
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1_beta),
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.grad_acts.residual_3 + prev_layer_offset
+                    ),
                     Int64(batch_size),
                     Int64(seq_len),
                     Int64(channels),
@@ -1501,17 +1414,11 @@ struct GPT2[target: StaticString]:
 
         # Encoder backward: scatter token grads into wte, sum position grads into wpe.
         encoder_bwd[GPT2_DTYPE, Self.target](
-            self.grads.wte,
-            self.grads.wpe,
-            UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin](
-                self.bucket_info
-            ),
-            UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin](
-                self.workload_indices
-            ),
-            UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin](
-                self.grad_acts.encoded
-            ),
+            as_mut_kernel[GPT2_DTYPE](self.grads.wte),
+            as_mut_kernel[GPT2_DTYPE](self.grads.wpe),
+            as_immut_kernel_from_mut[DType.int32](self.bucket_info),
+            as_immut_kernel_from_mut[DType.int32](self.workload_indices),
+            as_immut_kernel_from_mut[GPT2_DTYPE](self.grad_acts.encoded),
             self.num_wte_buckets,
             batch_size,
             seq_len,
@@ -1539,10 +1446,10 @@ struct GPT2[target: StaticString]:
         )
         adamw_update[GPT2_DTYPE, Self.target](
             self.num_parameters,
-            self.params_memory,
-            self.grads_memory,
-            self.m_memory,
-            self.v_memory,
+            as_mut_kernel[GPT2_DTYPE](self.params_memory),
+            as_mut_kernel[GPT2_DTYPE](self.grads_memory),
+            as_mut_kernel[GPT2_DTYPE](self.m_memory),
+            as_mut_kernel[GPT2_DTYPE](self.v_memory),
             t,
             config,
             self.ctx,
@@ -1555,7 +1462,11 @@ struct GPT2[target: StaticString]:
 
 
 def train[target: StaticString]() raises:
-    var ctx = DeviceContext()
+    var ctx: DeviceContext
+    comptime if is_cpu[target]():
+        ctx = DeviceContext(api="cpu")
+    else:
+        ctx = DeviceContext()
 
     # Build the GPT-2 model from my checkpoint.
     var model = GPT2[target]("gpt2_124M.bin", ctx)
@@ -1594,8 +1505,8 @@ def train[target: StaticString]() raises:
 
     # Build the learning rate scheduler.
     var num_iters = 1000
-    var scheduler = LearningRateScheduler(
-        "cosine",
+    var learning_rate_scheduler = LearningRateScheduler(
+        "constant",
         learning_rate=Scalar[DType.float32](1e-4),
         warmup_steps=100,
         train_num_batches=num_iters,
@@ -1603,12 +1514,11 @@ def train[target: StaticString]() raises:
     )
 
     # Initialize some memory for generating samples from the model.
-    var rng_state = 1337
+    var rng_state = UInt64(1337)
     var gen_max_length = 64
-    var gen_tokens_buffer = alloc[Scalar[DType.int32]](
-        gen_max_length
-    ).as_unsafe_any_origin()
-    var gen_tokens = gen_tokens_buffer
+    var gen_tokens = alloc[Scalar[DType.int32]](gen_max_length)
+    var zero = 0
+    var null_int32_ptr = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
     #####################################################################################
     # Training Loop
@@ -1616,6 +1526,7 @@ def train[target: StaticString]() raises:
 
     var val_loss_every = 10
     var val_max_steps = 10
+    var grad_accum_steps = 10
     var sample_every = 10
 
     var elapsed_time_ms_total = 0.0
@@ -1634,12 +1545,57 @@ def train[target: StaticString]() raises:
             val_loss /= Float32(val_max_steps)
             print("Validation loss: " + String(val_loss))
 
-        # TODO: sample from model using tokenizer when step % sample_every == 0.
+        if sample_every > 0 and step > 0 and step % sample_every == 0:
+            gen_tokens[0] = Scalar[DType.int32](
+                tokenizer.eot_token
+            )  # The GPT-2 EOT token begins generation.
+
+            print("Generating:\n---")
+            for t in range(1, gen_max_length):
+                # NOTE: Inference is wasteful here because for each t we recompute all activations between 0 and t.
+                # In a real inference setting we would use a separate code for this anyway.
+                # Inference is here only for sanity checking.
+                model.forward(gen_tokens, null_int32_ptr, 1, t)
+                var logits = rebind[ImmutMemPtr[DType.float32]](
+                    (
+                        model.acts.logits
+                        + (t - 1) * model.config.padded_vocab_size
+                    ).as_unsafe_any_origin()
+                )
+                var coin = random_f32(rng_state)
+                var next_token = sample_softmax(
+                    logits, model.config.vocab_size, coin
+                )
+                gen_tokens[t] = Scalar[DType.int32](next_token)
+                var token_str = tokenizer.decode(next_token)
+                safe_print(token_str)
+            print("\n---")
 
         if step == num_iters:
             break
 
-        # TODO: training step (next_batch, forward, backward, grad clip, update).
+        var start_time = global_perf_counter_ns()
+        train_loader.next_batch()
+        model.forward(
+            train_loader.inputs, train_loader.targets, BATCH_SIZE, SEQ_LEN
+        )
+        model.backward()
+        model.update(
+            UInt32(step), learning_rate_scheduler.get_learning_rate(step)
+        )
+        var elapsed_time = Float64(global_perf_counter_ns() - start_time) / 1e9
+        elapsed_time_ms_total += elapsed_time
+        print(
+            "step "
+            + String(step)
+            + ": train loss "
+            + String(model.mean_loss)
+            + " | elapsed time "
+            + String(elapsed_time)
+            + " ms, average time "
+            + String(elapsed_time_ms_total / Float64(step + 1))
+            + " ms"
+        )
 
     train_loader.close()
     val_loader.close()

@@ -1,10 +1,10 @@
 import compiler
 from std.sys import simd_width_of
+from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from extensibility import InputTensor
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
@@ -15,6 +15,7 @@ from llmm.head_layout import (
     token_layout_plane0_flat_at_head_dim_zero,
     token_layout_plane0_flat_from_head_layout_flat,
 )
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 # ===----------------------------------------------------------------------=== #
 # Constants
@@ -36,15 +37,15 @@ def _split_planes[
     num_splits: Int,
     backward: Bool,
 ](
-    qkv_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    plane0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst0: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst1: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst2: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst3: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    qkv_ptr: MutKernelPtr[dtype],
+    plane0: ImmutKernelPtr[dtype],
+    plane1: ImmutKernelPtr[dtype],
+    plane2: ImmutKernelPtr[dtype],
+    plane3: ImmutKernelPtr[dtype],
+    dst0: MutKernelPtr[dtype],
+    dst1: MutKernelPtr[dtype],
+    dst2: MutKernelPtr[dtype],
+    dst3: MutKernelPtr[dtype],
     token_layout_src_flat_index: Int,
     head_layout_dst_flat_index: Int,
     channels: Int,
@@ -67,9 +68,7 @@ def _split_planes[
                 (plane3 + head_layout_dst_flat_index).load[width=width]()
             )
     else:
-        var src_immut = rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
-            qkv_ptr
-        )
+        var src_immut = rebind[ImmutKernelPtr[dtype]](qkv_ptr)
         if num_splits >= 1 and Int(dst0) != 0:
             (dst0 + head_layout_dst_flat_index).store(
                 (src_immut + token_layout_src_flat_index).load[width=width]()
@@ -101,15 +100,15 @@ def _split_cpu_tile[
     num_splits: Int,
     backward: Bool,
 ](
-    qkv_mut_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    plane0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst0: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst1: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst2: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst3: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    qkv_mut_ptr: MutKernelPtr[dtype],
+    plane0: ImmutKernelPtr[dtype],
+    plane1: ImmutKernelPtr[dtype],
+    plane2: ImmutKernelPtr[dtype],
+    plane3: ImmutKernelPtr[dtype],
+    dst0: MutKernelPtr[dtype],
+    dst1: MutKernelPtr[dtype],
+    dst2: MutKernelPtr[dtype],
+    dst3: MutKernelPtr[dtype],
     token_layout_src_flat_at_head_dim_zero: Int,
     head_layout_dst_flat_at_head_dim_zero: Int,
     channels: Int,
@@ -157,15 +156,15 @@ def _split_cpu[
     num_splits: Int,
     backward: Bool,
 ](
-    qkv_mut_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    plane0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst0: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst1: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst2: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst3: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    qkv_mut_ptr: MutKernelPtr[dtype],
+    plane0: ImmutKernelPtr[dtype],
+    plane1: ImmutKernelPtr[dtype],
+    plane2: ImmutKernelPtr[dtype],
+    plane3: ImmutKernelPtr[dtype],
+    dst0: MutKernelPtr[dtype],
+    dst1: MutKernelPtr[dtype],
+    dst2: MutKernelPtr[dtype],
+    dst3: MutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -217,11 +216,11 @@ def split_fwd_cpu[
     width: Int,
     num_splits: Int,
 ](
-    src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst0: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst1: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst2: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst3: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: MutKernelPtr[dtype],
+    dst0: MutKernelPtr[dtype],
+    dst1: MutKernelPtr[dtype],
+    dst2: MutKernelPtr[dtype],
+    dst3: MutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -251,15 +250,15 @@ def split_gpu[
     BLOCK_SIZE: Int,
     backward: Bool,
 ](
-    qkv_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    plane0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    plane3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst0: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst1: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst2: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst3: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    qkv_ptr: MutKernelPtr[dtype],
+    plane0: ImmutKernelPtr[dtype],
+    plane1: ImmutKernelPtr[dtype],
+    plane2: ImmutKernelPtr[dtype],
+    plane3: ImmutKernelPtr[dtype],
+    dst0: MutKernelPtr[dtype],
+    dst1: MutKernelPtr[dtype],
+    dst2: MutKernelPtr[dtype],
+    dst3: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     num_heads: Int64,
@@ -300,11 +299,11 @@ def split_fwd_gpu[
     num_splits: Int,
     BLOCK_SIZE: Int,
 ](
-    src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst0: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst1: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst2: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst3: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: MutKernelPtr[dtype],
+    dst0: MutKernelPtr[dtype],
+    dst1: MutKernelPtr[dtype],
+    dst2: MutKernelPtr[dtype],
+    dst3: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     num_heads: Int64,
@@ -335,11 +334,11 @@ def split_bwd_gpu[
     num_splits: Int,
     BLOCK_SIZE: Int,
 ](
-    d_src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_dst0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_dst1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_dst2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_dst3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_src_ptr: MutKernelPtr[dtype],
+    d_dst0: ImmutKernelPtr[dtype],
+    d_dst1: ImmutKernelPtr[dtype],
+    d_dst2: ImmutKernelPtr[dtype],
+    d_dst3: ImmutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     num_heads: Int64,
@@ -370,8 +369,8 @@ def split_fwd[
     target: StaticString,
     num_splits: Int,
 ](
-    src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst_ptrs: List[UnsafePointer[Scalar[dtype], MutAnyOrigin]],
+    src_ptr: MutKernelPtr[dtype],
+    dst_ptrs: List[MutKernelPtr[dtype]],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -448,7 +447,7 @@ struct SplitFwd:
         head_dim: Int64,
         ctx: DeviceContext,
     ) capturing raises:
-        var dst_ptrs = List[UnsafePointer[Scalar[dtype], MutAnyOrigin]]()
+        var dst_ptrs = List[MutKernelPtr[dtype]]()
         dst_ptrs.append(dst0.unsafe_ptr())
         dst_ptrs.append(dst1.unsafe_ptr())
         dst_ptrs.append(dst2.unsafe_ptr())
@@ -473,11 +472,11 @@ def split_bwd_cpu[
     width: Int,
     num_splits: Int,
 ](
-    d_src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_dst0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_dst1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_dst2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_dst3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_src_ptr: MutKernelPtr[dtype],
+    d_dst0: ImmutKernelPtr[dtype],
+    d_dst1: ImmutKernelPtr[dtype],
+    d_dst2: ImmutKernelPtr[dtype],
+    d_dst3: ImmutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -506,8 +505,8 @@ def split_bwd[
     target: StaticString,
     num_splits: Int,
 ](
-    d_src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_dst_ptrs: List[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]],
+    d_src_ptr: MutKernelPtr[dtype],
+    d_dst_ptrs: List[ImmutKernelPtr[dtype]],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -584,7 +583,7 @@ struct SplitBwd:
         head_dim: Int64,
         ctx: DeviceContext,
     ) capturing raises:
-        var d_dst_ptrs = List[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]]()
+        var d_dst_ptrs = List[ImmutKernelPtr[dtype]]()
         d_dst_ptrs.append(d_dst0.unsafe_ptr())
         d_dst_ptrs.append(d_dst1.unsafe_ptr())
         d_dst_ptrs.append(d_dst2.unsafe_ptr())

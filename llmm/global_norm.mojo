@@ -1,6 +1,6 @@
 import compiler
+from std.memory import alloc
 from std.sys import simd_width_of
-from std.memory import alloc, UnsafePointer
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext, DeviceAttribute
 from std.math import sqrt, ceildiv, max, fma
@@ -12,6 +12,7 @@ from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.primitives import block
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
@@ -29,13 +30,13 @@ comptime UNROLL = 4
 @always_inline
 def _zero_gpu(
     idx: Int,
-    ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    ptr: MutKernelPtr[DType.float32],
 ) -> None:
     (ptr + idx).store(0.0)
 
 
 def zero_gpu(
-    ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    ptr: MutKernelPtr[DType.float32],
     size: Int,
 ) -> None:
     # NOTE: This may be worth using in the future, also it could be an op in a mojo built-in library or even in tensor.
@@ -53,8 +54,8 @@ def global_norm_squared_cpu[
     dtype: DType,
     width: Int,
 ](
-    out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    data_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[DType.float32],
+    data_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
 ) -> None:
     var num_workers = min(num_params, parallelism_level())
@@ -104,10 +105,12 @@ def _global_norm_squared_for_range_gpu[
     BLOCK_SIZE: Int,
     width: Int,
 ](
-    data_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    data_ptr: ImmutKernelPtr[dtype],
     count: Int,
     tid: Int,
-) -> Scalar[DType.float32]:
+) -> Scalar[
+    DType.float32
+]:
     var index = (block_idx.x * block_dim.x + thread_idx.x) * width
     var grid_width = block_dim.x * grid_dim.x * width
 
@@ -136,8 +139,8 @@ def global_norm_squared_gpu[
     BLOCK_SIZE: Int,
     width: Int,
 ](
-    out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    data_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[DType.float32],
+    data_ptr: ImmutKernelPtr[dtype],
     count: Int,
     stride: Int,
 ) -> None:
@@ -152,10 +155,7 @@ def global_norm_squared_gpu[
 
 def global_norm_aggregate_gpu[
     BLOCK_SIZE: Int,
-](
-    out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grid_size: Int,
-) -> None:
+](out_ptr: MutKernelPtr[DType.float32], grid_size: Int,) -> None:
     var tid = Int(thread_idx.x)
     var block_sum = Scalar[DType.float32](0.0)
     var idx = tid

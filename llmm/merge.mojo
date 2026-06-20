@@ -1,10 +1,10 @@
 import compiler
 from std.sys import simd_width_of
+from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from std.algorithm import sync_parallelize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from extensibility import InputTensor
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
@@ -15,6 +15,7 @@ from llmm.head_layout import (
     token_layout_plane0_flat_from_head_layout_flat,
     vectorize_layout_copy,
 )
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -28,8 +29,8 @@ def _merge_cpu_tile[
     width: Int,
     backward: Bool,
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dst_ptr: MutKernelPtr[dtype],
+    src_ptr: ImmutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -63,8 +64,8 @@ def _merge_cpu[
     width: Int,
     backward: Bool,
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dst_ptr: MutKernelPtr[dtype],
+    src_ptr: ImmutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -96,8 +97,8 @@ def merge_fwd_cpu[
     dtype: DType,
     width: Int,
 ](
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: ImmutKernelPtr[dtype],
+    dst_ptr: MutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -113,8 +114,8 @@ def merge_gpu[
     BLOCK_SIZE: Int,
     backward: Bool,
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dst_ptr: MutKernelPtr[dtype],
+    src_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     num_heads: Int64,
@@ -146,8 +147,8 @@ def merge_fwd_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
 ](
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: ImmutKernelPtr[dtype],
+    dst_ptr: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     num_heads: Int64,
@@ -169,8 +170,8 @@ def merge_bwd_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
 ](
-    d_dst_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_dst_ptr: ImmutKernelPtr[dtype],
+    d_src_ptr: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     num_heads: Int64,
@@ -192,8 +193,8 @@ def merge_fwd[
     dtype: DType,
     target: StaticString,
 ](
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: ImmutKernelPtr[dtype],
+    dst_ptr: MutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -268,8 +269,8 @@ def merge_bwd_cpu[
     dtype: DType,
     width: Int,
 ](
-    d_dst_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_dst_ptr: ImmutKernelPtr[dtype],
+    d_src_ptr: MutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,
@@ -284,8 +285,8 @@ def merge_bwd[
     dtype: DType,
     target: StaticString,
 ](
-    d_dst_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    d_dst_ptr: ImmutKernelPtr[dtype],
+    d_src_ptr: MutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     num_heads: Int,

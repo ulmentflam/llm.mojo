@@ -1,6 +1,5 @@
 import compiler
 from std.sys import simd_width_of
-from std.memory import UnsafePointer
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.math import ceildiv, exp, log
@@ -14,6 +13,7 @@ from std.algorithm import vectorize, sync_parallelize
 from std.gpu import barrier, block_idx, grid_dim, thread_idx
 
 from llmm.softmax import softmax_phase_1_and_2_cpu, softmax_phase_1_and_2_gpu
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
@@ -32,10 +32,10 @@ def _fused_classifier_cpu[
     dtype: DType, width: Int, write_d_logits: Bool = True
 ](
     idx: Int,
-    logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    logits_ptr: MutKernelPtr[dtype],
+    losses_ptr: MutKernelPtr[DType.float32],
+    d_losses_ptr: ImmutKernelPtr[DType.float32],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     vocab_size: Int,  # Our V
     vocab_size_padded: Int,  # Our Vp, padding is garbage
 ) -> None:
@@ -90,10 +90,10 @@ def fused_classifier_cpu[
     width: Int,
     write_d_logits: Bool = True,
 ](
-    logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    logits_ptr: MutKernelPtr[dtype],
+    losses_ptr: MutKernelPtr[DType.float32],
+    d_losses_ptr: ImmutKernelPtr[DType.float32],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
@@ -133,10 +133,10 @@ def _fused_classifier_gpu[
     tid: Int,
     stride: Int,
     block_row: Int,
-    logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    logits_ptr: MutKernelPtr[dtype],
+    losses_ptr: MutKernelPtr[DType.float32],
+    d_losses_ptr: ImmutKernelPtr[DType.float32],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     vocab_size: Int,
     vocab_size_padded: Int,
 ) -> None:
@@ -214,10 +214,10 @@ def fused_classifier_gpu[
     width: Int = 4,
     write_d_logits: Bool = True,
 ](
-    logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    logits_ptr: MutKernelPtr[dtype],
+    losses_ptr: MutKernelPtr[DType.float32],
+    d_losses_ptr: ImmutKernelPtr[DType.float32],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
@@ -242,10 +242,10 @@ def fused_classifier[
     target: StaticString,
     write_d_logits: Bool = True,
 ](
-    logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    logits_ptr: MutKernelPtr[dtype],
+    losses_ptr: MutKernelPtr[DType.float32],
+    d_losses_ptr: ImmutKernelPtr[DType.float32],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
@@ -389,9 +389,7 @@ struct FusedClassifierFwd:
         # logits (comptime-dead code), so handing the shared kernel
         # signature a mutable-origin pointer is sound. The dangling
         # d_losses sentinel is likewise never dereferenced.
-        var null_d_losses = UnsafePointer[
-            Scalar[DType.float32], ImmutAnyOrigin
-        ].unsafe_dangling()
+        var null_d_losses = ImmutKernelPtr[DType.float32].unsafe_dangling()
         fused_classifier[dtype, target, False](
             logits.unsafe_ptr(),
             losses.unsafe_ptr(),

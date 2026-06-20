@@ -29,7 +29,7 @@ help:
 	@echo "Usage: make <target>"
 	@echo ""
 	@echo "Quality gates:"
-	@echo "  check         Run lint, typecheck, and build-mojo"
+	@echo "  check         Run lint, typecheck, build-mojo, and build train_gpt2"
 	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
 	@echo "  build-train   Alias for build"
 	@echo "  run-train     Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
@@ -64,7 +64,7 @@ help:
 	@echo "  help          Show this help message"
 	@echo "  clean         Remove cache directories"
 
-check: lint typecheck build-mojo
+check: lint typecheck build-mojo build
 
 # Compiles the GPT-2 training binary. MOJO_PYTHON_LIBRARY must be set because
 # DataLoader uses Python glob; pixi run supplies the Modular std/toolchain env.

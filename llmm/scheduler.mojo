@@ -80,7 +80,7 @@ struct LearningRateScheduler:
         # See https://arxiv.org/abs/2405.18392
         var lr: Scalar[DType.float32] = self.learning_rate
         var max_lr: Scalar[DType.float32] = lr
-        var decay_point = Int(self.train_num_batches * 0.8)
+        var decay_point = self.train_num_batches * 4 // 5
 
         if step < self.warmup_steps:
             var decay_ratio = Scalar[DType.float32](step + 1) / Scalar[

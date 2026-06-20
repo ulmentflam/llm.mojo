@@ -1,5 +1,5 @@
 from std.math import exp
-from std.memory import UnsafePointer
+from llmm.memory import ImmutMemPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -48,7 +48,7 @@ def random_permutation(mut arr: List[Int], mut state: UInt64):
 
 
 def sample_softmax(
-    logits_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    logits_ptr: ImmutMemPtr[DType.float32],
     n: Int,
     mut coin: Float32,
 ) -> Int:

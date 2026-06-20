@@ -1,7 +1,7 @@
 import compiler
 from layout import Layout
 from std.sys import simd_width_of
-from std.memory import alloc, UnsafePointer
+from std.memory import alloc
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host import DeviceAttribute
@@ -24,6 +24,7 @@ from std.gpu import (
     thread_idx,
     WARP_SIZE,
 )
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -137,12 +138,8 @@ def _attention_query_key_dot_product[
     dtype: DType,
     width: Int,
 ](
-    query_row: UnsafePointer[
-        Scalar[dtype], ImmutAnyOrigin
-    ],  # Pointer to the query row in the query tensor
-    key_row: UnsafePointer[
-        Scalar[dtype], ImmutAnyOrigin
-    ],  # Pointer to the key row in the key tensor
+    query_row: ImmutKernelPtr[dtype],
+    key_row: ImmutKernelPtr[dtype],
     head_dim: Int,  # The dimension of the head
     attention_scale: Scalar[DType.float32],  # The attention scale
 ) -> Scalar[DType.float32]:
@@ -169,12 +166,8 @@ def _attention_rescale_and_add_value_to_output[
     dtype: DType,
     width: Int,
 ](
-    output_row: UnsafePointer[
-        Scalar[dtype], MutAnyOrigin
-    ],  # Pointer to the output row in the output tensor
-    value_row: UnsafePointer[
-        Scalar[dtype], ImmutAnyOrigin
-    ],  # Pointer to the value row in the value tensor
+    output_row: MutKernelPtr[dtype],
+    value_row: ImmutKernelPtr[dtype],
     rescale_factor: Scalar[DType.float32],  # The rescale factor
     attention_weight: Scalar[DType.float32],  # The attention weight
     head_dim: Int,  # The dimension of the head
@@ -211,12 +204,8 @@ def _attention_add_weighted_value_to_output[
     dtype: DType,
     width: Int,
 ](
-    output_row: UnsafePointer[
-        Scalar[dtype], MutAnyOrigin
-    ],  # Pointer to the output row in the output tensor
-    value_row: UnsafePointer[
-        Scalar[dtype], ImmutAnyOrigin
-    ],  # Pointer to the value row in the value tensor
+    output_row: MutKernelPtr[dtype],
+    value_row: ImmutKernelPtr[dtype],
     attention_weight: Scalar[DType.float32],  # The attention weight
     head_dim: Int,  # The dimension of the head
 ) -> None:
@@ -245,7 +234,7 @@ def _attention_scale_output_row[
     dtype: DType,
     width: Int,
 ](
-    output_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    output_row: MutKernelPtr[dtype],
     scale_factor: Scalar[DType.float32],
     head_dim: Int,
 ) -> None:
@@ -271,10 +260,10 @@ def _attention_update_query_row_for_key[
     use_conditional_rescale: Bool = True,
 ](
     mut state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
-    query_row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    output_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    query_row: ImmutKernelPtr[dtype],
+    key_row: ImmutKernelPtr[dtype],
+    value_row: ImmutKernelPtr[dtype],
+    output_row: MutKernelPtr[dtype],
     head_dim: Int,
     attention_scale: Scalar[DType.float32],
 ) -> None:
@@ -295,8 +284,8 @@ def _attention_online_softmax_update_row[
 ](
     mut state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
     attention_score: Scalar[DType.float32],
-    output_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    value_row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    output_row: MutKernelPtr[dtype],
+    value_row: ImmutKernelPtr[dtype],
     head_dim: Int,
 ) -> None:
     # From the FlashAttention 4 implementation.
@@ -365,8 +354,8 @@ def _attention_finalize_output_row[
     use_conditional_rescale: Bool = True,
 ](
     state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
-    output_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    log_sum_exp_out: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output_row: MutKernelPtr[dtype],
+    log_sum_exp_out: MutKernelPtr[DType.float32],
     head_dim: Int,
 ) -> None:
     var inverse_denominator = (
@@ -387,11 +376,11 @@ def _attention_forward_query_row[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output_ptr: MutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: MutKernelPtr[DType.float32],
     head_offset: Int,
     query_index: Int,
     seq_len: Int,
@@ -431,13 +420,8 @@ def _attention_forward_query_row[
 @always_inline
 def _attention_shared_memory_row_pointer[
     dtype: DType,
-](
-    shared_tensor: LayoutTensor,
-    row_index: Int,
-) -> UnsafePointer[
-    Scalar[dtype], ImmutAnyOrigin
-]:
-    return rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+](shared_tensor: LayoutTensor, row_index: Int,) -> ImmutKernelPtr[dtype]:
+    return rebind[ImmutKernelPtr[dtype]](
         shared_tensor.ptr + row_index * MAX_HEAD_DIM
     )
 
@@ -448,7 +432,7 @@ def _attention_copy_rows_dram_to_shared[
     BLOCK_SIZE: Int,
 ](
     shared_tensor: LayoutTensor,
-    dram_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dram_ptr: ImmutKernelPtr[dtype],
     dram_row_start: Int,
     row_count: Int,
     head_dim: Int,
@@ -457,9 +441,7 @@ def _attention_copy_rows_dram_to_shared[
     # collectively fills the shared tile. Uses synchronous stores because the
     # a copy_dram_to_sram_async thread_layout API is not available;
     # callers issue a barrier() after this returns to ensure visibility.
-    var shared_ptr = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
-        shared_tensor.ptr
-    )
+    var shared_ptr = rebind[MutKernelPtr[dtype]](shared_tensor.ptr)
     var thread_id = Int(thread_idx.x)
     var element_count = row_count * head_dim
     var element_index = thread_id
@@ -477,7 +459,7 @@ def _attention_zero_output_tile_rows[
     dtype: DType,
     BLOCK_SIZE: Int,
 ](
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    output_ptr: MutKernelPtr[dtype],
     head_offset: Int,
     query_tile_start: Int,
     query_tile_rows: Int,
@@ -504,16 +486,10 @@ def _attention_load_online_softmax_state_from_shared[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    softmax_max_deferred_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    softmax_max_true_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    softmax_denominator_true_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    output_rescale_factor_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
+    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
+    softmax_max_true_ptr: MutKernelPtr[DType.float32],
+    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
+    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
     local_query_row: Int,
     mut state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
 ) -> None:
@@ -530,16 +506,10 @@ def _attention_store_online_softmax_state_to_shared[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    softmax_max_deferred_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    softmax_max_true_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    softmax_denominator_true_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    output_rescale_factor_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
+    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
+    softmax_max_true_ptr: MutKernelPtr[DType.float32],
+    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
+    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
     local_query_row: Int,
     state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
 ) -> None:
@@ -558,16 +528,10 @@ def _attention_init_online_softmax_state_shared[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    softmax_max_deferred_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    softmax_max_true_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    softmax_denominator_true_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    output_rescale_factor_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
+    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
+    softmax_max_true_ptr: MutKernelPtr[DType.float32],
+    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
+    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
     query_tile_start: Int,
     query_tile_rows: Int,
     seq_len: Int,
@@ -605,11 +569,11 @@ def _attention_fwd_cpu[
     use_conditional_rescale: Bool = True,
 ](
     head_index: Int,
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output_ptr: MutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: MutKernelPtr[DType.float32],
     seq_len: Int,
     head_dim: Int,
     attention_scale: Scalar[DType.float32],
@@ -638,11 +602,11 @@ def attention_fwd_cpu[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output_ptr: MutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: MutKernelPtr[DType.float32],
     batch_size: Int,
     num_heads: Int,
     seq_len: Int,
@@ -699,20 +663,14 @@ def _attention_gpu_process_key_value_tile_warp[
     head_dim: Int,
     head_offset: Int,
     attention_scale: Scalar[DType.float32],
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    output_ptr: MutKernelPtr[dtype],
     query_shared: LayoutTensor,
     key_shared: LayoutTensor,
     value_shared: LayoutTensor,
-    softmax_max_deferred_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    softmax_max_true_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    softmax_denominator_true_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    output_rescale_factor_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
+    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
+    softmax_max_true_ptr: MutKernelPtr[DType.float32],
+    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
+    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
 ) -> None:
     comptime NUM_WARPS = BLOCK_SIZE // WARP_SIZE
     comptime ROWS_PER_WARP = Br // NUM_WARPS
@@ -790,18 +748,12 @@ def _attention_gpu_finalize_query_rows_warp[
     head_dim: Int,
     head_offset: Int,
     head_index: Int,
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    softmax_max_deferred_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    softmax_max_true_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    softmax_denominator_true_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
-    output_rescale_factor_ptr: UnsafePointer[
-        Scalar[DType.float32], MutAnyOrigin
-    ],
+    output_ptr: MutKernelPtr[dtype],
+    log_sum_exp_ptr: MutKernelPtr[DType.float32],
+    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
+    softmax_max_true_ptr: MutKernelPtr[DType.float32],
+    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
+    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
 ) -> None:
     comptime NUM_WARPS = BLOCK_SIZE // WARP_SIZE
     comptime ROWS_PER_WARP = Br // NUM_WARPS
@@ -845,11 +797,11 @@ def _attention_gpu_forward_query_tile_block[
     use_conditional_rescale: Bool = True,
 ](
     tile_index: Int,
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output_ptr: MutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: MutKernelPtr[DType.float32],
     seq_len: Int,
     head_dim: Int,
     query_tiles: Int,
@@ -909,18 +861,18 @@ def _attention_gpu_forward_query_tile_block[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var softmax_max_deferred_ptr = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-    ](softmax_max_deferred_shared.ptr)
-    var softmax_max_true_ptr = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-    ](softmax_max_true_shared.ptr)
-    var softmax_denominator_true_ptr = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-    ](softmax_denominator_true_shared.ptr)
-    var output_rescale_factor_ptr = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-    ](output_rescale_factor_shared.ptr)
+    var softmax_max_deferred_ptr = rebind[MutKernelPtr[DType.float32]](
+        softmax_max_deferred_shared.ptr
+    )
+    var softmax_max_true_ptr = rebind[MutKernelPtr[DType.float32]](
+        softmax_max_true_shared.ptr
+    )
+    var softmax_denominator_true_ptr = rebind[MutKernelPtr[DType.float32]](
+        softmax_denominator_true_shared.ptr
+    )
+    var output_rescale_factor_ptr = rebind[MutKernelPtr[DType.float32]](
+        output_rescale_factor_shared.ptr
+    )
 
     # Load this CTA's query tile once; it is reused across every KV tile.
     _attention_copy_rows_dram_to_shared[dtype, BLOCK_SIZE](
@@ -1022,11 +974,11 @@ def attention_fwd_gpu[
 ](
     num_tiles: Int,
     query_tiles: Int,
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output_ptr: MutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: MutKernelPtr[DType.float32],
     seq_len: Int64,
     head_dim: Int64,
 ) -> None:
@@ -1061,21 +1013,21 @@ def attention_fwd[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    qkv_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    q_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    k_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    v_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    attn_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    attn_merged_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    qkv_ptr: ImmutKernelPtr[dtype],
+    q_ptr: MutKernelPtr[dtype],
+    k_ptr: MutKernelPtr[dtype],
+    v_ptr: MutKernelPtr[dtype],
+    attn_ptr: MutKernelPtr[dtype],
+    attn_merged_ptr: MutKernelPtr[dtype],
+    log_sum_exp_ptr: MutKernelPtr[DType.float32],
     batch_size: Int64,
     num_heads: Int64,
     seq_len: Int64,
     head_dim: Int64,
     ctx: DeviceContext,
 ) capturing raises:
-    var qkv_mut = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](qkv_ptr)
-    var dst_ptrs = List[UnsafePointer[Scalar[dtype], MutAnyOrigin]]()
+    var qkv_mut = rebind[MutKernelPtr[dtype]](qkv_ptr)
+    var dst_ptrs = List[MutKernelPtr[dtype]]()
     dst_ptrs.append(q_ptr)
     dst_ptrs.append(k_ptr)
     dst_ptrs.append(v_ptr)
@@ -1117,11 +1069,11 @@ def attention_fwd[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output_ptr: MutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: MutKernelPtr[DType.float32],
     batch_size: Int64,
     num_heads: Int64,
     seq_len: Int64,
@@ -1259,13 +1211,13 @@ def _attention_bwd_update_step[
     width: Int,
     use_soft_exp: Bool = True,
 ](
-    q_row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    k_row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    v_row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    do_row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dq_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dk_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dv_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    q_row: ImmutKernelPtr[dtype],
+    k_row: ImmutKernelPtr[dtype],
+    v_row: ImmutKernelPtr[dtype],
+    do_row: ImmutKernelPtr[dtype],
+    dq_row: MutKernelPtr[dtype],
+    dk_row: MutKernelPtr[dtype],
+    dv_row: MutKernelPtr[dtype],
     L_i: Scalar[DType.float32],
     D_i: Scalar[DType.float32],
     head_dim: Int,
@@ -1311,15 +1263,15 @@ def _attention_bwd_cpu[
     use_soft_exp: Bool = True,
 ](
     head_index: Int,
-    d_query_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_key_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_value_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    d_query_ptr: MutKernelPtr[dtype],
+    d_key_ptr: MutKernelPtr[dtype],
+    d_value_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    output_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: ImmutKernelPtr[DType.float32],
     seq_len: Int,
     head_dim: Int,
     attention_scale: Scalar[DType.float32],
@@ -1393,15 +1345,15 @@ def attention_bwd_cpu[
     width: Int,
     use_soft_exp: Bool = True,
 ](
-    d_query_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_key_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_value_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    d_query_ptr: MutKernelPtr[dtype],
+    d_key_ptr: MutKernelPtr[dtype],
+    d_value_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    output_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: ImmutKernelPtr[DType.float32],
     batch_size: Int,
     num_heads: Int,
     seq_len: Int,
@@ -1451,8 +1403,8 @@ def _attention_copy_tile[
     row_count: Int,
     head_dim: Int,
 ) -> None:
-    var dest_ptr = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](dest.ptr)
-    var src_ptr = rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](src.ptr)
+    var dest_ptr = rebind[MutKernelPtr[dtype]](dest.ptr)
+    var src_ptr = rebind[ImmutKernelPtr[dtype]](src.ptr)
     var thread_id = Int(thread_idx.x)
     var element_count = row_count * head_dim
     var element_index = thread_id
@@ -1493,9 +1445,9 @@ def _attention_gpu_bwd_dq_tile_block[
     dq_tile_dram: LayoutTensor[
         dtype, Layout.row_major(Br, MAX_HEAD_DIM), MutAnyOrigin
     ],
-    k_head: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    v_head: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    lse_head: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    k_head: ImmutKernelPtr[dtype],
+    v_head: ImmutKernelPtr[dtype],
+    lse_head: ImmutKernelPtr[DType.float32],
     seq_len: Int,
     head_dim: Int,
 ) -> None:
@@ -1568,12 +1520,8 @@ def _attention_gpu_bwd_dq_tile_block[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var lse_shared_ptr = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-    ](lse_shared.ptr)
-    var D_shared_ptr = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-    ](D_shared.ptr)
+    var lse_shared_ptr = rebind[MutKernelPtr[DType.float32]](lse_shared.ptr)
+    var D_shared_ptr = rebind[MutKernelPtr[DType.float32]](D_shared.ptr)
 
     # Load Q, dO, O tiles into SRAM once and reuse across every KV inner tile.
     _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM](
@@ -1625,10 +1573,10 @@ def _attention_gpu_bwd_dq_tile_block[
 
         var k_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((k_head + key_tile_start * head_dim).as_unsafe_any_origin())
+        ]((k_head + key_tile_start * head_dim))
         var v_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((v_head + key_tile_start * head_dim).as_unsafe_any_origin())
+        ]((v_head + key_tile_start * head_dim))
 
         _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM](
             key_shared, k_tile_dram, key_tile_rows, head_dim
@@ -1724,13 +1672,13 @@ def attention_bwd_dq_gpu[
 ](
     num_tiles: Int,
     query_tiles: Int,
-    d_query_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    d_query_ptr: MutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    output_ptr: ImmutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: ImmutKernelPtr[DType.float32],
     seq_len: Int64,
     head_dim: Int64,
 ) -> None:
@@ -1745,32 +1693,16 @@ def attention_bwd_dq_gpu[
 
         var q_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                query_ptr + head_offset + query_tile_start * Int(head_dim)
-            ).as_unsafe_any_origin()
-        )
+        ]((query_ptr + head_offset + query_tile_start * Int(head_dim)))
         var do_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                d_output_ptr + head_offset + query_tile_start * Int(head_dim)
-            ).as_unsafe_any_origin()
-        )
+        ]((d_output_ptr + head_offset + query_tile_start * Int(head_dim)))
         var o_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                output_ptr + head_offset + query_tile_start * Int(head_dim)
-            ).as_unsafe_any_origin()
-        )
+        ]((output_ptr + head_offset + query_tile_start * Int(head_dim)))
         var dq_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), MutAnyOrigin
-        ](
-            (
-                d_query_ptr + head_offset + query_tile_start * Int(head_dim)
-            ).as_unsafe_any_origin()
-        )
+        ]((d_query_ptr + head_offset + query_tile_start * Int(head_dim)))
 
         var k_head = key_ptr + head_offset
         var v_head = value_ptr + head_offset
@@ -1818,10 +1750,10 @@ def _attention_gpu_bwd_dkv_tile_block[
     v_tile_dram: LayoutTensor[
         dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
     ],
-    q_head: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    do_head: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    o_head: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    lse_head: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    q_head: ImmutKernelPtr[dtype],
+    do_head: ImmutKernelPtr[dtype],
+    o_head: ImmutKernelPtr[dtype],
+    lse_head: ImmutKernelPtr[DType.float32],
     seq_len: Int,
     head_dim: Int,
     query_tiles: Int,
@@ -1890,12 +1822,8 @@ def _attention_gpu_bwd_dkv_tile_block[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var lse_shared_ptr = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-    ](lse_shared.ptr)
-    var D_shared_ptr = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-    ](D_shared.ptr)
+    var lse_shared_ptr = rebind[MutKernelPtr[DType.float32]](lse_shared.ptr)
+    var D_shared_ptr = rebind[MutKernelPtr[DType.float32]](D_shared.ptr)
 
     # Load K, V tiles into SRAM once; reused across every query inner tile.
     _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM](
@@ -1938,13 +1866,13 @@ def _attention_gpu_bwd_dkv_tile_block[
 
         var q_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((q_head + query_tile_start * head_dim).as_unsafe_any_origin())
+        ]((q_head + query_tile_start * head_dim))
         var do_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((do_head + query_tile_start * head_dim).as_unsafe_any_origin())
+        ]((do_head + query_tile_start * head_dim))
         var o_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((o_head + query_tile_start * head_dim).as_unsafe_any_origin())
+        ]((o_head + query_tile_start * head_dim))
 
         _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM](
             q_shared, q_tile_dram, query_tile_rows, head_dim
@@ -2105,14 +2033,14 @@ def attention_bwd_dkv_gpu[
     num_tiles: Int,
     kv_tiles: Int,
     query_tiles: Int,
-    d_key_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_value_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    d_key_ptr: MutKernelPtr[dtype],
+    d_value_ptr: MutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    output_ptr: ImmutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: ImmutKernelPtr[DType.float32],
     seq_len: Int64,
     head_dim: Int64,
 ) -> None:
@@ -2127,32 +2055,16 @@ def attention_bwd_dkv_gpu[
 
         var dk_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), MutAnyOrigin
-        ](
-            (
-                d_key_ptr + head_offset + key_tile_start * Int(head_dim)
-            ).as_unsafe_any_origin()
-        )
+        ]((d_key_ptr + head_offset + key_tile_start * Int(head_dim)))
         var dv_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), MutAnyOrigin
-        ](
-            (
-                d_value_ptr + head_offset + key_tile_start * Int(head_dim)
-            ).as_unsafe_any_origin()
-        )
+        ]((d_value_ptr + head_offset + key_tile_start * Int(head_dim)))
         var k_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                key_ptr + head_offset + key_tile_start * Int(head_dim)
-            ).as_unsafe_any_origin()
-        )
+        ]((key_ptr + head_offset + key_tile_start * Int(head_dim)))
         var v_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                value_ptr + head_offset + key_tile_start * Int(head_dim)
-            ).as_unsafe_any_origin()
-        )
+        ]((value_ptr + head_offset + key_tile_start * Int(head_dim)))
 
         var q_head = query_ptr + head_offset
         var do_head = d_output_ptr + head_offset
@@ -2183,17 +2095,17 @@ def attention_bwd[
     target: StaticString,
     use_soft_exp: Bool = True,
 ](
-    d_qkv_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_q_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_k_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_v_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_attn_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_attn_merged_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    q_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    k_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    v_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    attn_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    d_qkv_ptr: MutKernelPtr[dtype],
+    d_q_ptr: MutKernelPtr[dtype],
+    d_k_ptr: MutKernelPtr[dtype],
+    d_v_ptr: MutKernelPtr[dtype],
+    d_attn_ptr: MutKernelPtr[dtype],
+    d_attn_merged_ptr: ImmutKernelPtr[dtype],
+    q_ptr: ImmutKernelPtr[dtype],
+    k_ptr: ImmutKernelPtr[dtype],
+    v_ptr: ImmutKernelPtr[dtype],
+    attn_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: ImmutKernelPtr[DType.float32],
     batch_size: Int64,
     num_heads: Int64,
     seq_len: Int64,
@@ -2230,7 +2142,7 @@ def attention_bwd[
     )
 
     # 3. Merge QKV backward: merge d_q, d_k, d_v back into d_qkv
-    var d_dst_ptrs = List[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]]()
+    var d_dst_ptrs = List[ImmutKernelPtr[dtype]]()
     d_dst_ptrs.append(d_q_ptr)
     d_dst_ptrs.append(d_k_ptr)
     d_dst_ptrs.append(d_v_ptr)
@@ -2250,15 +2162,15 @@ def attention_bwd[
     target: StaticString,
     use_soft_exp: Bool = True,
 ](
-    d_query_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_key_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_value_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    query_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    output_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    log_sum_exp_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    d_query_ptr: MutKernelPtr[dtype],
+    d_key_ptr: MutKernelPtr[dtype],
+    d_value_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    output_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: ImmutKernelPtr[DType.float32],
     batch_size: Int64,
     num_heads: Int64,
     seq_len: Int64,

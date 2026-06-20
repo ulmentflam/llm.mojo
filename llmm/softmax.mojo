@@ -1,6 +1,5 @@
 import compiler
 from std.sys import simd_width_of
-from std.memory import UnsafePointer
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host import DeviceAttribute
@@ -13,6 +12,7 @@ from extensibility.managed_tensor_slice import (
 from std.algorithm import vectorize, sync_parallelize
 from std.runtime.asyncrt import parallelism_level
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -33,7 +33,7 @@ def _softmax_comp_max[
     width: Int,
 ](
     idx: Int,
-    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    logits_ptr: ImmutKernelPtr[dtype],
     mut s: SIMD[DType.float32, width],
     mut m: SIMD[DType.float32, width],
 ) -> None:
@@ -48,7 +48,7 @@ def softmax_phase_1_and_2_cpu[
     dtype: DType, width: Int
 ](
     idx: Int,
-    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    logits_ptr: ImmutKernelPtr[dtype],
     vocab_size: Int,  # Our V
     vocab_size_padded: Int,  # Our Vp, padding is garbage
 ) -> Tuple[Scalar[DType.float32], Scalar[DType.float32]]:
@@ -85,8 +85,8 @@ def _softmax_fwd_cpu[
     dtype: DType, width: Int
 ](
     idx: Int,
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    probs_ptr: MutKernelPtr[dtype],
+    logits_ptr: ImmutKernelPtr[dtype],
     vocab_size: Int,  # Our V
     vocab_size_padded: Int,  # Our Vp, padding is garbage
 ) -> None:
@@ -125,8 +125,8 @@ def softmax_fwd_cpu[
     dtype: DType,
     width: Int,
 ](
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    probs_ptr: MutKernelPtr[dtype],
+    logits_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
@@ -159,7 +159,7 @@ def softmax_phase_1_and_2_gpu[
 ](
     row: Int,
     tid: Int,
-    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    logits_ptr: ImmutKernelPtr[dtype],
     vocab_size: Int,
     vocab_size_padded: Int,
 ) -> Tuple[Scalar[DType.float32], Scalar[DType.float32]]:
@@ -210,8 +210,8 @@ def _softmax_fwd_gpu[
     tid: Int,
     stride: Int,
     block_row: Int,
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    probs_ptr: MutKernelPtr[dtype],
+    logits_ptr: ImmutKernelPtr[dtype],
     vocab_size: Int,
     vocab_size_padded: Int,
 ) -> None:
@@ -260,8 +260,8 @@ def _softmax_fwd_gpu[
 def softmax_fwd_gpu[
     dtype: DType, BLOCK_SIZE: Int, width: Int = 4
 ](
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    probs_ptr: MutKernelPtr[dtype],
+    logits_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
@@ -284,8 +284,8 @@ def softmax_fwd[
     dtype: DType,
     target: StaticString,
 ](
-    probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    logits_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    probs_ptr: MutKernelPtr[dtype],
+    logits_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
@@ -376,8 +376,8 @@ def _softmax_dot[
     width: Int,
 ](
     idx: Int,
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    probs_ptr: ImmutKernelPtr[dtype],
+    d_probs_ptr: ImmutKernelPtr[dtype],
     mut accumulator: SIMD[DType.float32, width],
 ) -> None:
     var d_prob = (d_probs_ptr + idx).load[width=width]().cast[DType.float32]()
@@ -390,9 +390,9 @@ def _softmax_bwd_cpu[
     dtype: DType, width: Int
 ](
     idx: Int,
-    d_logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_logits_ptr: MutKernelPtr[dtype],
+    d_probs_ptr: ImmutKernelPtr[dtype],
+    probs_ptr: ImmutKernelPtr[dtype],
     vocab_size: Int,  # Our V
     vocab_size_padded: Int,  # Our Vp, padding is garbage
 ) -> None:
@@ -444,9 +444,9 @@ def softmax_bwd_cpu[
     dtype: DType,
     width: Int,
 ](
-    d_logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_logits_ptr: MutKernelPtr[dtype],
+    d_probs_ptr: ImmutKernelPtr[dtype],
+    probs_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
@@ -482,9 +482,9 @@ def _softmax_bwd_gpu[
     tid: Int,
     stride: Int,
     block_row: Int,
-    d_logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_logits_ptr: MutKernelPtr[dtype],
+    d_probs_ptr: ImmutKernelPtr[dtype],
+    probs_ptr: ImmutKernelPtr[dtype],
     vocab_size: Int,
     vocab_size_padded: Int,
 ) -> None:
@@ -540,9 +540,9 @@ def _softmax_bwd_gpu[
 def softmax_bwd_gpu[
     dtype: DType, BLOCK_SIZE: Int, width: Int = 4
 ](
-    d_logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_logits_ptr: MutKernelPtr[dtype],
+    d_probs_ptr: ImmutKernelPtr[dtype],
+    probs_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
@@ -566,9 +566,9 @@ def softmax_bwd[
     dtype: DType,
     target: StaticString,
 ](
-    d_logits_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d_logits_ptr: MutKernelPtr[dtype],
+    d_probs_ptr: ImmutKernelPtr[dtype],
+    probs_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V

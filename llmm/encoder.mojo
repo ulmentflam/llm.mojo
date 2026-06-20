@@ -2,7 +2,6 @@ import compiler
 from layout import Layout
 from std.math import ceildiv
 from std.sys import simd_width_of
-from std.memory import UnsafePointer
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.memory import AddressSpace
@@ -12,6 +11,7 @@ from layout.layout_tensor import LayoutTensor
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu import (
@@ -43,9 +43,9 @@ def _encoder_fwd_vector_slice[
     dtype: DType,
     width: Int,
 ](
-    out_row_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    wte_row_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    wpe_row_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_row_ptr: MutKernelPtr[dtype],
+    wte_row_ptr: ImmutKernelPtr[dtype],
+    wpe_row_ptr: ImmutKernelPtr[dtype],
     c: Int,
 ) -> None:
     var wte_val = (wte_row_ptr + c).load[width=width]()
@@ -57,10 +57,10 @@ def encoder_fwd_cpu[
     dtype: DType,
     width: Int,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    inp_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    wte_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    wpe_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    inp_ptr: ImmutKernelPtr[DType.int32],
+    wte_ptr: ImmutKernelPtr[dtype],
+    wpe_ptr: ImmutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     channels: Int,
@@ -99,10 +99,10 @@ def encoder_fwd_gpu_kernel[
     dtype: DType,
     width: Int,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    inp_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    wte_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    wpe_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    inp_ptr: ImmutKernelPtr[DType.int32],
+    wte_ptr: ImmutKernelPtr[dtype],
+    wpe_ptr: ImmutKernelPtr[dtype],
     seq_len: Int,
     channels: Int,
     total_elements: Int,
@@ -132,10 +132,10 @@ def encoder_fwd_gpu[
     BLOCK_SIZE: Int,
     width: Int = 4,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    inp_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    wte_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    wpe_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    inp_ptr: ImmutKernelPtr[DType.int32],
+    wte_ptr: ImmutKernelPtr[dtype],
+    wpe_ptr: ImmutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     channels: Int,
@@ -155,10 +155,10 @@ def encoder_fwd[
     dtype: DType,
     target: StaticString,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    inp_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    wte_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    wpe_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: MutKernelPtr[dtype],
+    inp_ptr: ImmutKernelPtr[DType.int32],
+    wte_ptr: ImmutKernelPtr[dtype],
+    wpe_ptr: ImmutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     channels: Int,
@@ -242,9 +242,9 @@ struct EncoderFwd:
 
 
 def build_wte_buckets(
-    inputs_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    bucket_info_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    inputs_ptr: ImmutKernelPtr[DType.int32],
+    bucket_info_ptr: MutKernelPtr[DType.int32],
+    workload_indices_ptr: MutKernelPtr[DType.int32],
     batch_size: Int,
     seq_len: Int,
     vocab_size: Int,
@@ -314,8 +314,8 @@ def _accumulate_token_gradients[
     dtype: DType,
     width: Int,
 ](
-    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    dout_ptr: ImmutKernelPtr[dtype],
+    workload_indices_ptr: ImmutKernelPtr[DType.int32],
     start_idx: Int,
     bucket_size: Int,
     channels: Int,
@@ -342,7 +342,7 @@ def _write_dwte_accumulation[
     dtype: DType,
     width: Int,
 ](
-    dwte_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dwte_ptr: MutKernelPtr[dtype],
     dwte_offset: Int,
     accum: SIMD[DType.float32, width],
 ) -> None:
@@ -362,10 +362,10 @@ def wte_backward_cpu[
     width: Int,
     BUCKET_IDX_SIZE: Int = 4,
 ](
-    dwte_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    bucket_info_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dwte_ptr: MutKernelPtr[dtype],
+    bucket_info_ptr: ImmutKernelPtr[DType.int32],
+    workload_indices_ptr: ImmutKernelPtr[DType.int32],
+    dout_ptr: ImmutKernelPtr[dtype],
     num_buckets: Int,
     channels: Int,
 ) -> None:
@@ -437,8 +437,8 @@ def wpe_backward_cpu[
     dtype: DType,
     width: Int,
 ](
-    dwpe_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dwpe_ptr: MutKernelPtr[dtype],
+    dout_ptr: ImmutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     channels: Int,
@@ -484,10 +484,10 @@ def wte_backward_gpu_kernel[
     BLOCK_SIZE: Int,
     width: Int = 4,
 ](
-    dwte_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    bucket_info_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dwte_ptr: MutKernelPtr[dtype],
+    bucket_info_ptr: ImmutKernelPtr[DType.int32],
+    workload_indices_ptr: ImmutKernelPtr[DType.int32],
+    dout_ptr: ImmutKernelPtr[dtype],
     channels: Int,
 ) -> None:
     var bucket = Int(block_idx.x)
@@ -528,9 +528,7 @@ def wte_backward_gpu_kernel[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var accum_shared_ptr = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-    ](accum_shared.ptr)
+    var accum_shared_ptr = rebind[MutKernelPtr[DType.float32]](accum_shared.ptr)
 
     for k in range(width):
         accum_shared_ptr[tid * width + k] = accum[k]
@@ -560,8 +558,8 @@ def wpe_backward_gpu_kernel[
     BLOCK_SIZE: Int,
     width: Int = 4,
 ](
-    dwpe_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dwpe_ptr: MutKernelPtr[dtype],
+    dout_ptr: ImmutKernelPtr[dtype],
     batch_size: Int,
     seq_len: Int,
     channels: Int,
@@ -595,11 +593,11 @@ def encoder_bwd[
     dtype: DType,
     target: StaticString,
 ](
-    dwte_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dwpe_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    bucket_info_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    workload_indices_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
-    dout_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dwte_ptr: MutKernelPtr[dtype],
+    dwpe_ptr: MutKernelPtr[dtype],
+    bucket_info_ptr: ImmutKernelPtr[DType.int32],
+    workload_indices_ptr: ImmutKernelPtr[DType.int32],
+    dout_ptr: ImmutKernelPtr[dtype],
     num_buckets: Int,
     batch_size: Int,
     seq_len: Int,

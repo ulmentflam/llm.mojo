@@ -1,4 +1,4 @@
-from std.memory import UnsafePointer
+from llmm.memory import ImmutKernelPtr, MutMemPtr
 
 
 def get_dtype_size(dtype: DType) -> Int:
@@ -19,11 +19,7 @@ def get_dtype_size(dtype: DType) -> Int:
 # Generic utility function to read count elements from a FileHandle directly into an UnsafePointer.
 def read_and_copy[
     dtype: DType,
-](
-    mut file: FileHandle,
-    dest: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    count: Int,
-) raises:
+](mut file: FileHandle, dest: MutMemPtr[dtype], count: Int,) raises:
     var bytes_to_read = count * get_dtype_size(dtype)
     var bytes_read = file.read_bytes(bytes_to_read)
     if len(bytes_read) < bytes_to_read:

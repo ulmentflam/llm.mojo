@@ -1,6 +1,5 @@
 import compiler
 from std.sys import simd_width_of
-from std.memory import UnsafePointer
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.math import fma, sqrt, ceildiv
@@ -10,6 +9,7 @@ from extensibility.managed_tensor_slice import (
 )
 from std.gpu import block_dim, block_idx, thread_idx
 from std.algorithm import vectorize, sync_parallelize
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -69,10 +69,10 @@ def _adamw_update[
     width: Int,
 ](
     idx: Int,
-    params_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grads_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    v_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    params_ptr: MutKernelPtr[dtype],
+    grads_ptr: ImmutKernelPtr[dtype],
+    m_ptr: MutKernelPtr[DType.float32],
+    v_ptr: MutKernelPtr[DType.float32],
     config: AdamWConfig[dtype],
     beta1_correction: Scalar[DType.float32],
     beta2_correction: Scalar[DType.float32],
@@ -108,10 +108,10 @@ def adamw_update_cpu[
     width: Int,
 ](
     num_params: Int,
-    params_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grads_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    v_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    params_ptr: MutKernelPtr[dtype],
+    grads_ptr: ImmutKernelPtr[dtype],
+    m_ptr: MutKernelPtr[DType.float32],
+    v_ptr: MutKernelPtr[DType.float32],
     config: AdamWConfig[dtype],
     beta1_correction: Scalar[DType.float32],
     beta2_correction: Scalar[DType.float32],
@@ -158,10 +158,10 @@ def adamw_update_gpu[
     width: Int = 4,
 ](
     num_params: Int,
-    params_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grads_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    v_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    params_ptr: MutKernelPtr[dtype],
+    grads_ptr: ImmutKernelPtr[dtype],
+    m_ptr: MutKernelPtr[DType.float32],
+    v_ptr: MutKernelPtr[DType.float32],
     learning_rate: Scalar[dtype],
     beta1: Scalar[dtype],
     beta2: Scalar[dtype],
@@ -212,10 +212,10 @@ def adamw_update[
     width: Int = 4,  # Pinning to 4 — optimal for the Float32 moment loads.
 ](
     num_params: Int,
-    params_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grads_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    v_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    params_ptr: MutKernelPtr[dtype],
+    grads_ptr: ImmutKernelPtr[dtype],
+    m_ptr: MutKernelPtr[DType.float32],
+    v_ptr: MutKernelPtr[DType.float32],
     t: UInt32,
     config: AdamWConfig[dtype],
     ctx: DeviceContext,
@@ -323,7 +323,7 @@ struct AdamWUpdate:
             grad_scale=grad_scale,
         )
 
-        # Lower to raw UnsafePointer at the dispatch boundary so CPU + GPU
+        # Lower to kernel pointers at the dispatch boundary so CPU + GPU
         # share one code path (`_adamw_step` works on pointers in both cases).
         adamw_update[dtype, target, width](
             params.size(),

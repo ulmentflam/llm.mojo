@@ -23,6 +23,17 @@ from .layernorm import (
     layernorm_fused_residual_bwd,
 )
 from .matmul import MatmulFwd, MatmulBwd, matmul_fwd, matmul_bwd
+from .memory import (
+    ImmutKernelPtr,
+    ImmutMemPtr,
+    MutKernelPtr,
+    MutMemPtr,
+    as_immut_kernel,
+    as_immut_kernel_from_mut,
+    as_mut_kernel,
+    rebind_immut_mem,
+    rebind_mut_mem,
+)
 from .merge import MergeFwd, MergeBwd, merge_fwd, merge_bwd
 from .sampler import sample_softmax, random_u32, random_f32, random_permutation
 from .scheduler import LearningRateScheduler

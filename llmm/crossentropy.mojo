@@ -1,7 +1,6 @@
 import compiler
 from std.sys import simd_width_of
 from std.math import ceildiv, log
-from std.memory import UnsafePointer
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.algorithm import sync_parallelize
@@ -10,6 +9,7 @@ from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
 from std.gpu import block_dim, block_idx, thread_idx
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -28,9 +28,9 @@ def _crossentropy_ohe_fwd[
     dtype: DType,
 ](
     idx: Int,
-    losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    losses_ptr: MutKernelPtr[DType.float32],
+    probs_ptr: ImmutKernelPtr[dtype],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
@@ -53,9 +53,9 @@ def _crossentropy_ohe_fwd[
 def crossentropy_ohe_fwd_cpu[
     dtype: DType,
 ](
-    losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    losses_ptr: MutKernelPtr[DType.float32],
+    probs_ptr: ImmutKernelPtr[dtype],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
@@ -97,9 +97,9 @@ def crossentropy_ohe_fwd_cpu[
 def crossentropy_ohe_fwd_gpu[
     dtype: DType,
 ](
-    losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    losses_ptr: MutKernelPtr[DType.float32],
+    probs_ptr: ImmutKernelPtr[dtype],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
@@ -121,9 +121,9 @@ def crossentropy_ohe_fwd[
     dtype: DType,
     target: StaticString,
 ](
-    losses_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    losses_ptr: MutKernelPtr[DType.float32],
+    probs_ptr: ImmutKernelPtr[dtype],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
@@ -216,10 +216,10 @@ def _crossentropy_ohe_bwd[
     dtype: DType,
 ](
     idx: Int,
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    d_losses_ptr: ImmutKernelPtr[DType.float32],
+    d_probs_ptr: MutKernelPtr[dtype],
+    probs_ptr: ImmutKernelPtr[dtype],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp — only used as row stride here
@@ -235,10 +235,10 @@ def _crossentropy_ohe_bwd[
 def crossentropy_ohe_bwd_cpu[
     dtype: DType,
 ](
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    d_losses_ptr: ImmutKernelPtr[DType.float32],
+    d_probs_ptr: MutKernelPtr[dtype],
+    probs_ptr: ImmutKernelPtr[dtype],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
@@ -270,10 +270,10 @@ def crossentropy_ohe_bwd_cpu[
 def crossentropy_ohe_bwd_gpu[
     dtype: DType,
 ](
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    d_losses_ptr: ImmutKernelPtr[DType.float32],
+    d_probs_ptr: MutKernelPtr[dtype],
+    probs_ptr: ImmutKernelPtr[dtype],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
@@ -296,10 +296,10 @@ def crossentropy_ohe_bwd[
     dtype: DType,
     target: StaticString,
 ](
-    d_losses_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    d_probs_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    targets_ptr: UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin],
+    d_losses_ptr: ImmutKernelPtr[DType.float32],
+    d_probs_ptr: MutKernelPtr[dtype],
+    probs_ptr: ImmutKernelPtr[dtype],
+    targets_ptr: ImmutKernelPtr[DType.int32],
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
