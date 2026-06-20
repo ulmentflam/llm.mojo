@@ -2,7 +2,7 @@
 authors = ["ulmentflam <johnwowen3@gmail.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "llm.mojo"
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
