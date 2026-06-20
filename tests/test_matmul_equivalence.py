@@ -121,7 +121,16 @@ def _make_operands(case: Case):
     return x, w, b, d_out
 
 
-def _torch_grads(x, w, b, d_out):
+def _torch_linear(x, w, b, *, has_bias: bool = True):
+    y = torch.from_numpy(x) @ torch.from_numpy(w).T
+    if has_bias:
+        y = y + torch.from_numpy(b)
+    return y
+
+
+def _torch_grads(
+    x: np.ndarray, w: np.ndarray, b: np.ndarray, d_out: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Autograd reference grads of y = x @ w^T + b contracted with d_out."""
     xt = torch.from_numpy(x).requires_grad_(True)
     wt = torch.from_numpy(w).requires_grad_(True)
@@ -132,7 +141,19 @@ def _torch_grads(x, w, b, d_out):
     return xt.grad.numpy(), wt.grad.numpy(), bt.grad.numpy()
 
 
-def _run_forward(case: Case, x, w, b, *, use_gelu: bool = False):
+def _torch_grads_no_bias(
+    x: np.ndarray, w: np.ndarray, d_out: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Autograd reference grads of y = x @ w^T contracted with d_out."""
+    xt = torch.from_numpy(x).requires_grad_(True)
+    wt = torch.from_numpy(w).requires_grad_(True)
+    y = xt @ wt.T
+    y.backward(gradient=torch.from_numpy(d_out))
+    assert xt.grad is not None and wt.grad is not None
+    return xt.grad.numpy(), wt.grad.numpy()
+
+
+def _run_forward(case: Case, x, w, b, *, use_gelu: bool = False, has_bias: bool = True):
     out, pre_gelu = matmul.forward(
         x=to_storage(x, case.dtype),
         weight=to_storage(w, case.dtype),
@@ -143,6 +164,7 @@ def _run_forward(case: Case, x, w, b, *, use_gelu: bool = False):
         output_channels=case.output_channels,
         dtype_name=case.dtype,
         use_gelu=use_gelu,
+        has_bias=has_bias,
     )
     return from_storage(out, case.dtype), from_storage(pre_gelu, case.dtype)
 
@@ -170,7 +192,15 @@ def _run_backward(case: Case, d_out, x, w, **kwargs):
 def test_forward_matches_torch(case: Case) -> None:
     x, w, b, _ = _make_operands(case)
     out, _ = _run_forward(case, x, w, b)
-    expected = torch.from_numpy(x) @ torch.from_numpy(w).T + torch.from_numpy(b)
+    expected = _torch_linear(x, w, b)
+    np.testing.assert_allclose(out, expected.numpy(), **TOLERANCES[case.dtype])
+
+
+@pytest.mark.parametrize("case", CASES, ids=_ids)
+def test_forward_no_bias_matches_torch(case: Case) -> None:
+    x, w, b, _ = _make_operands(case)
+    out, _ = _run_forward(case, x, w, b, has_bias=False)
+    expected = _torch_linear(x, w, b, has_bias=False)
     np.testing.assert_allclose(out, expected.numpy(), **TOLERANCES[case.dtype])
 
 
@@ -180,7 +210,7 @@ def test_forward_gelu_pre_gelu_matches_linear(case: Case) -> None:
     separately in test_forward_gelu_out_matches_torch."""
     x, w, b, _ = _make_operands(case)
     _, pre_gelu = _run_forward(case, x, w, b, use_gelu=True)
-    expected = torch.from_numpy(x) @ torch.from_numpy(w).T + torch.from_numpy(b)
+    expected = _torch_linear(x, w, b)
     np.testing.assert_allclose(pre_gelu, expected.numpy(), **TOLERANCES[case.dtype])
 
 
@@ -193,6 +223,16 @@ def test_backward_matches_torch(case: Case) -> None:
     np.testing.assert_allclose(d_input, ref_dx, **tol)
     np.testing.assert_allclose(d_weight, ref_dw, **tol)
     np.testing.assert_allclose(d_bias, ref_db, **tol)
+
+
+@pytest.mark.parametrize("case", CASES, ids=_ids)
+def test_backward_no_bias_matches_torch(case: Case) -> None:
+    x, w, b, d_out = _make_operands(case)
+    ref_dx, ref_dw = _torch_grads_no_bias(x, w, d_out)
+    d_input, d_weight, _ = _run_backward(case, d_out, x, w, has_bias=False)
+    tol = TOLERANCES[case.dtype]
+    np.testing.assert_allclose(d_input, ref_dx, **tol)
+    np.testing.assert_allclose(d_weight, ref_dw, **tol)
 
 
 @pytest.mark.parametrize("case", CASES, ids=_ids)
@@ -249,7 +289,7 @@ def test_forward_gelu_out_matches_torch(case: Case) -> None:
     """out must be gelu(x @ W^T + b), llm.c tanh approximation."""
     x, w, b, _ = _make_operands(case)
     out, _ = _run_forward(case, x, w, b, use_gelu=True)
-    linear = torch.from_numpy(x) @ torch.from_numpy(w).T + torch.from_numpy(b)
+    linear = _torch_linear(x, w, b)
     expected = torch.nn.functional.gelu(linear, approximate="tanh")
     np.testing.assert_allclose(out, expected.numpy(), **TOLERANCES[case.dtype])
 

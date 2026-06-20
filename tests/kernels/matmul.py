@@ -26,6 +26,11 @@ def _dummy(dtype_name: str) -> np.ndarray:
     return np.zeros((1, 1), dtype=NP_STORAGE_DTYPES[dtype_name])
 
 
+def _dummy_bias(dtype_name: str) -> np.ndarray:
+    """Rank-1 placeholder when has_bias=False (comptime-dead in the kernel)."""
+    return np.zeros(1, dtype=NP_STORAGE_DTYPES[dtype_name])
+
+
 def forward(
     *,
     x: np.ndarray,  # (B*T, C) kernel dtype (storage form)
@@ -37,12 +42,13 @@ def forward(
     output_channels: int,
     dtype_name: str,
     use_gelu: bool = False,
+    has_bias: bool = True,
     device: "Device | None" = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """(out, pre_gelu) through the registered matmul_fwd op.
 
-    out = x @ weight^T + bias; with use_gelu, pre_gelu holds that value and
-    out gets gelu(pre_gelu).
+    out = x @ weight^T (+ bias when has_bias); with use_gelu, pre_gelu holds
+    that value and out gets gelu(pre_gelu).
     """
     rows = batch_size * seq_len
     storage = NP_STORAGE_DTYPES[dtype_name]
@@ -52,6 +58,7 @@ def forward(
         if use_gelu
         else _dummy(dtype_name)
     )
+    bias_arg = bias if has_bias else _dummy_bias(dtype_name)
     out, pre_gelu = run_custom_op(
         kernel_name="matmul_fwd",
         args=[
@@ -59,10 +66,10 @@ def forward(
             MutableBuf(pre_gelu, dtype_name),
             ReadTensor(x, dtype_name),
             ReadTensor(weight, dtype_name),
-            ReadTensor(bias, dtype_name),
+            ReadTensor(bias_arg, dtype_name),
             *_scalars(batch_size, seq_len, channels, output_channels),
         ],
-        parameters={"use_gelu": use_gelu},
+        parameters={"use_gelu": use_gelu, "has_bias": has_bias},
         device=device,
     )
     return out, pre_gelu
@@ -80,6 +87,7 @@ def backward(
     dtype_name: str,
     use_gelu: bool = False,
     accumulate: bool = True,
+    has_bias: bool = True,
     pre_gelu: np.ndarray
     | None = None,  # (B*T, C) pre-activation of x; required when use_gelu
     d_input: np.ndarray | None = None,
@@ -92,7 +100,7 @@ def backward(
     With accumulate (llm.c beta=1 contract) the op ACCUMULATES into
     d_weight/d_bias; d_input is always overwritten. Pass zeroed buffers
     (the default) for plain gradients, or prior-step grads to test
-    accumulation.
+    accumulation. When has_bias=False, d_bias is a comptime-dead dummy.
     """
     rows = batch_size * seq_len
     storage = NP_STORAGE_DTYPES[dtype_name]
@@ -105,7 +113,11 @@ def backward(
     if d_weight is None:
         d_weight = np.zeros((output_channels, channels), dtype=storage)
     if d_bias is None:
-        d_bias = np.zeros(output_channels, dtype=storage)
+        d_bias = (
+            np.zeros(output_channels, dtype=storage)
+            if has_bias
+            else _dummy_bias(dtype_name)
+        )
     scratch = np.zeros((output_channels, rows), dtype=storage)
     d_input, d_weight, d_bias, _ = run_custom_op(
         kernel_name="matmul_bwd",
@@ -120,7 +132,11 @@ def backward(
             ReadTensor(pre_gelu, dtype_name),
             *_scalars(batch_size, seq_len, channels, output_channels),
         ],
-        parameters={"use_gelu": use_gelu, "accumulate": accumulate},
+        parameters={
+            "use_gelu": use_gelu,
+            "accumulate": accumulate,
+            "has_bias": has_bias,
+        },
         device=device,
     )
     return d_input, d_weight, d_bias

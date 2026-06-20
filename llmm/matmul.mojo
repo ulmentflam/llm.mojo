@@ -39,6 +39,7 @@ def matmul_fwd[
     dtype: DType,
     target: StaticString,
     use_gelu: Bool = False,
+    has_bias: Bool = True,
 ](
     out_ptr: MutKernelPtr[dtype],
     pre_gelu_ptr: MutKernelPtr[dtype],
@@ -77,7 +78,7 @@ def matmul_fwd[
 
     @parameter
     @always_inline
-    def epilogue[
+    def epilogue_with_bias[
         dtype: DType, width: SIMDSize, *, alignment: Int = 1
     ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
         var offset = idx[0] * out_channels + idx[1]
@@ -85,7 +86,6 @@ def matmul_fwd[
             val.cast[DType.float32]()
             + (bias_ptr + idx[1]).load[width=width]().cast[DType.float32]()
         )
-
         comptime if use_gelu:
             (pre_gelu_ptr + offset).store(v.cast[elem_dtype]())
             (out_ptr + offset).store(
@@ -94,9 +94,33 @@ def matmul_fwd[
         else:
             (out_ptr + offset).store(v.cast[elem_dtype]())
 
-    matmul[transpose_b=True, elementwise_lambda_fn=epilogue, target=target](
-        c, a, b, ctx=ctx
-    )
+    @parameter
+    @always_inline
+    def epilogue_no_bias[
+        dtype: DType, width: SIMDSize, *, alignment: Int = 1
+    ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
+        var offset = idx[0] * out_channels + idx[1]
+        var v = val.cast[DType.float32]()
+        comptime if use_gelu:
+            (pre_gelu_ptr + offset).store(v.cast[elem_dtype]())
+            (out_ptr + offset).store(
+                gelu[DType.float32, width](v).cast[elem_dtype]()
+            )
+        else:
+            (out_ptr + offset).store(v.cast[elem_dtype]())
+
+    comptime if has_bias:
+        matmul[
+            transpose_b=True,
+            elementwise_lambda_fn=epilogue_with_bias,
+            target=target,
+        ](c, a, b, ctx=ctx)
+    else:
+        matmul[
+            transpose_b=True,
+            elementwise_lambda_fn=epilogue_no_bias,
+            target=target,
+        ](c, a, b, ctx=ctx)
 
 
 @compiler.register("matmul_fwd")
@@ -106,6 +130,7 @@ struct MatmulFwd:
         dtype: DType,
         target: StaticString,
         use_gelu: Bool = False,
+        has_bias: Bool = True,
     ](
         output: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
         pre_gelu: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
@@ -140,10 +165,16 @@ struct MatmulFwd:
             raise Error(
                 "weight must have the same size as output_channels * channels"
             )
-        if bias.size() != Int(output_channels):
-            raise Error("bias must have the same size as output_channels")
+        comptime if has_bias:
+            if bias.size() != Int(output_channels):
+                raise Error("bias must have the same size as output_channels")
 
-        matmul_fwd[dtype, target, use_gelu=use_gelu](
+        matmul_fwd[
+            dtype,
+            target,
+            use_gelu=use_gelu,
+            has_bias=has_bias,
+        ](
             output.unsafe_ptr(),
             pre_gelu.unsafe_ptr(),
             x.unsafe_ptr(),
@@ -545,6 +576,7 @@ def matmul_bwd[
     target: StaticString,
     use_gelu: Bool = False,
     accumulate: Bool = True,
+    has_bias: Bool = True,
 ](
     d_input_ptr: MutKernelPtr[dtype],
     d_weight_ptr: MutKernelPtr[dtype],
@@ -560,14 +592,15 @@ def matmul_bwd[
     output_channels: Int64,
     ctx: DeviceContext,
 ) raises -> None:
-    matmul_bias_bwd[dtype, target, accumulate](
-        d_bias_ptr,
-        d_output_ptr,
-        batch_size,
-        seq_len,
-        output_channels,
-        ctx,
-    )
+    comptime if has_bias:
+        matmul_bias_bwd[dtype, target, accumulate](
+            d_bias_ptr,
+            d_output_ptr,
+            batch_size,
+            seq_len,
+            output_channels,
+            ctx,
+        )
     matmul_d_input_bwd[dtype, target, use_gelu](
         d_input_ptr,
         d_output_ptr,
@@ -598,7 +631,9 @@ def matmul_bwd[
 
 
 @always_inline
-def _check_bwd_sizes(
+def _check_bwd_sizes[
+    has_bias: Bool = True,
+](
     d_input_size: Int,
     d_weight_size: Int,
     d_bias_size: Int,
@@ -622,8 +657,9 @@ def _check_bwd_sizes(
         raise Error(
             "d_weight must have the same size as output_channels * channels"
         )
-    if d_bias_size != Int(output_channels):
-        raise Error("d_bias must have the same size as output_channels")
+    comptime if has_bias:
+        if d_bias_size != Int(output_channels):
+            raise Error("d_bias must have the same size as output_channels")
     if d_output_size != rows_x_out:
         raise Error(
             "d_output must have the same size as batch_size * seq_len *"
@@ -652,6 +688,7 @@ struct MatmulBwd:
         target: StaticString,
         use_gelu: Bool = False,
         accumulate: Bool = True,
+        has_bias: Bool = True,
     ](
         d_input: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
         d_weight: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
@@ -667,7 +704,7 @@ struct MatmulBwd:
         output_channels: Int64,
         ctx: DeviceContext,
     ) capturing raises:
-        _check_bwd_sizes(
+        _check_bwd_sizes[has_bias=has_bias](
             d_input.size(),
             d_weight.size(),
             d_bias.size(),
@@ -691,7 +728,13 @@ struct MatmulBwd:
                     "pre_gelu must have the same size as batch_size * seq_len"
                     " * channels"
                 )
-        matmul_bwd[dtype, target, use_gelu=use_gelu, accumulate=accumulate](
+        matmul_bwd[
+            dtype,
+            target,
+            use_gelu=use_gelu,
+            accumulate=accumulate,
+            has_bias=has_bias,
+        ](
             d_input.unsafe_ptr(),
             d_weight.unsafe_ptr(),
             d_bias.unsafe_ptr(),

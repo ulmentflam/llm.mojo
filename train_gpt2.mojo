@@ -333,7 +333,6 @@ struct GPT2[target: StaticString]:
     var grad_acts_buf: HostBuffer[GPT2_DTYPE]
     var inputs_buf: HostBuffer[DType.int32]
     var targets_buf: HostBuffer[DType.int32]
-    var dummy_bias_buf: HostBuffer[GPT2_DTYPE]
     var bucket_info_buf: HostBuffer[DType.int32]
     var workload_indices_buf: HostBuffer[DType.int32]
 
@@ -438,7 +437,6 @@ struct GPT2[target: StaticString]:
         self.grad_acts_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
         self.inputs_buf = ctx.enqueue_create_host_buffer[DType.int32](1)
         self.targets_buf = ctx.enqueue_create_host_buffer[DType.int32](1)
-        self.dummy_bias_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
         self.bucket_info_buf = ctx.enqueue_create_host_buffer[DType.int32](1)
         self.workload_indices_buf = ctx.enqueue_create_host_buffer[DType.int32](
             1
@@ -474,13 +472,6 @@ struct GPT2[target: StaticString]:
             padded_vocab_size=Int(model_header.load(7)),
         )
         model_header.free()
-
-        self.dummy_bias_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](
-            self.config.padded_vocab_size
-        )
-        var dummy_bias_ptr = self.dummy_bias_buf.unsafe_ptr()
-        for i in range(self.config.padded_vocab_size):
-            dummy_bias_ptr.store(i, 0.0)
 
         # Allocate parameters.
         self.allocate_parameters(model_file)
@@ -1025,15 +1016,13 @@ struct GPT2[target: StaticString]:
             self.ctx,
         )
 
-        # Output Logits
-        matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
+        # Output Logits (wte has no bias).
+        matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
             as_mut_kernel[GPT2_DTYPE](self.acts.logits),
             as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
             as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
             as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
-            rebind[ImmutKernelPtr[GPT2_DTYPE]](
-                self.dummy_bias_buf.unsafe_ptr().as_unsafe_any_origin()
-            ),
+            as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
             Int64(batch_size),
             Int64(seq_len),
             Int64(channels),
@@ -1121,8 +1110,8 @@ struct GPT2[target: StaticString]:
             self.ctx,
         )
 
-        # LM head matmul backward.
-        matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
+        # LM head matmul backward (wte has no bias).
+        matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
             as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
             as_mut_kernel[GPT2_DTYPE](self.grads.wte),
             as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
@@ -1581,7 +1570,7 @@ def train[target: StaticString]() raises:
         )
         model.backward()
         model.update(
-            UInt32(step), learning_rate_scheduler.get_learning_rate(step)
+            UInt32(step + 1), learning_rate_scheduler.get_learning_rate(step)
         )
         var elapsed_time = Float64(global_perf_counter_ns() - start_time) / 1e9
         elapsed_time_ms_total += elapsed_time
@@ -1602,7 +1591,20 @@ def train[target: StaticString]() raises:
 
 
 def main() raises:
-    comptime if has_accelerator() and not has_apple_gpu_accelerator():
+    comptime if has_apple_gpu_accelerator():
+        print("===============================================================================")
+        print("WARNING: Apple Silicon GPU training is disabled — using CPU instead.")
+        print("")
+        print("An Apple Metal accelerator is present, but this trainer does not run on it yet.")
+        print("Known blockers on Apple Silicon today:")
+        print("  • Metal / KGEN: several llmm GPU kernels compile in Mojo but fail at the")
+        print("    metallib stage (\"could not elaborate the generated KGEN\") or miscompile")
+        print("    when lowered through MAX's Apple-GPU path.")
+        print("")
+        print("CPU training is correct and fast enough for dev; GPU support here is WIP.")
+        print("===============================================================================")
+        train["cpu"]()
+    elif has_accelerator():
         train["gpu"]()
     else:
         train["cpu"]()

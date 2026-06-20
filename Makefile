@@ -29,11 +29,11 @@ help:
 	@echo "Usage: make <target>"
 	@echo ""
 	@echo "Quality gates:"
-	@echo "  check         Run lint, typecheck, build-mojo, and build train_gpt2"
+	@echo "  check         Run lint (incl. typecheck), build-mojo, and build train_gpt2"
 	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
 	@echo "  build-train   Alias for build"
 	@echo "  run-train     Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
-	@echo "  lint          Lint Python, Mojo, C, CUDA, and LaTeX sources"
+	@echo "  lint          Lint Python, Mojo, C, CUDA, LaTeX sources, and typecheck"
 	@echo "  lint-python   Lint Python sources with ruff"
 	@echo "  lint-mojo     Lint Mojo sources with mojo format --check"
 	@echo "  lint-c        Lint C sources with clang-format and clang-tidy"
@@ -64,7 +64,7 @@ help:
 	@echo "  help          Show this help message"
 	@echo "  clean         Remove cache directories"
 
-check: lint typecheck build-mojo build
+check: lint build-mojo build
 
 # Compiles the GPT-2 training binary. MOJO_PYTHON_LIBRARY must be set because
 # DataLoader uses Python glob; pixi run supplies the Modular std/toolchain env.
@@ -89,7 +89,7 @@ build-mojo:
 		echo "No llmm package found, skipping mojo build."; \
 	fi
 
-lint: lint-python lint-mojo lint-c lint-cuda lint-latex
+lint: lint-python lint-mojo lint-c lint-cuda lint-latex typecheck
 
 lint-python:
 	@uvx ruff check $(PYTHON_PATHS)
