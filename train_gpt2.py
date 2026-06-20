@@ -966,6 +966,7 @@ def write_tensor(
     write_fn(model_tensors["transformer.wpe.weight"], file)  # [T, C]
     for i in range(L):  # [L, C]
         write_fn(model_tensors[f"transformer.h.{i}.ln_1.gamma"], file)
+    for i in range(L):  # [L, C]
         write_fn(model_tensors[f"transformer.h.{i}.ln_1.beta"], file)
     for i in range(L):  # [L, 3C, C]
         write_fn(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
@@ -975,7 +976,9 @@ def write_tensor(
         write_fn(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L):  # [L, C]
         write_fn(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+    for i in range(L):  # [L, C]
         write_fn(model_tensors[f"transformer.h.{i}.ln_2.gamma"], file)
+    for i in range(L):  # [L, C]
         write_fn(model_tensors[f"transformer.h.{i}.ln_2.beta"], file)
     for i in range(L):  # [L, 4C, C]
         write_fn(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
@@ -1198,7 +1201,7 @@ def capture_activations(model: GPT) -> tuple[dict[str, Tensor], list]:
 if __name__ == "__main__":
     import time
     import argparse
-    import tiktoken
+    from data.utils import get_gpt2_encoding
 
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name()
@@ -1451,7 +1454,7 @@ if __name__ == "__main__":
     print_zero_rank(f"Using Flash Attention: {FLASH}")
 
     # Init and write the tokenizer
-    enc = tiktoken.get_encoding("gpt2")
+    enc = get_gpt2_encoding()
     if master_process and args.write_tensors:
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
@@ -1740,7 +1743,10 @@ if __name__ == "__main__":
 
     # Print the average of the last 20 timings to get somting smooth-esque
     timings = timings[-20:]
-    print_zero_rank(f"Average of last 20 timings: {sum(timings) / len(timings):.2f} ms")
+    if timings:
+        print_zero_rank(
+            f"Average of last 20 timings: {sum(timings) / len(timings):.2f} ms"
+        )
     print_zero_rank(
         f"Peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB"
     )

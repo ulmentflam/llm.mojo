@@ -2,8 +2,10 @@ from std.gpu.host import DeviceContext, HostBuffer
 from std.memory import alloc, UnsafePointer, memcpy, memset_zero
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host.info import is_cpu, is_gpu
+from std.sys import has_accelerator, has_apple_gpu_accelerator
 
 from llmm.io import read_and_copy
+from llmm.dataloader import DataLoader
 from llmm.encoder import encoder_fwd, encoder_bwd, build_wte_buckets
 from llmm.layernorm import (
     layernorm_fwd,
@@ -18,6 +20,8 @@ from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
 from llmm.global_norm import global_norm_squared
 from llmm.adamw import adamw_update, AdamWConfig
 from llmm.fused_classifier import fused_classifier
+from llmm.scheduler import LearningRateScheduler
+from llmm.tokenizer import Tokenizer
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1015,7 +1019,7 @@ struct GPT2[target: StaticString]:
 
             # Attention Forward (handles QKV Split/Transpose and Merge Heads internally).
             var head_dim = channels // num_heads
-            attention_fwd[GPT2_DTYPE, Self.target](
+            attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
                 l_qkv,
                 l_q,
                 l_k,
@@ -1131,6 +1135,7 @@ struct GPT2[target: StaticString]:
             Int64(vocab_size_padded),
             self.ctx,
         )
+        self.ctx.synchronize()
 
         # Fused classifier (cross entropy loss).
         if targets != NULL_INT32_PTR:
@@ -1155,7 +1160,7 @@ struct GPT2[target: StaticString]:
             var total_loss: Float32 = 0.0
             var count = batch_size * seq_len
             for i in range(count):
-                total_loss += self.acts.losses.load(i)
+                total_loss += self.acts.losses.load(i).cast[DType.float32]()
             self.mean_loss = total_loss / Float32(count)
 
     def zero_gradients(mut self):
@@ -1423,7 +1428,7 @@ struct GPT2[target: StaticString]:
             )
 
             # Attention backward.
-            attention_bwd[GPT2_DTYPE, Self.target](
+            attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
                 d_l_qkv,
                 d_l_q,
                 d_l_k,
@@ -1542,3 +1547,106 @@ struct GPT2[target: StaticString]:
             config,
             self.ctx,
         )
+
+
+# ===----------------------------------------------------------------------=== #
+# The Main Training Loop!
+# ===----------------------------------------------------------------------=== #
+
+
+def train[target: StaticString]() raises:
+    var ctx = DeviceContext()
+
+    # Build the GPT-2 model from my checkpoint.
+    var model = GPT2[target]("gpt2_124M.bin", ctx)
+
+    # Build the dataloaders from tokens files.
+    # TODO: Add tiny stories dataset.
+    var tiny_shakespeare_train = (
+        "./data/.tinyshakespeare/tiny_shakespeare_train.bin"
+    )
+    var tiny_shakespeare_val = (
+        "./data/.tinyshakespeare/tiny_shakespeare_val.bin"
+    )
+
+    var train_tokens = tiny_shakespeare_train
+    var val_tokens = tiny_shakespeare_val
+
+    try:
+        var file = open(tiny_shakespeare_train, "r")
+        file.close()
+    except:
+        raise Error("Failed to open train tokens file: " + train_tokens)
+
+    comptime BATCH_SIZE = 4
+    comptime SEQ_LEN = 64
+
+    var train_loader = DataLoader(train_tokens, BATCH_SIZE, SEQ_LEN)
+    print("Loaded train tokens from " + train_tokens)
+    print("Number of tokens: " + String(train_loader.num_tokens))
+    var val_loader = DataLoader(val_tokens, BATCH_SIZE, SEQ_LEN)
+    print("Loaded val tokens from " + val_tokens)
+    print("Number of tokens: " + String(val_loader.num_tokens))
+
+    # Build the tokenizer from the tokens file.
+    var tokenizer = Tokenizer("gpt2_tokenizer.bin")
+    print("Loaded tokenizer from " + "gpt2_tokenizer.bin")
+
+    # Build the learning rate scheduler.
+    var num_iters = 1000
+    var scheduler = LearningRateScheduler(
+        "cosine",
+        learning_rate=Scalar[DType.float32](1e-4),
+        warmup_steps=100,
+        train_num_batches=num_iters,
+        final_learning_rate_fraction=Scalar[DType.float32](1e-2),
+    )
+
+    # Initialize some memory for generating samples from the model.
+    var rng_state = 1337
+    var gen_max_length = 64
+    var gen_tokens_buffer = alloc[Scalar[DType.int32]](
+        gen_max_length
+    ).as_unsafe_any_origin()
+    var gen_tokens = gen_tokens_buffer
+
+    #####################################################################################
+    # Training Loop
+    #####################################################################################
+
+    var val_loss_every = 10
+    var val_max_steps = 10
+    var sample_every = 10
+
+    var elapsed_time_ms_total = 0.0
+
+    for step in range(num_iters + 1):
+        # Occasionally estimate validation loss.
+        if val_loss_every > 0 and step % val_loss_every == 0:
+            var val_loss = Float32(0.0)
+            val_loader.reset()
+            for _ in range(val_max_steps):
+                val_loader.next_batch()
+                model.forward(
+                    val_loader.inputs, val_loader.targets, BATCH_SIZE, SEQ_LEN
+                )
+                val_loss += model.mean_loss
+            val_loss /= Float32(val_max_steps)
+            print("Validation loss: " + String(val_loss))
+
+        # TODO: sample from model using tokenizer when step % sample_every == 0.
+
+        if step == num_iters:
+            break
+
+        # TODO: training step (next_batch, forward, backward, grad clip, update).
+
+    train_loader.close()
+    val_loader.close()
+
+
+def main() raises:
+    comptime if has_accelerator() and not has_apple_gpu_accelerator():
+        train["gpu"]()
+    else:
+        train["cpu"]()

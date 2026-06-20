@@ -36,6 +36,9 @@ comptime TAU = Scalar[DType.float32](
     8.0
 )  # FlashAttention 4 deferred-max threshold
 comptime LN_2 = Scalar[DType.float32](0.69314718056)  # ln(2)
+comptime LOG2_EXP_MIN = Scalar[DType.float32](
+    -127.0
+)  # FlashAttention 4: ldexp/ex2 emulation clamps here
 comptime C3 = Scalar[DType.float32](
     0.009618129
 )  # FlashAttention 4 polynomial coefficient
@@ -66,6 +69,9 @@ def software_emulated_exp[
         if x <= Scalar[DType.float32](-103.0):
             return Scalar[DType.float32](0.0)
         var log2_input = x / LN_2
+        # FA4 ex2_emulation clamps the log2 exponent before range reduction.
+        # Mojo ldexp returns garbage for exponents below -128.
+        log2_input = max(log2_input, LOG2_EXP_MIN)
         var integer_part = Int(floor(log2_input))
         var fractional_part = log2_input - Float32(integer_part)
         var polynomial = fma(

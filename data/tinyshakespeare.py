@@ -12,10 +12,9 @@ The output is written to a newly created tinyshakespear/ folder.
 import os
 import argparse
 
-import tiktoken
 from transformers import AutoTokenizer
 
-from utils import download_file, write_datafile
+from utils import download_file, get_gpt2_encoding, write_datafile
 
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".tinyshakespeare")
 
@@ -41,7 +40,7 @@ def download() -> None:
 
 def tokenize(model_desc: str = "gpt-2") -> None:
     if model_desc == "gpt-2":
-        encoder = tiktoken.get_encoding("gpt2")
+        encoder = get_gpt2_encoding()
 
         def encode(s: str) -> list[int]:
             return encoder.encode(s)

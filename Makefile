@@ -4,15 +4,22 @@ PYTHON_PATHS := train_gpt2.py tests data
 LATEX_SOURCES := docs/backprop.tex
  
 # Auto-detect python library for Mojo standard library python interop.
-# Using relative paths avoids issues with spaces in absolute workspace paths (e.g. iCloud).
-MOJO_PYTHON_LIBRARY ?= $(shell find .pixi/envs/default/lib -maxdepth 1 -name "libpython3.*.dylib" -o -name "libpython3.*.so" 2>/dev/null | head -n 1)
+# Keep this a repo-relative path — absolute iCloud paths contain spaces and
+# break Mojo's libpython discovery if MOJO_PYTHON_LIBRARY is unset at runtime.
+MOJO_PYTHON_LIBRARY ?= $(shell find .pixi/envs/default/lib -maxdepth 1 \( -name 'libpython3*.dylib' -o -name 'libpython3*.so' \) -print -quit 2>/dev/null)
 export MOJO_PYTHON_LIBRARY
+
+TRAIN_MOJO_SRC := train_gpt2.mojo
+TRAIN_BIN := build/train_gpt2
+TRAIN_RUNNER := scripts/run_train_gpt2.sh
+MOJO_INCLUDES := -I .
+LLMM_SOURCES := $(shell find llmm -name '*.mojo' 2>/dev/null)
 
 SHELL := /bin/bash
 
 .PHONY: help lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        typecheck check clean build-mojo \
+        typecheck check clean build build-mojo build-train run-train \
         test test-python test-mojo test-fixtures \
         docs docs-clean
 
@@ -23,6 +30,9 @@ help:
 	@echo ""
 	@echo "Quality gates:"
 	@echo "  check         Run lint, typecheck, and build-mojo"
+	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
+	@echo "  build-train   Alias for build"
+	@echo "  run-train     Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
 	@echo "  lint          Lint Python, Mojo, C, CUDA, and LaTeX sources"
 	@echo "  lint-python   Lint Python sources with ruff"
 	@echo "  lint-mojo     Lint Mojo sources with mojo format --check"
@@ -55,6 +65,17 @@ help:
 	@echo "  clean         Remove cache directories"
 
 check: lint typecheck build-mojo
+
+# Compiles the GPT-2 training binary. MOJO_PYTHON_LIBRARY must be set because
+# DataLoader uses Python glob; pixi run supplies the Modular std/toolchain env.
+build build-train: $(TRAIN_BIN)
+
+$(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build $(MOJO_INCLUDES) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
+
+run-train: $(TRAIN_BIN) $(TRAIN_RUNNER)
+	@$(TRAIN_RUNNER)
 
 # Builds llmm.mojopkg into the persistent cache the pytest suite consumes
 # (tests/.mef_cache/<source-fingerprint>/llmm.mojopkg, via the bridge so
@@ -215,3 +236,4 @@ docs-clean:
 
 clean:
 	rm -rf .ruff_cache .pyrefly_cache tests/fixtures tests/.mef_cache
+	rm -f $(TRAIN_BIN)

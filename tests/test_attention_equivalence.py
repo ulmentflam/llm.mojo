@@ -150,6 +150,7 @@ KERNEL_PARAM_CASES: tuple[KernelParams, ...] = (
 
 # FlashAttention-4 softmax helpers (must match llmm/attention.mojo).
 _LN_2 = np.float32(0.69314718056)
+_LOG2_EXP_MIN = np.float32(-127.0)
 _C3 = np.float32(0.009618129)
 _C2 = np.float32(0.055504108)
 _C1 = np.float32(0.240179544)
@@ -165,6 +166,7 @@ def _kernel_exp(x: float | np.floating, *, use_soft_exp: bool) -> np.float32:
     if not use_soft_exp:
         return np.float32(np.exp(xf))
     log2_input = xf / _LN_2
+    log2_input = np.float32(max(log2_input, _LOG2_EXP_MIN))
     integer_part = np.floor(log2_input)
     fractional_part = log2_input - integer_part
     polynomial = np.float32(
@@ -389,6 +391,107 @@ def _assert_matches_reference(
         atol=l_tol["atol"],
         rtol=l_tol["rtol"],
         err_msg=f"{err_prefix}: log-sum-exp diverged from reference",
+    )
+
+
+def _make_extreme_negative_score_qkv(
+    batch_size: int,
+    num_heads: int,
+    seq_len: int,
+    head_dim: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build Q/K with dot products that yield very negative attention scores.
+
+    Align both on axis 0 so score_ij = scale * k_ij[0] with q_ij[0] == 1.
+    Causal keys per query sweep from +30 down to -92, matching the spread
+    seen in GPT-2 layer-4 head 11 that exposed the soft_exp ldexp bug.
+    """
+    scale = np.float32(1.0 / np.sqrt(head_dim))
+    q = np.zeros((batch_size, num_heads, seq_len, head_dim), dtype=np.float32)
+    k = np.zeros((batch_size, num_heads, seq_len, head_dim), dtype=np.float32)
+    v = np.zeros((batch_size, num_heads, seq_len, head_dim), dtype=np.float32)
+
+    max_score = np.float32(30.0)
+    min_score = np.float32(-92.0)
+
+    for bi in range(batch_size):
+        for hi in range(num_heads):
+            for ti in range(seq_len):
+                q[bi, hi, ti, 0] = np.float32(1.0)
+                for kj in range(ti + 1):
+                    if ti == 0:
+                        target_score = max_score
+                    else:
+                        frac = np.float32(kj) / np.float32(ti)
+                        target_score = max_score + frac * (min_score - max_score)
+                    k[bi, hi, kj, 0] = target_score / scale
+                    v[bi, hi, kj, :] = np.float32(kj + 1)
+
+    return q, k, v
+
+
+def test_kernel_exp_large_negative_delta_is_finite():
+    """Regression scalar: exp inputs near -91 must not hit broken Mojo ldexp paths."""
+    y = _kernel_exp(np.float32(-91.41362), use_soft_exp=True)
+    assert np.isfinite(y)
+    assert y >= np.float32(0.0)
+    assert y < np.float32(1e-30)
+
+
+def test_soft_exp_finite_on_extreme_negative_score_deltas():
+    """Regression: FA4 soft_exp must stay finite on wide causal score spreads.
+
+    Before the log2 clamp (FA4 ex2_emulation uses max(x, -127) in log2 space),
+    Mojo ldexp returned garbage for exponents below -128 and attention_fwd
+    produced NaNs on real GPT-2 activations (layer-4 head 11).
+    """
+    case = Case(
+        "fp32_soft_exp_extreme_scores",
+        batch_size=4,
+        num_heads=12,
+        seq_len=64,
+        head_dim=64,
+        dtype="float32",
+        seed=0,
+    )
+    q, k, v = _make_extreme_negative_score_qkv(
+        case.batch_size,
+        case.num_heads,
+        case.seq_len,
+        case.head_dim,
+    )
+
+    expected_out, expected_l = _reference_kernel_path(
+        q,
+        k,
+        v,
+        dtype_name=case.dtype,
+        use_soft_exp=True,
+        use_conditional_rescale=True,
+    )
+
+    got_out_storage, got_l = _run_kernel(
+        case,
+        q,
+        k,
+        v,
+        use_soft_exp=True,
+        use_conditional_rescale=True,
+    )
+
+    got_out = from_storage(got_out_storage, case.dtype).reshape(expected_out.shape)
+    assert np.all(np.isfinite(got_out)), (
+        "soft_exp attention output contains non-finite values"
+    )
+    assert np.all(np.isfinite(got_l)), "soft_exp log-sum-exp contains non-finite values"
+
+    _assert_matches_reference(
+        case,
+        got_out_storage,
+        got_l,
+        expected_out,
+        expected_l,
+        err_prefix=case.name,
     )
 
 

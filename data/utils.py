@@ -2,7 +2,10 @@
 Common utilities for data processing.
 """
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import tiktoken
 
 # pyrefly: ignore[untyped-import]  requests ships no stubs; types-requests
 # is not in the pixi env.
@@ -11,6 +14,18 @@ import numpy as np
 
 # pyrefly: ignore[untyped-import]  same for types-tqdm.
 from tqdm import tqdm
+
+
+def get_gpt2_encoding() -> "tiktoken.Encoding":
+    """Return the GPT-2 tiktoken encoding without scanning plugin modules.
+
+    iCloud-synced pixi envs can pick up duplicate ``tiktoken_ext/openai_public *.py``
+    copies, which makes ``tiktoken.get_encoding("gpt2")`` raise on duplicate names.
+    """
+    import tiktoken
+    from tiktoken_ext import openai_public
+
+    return tiktoken.Encoding(**openai_public.ENCODING_CONSTRUCTORS["gpt2"]())
 
 
 def download_file(url: str, output_path: str) -> None:
