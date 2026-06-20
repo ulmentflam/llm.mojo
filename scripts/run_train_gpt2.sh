@@ -19,7 +19,7 @@ fi
 
 if [ -z "${MOJO_PYTHON_LIBRARY:-}" ]; then
 	echo "error: libpython not found under .pixi/envs/default/lib" >&2
-	echo "hint: run 'pixi install' from the repo root" >&2
+	echo "hint: run 'make install' from the repo root" >&2
 	exit 1
 fi
 

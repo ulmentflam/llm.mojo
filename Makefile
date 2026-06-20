@@ -17,7 +17,7 @@ LLMM_SOURCES := $(shell find llmm -name '*.mojo' 2>/dev/null)
 
 SHELL := /bin/bash
 
-.PHONY: help lint lint-python lint-mojo lint-c lint-cuda lint-latex \
+.PHONY: help install update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build build-mojo build-train run-train \
         test test-python test-mojo test-fixtures \
@@ -27,6 +27,10 @@ SHELL := /bin/bash
 
 help:
 	@echo "Usage: make <target>"
+	@echo ""
+	@echo "Setup:"
+	@echo "  install       Install pixi dependencies (first-time setup)"
+	@echo "  update        Update pixi dependencies and refresh pixi.lock"
 	@echo ""
 	@echo "Quality gates:"
 	@echo "  check         Run lint (incl. typecheck), build-mojo, and build train_gpt2"
@@ -63,6 +67,12 @@ help:
 	@echo "Housekeeping:"
 	@echo "  help          Show this help message"
 	@echo "  clean         Remove cache directories"
+
+install:
+	pixi install
+
+update:
+	pixi update
 
 check: lint build-mojo build
 
