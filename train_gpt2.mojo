@@ -1493,7 +1493,7 @@ def train[target: StaticString]() raises:
     print("Loaded tokenizer from " + "gpt2_tokenizer.bin")
 
     # Build the learning rate scheduler.
-    var num_iters = 1000
+    var num_iters = 40
     var learning_rate_scheduler = LearningRateScheduler(
         "constant",
         learning_rate=Scalar[DType.float32](1e-4),
@@ -1516,7 +1516,7 @@ def train[target: StaticString]() raises:
     var val_loss_every = 10
     var val_max_steps = 10
     var grad_accum_steps = 10
-    var sample_every = 10
+    var sample_every = 20
 
     var elapsed_time_ms_total = 0.0
 
@@ -1592,19 +1592,40 @@ def train[target: StaticString]() raises:
 
 def main() raises:
     comptime if has_apple_gpu_accelerator():
-        print("===============================================================================")
-        print("WARNING: Apple Silicon GPU training is disabled — using CPU instead.")
+        print(
+            "==============================================================================="
+        )
+        print(
+            "WARNING: Apple Silicon GPU training is disabled — using CPU"
+            " instead."
+        )
         print("")
-        print("An Apple Metal accelerator is present, but this trainer does not run on it yet.")
+        print(
+            "An Apple Metal accelerator is present, but this trainer does not"
+            " run on it yet."
+        )
         print("Known blockers on Apple Silicon today:")
-        print("  • Metal / KGEN: several llmm GPU kernels compile in Mojo but fail at the")
-        print("    metallib stage (\"could not elaborate the generated KGEN\") or miscompile")
+        print(
+            "  • Metal / KGEN: several llmm GPU kernels compile in Mojo but"
+            " fail at the"
+        )
+        print(
+            '    metallib stage ("could not elaborate the generated KGEN") or'
+            " miscompile"
+        )
         print("    when lowered through MAX's Apple-GPU path.")
         print("")
-        print("CPU training is correct and fast enough for dev; GPU support here is WIP.")
-        print("===============================================================================")
+        print(
+            "CPU training is correct and fast enough for dev; GPU support here"
+            " is WIP."
+        )
+        print(
+            "==============================================================================="
+        )
         train["cpu"]()
     elif has_accelerator():
+        print("GPU detected — training on GPU.")
         train["gpu"]()
     else:
+        print("No GPU detected — training on CPU.")
         train["cpu"]()
