@@ -1,6 +1,8 @@
 from std.python import Python
 from std.memory import alloc, UnsafePointer
 
+from llmm.sampler import random_permutation
+
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
@@ -11,38 +13,9 @@ comptime GPT2_MAGIC = 20240520
 comptime LLAMA3_MAGIC = 20240801
 
 
-comptime RU32_HEX = 0x2545F4914F6CDD1D
 comptime GLOB = "glob"
 comptime RNG_SEED = 42  # The meaning of life, the universe, and everything.
 
-# ===----------------------------------------------------------------------=== #
-# Utility Functions
-# ===----------------------------------------------------------------------=== #
-
-
-def _random_u32(mut state: UInt64) -> UInt32:
-    state ^= (
-        state >> 12
-    )  # Magic numbers from the Karpathy's llm.c implementation.
-    state ^= (
-        state << 25
-    )  # Magic numbers from the Karpathy's llm.c implementation.
-    state ^= (
-        state >> 27
-    )  # Magic numbers from the Karpathy's llm.c implementation.
-    return ((state * RU32_HEX) >> 32).cast[DType.uint32]()
-
-
-def _random_permutation(mut arr: List[Int], mut state: UInt64):
-    var n = len(arr)
-    for i in range(n - 1, 0, -1):
-        var r = Int(_random_u32(state) % UInt32(i + 1))
-        var tmp = arr[i]
-        arr[i] = arr[r]
-        arr[r] = tmp
-
-
-# NOTE: These utility functions might be needed elsewhere, as the Karpathy's AdamW also leveraged similar random numbers.
 
 # ===----------------------------------------------------------------------=== #
 # DataLoader
@@ -256,14 +229,14 @@ struct DataLoader:
         self.intra_shard_indices = List[Int]()
         for i in range(self.shard_num_samples):
             self.intra_shard_indices.append(i)
-        _random_permutation(self.intra_shard_indices, self.shuffle_rng_state)
+        random_permutation(self.intra_shard_indices, self.shuffle_rng_state)
 
     def reset(mut self) raises:
         self.current_shard_idx = 0
         self.current_sample_idx = 0
 
         if self.should_shuffle:
-            _random_permutation(self.shard_indices, self.shuffle_rng_state)
+            random_permutation(self.shard_indices, self.shuffle_rng_state)
 
         _ = self._load_shard(self.current_shard_idx)
 

@@ -14,7 +14,7 @@ import pytest
 # suite) dominate a cold run. The bridge persists every compiled model as
 # MEF under tests/.mef_cache/ (see tests/_max_bridge.py), so a compile is
 # paid once per kernel-source change, not once per run; warm runs load in
-# milliseconds. Packaging llmm.mojopkg is also lazy and cached there.
+# milliseconds. Precompiling llmm.mojoc is also lazy and cached there.
 #
 # Parallelism: not worth it — run the suite sequentially. With a warm MEF
 # cache there is nothing left for xdist to parallelize but kernel

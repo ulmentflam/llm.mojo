@@ -40,7 +40,7 @@ help:
 	@echo "  lint-cuda     Lint CUDA sources with clang-format and clang-tidy"
 	@echo "  lint-latex    Lint LaTeX sources with latexindent (check only)"
 	@echo "  typecheck     Type-check Python sources with pyrefly"
-	@echo "  build-mojo    Compile llmm.mojopkg into the test cache; surfaces Mojo warnings"
+	@echo "  build-mojo    Precompile llmm.mojoc into the test cache; surfaces Mojo warnings"
 	@echo ""
 	@echo "Formatting:"
 	@echo "  format        Format Python, Mojo, C, CUDA, and LaTeX sources"
@@ -77,8 +77,8 @@ $(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 run-train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@$(TRAIN_RUNNER)
 
-# Builds llmm.mojopkg into the persistent cache the pytest suite consumes
-# (tests/.mef_cache/<source-fingerprint>/llmm.mojopkg, via the bridge so
+# Builds llmm.mojoc into the persistent cache the pytest suite consumes
+# (tests/.mef_cache/<source-fingerprint>/llmm.mojoc, via the bridge so
 # the fingerprint logic lives in one place). Content-addressed: a no-op
 # when sources are unchanged, so chaining it before test-python costs
 # nothing on warm runs while keeping the two steps independently runnable.

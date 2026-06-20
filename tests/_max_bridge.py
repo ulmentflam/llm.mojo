@@ -54,9 +54,9 @@ if TYPE_CHECKING:
 
 
 # Source dir by default; `_ensure_packaged` reassigns this to a prebuilt
-# .mojopkg before any compile so MAX never repackages the sources into its
+# .mojoc before any compile so MAX never repackages the sources into its
 # shared (and race-prone) temp mojo_pkg cache. Compiling custom_extensions
-# from the SOURCE dir makes MAX repackage it into one shared temp .mojopkg
+# from the SOURCE dir makes MAX repackage it into one shared temp package
 # (/var/folders/.../.modular_*/mojo_pkg/, content-hashed name) on every
 # Graph build, rewritten non-atomically and read back immediately. That
 # file is the root of the nondeterministic "Failed to compile the model"
@@ -66,6 +66,8 @@ if TYPE_CHECKING:
 # package is loaded directly — the temp dir is never created (verified).
 MOJO_KERNELS_DIR = Path(__file__).resolve().parents[1] / "llmm"
 _SOURCE_KERNELS_DIR = MOJO_KERNELS_DIR
+_PKG_SUFFIX = ".mojoc"
+_PKG_FILENAME = f"llmm{_PKG_SUFFIX}"
 
 # Persistent compiled-model cache (tests/.mef_cache/<fingerprint>/). A MAX
 # model compile costs 4-10s per (kernel, dtype, parameters) and the suite
@@ -77,10 +79,10 @@ _SOURCE_KERNELS_DIR = MOJO_KERNELS_DIR
 # name hashes the llmm/*.mojo sources, the MAX version, the mojo binary,
 # and _MEF_SCHEMA: editing a kernel lands in a fresh dir, and stale dirs
 # are pruned. Set LLMM_DISABLE_MEF_CACHE=1 to force full recompiles.
-# `mojo package` output is NOT bit-stable across identical sources
+# `mojo precompile` output is NOT bit-stable across identical sources
 # (verified), hence hashing sources rather than the package.
 _MEF_CACHE_ROOT = Path(__file__).resolve().parent / ".mef_cache"
-_MEF_SCHEMA = 1  # bump when _compile_model's graph construction changes
+_MEF_SCHEMA = 2  # bump when _compile_model's graph construction changes
 _MEF_CACHE_DIR: "Path | None | Literal[False]" = False  # False = unresolved
 
 
@@ -122,7 +124,7 @@ def _mef_cache_dir() -> "Path | None":
 
 
 def _ensure_packaged(echo_warnings: bool = False) -> Path:
-    """Build llmm.mojopkg once (per kernel-source state) and reuse it.
+    """Precompile llmm.mojoc once (per kernel-source state) and reuse it.
 
     Lazy: a fully MEF-cached run never compiles a graph, so it never pays
     for packaging either. The package lands in the fingerprint cache dir
@@ -134,40 +136,43 @@ def _ensure_packaged(echo_warnings: bool = False) -> Path:
     warnings are forwarded to stderr instead of swallowed.
     """
     global MOJO_KERNELS_DIR
-    if MOJO_KERNELS_DIR.suffix == ".mojopkg" and MOJO_KERNELS_DIR.exists():
+    if MOJO_KERNELS_DIR.suffix == _PKG_SUFFIX and MOJO_KERNELS_DIR.exists():
         return MOJO_KERNELS_DIR
     cache = _mef_cache_dir()
     if cache is None:
-        target = Path(tempfile.mkdtemp(prefix="llmm_pkg_")) / "llmm.mojopkg"
+        target = Path(tempfile.mkdtemp(prefix="llmm_pkg_")) / _PKG_FILENAME
     else:
-        target = cache / "llmm.mojopkg"
+        target = cache / _PKG_FILENAME
         if target.exists():
             MOJO_KERNELS_DIR = target
             return target
     # The package embeds its module name from the build-time FILENAME
-    # (a `llmm.tmp123.mojopkg` build leaves kernels under `llmm.tmp123.*`,
+    # (a mismatched filename leaves kernels under the wrong module prefix,
     # which MAX's generated code then can't resolve), so the temp build
-    # must be named exactly llmm.mojopkg; uniqueness comes from a
+    # must be named exactly llmm.mojoc; uniqueness comes from a
     # per-process scratch dir beside the target (same filesystem, so the
     # final os.replace stays atomic).
     scratch = target.parent / f".pkg_build{os.getpid()}"
     scratch.mkdir(parents=True, exist_ok=True)
     tmp = scratch / target.name
+    legacy = target.parent / "llmm.mojopkg"
     try:
         proc = subprocess.run(
-            ["mojo", "package", str(_SOURCE_KERNELS_DIR), "-o", str(tmp)],
+            ["mojo", "precompile", str(_SOURCE_KERNELS_DIR), "-o", str(tmp)],
             check=True,
             capture_output=True,
             text=True,
         )
         os.replace(tmp, target)
+        if legacy.exists():
+            legacy.unlink()
     except FileNotFoundError as e:
         raise RuntimeError(
             "`mojo` not on PATH; run the suite via `pixi run pytest` or "
             "activate the pixi env (see CLAUDE notes)."
         ) from e
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"mojo package failed:\n{e.stderr}") from e
+        raise RuntimeError(f"mojo precompile failed:\n{e.stderr}") from e
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     if echo_warnings and proc.stderr:
@@ -520,7 +525,7 @@ def _from_device_buffer(buf, dtype_name: str) -> np.ndarray:
 
 if __name__ == "__main__":
     # `python -m tests._max_bridge`: the build half of the test chain.
-    # Builds (or reuses) llmm.mojopkg in the persistent cache and prints
+    # Builds (or reuses) llmm.mojoc in the persistent cache and prints
     # its path, so `make build-mojo` produces exactly the artifact the
     # test step consumes; rerunning with unchanged sources is a no-op.
     print(_ensure_packaged(echo_warnings=True))

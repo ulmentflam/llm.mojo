@@ -24,6 +24,7 @@ from .layernorm import (
 )
 from .matmul import MatmulFwd, MatmulBwd, matmul_fwd, matmul_bwd
 from .merge import MergeFwd, MergeBwd, merge_fwd, merge_bwd
+from .sampler import sample_softmax, random_u32, random_f32, random_permutation
 from .scheduler import LearningRateScheduler
 from .softmax import SoftmaxFwd, SoftmaxBwd, softmax_fwd, softmax_bwd
 from .split import SplitFwd, SplitBwd, split_fwd, split_bwd
