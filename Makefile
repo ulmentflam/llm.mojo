@@ -19,7 +19,7 @@ SHELL := /bin/bash
 
 .PHONY: help install update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        typecheck check clean build build-mojo build-train train \
+        typecheck check clean build         build-mojo build-train train train-cpu \
         test test-python test-mojo test-fixtures \
         docs docs-clean
 
@@ -37,7 +37,8 @@ help:
 	@echo "  check         Run lint (incl. typecheck), build-mojo, and build train_gpt2"
 	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
 	@echo "  build-train   Alias for build"
-	@echo "  train     Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
+	@echo "  train         Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
+	@echo "  train-cpu     Build and run build/train_gpt2 on CPU (LLMM_USE_CPU=1)"
 	@echo "  lint          Lint Python, Mojo, C, CUDA, LaTeX sources, and typecheck"
 	@echo "  lint-python   Lint Python sources with ruff"
 	@echo "  lint-mojo     Lint Mojo sources with mojo format --check"
@@ -91,6 +92,9 @@ $(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 
 train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@$(TRAIN_RUNNER)
+
+train-cpu: $(TRAIN_BIN) $(TRAIN_RUNNER)
+	@LLMM_USE_CPU=1 $(TRAIN_RUNNER)
 
 # Builds llmm.mojoc into the persistent cache the pytest suite consumes
 # (tests/.mef_cache/<source-fingerprint>/llmm.mojoc, via the bridge so

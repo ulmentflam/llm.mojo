@@ -1,3 +1,4 @@
+from std.os import getenv
 from std.time import global_perf_counter_ns
 from std.gpu.host.info import is_cpu, is_gpu
 from std.gpu.host import DeviceContext, HostBuffer
@@ -941,6 +942,9 @@ struct GPT2[target: StaticString]:
                 Int64(channels),
                 self.ctx,
             )
+            
+            # TODO: Race condition fix: Synchronize context before reading logits on CPU.
+            # self.ctx.synchronize()
 
             # LayerNorm 2 & Residual.
             layernorm_fused_residual_fwd[GPT2_DTYPE, Self.target](
@@ -1015,6 +1019,9 @@ struct GPT2[target: StaticString]:
             Int64(channels),
             self.ctx,
         )
+
+        # TODO: Race condition fix: Synchronize context before reading logits on CPU.
+        # self.ctx.synchronize()
 
         # Output Logits (wte has no bias).
         matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
@@ -1591,6 +1598,11 @@ def train[target: StaticString]() raises:
 
 
 def main() raises:
+    var use_cpu = getenv("LLMM_USE_CPU")
+    if use_cpu != "":
+        print("LLMM_USE_CPU is set — forcing CPU training.")
+        train["cpu"]()
+        return
     comptime if has_apple_gpu_accelerator():
         print(
             "==============================================================================="
