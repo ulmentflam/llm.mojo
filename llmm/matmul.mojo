@@ -458,6 +458,7 @@ def matmul_d_input_bwd[
 
     comptime if is_cpu[target]():
         comptime if use_gelu:
+
             @parameter
             @always_inline
             def d_input_epilogue[

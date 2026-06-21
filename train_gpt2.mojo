@@ -942,7 +942,7 @@ struct GPT2[target: StaticString]:
                 Int64(channels),
                 self.ctx,
             )
-            
+
             # TODO: Race condition fix: Synchronize context before reading logits on CPU.
             # self.ctx.synchronize()
 
