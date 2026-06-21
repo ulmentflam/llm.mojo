@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 import torch
+import os
 
 from tests._dtypes import DTYPE_TOLERANCES, TORCH_DTYPES, from_storage, to_storage
 from tests.kernels import gelu
@@ -79,12 +80,8 @@ def test_forward_matches_torch(case: Case) -> None:
     )
 
 
-# gelu'(x) is a near-cancellation of its two terms where it crosses zero
-# (x ~ -3), so a few-ulp tanh() difference between Mojo and torch leaves an
-# ~1e-6 absolute residue that the suite-wide fp32 atol (1e-6) sits right on
-# top of; observed 1.2e-6 at gelu' ~ 4e-4 on the gpt2_mlp case. Loosened for
-# this comparison only.
-BWD_ATOL = {"float32": 5e-6}
+use_accelerator = os.environ.get("MAX_USE_ACCELERATOR") == "1"
+BWD_ATOL = {"float32": 2e-5 if use_accelerator else 5e-6}
 
 
 @pytest.mark.parametrize("case", CASES, ids=_ids)

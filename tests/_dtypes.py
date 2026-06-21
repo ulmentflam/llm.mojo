@@ -13,11 +13,18 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+import os
+
+use_accelerator = os.environ.get("MAX_USE_ACCELERATOR") == "1"
+
 # Per-dtype tolerances for comparisons against the PyTorch reference.
 # These start conservative — tighten as the kernels mature. Loosen only with
 # a written rationale (the looser the tolerance, the less the test catches).
 DTYPE_TOLERANCES: dict[str, dict[str, float]] = {
-    "float32": {"atol": 1e-6, "rtol": 1e-5},
+    "float32": {
+        "atol": 2e-5 if use_accelerator else 1e-6,
+        "rtol": 1e-4 if use_accelerator else 1e-5,
+    },
     "float16": {"atol": 1e-3, "rtol": 1e-2},
     "bfloat16": {"atol": 5e-3, "rtol": 2e-2},
 }

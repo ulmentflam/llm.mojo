@@ -58,8 +58,9 @@ def global_norm_squared_cpu[
     data_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
 ) -> None:
-    var num_workers = min(num_params, parallelism_level())
-    var chunk = ceildiv(num_params, num_workers)
+    var max_workers = parallelism_level()
+    var chunk = ceildiv(num_params, max_workers)
+    var num_workers = ceildiv(num_params, chunk)
     var partials = alloc[Scalar[DType.float32]](num_workers)
 
     @parameter
@@ -67,7 +68,6 @@ def global_norm_squared_cpu[
         var base = w * chunk
         var count = min(chunk, num_params - base)
         var worker_partial = partials + w
-        # Zero the partial sum for the worker.
         worker_partial[0] = 0.0
 
         @always_inline
@@ -85,7 +85,6 @@ def global_norm_squared_cpu[
 
     sync_parallelize[_worker](num_workers)
 
-    # Reduce the partial sums into the total sum at the end.
     var total_sum = Scalar[DType.float32](0.0)
     for w in range(num_workers):
         total_sum += partials[w]
@@ -256,14 +255,19 @@ struct GlobalNormSquared:
         reset: UInt32,
         ctx: DeviceContext,
     ) capturing raises:
-        if output.size() != 1:
-            raise Error("output must have size 1")
+        if output.size() < 1:
+            raise Error("output must have at least size 1")
         if data.size() != Int(num_slices) * Int(stride):
             raise Error("data must have size num_slices * stride")
         if max_num_block_sums < 0:
             raise Error("max_num_block_sums must be non-negative")
         if reset != 0 and reset != 1:
             raise Error("reset must be 0 or 1")
+        if is_gpu[target]():
+            if output.size() < Int(max_num_block_sums):
+                raise Error(
+                    "output size on GPU must be at least max_num_block_sums"
+                )
 
         global_norm_squared[dtype, target](
             output, data, stride, num_slices, max_num_block_sums, reset, ctx

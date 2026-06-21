@@ -66,18 +66,22 @@ def _run_kernel(
     reset: bool = True,
     output: np.ndarray | None = None,
 ) -> np.ndarray:
-    # Size output buffer exactly to 1 to satisfy output.size() == 1 validation.
+    # max_num_block_sums must be non-negative
+    max_num_block_sums = 4096 + case.num_slices
+
+    # Size output buffer to max_num_block_sums to satisfy GPU workspace size.
     if output is None:
-        output = np.zeros(1, dtype=np.float32)
+        output = np.zeros(max_num_block_sums, dtype=np.float32)
+    elif len(output) < max_num_block_sums:
+        new_output = np.zeros(max_num_block_sums, dtype=np.float32)
+        new_output[0] = output[0]
+        output = new_output
 
     # Convert data to storage format (e.g. uint16 for bf16)
     data_storage = to_storage(data, case.dtype)
 
     # Since the array is contiguous, the stride is the number of columns
     stride = case.cols
-
-    # max_num_block_sums must be non-negative
-    max_num_block_sums = 4096 + case.num_slices
 
     return global_norm.global_norm_squared(
         output=output,

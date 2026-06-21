@@ -133,8 +133,9 @@ def softmax_fwd_cpu[
     vocab_size_padded: Int64,  # Our Vp
 ) -> None:
     var total = Int(batch_size * seq_len)
-    var num_workers = min(total, parallelism_level())
-    var rows_per_worker = ceildiv(total, num_workers)
+    var max_workers = parallelism_level()
+    var rows_per_worker = ceildiv(total, max_workers)
+    var num_workers = ceildiv(total, rows_per_worker)
 
     @parameter
     def _worker(w: Int):
@@ -453,8 +454,9 @@ def softmax_bwd_cpu[
     vocab_size_padded: Int64,  # Our Vp
 ) -> None:
     var total = Int(batch_size * seq_len)
-    var num_workers = min(total, parallelism_level())
-    var rows_per_worker = ceildiv(total, num_workers)
+    var max_workers = parallelism_level()
+    var rows_per_worker = ceildiv(total, max_workers)
+    var num_workers = ceildiv(total, rows_per_worker)
 
     @parameter
     def _worker(w: Int):

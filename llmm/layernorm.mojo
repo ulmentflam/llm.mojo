@@ -139,8 +139,9 @@ def layernorm_fwd_cpu[
     channels: Int64,
 ) -> None:
     var total = Int(batch_size * seq_len)
-    var num_workers = min(total, parallelism_level())
-    var rows_per_worker = ceildiv(total, num_workers)
+    var max_workers = parallelism_level()
+    var rows_per_worker = ceildiv(total, max_workers)
+    var num_workers = ceildiv(total, rows_per_worker)
 
     @parameter
     def _worker(w: Int):
@@ -548,8 +549,9 @@ def layernorm_fused_residual_fwd_cpu[
     channels: Int64,
 ) -> None:
     var total = Int(batch_size * seq_len)
-    var num_workers = min(total, parallelism_level())
-    var rows_per_worker = ceildiv(total, num_workers)
+    var max_workers = parallelism_level()
+    var rows_per_worker = ceildiv(total, max_workers)
+    var num_workers = ceildiv(total, rows_per_worker)
 
     @parameter
     def _worker(w: Int):
@@ -988,8 +990,9 @@ def layernorm_bwd_cpu[
 ) -> None:
     var total = Int(batch_size * seq_len)
     var c = Int(channels)
-    var num_workers = min(total, parallelism_level())
-    var rows_per_worker = ceildiv(total, num_workers)
+    var max_workers = parallelism_level()
+    var rows_per_worker = ceildiv(total, max_workers)
+    var num_workers = ceildiv(total, rows_per_worker)
 
     # One private [channels] accumulator per worker for the parameter
     # gradients. Reducing these once after the join replaces the per-element
@@ -1225,8 +1228,11 @@ def _layernorm_dgamma_dbeta_gpu[
                 var x_hat = (x - mean_ptr[r]) * rstd_ptr[r]
                 acc_dgamma = fma(dy, x_hat, acc_dgamma)
                 acc_dbeta += dy
-            var sum_dgamma = block.sum[block_size=BLOCK_SIZE](acc_dgamma)
-            var sum_dbeta = block.sum[block_size=BLOCK_SIZE](acc_dbeta)
+            var sum_dgamma = SIMD[DType.float32, width](0.0)
+            var sum_dbeta = SIMD[DType.float32, width](0.0)
+            comptime for i in range(width):
+                sum_dgamma[i] = block.sum[block_size=BLOCK_SIZE](acc_dgamma[i])
+                sum_dbeta[i] = block.sum[block_size=BLOCK_SIZE](acc_dbeta[i])
             if tid == 0:
                 # Accumulate into existing grads (matches the CPU path and the
                 # old atomic accumulate-into-buffer behavior).

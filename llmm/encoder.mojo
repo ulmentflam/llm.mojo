@@ -66,8 +66,9 @@ def encoder_fwd_cpu[
     channels: Int,
 ) -> None:
     var total_rows = batch_size * seq_len
-    var num_workers = min(total_rows, parallelism_level())
-    var rows_per_worker = ceildiv(total_rows, num_workers)
+    var max_workers = parallelism_level()
+    var rows_per_worker = ceildiv(total_rows, max_workers)
+    var num_workers = ceildiv(total_rows, rows_per_worker)
 
     @parameter
     def _worker(w: Int):
@@ -105,26 +106,33 @@ def encoder_fwd_gpu_kernel[
     wpe_ptr: ImmutKernelPtr[dtype],
     seq_len: Int,
     channels: Int,
-    total_elements: Int,
 ) -> None:
-    var global_idx = (
-        Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
-    ) * width
-    if global_idx >= total_elements:
+    var bt = Int(block_idx.x)
+    var c_base = Int(block_idx.y) * Int(block_dim.x) * width
+    var tid = Int(thread_idx.x)
+    var c = c_base + tid * width
+
+    if c >= channels:
         return
 
-    var bt = global_idx // channels
     var t = bt % seq_len
-    var c = global_idx % channels
-
     var ix = Int((inp_ptr + bt).load())
 
-    _encoder_fwd_vector_slice[dtype, width](
-        out_ptr + bt * channels,
-        wte_ptr + ix * channels,
-        wpe_ptr + t * channels,
-        c,
-    )
+    if c + width <= channels:
+        _encoder_fwd_vector_slice[dtype, width](
+            out_ptr + bt * channels,
+            wte_ptr + ix * channels,
+            wpe_ptr + t * channels,
+            c,
+        )
+    else:
+        for i in range(c, channels):
+            _encoder_fwd_vector_slice[dtype, 1](
+                out_ptr + bt * channels,
+                wte_ptr + ix * channels,
+                wpe_ptr + t * channels,
+                i,
+            )
 
 
 def encoder_fwd_gpu[
@@ -136,13 +144,11 @@ def encoder_fwd_gpu[
     inp_ptr: ImmutKernelPtr[DType.int32],
     wte_ptr: ImmutKernelPtr[dtype],
     wpe_ptr: ImmutKernelPtr[dtype],
-    batch_size: Int,
     seq_len: Int,
     channels: Int,
 ) -> None:
-    var total_elements = batch_size * seq_len * channels
     encoder_fwd_gpu_kernel[dtype, width](
-        out_ptr, inp_ptr, wte_ptr, wpe_ptr, seq_len, channels, total_elements
+        out_ptr, inp_ptr, wte_ptr, wpe_ptr, seq_len, channels
     )
 
 
@@ -179,9 +185,8 @@ def encoder_fwd[
         comptime BLOCK_SIZE = 256
         comptime width = 4
         var device_ctx = ctx
-        var total_elements = batch_size * seq_len * channels
-        var num_threads = (total_elements + width - 1) // width
-        var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
+        var grid_x = batch_size * seq_len
+        var grid_y = ceildiv(channels, BLOCK_SIZE * width)
 
         comptime gpu_kernel = encoder_fwd_gpu[dtype, BLOCK_SIZE, width]
         var compiled = device_ctx.compile_function[gpu_kernel]()
@@ -191,10 +196,9 @@ def encoder_fwd[
             inp_ptr,
             wte_ptr,
             wpe_ptr,
-            batch_size,
             seq_len,
             channels,
-            grid_dim=(num_blocks,),
+            grid_dim=(grid_x, grid_y),
             block_dim=(BLOCK_SIZE,),
         )
     else:
@@ -369,8 +373,9 @@ def wte_backward_cpu[
     num_buckets: Int,
     channels: Int,
 ) -> None:
-    var num_workers = min(num_buckets, parallelism_level())
-    var buckets_per_worker = ceildiv(num_buckets, num_workers)
+    var max_workers = parallelism_level()
+    var buckets_per_worker = ceildiv(num_buckets, max_workers)
+    var num_workers = ceildiv(num_buckets, buckets_per_worker)
 
     @parameter
     def _worker(w: Int):
@@ -443,8 +448,9 @@ def wpe_backward_cpu[
     seq_len: Int,
     channels: Int,
 ) -> None:
-    var num_workers = min(seq_len, parallelism_level())
-    var t_per_worker = ceildiv(seq_len, num_workers)
+    var max_workers = parallelism_level()
+    var t_per_worker = ceildiv(seq_len, max_workers)
+    var num_workers = ceildiv(seq_len, t_per_worker)
 
     @parameter
     def _worker(w: Int):
@@ -510,17 +516,6 @@ def wte_backward_gpu_kernel[
     if warp_id >= bucket_size:
         return
 
-    var accum = _accumulate_token_gradients[dtype, width](
-        dout_ptr,
-        workload_indices_ptr,
-        start_idx,
-        bucket_size,
-        channels,
-        c,
-        start_item=warp_id,
-        step_size=num_warps,
-    )
-
     comptime SMEM_SIZE = BLOCK_SIZE * width
     var accum_shared = LayoutTensor[
         DType.float32,
@@ -528,10 +523,34 @@ def wte_backward_gpu_kernel[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var accum_shared_ptr = rebind[MutKernelPtr[DType.float32]](accum_shared.ptr)
+    var accum_shared_ptr = rebind[MutKernelPtr[DType.float32]](
+        accum_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
 
-    for k in range(width):
-        accum_shared_ptr[tid * width + k] = accum[k]
+    if c + width <= channels:
+        var accum = _accumulate_token_gradients[dtype, width](
+            dout_ptr,
+            workload_indices_ptr,
+            start_idx,
+            bucket_size,
+            channels,
+            c,
+            start_item=warp_id,
+            step_size=num_warps,
+        )
+        for k in range(width):
+            accum_shared_ptr[tid * width + k] = accum[k]
+    else:
+        var accum = SIMD[DType.float32, width](0.0)
+        var item = warp_id
+        while item < bucket_size:
+            var bt = Int((workload_indices_ptr + start_idx + item).load())
+            for k in range(channels - c):
+                var val = dout_ptr[bt * channels + c + k].cast[DType.float32]()
+                accum[k] += val
+            item += num_warps
+        for k in range(width):
+            accum_shared_ptr[tid * width + k] = accum[k]
 
     barrier()
 
@@ -545,11 +564,20 @@ def wte_backward_gpu_kernel[
                     val[k] = accum_shared_ptr[partner_tid * width + k]
                 final_accum += val
 
-        _write_dwte_accumulation[dtype, width](
-            dwte_ptr,
-            token_idx * channels + c,
-            final_accum,
-        )
+        if c + width <= channels:
+            _write_dwte_accumulation[dtype, width](
+                dwte_ptr,
+                token_idx * channels + c,
+                final_accum,
+            )
+        else:
+            for k in range(channels - c):
+                var prev_dwte = dwte_ptr[token_idx * channels + c + k].cast[
+                    DType.float32
+                ]()
+                dwte_ptr[token_idx * channels + c + k] = (
+                    prev_dwte + final_accum[k]
+                ).cast[dtype]()
 
 
 @always_inline
@@ -573,20 +601,33 @@ def wpe_backward_gpu_kernel[
         if c >= channels:
             break
 
-        var accum = SIMD[DType.float32, width](0.0)
-        for b in range(batch_size):
-            var dout_val = (
-                (dout_ptr + (b * seq_len + t) * channels + c)
-                .load[width=width]()
-                .cast[DType.float32]()
-            )
-            accum += dout_val
+        if c + width <= channels:
+            var accum = SIMD[DType.float32, width](0.0)
+            for b in range(batch_size):
+                var dout_val = (
+                    (dout_ptr + (b * seq_len + t) * channels + c)
+                    .load[width=width]()
+                    .cast[DType.float32]()
+                )
+                accum += dout_val
 
-        var offset = t * channels + c
-        var prev_dwpe = (
-            (dwpe_ptr + offset).load[width=width]().cast[DType.float32]()
-        )
-        (dwpe_ptr + offset).store((prev_dwpe + accum).cast[dtype]())
+            var offset = t * channels + c
+            var prev_dwpe = (
+                (dwpe_ptr + offset).load[width=width]().cast[DType.float32]()
+            )
+            (dwpe_ptr + offset).store((prev_dwpe + accum).cast[dtype]())
+        else:
+            for col in range(c, channels):
+                var accum = Scalar[DType.float32](0.0)
+                for b in range(batch_size):
+                    var dout_val = dout_ptr[
+                        (b * seq_len + t) * channels + col
+                    ].cast[DType.float32]()
+                    accum += dout_val
+
+                var offset = t * channels + col
+                var prev_dwpe = dwpe_ptr[offset].cast[DType.float32]()
+                dwpe_ptr[offset] = (prev_dwpe + accum).cast[dtype]()
 
 
 def encoder_bwd[

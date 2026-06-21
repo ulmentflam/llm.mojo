@@ -421,9 +421,10 @@ def _attention_forward_query_row[
 def _attention_shared_memory_row_pointer[
     dtype: DType,
 ](shared_tensor: LayoutTensor, row_index: Int,) -> ImmutKernelPtr[dtype]:
-    return rebind[ImmutKernelPtr[dtype]](
-        shared_tensor.ptr + row_index * MAX_HEAD_DIM
+    var base_ptr = rebind[ImmutKernelPtr[dtype]](
+        shared_tensor.ptr.address_space_cast[AddressSpace.GENERIC]()
     )
+    return base_ptr + row_index * MAX_HEAD_DIM
 
 
 @always_inline
@@ -441,7 +442,9 @@ def _attention_copy_rows_dram_to_shared[
     # collectively fills the shared tile. Uses synchronous stores because the
     # a copy_dram_to_sram_async thread_layout API is not available;
     # callers issue a barrier() after this returns to ensure visibility.
-    var shared_ptr = rebind[MutKernelPtr[dtype]](shared_tensor.ptr)
+    var shared_ptr = rebind[MutKernelPtr[dtype]](
+        shared_tensor.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
     var thread_id = Int(thread_idx.x)
     var element_count = row_count * head_dim
     var element_index = thread_id
@@ -616,8 +619,9 @@ def attention_fwd_cpu[
         Scalar[DType.float32](head_dim)
     )
     var total_heads = Int(batch_size * num_heads)
-    var num_workers = min(total_heads, parallelism_level())
-    var heads_per_worker = ceildiv(total_heads, num_workers)
+    var max_workers = parallelism_level()
+    var heads_per_worker = ceildiv(total_heads, max_workers)
+    var num_workers = ceildiv(total_heads, heads_per_worker)
 
     @parameter
     def _worker(worker_index: Int):
@@ -862,16 +866,22 @@ def _attention_gpu_forward_query_tile_block[
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
     var softmax_max_deferred_ptr = rebind[MutKernelPtr[DType.float32]](
-        softmax_max_deferred_shared.ptr
+        softmax_max_deferred_shared.ptr.address_space_cast[
+            AddressSpace.GENERIC
+        ]()
     )
     var softmax_max_true_ptr = rebind[MutKernelPtr[DType.float32]](
-        softmax_max_true_shared.ptr
+        softmax_max_true_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
     )
     var softmax_denominator_true_ptr = rebind[MutKernelPtr[DType.float32]](
-        softmax_denominator_true_shared.ptr
+        softmax_denominator_true_shared.ptr.address_space_cast[
+            AddressSpace.GENERIC
+        ]()
     )
     var output_rescale_factor_ptr = rebind[MutKernelPtr[DType.float32]](
-        output_rescale_factor_shared.ptr
+        output_rescale_factor_shared.ptr.address_space_cast[
+            AddressSpace.GENERIC
+        ]()
     )
 
     # Load this CTA's query tile once; it is reused across every KV tile.
@@ -1099,8 +1109,9 @@ def attention_fwd[
         if Int(head_dim) > MAX_HEAD_DIM:
             raise Error("head_dim exceeds MAX_HEAD_DIM for GPU attention")
         comptime simd_width = simd_width_of[dtype]()
-        comptime Br = 64
-        comptime Bc = 64
+        comptime is_float32 = dtype == DType.float32
+        comptime Br = 16 if is_float32 else 32
+        comptime Bc = 16 if is_float32 else 32
         comptime BLOCK_SIZE = 256
         comptime SM_OVERPROVISION = 32
         var device_ctx = ctx
@@ -1363,8 +1374,9 @@ def attention_bwd_cpu[
         Scalar[DType.float32](head_dim)
     )
     var total_heads = Int(batch_size * num_heads)
-    var num_workers = min(total_heads, parallelism_level())
-    var heads_per_worker = ceildiv(total_heads, num_workers)
+    var max_workers = parallelism_level()
+    var heads_per_worker = ceildiv(total_heads, max_workers)
+    var num_workers = ceildiv(total_heads, heads_per_worker)
 
     @parameter
     def _worker(worker_index: Int):
@@ -1397,23 +1409,33 @@ def _attention_copy_tile[
     BLOCK_SIZE: Int,
     R: Int,
     C: Int,
+    is_dram_to_shared: Bool,
 ](
     dest: LayoutTensor,
     src: LayoutTensor,
     row_count: Int,
     head_dim: Int,
 ) -> None:
-    var dest_ptr = rebind[MutKernelPtr[dtype]](dest.ptr)
-    var src_ptr = rebind[ImmutKernelPtr[dtype]](src.ptr)
+    var dest_ptr = rebind[MutKernelPtr[dtype]](
+        dest.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
+    var src_ptr = rebind[ImmutKernelPtr[dtype]](
+        src.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
     var thread_id = Int(thread_idx.x)
     var element_count = row_count * head_dim
     var element_index = thread_id
     while element_index < element_count:
         var local_row = element_index // head_dim
         var column = element_index % head_dim
-        dest_ptr[local_row * MAX_HEAD_DIM + column] = src_ptr[
-            local_row * MAX_HEAD_DIM + column
-        ]
+        comptime if is_dram_to_shared:
+            dest_ptr[local_row * MAX_HEAD_DIM + column] = src_ptr[
+                local_row * head_dim + column
+            ]
+        else:
+            dest_ptr[local_row * head_dim + column] = src_ptr[
+                local_row * MAX_HEAD_DIM + column
+            ]
         element_index += BLOCK_SIZE
 
 
@@ -1520,17 +1542,21 @@ def _attention_gpu_bwd_dq_tile_block[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var lse_shared_ptr = rebind[MutKernelPtr[DType.float32]](lse_shared.ptr)
-    var D_shared_ptr = rebind[MutKernelPtr[DType.float32]](D_shared.ptr)
+    var lse_shared_ptr = rebind[MutKernelPtr[DType.float32]](
+        lse_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
+    var D_shared_ptr = rebind[MutKernelPtr[DType.float32]](
+        D_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
 
     # Load Q, dO, O tiles into SRAM once and reuse across every KV inner tile.
-    _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM](
+    _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, True](
         q_shared, q_tile_dram, query_tile_rows, head_dim
     )
-    _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM](
+    _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, True](
         do_shared, do_tile_dram, query_tile_rows, head_dim
     )
-    _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM](
+    _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, True](
         o_shared, o_tile_dram, query_tile_rows, head_dim
     )
 
@@ -1578,10 +1604,10 @@ def _attention_gpu_bwd_dq_tile_block[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
         ]((v_head + key_tile_start * head_dim))
 
-        _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM](
+        _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, True](
             key_shared, k_tile_dram, key_tile_rows, head_dim
         )
-        _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM](
+        _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, True](
             val_shared, v_tile_dram, key_tile_rows, head_dim
         )
         barrier()
@@ -1657,7 +1683,7 @@ def _attention_gpu_bwd_dq_tile_block[
         private_dq.free()
 
     # Write final dq_shared block out to DRAM.
-    _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM](
+    _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, False](
         dq_tile_dram, dq_shared, query_tile_rows, head_dim
     )
 
@@ -1822,14 +1848,18 @@ def _attention_gpu_bwd_dkv_tile_block[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var lse_shared_ptr = rebind[MutKernelPtr[DType.float32]](lse_shared.ptr)
-    var D_shared_ptr = rebind[MutKernelPtr[DType.float32]](D_shared.ptr)
+    var lse_shared_ptr = rebind[MutKernelPtr[DType.float32]](
+        lse_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
+    var D_shared_ptr = rebind[MutKernelPtr[DType.float32]](
+        D_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
 
     # Load K, V tiles into SRAM once; reused across every query inner tile.
-    _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM](
+    _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, True](
         key_shared, k_tile_dram, key_tile_rows, head_dim
     )
-    _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM](
+    _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, True](
         val_shared, v_tile_dram, key_tile_rows, head_dim
     )
 
@@ -1874,13 +1904,13 @@ def _attention_gpu_bwd_dkv_tile_block[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
         ]((o_head + query_tile_start * head_dim))
 
-        _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM](
+        _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, True](
             q_shared, q_tile_dram, query_tile_rows, head_dim
         )
-        _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM](
+        _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, True](
             do_shared, do_tile_dram, query_tile_rows, head_dim
         )
-        _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM](
+        _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, True](
             o_shared, o_tile_dram, query_tile_rows, head_dim
         )
 
@@ -2014,10 +2044,10 @@ def _attention_gpu_bwd_dkv_tile_block[
         private_dv.free()
 
     # Write final dk_shared and dv_shared blocks out to DRAM (fully contention-free)
-    _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM](
+    _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, False](
         dk_tile_dram, dk_shared, key_tile_rows, head_dim
     )
-    _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM](
+    _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, False](
         dv_tile_dram, dv_shared, key_tile_rows, head_dim
     )
 
@@ -2198,9 +2228,10 @@ def attention_bwd[
         if Int(head_dim) > MAX_HEAD_DIM:
             raise Error("head_dim exceeds MAX_HEAD_DIM for GPU attention")
         comptime simd_width = simd_width_of[dtype]()
-        comptime Br = 64
-        comptime Bc = 64
-        comptime BLOCK_SIZE = 256
+        comptime is_float32 = dtype == DType.float32
+        comptime Br = 16 if is_float32 else 32
+        comptime Bc = 16 if is_float32 else 32
+        comptime BLOCK_SIZE = 64 if is_float32 else 128
         comptime SM_OVERPROVISION = 32
 
         var device_ctx = ctx

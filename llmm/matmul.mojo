@@ -219,7 +219,9 @@ def _matmul_bias_bwd_gpu[
                     .load[width=width]()
                     .cast[DType.float32]()
                 )
-            var tile_sum = block.sum[block_size=BLOCK_SIZE](accumulator)
+            var tile_sum = SIMD[DType.float32, width](0.0)
+            comptime for i in range(width):
+                tile_sum[i] = block.sum[block_size=BLOCK_SIZE](accumulator[i])
             if tid == 0:
                 comptime if accumulate:
                     var previous = (
@@ -292,8 +294,9 @@ def matmul_bias_bwd_cpu[
     rows: Int,  # (B * T) or (batch_size * seq_len)
     out_channels: Int,  # OC
 ) -> None:
-    var num_workers = min(out_channels, parallelism_level())
-    var cols_per_worker = ceildiv(out_channels, num_workers)
+    var max_workers = parallelism_level()
+    var cols_per_worker = ceildiv(out_channels, max_workers)
+    var num_workers = ceildiv(out_channels, cols_per_worker)
 
     @parameter
     def _worker(w: Int):
@@ -375,6 +378,43 @@ def matmul_bias_bwd[
         raise Error("Invalid target")
 
 
+@always_inline
+def _matmul_gelu_backward_scaling[
+    dtype: DType,
+    width: Int,
+](
+    idx: Int,
+    d_input_ptr: MutKernelPtr[dtype],
+    pre_gelu_ptr: ImmutKernelPtr[dtype],
+) -> None:
+    var dy = (d_input_ptr + idx).load[width=width]().cast[DType.float32]()
+    var pre_gelu = (
+        (pre_gelu_ptr + idx).load[width=width]().cast[DType.float32]()
+    )
+    var scaled = dy * gelu_grad[DType.float32, width](pre_gelu)
+    (d_input_ptr + idx).store(scaled.cast[dtype]())
+
+
+def matmul_gelu_backward_scaling_gpu[
+    dtype: DType,
+    width: Int,
+](
+    d_input_ptr: MutKernelPtr[dtype],
+    pre_gelu_ptr: ImmutKernelPtr[dtype],
+    num_params: Int,
+) -> None:
+    var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
+    if idx + width <= num_params:
+        _matmul_gelu_backward_scaling[dtype, width](
+            idx, d_input_ptr, pre_gelu_ptr
+        )
+    elif idx < num_params:
+        for i in range(idx, num_params):
+            _matmul_gelu_backward_scaling[dtype, 1](
+                i, d_input_ptr, pre_gelu_ptr
+            )
+
+
 def matmul_d_input_bwd[
     dtype: DType,
     target: StaticString,
@@ -416,32 +456,54 @@ def matmul_d_input_bwd[
         row_major(out_channels, in_channels),
     )
 
-    comptime if use_gelu:
+    comptime if is_cpu[target]():
+        comptime if use_gelu:
+            @parameter
+            @always_inline
+            def d_input_epilogue[
+                dtype: DType, width: SIMDSize, *, alignment: Int = 1
+            ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
+                var offset = idx[0] * in_channels + idx[1]
+                var v = val.cast[DType.float32]()
+                var pre_gelu = (
+                    (pre_gelu_ptr + offset)
+                    .load[width=width]()
+                    .cast[DType.float32]()
+                )
+                v *= gelu_grad[DType.float32, width](pre_gelu)
+                (d_input_ptr + offset).store(v.cast[elem_dtype]())
 
-        @parameter
-        @always_inline
-        def d_input_epilogue[
-            dtype: DType, width: SIMDSize, *, alignment: Int = 1
-        ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
-            var offset = idx[0] * in_channels + idx[1]
-            var v = val.cast[DType.float32]()
-            var pre_gelu = (
-                (pre_gelu_ptr + offset)
-                .load[width=width]()
-                .cast[DType.float32]()
+            matmul[
+                transpose_b=False,
+                elementwise_lambda_fn=d_input_epilogue,
+                target=target,
+            ](c_d_input, a_d_output, b_weight, ctx=ctx)
+        else:
+            matmul[transpose_b=False, target=target](
+                c_d_input, a_d_output, b_weight, ctx=ctx
             )
-            v *= gelu_grad[DType.float32, width](pre_gelu)
-            (d_input_ptr + offset).store(v.cast[elem_dtype]())
-
-        matmul[
-            transpose_b=False,
-            elementwise_lambda_fn=d_input_epilogue,
-            target=target,
-        ](c_d_input, a_d_output, b_weight, ctx=ctx)
-    else:
+    elif is_gpu[target]():
         matmul[transpose_b=False, target=target](
             c_d_input, a_d_output, b_weight, ctx=ctx
         )
+        comptime if use_gelu:
+            comptime width = simd_width_of[dtype]()
+            comptime BLOCK_SIZE = 256
+            var device_ctx = ctx
+            var num_threads = ceildiv(rows * in_channels, width)
+            var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
+            comptime gpu_kernel = matmul_gelu_backward_scaling_gpu[dtype, width]
+            var compiled = device_ctx.compile_function[gpu_kernel]()
+            device_ctx.enqueue_function(
+                compiled,
+                d_input_ptr,
+                pre_gelu_ptr,
+                rows * in_channels,
+                grid_dim=(num_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
+    else:
+        raise Error("Invalid target")
 
 
 @always_inline
@@ -454,8 +516,9 @@ def _add_into[
     total: Int,
 ) -> None:
     """dst += src elementwise, f32 math, one rounding at the store."""
-    var num_workers = min(total, parallelism_level())
-    var chunk = ceildiv(total, num_workers)
+    var max_workers = parallelism_level()
+    var chunk = ceildiv(total, max_workers)
+    var num_workers = ceildiv(total, chunk)
 
     @parameter
     def _worker(w: Int):

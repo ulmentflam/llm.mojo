@@ -19,7 +19,7 @@ SHELL := /bin/bash
 
 .PHONY: help install update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        typecheck check clean build build-mojo build-train run-train \
+        typecheck check clean build build-mojo build-train train \
         test test-python test-mojo test-fixtures \
         docs docs-clean
 
@@ -30,13 +30,14 @@ help:
 	@echo ""
 	@echo "Setup:"
 	@echo "  install       Install pixi dependencies (first-time setup)"
+	@echo "  install-cuda  Install CUDA/GPU-enabled pixi dependencies"
 	@echo "  update        Update pixi dependencies and refresh pixi.lock"
 	@echo ""
 	@echo "Quality gates:"
 	@echo "  check         Run lint (incl. typecheck), build-mojo, and build train_gpt2"
 	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
 	@echo "  build-train   Alias for build"
-	@echo "  run-train     Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
+	@echo "  train     Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
 	@echo "  lint          Lint Python, Mojo, C, CUDA, LaTeX sources, and typecheck"
 	@echo "  lint-python   Lint Python sources with ruff"
 	@echo "  lint-mojo     Lint Mojo sources with mojo format --check"
@@ -58,6 +59,7 @@ help:
 	@echo "  test          Run Mojo + Python test suites"
 	@echo "  test-mojo     Run pure-Mojo unit tests with mojo test"
 	@echo "  test-python   Run pytest equivalence + property tests"
+	@echo "  test-python-cuda Run GPU/accelerator pytest equivalence + property tests"
 	@echo "  test-fixtures Regenerate tests/fixtures/*.npz from PyTorch reference"
 	@echo ""
 	@echo "Documents:"
@@ -70,6 +72,9 @@ help:
 
 install:
 	pixi install
+
+install-cuda:
+	pixi install -e cuda
 
 update:
 	pixi update
@@ -84,7 +89,7 @@ $(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	pixi run mojo build $(MOJO_INCLUDES) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
 
-run-train: $(TRAIN_BIN) $(TRAIN_RUNNER)
+train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@$(TRAIN_RUNNER)
 
 # Builds llmm.mojoc into the persistent cache the pytest suite consumes
@@ -147,7 +152,9 @@ lint-cuda:
 # latexindent insists on writing logs to cwd, so both latex targets run it
 # against a scratch copy and diff/copy back (same trick as lint-mojo).
 lint-latex:
-	@if [ -n "$(LATEX_SOURCES)" ]; then \
+	@if ! command -v latexindent >/dev/null 2>&1; then \
+		echo "latexindent not installed, skipping latex lint."; \
+	elif [ -n "$(LATEX_SOURCES)" ]; then \
 		fail=0; \
 		tmpdir=$$(mktemp -d); \
 		trap "rm -rf $$tmpdir" EXIT; \
@@ -194,7 +201,9 @@ format-cuda:
 	fi
 
 format-latex:
-	@if [ -n "$(LATEX_SOURCES)" ]; then \
+	@if ! command -v latexindent >/dev/null 2>&1; then \
+		echo "latexindent not installed, skipping latex format."; \
+	elif [ -n "$(LATEX_SOURCES)" ]; then \
 		tmpdir=$$(mktemp -d); \
 		trap "rm -rf $$tmpdir" EXIT; \
 		for f in $(LATEX_SOURCES); do \
@@ -213,6 +222,8 @@ typecheck:
 	@pixi run pyrefly check $(PYTHON_PATHS)
 
 test: test-mojo test-python
+
+test-cuda: test-mojo test-python-cuda
 
 test-mojo:
 	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
@@ -234,6 +245,9 @@ test-mojo:
 # change pays compiles again.
 test-python: build-mojo
 	pixi run pytest tests/ -v
+
+test-python-cuda: build-mojo
+	MAX_USE_ACCELERATOR=1 pixi run -e cuda pytest tests/ -v
 
 test-fixtures:
 	pixi run python -m tests.reference dump

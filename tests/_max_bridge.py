@@ -517,9 +517,11 @@ def _from_device_buffer(buf, dtype_name: str) -> np.ndarray:
     re-encoded as uint16 so callers can diff fixtures consistently."""
     if dtype_name == "bfloat16":
         import torch
+        from max.driver import CPU
 
         # Pull back via dlpack and reinterpret as uint16 for numpy storage.
-        return torch.from_dlpack(buf).view(torch.uint16).cpu().numpy()
+        # Copy to CPU first to avoid PyTorch CUDA dependency.
+        return torch.from_dlpack(buf.to(CPU())).view(torch.uint16).cpu().numpy()
     return buf.to_numpy()
 
 

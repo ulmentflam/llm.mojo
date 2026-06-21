@@ -33,4 +33,4 @@ def global_norm_squared(
         ],
         device=device,
     )
-    return out_params[0]
+    return out_params[0][:1]

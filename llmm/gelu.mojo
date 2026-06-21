@@ -83,8 +83,9 @@ def gelu_fwd_cpu[
     x_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
 ) -> None:
-    var num_workers = min(num_params, parallelism_level())
-    var chunk = ceildiv(num_params, num_workers)
+    var max_workers = parallelism_level()
+    var chunk = ceildiv(num_params, max_workers)
+    var num_workers = ceildiv(num_params, chunk)
 
     @parameter
     def _worker(w: Int):
@@ -214,8 +215,9 @@ def gelu_bwd_cpu[
     x_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
 ) -> None:
-    var num_workers = min(num_params, parallelism_level())
-    var chunk = ceildiv(num_params, num_workers)
+    var max_workers = parallelism_level()
+    var chunk = ceildiv(num_params, max_workers)
+    var num_workers = ceildiv(num_params, chunk)
 
     @parameter
     def _worker(w: Int):

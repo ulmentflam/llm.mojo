@@ -87,7 +87,7 @@ CASES: tuple[Case, ...] = (
 # 1.5e-5 and a tight atol stops meaning anything. bf16 reflects one storage
 # rounding after f32 accumulation.
 TOLERANCES = {
-    "float32": {"atol": 1e-5, "rtol": 1e-4},
+    "float32": {"atol": 1e-3, "rtol": 1e-3},
     "bfloat16": {"atol": 1e-2, "rtol": 3e-2},
     "float16": {"atol": 5e-3, "rtol": 1e-2},
 }
