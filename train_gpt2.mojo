@@ -1121,14 +1121,6 @@ struct GPT2[target: StaticString]:
         var qkv_layer_stride = layer_stride * 3
         var fch_layer_stride = layer_stride * 4
 
-        var t_mlp_proj = Float64(0.0)
-        var t_mlp_fc = Float64(0.0)
-        var t_ln2 = Float64(0.0)
-        var t_attn_proj = Float64(0.0)
-        var t_attn = Float64(0.0)
-        var t_qkv = Float64(0.0)
-        var t_ln1 = Float64(0.0)
-
         ##############################################################
         # Backward Pass
         ##############################################################
@@ -1320,9 +1312,6 @@ struct GPT2[target: StaticString]:
                 Int64(channels),
                 self.ctx,
             )
-            self.ctx.synchronize()
-            var loop_t1 = global_perf_counter_ns()
-            t_mlp_proj += Float64(loop_t1 - loop_t0) / 1e9
 
             # MLP FC backward (fused GELU).
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
@@ -1340,9 +1329,6 @@ struct GPT2[target: StaticString]:
                 Int64(4 * channels),
                 self.ctx,
             )
-            self.ctx.synchronize()
-            var loop_t2 = global_perf_counter_ns()
-            t_mlp_fc += Float64(loop_t2 - loop_t1) / 1e9
 
             # LayerNorm 2 fused residual backward.
             layernorm_fused_residual_bwd[GPT2_DTYPE, Self.target](
@@ -1363,9 +1349,6 @@ struct GPT2[target: StaticString]:
                 Int64(channels),
                 self.ctx,
             )
-            self.ctx.synchronize()
-            var loop_t3 = global_perf_counter_ns()
-            t_ln2 += Float64(loop_t3 - loop_t2) / 1e9
 
             # Attention projection backward.
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
@@ -1383,9 +1366,6 @@ struct GPT2[target: StaticString]:
                 Int64(channels),
                 self.ctx,
             )
-            self.ctx.synchronize()
-            var loop_t4 = global_perf_counter_ns()
-            t_attn_proj += Float64(loop_t4 - loop_t3) / 1e9
 
             # Attention backward.
             attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
@@ -1407,9 +1387,6 @@ struct GPT2[target: StaticString]:
                 self.ctx,
                 cache=rebind[KVCachePtr](UnsafePointer(to=self.kv_cache)),
             )
-            self.ctx.synchronize()
-            var loop_t5 = global_perf_counter_ns()
-            t_attn += Float64(loop_t5 - loop_t4) / 1e9
 
             # QKV matmul backward.
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
@@ -1427,9 +1404,6 @@ struct GPT2[target: StaticString]:
                 Int64(3 * channels),
                 self.ctx,
             )
-            self.ctx.synchronize()
-            var loop_t6 = global_perf_counter_ns()
-            t_qkv += Float64(loop_t6 - loop_t5) / 1e9
 
             # LayerNorm 1 backward.
             if layer == 0:
@@ -1473,12 +1447,8 @@ struct GPT2[target: StaticString]:
                     Int64(channels),
                     self.ctx,
                 )
-            self.ctx.synchronize()
-            var loop_t7 = global_perf_counter_ns()
-            t_ln1 += Float64(loop_t7 - loop_t6) / 1e9
 
         # Encoder backward: scatter token grads into wte, sum position grads into wpe.
-        var t_enc0 = global_perf_counter_ns()
         encoder_bwd[GPT2_DTYPE, Self.target](
             as_mut_kernel[GPT2_DTYPE](self.grads.wte),
             as_mut_kernel[GPT2_DTYPE](self.grads.wpe),
@@ -1491,16 +1461,6 @@ struct GPT2[target: StaticString]:
             channels,
             self.ctx,
         )
-        self.ctx.synchronize()
-        var t_enc1 = global_perf_counter_ns()
-        print("  - mlp_proj:", t_mlp_proj, "s")
-        print("  - mlp_fc:", t_mlp_fc, "s")
-        print("  - ln2:", t_ln2, "s")
-        print("  - attn_proj:", t_attn_proj, "s")
-        print("  - attn:", t_attn, "s")
-        print("  - qkv:", t_qkv, "s")
-        print("  - ln1:", t_ln1, "s")
-        print("  - encoder_bwd:", Float64(t_enc1 - t_enc0) / 1e9, "s")
 
     def update(
         mut self,
@@ -1580,8 +1540,7 @@ def train[target: StaticString]() raises:
     print("Loaded tokenizer from " + "gpt2_tokenizer.bin")
 
     # Build the learning rate scheduler.
-    # var num_iters = 40
-    var num_iters = 5
+    var num_iters = 40
     var learning_rate_scheduler = LearningRateScheduler(
         "constant",
         learning_rate=Scalar[DType.float32](1e-4),
@@ -1613,6 +1572,7 @@ def train[target: StaticString]() raises:
     for step in range(num_iters + 1):
         # Occasionally estimate validation loss.
         if val_loss_every > 0 and step % val_loss_every == 0:
+            var time_val_start = global_perf_counter_ns()
             var val_loss = Float32(0.0)
             val_loader.reset()
             for _ in range(val_max_steps):
@@ -1622,7 +1582,16 @@ def train[target: StaticString]() raises:
                 )
                 val_loss += model.mean_loss
             val_loss /= Float32(val_max_steps)
-            print("Validation loss: " + String(val_loss))
+            var time_val_end = global_perf_counter_ns()
+            print(
+                "validation step "
+                + String(step // val_loss_every)
+                + ": validation loss: "
+                + String(val_loss)
+                + " | total: "
+                + String(Float64(time_val_end - time_val_start) / 1e9)
+                + "s"
+            )
 
         if sample_every > 0 and step > 0 and step % sample_every == 0:
             gen_tokens[0] = Scalar[DType.int32](
@@ -1666,27 +1635,27 @@ def train[target: StaticString]() raises:
         if step == num_iters:
             break
 
-        var t0 = global_perf_counter_ns()
+        var time_forward = global_perf_counter_ns()
         model.forward(
             train_loader.inputs, train_loader.targets, BATCH_SIZE, SEQ_LEN
         )
         model.ctx.synchronize()
-        var t1 = global_perf_counter_ns()
+        var time_backward = global_perf_counter_ns()
 
         model.backward()
         model.ctx.synchronize()
-        var t2 = global_perf_counter_ns()
+        var time_update = global_perf_counter_ns()
 
         model.update(
             UInt32(step + 1), learning_rate_scheduler.get_learning_rate(step)
         )
         model.ctx.synchronize()
-        var t3 = global_perf_counter_ns()
+        var time_load_batch = global_perf_counter_ns()
 
         train_loader.next_batch()
-        var t4 = global_perf_counter_ns()
+        var time_end = global_perf_counter_ns()
 
-        var elapsed_time = Float64(t4 - t0) / 1e9
+        var elapsed_time = Float64(time_end - time_forward) / 1e9
         elapsed_time_ms_total += elapsed_time
         print(
             "step "
@@ -1694,13 +1663,13 @@ def train[target: StaticString]() raises:
             + ": train loss "
             + String(model.mean_loss)
             + " | forward: "
-            + String(Float64(t1 - t0) / 1e9)
+            + String(Float64(time_backward - time_forward) / 1e9)
             + "s | backward: "
-            + String(Float64(t2 - t1) / 1e9)
+            + String(Float64(time_update - time_backward) / 1e9)
             + "s | update: "
-            + String(Float64(t3 - t2) / 1e9)
+            + String(Float64(time_load_batch - time_update) / 1e9)
             + "s | loader: "
-            + String(Float64(t4 - t3) / 1e9)
+            + String(Float64(time_end - time_load_batch) / 1e9)
             + "s | total: "
             + String(elapsed_time)
             + "s"

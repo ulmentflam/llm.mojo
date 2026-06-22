@@ -698,17 +698,25 @@ def _attention_gpu_process_key_value_tile_warp[
     softmax_max_true_ptr: MutKernelPtr[DType.float32],
     softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
     output_rescale_factor_ptr: MutKernelPtr[DType.float32],
+    reduction_shared: LayoutTensor,
 ) -> None:
     comptime NUM_WARPS = BLOCK_SIZE // WARP_SIZE
     comptime ROWS_PER_WARP = Br // NUM_WARPS
+
+    var lane_id = Int(thread_idx.x) % WARP_SIZE
+    var warp_offset = warp_index * WARP_SIZE
+
+    comptime ELEMENTS_PER_THREAD = MAX_HEAD_DIM // WARP_SIZE
+    var d_start = lane_id * ELEMENTS_PER_THREAD
+
+    var reduction_shared_ptr = rebind[MutKernelPtr[DType.float32]](
+        reduction_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
 
     comptime for local_row in range(ROWS_PER_WARP):
         var query_index = (
             query_tile_start + warp_index * ROWS_PER_WARP + local_row
         )
-        if query_index >= seq_len:
-            continue
-
         var local_query_row = warp_index * ROWS_PER_WARP + local_row
         var output_row = output_ptr + head_offset + query_index * head_dim
         var state = OnlineSoftmaxState[use_soft_exp, use_conditional_rescale]()
@@ -725,39 +733,141 @@ def _attention_gpu_process_key_value_tile_warp[
 
         comptime for key_column in range(Bc):
             var key_index = key_tile_start + key_column
-            if key_index >= seq_len:
-                continue
-            if key_index > query_index:
-                continue
-
-            _attention_update_query_row_for_key[
-                dtype, width, use_soft_exp, use_conditional_rescale
-            ](
-                state,
-                _attention_shared_memory_row_pointer[dtype](
-                    query_shared, local_query_row
-                ),
-                _attention_shared_memory_row_pointer[dtype](
-                    key_shared, key_column
-                ),
-                _attention_shared_memory_row_pointer[dtype](
-                    value_shared, key_column
-                ),
-                output_row,
-                head_dim,
-                attention_scale,
+            var is_active_and_valid = (
+                (query_index < seq_len)
+                and (key_index < seq_len)
+                and (key_index <= query_index)
             )
 
-        _attention_store_online_softmax_state_to_shared[
-            use_soft_exp, use_conditional_rescale
-        ](
-            softmax_max_deferred_ptr,
-            softmax_max_true_ptr,
-            softmax_denominator_true_ptr,
-            output_rescale_factor_ptr,
-            local_query_row,
-            state,
-        )
+            var local_sum = Scalar[DType.float32](0.0)
+            var q_row_ptr = _attention_shared_memory_row_pointer[dtype](
+                query_shared, local_query_row
+            )
+            var k_row_ptr = _attention_shared_memory_row_pointer[dtype](
+                key_shared, key_column
+            )
+            if is_active_and_valid:
+                for d in range(ELEMENTS_PER_THREAD):
+                    var idx = d_start + d
+                    if idx < head_dim:
+                        local_sum += (
+                            q_row_ptr[idx].cast[DType.float32]()
+                            * k_row_ptr[idx].cast[DType.float32]()
+                        )
+
+            reduction_shared_ptr[warp_offset + lane_id] = local_sum
+            barrier()
+
+            # Warp tree reduction unrolled.
+            if lane_id < 16:
+                reduction_shared_ptr[
+                    warp_offset + lane_id
+                ] += reduction_shared_ptr[warp_offset + lane_id + 16]
+            barrier()
+            if lane_id < 8:
+                reduction_shared_ptr[
+                    warp_offset + lane_id
+                ] += reduction_shared_ptr[warp_offset + lane_id + 8]
+            barrier()
+            if lane_id < 4:
+                reduction_shared_ptr[
+                    warp_offset + lane_id
+                ] += reduction_shared_ptr[warp_offset + lane_id + 4]
+            barrier()
+            if lane_id < 2:
+                reduction_shared_ptr[
+                    warp_offset + lane_id
+                ] += reduction_shared_ptr[warp_offset + lane_id + 2]
+            barrier()
+            if lane_id < 1:
+                reduction_shared_ptr[
+                    warp_offset + lane_id
+                ] += reduction_shared_ptr[warp_offset + lane_id + 1]
+            barrier()
+
+            var S_ij = reduction_shared_ptr[warp_offset] * attention_scale
+
+            if is_active_and_valid:
+                var previous_true_max = state.softmax_max_true
+                state.softmax_max_true = max(state.softmax_max_true, S_ij)
+                var true_rescale = software_emulated_exp[use_soft_exp](
+                    previous_true_max - state.softmax_max_true
+                )
+                var true_weight = software_emulated_exp[use_soft_exp](
+                    S_ij - state.softmax_max_true
+                )
+                state.softmax_denominator_true = fma(
+                    true_rescale, state.softmax_denominator_true, true_weight
+                )
+
+                var v_row_ptr = _attention_shared_memory_row_pointer[dtype](
+                    value_shared, key_column
+                )
+
+                comptime if use_conditional_rescale:
+                    var candidate_max = max(state.softmax_max_deferred, S_ij)
+                    var max_delta = candidate_max - state.softmax_max_deferred
+                    if max_delta > TAU:
+                        var rescale_factor = software_emulated_exp[
+                            use_soft_exp
+                        ](state.softmax_max_deferred - candidate_max)
+                        var attention_weight = software_emulated_exp[
+                            use_soft_exp
+                        ](S_ij - candidate_max)
+                        for d in range(ELEMENTS_PER_THREAD):
+                            var idx = d_start + d
+                            if idx < head_dim:
+                                var v_val = v_row_ptr[idx]
+                                var out_val = output_row[idx]
+                                output_row[idx] = (
+                                    rescale_factor
+                                    * out_val.cast[DType.float32]()
+                                    + attention_weight
+                                    * v_val.cast[DType.float32]()
+                                ).cast[dtype]()
+                        state.softmax_max_deferred = candidate_max
+                    else:
+                        var attention_weight = software_emulated_exp[
+                            use_soft_exp
+                        ](S_ij - state.softmax_max_deferred)
+                        for d in range(ELEMENTS_PER_THREAD):
+                            var idx = d_start + d
+                            if idx < head_dim:
+                                var v_val = v_row_ptr[idx]
+                                var out_val = output_row[idx]
+                                output_row[idx] = (
+                                    out_val.cast[DType.float32]()
+                                    + attention_weight
+                                    * v_val.cast[DType.float32]()
+                                ).cast[dtype]()
+                else:
+                    var attention_weight = software_emulated_exp[use_soft_exp](
+                        S_ij - state.softmax_max_deferred
+                    )
+                    for d in range(ELEMENTS_PER_THREAD):
+                        var idx = d_start + d
+                        if idx < head_dim:
+                            var v_val = v_row_ptr[idx]
+                            var out_val = output_row[idx]
+                            output_row[idx] = (
+                                out_val.cast[DType.float32]()
+                                + attention_weight * v_val.cast[DType.float32]()
+                            ).cast[dtype]()
+
+            barrier()
+
+        if lane_id == 0:
+            _attention_store_online_softmax_state_to_shared[
+                use_soft_exp, use_conditional_rescale
+            ](
+                softmax_max_deferred_ptr,
+                softmax_max_true_ptr,
+                softmax_denominator_true_ptr,
+                output_rescale_factor_ptr,
+                local_query_row,
+                state,
+            )
+        barrier()
 
 
 @always_inline
@@ -785,13 +895,14 @@ def _attention_gpu_finalize_query_rows_warp[
     comptime NUM_WARPS = BLOCK_SIZE // WARP_SIZE
     comptime ROWS_PER_WARP = Br // NUM_WARPS
 
+    var lane_id = Int(thread_idx.x) % WARP_SIZE
+    comptime ELEMENTS_PER_THREAD = MAX_HEAD_DIM // WARP_SIZE
+    var d_start = lane_id * ELEMENTS_PER_THREAD
+
     comptime for local_row in range(ROWS_PER_WARP):
         var query_index = (
             query_tile_start + warp_index * ROWS_PER_WARP + local_row
         )
-        if query_index >= seq_len:
-            continue
-
         var local_query_row = warp_index * ROWS_PER_WARP + local_row
         var state = OnlineSoftmaxState[use_soft_exp, use_conditional_rescale]()
         _attention_load_online_softmax_state_from_shared[
@@ -808,9 +919,22 @@ def _attention_gpu_finalize_query_rows_warp[
         var log_sum_exp_out = (
             log_sum_exp_ptr + head_index * seq_len + query_index
         )
-        _attention_finalize_output_row[
-            dtype, width, use_soft_exp, use_conditional_rescale
-        ](state, output_row, log_sum_exp_out, head_dim)
+
+        var scale = (
+            state.epilogue_output_scale() / state.softmax_denominator_true
+        )
+        if query_index < seq_len:
+            for d in range(ELEMENTS_PER_THREAD):
+                var idx = d_start + d
+                if idx < head_dim:
+                    var out_val = output_row[idx]
+                    output_row[idx] = (
+                        out_val.cast[DType.float32]() * scale
+                    ).cast[dtype]()
+
+            if lane_id == 0:
+                log_sum_exp_out.store(state.log_sum_exp())
+        barrier()
 
 
 @always_inline
@@ -888,6 +1012,12 @@ def _attention_gpu_forward_query_tile_block[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
+    var reduction_shared = LayoutTensor[
+        DType.float32,
+        Layout.row_major(BLOCK_SIZE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
     var softmax_max_deferred_ptr = rebind[MutKernelPtr[DType.float32]](
         softmax_max_deferred_shared.ptr.address_space_cast[
             AddressSpace.GENERIC
@@ -933,12 +1063,6 @@ def _attention_gpu_forward_query_tile_block[
     )
     barrier()
 
-    # Stream over KV tiles (FA2 loop_over_kvcache). Each iteration loads one K
-    # and V tile synchronously then folds them into the online softmax state.
-    # The barrier between copy and compute stands in for async_copy_wait_all()
-    # that the reference uses to overlap the load of tile i+1 with compute on
-    # tile i; here the copy and compute are serialized because a
-    # copy_dram_to_sram_async thread_layout API is not yet available.
     for key_tile_start in range(0, seq_len, Bc):
         var key_tile_rows = min(Bc, seq_len - key_tile_start)
         _attention_copy_rows_dram_to_shared[dtype, BLOCK_SIZE](
@@ -949,51 +1073,50 @@ def _attention_gpu_forward_query_tile_block[
         )
         barrier()
 
-        if Int(thread_idx.x) % WARP_SIZE == 0:
-            _attention_gpu_process_key_value_tile_warp[
-                dtype,
-                width,
-                Br,
-                Bc,
-                BLOCK_SIZE,
-                use_soft_exp,
-                use_conditional_rescale,
-            ](
-                Int(thread_idx.x) // WARP_SIZE,
-                query_tile_start,
-                key_tile_start,
-                seq_len,
-                head_dim,
-                head_offset,
-                attention_scale,
-                output_ptr,
-                query_shared,
-                key_shared,
-                value_shared,
-                softmax_max_deferred_ptr,
-                softmax_max_true_ptr,
-                softmax_denominator_true_ptr,
-                output_rescale_factor_ptr,
-            )
-        barrier()
-
-    if Int(thread_idx.x) % WARP_SIZE == 0:
-        _attention_gpu_finalize_query_rows_warp[
-            dtype, width, Br, BLOCK_SIZE, use_soft_exp, use_conditional_rescale
+        _attention_gpu_process_key_value_tile_warp[
+            dtype,
+            width,
+            Br,
+            Bc,
+            BLOCK_SIZE,
+            use_soft_exp,
+            use_conditional_rescale,
         ](
             Int(thread_idx.x) // WARP_SIZE,
             query_tile_start,
+            key_tile_start,
             seq_len,
             head_dim,
             head_offset,
-            head_index,
+            attention_scale,
             output_ptr,
-            log_sum_exp_ptr,
+            query_shared,
+            key_shared,
+            value_shared,
             softmax_max_deferred_ptr,
             softmax_max_true_ptr,
             softmax_denominator_true_ptr,
             output_rescale_factor_ptr,
+            reduction_shared,
         )
+        barrier()
+
+    _attention_gpu_finalize_query_rows_warp[
+        dtype, width, Br, BLOCK_SIZE, use_soft_exp, use_conditional_rescale
+    ](
+        Int(thread_idx.x) // WARP_SIZE,
+        query_tile_start,
+        seq_len,
+        head_dim,
+        head_offset,
+        head_index,
+        output_ptr,
+        log_sum_exp_ptr,
+        softmax_max_deferred_ptr,
+        softmax_max_true_ptr,
+        softmax_denominator_true_ptr,
+        output_rescale_factor_ptr,
+    )
 
 
 def attention_fwd_gpu[
@@ -1663,7 +1786,7 @@ def _attention_gpu_bwd_dq_tile_block[
     # merge their private dQ partials before writing dq_shared.
     var reduction_shared = LayoutTensor[
         DType.float32,
-        Layout.row_major(Br, 4),
+        Layout.row_major(Br, 4, 8),
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
@@ -1749,18 +1872,30 @@ def _attention_gpu_bwd_dq_tile_block[
                         factor * k_row[tail].cast[DType.float32]()
                     )
 
-        for col in range(head_dim):
-            reduction_shared[local_row, thread_row_index] = private_dq[col]
+        for col_base in range(0, head_dim, 8):
+            for c in range(8):
+                var col = col_base + c
+                if col < head_dim:
+                    reduction_shared[
+                        local_row, thread_row_index, c
+                    ] = private_dq[col]
             barrier()
-            if thread_row_index == 0:
-                var sum_col = (
-                    reduction_shared[local_row, 0]
-                    + reduction_shared[local_row, 1]
-                    + reduction_shared[local_row, 2]
-                    + reduction_shared[local_row, 3]
-                )
-                var existing = dq_shared[local_row, col].cast[DType.float32]()
-                dq_shared[local_row, col] = (existing + sum_col).cast[dtype]()
+            for step in range(2):
+                var c = thread_row_index + step * 4
+                var col = col_base + c
+                if col < head_dim:
+                    var sum_col = (
+                        reduction_shared[local_row, 0, c]
+                        + reduction_shared[local_row, 1, c]
+                        + reduction_shared[local_row, 2, c]
+                        + reduction_shared[local_row, 3, c]
+                    )
+                    var existing = dq_shared[local_row, col].cast[
+                        DType.float32
+                    ]()
+                    dq_shared[local_row, col] = (existing + sum_col).cast[
+                        dtype
+                    ]()
             barrier()
 
     # Write final dq_shared block out to DRAM.
@@ -1957,13 +2092,13 @@ def _attention_gpu_bwd_dkv_tile_block[
     # 4 threads per KV column merge private dK/dV partials before dk/dv_shared.
     var reduction_dk = LayoutTensor[
         DType.float32,
-        Layout.row_major(Bc, 4),
+        Layout.row_major(Bc, 4, 8),
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
     var reduction_dv = LayoutTensor[
         DType.float32,
-        Layout.row_major(Bc, 4),
+        Layout.row_major(Bc, 4, 8),
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
@@ -2104,33 +2239,45 @@ def _attention_gpu_bwd_dkv_tile_block[
                         dv_factor * do_row[tail].cast[DType.float32]()
                     )
 
-        for col in range(head_dim):
-            reduction_dk[local_col, thread_col_index] = private_dk[col]
-            reduction_dv[local_col, thread_col_index] = private_dv[col]
+        for col_base in range(0, head_dim, 8):
+            for c in range(8):
+                var col = col_base + c
+                if col < head_dim:
+                    reduction_dk[local_col, thread_col_index, c] = private_dk[
+                        col
+                    ]
+                    reduction_dv[local_col, thread_col_index, c] = private_dv[
+                        col
+                    ]
             barrier()
-            if thread_col_index == 0:
-                var sum_dk = (
-                    reduction_dk[local_col, 0]
-                    + reduction_dk[local_col, 1]
-                    + reduction_dk[local_col, 2]
-                    + reduction_dk[local_col, 3]
-                )
-                var sum_dv = (
-                    reduction_dv[local_col, 0]
-                    + reduction_dv[local_col, 1]
-                    + reduction_dv[local_col, 2]
-                    + reduction_dv[local_col, 3]
-                )
-
-                var existing_dk = dk_shared[local_col, col].cast[
-                    DType.float32
-                ]()
-                var existing_dv = dv_shared[local_col, col].cast[
-                    DType.float32
-                ]()
-
-                dk_shared[local_col, col] = (existing_dk + sum_dk).cast[dtype]()
-                dv_shared[local_col, col] = (existing_dv + sum_dv).cast[dtype]()
+            for step in range(2):
+                var c = thread_col_index + step * 4
+                var col = col_base + c
+                if col < head_dim:
+                    var sum_dk = (
+                        reduction_dk[local_col, 0, c]
+                        + reduction_dk[local_col, 1, c]
+                        + reduction_dk[local_col, 2, c]
+                        + reduction_dk[local_col, 3, c]
+                    )
+                    var sum_dv = (
+                        reduction_dv[local_col, 0, c]
+                        + reduction_dv[local_col, 1, c]
+                        + reduction_dv[local_col, 2, c]
+                        + reduction_dv[local_col, 3, c]
+                    )
+                    var existing_dk = dk_shared[local_col, col].cast[
+                        DType.float32
+                    ]()
+                    var existing_dv = dv_shared[local_col, col].cast[
+                        DType.float32
+                    ]()
+                    dk_shared[local_col, col] = (existing_dk + sum_dk).cast[
+                        dtype
+                    ]()
+                    dv_shared[local_col, col] = (existing_dv + sum_dv).cast[
+                        dtype
+                    ]()
             barrier()
 
     # Write final dk_shared and dv_shared blocks out to DRAM (fully contention-free)
@@ -2324,9 +2471,10 @@ def attention_bwd[
             raise Error("head_dim exceeds MAX_HEAD_DIM for GPU attention")
         comptime simd_width = simd_width_of[dtype]()
         comptime is_float32 = dtype == DType.float32
-        comptime Br = 16 if is_float32 else 32
+        comptime Br = 32
         comptime Bc = 16 if is_float32 else 32
-        comptime BLOCK_SIZE = 64 if is_float32 else 128
+        comptime BLOCK_SIZE_DQ = Br * 4
+        comptime BLOCK_SIZE_DKV = Bc * 4
         comptime SM_OVERPROVISION = 32
 
         var device_ctx = ctx
@@ -2345,7 +2493,7 @@ def attention_bwd[
             simd_width,
             Br,
             Bc,
-            BLOCK_SIZE,
+            BLOCK_SIZE_DQ,
             use_soft_exp=use_soft_exp,
         ]
 
@@ -2385,7 +2533,7 @@ def attention_bwd[
                 seq_len,
                 head_dim,
                 grid_dim=(num_blocks_dq,),
-                block_dim=(BLOCK_SIZE,),
+                block_dim=(BLOCK_SIZE_DQ,),
             )
         else:
             var compiled_dq = device_ctx.compile_function[gpu_kernel_dq]()
@@ -2403,7 +2551,7 @@ def attention_bwd[
                 seq_len,
                 head_dim,
                 grid_dim=(num_blocks_dq,),
-                block_dim=(BLOCK_SIZE,),
+                block_dim=(BLOCK_SIZE_DQ,),
             )
 
         # Pass 2: dK/dV - FA2 backward kernel with KV tile as outer loop.
@@ -2418,7 +2566,7 @@ def attention_bwd[
             simd_width,
             Br,
             Bc,
-            BLOCK_SIZE,
+            BLOCK_SIZE_DKV,
             use_soft_exp=use_soft_exp,
         ]
 
@@ -2460,7 +2608,7 @@ def attention_bwd[
                 seq_len,
                 head_dim,
                 grid_dim=(num_blocks_dkv,),
-                block_dim=(BLOCK_SIZE,),
+                block_dim=(BLOCK_SIZE_DKV,),
             )
         else:
             var compiled_dkv = device_ctx.compile_function[gpu_kernel_dkv]()
@@ -2480,7 +2628,7 @@ def attention_bwd[
                 seq_len,
                 head_dim,
                 grid_dim=(num_blocks_dkv,),
-                block_dim=(BLOCK_SIZE,),
+                block_dim=(BLOCK_SIZE_DKV,),
             )
     else:
         raise Error("Invalid target")
