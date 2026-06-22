@@ -28,6 +28,29 @@ from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
 # ===----------------------------------------------------------------------=== #
+# KV Cache
+# ===----------------------------------------------------------------------=== #
+
+# NOTE: Simple implementation of a KV cache for the attention mechanism.
+
+
+struct KVCache:
+    var fwd_addr: Int
+    var bwd_dq_addr: Int
+    var bwd_dkv_addr: Int
+
+    def __init__(out self):
+        self.fwd_addr = 0
+        self.bwd_dq_addr = 0
+        self.bwd_dkv_addr = 0
+
+
+comptime KVCachePtr = UnsafePointer[
+    mut=True, type=KVCache, origin=MutUntrackedOrigin
+]
+
+
+# ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
 # ===----------------------------------------------------------------------=== #
 
@@ -1022,6 +1045,7 @@ def attention_fwd[
     target: StaticString,
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
+    use_kv_cache: Bool = True,
 ](
     qkv_ptr: ImmutKernelPtr[dtype],
     q_ptr: MutKernelPtr[dtype],
@@ -1035,6 +1059,7 @@ def attention_fwd[
     seq_len: Int64,
     head_dim: Int64,
     ctx: DeviceContext,
+    cache: Optional[KVCachePtr] = None,
 ) capturing raises:
     var qkv_mut = rebind[MutKernelPtr[dtype]](qkv_ptr)
     var dst_ptrs = List[MutKernelPtr[dtype]]()
@@ -1050,7 +1075,9 @@ def attention_fwd[
         Int(head_dim),
         ctx,
     )
-    attention_fwd[dtype, target, use_soft_exp, use_conditional_rescale](
+    attention_fwd[
+        dtype, target, use_soft_exp, use_conditional_rescale, use_kv_cache
+    ](
         attn_ptr,
         q_ptr,
         k_ptr,
@@ -1061,6 +1088,7 @@ def attention_fwd[
         seq_len,
         head_dim,
         ctx,
+        cache=cache,
     )
     merge_fwd[dtype, target](
         attn_ptr,
@@ -1078,6 +1106,7 @@ def attention_fwd[
     target: StaticString,
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
+    use_kv_cache: Bool = True,
 ](
     output_ptr: MutKernelPtr[dtype],
     query_ptr: ImmutKernelPtr[dtype],
@@ -1089,6 +1118,7 @@ def attention_fwd[
     seq_len: Int64,
     head_dim: Int64,
     ctx: DeviceContext,
+    cache: Optional[KVCachePtr] = None,
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime simd_width = simd_width_of[dtype]()
@@ -1131,21 +1161,68 @@ def attention_fwd[
             use_soft_exp=use_soft_exp,
             use_conditional_rescale=use_conditional_rescale,
         ]
-        var compiled = device_ctx.compile_function[gpu_kernel]()
-        device_ctx.enqueue_function(
-            compiled,
-            num_tiles,
-            query_tiles,
-            output_ptr,
-            query_ptr,
-            key_ptr,
-            value_ptr,
-            log_sum_exp_ptr,
-            seq_len,
-            head_dim,
-            grid_dim=(num_blocks,),
-            block_dim=(BLOCK_SIZE,),
-        )
+
+        comptime if use_kv_cache:
+            # PERFORMANCE NOTE:
+            # Previously, JIT compilation (device_ctx.compile_function) was run dynamically on every
+            # layer call and training step, adding massive host JIT compiler overhead. To avoid this,
+            # we now query the cache pointer passed from the GPT2 model.
+            #
+            # In the backward pass, threads were also doing heap alloc() and free() inside the thread-block
+            # inner loops, which serialized execution on the GPU. This is now resolved by using
+            # stack-allocated LayoutTensors instead of heap memory.
+            var addr_fwd = 0
+            if cache:
+                addr_fwd = cache.value()[].fwd_addr
+
+            comptime CompiledType = type_of(
+                device_ctx.compile_function[gpu_kernel]()
+            )
+
+            # Cache miss, compile the kernel and store the address.
+            if addr_fwd == 0:
+                var compiled = device_ctx.compile_function[gpu_kernel]()
+                var ptr = alloc[CompiledType](1)
+                ptr.init_pointee_copy(compiled)
+                addr_fwd = Int(ptr)
+                if cache:
+                    cache.value()[].fwd_addr = addr_fwd
+
+            var casted_ptr = UnsafePointer[
+                mut=True, type=CompiledType, origin=MutUntrackedOrigin
+            ](unsafe_from_address=addr_fwd)
+            var retrieved = casted_ptr[]
+
+            device_ctx.enqueue_function(
+                retrieved,
+                num_tiles,
+                query_tiles,
+                output_ptr,
+                query_ptr,
+                key_ptr,
+                value_ptr,
+                log_sum_exp_ptr,
+                seq_len,
+                head_dim,
+                grid_dim=(num_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            var compiled = device_ctx.compile_function[gpu_kernel]()
+            device_ctx.enqueue_function(
+                compiled,
+                num_tiles,
+                query_tiles,
+                output_ptr,
+                query_ptr,
+                key_ptr,
+                value_ptr,
+                log_sum_exp_ptr,
+                seq_len,
+                head_dim,
+                grid_dim=(num_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
     else:
         raise Error("Invalid target")
 
@@ -1614,7 +1691,13 @@ def _attention_gpu_bwd_dq_tile_block[
 
         # Per-thread dQ partials live in local memory (registers/spill), not
         # shared SRAM, only this thread reads/writes them before the reduction.
-        var private_dq = alloc[Scalar[DType.float32]](MAX_HEAD_DIM)
+        var private_dq_tensor = LayoutTensor[
+            DType.float32,
+            Layout.row_major(MAX_HEAD_DIM),
+            MutAnyOrigin,
+            address_space=AddressSpace.GENERIC,
+        ].stack_allocation()
+        var private_dq = private_dq_tensor.ptr
         for col in range(head_dim):
             private_dq[col] = 0.0
 
@@ -1679,8 +1762,6 @@ def _attention_gpu_bwd_dq_tile_block[
                 var existing = dq_shared[local_row, col].cast[DType.float32]()
                 dq_shared[local_row, col] = (existing + sum_col).cast[dtype]()
             barrier()
-
-        private_dq.free()
 
     # Write final dq_shared block out to DRAM.
     _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, False](
@@ -1935,8 +2016,20 @@ def _attention_gpu_bwd_dkv_tile_block[
         barrier()
 
         # Per-thread dK/dV partials in local memory, same rationale as dQ pass.
-        var private_dk = alloc[Scalar[DType.float32]](MAX_HEAD_DIM)
-        var private_dv = alloc[Scalar[DType.float32]](MAX_HEAD_DIM)
+        var private_dk_tensor = LayoutTensor[
+            DType.float32,
+            Layout.row_major(MAX_HEAD_DIM),
+            MutAnyOrigin,
+            address_space=AddressSpace.GENERIC,
+        ].stack_allocation()  # Stack-allocated generic memory is much faster then heap the way we previously allocated it.
+        var private_dk = private_dk_tensor.ptr
+        var private_dv_tensor = LayoutTensor[
+            DType.float32,
+            Layout.row_major(MAX_HEAD_DIM),
+            MutAnyOrigin,
+            address_space=AddressSpace.GENERIC,
+        ].stack_allocation()
+        var private_dv = private_dv_tensor.ptr
         for col in range(head_dim):
             private_dk[col] = 0.0
             private_dv[col] = 0.0
@@ -2040,9 +2133,6 @@ def _attention_gpu_bwd_dkv_tile_block[
                 dv_shared[local_col, col] = (existing_dv + sum_dv).cast[dtype]()
             barrier()
 
-        private_dk.free()
-        private_dv.free()
-
     # Write final dk_shared and dv_shared blocks out to DRAM (fully contention-free)
     _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, False](
         dk_tile_dram, dk_shared, key_tile_rows, head_dim
@@ -2124,6 +2214,7 @@ def attention_bwd[
     dtype: DType,
     target: StaticString,
     use_soft_exp: Bool = True,
+    use_kv_cache: Bool = True,
 ](
     d_qkv_ptr: MutKernelPtr[dtype],
     d_q_ptr: MutKernelPtr[dtype],
@@ -2141,6 +2232,7 @@ def attention_bwd[
     seq_len: Int64,
     head_dim: Int64,
     ctx: DeviceContext,
+    cache: Optional[KVCachePtr] = None,
 ) capturing raises:
     # 1. Split heads backward: split d_attn_merged into d_attn
     merge_bwd[dtype, target](
@@ -2154,7 +2246,7 @@ def attention_bwd[
     )
 
     # 2. Core attention backward
-    attention_bwd[dtype, target, use_soft_exp](
+    attention_bwd[dtype, target, use_soft_exp, use_kv_cache](
         d_q_ptr,
         d_k_ptr,
         d_v_ptr,
@@ -2169,6 +2261,7 @@ def attention_bwd[
         seq_len,
         head_dim,
         ctx,
+        cache=cache,
     )
 
     # 3. Merge QKV backward: merge d_q, d_k, d_v back into d_qkv
@@ -2191,6 +2284,7 @@ def attention_bwd[
     dtype: DType,
     target: StaticString,
     use_soft_exp: Bool = True,
+    use_kv_cache: Bool = True,
 ](
     d_query_ptr: MutKernelPtr[dtype],
     d_key_ptr: MutKernelPtr[dtype],
@@ -2206,6 +2300,7 @@ def attention_bwd[
     seq_len: Int64,
     head_dim: Int64,
     ctx: DeviceContext,
+    cache: Optional[KVCachePtr] = None,
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime simd_width = simd_width_of[dtype]()
@@ -2253,23 +2348,63 @@ def attention_bwd[
             BLOCK_SIZE,
             use_soft_exp=use_soft_exp,
         ]
-        var compiled_dq = device_ctx.compile_function[gpu_kernel_dq]()
-        device_ctx.enqueue_function(
-            compiled_dq,
-            num_tiles_dq,
-            query_tiles,
-            d_query_ptr,
-            query_ptr,
-            key_ptr,
-            value_ptr,
-            output_ptr,
-            d_output_ptr,
-            log_sum_exp_ptr,
-            seq_len,
-            head_dim,
-            grid_dim=(num_blocks_dq,),
-            block_dim=(BLOCK_SIZE,),
-        )
+
+        comptime if use_kv_cache:
+            var addr_dq = 0
+            if cache:
+                addr_dq = cache.value()[].bwd_dq_addr
+
+            comptime CompiledTypeDQ = type_of(
+                device_ctx.compile_function[gpu_kernel_dq]()
+            )
+
+            if addr_dq == 0:
+                var compiled_dq = device_ctx.compile_function[gpu_kernel_dq]()
+                var ptr_dq = alloc[CompiledTypeDQ](1)
+                ptr_dq.init_pointee_copy(compiled_dq)
+                addr_dq = Int(ptr_dq)
+                if cache:
+                    cache.value()[].bwd_dq_addr = addr_dq
+
+            var casted_ptr_dq = UnsafePointer[
+                mut=True, type=CompiledTypeDQ, origin=MutUntrackedOrigin
+            ](unsafe_from_address=addr_dq)
+            var retrieved_dq = casted_ptr_dq[]
+
+            device_ctx.enqueue_function(
+                retrieved_dq,
+                num_tiles_dq,
+                query_tiles,
+                d_query_ptr,
+                query_ptr,
+                key_ptr,
+                value_ptr,
+                output_ptr,
+                d_output_ptr,
+                log_sum_exp_ptr,
+                seq_len,
+                head_dim,
+                grid_dim=(num_blocks_dq,),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            var compiled_dq = device_ctx.compile_function[gpu_kernel_dq]()
+            device_ctx.enqueue_function(
+                compiled_dq,
+                num_tiles_dq,
+                query_tiles,
+                d_query_ptr,
+                query_ptr,
+                key_ptr,
+                value_ptr,
+                output_ptr,
+                d_output_ptr,
+                log_sum_exp_ptr,
+                seq_len,
+                head_dim,
+                grid_dim=(num_blocks_dq,),
+                block_dim=(BLOCK_SIZE,),
+            )
 
         # Pass 2: dK/dV - FA2 backward kernel with KV tile as outer loop.
         var num_tiles_dkv = Int(batch_size * num_heads * Int64(kv_tiles))
@@ -2277,6 +2412,7 @@ def attention_bwd[
             min(num_tiles_dkv, SM_OVERPROVISION * num_sm), 1
         )
 
+        # Cache retrieve or compile dkv
         comptime gpu_kernel_dkv = attention_bwd_dkv_gpu[
             dtype,
             simd_width,
@@ -2285,25 +2421,67 @@ def attention_bwd[
             BLOCK_SIZE,
             use_soft_exp=use_soft_exp,
         ]
-        var compiled_dkv = device_ctx.compile_function[gpu_kernel_dkv]()
-        device_ctx.enqueue_function(
-            compiled_dkv,
-            num_tiles_dkv,
-            kv_tiles,
-            query_tiles,
-            d_key_ptr,
-            d_value_ptr,
-            query_ptr,
-            key_ptr,
-            value_ptr,
-            output_ptr,
-            d_output_ptr,
-            log_sum_exp_ptr,
-            seq_len,
-            head_dim,
-            grid_dim=(num_blocks_dkv,),
-            block_dim=(BLOCK_SIZE,),
-        )
+
+        comptime if use_kv_cache:
+            var addr_dkv = 0
+            if cache:
+                addr_dkv = cache.value()[].bwd_dkv_addr
+
+            comptime CompiledTypeDKV = type_of(
+                device_ctx.compile_function[gpu_kernel_dkv]()
+            )
+            # Cache miss, compile the kernel and store the address.
+            if addr_dkv == 0:
+                var compiled_dkv = device_ctx.compile_function[gpu_kernel_dkv]()
+                var ptr_dkv = alloc[CompiledTypeDKV](1)
+                ptr_dkv.init_pointee_copy(compiled_dkv)
+                addr_dkv = Int(ptr_dkv)
+                if cache:
+                    cache.value()[].bwd_dkv_addr = addr_dkv
+
+            var casted_ptr_dkv = UnsafePointer[
+                mut=True, type=CompiledTypeDKV, origin=MutUntrackedOrigin
+            ](unsafe_from_address=addr_dkv)
+            var retrieved_dkv = casted_ptr_dkv[]
+
+            device_ctx.enqueue_function(
+                retrieved_dkv,
+                num_tiles_dkv,
+                kv_tiles,
+                query_tiles,
+                d_key_ptr,
+                d_value_ptr,
+                query_ptr,
+                key_ptr,
+                value_ptr,
+                output_ptr,
+                d_output_ptr,
+                log_sum_exp_ptr,
+                seq_len,
+                head_dim,
+                grid_dim=(num_blocks_dkv,),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            var compiled_dkv = device_ctx.compile_function[gpu_kernel_dkv]()
+            device_ctx.enqueue_function(
+                compiled_dkv,
+                num_tiles_dkv,
+                kv_tiles,
+                query_tiles,
+                d_key_ptr,
+                d_value_ptr,
+                query_ptr,
+                key_ptr,
+                value_ptr,
+                output_ptr,
+                d_output_ptr,
+                log_sum_exp_ptr,
+                seq_len,
+                head_dim,
+                grid_dim=(num_blocks_dkv,),
+                block_dim=(BLOCK_SIZE,),
+            )
     else:
         raise Error("Invalid target")
 

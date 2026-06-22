@@ -15,7 +15,7 @@ from llmm.layernorm import (
     layernorm_fused_residual_fwd,
     layernorm_fused_residual_bwd,
 )
-from llmm.attention import attention_fwd, attention_bwd
+from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
 from llmm.matmul import matmul_fwd, matmul_bwd
 from llmm.softmax import softmax_fwd, softmax_bwd
 from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
@@ -385,6 +385,7 @@ struct GPT2[target: StaticString]:
     var has_allocated_acts: Bool
     var has_allocated_grads: Bool
     var has_allocated_optimizer_moments: Bool
+    var kv_cache: KVCache
 
     def __init__(out self, checkpoint_path: String, ctx: DeviceContext) raises:
         self.ctx = ctx
@@ -393,6 +394,7 @@ struct GPT2[target: StaticString]:
         self.has_allocated_acts = False
         self.has_allocated_grads = False
         self.has_allocated_optimizer_moments = False
+        self.kv_cache = KVCache()
 
         self.config = GPT2Config(
             max_seq_len=0,
@@ -946,6 +948,7 @@ struct GPT2[target: StaticString]:
                 Int64(seq_len),
                 Int64(head_dim),
                 self.ctx,
+                cache=rebind[KVCachePtr](UnsafePointer(to=self.kv_cache)),
             )
 
             # Matmul Attn Proj
@@ -1117,6 +1120,14 @@ struct GPT2[target: StaticString]:
         var layer_stride = batch_size * seq_len * channels
         var qkv_layer_stride = layer_stride * 3
         var fch_layer_stride = layer_stride * 4
+
+        var t_mlp_proj = Float64(0.0)
+        var t_mlp_fc = Float64(0.0)
+        var t_ln2 = Float64(0.0)
+        var t_attn_proj = Float64(0.0)
+        var t_attn = Float64(0.0)
+        var t_qkv = Float64(0.0)
+        var t_ln1 = Float64(0.0)
 
         ##############################################################
         # Backward Pass
@@ -1293,6 +1304,7 @@ struct GPT2[target: StaticString]:
                 )
 
             # MLP projection backward.
+            var loop_t0 = global_perf_counter_ns()
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
                 as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
                 as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
@@ -1308,6 +1320,9 @@ struct GPT2[target: StaticString]:
                 Int64(channels),
                 self.ctx,
             )
+            self.ctx.synchronize()
+            var loop_t1 = global_perf_counter_ns()
+            t_mlp_proj += Float64(loop_t1 - loop_t0) / 1e9
 
             # MLP FC backward (fused GELU).
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
@@ -1325,6 +1340,9 @@ struct GPT2[target: StaticString]:
                 Int64(4 * channels),
                 self.ctx,
             )
+            self.ctx.synchronize()
+            var loop_t2 = global_perf_counter_ns()
+            t_mlp_fc += Float64(loop_t2 - loop_t1) / 1e9
 
             # LayerNorm 2 fused residual backward.
             layernorm_fused_residual_bwd[GPT2_DTYPE, Self.target](
@@ -1345,6 +1363,9 @@ struct GPT2[target: StaticString]:
                 Int64(channels),
                 self.ctx,
             )
+            self.ctx.synchronize()
+            var loop_t3 = global_perf_counter_ns()
+            t_ln2 += Float64(loop_t3 - loop_t2) / 1e9
 
             # Attention projection backward.
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
@@ -1362,6 +1383,9 @@ struct GPT2[target: StaticString]:
                 Int64(channels),
                 self.ctx,
             )
+            self.ctx.synchronize()
+            var loop_t4 = global_perf_counter_ns()
+            t_attn_proj += Float64(loop_t4 - loop_t3) / 1e9
 
             # Attention backward.
             attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
@@ -1381,7 +1405,11 @@ struct GPT2[target: StaticString]:
                 Int64(seq_len),
                 Int64(head_dim),
                 self.ctx,
+                cache=rebind[KVCachePtr](UnsafePointer(to=self.kv_cache)),
             )
+            self.ctx.synchronize()
+            var loop_t5 = global_perf_counter_ns()
+            t_attn += Float64(loop_t5 - loop_t4) / 1e9
 
             # QKV matmul backward.
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
@@ -1399,6 +1427,9 @@ struct GPT2[target: StaticString]:
                 Int64(3 * channels),
                 self.ctx,
             )
+            self.ctx.synchronize()
+            var loop_t6 = global_perf_counter_ns()
+            t_qkv += Float64(loop_t6 - loop_t5) / 1e9
 
             # LayerNorm 1 backward.
             if layer == 0:
@@ -1442,8 +1473,12 @@ struct GPT2[target: StaticString]:
                     Int64(channels),
                     self.ctx,
                 )
+            self.ctx.synchronize()
+            var loop_t7 = global_perf_counter_ns()
+            t_ln1 += Float64(loop_t7 - loop_t6) / 1e9
 
         # Encoder backward: scatter token grads into wte, sum position grads into wpe.
+        var t_enc0 = global_perf_counter_ns()
         encoder_bwd[GPT2_DTYPE, Self.target](
             as_mut_kernel[GPT2_DTYPE](self.grads.wte),
             as_mut_kernel[GPT2_DTYPE](self.grads.wpe),
@@ -1456,6 +1491,16 @@ struct GPT2[target: StaticString]:
             channels,
             self.ctx,
         )
+        self.ctx.synchronize()
+        var t_enc1 = global_perf_counter_ns()
+        print("  - mlp_proj:", t_mlp_proj, "s")
+        print("  - mlp_fc:", t_mlp_fc, "s")
+        print("  - ln2:", t_ln2, "s")
+        print("  - attn_proj:", t_attn_proj, "s")
+        print("  - attn:", t_attn, "s")
+        print("  - qkv:", t_qkv, "s")
+        print("  - ln1:", t_ln1, "s")
+        print("  - encoder_bwd:", Float64(t_enc1 - t_enc0) / 1e9, "s")
 
     def update(
         mut self,
@@ -1521,7 +1566,7 @@ def train[target: StaticString]() raises:
         raise Error("Failed to open train tokens file: " + train_tokens)
 
     comptime BATCH_SIZE = 4
-    comptime SEQ_LEN = 64
+    comptime SEQ_LEN = 1024
 
     var train_loader = DataLoader(train_tokens, BATCH_SIZE, SEQ_LEN)
     print("Loaded train tokens from " + train_tokens)
@@ -1535,7 +1580,8 @@ def train[target: StaticString]() raises:
     print("Loaded tokenizer from " + "gpt2_tokenizer.bin")
 
     # Build the learning rate scheduler.
-    var num_iters = 40
+    # var num_iters = 40
+    var num_iters = 5
     var learning_rate_scheduler = LearningRateScheduler(
         "constant",
         learning_rate=Scalar[DType.float32](1e-4),
@@ -1620,28 +1666,44 @@ def train[target: StaticString]() raises:
         if step == num_iters:
             break
 
-        var start_time = global_perf_counter_ns()
+        var t0 = global_perf_counter_ns()
         model.forward(
             train_loader.inputs, train_loader.targets, BATCH_SIZE, SEQ_LEN
         )
+        model.ctx.synchronize()
+        var t1 = global_perf_counter_ns()
+
         model.backward()
+        model.ctx.synchronize()
+        var t2 = global_perf_counter_ns()
+
         model.update(
             UInt32(step + 1), learning_rate_scheduler.get_learning_rate(step)
         )
-        train_loader.next_batch()
         model.ctx.synchronize()
-        var elapsed_time = Float64(global_perf_counter_ns() - start_time) / 1e9
+        var t3 = global_perf_counter_ns()
+
+        train_loader.next_batch()
+        var t4 = global_perf_counter_ns()
+
+        var elapsed_time = Float64(t4 - t0) / 1e9
         elapsed_time_ms_total += elapsed_time
         print(
             "step "
             + String(step)
             + ": train loss "
             + String(model.mean_loss)
-            + " | elapsed time "
+            + " | forward: "
+            + String(Float64(t1 - t0) / 1e9)
+            + "s | backward: "
+            + String(Float64(t2 - t1) / 1e9)
+            + "s | update: "
+            + String(Float64(t3 - t2) / 1e9)
+            + "s | loader: "
+            + String(Float64(t4 - t3) / 1e9)
+            + "s | total: "
             + String(elapsed_time)
-            + " ms, average time "
-            + String(elapsed_time_ms_total / Float64(step + 1))
-            + " ms"
+            + "s"
         )
 
     train_loader.close()

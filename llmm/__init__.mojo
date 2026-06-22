@@ -1,5 +1,12 @@
 from .adamw import AdamWUpdate, adamw_update
-from .attention import AttentionFwd, AttentionBwd, attention_fwd, attention_bwd
+from .attention import (
+    AttentionFwd,
+    AttentionBwd,
+    attention_fwd,
+    attention_bwd,
+    KVCache,
+    KVCachePtr,
+)
 from .crossentropy import (
     CrossEntropyOHEFwd,
     CrossEntropyOHEBwd,
