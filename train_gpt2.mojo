@@ -1569,6 +1569,8 @@ def train[target: StaticString]() raises:
 
     var elapsed_time_ms_total = 0.0
 
+    train_loader.next_batch()
+
     for step in range(num_iters + 1):
         # Occasionally estimate validation loss.
         if val_loss_every > 0 and step % val_loss_every == 0:
@@ -1626,7 +1628,6 @@ def train[target: StaticString]() raises:
             break
 
         var start_time = global_perf_counter_ns()
-        train_loader.next_batch()
         model.forward(
             train_loader.inputs, train_loader.targets, BATCH_SIZE, SEQ_LEN
         )
@@ -1634,6 +1635,7 @@ def train[target: StaticString]() raises:
         model.update(
             UInt32(step + 1), learning_rate_scheduler.get_learning_rate(step)
         )
+        train_loader.next_batch()
         model.ctx.synchronize()
         var elapsed_time = Float64(global_perf_counter_ns() - start_time) / 1e9
         elapsed_time_ms_total += elapsed_time

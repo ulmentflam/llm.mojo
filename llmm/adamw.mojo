@@ -209,7 +209,7 @@ def adamw_update_gpu[
 def adamw_update[
     dtype: DType,
     target: StaticString,
-    width: Int = 4,  # Pinning to 4 — optimal for the Float32 moment loads.
+    width: Int = 8,  # Pinning to 8 — optimal for 32-byte coalesced GPU loads.
 ](
     num_params: Int,
     params_ptr: MutKernelPtr[dtype],
@@ -288,7 +288,7 @@ struct AdamWUpdate:
     def execute[
         dtype: DType,
         target: StaticString,
-        width: Int = 4,
+        width: Int = 8,
     ](
         params: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
         m_memory: MutableInputTensor[

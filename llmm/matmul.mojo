@@ -461,56 +461,32 @@ def matmul_d_input_bwd[
         row_major(out_channels, in_channels),
     )
 
-    comptime if is_cpu[target]():
-        comptime if use_gelu:
+    comptime if use_gelu:
 
-            @parameter
-            @always_inline
-            def d_input_epilogue[
-                dtype: DType, width: SIMDSize, *, alignment: Int = 1
-            ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
-                var offset = idx[0] * in_channels + idx[1]
-                var v = val.cast[DType.float32]()
-                var pre_gelu = (
-                    (pre_gelu_ptr + offset)
-                    .load[width=width]()
-                    .cast[DType.float32]()
-                )
-                v *= gelu_grad[DType.float32, width](pre_gelu)
-                (d_input_ptr + offset).store(v.cast[elem_dtype]())
-
-            matmul[
-                transpose_b=False,
-                elementwise_lambda_fn=d_input_epilogue,
-                target=target,
-            ](c_d_input, a_d_output, b_weight, ctx=ctx)
-        else:
-            matmul[transpose_b=False, target=target](
-                c_d_input, a_d_output, b_weight, ctx=ctx
+        @parameter
+        @always_inline
+        def d_input_epilogue[
+            dtype: DType, width: SIMDSize, *, alignment: Int = 1
+        ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
+            var offset = idx[0] * in_channels + idx[1]
+            var v = val.cast[DType.float32]()
+            var pre_gelu = (
+                (pre_gelu_ptr + offset)
+                .load[width=width]()
+                .cast[DType.float32]()
             )
-    elif is_gpu[target]():
+            v *= gelu_grad[DType.float32, width](pre_gelu)
+            (d_input_ptr + offset).store(v.cast[elem_dtype]())
+
+        matmul[
+            transpose_b=False,
+            elementwise_lambda_fn=d_input_epilogue,
+            target=target,
+        ](c_d_input, a_d_output, b_weight, ctx=ctx)
+    else:
         matmul[transpose_b=False, target=target](
             c_d_input, a_d_output, b_weight, ctx=ctx
         )
-        ctx.synchronize()
-        comptime if use_gelu:
-            comptime width = simd_width_of[dtype]()
-            comptime BLOCK_SIZE = 256
-            var device_ctx = ctx
-            var num_threads = ceildiv(rows * in_channels, width)
-            var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
-            comptime gpu_kernel = matmul_gelu_backward_scaling_gpu[dtype, width]
-            var compiled = device_ctx.compile_function[gpu_kernel]()
-            device_ctx.enqueue_function(
-                compiled,
-                d_input_ptr,
-                pre_gelu_ptr,
-                rows * in_channels,
-                grid_dim=(num_blocks,),
-                block_dim=(BLOCK_SIZE,),
-            )
-    else:
-        raise Error("Invalid target")
     ctx.synchronize()
 
 
