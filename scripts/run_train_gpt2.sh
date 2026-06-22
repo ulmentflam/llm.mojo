@@ -29,6 +29,6 @@ if [ ! -x "$ROOT/build/train_gpt2" ]; then
 fi
 
 # TODO: Race condition fix: Enable device-sync-mode
-export MODULAR_DEBUG="${MODULAR_DEBUG:-device-sync-mode}"
+# export MODULAR_DEBUG="${MODULAR_DEBUG:-device-sync-mode}"
 
 exec "$ROOT/build/train_gpt2" "$@"

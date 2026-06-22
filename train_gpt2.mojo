@@ -1,7 +1,7 @@
 from std.os import getenv
 from std.time import global_perf_counter_ns
 from std.gpu.host.info import is_cpu, is_gpu
-from std.gpu.host import DeviceContext, HostBuffer
+from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.sys import has_accelerator, has_apple_gpu_accelerator
 from std.memory import alloc, UnsafePointer, memcpy, memset_zero
@@ -326,16 +326,18 @@ struct GPT2[target: StaticString]:
     var config: GPT2Config
 
     # Buffer objects managing physical memory lifetimes
-    var params_buf: HostBuffer[GPT2_DTYPE]
-    var grads_buf: HostBuffer[GPT2_DTYPE]
-    var m_buf: HostBuffer[GPT2_DTYPE]
-    var v_buf: HostBuffer[GPT2_DTYPE]
-    var acts_buf: HostBuffer[GPT2_DTYPE]
-    var grad_acts_buf: HostBuffer[GPT2_DTYPE]
+    var params_buf: DeviceBuffer[GPT2_DTYPE]
+    var grads_buf: DeviceBuffer[GPT2_DTYPE]
+    var m_buf: DeviceBuffer[GPT2_DTYPE]
+    var v_buf: DeviceBuffer[GPT2_DTYPE]
+    var acts_buf: DeviceBuffer[GPT2_DTYPE]
+    var grad_acts_buf: DeviceBuffer[GPT2_DTYPE]
     var inputs_buf: HostBuffer[DType.int32]
     var targets_buf: HostBuffer[DType.int32]
     var bucket_info_buf: HostBuffer[DType.int32]
     var workload_indices_buf: HostBuffer[DType.int32]
+    var losses_host_buf: HostBuffer[GPT2_DTYPE]
+    var logits_host_buf: HostBuffer[GPT2_DTYPE]
 
     # Model weights and their sizes
     var params: ParameterTensors[GPT2_DTYPE]
@@ -430,18 +432,21 @@ struct GPT2[target: StaticString]:
         self.acts = ActivationTensors[GPT2_DTYPE]()
         self.grad_acts = ActivationTensors[GPT2_DTYPE]()
 
-        self.params_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
-        self.grads_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
-        self.m_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
-        self.v_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
-        self.acts_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
-        self.grad_acts_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
+        self.params_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.grads_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.m_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.v_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.acts_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.grad_acts_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.inputs_buf = ctx.enqueue_create_host_buffer[DType.int32](1)
         self.targets_buf = ctx.enqueue_create_host_buffer[DType.int32](1)
         self.bucket_info_buf = ctx.enqueue_create_host_buffer[DType.int32](1)
         self.workload_indices_buf = ctx.enqueue_create_host_buffer[DType.int32](
             1
         )
+        self.losses_host_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
+        self.logits_host_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
+        ctx.synchronize()
 
         self.param_sizes = List[Int]()
         for _ in range(NUM_PARAMETER_TENSORS):
@@ -553,53 +558,58 @@ struct GPT2[target: StaticString]:
 
         # Allocate parameters using device context host buffer.
         self.params = ParameterTensors[GPT2_DTYPE]()
-        self.params_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+        var temp_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )
+        self.ctx.synchronize()
+        var temp_ptr = rebind_mut_mem[GPT2_DTYPE](
+            temp_host_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        read_and_copy[GPT2_DTYPE](model_file, temp_ptr, self.num_parameters)
+        model_file.close()
+
+        self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+            self.num_parameters
+        )
+        self.ctx.enqueue_copy(dst_buf=self.params_buf, src_ptr=temp_ptr)
+        self.ctx.synchronize()
         self.params_memory = rebind_mut_mem[GPT2_DTYPE](
             self.params_buf.unsafe_ptr().as_unsafe_any_origin()
         )
         self.params.point_parameters(self.param_sizes, self.params_memory)
 
-        read_and_copy[GPT2_DTYPE](
-            model_file, self.params_memory, self.num_parameters
-        )
-        model_file.close()
-
         self.has_allocated_params = True
 
     def allocate_gradients(mut self) raises:
         self.grads = ParameterTensors[GPT2_DTYPE]()
-        self.grads_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+        self.grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             self.num_parameters
         )
+        self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        self.ctx.synchronize()
         self.grads_memory = rebind_mut_mem[GPT2_DTYPE](
             self.grads_buf.unsafe_ptr().as_unsafe_any_origin()
         )
         self.grads.point_parameters(self.param_sizes, self.grads_memory)
-
-        for i in range(self.num_parameters):
-            self.grads_memory.store(i, 0.0)  # Initialize gradients to 0.0
         self.num_grads = self.num_parameters
         self.has_allocated_grads = True
 
     def allocate_optimizer_moments(mut self) raises:
-        self.m_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+        self.m_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             self.num_parameters
         )
-        self.v_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+        self.v_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             self.num_parameters
         )
+        self.m_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        self.v_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        self.ctx.synchronize()
         self.m_memory = rebind_mut_mem[GPT2_DTYPE](
             self.m_buf.unsafe_ptr().as_unsafe_any_origin()
         )
         self.v_memory = rebind_mut_mem[GPT2_DTYPE](
             self.v_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-
-        for i in range(self.num_parameters):
-            self.m_memory.store(i, 0.0)  # Initialize m to 0.0
-            self.v_memory.store(i, 0.0)  # Initialize v to 0.0
         self.has_allocated_optimizer_moments = True
 
     def allocate_activations(mut self, batch_size: Int, seq_len: Int) raises:
@@ -648,17 +658,11 @@ struct GPT2[target: StaticString]:
         print("Number of Activations: " + String(self.num_activations))
 
         # Re-allocate device memory and point the structures
-        self.acts_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+        self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             self.num_activations
         )
-        self.grad_acts_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+        self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             self.num_activations
-        )
-        self.acts_memory = rebind_mut_mem[GPT2_DTYPE](
-            self.acts_buf.unsafe_ptr().as_unsafe_any_origin()
-        )
-        self.grad_acts_memory = rebind_mut_mem[GPT2_DTYPE](
-            self.grad_acts_buf.unsafe_ptr().as_unsafe_any_origin()
         )
 
         self.inputs_buf = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -666,12 +670,6 @@ struct GPT2[target: StaticString]:
         )
         self.targets_buf = self.ctx.enqueue_create_host_buffer[DType.int32](
             self.batch_size * self.seq_len
-        )
-        self.inputs = rebind_mut_mem[DType.int32](
-            self.inputs_buf.unsafe_ptr().as_unsafe_any_origin()
-        )
-        self.targets = rebind_mut_mem[DType.int32](
-            self.targets_buf.unsafe_ptr().as_unsafe_any_origin()
         )
 
         # Encoder backward scratch: one bucket per (token, channel_group).
@@ -684,13 +682,34 @@ struct GPT2[target: StaticString]:
         self.workload_indices_buf = self.ctx.enqueue_create_host_buffer[
             DType.int32
         ](B * T)
+
+        self.losses_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+            self.batch_size * self.seq_len
+        )
+        self.logits_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+            self.config.padded_vocab_size
+        )
+
+        self.ctx.synchronize()
+
+        self.acts_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.acts_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.grad_acts_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.grad_acts_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.inputs = rebind_mut_mem[DType.int32](
+            self.inputs_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.targets = rebind_mut_mem[DType.int32](
+            self.targets_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
         self.bucket_info = rebind_mut_mem[DType.int32](
             self.bucket_info_buf.unsafe_ptr().as_unsafe_any_origin()
         )
         self.workload_indices = rebind_mut_mem[DType.int32](
             self.workload_indices_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-        self.num_wte_buckets = 0
 
         self.acts.point_activations(self.act_sizes, self.acts_memory)
         self.grad_acts.point_activations(self.act_sizes, self.grad_acts_memory)
@@ -944,7 +963,7 @@ struct GPT2[target: StaticString]:
             )
 
             # TODO: Race condition fix: Synchronize context before reading logits on CPU.
-            # self.ctx.synchronize()
+            self.ctx.synchronize()
 
             # LayerNorm 2 & Residual.
             layernorm_fused_residual_fwd[GPT2_DTYPE, Self.target](
@@ -1021,7 +1040,7 @@ struct GPT2[target: StaticString]:
         )
 
         # TODO: Race condition fix: Synchronize context before reading logits on CPU.
-        # self.ctx.synchronize()
+        self.ctx.synchronize()
 
         # Output Logits (wte has no bias).
         matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
@@ -1057,18 +1076,31 @@ struct GPT2[target: StaticString]:
             # Sync context before reading losses on CPU.
             self.ctx.synchronize()
 
+            # Copy losses back to host.
+            var count = batch_size * seq_len
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                ](self.acts.losses.as_unsafe_any_origin()),
+                size=count,
+            )
+            self.ctx.synchronize()
+
             # Average loss into self.mean_loss.
             var total_loss: Float32 = 0.0
-            var count = batch_size * seq_len
             for i in range(count):
-                total_loss += self.acts.losses.load(i).cast[DType.float32]()
+                total_loss += self.losses_host_buf[i].cast[DType.float32]()
             self.mean_loss = total_loss / Float32(count)
 
-    def zero_gradients(mut self):
+    def zero_gradients(mut self) raises:
         if self.has_allocated_grads:
-            memset_zero(self.grads_memory, self.num_parameters)
+            self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
         if self.has_allocated_acts:
-            memset_zero(self.grad_acts_memory, self.num_activations)
+            self.grad_acts_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        self.ctx.synchronize()
 
     def backward(mut self) raises:
         if self.mean_loss == -1.0:
@@ -1102,7 +1134,17 @@ struct GPT2[target: StaticString]:
         )
         var dloss_val = dloss_mean.cast[GPT2_DTYPE]()
         for i in range(batch_size * seq_len):
-            self.grad_acts.losses.store(i, dloss_val)
+            self.losses_host_buf[i] = dloss_val
+
+        self.ctx.enqueue_copy(
+            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                self.grad_acts.losses.as_unsafe_any_origin()
+            ),
+            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            size=batch_size * seq_len,
+        )
 
         # Fused classifier backward writes d_logits in-place into acts.logits.
         fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=True](
@@ -1552,11 +1594,24 @@ def train[target: StaticString]() raises:
                 # In a real inference setting we would use a separate code for this anyway.
                 # Inference is here only for sanity checking.
                 model.forward(gen_tokens, null_int32_ptr, 1, t)
+                var dev_logits_ptr = (
+                    model.acts.logits + (t - 1) * model.config.padded_vocab_size
+                )
+                model.ctx.enqueue_copy(
+                    dst_ptr=rebind[
+                        UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+                    ](
+                        model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
+                    ),
+                    src_ptr=rebind[
+                        UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                    ](dev_logits_ptr.as_unsafe_any_origin()),
+                    size=model.config.vocab_size,
+                )
+                model.ctx.synchronize()
+
                 var logits = rebind[ImmutMemPtr[DType.float32]](
-                    (
-                        model.acts.logits
-                        + (t - 1) * model.config.padded_vocab_size
-                    ).as_unsafe_any_origin()
+                    model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
                 )
                 var coin = random_f32(rng_state)
                 var next_token = sample_softmax(
@@ -1579,6 +1634,7 @@ def train[target: StaticString]() raises:
         model.update(
             UInt32(step + 1), learning_rate_scheduler.get_learning_rate(step)
         )
+        model.ctx.synchronize()
         var elapsed_time = Float64(global_perf_counter_ns() - start_time) / 1e9
         elapsed_time_ms_total += elapsed_time
         print(

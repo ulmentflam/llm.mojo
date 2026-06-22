@@ -52,6 +52,7 @@ def matmul_fwd[
     output_channels: Int64,
     ctx: DeviceContext,
 ) raises -> None:
+    ctx.synchronize()
     var rows = Int(batch_size * seq_len)  # M in matmul
     var in_channels = Int(channels)  # K in matmul
     var out_channels = Int(output_channels)  # N in matmul
@@ -121,6 +122,7 @@ def matmul_fwd[
             elementwise_lambda_fn=epilogue_no_bias,
             target=target,
         ](c, a, b, ctx=ctx)
+    ctx.synchronize()
 
 
 @compiler.register("matmul_fwd")
@@ -341,6 +343,7 @@ def matmul_bias_bwd[
     output_channels: Int64,
     ctx: DeviceContext,
 ) raises -> None:
+    ctx.synchronize()
     comptime if is_cpu[target]():
         comptime simd_width = simd_width_of[DType.float32]()
         matmul_bias_bwd_cpu[dtype, simd_width, accumulate](
@@ -376,6 +379,7 @@ def matmul_bias_bwd[
         )
     else:
         raise Error("Invalid target")
+    ctx.synchronize()
 
 
 @always_inline
@@ -432,6 +436,7 @@ def matmul_d_input_bwd[
 ) raises -> None:
     """Computes d_input = d_output @ weight. Overwrites d_input: llm.c overwrites
     activation grads; only weight/bias grads accumulate across micro-steps."""
+    ctx.synchronize()
     var rows = Int(batch_size * seq_len)
     var in_channels = Int(channels)
     var out_channels = Int(output_channels)
@@ -487,6 +492,7 @@ def matmul_d_input_bwd[
         matmul[transpose_b=False, target=target](
             c_d_input, a_d_output, b_weight, ctx=ctx
         )
+        ctx.synchronize()
         comptime if use_gelu:
             comptime width = simd_width_of[dtype]()
             comptime BLOCK_SIZE = 256
@@ -505,6 +511,7 @@ def matmul_d_input_bwd[
             )
     else:
         raise Error("Invalid target")
+    ctx.synchronize()
 
 
 @always_inline
@@ -559,6 +566,7 @@ def matmul_d_weight_bwd[
     GPU goes through the vendor BLAS (transposed A is native and beta folds
     in accumulation) and CPU materializes d_output^T once into scratch
     (O(rows * OC) traffic next to the GEMM's O(2 * rows * OC * C) flops)."""
+    ctx.synchronize()
     var rows = Int(batch_size * seq_len)
     var in_channels = Int(channels)
     var out_channels = Int(output_channels)
@@ -633,6 +641,7 @@ def matmul_d_weight_bwd[
             matmul[transpose_b=False, target=target](
                 c_d_weight, scratch_t, b_input, ctx=ctx
             )
+    ctx.synchronize()
 
 
 def matmul_bwd[
