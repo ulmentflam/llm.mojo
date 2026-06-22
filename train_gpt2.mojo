@@ -961,10 +961,6 @@ struct GPT2[target: StaticString]:
                 Int64(channels),
                 self.ctx,
             )
-
-            # TODO: Race condition fix: Synchronize context before reading logits on CPU.
-            self.ctx.synchronize()
-
             # LayerNorm 2 & Residual.
             layernorm_fused_residual_fwd[GPT2_DTYPE, Self.target](
                 as_mut_kernel[GPT2_DTYPE](l_residual_2),
@@ -1038,9 +1034,6 @@ struct GPT2[target: StaticString]:
             Int64(channels),
             self.ctx,
         )
-
-        # TODO: Race condition fix: Synchronize context before reading logits on CPU.
-        self.ctx.synchronize()
 
         # Output Logits (wte has no bias).
         matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
