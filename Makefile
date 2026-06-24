@@ -21,6 +21,7 @@ SHELL := /bin/bash
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build         build-mojo build-train train train-cpu \
         test test-python test-mojo test-fixtures \
+        verify verify-cpu verify-gpu \
         docs docs-clean
 
 .DEFAULT_GOAL := help
@@ -62,6 +63,9 @@ help:
 	@echo "  test-python   Run pytest equivalence + property tests"
 	@echo "  test-python-cuda Run GPU/accelerator pytest equivalence + property tests"
 	@echo "  test-fixtures Regenerate tests/fixtures/*.npz from PyTorch reference"
+	@echo "  verify        Verify both CPU and GPU versions against reference state"
+	@echo "  verify-cpu    Verify CPU version against reference state"
+	@echo "  verify-gpu    Verify GPU version against reference state"
 	@echo ""
 	@echo "Documents:"
 	@echo "  docs          Build docs/backprop.pdf with latexmk"
@@ -255,6 +259,17 @@ test-python-cuda: build-mojo
 
 test-fixtures:
 	pixi run python -m tests.reference dump
+
+# Run verification of activations, losses, and gradients against gpt2_124M_debug_state.bin.
+# We run them as separate processes because initializing both CPU and GPU standard
+# DeviceContexts in the same process leads to a MAX multi-context conflict/crash.
+verify: verify-cpu verify-gpu
+
+verify-cpu:
+	pixi run mojo test_gpt2.mojo cpu
+
+verify-gpu:
+	pixi run -e cuda mojo test_gpt2.mojo gpu
 
 docs:
 	latexmk -pdf -quiet -cd docs/backprop.tex
