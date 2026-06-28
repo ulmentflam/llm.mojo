@@ -34,6 +34,7 @@ from llmm.memory import (
     as_mut_kernel,
     rebind_mut_mem,
 )
+from llmm.zero import ZeroContext, ShardedParameter, CpuCoordinator
 
 
 # ===----------------------------------------------------------------------=== #
@@ -387,7 +388,12 @@ struct GPT2[target: StaticString]:
     var has_allocated_optimizer_moments: Bool
     var kv_cache: KVCache
 
-    def __init__(out self, checkpoint_path: String, ctx: DeviceContext) raises:
+    def __init__(
+        out self,
+        checkpoint_path: String,
+        zero_ctx: ZeroContext,
+        ctx: DeviceContext,
+    ) raises:
         self.ctx = ctx
         self.checkpoint_path = checkpoint_path
         self.has_allocated_params = False
@@ -1497,15 +1503,25 @@ struct GPT2[target: StaticString]:
 # ===----------------------------------------------------------------------=== #
 
 
-def train[target: StaticString]() raises:
+def train[
+    target: StaticString
+](
+    rank: Int = 0,
+    world_size: Int = 1,
+    cpu_coord: Optional[
+        UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
+    ] = Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+) raises:
     var ctx: DeviceContext
     comptime if is_cpu[target]():
         ctx = DeviceContext(api="cpu")
     else:
         ctx = DeviceContext()
 
+    # Zero sharding.
+    var zero_ctx = ZeroContext[target](rank, world_size, ctx, cpu_coord)
     # Build the GPT-2 model from my checkpoint.
-    var model = GPT2[target]("gpt2_124M.bin", ctx)
+    var model = GPT2[target]("gpt2_124M.bin", zero_ctx, ctx)
 
     # Build the dataloaders from tokens files.
     # TODO: Add tiny stories dataset.

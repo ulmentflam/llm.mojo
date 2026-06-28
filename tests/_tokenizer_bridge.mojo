@@ -15,7 +15,7 @@ def main() raises:
     print(String(tokenizer.vocab_size))
     print(String(tokenizer.eot_token))
 
-    if len(ids_str) == 0:
+    if ids_str.byte_length() == 0:
         return
 
     var ids = ids_str.split(",")

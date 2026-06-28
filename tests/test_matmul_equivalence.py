@@ -106,6 +106,15 @@ def _make_operands(case: Case):
     """Returns (x, w, b, d_out) as f32 numpy arrays already rounded to the
     kernel dtype, llm.c layouts: x (B*T, C), w (OC, C), b (OC,), d_out
     (B*T, OC)."""
+    if case.dtype == "bfloat16":
+        from tests._max_bridge import pick_device
+        from max.driver import CPU
+
+        if isinstance(pick_device(), CPU):
+            pytest.skip(
+                "Bfloat16 matmul is not supported/stable on CPU target under MAX engine."
+            )
+
     g = torch.Generator().manual_seed(case.seed)
     rows = case.batch_size * case.seq_len
     td = TORCH_DTYPES[case.dtype]
