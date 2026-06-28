@@ -20,7 +20,7 @@ SHELL := /bin/bash
 .PHONY: help install update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build         build-mojo build-train train train-cpu \
-        test test-python test-mojo test-fixtures \
+        test test-cpu test-cuda test-python test-mojo test-fixtures \
         verify verify-cpu verify-gpu \
         docs docs-clean
 
@@ -229,7 +229,16 @@ format-latex:
 typecheck:
 	@pixi run pyrefly check $(PYTHON_PATHS)
 
-test: test-mojo test-python
+test:
+	@if command -v nvidia-smi >/dev/null 2>&1 && timeout 2 nvidia-smi >/dev/null 2>&1; then \
+		echo "GPU detected. Running GPU tests..."; \
+		$(MAKE) test-mojo test-python-cuda; \
+	else \
+		echo "GPU not detected (or unresponsive). Running CPU tests..."; \
+		$(MAKE) test-mojo test-python; \
+	fi
+
+test-cpu: test-mojo test-python
 
 test-cuda: test-mojo test-python-cuda
 
