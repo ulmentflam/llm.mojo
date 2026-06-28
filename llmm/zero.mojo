@@ -1,17 +1,17 @@
+from std.atomic import Atomic
 from std.sys.info import size_of
 from comm import Signal, MAX_GPUS
 from comm.allreduce import allreduce
 from comm.allgather import allgather
-from std.memory import UnsafePointer, memcpy
 from std.collections import InlineArray
 from layout.tile_layout import row_major
 from std.algorithm import sync_parallelize
-from comm.reducescatter import reducescatter
 from layout import TileTensor, TensorLayout
+from comm.reducescatter import reducescatter
+from std.memory import UnsafePointer, memcpy
+from std.gpu.host.info import is_cpu, is_gpu
 from comm.sync import enable_p2p, init_signal_buffer
 from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from std.gpu.host.info import is_cpu, is_gpu
-from std.atomic import Atomic
 
 
 # ===----------------------------------------------------------------------=== #
