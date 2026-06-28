@@ -252,7 +252,7 @@ test-mojo:
 # tests/_max_bridge.py): warm runs take seconds, and only a kernel-source
 # change pays compiles again.
 test-python: build-mojo
-	pixi run pytest tests/ -v
+	pixi run pytest tests/ -v -n auto
 
 test-python-cuda: build-mojo
 	MAX_USE_ACCELERATOR=1 pixi run -e cuda pytest tests/ -v

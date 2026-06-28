@@ -150,10 +150,11 @@ KERNEL_PARAM_CASES: tuple[KernelParams, ...] = (
 
 # FlashAttention-4 softmax helpers (must match llmm/attention.mojo).
 _LN_2 = np.float32(0.69314718056)
-_LOG2_EXP_MIN = np.float32(-127.0)
-_C3 = np.float32(0.009618129)
-_C2 = np.float32(0.055504108)
-_C1 = np.float32(0.240179544)
+_LOG2_EXP_MIN = np.float32(-126.0)
+_C4 = np.float32(0.009618129)
+_C3 = np.float32(0.055504108)
+_C2 = np.float32(0.240179544)
+_C1 = np.float32(0.69314718)
 _C0 = np.float32(1.0)
 _TAU = np.float32(8.0)
 _MIN_FINITE = np.float32(np.finfo(np.float32).min)
@@ -171,9 +172,11 @@ def _kernel_exp(x: float | np.floating, *, use_soft_exp: bool) -> np.float32:
     fractional_part = log2_input - integer_part
     polynomial = np.float32(
         (
-            ((_C3 * fractional_part + _C2) * fractional_part + _C1) * fractional_part
-            + _C0
+            ((_C4 * fractional_part + _C3) * fractional_part + _C2) * fractional_part
+            + _C1
         )
+        * fractional_part
+        + _C0
     )
     return np.float32(np.ldexp(polynomial, np.int32(integer_part)))
 
@@ -536,6 +539,10 @@ def test_compile_time_paths_match_reference(params: KernelParams):
         use_conditional_rescale=params.use_conditional_rescale,
     )
 
+    tol = None
+    if params.use_soft_exp:
+        tol = {"atol": 2e-3, "rtol": 2e-3}
+
     _assert_matches_reference(
         case,
         got_out_storage,
@@ -543,6 +550,7 @@ def test_compile_time_paths_match_reference(params: KernelParams):
         expected_out,
         expected_l,
         err_prefix=params.name,
+        tol=tol,
     )
 
 

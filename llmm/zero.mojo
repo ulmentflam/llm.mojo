@@ -67,11 +67,6 @@ struct CpuCoordinator:
         ](uninitialized=True)
 
 
-# ===----------------------------------------------------------------------=== #
-# Shared CPU Helpers
-# ===----------------------------------------------------------------------=== #
-
-
 @always_inline
 def _register_and_sync[
     dtype: DType, in_origin: Origin, out_origin: Origin

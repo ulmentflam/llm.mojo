@@ -10,7 +10,7 @@ from std.testing import (
     assert_equal,
     TestSuite,
 )
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from std.gpu.host import DeviceContext
 from std.collections import InlineArray
 from layout import TileTensor
 from layout.tile_layout import row_major

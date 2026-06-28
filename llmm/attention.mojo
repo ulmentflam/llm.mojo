@@ -1,11 +1,12 @@
 import compiler
 from layout import Layout
-from std.sys import simd_width_of
 from std.memory import alloc
+from std.sys import simd_width_of
+from std.gpu.primitives import warp
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
-from std.gpu.host import DeviceAttribute
 from std.gpu.memory import AddressSpace
+from std.gpu.host import DeviceAttribute
 from layout.layout_tensor import LayoutTensor
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
@@ -15,7 +16,7 @@ from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from llmm.split import split_fwd, split_bwd
 from llmm.merge import merge_fwd, merge_bwd
-from std.math import fma, sqrt, ceildiv, exp, log, ldexp, floor
+from std.math import fma, sqrt, ceildiv, exp, log, ldexp, floor, exp2
 from std.gpu import (
     barrier,
     block_dim,
@@ -61,16 +62,19 @@ comptime TAU = Scalar[DType.float32](
 )  # FlashAttention 4 deferred-max threshold
 comptime LN_2 = Scalar[DType.float32](0.69314718056)  # ln(2)
 comptime LOG2_EXP_MIN = Scalar[DType.float32](
-    -127.0
+    -126.0
 )  # FlashAttention 4: ldexp/ex2 emulation clamps here
-comptime C3 = Scalar[DType.float32](
+comptime C4 = Scalar[DType.float32](
     0.009618129
 )  # FlashAttention 4 polynomial coefficient
-comptime C2 = Scalar[DType.float32](
+comptime C3 = Scalar[DType.float32](
     0.055504108
 )  # FlashAttention 4 polynomial coefficient
-comptime C1 = Scalar[DType.float32](
+comptime C2 = Scalar[DType.float32](
     0.240179544
+)  # FlashAttention 4 polynomial coefficient
+comptime C1 = Scalar[DType.float32](
+    0.69314718
 )  # FlashAttention 4 polynomial coefficient
 comptime C0 = Scalar[DType.float32](
     1.0
@@ -80,6 +84,11 @@ comptime C0 = Scalar[DType.float32](
 # ===----------------------------------------------------------------------=== #
 # Utilities and Helpers
 # ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def _exp2_int(val: Int32) -> Float32:
+    return exp2(Float32(val))
 
 
 @always_inline
@@ -96,18 +105,24 @@ def software_emulated_exp[
         # FA4 ex2_emulation clamps the log2 exponent before range reduction.
         # Mojo ldexp returns garbage for exponents below -128.
         log2_input = max(log2_input, LOG2_EXP_MIN)
-        var integer_part = Int(floor(log2_input))
+        var integer_part = Int(log2_input)
+        if log2_input < 0.0 and Float32(integer_part) != log2_input:
+            integer_part -= 1
         var fractional_part = log2_input - Float32(integer_part)
         var polynomial = fma(
             fma(
-                fma(C3, fractional_part, C2),
+                fma(
+                    fma(C4, fractional_part, C3),
+                    fractional_part,
+                    C2,
+                ),
                 fractional_part,
                 C1,
             ),
             fractional_part,
             C0,
         )
-        return ldexp(polynomial, Int32(integer_part))
+        return polynomial * _exp2_int(Int32(integer_part))
 
 
 struct OnlineSoftmaxState[
@@ -755,37 +770,7 @@ def _attention_gpu_process_key_value_tile_warp[
                             * k_row_ptr[idx].cast[DType.float32]()
                         )
 
-            reduction_shared_ptr[warp_offset + lane_id] = local_sum
-            barrier()
-
-            # Warp tree reduction unrolled.
-            if lane_id < 16:
-                reduction_shared_ptr[
-                    warp_offset + lane_id
-                ] += reduction_shared_ptr[warp_offset + lane_id + 16]
-            barrier()
-            if lane_id < 8:
-                reduction_shared_ptr[
-                    warp_offset + lane_id
-                ] += reduction_shared_ptr[warp_offset + lane_id + 8]
-            barrier()
-            if lane_id < 4:
-                reduction_shared_ptr[
-                    warp_offset + lane_id
-                ] += reduction_shared_ptr[warp_offset + lane_id + 4]
-            barrier()
-            if lane_id < 2:
-                reduction_shared_ptr[
-                    warp_offset + lane_id
-                ] += reduction_shared_ptr[warp_offset + lane_id + 2]
-            barrier()
-            if lane_id < 1:
-                reduction_shared_ptr[
-                    warp_offset + lane_id
-                ] += reduction_shared_ptr[warp_offset + lane_id + 1]
-            barrier()
-
-            var S_ij = reduction_shared_ptr[warp_offset] * attention_scale
+            var S_ij = warp.sum(local_sum) * attention_scale
 
             if is_active_and_valid:
                 var previous_true_max = state.softmax_max_true
@@ -841,8 +826,12 @@ def _attention_gpu_process_key_value_tile_warp[
                                     * v_val.cast[DType.float32]()
                                 ).cast[dtype]()
                 else:
+                    var candidate_max = max(state.softmax_max_deferred, S_ij)
+                    var rescale_factor = software_emulated_exp[use_soft_exp](
+                        state.softmax_max_deferred - candidate_max
+                    )
                     var attention_weight = software_emulated_exp[use_soft_exp](
-                        S_ij - state.softmax_max_deferred
+                        S_ij - candidate_max
                     )
                     for d in range(ELEMENTS_PER_THREAD):
                         var idx = d_start + d
@@ -850,9 +839,10 @@ def _attention_gpu_process_key_value_tile_warp[
                             var v_val = v_row_ptr[idx]
                             var out_val = output_row[idx]
                             output_row[idx] = (
-                                out_val.cast[DType.float32]()
+                                rescale_factor * out_val.cast[DType.float32]()
                                 + attention_weight * v_val.cast[DType.float32]()
                             ).cast[dtype]()
+                    state.softmax_max_deferred = candidate_max
 
             barrier()
 
@@ -2103,10 +2093,7 @@ def _attention_gpu_bwd_dkv_tile_block[
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
 
-    # FA2 inner loop (dK/dV path): stream query tiles I. Start at
-    # key_tile_index because causal pairs require i >= j.
-    # Only later query rows can attend to keys in this tile).
-    for query_tile_idx in range(key_tile_index, query_tiles):
+    for query_tile_idx in range((key_tile_index * Bc) // Br, query_tiles):
         var query_tile_start = query_tile_idx * Br
         var query_tile_rows = min(Br, seq_len - query_tile_start)
 
