@@ -638,6 +638,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
         self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             self.padded_num_parameters
         )
+        
+        self.params_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
         self.ctx.enqueue_copy(
             dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 self.params_buf.unsafe_ptr().as_unsafe_any_origin()
@@ -669,7 +671,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
         self.num_grads = self.num_parameters
 
         comptime if Self.WORLD_SIZE > 1:
-            # Zero 2/3 shards the gradients. We must create a new buffer for each shard.
+            # ZeRO-2/3 shards the gradient communication (reduce-scatter).
+            # ZeRO-1 uses allreduce so gradients stay fully replicated in grads_memory;
+            # the optimizer reads grads_memory + rank*opt directly, no shard buffer needed.
             if self.zero_ctx.zero_stage >= 2:
                 self.sharded_grads_buf = self.ctx.enqueue_create_buffer[
                     GPT2_DTYPE
@@ -680,7 +684,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
                     self.sharded_grads_buf.unsafe_ptr().as_unsafe_any_origin()
                 )
             else:
-                # For Zero 1, we don't shard the gradients, only the optimizer states.
+                # ZeRO-0 (DDP) and ZeRO-1 keep gradients fully replicated;
+                # no sharded_grads_buf is needed.
                 self.sharded_grads_buf = self.ctx.enqueue_create_buffer[
                     GPT2_DTYPE
                 ](1)
@@ -887,6 +892,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
             memcpy(dest=self.targets, src=targets, count=batch_size * seq_len)
 
         self.build_encoder_buckets(batch_size, seq_len)
+
+        comptime if Self.WORLD_SIZE > 1:
+            # ZeRO-3: Gather all parameter shards into params_buf before running forward.
+            # Each rank holds its persistent shard at params_memory + rank * optimizer_num_parameters.
+            # This is a coarse-grained gather: one allgather per forward pass rather than per layer.
+            # It is memory-correct ZeRO-3 sharding of persistent state, but does NOT yet achieve
+            # the peak-memory savings of true per-layer streaming (gather/free per tensor).
+            if self.zero_ctx.zero_stage >= 3:
+                self.zero_ctx.allgather(
+                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.params_memory.as_unsafe_any_origin()
+                    ),
+                    self.optimizer_num_parameters,
+                )
+                self.ctx.synchronize()
 
         #########################################################
         # Forward Pass
@@ -1569,8 +1589,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
         )
 
         comptime if Self.WORLD_SIZE > 1:
-            # Zero 1/0 leverages an allreduce operation to synchronize gradients across all processes.
-            if self.zero_ctx.zero_stage < 2:
+            # ZeRO-0 (DDP) and ZeRO-1 use allreduce: full gradient sum is replicated
+            # to all ranks (2N communication). ZeRO-1 then reads grads_memory + rank*opt
+            # in the optimizer step.
+            # ZeRO-2/3 use reduce-scatter: each rank receives only its gradient shard
+            # (N communication), which is stored in sharded_grads_memory.
+            if self.zero_ctx.zero_stage <= 1:
                 self.zero_ctx.allreduce(
                     rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.grads_memory.as_unsafe_any_origin()
@@ -1578,7 +1602,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
                     self.num_parameters,
                 )
             else:
-                # Zero 2/3 leverages a reduce-scatter operation to synchronize gradients across all processes.
                 self.zero_ctx.reducescatter(
                     rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.grads_memory.as_unsafe_any_origin()
@@ -1621,7 +1644,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
             var update_num_params = self.num_parameters
 
             comptime if Self.WORLD_SIZE > 1:
-                if self.zero_ctx.zero_stage > 0:
+                if self.zero_ctx.zero_stage >= 1:
                     var offset = (
                         self.zero_ctx.rank * self.optimizer_num_parameters
                     )
@@ -1630,10 +1653,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
                         self.optimizer_num_parameters,
                     )
                     p_ptr = self.params_memory + offset
-                    if self.zero_ctx.zero_stage >= 2:
-                        g_ptr = self.sharded_grads_memory
-                    else:
+                    # ZeRO-1: grads were allreduced — each rank reads its shard directly
+                    # from the replicated grads_memory (no sharded_grads_buf allocated).
+                    # ZeRO-2/3: grads were reduce-scattered into sharded_grads_memory.
+                    if self.zero_ctx.zero_stage == 1:
                         g_ptr = self.grads_memory + offset
+                    else:
+                        g_ptr = self.sharded_grads_memory
                     update_num_params = local_num_params
 
             if update_num_params > 0:
@@ -1652,7 +1678,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
             self.ctx.synchronize()
 
             comptime if Self.WORLD_SIZE > 1:
-                if self.zero_ctx.zero_stage > 0:
+                # ZeRO-3 does NOT allgather after the optimizer step — the next
+                # forward() call gathers param shards just-in-time.
+                # ZeRO-1 and ZeRO-2 allgather here so params_memory is consistent
+                # before the next forward (they do not pre-gather in forward).
+                if (
+                    self.zero_ctx.zero_stage >= 1
+                    and self.zero_ctx.zero_stage < 3
+                ):
                     self.zero_ctx.allgather(
                         rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                             self.params_memory.as_unsafe_any_origin()
@@ -1663,6 +1696,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
         else:
             comptime if Self.WORLD_SIZE > 1:
                 if self.zero_ctx.zero_stage == 0:
+                    # ZeRO-0 (DDP): every rank updates all params using full grads.
                     adamw_update[GPT2_DTYPE, Self.target](
                         self.num_parameters,
                         as_mut_kernel[GPT2_DTYPE](self.params_memory),
@@ -1673,7 +1707,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
                         config,
                         self.ctx,
                     )
-                else:
+                elif self.zero_ctx.zero_stage == 1:
+                    # ZeRO-1: grads were allreduced — read shard from grads_memory + offset.
                     var offset = (
                         self.zero_ctx.rank * self.optimizer_num_parameters
                     )
@@ -1682,38 +1717,22 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
                         self.optimizer_num_parameters,
                     )
                     if local_num_params > 0:
-                        if self.zero_ctx.zero_stage < 2:
-                            adamw_update[GPT2_DTYPE, Self.target](
-                                local_num_params,
-                                as_mut_kernel[GPT2_DTYPE](
-                                    self.params_memory + offset
-                                ),
-                                as_mut_kernel[GPT2_DTYPE](
-                                    self.grads_memory + offset
-                                ),
-                                as_mut_kernel[GPT2_DTYPE](self.m_memory),
-                                as_mut_kernel[GPT2_DTYPE](self.v_memory),
-                                t,
-                                config,
-                                self.ctx,
-                            )
-                        else:
-                            adamw_update[GPT2_DTYPE, Self.target](
-                                local_num_params,
-                                as_mut_kernel[GPT2_DTYPE](
-                                    self.params_memory + offset
-                                ),
-                                as_mut_kernel[GPT2_DTYPE](
-                                    self.sharded_grads_memory
-                                ),
-                                as_mut_kernel[GPT2_DTYPE](self.m_memory),
-                                as_mut_kernel[GPT2_DTYPE](self.v_memory),
-                                t,
-                                config,
-                                self.ctx,
-                            )
+                        adamw_update[GPT2_DTYPE, Self.target](
+                            local_num_params,
+                            as_mut_kernel[GPT2_DTYPE](
+                                self.params_memory + offset
+                            ),
+                            as_mut_kernel[GPT2_DTYPE](
+                                self.grads_memory + offset
+                            ),
+                            as_mut_kernel[GPT2_DTYPE](self.m_memory),
+                            as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                            t,
+                            config,
+                            self.ctx,
+                        )
                     self.ctx.synchronize()
-
+                    # Allgather so params_memory is consistent before the next forward.
                     self.zero_ctx.allgather(
                         rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                             self.params_memory.as_unsafe_any_origin()
@@ -1721,6 +1740,40 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
                         self.optimizer_num_parameters,
                     )
                     self.ctx.synchronize()
+                else:
+                    # ZeRO 2/3: grads were reduce-scattered into sharded_grads_memory.
+                    var offset = (
+                        self.zero_ctx.rank * self.optimizer_num_parameters
+                    )
+                    var local_num_params = min(
+                        self.num_parameters - offset,
+                        self.optimizer_num_parameters,
+                    )
+                    if local_num_params > 0:
+                        adamw_update[GPT2_DTYPE, Self.target](
+                            local_num_params,
+                            as_mut_kernel[GPT2_DTYPE](
+                                self.params_memory + offset
+                            ),
+                            as_mut_kernel[GPT2_DTYPE](
+                                self.sharded_grads_memory
+                            ),
+                            as_mut_kernel[GPT2_DTYPE](self.m_memory),
+                            as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                            t,
+                            config,
+                            self.ctx,
+                        )
+                    self.ctx.synchronize()
+                    # ZeRO-2 allgathers here so params_memory is immediately consistent.
+                    if self.zero_ctx.zero_stage == 2:
+                        self.zero_ctx.allgather(
+                            rebind[
+                                UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+                            ](self.params_memory.as_unsafe_any_origin()),
+                            self.optimizer_num_parameters,
+                        )
+                        self.ctx.synchronize()
             else:
                 adamw_update[GPT2_DTYPE, Self.target](
                     self.num_parameters,
@@ -1827,7 +1880,6 @@ def train[
 
     var val_loss_every = 10
     var val_max_steps = 10
-    var grad_accum_steps = 10
     var sample_every = 20
 
     var elapsed_time_ms_total = 0.0

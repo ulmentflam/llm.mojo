@@ -209,6 +209,10 @@ def run_zero_equivalence_test(stage: Int) raises:
         model0.grads_memory[i] = sum_grad
         model1.grads_memory[i] = sum_grad
 
+    # ZeRO-1: grads are allreduced and replicated in grads_memory; update() reads
+    #         grads_memory + rank*opt directly — no sharded_grads_memory needed.
+    # ZeRO-2/3: fill sharded_grads_memory with the reduce-scattered shard so
+    #           update() reads from sharded_grads_memory.
     if stage >= 2:
         var shard_size = model0.optimizer_num_parameters
         var local_len0 = min(NUM_PARAMS, shard_size)
@@ -240,6 +244,36 @@ def run_zero_equivalence_test(stage: Int) raises:
         weight_decay=Scalar[DType.float32](0.01),
     )
     model1.ctx.synchronize()
+
+    # 4b. Stage-3 specific: verify per-rank param shards BEFORE any allgather.
+    # ZeRO-3 skips the post-update allgather (stage 1/2 call it inside update());
+    # instead the next forward() gathers shards on demand. Assert that each rank's
+    # persistent owned shard already matches the corresponding baseline slice.
+    if stage >= 3:
+        try:
+            var ss3 = model0.optimizer_num_parameters
+            var len3_0 = min(NUM_PARAMS, ss3)
+            for i in range(len3_0):
+                assert_almost_equal(
+                    model0.params_memory[i].cast[DType.float32](),
+                    baseline_params[i],
+                    atol=1e-5,
+                )
+            var off3_1 = ss3
+            var len3_1 = min(NUM_PARAMS - off3_1, ss3)
+            for i in range(len3_1):
+                assert_almost_equal(
+                    model1.params_memory[off3_1 + i].cast[DType.float32](),
+                    baseline_params[off3_1 + i],
+                    atol=1e-5,
+                )
+        except e:
+            x.free()
+            y.free()
+            baseline_params.free()
+            raise Error(
+                "Stage-3 per-shard equivalence check failed: " + String(e)
+            )
 
     # 5. Manual Allgather of parameters
     var shard_size = model0.optimizer_num_parameters
@@ -282,6 +316,20 @@ def test_zero_stage1_equivalence() raises:
 
 def test_zero_stage2_equivalence() raises:
     run_zero_equivalence_test(2)
+
+
+def test_zero_stage3_equivalence() raises:
+    # ZeRO-3 uses reduce-scatter for gradients (same as stage 2) and sharded
+    # AdamW (same as stage 2), but defers the post-update param allgather to
+    # the next forward() call rather than doing it immediately after update().
+    # run_zero_equivalence_test(3) verifies:
+    #   - Grad reduce-scatter shards feed the optimizer correctly (implicitly,
+    #     via the final param equivalence).
+    #   - Each rank's per-shard params match the baseline BEFORE any allgather
+    #     (the stage-3 specific check inserted at step 4b above).
+    #   - Simulating the forward()-triggered allgather reconstructs the full
+    #     parameter vector identically to the stage-2 / baseline result.
+    run_zero_equivalence_test(3)
 
 
 def main() raises:
