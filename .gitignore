@@ -14,6 +14,9 @@ tests/fixtures/
 # Compiled-model cache for the pytest suite (see tests/_max_bridge.py)
 tests/.mef_cache/
 
+# Training checkpoints (default LLMM_OUTPUT_DIR; override with LLMM_OUTPUT_DIR)
+checkpoints/
+
 # ---------- macOS ----------
 .DS_Store
 .AppleDouble
