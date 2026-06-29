@@ -1,4 +1,5 @@
 from std.os import getenv
+from std.python import Python
 from std.sys import (
     argv,
     has_accelerator,
@@ -15,6 +16,16 @@ from std.math import sqrt
 
 from llmm.io import read_and_copy
 from llmm.dataloader import DataLoader
+from llmm.checkpointing import (
+    CheckpointConfig,
+    TrainingState,
+    write_model_checkpoint,
+    read_model_checkpoint,
+    write_state_checkpoint,
+    read_state_checkpoint,
+    make_training_state,
+    restore_dataloader_state,
+)
 from llmm.encoder import encoder_fwd, encoder_bwd, build_wte_buckets
 from llmm.layernorm import (
     layernorm_fwd,
@@ -337,7 +348,16 @@ struct GPT2Config:
     var padded_vocab_size: Int  # Padded vocab size (%128 == 0, e.g. 50304).
 
 
-struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
+# `recompute` enables activation (gradient) checkpointing: when True, the
+# per-layer MLP activations fch (pre-GELU) and fch_gelu (post-GELU) are not
+# persisted across the forward/backward boundary. They collapse to a single
+# scratch slot that the forward fills and the backward rematerializes by
+# re-running the same fused FC matmul (matmul_fwd[use_gelu=True]) from the
+# still-resident ln_2. This reuses the forward's fused-GELU kernel and drops the
+# two largest per-layer activation buffers (each B*T*4C), trading one FC GEMM
+# per layer in backward for the memory. That activation-memory cut is what makes
+# ZeRO-3 tractable (ZeRO-3 shards params/grads/optimizer but not activations).
+struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var ctx: DeviceContext
     var config: GPT2Config
 
@@ -745,8 +765,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
         self.act_sizes[Activations.ln_2] = L * B * T * C
         self.act_sizes[Activations.ln_2_mean] = L * B * T
         self.act_sizes[Activations.ln_2_rstd] = L * B * T
-        self.act_sizes[Activations.fch] = L * B * T * 4 * C
-        self.act_sizes[Activations.fch_gelu] = L * B * T * 4 * C
+        # With activation recompute on, fch and fch_gelu are not persisted per
+        # layer: they collapse to a single-layer scratch slot that forward fills
+        # and backward rematerializes via the fused FC matmul (see `recompute`).
+        var fch_layers = L
+        comptime if Self.recompute:
+            fch_layers = 1
+        self.act_sizes[Activations.fch] = fch_layers * B * T * 4 * C
+        self.act_sizes[Activations.fch_gelu] = fch_layers * B * T * 4 * C
         self.act_sizes[Activations.fc_proj] = L * B * T * C
         self.act_sizes[Activations.residual_3] = L * B * T * C
         self.act_sizes[Activations.ln_f] = B * T * C
@@ -988,12 +1014,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
             )
             var l_ln_2_mean = self.acts.ln_2_mean + layer * batch_size * seq_len
             var l_ln_2_rstd = self.acts.ln_2_rstd + layer * batch_size * seq_len
-            var l_fch = self.acts.fch + layer * batch_size * seq_len * (
+            # fch / fch_gelu live in a single-layer scratch slot when recompute
+            # is on, so their per-layer offset collapses to 0.
+            var fch_layer = layer
+            comptime if Self.recompute:
+                fch_layer = 0
+            var l_fch = self.acts.fch + fch_layer * batch_size * seq_len * (
                 4 * channels
             )
             var l_fch_gelu = (
                 self.acts.fch_gelu
-                + layer * batch_size * seq_len * (4 * channels)
+                + fch_layer * batch_size * seq_len * (4 * channels)
             )
             var l_fc_proj = (
                 self.acts.fc_proj + layer * batch_size * seq_len * channels
@@ -1393,8 +1424,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
             var l_ln_2 = self.acts.ln_2 + layer_offset
             var l_ln_2_mean = self.acts.ln_2_mean + layer * batch_size * seq_len
             var l_ln_2_rstd = self.acts.ln_2_rstd + layer * batch_size * seq_len
-            var l_fch = self.acts.fch + layer * fch_layer_stride
-            var l_fch_gelu = self.acts.fch_gelu + layer * fch_layer_stride
+            # With recompute on, fch / fch_gelu (and their grads) share a single
+            # scratch slot, so the per-layer offset collapses to 0; backward
+            # rematerializes them below before the MLP backward kernels run.
+            var fch_layer = layer
+            comptime if Self.recompute:
+                fch_layer = 0
+            var l_fch = self.acts.fch + fch_layer * fch_layer_stride
+            var l_fch_gelu = self.acts.fch_gelu + fch_layer * fch_layer_stride
             var l_fc_proj = self.acts.fc_proj + layer_offset
 
             # Activation gradients for this layer.
@@ -1407,9 +1444,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
             var d_l_attn_merged = self.grad_acts.attn_merged + layer_offset
             var d_l_attn_proj = self.grad_acts.attn_proj + layer_offset
             var d_l_ln_2 = self.grad_acts.ln_2 + layer_offset
-            var d_l_fch = self.grad_acts.fch + layer * fch_layer_stride
+            var d_l_fch = self.grad_acts.fch + fch_layer * fch_layer_stride
             var d_l_fch_gelu = (
-                self.grad_acts.fch_gelu + layer * fch_layer_stride
+                self.grad_acts.fch_gelu + fch_layer * fch_layer_stride
             )
             var d_l_fc_proj = self.grad_acts.fc_proj + layer_offset
 
@@ -1419,6 +1456,26 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
             else:
                 d_block_input = (
                     self.grad_acts.residual_3 + (layer - 1) * layer_stride
+                )
+
+            # Recompute checkpointing: rematerialize fch (pre-GELU) and fch_gelu
+            # (post-GELU) into the scratch slot by re-running the same fused FC
+            # matmul the forward used, reading the still-resident ln_2. Both MLP
+            # backward kernels below then read them exactly as in the no-recompute
+            # path. Bit-identical to having stored them, since the GEMM + GELU are
+            # deterministic in the same inputs.
+            comptime if Self.recompute:
+                matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=True](
+                    as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](l_fch),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(4 * channels),
+                    self.ctx,
                 )
 
             # MLP projection backward.
@@ -1786,6 +1843,157 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
                     self.ctx,
                 )
 
+    def _checkpoint_config(self) -> CheckpointConfig:
+        return CheckpointConfig(
+            max_seq_len=self.config.max_seq_len,
+            vocab_size=self.config.vocab_size,
+            num_layer=self.config.num_layer,
+            num_heads=self.config.num_heads,
+            channels=self.config.channels,
+            padded_vocab_size=self.config.padded_vocab_size,
+        )
+
+    def _copy_device_to_host(
+        mut self,
+        host: HostBuffer[GPT2_DTYPE],
+        src: MutMemPtr[GPT2_DTYPE],
+        n: Int,
+    ) raises:
+        self.ctx.enqueue_copy(
+            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                host.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                src.as_unsafe_any_origin()
+            ),
+            size=n,
+        )
+
+    def _copy_host_to_device(
+        mut self,
+        dst: MutMemPtr[GPT2_DTYPE],
+        host: HostBuffer[GPT2_DTYPE],
+        n: Int,
+    ) raises:
+        self.ctx.enqueue_copy(
+            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                dst.as_unsafe_any_origin()
+            ),
+            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                host.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            size=n,
+        )
+
+    def write_checkpoint(
+        mut self,
+        model_path: String,
+        state_path: String,
+        step: Int,
+        loader: DataLoader,
+        sampler_rng_state: UInt64,
+    ) raises:
+        """Write a model + optimizer-state checkpoint to disk.
+
+        Rank 0 writes the full model file; every rank writes its own optimizer
+        shard (m, v) to its `state_path`. Mirrors llm.c's split of model_*.bin
+        (shared) and state_*_rank.bin (per-process).
+        """
+        # ZeRO-3 keeps only this rank's parameter shard resident in
+        # params_memory after update() (the next forward re-gathers it). Gather
+        # the full parameter set before snapshotting the model.
+        comptime if Self.WORLD_SIZE > 1:
+            if self.zero_ctx.zero_stage >= 3:
+                self.zero_ctx.allgather(
+                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.params_memory.as_unsafe_any_origin()
+                    ),
+                    self.optimizer_num_parameters,
+                )
+                self.ctx.synchronize()
+
+        if self.zero_ctx.rank == 0:
+            var host_params = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+                self.num_parameters
+            )
+            self.ctx.synchronize()
+            self._copy_device_to_host(
+                host_params, self.params_memory, self.num_parameters
+            )
+            self.ctx.synchronize()
+            write_model_checkpoint(
+                model_path,
+                self._checkpoint_config(),
+                rebind_mut_mem[GPT2_DTYPE](
+                    host_params.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                self.num_parameters,
+            )
+
+        var n_opt = self.optimizer_num_parameters
+        var host_m = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n_opt)
+        var host_v = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n_opt)
+        self.ctx.synchronize()
+        self._copy_device_to_host(host_m, self.m_memory, n_opt)
+        self._copy_device_to_host(host_v, self.v_memory, n_opt)
+        self.ctx.synchronize()
+        write_state_checkpoint(
+            state_path,
+            make_training_state(loader, step, sampler_rng_state),
+            rebind_mut_mem[GPT2_DTYPE](
+                host_m.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            rebind_mut_mem[GPT2_DTYPE](
+                host_v.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            n_opt,
+        )
+
+    def load_checkpoint(
+        mut self, model_path: String, state_path: String
+    ) raises -> TrainingState:
+        """Restore params and optimizer moments from a checkpoint into device
+        memory; return the TrainingState (step, rng, dataloader position).
+
+        The model must already be allocated with the same config that wrote the
+        checkpoint (build it from the same base checkpoint first). Each rank
+        reads the shared model file plus its own optimizer-state shard.
+        """
+        var host_params = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+            self.num_parameters
+        )
+        self.ctx.synchronize()
+        _ = read_model_checkpoint(
+            model_path,
+            rebind_mut_mem[GPT2_DTYPE](
+                host_params.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            self.num_parameters,
+        )
+        self._copy_host_to_device(
+            self.params_memory, host_params, self.num_parameters
+        )
+        self.ctx.synchronize()
+
+        var n_opt = self.optimizer_num_parameters
+        var host_m = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n_opt)
+        var host_v = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n_opt)
+        self.ctx.synchronize()
+        var state = read_state_checkpoint(
+            state_path,
+            rebind_mut_mem[GPT2_DTYPE](
+                host_m.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            rebind_mut_mem[GPT2_DTYPE](
+                host_v.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            n_opt,
+        )
+        self._copy_host_to_device(self.m_memory, host_m, n_opt)
+        self._copy_host_to_device(self.v_memory, host_v, n_opt)
+        self.ctx.synchronize()
+        return state^
+
 
 # ===----------------------------------------------------------------------=== #
 # The Main Training Loop!
@@ -1817,6 +2025,23 @@ def train[
         ctx,
         cpu_coordinator_ptr=cpu_coord,
     )
+
+    # Disk checkpointing config (opt-in via env, mirroring llm.c's CLI flags):
+    #   LLMM_SAVE_EVERY=N      write a checkpoint every N steps (0 = off)
+    #   LLMM_OUTPUT_DIR=dir    directory for model_*/state_* files
+    #   LLMM_RESUME_FROM=step  resume params/optimizer/dataloader from a step
+    var save_every = 0
+    if getenv("LLMM_SAVE_EVERY") != "":
+        save_every = atol(getenv("LLMM_SAVE_EVERY"))
+    var output_dir = getenv("LLMM_OUTPUT_DIR")
+    if output_dir == "":
+        output_dir = String("checkpoints")
+    var resume_from = -1
+    if getenv("LLMM_RESUME_FROM") != "":
+        resume_from = atol(getenv("LLMM_RESUME_FROM"))
+    if save_every > 0 and rank == 0:
+        var os = Python.import_module("os")
+        _ = os.makedirs(output_dir, exist_ok=True)
 
     # Build the dataloaders from tokens files.
     # TODO: Add tiny stories dataset.
@@ -1874,6 +2099,28 @@ def train[
     var zero = 0
     var null_int32_ptr = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
+    # Optionally resume params, optimizer moments, RNG and dataloader position
+    # from a prior checkpoint. Restoring the loader before the priming
+    # next_batch() below means training continues over the exact data stream it
+    # would have without the interruption.
+    var start_step = 0
+    if resume_from >= 0:
+        var model_path = output_dir + "/model_" + String(resume_from) + ".bin"
+        var state_path = (
+            output_dir
+            + "/state_"
+            + String(resume_from)
+            + "_"
+            + String(rank)
+            + ".bin"
+        )
+        var resumed = model.load_checkpoint(model_path, state_path)
+        restore_dataloader_state(train_loader, resumed)
+        rng_state = resumed.sampler_rng_state
+        start_step = resumed.step
+        if rank == 0:
+            print("Resumed from checkpoint at step " + String(start_step))
+
     #####################################################################################
     # Training Loop
     #####################################################################################
@@ -1886,7 +2133,7 @@ def train[
 
     train_loader.next_batch()
 
-    for step in range(num_iters + 1):
+    for step in range(start_step, num_iters + 1):
         # Occasionally estimate validation loss.
         if val_loss_every > 0 and step % val_loss_every == 0:
             var time_val_start = global_perf_counter_ns()
@@ -1972,6 +2219,28 @@ def train[
         model.ctx.synchronize()
         var time_load_batch = global_perf_counter_ns()
 
+        # Checkpoint after the step's optimizer update but before advancing the
+        # loader, so the saved dataloader position (current_sample_idx) is the
+        # batch the next step will consume. The stored step is the next step to
+        # run, matching how `start_step` resumes the loop.
+        if save_every > 0 and (
+            (step + 1) % save_every == 0 or step + 1 == num_iters
+        ):
+            var model_path = output_dir + "/model_" + String(step + 1) + ".bin"
+            var state_path = (
+                output_dir
+                + "/state_"
+                + String(step + 1)
+                + "_"
+                + String(rank)
+                + ".bin"
+            )
+            model.write_checkpoint(
+                model_path, state_path, step + 1, train_loader, rng_state
+            )
+            if rank == 0:
+                print("Saved checkpoint at step " + String(step + 1))
+
         train_loader.next_batch()
         var time_end = global_perf_counter_ns()
 
@@ -2008,9 +2277,13 @@ def _dispatch_world_size[
     cpu_coord: Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]],
     zero_stage: Int,
 ) raises:
-    if world_size == WORLD_SIZE_DEF:
-        train[target, WORLD_SIZE_DEF](rank, cpu_coord, zero_stage)
-    elif world_size == 1:
+    # train() is monomorphized on WORLD_SIZE (a comptime parameter), so a runtime
+    # world_size can only dispatch to an instantiation compiled into this binary:
+    # the common sizes below, plus whatever this binary was built for
+    # (-D WORLD_SIZE=..., exposed as WORLD_SIZE_DEF). Listing WORLD_SIZE_DEF as
+    # one branch is what makes larger sizes (16/32/64/...) reachable, without
+    # compiling an instantiation for every possible size.
+    if world_size == 1:
         train[target, 1](rank, cpu_coord, zero_stage)
     elif world_size == 2:
         train[target, 2](rank, cpu_coord, zero_stage)
@@ -2018,28 +2291,13 @@ def _dispatch_world_size[
         train[target, 4](rank, cpu_coord, zero_stage)
     elif world_size == 8:
         train[target, 8](rank, cpu_coord, zero_stage)
+    elif world_size == WORLD_SIZE_DEF:
+        train[target, WORLD_SIZE_DEF](rank, cpu_coord, zero_stage)
     else:
-        comptime if WORLD_SIZE_DEF == 16:
-            if world_size == 16:
-                train[target, 16](rank, cpu_coord, zero_stage)
-                return
-        comptime if WORLD_SIZE_DEF == 32:
-            if world_size == 32:
-                train[target, 32](rank, cpu_coord, zero_stage)
-                return
-        comptime if WORLD_SIZE_DEF == 64:
-            if world_size == 64:
-                train[target, 64](rank, cpu_coord, zero_stage)
-                return
-        comptime if WORLD_SIZE_DEF == 128:
-            if world_size == 128:
-                train[target, 128](rank, cpu_coord, zero_stage)
-                return
         raise Error(
             "Unsupported world_size: "
             + String(world_size)
-            + ". Supported values: 1, 2, 4, 8 or compile-time defined"
-            " WORLD_SIZE: "
+            + ". Supported values: 1, 2, 4, 8, or the compile-time WORLD_SIZE: "
             + String(WORLD_SIZE_DEF)
         )
 

@@ -1,6 +1,7 @@
 from std.collections import InlineArray, List
 from std.time import perf_counter_ns
 from std.sys import exit, argv
+from std.os import getenv
 from std.sys.info import size_of
 from std.memory import alloc, UnsafePointer, memcpy
 from std.gpu.host import DeviceContext
@@ -98,7 +99,8 @@ def read_to_dtype_pointer[
 
 
 def run_test[
-    target: StaticString
+    target: StaticString,
+    recompute: Bool = False,
 ](logits_tol: Float32, loss_tol: Float32, grads_tol: Float32,) raises -> Bool:
     # build the GPT-2 model from a checkpoint
     var ctx: DeviceContext
@@ -107,7 +109,10 @@ def run_test[
     else:
         ctx = DeviceContext()
 
-    var model = GPT2[target, 1](
+    # `recompute` is a comptime parameter (see main's LLMM_RECOMPUTE dispatch):
+    # this reference check also guards the recompute path, which must produce
+    # the same logits/loss/gradients as the default run.
+    var model = GPT2[target, 1, recompute](
         "gpt2_124M.bin",
         rank=0,
         zero_stage=0,
@@ -467,17 +472,32 @@ def main() raises:
     if len(args) > 1:
         target = args[1]
 
+    # LLMM_RECOMPUTE=1 builds the model with activation recompute enabled so the
+    # reference check guards that path; recompute is comptime, so dispatch here.
+    var recompute = False
+    var env_recompute = getenv("LLMM_RECOMPUTE")
+    if env_recompute != "" and atol(env_recompute) != 0:
+        recompute = True
+
     if target == "gpu":
         print("=== Running GPU Tests ===")
         # GPU version can run with dedicated tolerances
-        var gpu_ok = run_test["gpu"](100.0, 0.1, 2.0)
+        var gpu_ok: Bool
+        if recompute:
+            gpu_ok = run_test["gpu", True](100.0, 0.1, 2.0)
+        else:
+            gpu_ok = run_test["gpu", False](100.0, 0.1, 2.0)
         print("GPU Test Result:", gpu_ok)
         if not gpu_ok:
             exit(1)
     else:
         print("=== Running CPU Tests ===")
         # CPU version has higher precision, let's use dedicated tolerances
-        var cpu_ok = run_test["cpu"](100.0, 0.08, 10.0)
+        var cpu_ok: Bool
+        if recompute:
+            cpu_ok = run_test["cpu", True](100.0, 0.08, 10.0)
+        else:
+            cpu_ok = run_test["cpu", False](100.0, 0.08, 10.0)
         print("CPU Test Result:", cpu_ok)
         if not cpu_ok:
             exit(1)
