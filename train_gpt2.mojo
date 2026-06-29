@@ -638,7 +638,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
         self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             self.padded_num_parameters
         )
-        
+
         self.params_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
         self.ctx.enqueue_copy(
             dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
