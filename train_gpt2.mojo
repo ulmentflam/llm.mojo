@@ -1,10 +1,17 @@
 from std.os import getenv
+from std.sys import (
+    argv,
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    simd_width_of,
+)
 from std.time import global_perf_counter_ns
+from std.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
 from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.sys import has_accelerator, has_apple_gpu_accelerator
 from std.memory import alloc, UnsafePointer, memcpy, memset_zero
+from std.math import sqrt
 
 from llmm.io import read_and_copy
 from llmm.dataloader import DataLoader
@@ -34,13 +41,21 @@ from llmm.memory import (
     as_mut_kernel,
     rebind_mut_mem,
 )
-from llmm.zero import ZeroContext, ShardedParameter, CpuCoordinator
+from llmm.zero import (
+    ZeroContext,
+    ShardedParameter,
+    CpuCoordinator,
+)
 
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
 # ===----------------------------------------------------------------------=== #
 
+
+from std.sys import get_defined_int
+
+comptime WORLD_SIZE_DEF = get_defined_int["WORLD_SIZE", 1]()
 
 comptime NUM_PARAMETER_TENSORS = 16
 comptime NUM_ACTIVATION_TENSORS = 25
@@ -322,7 +337,7 @@ struct GPT2Config:
     var padded_vocab_size: Int  # Padded vocab size (%128 == 0, e.g. 50304).
 
 
-struct GPT2[target: StaticString]:
+struct GPT2[target: StaticString, WORLD_SIZE: Int = 1]:
     var ctx: DeviceContext
     var config: GPT2Config
 
@@ -386,13 +401,26 @@ struct GPT2[target: StaticString]:
     var has_allocated_acts: Bool
     var has_allocated_grads: Bool
     var has_allocated_optimizer_moments: Bool
+
+    # Cache management
     var kv_cache: KVCache
+
+    # Sharding and parallelism
+    var zero_ctx: ZeroContext[Self.target, Self.WORLD_SIZE]
+    var optimizer_num_parameters: Int
+    var padded_num_parameters: Int
+    var sharded_grads_buf: DeviceBuffer[GPT2_DTYPE]
+    var sharded_grads_memory: MutMemPtr[GPT2_DTYPE]
 
     def __init__(
         out self,
         checkpoint_path: String,
-        zero_ctx: ZeroContext,
+        rank: Int,
+        zero_stage: Int,
         ctx: DeviceContext,
+        cpu_coordinator_ptr: Optional[
+            UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
+        ] = None,
     ) raises:
         self.ctx = ctx
         self.checkpoint_path = checkpoint_path
@@ -401,6 +429,11 @@ struct GPT2[target: StaticString]:
         self.has_allocated_grads = False
         self.has_allocated_optimizer_moments = False
         self.kv_cache = KVCache()
+        self.zero_ctx = ZeroContext[Self.target, Self.WORLD_SIZE](
+            rank, zero_stage, ctx, cpu_coordinator_ptr
+        )
+        self.optimizer_num_parameters = 0
+        self.padded_num_parameters = 0
 
         self.config = GPT2Config(
             max_seq_len=0,
@@ -414,6 +447,9 @@ struct GPT2[target: StaticString]:
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
         var NULL_INT32_PTR = MutMemPtr[DType.int32](unsafe_from_address=zero)
+
+        self.sharded_grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.sharded_grads_memory = NULL_DTYPE_PTR
 
         self.params_memory = NULL_DTYPE_PTR
         self.grads_memory = NULL_DTYPE_PTR
@@ -440,21 +476,27 @@ struct GPT2[target: StaticString]:
         self.acts = ActivationTensors[GPT2_DTYPE]()
         self.grad_acts = ActivationTensors[GPT2_DTYPE]()
 
-        self.params_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
-        self.grads_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
-        self.m_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
-        self.v_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
-        self.acts_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
-        self.grad_acts_buf = ctx.enqueue_create_buffer[GPT2_DTYPE](1)
-        self.inputs_buf = ctx.enqueue_create_host_buffer[DType.int32](1)
-        self.targets_buf = ctx.enqueue_create_host_buffer[DType.int32](1)
-        self.bucket_info_buf = ctx.enqueue_create_host_buffer[DType.int32](1)
-        self.workload_indices_buf = ctx.enqueue_create_host_buffer[DType.int32](
+        self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.m_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.v_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.inputs_buf = self.ctx.enqueue_create_host_buffer[DType.int32](1)
+        self.targets_buf = self.ctx.enqueue_create_host_buffer[DType.int32](1)
+        self.bucket_info_buf = self.ctx.enqueue_create_host_buffer[DType.int32](
             1
         )
-        self.losses_host_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
-        self.logits_host_buf = ctx.enqueue_create_host_buffer[GPT2_DTYPE](1)
-        ctx.synchronize()
+        self.workload_indices_buf = self.ctx.enqueue_create_host_buffer[
+            DType.int32
+        ](1)
+        self.losses_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+            1
+        )
+        self.logits_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+            1
+        )
+        self.ctx.synchronize()
 
         self.param_sizes = List[Int]()
         for _ in range(NUM_PARAMETER_TENSORS):
@@ -564,6 +606,23 @@ struct GPT2[target: StaticString]:
             num_parameters += self.param_sizes[i]
         self.num_parameters = num_parameters
 
+        # Calculate optimizer sharding parameters
+        comptime if Self.WORLD_SIZE > 1:
+            # All zero stages 1/2/3 shard the optimizer parameters.
+            if self.zero_ctx.zero_stage >= 1:
+                self.optimizer_num_parameters = (
+                    self.num_parameters + Self.WORLD_SIZE - 1
+                ) // Self.WORLD_SIZE
+                self.padded_num_parameters = (
+                    self.optimizer_num_parameters * Self.WORLD_SIZE
+                )
+            else:
+                self.optimizer_num_parameters = self.num_parameters
+                self.padded_num_parameters = self.num_parameters
+        else:
+            self.optimizer_num_parameters = self.num_parameters
+            self.padded_num_parameters = self.num_parameters
+
         # Allocate parameters using device context host buffer.
         self.params = ParameterTensors[GPT2_DTYPE]()
         var temp_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
@@ -577,9 +636,17 @@ struct GPT2[target: StaticString]:
         model_file.close()
 
         self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.num_parameters
+            self.padded_num_parameters
         )
-        self.ctx.enqueue_copy(dst_buf=self.params_buf, src_ptr=temp_ptr)
+        self.ctx.enqueue_copy(
+            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                self.params_buf.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                temp_ptr.as_unsafe_any_origin()
+            ),
+            size=self.num_parameters,
+        )
         self.ctx.synchronize()
         self.params_memory = rebind_mut_mem[GPT2_DTYPE](
             self.params_buf.unsafe_ptr().as_unsafe_any_origin()
@@ -591,7 +658,7 @@ struct GPT2[target: StaticString]:
     def allocate_gradients(mut self) raises:
         self.grads = ParameterTensors[GPT2_DTYPE]()
         self.grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.num_parameters
+            self.padded_num_parameters
         )
         self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
         self.ctx.synchronize()
@@ -600,14 +667,44 @@ struct GPT2[target: StaticString]:
         )
         self.grads.point_parameters(self.param_sizes, self.grads_memory)
         self.num_grads = self.num_parameters
+
+        comptime if Self.WORLD_SIZE > 1:
+            # Zero 2/3 shards the gradients. We must create a new buffer for each shard.
+            if self.zero_ctx.zero_stage >= 2:
+                self.sharded_grads_buf = self.ctx.enqueue_create_buffer[
+                    GPT2_DTYPE
+                ](self.optimizer_num_parameters)
+                self.sharded_grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+                self.ctx.synchronize()
+                self.sharded_grads_memory = rebind_mut_mem[GPT2_DTYPE](
+                    self.sharded_grads_buf.unsafe_ptr().as_unsafe_any_origin()
+                )
+            else:
+                # For Zero 1, we don't shard the gradients, only the optimizer states.
+                self.sharded_grads_buf = self.ctx.enqueue_create_buffer[
+                    GPT2_DTYPE
+                ](1)
+                var zero = 0
+                self.sharded_grads_memory = MutMemPtr[GPT2_DTYPE](
+                    unsafe_from_address=zero
+                )
+        else:
+            self.sharded_grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+                1
+            )
+            var zero = 0
+            self.sharded_grads_memory = MutMemPtr[GPT2_DTYPE](
+                unsafe_from_address=zero
+            )
+
         self.has_allocated_grads = True
 
     def allocate_optimizer_moments(mut self) raises:
         self.m_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.num_parameters
+            self.optimizer_num_parameters
         )
         self.v_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.num_parameters
+            self.optimizer_num_parameters
         )
         self.m_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
         self.v_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
@@ -1100,6 +1197,9 @@ struct GPT2[target: StaticString]:
     def zero_gradients(mut self) raises:
         if self.has_allocated_grads:
             self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+            comptime if Self.WORLD_SIZE > 1:
+                if self.zero_ctx.zero_stage >= 2:
+                    self.sharded_grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
         if self.has_allocated_acts:
             self.grad_acts_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
         self.ctx.synchronize()
@@ -1468,6 +1568,28 @@ struct GPT2[target: StaticString]:
             self.ctx,
         )
 
+        comptime if Self.WORLD_SIZE > 1:
+            # Zero 1/0 leverages an allreduce operation to synchronize gradients across all processes.
+            if self.zero_ctx.zero_stage < 2:
+                self.zero_ctx.allreduce(
+                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.grads_memory.as_unsafe_any_origin()
+                    ),
+                    self.num_parameters,
+                )
+            else:
+                # Zero 2/3 leverages a reduce-scatter operation to synchronize gradients across all processes.
+                self.zero_ctx.reducescatter(
+                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.grads_memory.as_unsafe_any_origin()
+                    ),
+                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.sharded_grads_memory.as_unsafe_any_origin()
+                    ),
+                    self.optimizer_num_parameters,
+                )
+            self.ctx.synchronize()
+
     def update(
         mut self,
         t: UInt32,
@@ -1478,24 +1600,138 @@ struct GPT2[target: StaticString]:
         weight_decay: Scalar[DType.float32] = Scalar[DType.float32](0.0),
         grad_scale: Scalar[DType.float32] = Scalar[DType.float32](1.0),
     ) raises:
+        var scaled_grad_scale = grad_scale
+        comptime if Self.WORLD_SIZE > 1:
+            scaled_grad_scale = grad_scale / Scalar[DType.float32](
+                Self.WORLD_SIZE
+            )
+
         var config = AdamWConfig[GPT2_DTYPE](
             learning_rate=learning_rate,
             beta1=beta1,
             beta2=beta2,
             eps=eps,
             weight_decay=weight_decay,
-            grad_scale=grad_scale,
+            grad_scale=scaled_grad_scale,
         )
-        adamw_update[GPT2_DTYPE, Self.target](
-            self.num_parameters,
-            as_mut_kernel[GPT2_DTYPE](self.params_memory),
-            as_mut_kernel[GPT2_DTYPE](self.grads_memory),
-            as_mut_kernel[GPT2_DTYPE](self.m_memory),
-            as_mut_kernel[GPT2_DTYPE](self.v_memory),
-            t,
-            config,
-            self.ctx,
-        )
+
+        comptime if is_cpu[Self.target]():
+            var p_ptr: MutMemPtr[GPT2_DTYPE] = self.params_memory
+            var g_ptr: MutMemPtr[GPT2_DTYPE] = self.grads_memory
+            var update_num_params = self.num_parameters
+
+            comptime if Self.WORLD_SIZE > 1:
+                if self.zero_ctx.zero_stage > 0:
+                    var offset = (
+                        self.zero_ctx.rank * self.optimizer_num_parameters
+                    )
+                    var local_num_params = min(
+                        self.num_parameters - offset,
+                        self.optimizer_num_parameters,
+                    )
+                    p_ptr = self.params_memory + offset
+                    if self.zero_ctx.zero_stage >= 2:
+                        g_ptr = self.sharded_grads_memory
+                    else:
+                        g_ptr = self.grads_memory + offset
+                    update_num_params = local_num_params
+
+            if update_num_params > 0:
+                comptime simd_w = simd_width_of[GPT2_DTYPE]()
+                adamw_update[GPT2_DTYPE, Self.target, width=simd_w](
+                    update_num_params,
+                    p_ptr.as_unsafe_any_origin(),
+                    g_ptr.as_unsafe_any_origin(),
+                    self.m_memory.as_unsafe_any_origin(),
+                    self.v_memory.as_unsafe_any_origin(),
+                    t,
+                    config,
+                    self.ctx,
+                )
+
+            self.ctx.synchronize()
+
+            comptime if Self.WORLD_SIZE > 1:
+                if self.zero_ctx.zero_stage > 0:
+                    self.zero_ctx.allgather(
+                        rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                            self.params_memory.as_unsafe_any_origin()
+                        ),
+                        self.optimizer_num_parameters,
+                    )
+                    self.ctx.synchronize()
+        else:
+            comptime if Self.WORLD_SIZE > 1:
+                if self.zero_ctx.zero_stage == 0:
+                    adamw_update[GPT2_DTYPE, Self.target](
+                        self.num_parameters,
+                        as_mut_kernel[GPT2_DTYPE](self.params_memory),
+                        as_mut_kernel[GPT2_DTYPE](self.grads_memory),
+                        as_mut_kernel[GPT2_DTYPE](self.m_memory),
+                        as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                        t,
+                        config,
+                        self.ctx,
+                    )
+                else:
+                    var offset = (
+                        self.zero_ctx.rank * self.optimizer_num_parameters
+                    )
+                    var local_num_params = min(
+                        self.num_parameters - offset,
+                        self.optimizer_num_parameters,
+                    )
+                    if local_num_params > 0:
+                        if self.zero_ctx.zero_stage < 2:
+                            adamw_update[GPT2_DTYPE, Self.target](
+                                local_num_params,
+                                as_mut_kernel[GPT2_DTYPE](
+                                    self.params_memory + offset
+                                ),
+                                as_mut_kernel[GPT2_DTYPE](
+                                    self.grads_memory + offset
+                                ),
+                                as_mut_kernel[GPT2_DTYPE](self.m_memory),
+                                as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                                t,
+                                config,
+                                self.ctx,
+                            )
+                        else:
+                            adamw_update[GPT2_DTYPE, Self.target](
+                                local_num_params,
+                                as_mut_kernel[GPT2_DTYPE](
+                                    self.params_memory + offset
+                                ),
+                                as_mut_kernel[GPT2_DTYPE](
+                                    self.sharded_grads_memory
+                                ),
+                                as_mut_kernel[GPT2_DTYPE](self.m_memory),
+                                as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                                t,
+                                config,
+                                self.ctx,
+                            )
+                    self.ctx.synchronize()
+
+                    self.zero_ctx.allgather(
+                        rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                            self.params_memory.as_unsafe_any_origin()
+                        ),
+                        self.optimizer_num_parameters,
+                    )
+                    self.ctx.synchronize()
+            else:
+                adamw_update[GPT2_DTYPE, Self.target](
+                    self.num_parameters,
+                    as_mut_kernel[GPT2_DTYPE](self.params_memory),
+                    as_mut_kernel[GPT2_DTYPE](self.grads_memory),
+                    as_mut_kernel[GPT2_DTYPE](self.m_memory),
+                    as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                    t,
+                    config,
+                    self.ctx,
+                )
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1504,13 +1740,14 @@ struct GPT2[target: StaticString]:
 
 
 def train[
-    target: StaticString
+    target: StaticString,
+    WORLD_SIZE: Int = 1,
 ](
     rank: Int = 0,
-    world_size: Int = 1,
     cpu_coord: Optional[
         UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
     ] = Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+    zero_stage: Int = 0,
 ) raises:
     var ctx: DeviceContext
     comptime if is_cpu[target]():
@@ -1519,9 +1756,14 @@ def train[
         ctx = DeviceContext()
 
     # Zero sharding.
-    var zero_ctx = ZeroContext[target](rank, world_size, ctx, cpu_coord)
     # Build the GPT-2 model from my checkpoint.
-    var model = GPT2[target]("gpt2_124M.bin", zero_ctx, ctx)
+    var model = GPT2[target, WORLD_SIZE](
+        "gpt2_124M.bin",
+        rank,
+        zero_stage,
+        ctx,
+        cpu_coordinator_ptr=cpu_coord,
+    )
 
     # Build the dataloaders from tokens files.
     # TODO: Add tiny stories dataset.
@@ -1544,16 +1786,23 @@ def train[
     comptime BATCH_SIZE = 4
     comptime SEQ_LEN = 1024
 
-    var train_loader = DataLoader(train_tokens, BATCH_SIZE, SEQ_LEN)
-    print("Loaded train tokens from " + train_tokens)
-    print("Number of tokens: " + String(train_loader.num_tokens))
-    var val_loader = DataLoader(val_tokens, BATCH_SIZE, SEQ_LEN)
-    print("Loaded val tokens from " + val_tokens)
-    print("Number of tokens: " + String(val_loader.num_tokens))
+    var train_loader = DataLoader(
+        train_tokens, BATCH_SIZE, SEQ_LEN, rank, WORLD_SIZE
+    )
+    if rank == 0:
+        print("Loaded train tokens from " + train_tokens)
+        print("Number of tokens: " + String(train_loader.num_tokens))
+    var val_loader = DataLoader(
+        val_tokens, BATCH_SIZE, SEQ_LEN, rank, WORLD_SIZE
+    )
+    if rank == 0:
+        print("Loaded val tokens from " + val_tokens)
+        print("Number of tokens: " + String(val_loader.num_tokens))
 
     # Build the tokenizer from the tokens file.
     var tokenizer = Tokenizer("gpt2_tokenizer.bin")
-    print("Loaded tokenizer from " + "gpt2_tokenizer.bin")
+    if rank == 0:
+        print("Loaded tokenizer from " + "gpt2_tokenizer.bin")
 
     # Build the learning rate scheduler.
     var num_iters = 40
@@ -1599,54 +1848,57 @@ def train[
                 val_loss += model.mean_loss
             val_loss /= Float32(val_max_steps)
             var time_val_end = global_perf_counter_ns()
-            print(
-                "validation step "
-                + String(step // val_loss_every)
-                + ": validation loss: "
-                + String(val_loss)
-                + " | total: "
-                + String(Float64(time_val_end - time_val_start) / 1e9)
-                + "s"
-            )
+            if rank == 0:
+                print(
+                    "validation step "
+                    + String(step // val_loss_every)
+                    + ": validation loss: "
+                    + String(val_loss)
+                    + " | total: "
+                    + String(Float64(time_val_end - time_val_start) / 1e9)
+                    + "s"
+                )
 
         if sample_every > 0 and step > 0 and step % sample_every == 0:
-            gen_tokens[0] = Scalar[DType.int32](
-                tokenizer.eot_token
-            )  # The GPT-2 EOT token begins generation.
+            if rank == 0:
+                gen_tokens[0] = Scalar[DType.int32](
+                    tokenizer.eot_token
+                )  # The GPT-2 EOT token begins generation.
 
-            print("Generating:\n---")
-            for t in range(1, gen_max_length):
-                # NOTE: Inference is wasteful here because for each t we recompute all activations between 0 and t.
-                # In a real inference setting we would use a separate code for this anyway.
-                # Inference is here only for sanity checking.
-                model.forward(gen_tokens, null_int32_ptr, 1, t)
-                var dev_logits_ptr = (
-                    model.acts.logits + (t - 1) * model.config.padded_vocab_size
-                )
-                model.ctx.enqueue_copy(
-                    dst_ptr=rebind[
-                        UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
-                    ](
+                print("Generating:\n---")
+                for t in range(1, gen_max_length):
+                    # NOTE: Inference is wasteful here because for each t we recompute all activations between 0 and t.
+                    # In a real inference setting we would use a separate code for this anyway.
+                    # Inference is here only for sanity checking.
+                    model.forward(gen_tokens, null_int32_ptr, 1, t)
+                    var dev_logits_ptr = (
+                        model.acts.logits
+                        + (t - 1) * model.config.padded_vocab_size
+                    )
+                    model.ctx.enqueue_copy(
+                        dst_ptr=rebind[
+                            UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+                        ](
+                            model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
+                        ),
+                        src_ptr=rebind[
+                            UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                        ](dev_logits_ptr.as_unsafe_any_origin()),
+                        size=model.config.vocab_size,
+                    )
+                    model.ctx.synchronize()
+
+                    var logits = rebind[ImmutMemPtr[DType.float32]](
                         model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
-                    ),
-                    src_ptr=rebind[
-                        UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
-                    ](dev_logits_ptr.as_unsafe_any_origin()),
-                    size=model.config.vocab_size,
-                )
-                model.ctx.synchronize()
-
-                var logits = rebind[ImmutMemPtr[DType.float32]](
-                    model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
-                )
-                var coin = random_f32(rng_state)
-                var next_token = sample_softmax(
-                    logits, model.config.vocab_size, coin
-                )
-                gen_tokens[t] = Scalar[DType.int32](next_token)
-                var token_str = tokenizer.decode(next_token)
-                safe_print(token_str)
-            print("\n---")
+                    )
+                    var coin = random_f32(rng_state)
+                    var next_token = sample_softmax(
+                        logits, model.config.vocab_size, coin
+                    )
+                    gen_tokens[t] = Scalar[DType.int32](next_token)
+                    var token_str = tokenizer.decode(next_token)
+                    safe_print(token_str)
+                print("\n---")
 
         if step == num_iters:
             break
@@ -1673,69 +1925,166 @@ def train[
 
         var elapsed_time = Float64(time_end - time_forward) / 1e9
         elapsed_time_ms_total += elapsed_time
-        print(
-            "step "
-            + String(step)
-            + ": train loss "
-            + String(model.mean_loss)
-            + " | forward: "
-            + String(Float64(time_backward - time_forward) / 1e9)
-            + "s | backward: "
-            + String(Float64(time_update - time_backward) / 1e9)
-            + "s | update: "
-            + String(Float64(time_load_batch - time_update) / 1e9)
-            + "s | loader: "
-            + String(Float64(time_end - time_load_batch) / 1e9)
-            + "s | total: "
-            + String(elapsed_time)
-            + "s"
-        )
+        if rank == 0:
+            print(
+                "step "
+                + String(step)
+                + ": train loss "
+                + String(model.mean_loss)
+                + " | forward: "
+                + String(Float64(time_backward - time_forward) / 1e9)
+                + "s | backward: "
+                + String(Float64(time_update - time_backward) / 1e9)
+                + "s | update: "
+                + String(Float64(time_load_batch - time_update) / 1e9)
+                + "s | loader: "
+                + String(Float64(time_end - time_load_batch) / 1e9)
+                + "s | total: "
+                + String(elapsed_time)
+                + "s"
+            )
 
     train_loader.close()
     val_loader.close()
 
 
+def _dispatch_world_size[
+    target: StaticString
+](
+    rank: Int,
+    world_size: Int,
+    cpu_coord: Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]],
+    zero_stage: Int,
+) raises:
+    if world_size == WORLD_SIZE_DEF:
+        train[target, WORLD_SIZE_DEF](rank, cpu_coord, zero_stage)
+    elif world_size == 1:
+        train[target, 1](rank, cpu_coord, zero_stage)
+    elif world_size == 2:
+        train[target, 2](rank, cpu_coord, zero_stage)
+    elif world_size == 4:
+        train[target, 4](rank, cpu_coord, zero_stage)
+    elif world_size == 8:
+        train[target, 8](rank, cpu_coord, zero_stage)
+    else:
+        comptime if WORLD_SIZE_DEF == 16:
+            if world_size == 16:
+                train[target, 16](rank, cpu_coord, zero_stage)
+                return
+        comptime if WORLD_SIZE_DEF == 32:
+            if world_size == 32:
+                train[target, 32](rank, cpu_coord, zero_stage)
+                return
+        comptime if WORLD_SIZE_DEF == 64:
+            if world_size == 64:
+                train[target, 64](rank, cpu_coord, zero_stage)
+                return
+        comptime if WORLD_SIZE_DEF == 128:
+            if world_size == 128:
+                train[target, 128](rank, cpu_coord, zero_stage)
+                return
+        raise Error(
+            "Unsupported world_size: "
+            + String(world_size)
+            + ". Supported values: 1, 2, 4, 8 or compile-time defined"
+            " WORLD_SIZE: "
+            + String(WORLD_SIZE_DEF)
+        )
+
+
 def main() raises:
+    var args = argv()
+    var rank = 0
+    var world_size = 1
+    var zero_stage = 0
+
+    var env_rank = getenv("RANK")
+    if env_rank != "":
+        rank = atol(env_rank)
+    var env_world_size = getenv("WORLD_SIZE")
+    if env_world_size != "":
+        world_size = atol(env_world_size)
+    var env_zero_stage = getenv("ZERO_STAGE")
+    if env_zero_stage != "":
+        zero_stage = atol(env_zero_stage)
+
+    # Command line args override env variables:
+    if len(args) > 1:
+        world_size = atol(args[1])
+    if len(args) > 2:
+        zero_stage = atol(args[2])
+    if len(args) > 3:
+        rank = atol(args[3])
+
+    print("Rank:", rank, "World size:", world_size, "ZeRO stage:", zero_stage)
+
     var use_cpu = getenv("LLMM_USE_CPU")
-    if use_cpu != "":
-        print("LLMM_USE_CPU is set — forcing CPU training.")
-        train["cpu"]()
-        return
-    comptime if has_apple_gpu_accelerator():
-        print(
-            "==============================================================================="
-        )
-        print(
-            "WARNING: Apple Silicon GPU training is disabled — using CPU"
-            " instead."
-        )
-        print("")
-        print(
-            "An Apple Metal accelerator is present, but this trainer does not"
-            " run on it yet."
-        )
-        print("Known blockers on Apple Silicon today:")
-        print(
-            "  • Metal / KGEN: several llmm GPU kernels compile in Mojo but"
-            " fail at the"
-        )
-        print(
-            '    metallib stage ("could not elaborate the generated KGEN") or'
-            " miscompile"
-        )
-        print("    when lowered through MAX's Apple-GPU path.")
-        print("")
-        print(
-            "CPU training is correct and fast enough for dev; GPU support here"
-            " is WIP."
-        )
-        print(
-            "==============================================================================="
-        )
-        train["cpu"]()
+    var run_on_cpu = (
+        (use_cpu != "") or not has_accelerator() or has_apple_gpu_accelerator()
+    )
+
+    if run_on_cpu:
+        if has_apple_gpu_accelerator() and use_cpu == "":
+            print(
+                "==============================================================================="
+            )
+            print(
+                "WARNING: Apple Silicon GPU training is disabled — using CPU"
+                " instead."
+            )
+            print("")
+            print(
+                "An Apple Metal accelerator is present, but this trainer does"
+                " not run on it yet."
+            )
+            print("Known blockers on Apple Silicon today:")
+            print(
+                "  • Metal / KGEN: several llmm GPU kernels compile in Mojo but"
+                " fail at the"
+            )
+            print(
+                '    metallib stage ("could not elaborate the generated KGEN")'
+                " or miscompile"
+            )
+            print("    when lowered through MAX's Apple-GPU path.")
+            print("")
+            print(
+                "CPU training is correct and fast enough for dev; GPU support"
+                " here is WIP."
+            )
+            print(
+                "==============================================================================="
+            )
+
+        print("Training on CPU.")
+        if world_size == 1:
+            _dispatch_world_size["cpu"](
+                0,
+                world_size,
+                Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+                zero_stage,
+            )
+        else:
+            var cpu_coord_ptr = alloc[CpuCoordinator](1)
+            cpu_coord_ptr[] = CpuCoordinator(world_size)
+
+            @parameter
+            def _run_rank(rank: Int):
+                try:
+                    _dispatch_world_size["cpu"](
+                        rank, world_size, cpu_coord_ptr, zero_stage
+                    )
+                except e:
+                    print("Rank", rank, "failed:", e)
+
+            sync_parallelize[_run_rank](world_size)
+            cpu_coord_ptr[].free()
+            cpu_coord_ptr.free()
     elif has_accelerator():
         print("GPU detected — training on GPU.")
-        train["gpu"]()
-    else:
-        print("No GPU detected — training on CPU.")
-        train["cpu"]()
+        _dispatch_world_size["gpu"](
+            rank,
+            world_size,
+            Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+            zero_stage,
+        )

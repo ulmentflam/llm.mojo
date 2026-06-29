@@ -106,19 +106,22 @@ struct DataLoader:
         self.targets = alloc[Scalar[DType.int32]](batch_size * seq_len)
         self.has_allocated = True
 
-        # Import python glob to find all matching shards.
-        var glob = Python.import_module(GLOB)
-        var py_files = glob.glob(filename_pattern)
-        py_files.sort()
+        # Check if there is a wildcard. If not, bypass Python to avoid thread safety issues.
+        if "*" not in filename_pattern and "?" not in filename_pattern:
+            self.files.append(filename_pattern)
+        else:
+            var glob = Python.import_module(GLOB)
+            var py_files = glob.glob(filename_pattern)
+            py_files.sort()
 
-        if len(py_files) == 0:
-            raise Error(
-                "DataLoader error: No files matched the pattern: "
-                + filename_pattern
-            )
+            if len(py_files) == 0:
+                raise Error(
+                    "DataLoader error: No files matched the pattern: "
+                    + filename_pattern
+                )
 
-        for i in range(len(py_files)):
-            self.files.append(String(py_files[i]))
+            for i in range(len(py_files)):
+                self.files.append(String(py_files[i]))
 
         for i in range(len(self.files)):
             self.shard_indices.append(i)

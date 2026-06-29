@@ -153,6 +153,46 @@ def adamw_update_cpu[
     sync_parallelize[_chunk](num_chunks)
 
 
+def adamw_update_cpu_seq[
+    dtype: DType,
+    width: Int,
+](
+    num_params: Int,
+    params_ptr: MutKernelPtr[dtype],
+    grads_ptr: ImmutKernelPtr[dtype],
+    m_ptr: MutKernelPtr[DType.float32],
+    v_ptr: MutKernelPtr[DType.float32],
+    config: AdamWConfig[dtype],
+    beta1_correction: Scalar[DType.float32],
+    beta2_correction: Scalar[DType.float32],
+) -> None:
+    var i = 0
+    while i + width <= num_params:
+        _adamw_update[dtype, width](
+            i,
+            params_ptr,
+            grads_ptr,
+            m_ptr,
+            v_ptr,
+            config,
+            beta1_correction,
+            beta2_correction,
+        )
+        i += width
+    while i < num_params:
+        _adamw_update[dtype, 1](
+            i,
+            params_ptr,
+            grads_ptr,
+            m_ptr,
+            v_ptr,
+            config,
+            beta1_correction,
+            beta2_correction,
+        )
+        i += 1
+
+
 def adamw_update_gpu[
     dtype: DType,
     width: Int = 4,
@@ -210,6 +250,7 @@ def adamw_update[
     dtype: DType,
     target: StaticString,
     width: Int = 8,  # Pinning to 8 — optimal for 32-byte coalesced GPU loads.
+    parallel: Bool = True,
 ](
     num_params: Int,
     params_ptr: MutKernelPtr[dtype],
@@ -235,16 +276,28 @@ def adamw_update[
 
     comptime if is_cpu[target]():
         comptime simd_width = simd_width_of[dtype]()
-        adamw_update_cpu[dtype, simd_width](
-            num_params,
-            params_ptr,
-            grads_ptr,
-            m_ptr,
-            v_ptr,
-            config,
-            beta1_correction,
-            beta2_correction,
-        )
+        comptime if parallel:
+            adamw_update_cpu[dtype, simd_width](
+                num_params,
+                params_ptr,
+                grads_ptr,
+                m_ptr,
+                v_ptr,
+                config,
+                beta1_correction,
+                beta2_correction,
+            )
+        else:
+            adamw_update_cpu_seq[dtype, simd_width](
+                num_params,
+                params_ptr,
+                grads_ptr,
+                m_ptr,
+                v_ptr,
+                config,
+                beta1_correction,
+                beta2_correction,
+            )
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
         var dev_ctx = ctx

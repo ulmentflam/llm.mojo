@@ -7,6 +7,7 @@ from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 
 from llmm.memory import MutMemPtr
+from llmm.zero import ZeroContext
 
 from train_gpt2 import (
     GPT2,
@@ -30,8 +31,12 @@ def check_tensor(
     var host_ptr = alloc[Scalar[DType.float32]](n)
     try:
         ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[DType.float32], MutAnyOrigin]](host_ptr),
-            src_ptr=rebind[UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]](device_ptr.as_unsafe_any_origin()),
+            dst_ptr=rebind[UnsafePointer[Scalar[DType.float32], MutAnyOrigin]](
+                host_ptr
+            ),
+            src_ptr=rebind[
+                UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
+            ](device_ptr.as_unsafe_any_origin()),
             size=n,
         )
         ctx.synchronize()
@@ -71,7 +76,7 @@ def check_tensor(
         print("TENSOR OK")
     else:
         print("TENSOR NOT OK, maxdiff =", maxdiff)
-        
+
     host_ptr.free()
     return ok
 
@@ -84,19 +89,17 @@ def read_to_dtype_pointer[
     # Read directly into the pointer using read_bytes
     var bytes_to_read = size * size_of[T]()
     var bytes_data = file_handle.read_bytes(bytes_to_read)
-    
+
     var d = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](ptr)
-    var s = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](bytes_data.unsafe_ptr())
+    var s = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        bytes_data.unsafe_ptr()
+    )
     memcpy(dest=d, src=s, count=bytes_to_read)
 
 
 def run_test[
     target: StaticString
-](
-    logits_tol: Float32,
-    loss_tol: Float32,
-    grads_tol: Float32,
-) raises -> Bool:
+](logits_tol: Float32, loss_tol: Float32, grads_tol: Float32,) raises -> Bool:
     # build the GPT-2 model from a checkpoint
     var ctx: DeviceContext
     comptime if is_cpu[target]():
@@ -104,7 +107,12 @@ def run_test[
     else:
         ctx = DeviceContext()
 
-    var model = GPT2[target]("gpt2_124M.bin", ctx)
+    var model = GPT2[target, 1](
+        "gpt2_124M.bin",
+        rank=0,
+        zero_stage=0,
+        ctx=ctx,
+    )
 
     var C: Int = model.config.channels
     var V: Int = model.config.vocab_size
@@ -136,7 +144,9 @@ def run_test[
     print("seq_len:", T)
 
     var expected_grads = ParameterTensors[DType.float32]()
-    var expected_grads_memory = alloc[Scalar[DType.float32]](model.num_parameters)
+    var expected_grads_memory = alloc[Scalar[DType.float32]](
+        model.num_parameters
+    )
     expected_grads.point_parameters(
         model.param_sizes,
         rebind[MutMemPtr[DType.float32]](expected_grads_memory),
@@ -197,8 +207,12 @@ def run_test[
             # copy logits from device buffer to host first
             var host_logits = alloc[Scalar[DType.float32]](B * T * V_p)
             ctx.enqueue_copy(
-                dst_ptr=rebind[UnsafePointer[Scalar[DType.float32], MutAnyOrigin]](host_logits),
-                src_ptr=rebind[UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]](model.acts.logits.as_unsafe_any_origin()),
+                dst_ptr=rebind[
+                    UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+                ](host_logits),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
+                ](model.acts.logits.as_unsafe_any_origin()),
                 size=B * T * V_p,
             )
             ctx.synchronize()
@@ -215,14 +229,36 @@ def run_test[
                         var idx_mj = (b * T + t) * V_p + v
 
                         if print_count < 3:
-                            print("PyTorch:", expected_logits[idx_py], "Mojo:", host_logits[idx_mj])
+                            print(
+                                "PyTorch:",
+                                expected_logits[idx_py],
+                                "Mojo:",
+                                host_logits[idx_mj],
+                            )
                             print_count += 1
 
                         # We only check logits that have a non-negligible impact on softmax (expected_logits > -10.0)
                         if expected_logits[idx_py] > -10.0:
-                            if abs(expected_logits[idx_py] - host_logits[idx_mj]) >= logits_tol:
-                                print("MISMATCH AT INDEX (Py=" + String(idx_py) + ", Mj=" + String(idx_mj) + "):")
-                                print("Expected (Py):", expected_logits[idx_py], "Got (Mj):", host_logits[idx_mj])
+                            if (
+                                abs(
+                                    expected_logits[idx_py]
+                                    - host_logits[idx_mj]
+                                )
+                                >= logits_tol
+                            ):
+                                print(
+                                    "MISMATCH AT INDEX (Py="
+                                    + String(idx_py)
+                                    + ", Mj="
+                                    + String(idx_mj)
+                                    + "):"
+                                )
+                                print(
+                                    "Expected (Py):",
+                                    expected_logits[idx_py],
+                                    "Got (Mj):",
+                                    host_logits[idx_mj],
+                                )
                                 logits_ok = False
                                 break
                     if not logits_ok:
@@ -251,22 +287,52 @@ def run_test[
             var gradoks = InlineArray[Bool, 16](fill=False)
 
             gradoks[0] = check_tensor(
-                ctx, model.grads.wte, expected_grads.wte, V * C, "dwte", grads_tol
+                ctx,
+                model.grads.wte,
+                expected_grads.wte,
+                V * C,
+                "dwte",
+                grads_tol,
             )
             gradoks[1] = check_tensor(
-                ctx, model.grads.wpe, expected_grads.wpe, maxT * C, "dwpe", grads_tol
+                ctx,
+                model.grads.wpe,
+                expected_grads.wpe,
+                maxT * C,
+                "dwpe",
+                grads_tol,
             )
             gradoks[2] = check_tensor(
-                ctx, model.grads.ln_1_gamma, expected_grads.ln_1_gamma, L * C, "dln1w", grads_tol
+                ctx,
+                model.grads.ln_1_gamma,
+                expected_grads.ln_1_gamma,
+                L * C,
+                "dln1w",
+                grads_tol,
             )
             gradoks[3] = check_tensor(
-                ctx, model.grads.ln_1_beta, expected_grads.ln_1_beta, L * C, "dln1b", grads_tol
+                ctx,
+                model.grads.ln_1_beta,
+                expected_grads.ln_1_beta,
+                L * C,
+                "dln1b",
+                grads_tol,
             )
             gradoks[4] = check_tensor(
-                ctx, model.grads.qkv_weight, expected_grads.qkv_weight, L * 3 * C * C, "dqkvw", grads_tol
+                ctx,
+                model.grads.qkv_weight,
+                expected_grads.qkv_weight,
+                L * 3 * C * C,
+                "dqkvw",
+                grads_tol,
             )
             gradoks[5] = check_tensor(
-                ctx, model.grads.qkv_bias, expected_grads.qkv_bias, L * 3 * C, "dqkvb", grads_tol
+                ctx,
+                model.grads.qkv_bias,
+                expected_grads.qkv_bias,
+                L * 3 * C,
+                "dqkvb",
+                grads_tol,
             )
             gradoks[6] = check_tensor(
                 ctx,
@@ -285,16 +351,36 @@ def run_test[
                 grads_tol,
             )
             gradoks[8] = check_tensor(
-                ctx, model.grads.ln_2_gamma, expected_grads.ln_2_gamma, L * C, "dln2w", grads_tol
+                ctx,
+                model.grads.ln_2_gamma,
+                expected_grads.ln_2_gamma,
+                L * C,
+                "dln2w",
+                grads_tol,
             )
             gradoks[9] = check_tensor(
-                ctx, model.grads.ln_2_beta, expected_grads.ln_2_beta, L * C, "dln2b", grads_tol
+                ctx,
+                model.grads.ln_2_beta,
+                expected_grads.ln_2_beta,
+                L * C,
+                "dln2b",
+                grads_tol,
             )
             gradoks[10] = check_tensor(
-                ctx, model.grads.fc_weight, expected_grads.fc_weight, L * 4 * C * C, "dfcw", grads_tol
+                ctx,
+                model.grads.fc_weight,
+                expected_grads.fc_weight,
+                L * 4 * C * C,
+                "dfcw",
+                grads_tol,
             )
             gradoks[11] = check_tensor(
-                ctx, model.grads.fc_bias, expected_grads.fc_bias, L * 4 * C, "dfcb", grads_tol
+                ctx,
+                model.grads.fc_bias,
+                expected_grads.fc_bias,
+                L * 4 * C,
+                "dfcb",
+                grads_tol,
             )
             gradoks[12] = check_tensor(
                 ctx,
@@ -305,13 +391,28 @@ def run_test[
                 grads_tol,
             )
             gradoks[13] = check_tensor(
-                ctx, model.grads.proj_bias, expected_grads.proj_bias, L * C, "dfcprojb", grads_tol
+                ctx,
+                model.grads.proj_bias,
+                expected_grads.proj_bias,
+                L * C,
+                "dfcprojb",
+                grads_tol,
             )
             gradoks[14] = check_tensor(
-                ctx, model.grads.ln_f_gamma, expected_grads.ln_f_gamma, C, "dlnfw", grads_tol
+                ctx,
+                model.grads.ln_f_gamma,
+                expected_grads.ln_f_gamma,
+                C,
+                "dlnfw",
+                grads_tol,
             )
             gradoks[15] = check_tensor(
-                ctx, model.grads.ln_f_beta, expected_grads.ln_f_beta, C, "dlnfb", grads_tol
+                ctx,
+                model.grads.ln_f_beta,
+                expected_grads.ln_f_beta,
+                C,
+                "dlnfb",
+                grads_tol,
             )
 
             for i in range(16):
@@ -332,12 +433,12 @@ def run_test[
 
         var expected_loss_val = expected_losses[step]
         var actual_loss = model.mean_loss
-        
+
         # We check loss step tolerance
         var _ = abs(expected_loss_val - actual_loss) < logits_tol
         # Note: we do not enforce tiny shakespeare losses for the debug 64-token batch,
         # but we print if it matches the expected overfitting trajectory or not.
-        
+
         # print timing information at the end
         print(
             "step "
@@ -380,4 +481,7 @@ def main() raises:
         print("CPU Test Result:", cpu_ok)
         if not cpu_ok:
             exit(1)
-        print("All CPU tests passed successfully! To run GPU tests, run: mojo test_gpt2.mojo gpu")
+        print(
+            "All CPU tests passed successfully! To run GPU tests, run: mojo"
+            " test_gpt2.mojo gpu"
+        )

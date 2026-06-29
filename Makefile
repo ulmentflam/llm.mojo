@@ -14,6 +14,7 @@ TRAIN_BIN := build/train_gpt2
 TRAIN_RUNNER := scripts/run_train_gpt2.sh
 MOJO_INCLUDES := -I .
 LLMM_SOURCES := $(shell find llmm -name '*.mojo' 2>/dev/null)
+WORLD_SIZE ?= 1
 
 SHELL := /bin/bash
 
@@ -92,7 +93,7 @@ build build-train: $(TRAIN_BIN)
 
 $(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build $(MOJO_INCLUDES) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
 
 train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@$(TRAIN_RUNNER)
