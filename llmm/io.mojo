@@ -1,3 +1,5 @@
+from std.memory import Span
+
 from llmm.memory import ImmutKernelPtr, MutMemPtr
 
 
@@ -28,3 +30,13 @@ def read_and_copy[
     var src_ptr = bytes_read.unsafe_ptr().bitcast[Scalar[dtype]]()
     for i in range(count):
         dest.store(i, src_ptr.load(i))
+
+
+# Generic utility to write count elements from a buffer to a FileHandle as raw
+# little-endian bytes. The write-side counterpart to read_and_copy.
+@always_inline
+def write_buffer[
+    dtype: DType,
+](mut file: FileHandle, src: MutMemPtr[dtype], count: Int) raises:
+    var nbytes = count * get_dtype_size(dtype)
+    file.write_all(Span(ptr=src.bitcast[Byte](), length=nbytes))

@@ -7,6 +7,20 @@ from .attention import (
     KVCache,
     KVCachePtr,
 )
+from .checkpointing import (
+    CheckpointConfig,
+    ModelHeader,
+    TrainingState,
+    write_model_checkpoint,
+    read_model_checkpoint,
+    peek_model_header,
+    read_model_header,
+    write_state_checkpoint,
+    read_state_checkpoint,
+    read_state_header,
+    make_training_state,
+    restore_dataloader_state,
+)
 from .crossentropy import (
     CrossEntropyOHEFwd,
     CrossEntropyOHEBwd,
@@ -18,7 +32,7 @@ from .encoder import EncoderFwd, EncoderBwd, encoder_fwd, encoder_bwd
 from .fused_classifier import FusedClassifier, fused_classifier
 from .gelu import GeluFwd, GeluBwd, gelu_fwd, gelu_bwd
 from .global_norm import GlobalNormSquared, global_norm_squared
-from .io import read_and_copy
+from .io import read_and_copy, write_buffer
 from .layernorm import (
     LayerNormFwd,
     LayerNormBwd,
