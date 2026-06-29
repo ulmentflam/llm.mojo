@@ -1,6 +1,6 @@
 # Source roots only — never `find .` (crawls .pixi and hangs on iCloud).
-MOJO_PATHS := train_gpt2.mojo llmm tests
-PYTHON_PATHS := train_gpt2.py tests data
+MOJO_PATHS := train_gpt2.mojo profile_gpt2.mojo llmm tests
+PYTHON_PATHS := train_gpt2.py profile_gpt2.py tests data
 LATEX_SOURCES := docs/backprop.tex
  
 # Auto-detect python library for Mojo standard library python interop.
@@ -16,11 +16,26 @@ MOJO_INCLUDES := -I .
 LLMM_SOURCES := $(shell find llmm -name '*.mojo' 2>/dev/null)
 WORLD_SIZE ?= 1
 
+# Profiling: a single forward/backward/update step on synthetic data, built as
+# its own binary so external profilers (ncu/nsys) and the Perfetto tracer can
+# target it without the full training loop.
+PROFILE_MOJO_SRC := profile_gpt2.mojo
+PROFILE_BIN := build/profile_gpt2
+PROFILE_RUNNER := scripts/run_profile_gpt2.sh
+PROFILE_SCRIPT := profile_gpt2.py
+PROFILE_TARGET ?= gpu
+# Suffix the Perfetto trace with the target (…gpu./…cpu.) so the GPU and CPU
+# runs write distinct files instead of clobbering each other. Recursive `=`
+# (not `:=`) so it re-expands with any per-target PROFILE_TARGET override.
+PROFILE_TRACE = $(PROFILE_BIN).$(PROFILE_TARGET).perfetto-trace.json
+PROFILE_NSYS_REP := $(PROFILE_BIN).nsys-rep
+
 SHELL := /bin/bash
 
 .PHONY: help install update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build         build-mojo build-train train train-cpu \
+        build-profile profile profile-trace profile-cpu profile-ncu profile-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures \
         verify verify-cpu verify-gpu \
         docs docs-clean
@@ -36,11 +51,19 @@ help:
 	@echo "  update        Update pixi dependencies and refresh pixi.lock"
 	@echo ""
 	@echo "Quality gates:"
-	@echo "  check         Run lint (incl. typecheck), build-mojo, and build train_gpt2"
+	@echo "  check         Run lint (incl. typecheck), build-mojo, build train_gpt2, and build-profile"
 	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
 	@echo "  build-train   Alias for build"
 	@echo "  train         Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
 	@echo "  train-cpu     Build and run build/train_gpt2 on CPU (LLMM_USE_CPU=1)"
+	@echo ""
+	@echo "Profiling:"
+	@echo "  build-profile Compile profile_gpt2.mojo to build/profile_gpt2"
+	@echo "  profile       Run one step and emit a Perfetto trace (alias: profile-trace)"
+	@echo "  profile-trace Write build/profile_gpt2.<target>.perfetto-trace.json (ui.perfetto.dev)"
+	@echo "  profile-cpu   Run the profile on CPU and emit a Perfetto trace"
+	@echo "  profile-ncu   Profile GPU kernels with ncu + print profile_gpt2.py table"
+	@echo "  profile-nsys  Capture an nsys timeline to build/profile_gpt2.nsys-rep"
 	@echo "  lint          Lint Python, Mojo, C, CUDA, LaTeX sources, and typecheck"
 	@echo "  lint-python   Lint Python sources with ruff"
 	@echo "  lint-mojo     Lint Mojo sources with mojo format --check"
@@ -85,7 +108,7 @@ install-cuda:
 update:
 	pixi update
 
-check: lint build-mojo build
+check: lint build-mojo build build-profile
 
 # Compiles the GPT-2 training binary. MOJO_PYTHON_LIBRARY must be set because
 # DataLoader uses Python glob; pixi run supplies the Modular std/toolchain env.
@@ -100,6 +123,46 @@ train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 
 train-cpu: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@LLMM_USE_CPU=1 $(TRAIN_RUNNER)
+
+# Compiles the single-step profiling harness. Depends on train_gpt2.mojo because
+# it imports GPT2 from it (the llm.mojo analogue of profile_gpt2.cu #include'ing
+# train_gpt2.cu).
+build-profile: $(PROFILE_BIN)
+
+$(PROFILE_BIN): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) -o $(PROFILE_BIN) $(PROFILE_MOJO_SRC)
+
+# Run one forward/backward/update step and emit a Chrome-trace-format JSON of the
+# high-level phases, loadable directly at https://ui.perfetto.dev. Set
+# PROFILE_TARGET=cpu to profile the CPU path.
+profile profile-trace: $(PROFILE_BIN) $(PROFILE_RUNNER)
+	@LLMM_PROFILE_TRACE=$(PROFILE_TRACE) $(PROFILE_RUNNER) $(PROFILE_TARGET)
+	@echo "Perfetto trace: $(PROFILE_TRACE) (open at https://ui.perfetto.dev)"
+
+# Same as profile-trace but forces the CPU path (mirrors train-cpu), so the
+# trace can be captured on machines without a GPU. The target-specific
+# PROFILE_TARGET also redirects PROFILE_TRACE to the …cpu. filename.
+profile-cpu: PROFILE_TARGET := cpu
+profile-cpu: $(PROFILE_BIN) $(PROFILE_RUNNER)
+	@LLMM_PROFILE_TRACE=$(PROFILE_TRACE) $(PROFILE_RUNNER) $(PROFILE_TARGET)
+	@echo "Perfetto trace: $(PROFILE_TRACE) (open at https://ui.perfetto.dev)"
+
+# Per-kernel GPU profile via NVIDIA Nsight Compute (ncu), printed as a table by
+# profile_gpt2.py. Add `--full` for the heavy metric set, `--sudo` if the
+# GPU performance counters need elevated access (DRAM/tensor metrics otherwise
+# show as n/a). The raw CSV is saved alongside the binary.
+profile-ncu: $(PROFILE_BIN) $(PROFILE_SCRIPT)
+	pixi run -e cuda python $(PROFILE_SCRIPT) \
+		--exe $(PROFILE_BIN) --target $(PROFILE_TARGET) \
+		--output $(PROFILE_BIN).ncu.csv
+
+# Timeline capture via NVIDIA Nsight Systems. Open the .nsys-rep in the Nsight
+# Systems UI (File > Open).
+profile-nsys: $(PROFILE_BIN)
+	pixi run -e cuda nsys profile --force-overwrite true \
+		-o $(PROFILE_BIN) $(PROFILE_BIN) $(PROFILE_TARGET)
+	@echo "nsys report: $(PROFILE_NSYS_REP)"
 
 # Builds llmm.mojoc into the persistent cache the pytest suite consumes
 # (tests/.mef_cache/<source-fingerprint>/llmm.mojoc, via the bridge so
@@ -290,3 +353,6 @@ docs-clean:
 clean:
 	rm -rf .ruff_cache .pyrefly_cache tests/fixtures tests/.mef_cache
 	rm -f $(TRAIN_BIN)
+	rm -f $(PROFILE_BIN) $(PROFILE_NSYS_REP) \
+		$(PROFILE_BIN).ncu.csv $(PROFILE_BIN).sqlite \
+		$(PROFILE_BIN).*.perfetto-trace.json

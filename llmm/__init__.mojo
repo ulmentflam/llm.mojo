@@ -56,6 +56,7 @@ from .memory import (
     rebind_mut_mem,
 )
 from .merge import MergeFwd, MergeBwd, merge_fwd, merge_bwd
+from .profiler import TraceProfiler
 from .sampler import sample_softmax, random_u32, random_f32, random_permutation
 from .scheduler import LearningRateScheduler
 from .softmax import SoftmaxFwd, SoftmaxBwd, softmax_fwd, softmax_bwd
