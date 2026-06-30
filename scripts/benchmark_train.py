@@ -82,9 +82,22 @@ def libpython():
     return ""
 
 
+def _ordinal(day):
+    # 1->1st, 2->2nd, 3->3rd, 4->4th ... 11/12/13 are always "th".
+    if 11 <= day % 100 <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
 def hardware_info():
+    now = datetime.datetime.now()
     info = {
-        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        # `date` keeps the timestamp for unique output filenames; `date_display`
+        # is the human date shown on the figure itself (e.g. "July 31st, 2026").
+        "date": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "date_display": f"{now.strftime('%B')} {_ordinal(now.day)}, {now.year}",
         "host": platform.node(),
         "os": platform.platform(),
         "cpu": platform.processor() or platform.machine(),
@@ -386,7 +399,7 @@ def plot_bars(device, series, info, outpath):
         )
 
     sub = (
-        f"{info['date']}   |   {info['gpu']}   |   {info['cpu']}  "
+        f"{info['date_display']}   |   {info['gpu']}   |   {info['cpu']}  "
         f"({info['cores']} cores)   |   {info['host']}"
     )
     dev_label = "GPU" if device == "gpu" else "CPU"
