@@ -81,6 +81,15 @@ LLMC_CPU_BIN := $(LLMC_DIR)/train_gpt2
 LLMC_GPU_BIN := $(LLMC_DIR)/train_gpt2cu          # bf16 CUDA build
 LLMC_FP32_GPU_BIN := $(LLMC_DIR)/train_gpt2fp32cu  # fp32 CUDA build
 BENCH_SCRIPT := scripts/benchmark_train.py
+# Benchmark hyperparameters, fed to every config (Mojo, llm.c CPU+CUDA, PyTorch)
+# so the bars stay apples-to-apples. Override on the command line, e.g.
+# `make benchmark-gpu BENCH_B=4 BENCH_T=1024`. Defaults match the historical
+# B=4, T=64 reference config. T must be <= 1024 (GPT-2's max).
+BENCH_B ?= 4
+BENCH_T ?= 64
+BENCH_CPU_STEPS ?= 40
+BENCH_GPU_STEPS ?= 40
+BENCH_ARGS := --batch-size $(BENCH_B) --seq-len $(BENCH_T)
 HAVE_NVCC := $(shell command -v nvcc 2>/dev/null)
 
 SHELL := /bin/bash
@@ -134,6 +143,7 @@ help:
 	@echo "  benchmark     Histogram of train-loop time: llm.mojo vs llm.c (CPU + GPU)"
 	@echo "  benchmark-cpu Only the CPU comparison (no CUDA needed)"
 	@echo "  benchmark-gpu Only the GPU comparison (NVIDIA)"
+	@echo "                (hyperparams: BENCH_B, BENCH_T, e.g. BENCH_T=1024)"
 	@echo "  profile-llmc-ncu  Profile llm.c bf16 CUDA kernels with ncu (same table)"
 	@echo "  profile-llmc-nsys Capture an nsys timeline of llm.c bf16 CUDA kernels"
 	@echo "  profile-llmc-fp32-ncu   Profile llm.c fp32 CUDA kernels with ncu (vs make profile-fp32-ncu)"
@@ -322,14 +332,17 @@ build-llmc: build-llmc-cpu build-llmc-gpu
 
 # Benchmarks: histogram of per-step train-loop time, llm.mojo vs llm.c.
 benchmark-cpu: $(PROFILE_BIN) build-llmc-cpu $(BENCH_SCRIPT)
-	pixi run python $(BENCH_SCRIPT) --device cpu
+	pixi run python $(BENCH_SCRIPT) --device cpu $(BENCH_ARGS) \
+		--cpu-steps $(BENCH_CPU_STEPS)
 
 benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
-	pixi run python $(BENCH_SCRIPT) --device gpu
+	pixi run python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
+		--gpu-steps $(BENCH_GPU_STEPS)
 
 # CPU always; GPU too iff an NVIDIA GPU is present.
 benchmark: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc $(BENCH_SCRIPT)
-	pixi run python $(BENCH_SCRIPT) --device auto
+	pixi run python $(BENCH_SCRIPT) --device auto $(BENCH_ARGS) \
+		--cpu-steps $(BENCH_CPU_STEPS) --gpu-steps $(BENCH_GPU_STEPS)
 
 # One short, deterministic train step of llm.c's CUDA build — the target for
 # profiling Karpathy's GPU kernels. Same B/T as our harness (shared PROFILE_B/T)

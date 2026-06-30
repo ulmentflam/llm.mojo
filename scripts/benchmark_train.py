@@ -54,8 +54,10 @@ MOJO_FP32_BIN = os.path.join(ROOT, "build", "profile_gpt2")
 MOJO_BF16_BIN = os.path.join(ROOT, "build", "profile_gpt2_bf16")
 
 # Apples-to-apples config: identical hyperparameters everywhere so the bars are
-# directly comparable. B=4, T=64 are what llm.c's CPU reference hardcodes, so we
-# pin every run to them.
+# directly comparable. Set from --batch-size / --seq-len in main(); every config
+# (Mojo harness env, llm.c CUDA -b/-t, PyTorch flags, and — via LLMC_B/LLMC_T —
+# the llm.c CPU reference) is fed the same pair. The defaults (B=4, T=64) match
+# what llm.c's CPU reference historically hardcoded.
 B, T = 4, 64
 WARMUP = 5  # leading steps to drop (allocation / first-touch / clock spin-up)
 
@@ -141,13 +143,13 @@ def _slug(s):
 
 
 def default_output(info, device):
-    """A self-describing path under figures/ so runs on different hardware/dates
-    never overwrite and are identifiable at a glance, e.g.
-    figures/benchmark_gpu_2026-06-30_2127_NVIDIA-GB10_spark-c265.png
+    """A self-describing path under figures/ so runs on different hardware/dates/
+    hyperparameters never overwrite and are identifiable at a glance, e.g.
+    figures/benchmark_gpu_b4_t1024_2026-06-30_2127_NVIDIA-GB10_spark-c265.png
     """
     date = info["date"][:16].replace(" ", "_").replace(":", "")  # YYYY-MM-DD_HHMM
     hw = _slug(info["gpu"]) if info["gpu"] != "none" else _slug(info["cpu"])
-    name = f"benchmark_{device}_{date}_{hw}_{_slug(info['host'])}.png"
+    name = f"benchmark_{device}_b{B}_t{T}_{date}_{hw}_{_slug(info['host'])}.png"
     return os.path.join(FIGURES, name)
 
 
@@ -194,10 +196,12 @@ def bench_mojo(binary, target, steps):
 
 
 def bench_llmc_cpu(threads):
-    # CPU train_gpt2 hardcodes B=4, T=64 and ~40 steps; runs in build/llmc.
+    # CPU train_gpt2 runs ~40 steps in build/llmc. Upstream hardcodes B=4, T=64;
+    # our build reads LLMC_B/LLMC_T (defaulting to 4/64 when unset), so pass the
+    # benchmark's B/T to keep the CPU bars apples-to-apples with the rest.
     out = _run(
         [os.path.join(LLMC, "train_gpt2")],
-        env={"OMP_NUM_THREADS": str(threads)},
+        env={"OMP_NUM_THREADS": str(threads), "LLMC_B": str(B), "LLMC_T": str(T)},
         cwd=STAGE,
     )
     return [float(x) for x in _LLMC_CPU_RE.findall(out)]
@@ -270,6 +274,12 @@ def bench_torch(device, dtype, steps):
         str(B),
         "--sequence_length",
         str(T),
+        # One fwd/bwd/update per measured step (grad_accum=1), matching every other
+        # config. The ref asserts total_batch_size % (B*T) == 0 and derives
+        # grad_accum = total_batch_size // (B*T); pin it to B*T so this holds at any
+        # T (the default 256 only divides at T=64).
+        "--total_batch_size",
+        str(B * T),
         "--dtype",
         dtype,
         "--device",
@@ -403,8 +413,12 @@ def plot_bars(device, series, info, outpath):
         f"({info['cores']} cores)   |   {info['host']}"
     )
     dev_label = "GPU" if device == "gpu" else "CPU"
+    # Hyperparameters belong on the figure itself so a saved PNG is self-describing:
+    # batch, sequence length, and the resulting tokens/step the bars are measured at.
+    cfg = f"B={B}, T={T}  ({B * T} tok/step)"
     fig.suptitle(
-        f"GPT-2 124M {dev_label} training-loop time (lower is better)\n" + sub,
+        f"GPT-2 124M {dev_label} training-loop time  —  {cfg}  (lower is better)\n"
+        + sub,
         fontsize=11,
     )
 
@@ -532,10 +546,26 @@ def gpu_series(steps):
 
 
 def main():
+    # B/T are module globals read by the bench_* helpers; the arg defaults below
+    # reference them, so the declaration must precede first use.
+    global B, T
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--device", choices=["cpu", "gpu", "auto"], default="auto")
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=B,
+        help=f"batch size B for every config (default {B})",
+    )
+    ap.add_argument(
+        "--seq-len",
+        type=int,
+        default=T,
+        help=f"sequence length T for every config (default {T}). T must be "
+        "<= 1024 (GPT-2's max). CPU fp32 cost scales steeply with T.",
+    )
     ap.add_argument("--cpu-steps", type=int, default=40)
     ap.add_argument("--gpu-steps", type=int, default=40)
     ap.add_argument("--output-cpu", default=None, help="output PNG for the CPU figure")
@@ -546,6 +576,11 @@ def main():
         help="only stage llm.c inputs into build/llmc (magic-patched), then exit",
     )
     args = ap.parse_args()
+
+    # Pin the module globals to the requested config (see note at top of main()).
+    B, T = args.batch_size, args.seq_len
+    if not 0 < T <= 1024:
+        ap.error(f"--seq-len must be in 1..1024 (GPT-2's max), got {T}")
 
     do_cpu = args.device in ("cpu", "auto")
     do_gpu = args.device == "gpu" or (args.device == "auto" and have_gpu())
