@@ -326,6 +326,14 @@ def main():
         action="store_true",
         help="run ncu under sudo (for perf-counter access)",
     )
+    ap.add_argument(
+        "--launch-count",
+        type=int,
+        default=None,
+        help="profile only the first N kernel launches (ncu --launch-count). "
+        "Use for harnesses with no step-limit flag (e.g. llm.c's fp32 CUDA "
+        "build runs a full epoch) so ncu doesn't replay hundreds of steps.",
+    )
     args = ap.parse_args()
 
     metrics = args.metrics.split(",") if args.metrics else DEFAULT_METRICS
@@ -340,6 +348,8 @@ def main():
         if not os.path.exists(args.exe):
             raise SystemExit(f"{args.exe} not found; run `make build-profile` first")
         extra = ["--set", "full"] if args.full else []
+        if args.launch_count is not None:
+            extra += ["--launch-count", str(args.launch_count)]
         exe_args = shlex.split(args.exe_args) if args.exe_args else [args.target]
         text = run_ncu(ncu, args.exe, exe_args, metrics, args.sudo, extra, cwd=args.cwd)
         if args.output:

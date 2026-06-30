@@ -33,6 +33,21 @@ PROFILE_TRACE_BIN := build/profile_gpt2_trace
 PROFILE_RUNNER := scripts/run_profile_gpt2.sh
 PROFILE_SCRIPT := profile_gpt2.py
 PROFILE_TARGET ?= gpu
+# Shared profiling config so llm.mojo and llm.c profile the SAME problem by
+# default — an apples-to-apples comparison. The llm.c profile binaries run the
+# full 12-layer GPT-2 124M at B=4, T=64, one step; the mojo harness defaults
+# (T=1024, 1 layer) would otherwise diverge, so we pin it to match here and feed
+# the same B/T into the llm.c argument lists below. Override on the command line,
+# e.g. `make profile-ncu PROFILE_T=256 PROFILE_LAYERS=1`.
+PROFILE_B ?= 4
+PROFILE_T ?= 64
+PROFILE_LAYERS ?= 12
+PROFILE_STEPS ?= 1
+# Env prefix that pins the mojo harness to the shared config (the binary reads
+# these LLMM_PROFILE_* vars). ncu/nsys launch the binary with the inherited
+# environment, so prefixing the recipe command is enough to reach it.
+PROFILE_ENV := LLMM_PROFILE_B=$(PROFILE_B) LLMM_PROFILE_T=$(PROFILE_T) \
+	LLMM_PROFILE_LAYERS=$(PROFILE_LAYERS) LLMM_PROFILE_STEPS=$(PROFILE_STEPS)
 # Suffix the Perfetto trace with the target (…gpu./…cpu.) so the GPU and CPU
 # runs write distinct files instead of clobbering each other. Recursive `=`
 # (not `:=`) so it re-expands with any per-target PROFILE_TARGET override.
@@ -48,7 +63,14 @@ PROFILE_THREAD_TRACE = $(PROFILE_BIN).$(PROFILE_TARGET).threads.perfetto-trace.j
 # — our in-process Perfetto tracer only sees the harness-level phases, not the
 # threads spawned inside the kernels. PROFILE_NSYS_ENV/FLAGS are overridden per
 # target: gpu needs the cuda pixi env and cuda trace; cpu needs neither.
-PROFILE_NSYS_REP = $(PROFILE_BIN).$(PROFILE_TARGET).nsys-rep
+# Binary that profile-ncu / profile-nsys capture. Defaults to the bf16 build —
+# bf16 is the precision we ship and profile by default. The profile-fp32-*
+# variants override it to the fp32 build, and the CPU nsys target overrides it
+# to the fp32 build too (bf16 is GPU-only). Recursive (`=`) so per-target
+# overrides re-expand. Output filenames derive from it, so each precision/target
+# writes its own report.
+PROFILE_PROF_BIN = $(PROFILE_BIN_BF16)
+PROFILE_NSYS_REP = $(PROFILE_PROF_BIN).$(PROFILE_TARGET).nsys-rep
 PROFILE_NSYS_ENV := -e cuda
 PROFILE_NSYS_FLAGS := --force-overwrite true --trace=cuda,osrt,nvtx --sample=process-tree
 
@@ -56,7 +78,8 @@ PROFILE_NSYS_FLAGS := --force-overwrite true --trace=cuda,osrt,nvtx --sample=pro
 # separated so the CPU path builds/runs with no CUDA toolchain (e.g. on macOS).
 LLMC_DIR := third_party/llm.c
 LLMC_CPU_BIN := $(LLMC_DIR)/train_gpt2
-LLMC_GPU_BIN := $(LLMC_DIR)/train_gpt2cu
+LLMC_GPU_BIN := $(LLMC_DIR)/train_gpt2cu          # bf16 CUDA build
+LLMC_FP32_GPU_BIN := $(LLMC_DIR)/train_gpt2fp32cu  # fp32 CUDA build
 BENCH_SCRIPT := scripts/benchmark_train.py
 HAVE_NVCC := $(shell command -v nvcc 2>/dev/null)
 
@@ -66,9 +89,10 @@ SHELL := /bin/bash
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build         build-mojo build-train train train-cpu \
         build-profile build-profile-bf16 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
-        profile-nsys profile-nsys-cpu \
+        profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
+        profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures \
         verify verify-cpu verify-gpu \
         docs docs-clean
@@ -97,8 +121,10 @@ help:
 	@echo "  profile-trace Write build/profile_gpt2.<target>.perfetto-trace.json (ui.perfetto.dev)"
 	@echo "  profile-cpu   Run the profile on CPU and emit a Perfetto trace"
 	@echo "  profile-threads-cpu  CPU per-thread Perfetto trace (all worker threads)"
-	@echo "  profile-ncu   Profile our Mojo GPU kernels with ncu + profile_gpt2.py table"
-	@echo "  profile-nsys  Capture a GPU nsys timeline (build/profile_gpt2.gpu.nsys-rep)"
+	@echo "  profile-ncu   Profile our Mojo bf16 GPU kernels with ncu + profile_gpt2.py table"
+	@echo "  profile-nsys  Capture a GPU nsys timeline of our Mojo bf16 kernels"
+	@echo "  profile-fp32-ncu   Same ncu table for the fp32 build (vs profile-llmc-fp32-ncu)"
+	@echo "  profile-fp32-nsys  fp32 GPU nsys timeline"
 	@echo "  profile-nsys-cpu  Capture a CPU nsys timeline showing all worker threads"
 	@echo ""
 	@echo "Benchmark (vs llm.c submodule):"
@@ -108,8 +134,10 @@ help:
 	@echo "  benchmark     Histogram of train-loop time: llm.mojo vs llm.c (CPU + GPU)"
 	@echo "  benchmark-cpu Only the CPU comparison (no CUDA needed)"
 	@echo "  benchmark-gpu Only the GPU comparison (NVIDIA)"
-	@echo "  profile-llmc-ncu  Profile llm.c CUDA kernels with ncu (same table)"
-	@echo "  profile-llmc-nsys Capture an nsys timeline of llm.c CUDA kernels"
+	@echo "  profile-llmc-ncu  Profile llm.c bf16 CUDA kernels with ncu (same table)"
+	@echo "  profile-llmc-nsys Capture an nsys timeline of llm.c bf16 CUDA kernels"
+	@echo "  profile-llmc-fp32-ncu   Profile llm.c fp32 CUDA kernels with ncu (vs make profile-fp32-ncu)"
+	@echo "  profile-llmc-fp32-nsys  nsys timeline of llm.c fp32 CUDA kernels"
 	@echo "  lint          Lint Python, Mojo, C, CUDA, LaTeX sources, and typecheck"
 	@echo "  lint-python   Lint Python sources with ruff"
 	@echo "  lint-mojo     Lint Mojo sources with mojo format --check"
@@ -216,31 +244,49 @@ profile-threads-cpu: $(PROFILE_TRACE_BIN) $(PROFILE_RUNNER)
 	@echo "Per-thread Perfetto trace: $(PROFILE_THREAD_TRACE) (open at https://ui.perfetto.dev)"
 
 # Per-kernel GPU profile via NVIDIA Nsight Compute (ncu), printed as a table by
-# profile_gpt2.py. Add `--full` for the heavy metric set, `--sudo` if the
-# GPU performance counters need elevated access (DRAM/tensor metrics otherwise
-# show as n/a). The raw CSV is saved alongside the binary.
-profile-ncu: $(PROFILE_BIN) $(PROFILE_SCRIPT)
-	pixi run -e cuda python $(PROFILE_SCRIPT) \
+# profile_gpt2.py. Defaults to the bf16 build (PROFILE_PROF_BIN); use
+# profile-fp32-ncu for the fp32 build. Add `--full` for the heavy metric set,
+# `--sudo` if the GPU performance counters need elevated access (DRAM/tensor
+# metrics otherwise show as n/a). The raw CSV is saved alongside the binary.
+profile-ncu: $(PROFILE_PROF_BIN) $(PROFILE_SCRIPT)
+	$(PROFILE_ENV) pixi run -e cuda python $(PROFILE_SCRIPT) \
+		--exe $(PROFILE_PROF_BIN) --target $(PROFILE_TARGET) \
+		--output $(PROFILE_PROF_BIN).ncu.csv
+
+# fp32 build of the same per-kernel profile (mirrors profile-llmc-fp32-ncu).
+profile-fp32-ncu: PROFILE_PROF_BIN := $(PROFILE_BIN)
+profile-fp32-ncu: $(PROFILE_BIN) $(PROFILE_SCRIPT)
+	$(PROFILE_ENV) pixi run -e cuda python $(PROFILE_SCRIPT) \
 		--exe $(PROFILE_BIN) --target $(PROFILE_TARGET) \
 		--output $(PROFILE_BIN).ncu.csv
 
 # Timeline capture via NVIDIA Nsight Systems. The report's thread timeline shows
 # every CPU worker thread (the ~20 sync_parallelize workers), which the in-process
 # Perfetto tracer cannot see. Open the .nsys-rep in the Nsight Systems UI
-# (File > Open). Default target is gpu; use profile-nsys-cpu for the CPU path.
-profile-nsys: $(PROFILE_BIN)
-	pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
-		-o $(PROFILE_BIN).$(PROFILE_TARGET) $(PROFILE_BIN) $(PROFILE_TARGET)
+# (File > Open). Defaults to the bf16 build; use profile-fp32-nsys for fp32, or
+# profile-nsys-cpu for the CPU path.
+profile-nsys: $(PROFILE_PROF_BIN)
+	$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
+		-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET)
+	@echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"
+
+# fp32 build of the GPU timeline.
+profile-fp32-nsys: PROFILE_PROF_BIN := $(PROFILE_BIN)
+profile-fp32-nsys: $(PROFILE_BIN)
+	$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
+		-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET)
 	@echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"
 
 # CPU thread timeline — runs in the default pixi env (no GPU required) and traces
 # only OS-runtime + CPU samples, so the ~20 worker threads show on the timeline.
+# bf16 is GPU-only, so the CPU path profiles the fp32 build.
 profile-nsys-cpu: PROFILE_TARGET := cpu
+profile-nsys-cpu: PROFILE_PROF_BIN := $(PROFILE_BIN)
 profile-nsys-cpu: PROFILE_NSYS_ENV :=
 profile-nsys-cpu: PROFILE_NSYS_FLAGS := --force-overwrite true --trace=osrt --sample=process-tree
 profile-nsys-cpu: $(PROFILE_BIN)
-	pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
-		-o $(PROFILE_BIN).$(PROFILE_TARGET) $(PROFILE_BIN) $(PROFILE_TARGET)
+	$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
+		-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET)
 	@echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"
 
 # ---------------------------------------------------------------------------
@@ -286,12 +332,13 @@ benchmark: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc $(BENCH_SCRIPT)
 	pixi run python $(BENCH_SCRIPT) --device auto
 
 # One short, deterministic train step of llm.c's CUDA build — the target for
-# profiling Karpathy's GPU kernels. Same B/T (4/64) as our harness; data paths
-# are relative to the staged build/llmc cwd.
-LLMC_GPU_ARGS := -e gpt2_124M_bf16.bin \
+# profiling Karpathy's GPU kernels. Same B/T as our harness (shared PROFILE_B/T)
+# for an apples-to-apples comparison; data paths are relative to the staged
+# build/llmc cwd. Recursive `=` so PROFILE_B/T overrides flow through.
+LLMC_GPU_ARGS = -e gpt2_124M_bf16.bin \
 	-i dev/data/tinyshakespeare/tiny_shakespeare_train.bin \
 	-j dev/data/tinyshakespeare/tiny_shakespeare_val.bin \
-	-b 4 -t 64 -x 1 -v 0 -s 0 -l 0
+	-b $(PROFILE_B) -t $(PROFILE_T) -x $(PROFILE_STEPS) -v 0 -s 0 -l 0
 
 stage-llmc: $(BENCH_SCRIPT)
 	pixi run python $(BENCH_SCRIPT) --stage-only --device gpu
@@ -312,6 +359,34 @@ profile-llmc-nsys: build-llmc-gpu stage-llmc
 		--trace=cuda,nvtx,osrt -o $(abspath build/profile_llmc) \
 		$(abspath $(LLMC_GPU_BIN)) $(LLMC_GPU_ARGS)
 	@echo "nsys report: build/profile_llmc.nsys-rep"
+
+# llm.c's *fp32* CUDA build (train_gpt2fp32cu). Unlike the bf16 build it has no
+# -e / -x flags: it loads gpt2_124M.bin and runs a full epoch. We point the data
+# at the small val bin and cap ncu to one step's worth of kernel launches with
+# --launch-count, so the per-kernel table mirrors `make profile-ncu` (our fp32
+# GPU kernels) without ncu replaying the whole epoch.
+LLMC_FP32_GPU_ARGS = \
+	-i dev/data/tinyshakespeare/tiny_shakespeare_val.bin \
+	-j dev/data/tinyshakespeare/tiny_shakespeare_val.bin \
+	-b $(PROFILE_B) -t $(PROFILE_T) -v 100000 -s 100000
+# One 12-layer fwd+bwd+update is a few hundred kernels; 400 covers it and the
+# table aggregates by kernel name, so the exact cap is not sensitive.
+LLMC_FP32_LAUNCH_COUNT := 400
+
+profile-llmc-fp32-ncu: build-llmc-gpu stage-llmc $(PROFILE_SCRIPT)
+	pixi run -e cuda python $(PROFILE_SCRIPT) \
+		--exe $(abspath $(LLMC_FP32_GPU_BIN)) \
+		--exe-args "$(LLMC_FP32_GPU_ARGS)" \
+		--launch-count $(LLMC_FP32_LAUNCH_COUNT) \
+		--cwd build/llmc \
+		--output build/profile_llmc_fp32.ncu.csv
+
+# nsys timeline of llm.c's fp32 CUDA training step.
+profile-llmc-fp32-nsys: build-llmc-gpu stage-llmc
+	cd build/llmc && pixi run -e cuda nsys profile --force-overwrite true \
+		--trace=cuda,nvtx,osrt -o $(abspath build/profile_llmc_fp32) \
+		$(abspath $(LLMC_FP32_GPU_BIN)) $(LLMC_FP32_GPU_ARGS)
+	@echo "nsys report: build/profile_llmc_fp32.nsys-rep"
 
 # Builds llmm.mojoc into the persistent cache the pytest suite consumes
 # (tests/.mef_cache/<source-fingerprint>/llmm.mojoc, via the bridge so
