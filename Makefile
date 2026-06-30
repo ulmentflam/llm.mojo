@@ -13,6 +13,10 @@ TRAIN_MOJO_SRC := train_gpt2.mojo
 TRAIN_BIN := build/train_gpt2
 TRAIN_RUNNER := scripts/run_train_gpt2.sh
 MOJO_INCLUDES := -I .
+# Link libm explicitly: from-scratch weight init (llmm/rand.mojo) draws Gaussian
+# noise via sinf/cosf, which the backend fuses into sincosf — a libm symbol that
+# the AOT linker otherwise reports as "DSO missing from command line".
+MOJO_LINK_FLAGS := -Xlinker -lm
 LLMM_SOURCES := $(shell find llmm -name '*.mojo' 2>/dev/null)
 WORLD_SIZE ?= 1
 
@@ -200,7 +204,7 @@ build build-train: $(TRAIN_BIN)
 
 $(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
 
 train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@$(TRAIN_RUNNER)
@@ -215,7 +219,7 @@ build-profile: $(PROFILE_BIN)
 
 $(PROFILE_BIN): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) -o $(PROFILE_BIN) $(PROFILE_MOJO_SRC)
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN) $(PROFILE_MOJO_SRC)
 
 # bf16 mixed-precision build of the harness (params/acts/grads bf16, fp32 master
 # weights + optimizer moments). GPU-only by policy; see profile_gpt2.mojo.
@@ -223,13 +227,13 @@ build-profile-bf16: $(PROFILE_BIN_BF16)
 
 $(PROFILE_BIN_BF16): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) -o $(PROFILE_BIN_BF16) $(PROFILE_MOJO_SRC)
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_BF16) $(PROFILE_MOJO_SRC)
 
 # Tracing build: same harness, with the per-thread kernel instrumentation
 # compiled in via -D LLMM_TRACE=1.
 $(PROFILE_TRACE_BIN): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_TRACE=1 $(MOJO_INCLUDES) -o $(PROFILE_TRACE_BIN) $(PROFILE_MOJO_SRC)
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_TRACE=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_TRACE_BIN) $(PROFILE_MOJO_SRC)
 
 # Run one forward/backward/update step and emit a Chrome-trace-format JSON of the
 # high-level phases, loadable directly at https://ui.perfetto.dev. Set

@@ -19,25 +19,31 @@ comptime SIZEOF_INT = size_of[DType.int32]()
 comptime SIZEOF_FLOAT = size_of[DType.float32]()
 
 
-# poor man's tensor checker that copies device tensor to host first
-def check_tensor(
+# poor man's tensor checker that copies device tensor to host first.
+# Parametric over the device dtype (GPT2_DTYPE for params/grads, which is fp32
+# or bf16 depending on the build): the host buffer matches the device element
+# size — so bf16 tensors copy correctly — and each element is cast to fp32 to
+# compare against the fp32 reference.
+def check_tensor[
+    dtype: DType
+](
     ctx: DeviceContext,
-    device_ptr: MutMemPtr[DType.float32],
+    device_ptr: MutMemPtr[dtype],
     expected_ptr: UnsafePointer[Scalar[DType.float32], _],
     n: Int,
     label: String,
     tol: Float32,
 ) -> Bool:
-    # Allocate host memory to copy the device tensor into
-    var host_ptr = alloc[Scalar[DType.float32]](n)
+    # Allocate host memory (of the device dtype) to copy the device tensor into
+    var host_ptr = alloc[Scalar[dtype]](n)
     try:
         ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[DType.float32], MutAnyOrigin]](
+            dst_ptr=rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
                 host_ptr
             ),
-            src_ptr=rebind[
-                UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
-            ](device_ptr.as_unsafe_any_origin()),
+            src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+                device_ptr.as_unsafe_any_origin()
+            ),
             size=n,
         )
         ctx.synchronize()
@@ -54,7 +60,8 @@ def check_tensor(
 
     for i in range(n):
         # look at the difference at position i of these two tensors
-        var diff = abs(host_ptr[i] - expected_ptr[i])
+        var actual = host_ptr[i].cast[DType.float32]()
+        var diff = abs(actual - expected_ptr[i])
 
         # keep track of the overall error
         ok = ok and (diff <= tol)
@@ -70,7 +77,7 @@ def check_tensor(
             else:
                 print("NOT OK ", end="")
 
-            print(host_ptr[i], expected_ptr[i])
+            print(actual, expected_ptr[i])
 
     # print the final result
     if ok:

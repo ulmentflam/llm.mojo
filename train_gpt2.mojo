@@ -1,4 +1,4 @@
-from std.math import sqrt
+from std.math import sqrt, ceildiv, isnan, nan, exp, log
 from std.os import getenv
 from std.python import Python
 from std.sys import (
@@ -11,7 +11,12 @@ from std.time import global_perf_counter_ns
 from std.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
 from std.sys import get_defined_int, is_defined
-from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
+from std.gpu.host import (
+    DeviceContext,
+    HostBuffer,
+    DeviceBuffer,
+    DeviceAttribute,
+)
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.memory import alloc, UnsafePointer, memcpy, memset_zero
 
@@ -38,16 +43,24 @@ from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
 from llmm.matmul import matmul_fwd, matmul_bwd
 from llmm.softmax import softmax_fwd, softmax_bwd
 from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
-from llmm.global_norm import global_norm_squared
+from llmm.global_norm import (
+    global_norm_squared,
+    global_norm_squared_cpu,
+    global_norm_squared_gpu,
+    global_norm_aggregate_gpu,
+)
 from llmm.adamw import adamw_update, AdamWConfig
 from llmm.fused_classifier import fused_classifier
 from llmm.scheduler import LearningRateScheduler
 from llmm.sampler import random_f32, sample_softmax
+from llmm.rand import MT19937, normal_
+from llmm.mfu import estimate_mfu
 from llmm.tokenizer import Tokenizer, safe_print
 from llmm.memory import (
     ImmutKernelPtr,
     ImmutMemPtr,
     MutMemPtr,
+    MutKernelPtr,
     as_immut_kernel,
     as_immut_kernel_from_mut,
     as_mut_kernel,
@@ -80,6 +93,107 @@ comptime MASTER_DTYPE = DType.float32
 comptime GPT2_MAGIC = 20240520
 comptime EPSILON = 1e-5
 comptime UNROLL = 4
+
+# From-scratch init draws the same random numbers as llm.c (and PyTorch) so the
+# initial weights are bit-identical: seed 42, weights ~N(0, 0.02), the residual
+# projections additionally scaled by 1/sqrt(2*L). See gpt_build_from_descriptor.
+comptime INIT_RNG_SEED = 42
+comptime INIT_WEIGHT_STD = Float32(0.02)
+# GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
+comptime SCRATCH_VOCAB_SIZE = 50257
+comptime SCRATCH_PADDED_VOCAB_SIZE = 50304
+
+
+# ===----------------------------------------------------------------------=== #
+# printf0 — rank-0-only print, mirroring llm.c's printf0 macro
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def printf0(rank: Int, msg: String):
+    """Print `msg` only on rank 0 (the master process), like llm.c's printf0."""
+    if rank == 0:
+        print(msg)
+
+
+comptime OUTLIER_DETECTOR_WINDOW_SIZE = 128
+
+
+struct OutlierDetector(Copyable, Movable):
+    """Sliding-window z-score detector for the loss and gradient norm, ported
+    from llm.c's outlier_detector.h. update() returns the z-score of the new
+    value against the window, or NaN until the window (128 samples) fills.
+    """
+
+    var buffer: List[Float64]
+    var count: Int
+    var index: Int
+    var sum: Float64
+    var sum_sq: Float64
+
+    def __init__(out self):
+        self.buffer = List[Float64]()
+        for _ in range(OUTLIER_DETECTOR_WINDOW_SIZE):
+            self.buffer.append(0.0)
+        self.count = 0
+        self.index = 0
+        self.sum = 0.0
+        self.sum_sq = 0.0
+
+    def update(mut self, new_value: Float64) -> Float64:
+        if self.count < OUTLIER_DETECTOR_WINDOW_SIZE:
+            # Still building up the window: record and report "not enough data".
+            self.buffer[self.count] = new_value
+            self.sum += new_value
+            self.sum_sq += new_value * new_value
+            self.count += 1
+            return nan[DType.float64]()
+
+        # Window full: pop the oldest value, push the new one, return z-score.
+        var old_value = self.buffer[self.index]
+        self.sum -= old_value
+        self.sum_sq -= old_value * old_value
+        self.buffer[self.index] = new_value
+        self.sum += new_value
+        self.sum_sq += new_value * new_value
+        self.index = (self.index + 1) % OUTLIER_DETECTOR_WINDOW_SIZE
+        var mean = self.sum / Float64(OUTLIER_DETECTOR_WINDOW_SIZE)
+        var variance = (
+            self.sum_sq / Float64(OUTLIER_DETECTOR_WINDOW_SIZE)
+        ) - mean * mean
+        var std_dev = sqrt(variance)
+        if std_dev == 0.0:
+            return 0.0
+        return (new_value - mean) / std_dev
+
+
+def _ffmt(x: Float64, decimals: Int) -> String:
+    """Format `x` with a fixed number of decimal places (no printf in Mojo)."""
+    if isnan(x):
+        return "nan"
+    var neg = x < 0.0
+    var v = -x if neg else x
+    var scale = 1
+    for _ in range(decimals):
+        scale *= 10
+    var scaled = Int(v * Float64(scale) + 0.5)  # round half up
+    var int_part = scaled // scale
+    var frac_part = scaled % scale
+    var out = String(int_part)
+    if decimals > 0:
+        var frac = String(frac_part)
+        while frac.byte_length() < decimals:
+            frac = "0" + frac
+        out += "." + frac
+    return ("-" + out) if neg else out
+
+
+def _zfmt(z: Float64) -> String:
+    """Format a z-score with an explicit sign, like llm.c's `%+.2f`."""
+    if isnan(z):
+        return "nan"
+    var body = _ffmt(z, 2)
+    return body if z < 0.0 else "+" + body
 
 
 # ===----------------------------------------------------------------------=== #
@@ -406,6 +520,101 @@ struct GPT2Config:
     var padded_vocab_size: Int  # Padded vocab size (%128 == 0, e.g. 50304).
 
 
+def _gpt2_hyperparameters(depth: Int) raises -> Tuple[Int, Int]:
+    """GPT-2 (channels, num_heads) for a given depth. Mirrors llm.c."""
+    if depth == 6:
+        return (384, 6)  # (unofficial) gpt2-tiny (30M)
+    elif depth == 12:
+        return (768, 12)  # gpt2 (124M)
+    elif depth == 24:
+        return (1024, 16)  # gpt2-medium (350M)
+    elif depth == 36:
+        return (1280, 20)  # gpt2-large (774M)
+    elif depth == 48:
+        return (1600, 25)  # gpt2-xl (1558M)
+    elif depth == 60:
+        return (1920, 30)  # (unofficial) 2.7B
+    elif depth == 72:
+        return (2880, 30)  # (unofficial) 7.3B
+    elif depth == 84:
+        return (3456, 36)  # (unofficial) 12.2B
+    raise Error("Unsupported GPT-2 depth: " + String(depth))
+
+
+def _gpt3_hyperparameters(channels: Int) raises -> Tuple[Int, Int]:
+    """GPT-3 (depth, head_size) for a given channel count. Mirrors llm.c."""
+    if channels == 384:
+        return (6, 64)  # (unofficial) gpt3-tiny (31M)
+    elif channels == 768:
+        return (12, 64)  # gpt3-small (125M)
+    elif channels == 1024:
+        return (24, 64)  # gpt3-medium (350M)
+    elif channels == 1536:
+        return (24, 96)  # gpt3-large (760M)
+    elif channels == 2048:
+        return (24, 128)  # gpt3-xl (1.3B)
+    elif channels == 2560:
+        return (32, 80)  # gpt3-2.7B
+    elif channels == 4096:
+        return (32, 128)  # gpt3-6.7B
+    elif channels == 5140:
+        return (40, 128)  # gpt3-13B
+    elif channels == 12288:
+        return (96, 128)  # gpt3 (175B)
+    raise Error("Unsupported GPT-3 channels: " + String(channels))
+
+
+def parse_model_descriptor(descriptor: String) raises -> GPT2Config:
+    """Build a randomly-initializable GPT2Config from a model descriptor.
+
+    Supported descriptors (matching llm.c's gpt_build_from_descriptor):
+      - "dX"       legacy GPT-2 with depth X, e.g. "d12"
+      - "gpt2:dX"  explicit GPT-2 with depth X, e.g. "gpt2:d48"
+      - "gpt3:cX"  GPT-3 with channel count X, e.g. "gpt3:c768"
+    """
+    var num_layer: Int
+    var channels: Int
+    var num_heads: Int
+    var max_seq_len: Int
+
+    if descriptor.startswith("gpt2:d"):
+        num_layer = atol(descriptor[byte=6:])
+        var ch_nh = _gpt2_hyperparameters(num_layer)
+        channels = ch_nh[0]
+        num_heads = ch_nh[1]
+        max_seq_len = 1024
+    elif descriptor.startswith("gpt3:c"):
+        channels = atol(descriptor[byte=6:])
+        var d_hs = _gpt3_hyperparameters(channels)
+        num_layer = d_hs[0]
+        var head_size = d_hs[1]
+        if channels % head_size != 0:
+            raise Error("GPT-3 channels not divisible by head size")
+        num_heads = channels // head_size
+        # NOTE: GPT-3 uses a context length of 2048 tokens (vs 1024 for GPT-2).
+        max_seq_len = 2048
+    elif descriptor.startswith("d"):
+        num_layer = atol(descriptor[byte=1:])
+        var ch_nh = _gpt2_hyperparameters(num_layer)
+        channels = ch_nh[0]
+        num_heads = ch_nh[1]
+        max_seq_len = 1024
+    else:
+        raise Error("Unsupported model descriptor: " + descriptor)
+
+    if num_layer <= 0:
+        raise Error("Invalid depth in model descriptor: " + descriptor)
+
+    return GPT2Config(
+        max_seq_len=max_seq_len,
+        vocab_size=SCRATCH_VOCAB_SIZE,
+        num_layer=num_layer,
+        num_heads=num_heads,
+        channels=channels,
+        padded_vocab_size=SCRATCH_PADDED_VOCAB_SIZE,
+    )
+
+
 # `recompute` enables activation (gradient) checkpointing: when True, the
 # per-layer MLP activations fch (pre-GELU) and fch_gelu (post-GELU) are not
 # persisted across the forward/backward boundary. They collapse to a single
@@ -600,33 +809,47 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for _ in range(NUM_ACTIVATION_TENSORS):
             self.act_sizes.append(0)
 
-        var model_file = open(self.checkpoint_path, "r")
-        var model_header = alloc[Int32](256)
-        read_and_copy[DType.int32](model_file, model_header, 256)
+        # Two ways to initialize the model, mirroring llm.c's main():
+        #  - `checkpoint_path` ends with ".bin": load config + weights from a
+        #     checkpoint file (e.g. gpt2_124M.bin).
+        #  - otherwise it is a model descriptor (e.g. "d12", "gpt2:d48",
+        #    "gpt3:c768"): derive the config and random-init the weights so the
+        #    run trains from scratch with PyTorch-identical initial conditions.
+        if self.checkpoint_path.endswith(".bin"):
+            var model_file = open(self.checkpoint_path, "r")
+            var model_header = alloc[Int32](256)
+            read_and_copy[DType.int32](model_file, model_header, 256)
 
-        if model_header.load(0) != GPT2_MAGIC:
-            print("Bad magic number in header: " + String(model_header.load(0)))
+            if model_header.load(0) != GPT2_MAGIC:
+                print(
+                    "Bad magic number in header: "
+                    + String(model_header.load(0))
+                )
+                model_header.free()
+                raise Error("GPT2 error: Invalid magic number in header")
+            # llm.c's version convention: 3 => fp32 params, 5 => bf16 params.
+            comptime EXPECTED_VERSION = 5 if GPT2_DTYPE == DType.bfloat16 else 3
+            if Int(model_header.load(1)) != EXPECTED_VERSION:
+                print("Bad version in header: " + String(model_header.load(1)))
+                model_header.free()
+                raise Error("GPT2 error: Invalid version in header")
+
+            self.config = GPT2Config(
+                max_seq_len=Int(model_header.load(2)),
+                vocab_size=Int(model_header.load(3)),
+                num_layer=Int(model_header.load(4)),
+                num_heads=Int(model_header.load(5)),
+                channels=Int(model_header.load(6)),
+                padded_vocab_size=Int(model_header.load(7)),
+            )
             model_header.free()
-            raise Error("GPT2 error: Invalid magic number in header")
-        # llm.c's version convention: 3 => fp32 params, 5 => bf16 params.
-        comptime EXPECTED_VERSION = 5 if GPT2_DTYPE == DType.bfloat16 else 3
-        if Int(model_header.load(1)) != EXPECTED_VERSION:
-            print("Bad version in header: " + String(model_header.load(1)))
-            model_header.free()
-            raise Error("GPT2 error: Invalid version in header")
 
-        self.config = GPT2Config(
-            max_seq_len=Int(model_header.load(2)),
-            vocab_size=Int(model_header.load(3)),
-            num_layer=Int(model_header.load(4)),
-            num_heads=Int(model_header.load(5)),
-            channels=Int(model_header.load(6)),
-            padded_vocab_size=Int(model_header.load(7)),
-        )
-        model_header.free()
-
-        # Allocate parameters.
-        self.allocate_parameters(model_file)
+            # Allocate parameters and read them from the checkpoint.
+            self.allocate_parameters(model_file)
+        else:
+            # Build config from the descriptor and random-init the weights.
+            self.config = parse_model_descriptor(self.checkpoint_path)
+            self.allocate_parameters_random()
 
         # Allocate weight gradients.
         self.allocate_gradients()
@@ -648,37 +871,38 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.inputs = MutMemPtr[DType.int32](unsafe_from_address=zero)
         self.targets = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
-        # Print out the model summary.
-        print("Model Summary:")
-        print("--------------------------------")
-        print("Model Name: GPT-2")
-        print("Model Version: 3")
-        print("Model Magic Number: " + String(GPT2_MAGIC))
-        print("Model Config:")
-        print("--------------------------------")
-        print("Max Sequence Length: " + String(self.config.max_seq_len))
-        print("Vocab Size: " + String(self.config.vocab_size))
-        print("Number of Layers: " + String(self.config.num_layer))
-        print("Number of Heads: " + String(self.config.num_heads))
-        print("Number of Channels: " + String(self.config.channels))
-        print("Padded Vocab Size: " + String(self.config.padded_vocab_size))
-        print("--------------------------------")
-        print("Number of Parameters: " + String(self.num_parameters))
-        print("--------------------------------")
-        print("Number of Activations: " + String(self.num_activations))
-        print("--------------------------------")
-        print("Number of Gradients: " + String(self.num_grads))
-        print("--------------------------------")
+        # Print out the model summary (rank 0 only).
+        if self.zero_ctx.rank == 0:
+            print("Model Summary:")
+            print("--------------------------------")
+            print("Model Name: GPT-2")
+            print("Model Magic Number: " + String(GPT2_MAGIC))
+            print("Model Config:")
+            print("--------------------------------")
+            print("Max Sequence Length: " + String(self.config.max_seq_len))
+            print("Vocab Size: " + String(self.config.vocab_size))
+            print("Number of Layers: " + String(self.config.num_layer))
+            print("Number of Heads: " + String(self.config.num_heads))
+            print("Number of Channels: " + String(self.config.channels))
+            print("Padded Vocab Size: " + String(self.config.padded_vocab_size))
+            print("--------------------------------")
+            print("Number of Parameters: " + String(self.num_parameters))
+            print("--------------------------------")
+            print("Number of Activations: " + String(self.num_activations))
+            print("--------------------------------")
+            print("Number of Gradients: " + String(self.num_grads))
+            print("--------------------------------")
 
-    def allocate_parameters(mut self, mut model_file: FileHandle) raises:
+    def _compute_param_sizes(mut self) raises:
+        """Fill param_sizes, num_parameters, and the optimizer sharding counts
+        from the current config. Shared by the checkpoint and from-scratch
+        allocation paths.
+        """
         var max_T = self.config.max_seq_len
-        var V = self.config.vocab_size
         var L = self.config.num_layer
-        var NH = self.config.num_heads
         var C = self.config.channels
         var V_p = self.config.padded_vocab_size
 
-        # Alloc space for all the parameters then read them in.
         self.param_sizes[Parameters.wte] = V_p * C
         self.param_sizes[Parameters.wpe] = max_T * C
         self.param_sizes[Parameters.ln_1_gamma] = L * C
@@ -719,6 +943,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.optimizer_num_parameters = self.num_parameters
             self.padded_num_parameters = self.num_parameters
 
+    def allocate_parameters(mut self, mut model_file: FileHandle) raises:
+        # Alloc space for all the parameters then read them in.
+        self._compute_param_sizes()
+
         # Allocate parameters using device context host buffer.
         self.params = ParameterTensors[GPT2_DTYPE]()
         var temp_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
@@ -742,6 +970,123 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             ),
             src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
                 temp_ptr.as_unsafe_any_origin()
+            ),
+            size=self.num_parameters,
+        )
+        self.ctx.synchronize()
+        self.params_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.params_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.params.point_parameters(self.param_sizes, self.params_memory)
+
+        self.has_allocated_params = True
+
+    def allocate_parameters_random(mut self) raises:
+        """Allocate parameters and fill them with a GPT-2 random init, exactly
+        matching llm.c's `gpt_build_from_descriptor` (and therefore PyTorch):
+        weights ~ N(0, 0.02), biases 0, layernorm gammas 1, and the residual
+        projections (attn_proj_weight, proj_weight) scaled by 1/sqrt(2*L). The
+        tensors are drawn in PyTorch's layer-by-layer order so the random stream
+        lines up bit-for-bit.
+        """
+        self._compute_param_sizes()
+
+        var L = self.config.num_layer
+        var C = self.config.channels
+        var V = self.config.vocab_size
+
+        self.params = ParameterTensors[GPT2_DTYPE]()
+
+        # Host buffer holding the final params (in GPT2_DTYPE), zero-initialized
+        # so all biases / layernorm betas are left at 0.
+        var host_params = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+            self.num_parameters
+        )
+        self.ctx.synchronize()
+        var hp = rebind_mut_mem[GPT2_DTYPE](
+            host_params.unsafe_ptr().as_unsafe_any_origin()
+        )
+        for i in range(self.num_parameters):
+            hp[i] = Scalar[GPT2_DTYPE](0.0)
+
+        # fp32 scratch for the normal_ draws, sized to the largest single draw
+        # (wte is V*C; the per-layer weight draws are at most 4*C*C).
+        var max_draw = V * C
+        if self.config.max_seq_len * C > max_draw:
+            max_draw = self.config.max_seq_len * C
+        if 4 * C * C > max_draw:
+            max_draw = 4 * C * C
+        var fp32_scratch = alloc[Scalar[DType.float32]](max_draw)
+        var fp32_ptr = rebind_mut_mem[DType.float32](
+            fp32_scratch.as_unsafe_any_origin()
+        )
+
+        var rng = MT19937(UInt32(INIT_RNG_SEED))
+        var residual_scale = Float32(1.0) / sqrt(Float32(2.0 * Float64(L)))
+
+        # Mirror gpt_build_from_descriptor: outer loop over layers, inner over
+        # the 16 parameter tensors, keeping a running offset into the flat param
+        # buffer. `offset` restarts every layer; layered weight tensors index
+        # into their own per-layer slice via `layer_offset`.
+        for l in range(L):
+            var offset = 0
+            for i in range(NUM_PARAMETER_TENSORS):
+                var n_elem = self.param_sizes[i]
+                # Layernorm gammas (ln_1/ln_2/ln_f) are initialized to 1, once.
+                if l == 0 and (
+                    i == Parameters.ln_1_gamma
+                    or i == Parameters.ln_2_gamma
+                    or i == Parameters.ln_f_gamma
+                ):
+                    for j in range(n_elem):
+                        hp[offset + j] = Scalar[GPT2_DTYPE](1.0)
+                # Weight tensors: wte/wpe once at l==0, the per-layer attention
+                # and MLP weights every layer.
+                var is_layer_weight = (
+                    i == Parameters.qkv_weight
+                    or i == Parameters.attn_proj_weight
+                    or i == Parameters.fc_weight
+                    or i == Parameters.proj_weight
+                )
+                var is_embedding = l == 0 and (
+                    i == Parameters.wte or i == Parameters.wpe
+                )
+                if is_embedding or is_layer_weight:
+                    var n = n_elem
+                    var layer_offset = 0
+                    if i == Parameters.wte:
+                        # init the V real rows, not the padded Vp rows
+                        n = V * C
+                    if is_layer_weight:
+                        n = n // L
+                        layer_offset = l * n
+                    # Residual-stream projections get the 1/sqrt(2*L) scaling.
+                    var scale = INIT_WEIGHT_STD
+                    if (
+                        i == Parameters.attn_proj_weight
+                        or i == Parameters.proj_weight
+                    ):
+                        scale = INIT_WEIGHT_STD * residual_scale
+                    normal_(rng, fp32_ptr, n, Float32(0.0), scale)
+                    for j in range(n):
+                        hp[offset + layer_offset + j] = fp32_ptr[j].cast[
+                            GPT2_DTYPE
+                        ]()
+                offset += n_elem
+
+        fp32_scratch.free()
+
+        # Copy the host params to the device, zero-padding the sharded tail.
+        self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+            self.padded_num_parameters
+        )
+        self.params_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        self.ctx.enqueue_copy(
+            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                self.params_buf.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                hp.as_unsafe_any_origin()
             ),
             size=self.num_parameters,
         )
@@ -1382,8 +1727,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 total_loss += self.losses_host_buf[i].cast[DType.float32]()
             self.mean_loss = total_loss / Float32(count)
 
-    def zero_gradients(mut self) raises:
-        if self.has_allocated_grads:
+    def zero_gradients(mut self, zero_param_grads: Bool = True) raises:
+        # Activation gradients are scratch and are always re-zeroed. Parameter
+        # gradients accumulate across micro-steps, so they are only zeroed on the
+        # first micro-step (zero_param_grads=False on later micro-steps lets the
+        # backward kernels keep `+=`-accumulating into them).
+        if zero_param_grads and self.has_allocated_grads:
             self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
             comptime if Self.WORLD_SIZE > 1:
                 if self.zero_ctx.zero_stage >= 2:
@@ -1392,13 +1741,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.grad_acts_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
         self.ctx.synchronize()
 
-    def backward(mut self) raises:
+    def backward(
+        mut self, grad_accum_steps: Int = 1, micro_step: Int = 0
+    ) raises:
         if self.mean_loss == -1.0:
             raise Error("GPT2 error: must call forward pass first")
         if not self.has_allocated_acts:
             raise Error("GPT2 error: activations not allocated")
 
-        self.zero_gradients()
+        # Zero the parameter gradients only at the first micro-step so they
+        # accumulate over the gradient-accumulation loop.
+        self.zero_gradients(zero_param_grads=(micro_step == 0))
 
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
@@ -1419,8 +1772,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # Backward Pass
         ##############################################################
 
+        # Seed dL/dloss. Dividing by grad_accum_steps makes the gradients that
+        # accumulate over the micro-step loop equal the mean over the full
+        # (B * T * grad_accum_steps) batch, matching llm.c.
         var dloss_mean = Scalar[DType.float32](1.0) / Scalar[DType.float32](
-            batch_size * seq_len
+            batch_size * seq_len * grad_accum_steps
         )
         # The dloss seed and grad_acts.losses are fp32 (StatsDType), matching
         # the fused classifier's fp32 read. Seed via the fp32 host buffer.
@@ -1995,6 +2351,85 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
 
+    def calculate_grad_norm(mut self) raises -> Float32:
+        """Global L2 norm of the parameter gradients (sqrt of the sum of squares
+        over all `num_parameters` grads), used for gradient clipping and the
+        grad-norm z-score. Reuses the llmm.global_norm kernels.
+
+        NOTE: this reduces over the full replicated grads_memory; it does not yet
+        all-reduce the norm across ranks in the multi-GPU sharded case.
+        """
+        var n = self.num_parameters
+        comptime width = simd_width_of[GPT2_DTYPE]()
+
+        comptime if is_cpu[Self.target]():
+            var host_out = alloc[Scalar[DType.float32]](1)
+            host_out[0] = Scalar[DType.float32](0.0)
+            global_norm_squared_cpu[GPT2_DTYPE, width](
+                rebind[MutKernelPtr[DType.float32]](
+                    host_out.as_unsafe_any_origin()
+                ),
+                as_immut_kernel_from_mut[GPT2_DTYPE](self.grads_memory),
+                n,
+            )
+            var sumsq = host_out[0]
+            host_out.free()
+            return sqrt(sumsq)
+        else:
+            comptime BLOCK_SIZE = 512
+            comptime RESIDENT_THREADS = 2048
+            var num_sm = self.ctx.get_attribute(
+                DeviceAttribute.MULTIPROCESSOR_COUNT
+            )
+            var grid_x = ceildiv(num_sm * RESIDENT_THREADS, BLOCK_SIZE)
+            # Per-block partial sums land in out_buf[0:grid_x]; the aggregate
+            # kernel reduces them into out_buf[0].
+            var out_buf = self.ctx.enqueue_create_buffer[DType.float32](grid_x)
+            out_buf.enqueue_fill(Scalar[DType.float32](0.0))
+            self.ctx.synchronize()
+            var out_ptr = rebind_mut_mem[DType.float32](
+                out_buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+
+            comptime norm_kernel = global_norm_squared_gpu[
+                GPT2_DTYPE, BLOCK_SIZE, width
+            ]
+            var compiled_norm = self.ctx.compile_function[norm_kernel]()
+            self.ctx.enqueue_function(
+                compiled_norm,
+                as_mut_kernel[DType.float32](out_ptr),
+                as_immut_kernel_from_mut[GPT2_DTYPE](self.grads_memory),
+                n,  # count (single slice)
+                n,  # stride (unused with one slice)
+                grid_dim=(grid_x, 1),
+                block_dim=(BLOCK_SIZE,),
+            )
+
+            comptime agg_kernel = global_norm_aggregate_gpu[BLOCK_SIZE]
+            var compiled_agg = self.ctx.compile_function[agg_kernel]()
+            self.ctx.enqueue_function(
+                compiled_agg,
+                as_mut_kernel[DType.float32](out_ptr),
+                grid_x,
+                grid_dim=(1,),
+                block_dim=(BLOCK_SIZE,),
+            )
+            self.ctx.synchronize()
+
+            var host_out = self.ctx.enqueue_create_host_buffer[DType.float32](1)
+            self.ctx.synchronize()
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[
+                    UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+                ](host_out.unsafe_ptr().as_unsafe_any_origin()),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
+                ](out_ptr.as_unsafe_any_origin()),
+                size=1,
+            )
+            self.ctx.synchronize()
+            return sqrt(host_out[0])
+
     def _checkpoint_config(self) -> CheckpointConfig:
         return CheckpointConfig(
             max_seq_len=self.config.max_seq_len,
@@ -2149,15 +2584,142 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 # ===----------------------------------------------------------------------=== #
 
 
+@fieldwise_init
+struct TrainArgs(Copyable, Movable):
+    """Parsed command-line configuration, mirroring train_gpt2.cu's main()."""
+
+    var train_data_pattern: String  # -i  train tokens (glob ok)
+    var val_data_pattern: String  # -j  val tokens (glob ok)
+    var load_filename: String  # -e  .bin checkpoint OR model descriptor
+    var output_log_dir: String  # -o  checkpoint dir ("" = no logging)
+    var checkpoint_every: Int  # -n  write a checkpoint every N steps
+    var resume: Int  # -y  resume from latest checkpoint in -o
+    var batch_size: Int  # -b  (micro) batch size B
+    var seq_len: Int  # -t  sequence length T
+    var total_batch_size: Int  # -d  desired total batch (-1 => B*T*procs)
+    var learning_rate: Float32  # -l
+    var lr_scheduler_type: String  # -k  cosine|linear|constant|wsd
+    var warmup_iterations: Int  # -u
+    var final_learning_rate_frac: Float32  # -q
+    var weight_decay: Float32  # -c
+    var val_loss_every: Int  # -v
+    var val_max_steps: Int  # -m
+    var sample_every: Int  # -s
+    var gen_tokens: Int  # -g  genT
+    var overfit_single_batch: Int  # -a
+    var max_steps: Int  # -x  (-1 => run one epoch)
+    var zero_stage: Int  # -z
+
+
+def default_train_args() -> TrainArgs:
+    """Default arguments, matching llm.c. The only deviation is `load_filename`,
+    which defaults to the fp32 checkpoint `gpt2_124M.bin` (llm.c defaults to the
+    bf16 file); build with -D LLMM_BF16=1 and pass `-e gpt2_124M_bf16.bin` for
+    bf16.
+    """
+    return TrainArgs(
+        train_data_pattern="./data/.tinyshakespeare/tiny_shakespeare_train.bin",
+        val_data_pattern="./data/.tinyshakespeare/tiny_shakespeare_val.bin",
+        load_filename="gpt2_124M.bin",
+        output_log_dir="",
+        checkpoint_every=0,
+        resume=0,
+        batch_size=4,
+        seq_len=1024,
+        total_batch_size=-1,
+        learning_rate=Float32(3e-4),
+        lr_scheduler_type="cosine",
+        warmup_iterations=0,
+        final_learning_rate_frac=Float32(1.0),
+        weight_decay=Float32(0.0),
+        val_loss_every=20,
+        val_max_steps=20,
+        sample_every=20,
+        gen_tokens=64,
+        overfit_single_batch=0,
+        max_steps=-1,
+        zero_stage=0,
+    )
+
+
+def _build_lr_scheduler(
+    args: TrainArgs, train_num_batches: Int
+) raises -> LearningRateScheduler:
+    """Construct the LR scheduler. scheduler_type is a StaticString, so we
+    dispatch the runtime string to the matching compile-time literal."""
+    var k = args.lr_scheduler_type
+    if k == "cosine":
+        return LearningRateScheduler(
+            "cosine",
+            learning_rate=args.learning_rate,
+            warmup_steps=args.warmup_iterations,
+            train_num_batches=train_num_batches,
+            final_learning_rate_fraction=args.final_learning_rate_frac,
+        )
+    elif k == "linear":
+        return LearningRateScheduler(
+            "linear",
+            learning_rate=args.learning_rate,
+            warmup_steps=args.warmup_iterations,
+            train_num_batches=train_num_batches,
+            final_learning_rate_fraction=args.final_learning_rate_frac,
+        )
+    elif k == "constant":
+        return LearningRateScheduler(
+            "constant",
+            learning_rate=args.learning_rate,
+            warmup_steps=args.warmup_iterations,
+            train_num_batches=train_num_batches,
+            final_learning_rate_fraction=args.final_learning_rate_frac,
+        )
+    elif k == "wsd":
+        return LearningRateScheduler(
+            "wsd",
+            learning_rate=args.learning_rate,
+            warmup_steps=args.warmup_iterations,
+            train_num_batches=train_num_batches,
+            final_learning_rate_fraction=args.final_learning_rate_frac,
+        )
+    raise Error("Invalid scheduler type: " + k)
+
+
+def _find_max_step(output_log_dir: String) raises -> Int:
+    """Return the highest step N for which `model_N.bin` exists in the dir, or
+    -1 if none is found. Used by `-y 1` to resume the latest checkpoint."""
+    var os = Python.import_module("os")
+    if not Bool(os.path.isdir(output_log_dir)):
+        return -1
+    var max_step = -1
+    var entries = os.listdir(output_log_dir)
+    for entry in entries:
+        var name = String(entry)
+        if name.startswith("model_") and name.endswith(".bin"):
+            var step = atol(name[byte = 6 : name.byte_length() - 4])
+            if step > max_step:
+                max_step = step
+    return max_step
+
+
+def _table_row(label: String, value: String) -> String:
+    # "| <label padded to 21> | <value padded to 50> |", like llm.c's printf0.
+    var lhs = label
+    while lhs.byte_length() < 21:
+        lhs += " "
+    var rhs = value
+    while rhs.byte_length() < 50:
+        rhs += " "
+    return "| " + lhs + " | " + rhs + " |"
+
+
 def train[
     target: StaticString,
     WORLD_SIZE: Int = 1,
 ](
+    args: TrainArgs,
     rank: Int = 0,
     cpu_coord: Optional[
         UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
     ] = Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
-    zero_stage: Int = 0,
 ) raises:
     var ctx: DeviceContext
     comptime if is_cpu[target]():
@@ -2165,254 +2727,380 @@ def train[
     else:
         ctx = DeviceContext()
 
-    # Zero sharding.
-    # Build the GPT-2 model from my checkpoint.
+    var zero_stage = args.zero_stage
+
+    # If we are only overfitting a single batch for debugging, overfit the first
+    # batch of val (it is smaller and faster), exactly like llm.c / train_gpt2.py.
+    var train_data_pattern = args.train_data_pattern
+    if args.overfit_single_batch == 1:
+        train_data_pattern = args.val_data_pattern
+
+    var B = args.batch_size
+    var T = args.seq_len
+    var tokens_per_fwdbwd = B * T * WORLD_SIZE
+    var total_batch_size = args.total_batch_size
+    if total_batch_size == -1:
+        total_batch_size = tokens_per_fwdbwd
+    if total_batch_size % tokens_per_fwdbwd != 0:
+        raise Error(
+            "total batch size ("
+            + String(total_batch_size)
+            + ") must be divisible by B*T*num_processes ("
+            + String(tokens_per_fwdbwd)
+            + ")"
+        )
+    var grad_accum_steps = total_batch_size // tokens_per_fwdbwd
+
+    var bar = "+-----------------------+----------------------------------------------------+"
+    printf0(rank, bar)
+    printf0(rank, _table_row("Parameter", "Value"))
+    printf0(rank, bar)
+    printf0(rank, _table_row("train data pattern", train_data_pattern))
+    printf0(rank, _table_row("val data pattern", args.val_data_pattern))
+    printf0(
+        rank,
+        _table_row(
+            "output log dir",
+            "NULL" if args.output_log_dir == "" else args.output_log_dir,
+        ),
+    )
+    printf0(rank, _table_row("checkpoint_every", String(args.checkpoint_every)))
+    printf0(rank, _table_row("resume", String(args.resume)))
+    printf0(rank, _table_row("micro batch size B", String(B)))
+    printf0(rank, _table_row("sequence length T", String(T)))
+    printf0(rank, _table_row("total batch size", String(total_batch_size)))
+    printf0(rank, _table_row("LR scheduler", args.lr_scheduler_type))
+    printf0(rank, _table_row("learning rate (LR)", String(args.learning_rate)))
+    printf0(
+        rank, _table_row("warmup iterations", String(args.warmup_iterations))
+    )
+    printf0(
+        rank,
+        _table_row("final LR fraction", String(args.final_learning_rate_frac)),
+    )
+    printf0(rank, _table_row("weight decay", String(args.weight_decay)))
+    printf0(rank, _table_row("max_steps", String(args.max_steps)))
+    printf0(rank, _table_row("val_loss_every", String(args.val_loss_every)))
+    printf0(rank, _table_row("val_max_steps", String(args.val_max_steps)))
+    printf0(rank, _table_row("sample_every", String(args.sample_every)))
+    printf0(rank, _table_row("genT", String(args.gen_tokens)))
+    printf0(
+        rank,
+        _table_row("overfit_single_batch", String(args.overfit_single_batch)),
+    )
+    printf0(rank, bar)
+
+    # Build the GPT-2 model from a checkpoint (.bin) or a descriptor (from
+    # scratch). See GPT2.__init__ / parse_model_descriptor.
     var model = GPT2[target, WORLD_SIZE](
-        "gpt2_124M.bin",
+        args.load_filename,
         rank,
         zero_stage,
         ctx,
         cpu_coordinator_ptr=cpu_coord,
     )
 
-    # Disk checkpointing config (opt-in via env, mirroring llm.c's CLI flags):
-    #   LLMM_SAVE_EVERY=N      write a checkpoint every N steps (0 = off)
-    #   LLMM_OUTPUT_DIR=dir    directory for model_*/state_* files
-    #   LLMM_RESUME_FROM=step  resume params/optimizer/dataloader from a step
-    var save_every = 0
-    if getenv("LLMM_SAVE_EVERY") != "":
-        save_every = atol(getenv("LLMM_SAVE_EVERY"))
-    var output_dir = getenv("LLMM_OUTPUT_DIR")
-    if output_dir == "":
-        output_dir = String("checkpoints")
-    var resume_from = -1
-    if getenv("LLMM_RESUME_FROM") != "":
-        resume_from = atol(getenv("LLMM_RESUME_FROM"))
-    if save_every > 0 and rank == 0:
+    printf0(rank, bar)
+    printf0(rank, _table_row("weight init method", args.load_filename))
+    printf0(
+        rank,
+        _table_row("max_sequence_length T", String(model.config.max_seq_len)),
+    )
+    printf0(rank, _table_row("vocab_size V", String(model.config.vocab_size)))
+    printf0(
+        rank,
+        _table_row(
+            "padded_vocab_size Vp", String(model.config.padded_vocab_size)
+        ),
+    )
+    printf0(rank, _table_row("num_layers L", String(model.config.num_layer)))
+    printf0(rank, _table_row("num_heads NH", String(model.config.num_heads)))
+    printf0(rank, _table_row("channels C", String(model.config.channels)))
+    printf0(rank, _table_row("num_parameters", String(model.num_parameters)))
+    printf0(rank, bar)
+
+    # Disk checkpointing: -o output_log_dir, -n checkpoint_every, -y resume.
+    var output_dir = args.output_log_dir
+    var save_every = args.checkpoint_every
+    if save_every > 0 and output_dir != "" and rank == 0:
         var os = Python.import_module("os")
         _ = os.makedirs(output_dir, exist_ok=True)
 
-    # Build the dataloaders from tokens files.
-    # TODO: Add tiny stories dataset.
-    var tiny_shakespeare_train = (
-        "./data/.tinyshakespeare/tiny_shakespeare_train.bin"
-    )
-    var tiny_shakespeare_val = (
-        "./data/.tinyshakespeare/tiny_shakespeare_val.bin"
-    )
+    # Build the dataloaders. The data patterns may be a single file or a glob.
+    var train_tokens = train_data_pattern
+    var val_tokens = args.val_data_pattern
 
-    var train_tokens = tiny_shakespeare_train
-    var val_tokens = tiny_shakespeare_val
+    var train_loader = DataLoader(train_tokens, B, T, rank, WORLD_SIZE)
+    printf0(rank, "Loaded train tokens from " + train_tokens)
+    printf0(rank, "Number of tokens: " + String(train_loader.num_tokens))
+    var val_loader = DataLoader(val_tokens, B, T, rank, WORLD_SIZE)
+    printf0(rank, "Loaded val tokens from " + val_tokens)
+    printf0(rank, "Number of tokens: " + String(val_loader.num_tokens))
 
-    try:
-        var file = open(tiny_shakespeare_train, "r")
-        file.close()
-    except:
-        raise Error("Failed to open train tokens file: " + train_tokens)
-
-    comptime BATCH_SIZE = 4
-    comptime SEQ_LEN = 1024
-
-    var train_loader = DataLoader(
-        train_tokens, BATCH_SIZE, SEQ_LEN, rank, WORLD_SIZE
-    )
-    if rank == 0:
-        print("Loaded train tokens from " + train_tokens)
-        print("Number of tokens: " + String(train_loader.num_tokens))
-    var val_loader = DataLoader(
-        val_tokens, BATCH_SIZE, SEQ_LEN, rank, WORLD_SIZE
-    )
-    if rank == 0:
-        print("Loaded val tokens from " + val_tokens)
-        print("Number of tokens: " + String(val_loader.num_tokens))
-
-    # Build the tokenizer from the tokens file.
+    # Build the tokenizer.
     var tokenizer = Tokenizer("gpt2_tokenizer.bin")
-    if rank == 0:
-        print("Loaded tokenizer from " + "gpt2_tokenizer.bin")
+    printf0(rank, "Loaded tokenizer from gpt2_tokenizer.bin")
+
+    # Number of training/validation batches. With -x set we run exactly that
+    # many steps; otherwise we run a single epoch over the training tokens.
+    var train_num_batches = args.max_steps
+    if train_num_batches <= 0:
+        train_num_batches = train_loader.num_tokens // tokens_per_fwdbwd
+    var val_num_batches = args.val_max_steps
+    if val_loader.num_tokens // tokens_per_fwdbwd < val_num_batches:
+        val_num_batches = val_loader.num_tokens // tokens_per_fwdbwd
+
+    printf0(
+        rank,
+        "batch_size B="
+        + String(B)
+        + " * seq_len T="
+        + String(T)
+        + " * num_processes="
+        + String(WORLD_SIZE)
+        + " and total_batch_size="
+        + String(total_batch_size),
+    )
+    printf0(
+        rank,
+        "=> setting grad_accum_steps=" + String(grad_accum_steps),
+    )
+    printf0(rank, bar)
+    printf0(rank, _table_row("train_num_batches", String(train_num_batches)))
+    printf0(rank, _table_row("val_num_batches", String(val_num_batches)))
+    printf0(rank, _table_row("num_processes", String(WORLD_SIZE)))
+    printf0(rank, _table_row("zero_stage", String(zero_stage)))
+    printf0(rank, bar)
 
     # Build the learning rate scheduler.
-    var num_iters = 40
-    var learning_rate_scheduler = LearningRateScheduler(
-        "constant",
-        learning_rate=Scalar[DType.float32](1e-4),
-        warmup_steps=100,
-        train_num_batches=num_iters,
-        final_learning_rate_fraction=Scalar[DType.float32](1e-2),
-    )
+    var learning_rate_scheduler = _build_lr_scheduler(args, train_num_batches)
 
     # Initialize some memory for generating samples from the model.
     var rng_state = UInt64(1337)
-    var gen_max_length = 64
+    var gen_max_length = args.gen_tokens
     var gen_tokens = alloc[Scalar[DType.int32]](gen_max_length)
     var zero = 0
     var null_int32_ptr = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
     # Optionally resume params, optimizer moments, RNG and dataloader position
-    # from a prior checkpoint. Restoring the loader before the priming
-    # next_batch() below means training continues over the exact data stream it
-    # would have without the interruption.
+    # from the latest checkpoint in the output dir (mirrors llm.c's -y 1).
     var start_step = 0
-    if resume_from >= 0:
-        var model_path = output_dir + "/model_" + String(resume_from) + ".bin"
-        var state_path = (
-            output_dir
-            + "/state_"
-            + String(resume_from)
-            + "_"
-            + String(rank)
-            + ".bin"
-        )
-        var resumed = model.load_checkpoint(model_path, state_path)
-        restore_dataloader_state(train_loader, resumed)
-        rng_state = resumed.sampler_rng_state
-        start_step = resumed.step
-        if rank == 0:
-            print("Resumed from checkpoint at step " + String(start_step))
+    if args.resume == 1 and output_dir != "":
+        var resume_from = _find_max_step(output_dir)
+        if resume_from >= 0:
+            var model_path = (
+                output_dir + "/model_" + String(resume_from) + ".bin"
+            )
+            var state_path = (
+                output_dir
+                + "/state_"
+                + String(resume_from)
+                + "_"
+                + String(rank)
+                + ".bin"
+            )
+            var resumed = model.load_checkpoint(model_path, state_path)
+            restore_dataloader_state(train_loader, resumed)
+            rng_state = resumed.sampler_rng_state
+            start_step = resumed.step
+            printf0(
+                rank, "Resumed from checkpoint at step " + String(start_step)
+            )
 
     #####################################################################################
     # Training Loop
     #####################################################################################
 
-    var val_loss_every = 10
-    var val_max_steps = 10
-    var sample_every = 20
+    var tokens_per_step = WORLD_SIZE * B * T * grad_accum_steps
+    var total_sum_iteration_time_s = 0.0
+    var ema_tokens_per_second = 0.0
+    # Sliding-window z-score detectors for the loss and gradient norm.
+    var loss_detector = OutlierDetector()
+    var grad_norm_detector = OutlierDetector()
+    # Device name drives the MFU peak-FLOPs lookup; CPU has no entry => "n/a".
+    var device_name = String("cpu")
+    comptime if is_gpu[target]():
+        device_name = ctx.name()
 
-    var elapsed_time_ms_total = 0.0
+    for step in range(start_step, train_num_batches + 1):
+        var last_step = step == train_num_batches
 
-    train_loader.next_batch()
-
-    for step in range(start_step, num_iters + 1):
-        # Occasionally estimate validation loss.
-        if val_loss_every > 0 and step % val_loss_every == 0:
-            var time_val_start = global_perf_counter_ns()
+        # Once in a while estimate the validation loss.
+        if args.val_loss_every > 0 and (
+            step % args.val_loss_every == 0 or last_step
+        ):
             var val_loss = Float32(0.0)
             val_loader.reset()
-            for _ in range(val_max_steps):
+            for _ in range(val_num_batches):
                 val_loader.next_batch()
-                model.forward(
-                    val_loader.inputs, val_loader.targets, BATCH_SIZE, SEQ_LEN
-                )
+                model.forward(val_loader.inputs, val_loader.targets, B, T)
                 val_loss += model.mean_loss
-            val_loss /= Float32(val_max_steps)
-            var time_val_end = global_perf_counter_ns()
-            if rank == 0:
-                print(
-                    "validation step "
-                    + String(step // val_loss_every)
-                    + ": validation loss: "
-                    + String(val_loss)
-                    + " | total: "
-                    + String(Float64(time_val_end - time_val_start) / 1e9)
-                    + "s"
-                )
+            if val_num_batches > 0:
+                val_loss /= Float32(val_num_batches)
+            printf0(rank, "val loss " + String(val_loss))
 
-        if sample_every > 0 and step > 0 and step % sample_every == 0:
-            if rank == 0:
-                gen_tokens[0] = Scalar[DType.int32](
-                    tokenizer.eot_token
-                )  # The GPT-2 EOT token begins generation.
-
-                print("Generating:\n---")
-                for t in range(1, gen_max_length):
-                    # NOTE: Inference is wasteful here because for each t we recompute all activations between 0 and t.
-                    # In a real inference setting we would use a separate code for this anyway.
-                    # Inference is here only for sanity checking.
-                    model.forward(gen_tokens, null_int32_ptr, 1, t)
-                    var dev_logits_ptr = (
-                        model.acts.logits
-                        + (t - 1) * model.config.padded_vocab_size
-                    )
-                    model.ctx.enqueue_copy(
-                        dst_ptr=rebind[
-                            UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
-                        ](
-                            model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
-                        ),
-                        src_ptr=rebind[
-                            UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
-                        ](dev_logits_ptr.as_unsafe_any_origin()),
-                        size=model.config.vocab_size,
-                    )
-                    model.ctx.synchronize()
-
-                    var logits = rebind[ImmutMemPtr[DType.float32]](
-                        model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
-                    )
-                    var coin = random_f32(rng_state)
-                    var next_token = sample_softmax(
-                        logits, model.config.vocab_size, coin
-                    )
-                    gen_tokens[t] = Scalar[DType.int32](next_token)
-                    var token_str = tokenizer.decode(next_token)
-                    safe_print(token_str)
-                print("\n---")
-
-        if step == num_iters:
-            break
-
-        var time_forward = global_perf_counter_ns()
-        model.forward(
-            train_loader.inputs, train_loader.targets, BATCH_SIZE, SEQ_LEN
-        )
-        model.ctx.synchronize()
-        var time_backward = global_perf_counter_ns()
-
-        model.backward()
-        model.ctx.synchronize()
-        var time_update = global_perf_counter_ns()
-
-        model.update(
-            UInt32(step + 1), learning_rate_scheduler.get_learning_rate(step)
-        )
-        model.ctx.synchronize()
-        var time_load_batch = global_perf_counter_ns()
-
-        # Checkpoint after the step's optimizer update but before advancing the
-        # loader, so the saved dataloader position (current_sample_idx) is the
-        # batch the next step will consume. The stored step is the next step to
-        # run, matching how `start_step` resumes the loop.
-        if save_every > 0 and (
-            (step + 1) % save_every == 0 or step + 1 == num_iters
+        # Once in a while do model inference to print generated text (rank 0).
+        if (
+            rank == 0
+            and args.sample_every > 0
+            and (step > 0 and step % args.sample_every == 0 or last_step)
         ):
-            var model_path = output_dir + "/model_" + String(step + 1) + ".bin"
+            gen_tokens[0] = Scalar[DType.int32](
+                tokenizer.eot_token
+            )  # The GPT-2 EOT token kicks off generation.
+
+            print("generating:\n---")
+            for t in range(1, gen_max_length):
+                # NOTE: Inference is wasteful here because for each t we recompute all activations between 0 and t.
+                # In a real inference setting we would use a separate code for this anyway.
+                # Inference is here only for sanity checking.
+                model.forward(gen_tokens, null_int32_ptr, 1, t)
+                var dev_logits_ptr = (
+                    model.acts.logits + (t - 1) * model.config.padded_vocab_size
+                )
+                model.ctx.enqueue_copy(
+                    dst_ptr=rebind[
+                        UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+                    ](
+                        model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
+                    ),
+                    src_ptr=rebind[
+                        UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                    ](dev_logits_ptr.as_unsafe_any_origin()),
+                    size=model.config.vocab_size,
+                )
+                model.ctx.synchronize()
+
+                var logits = rebind[ImmutMemPtr[DType.float32]](
+                    model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
+                )
+                var coin = random_f32(rng_state)
+                var next_token = sample_softmax(
+                    logits, model.config.vocab_size, coin
+                )
+                gen_tokens[t] = Scalar[DType.int32](next_token)
+                var token_str = tokenizer.decode(next_token)
+                safe_print(token_str)
+            print("\n---")
+
+        # Once in a while checkpoint the optimization state (all ranks).
+        if (
+            save_every > 0
+            and output_dir != ""
+            and ((step > 0 and step % save_every == 0) or last_step)
+        ):
+            var model_path = output_dir + "/model_" + String(step) + ".bin"
             var state_path = (
                 output_dir
                 + "/state_"
-                + String(step + 1)
+                + String(step)
                 + "_"
                 + String(rank)
                 + ".bin"
             )
             model.write_checkpoint(
-                model_path, state_path, step + 1, train_loader, rng_state
+                model_path, state_path, step, train_loader, rng_state
             )
-            if rank == 0:
-                print("Saved checkpoint at step " + String(step + 1))
+            printf0(rank, "Writing checkpoint at step " + String(step))
 
-        train_loader.next_batch()
+        if last_step:
+            break
+
+        # --------------- TRAINING SECTION -------------------
+        # If overfitting a single batch for debugging, reset the loader so every
+        # step re-reads the same batch (matches llm.c / train_gpt2.py).
+        if args.overfit_single_batch == 1:
+            train_loader.reset()
+
+        var time_start = global_perf_counter_ns()
+
+        # Gradient/loss accumulation over micro-batches. Gradients accumulate
+        # inside backward (zeroed only on micro_step 0); the loss is averaged.
+        var accumulated_loss = Float32(0.0)
+        for micro_step in range(grad_accum_steps):
+            train_loader.next_batch()
+            model.forward(train_loader.inputs, train_loader.targets, B, T)
+            accumulated_loss += model.mean_loss
+            model.backward(grad_accum_steps, micro_step)
+        model.ctx.synchronize()
+        accumulated_loss /= Float32(grad_accum_steps)
+
+        var zloss = loss_detector.update(Float64(accumulated_loss))
+        var step_learning_rate = learning_rate_scheduler.get_learning_rate(step)
+
+        # Gradient norm, its z-score, and clipping to a max norm of 1.0.
+        var grad_norm = model.calculate_grad_norm()
+        var zgrad = grad_norm_detector.update(Float64(grad_norm))
+        var grad_clip = Float32(1.0)
+        var grad_scale = (
+            grad_clip / grad_norm if grad_norm > grad_clip else Float32(1.0)
+        )
+
+        model.update(
+            UInt32(step + 1),
+            step_learning_rate,
+            weight_decay=args.weight_decay,
+            grad_scale=grad_scale,
+        )
+        model.ctx.synchronize()
         var time_end = global_perf_counter_ns()
+        # --------------- TRAINING SECTION END -------------------
 
-        var elapsed_time = Float64(time_end - time_forward) / 1e9
-        elapsed_time_ms_total += elapsed_time
-        if rank == 0:
-            print(
-                "step "
-                + String(step)
-                + ": train loss "
-                + String(model.mean_loss)
-                + " | forward: "
-                + String(Float64(time_backward - time_forward) / 1e9)
-                + "s | backward: "
-                + String(Float64(time_update - time_backward) / 1e9)
-                + "s | update: "
-                + String(Float64(time_load_batch - time_update) / 1e9)
-                + "s | loader: "
-                + String(Float64(time_end - time_load_batch) / 1e9)
-                + "s | total: "
-                + String(elapsed_time)
-                + "s"
+        var time_elapsed_ms = Float64(time_end - time_start) / 1e6
+        var tokens_per_second = (
+            Float64(tokens_per_step) / time_elapsed_ms * 1000.0
+        )
+        # Smooth tok/s with a bias-corrected EMA, treating step 0 as warmup.
+        var bias_corrected_ema = tokens_per_second
+        if step > 0:
+            total_sum_iteration_time_s += time_elapsed_ms / 1000.0
+            ema_tokens_per_second = (
+                0.95 * ema_tokens_per_second + 0.05 * tokens_per_second
             )
+            var bias_correction = 1.0 - exp(Float64(step) * log(0.95))
+            bias_corrected_ema = ema_tokens_per_second / bias_correction
+
+        var mfu = estimate_mfu(
+            model.num_parameters,
+            model.config.num_layer,
+            model.config.channels,
+            T,
+            B * T * grad_accum_steps,
+            time_elapsed_ms / 1000.0,
+            device_name,
+            USE_BF16,
+        )
+        var prec_label = String("bf16") if USE_BF16 else String("fp32")
+        var mfu_str = (
+            String("n/a") if mfu < 0.0 else _ffmt(mfu * 100.0, 1) + "%"
+        )
+
+        printf0(
+            rank,
+            "step "
+            + String(step + 1)
+            + "/"
+            + String(train_num_batches)
+            + " | loss "
+            + _ffmt(Float64(accumulated_loss), 6)
+            + " ("
+            + _zfmt(zloss)
+            + "z)| norm "
+            + _ffmt(Float64(grad_norm), 4)
+            + " ("
+            + _zfmt(zgrad)
+            + "z)| lr "
+            + String(step_learning_rate)
+            + " | "
+            + _ffmt(time_elapsed_ms, 2)
+            + " ms | "
+            + mfu_str
+            + " "
+            + prec_label
+            + " MFU | "
+            + _ffmt(bias_corrected_ema, 0)
+            + " tok/s",
+        )
 
     train_loader.close()
     val_loader.close()
@@ -2421,10 +3109,10 @@ def train[
 def _dispatch_world_size[
     target: StaticString
 ](
+    args: TrainArgs,
     rank: Int,
     world_size: Int,
     cpu_coord: Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]],
-    zero_stage: Int,
 ) raises:
     # train() is monomorphized on WORLD_SIZE (a comptime parameter), so a runtime
     # world_size can only dispatch to an instantiation compiled into this binary:
@@ -2433,15 +3121,15 @@ def _dispatch_world_size[
     # one branch is what makes larger sizes (16/32/64/...) reachable, without
     # compiling an instantiation for every possible size.
     if world_size == 1:
-        train[target, 1](rank, cpu_coord, zero_stage)
+        train[target, 1](args, rank, cpu_coord)
     elif world_size == 2:
-        train[target, 2](rank, cpu_coord, zero_stage)
+        train[target, 2](args, rank, cpu_coord)
     elif world_size == 4:
-        train[target, 4](rank, cpu_coord, zero_stage)
+        train[target, 4](args, rank, cpu_coord)
     elif world_size == 8:
-        train[target, 8](rank, cpu_coord, zero_stage)
+        train[target, 8](args, rank, cpu_coord)
     elif world_size == WORLD_SIZE_DEF:
-        train[target, WORLD_SIZE_DEF](rank, cpu_coord, zero_stage)
+        train[target, WORLD_SIZE_DEF](args, rank, cpu_coord)
     else:
         raise Error(
             "Unsupported world_size: "
@@ -2451,12 +3139,54 @@ def _dispatch_world_size[
         )
 
 
+def _print_usage():
+    print("Usage: ./train_gpt2 [options]")
+    print("Options (mirroring Karpathy's train_gpt2.cu):")
+    print("  -h, --help  print this help message and exit")
+    print("  -i <string> train data filename pattern (glob ok)")
+    print("  -j <string> val data filename pattern (glob ok)")
+    print(
+        "  -e <string> input .bin filename OR model descriptor (dX / gpt2:dX /"
+        " gpt3:cX) to train from scratch"
+    )
+    print("  -o <string> output log/checkpoint dir (default = none)")
+    print("  -n <int>    write a checkpoint every N steps (default 0)")
+    print("  -y <int>    resume from latest checkpoint in -o? (0/1)")
+    print("  -b <int>    (micro) batch size B (default = 4)")
+    print("  -t <int>    sequence length T (default = 1024)")
+    print(
+        "  -d <int>    total desired batch size (default = B*T*num_processes)"
+    )
+    print("  -l <float>  learning rate (default = 3e-4)")
+    print("  -k <string> learning rate scheduler (default = cosine)")
+    print("  -u <int>    learning rate warmup iterations (default = 0)")
+    print("  -q <float>  final learning rate fraction (default = 1.0)")
+    print("  -c <float>  weight decay (default = 0.0)")
+    print("  -v <int>    val_loss_every (default = 20)")
+    print("  -m <int>    val_max_steps (default = 20)")
+    print("  -s <int>    sample_every (default = 20)")
+    print("  -g <int>    genT, tokens of inference to generate (default = 64)")
+    print("  -a <int>    overfit a single batch? 0/1 (default = 0)")
+    print("  -x <int>    max_steps (-1 = one epoch, default)")
+    print(
+        "  -z <int>    zero_stage, ZeRO optimization stage 0/1/2/3 (default 0)"
+    )
+    print("  -pn <int>   num_processes / world_size (default = 1)")
+    print("  -pr <int>   process_rank (default = 0)")
+
+
+def _error_usage() raises:
+    _print_usage()
+    raise Error("invalid command-line usage")
+
+
 def main() raises:
-    var args = argv()
+    var cli = argv()
+    var args = default_train_args()
     var rank = 0
     var world_size = 1
-    var zero_stage = 0
 
+    # Env variables seed the defaults; command-line flags override them below.
     var env_rank = getenv("RANK")
     if env_rank != "":
         rank = atol(env_rank)
@@ -2465,16 +3195,79 @@ def main() raises:
         world_size = atol(env_world_size)
     var env_zero_stage = getenv("ZERO_STAGE")
     if env_zero_stage != "":
-        zero_stage = atol(env_zero_stage)
+        args.zero_stage = atol(env_zero_stage)
+    if getenv("LLMM_OUTPUT_DIR") != "":
+        args.output_log_dir = getenv("LLMM_OUTPUT_DIR")
+    if getenv("LLMM_SAVE_EVERY") != "":
+        args.checkpoint_every = atol(getenv("LLMM_SAVE_EVERY"))
 
-    # Command line args override env variables:
-    if len(args) > 1:
-        world_size = atol(args[1])
-    if len(args) > 2:
-        zero_stage = atol(args[2])
-    if len(args) > 3:
-        rank = atol(args[3])
+    # Parse the flags. Each is "-x" or "-xy" followed by a value, like llm.c.
+    var i = 1
+    while i < len(cli):
+        var flag = String(cli[i])
+        # Help takes no value, so handle it before the "must have a value" check.
+        if flag == "-h" or flag == "--help":
+            _print_usage()
+            return
+        if (
+            i + 1 >= len(cli)
+            or not flag.startswith("-")
+            or flag.byte_length() < 2
+        ):
+            _error_usage()
+        var val = String(cli[i + 1])
+        if flag == "-i":
+            args.train_data_pattern = val
+        elif flag == "-j":
+            args.val_data_pattern = val
+        elif flag == "-e":
+            args.load_filename = val
+        elif flag == "-o":
+            args.output_log_dir = val
+        elif flag == "-n":
+            args.checkpoint_every = atol(val)
+        elif flag == "-y":
+            args.resume = atol(val)
+        elif flag == "-b":
+            args.batch_size = atol(val)
+        elif flag == "-t":
+            args.seq_len = atol(val)
+        elif flag == "-d":
+            args.total_batch_size = atol(val)
+        elif flag == "-l":
+            args.learning_rate = Float32(atof(val))
+        elif flag == "-k":
+            args.lr_scheduler_type = val
+        elif flag == "-u":
+            args.warmup_iterations = atol(val)
+        elif flag == "-q":
+            args.final_learning_rate_frac = Float32(atof(val))
+        elif flag == "-c":
+            args.weight_decay = Float32(atof(val))
+        elif flag == "-v":
+            args.val_loss_every = atol(val)
+        elif flag == "-m":
+            args.val_max_steps = atol(val)
+        elif flag == "-s":
+            args.sample_every = atol(val)
+        elif flag == "-g":
+            args.gen_tokens = atol(val)
+        elif flag == "-a":
+            args.overfit_single_batch = atol(val)
+        elif flag == "-x":
+            args.max_steps = atol(val)
+        elif flag == "-z":
+            args.zero_stage = atol(val)
+        elif flag == "-pn":
+            world_size = atol(val)
+        elif flag == "-pr":
+            rank = atol(val)
+        else:
+            print("Unknown flag: " + flag)
+            _error_usage()
+        i += 2
 
+    var zero_stage = args.zero_stage
     print("Rank:", rank, "World size:", world_size, "ZeRO stage:", zero_stage)
 
     var use_cpu = getenv("LLMM_USE_CPU")
@@ -2518,10 +3311,10 @@ def main() raises:
         print("Training on CPU.")
         if world_size == 1:
             _dispatch_world_size["cpu"](
+                args,
                 0,
                 world_size,
                 Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
-                zero_stage,
             )
         else:
             var cpu_coord_ptr = alloc[CpuCoordinator](1)
@@ -2531,7 +3324,7 @@ def main() raises:
             def _run_rank(rank: Int):
                 try:
                     _dispatch_world_size["cpu"](
-                        rank, world_size, cpu_coord_ptr, zero_stage
+                        args, rank, world_size, cpu_coord_ptr
                     )
                 except e:
                     print("Rank", rank, "failed:", e)
@@ -2542,8 +3335,8 @@ def main() raises:
     elif has_accelerator():
         print("GPU detected — training on GPU.")
         _dispatch_world_size["gpu"](
+            args,
             rank,
             world_size,
             Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
-            zero_stage,
         )
