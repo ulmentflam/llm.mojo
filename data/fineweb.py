@@ -140,7 +140,9 @@ def main(
                 remainder = shard_size - token_count
                 assert progress_bar is not None
                 progress_bar.update(remainder)
-                all_tokens_np[token_count : token_count + remainder] = tokens[:remainder]
+                all_tokens_np[token_count : token_count + remainder] = tokens[
+                    :remainder
+                ]
                 write_datafile(filename, all_tokens_np.tolist(), model_desc)
                 shard_index += 1
                 progress_bar = None
