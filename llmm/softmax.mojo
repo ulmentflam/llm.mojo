@@ -9,9 +9,11 @@ from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.algorithm import vectorize, sync_parallelize
 from std.runtime.asyncrt import parallelism_level
+from std.algorithm import vectorize, sync_parallelize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+
+from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
@@ -131,7 +133,7 @@ def softmax_fwd_cpu[
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
     vocab_size_padded: Int64,  # Our Vp
-) -> None:
+) raises -> None:
     var total = Int(batch_size * seq_len)
     var max_workers = parallelism_level()
     var rows_per_worker = ceildiv(total, max_workers)
@@ -151,7 +153,7 @@ def softmax_fwd_cpu[
                 Int(vocab_size_padded),
             )
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["softmax_fwd", _worker](num_workers)
 
 
 @always_inline
@@ -452,7 +454,7 @@ def softmax_bwd_cpu[
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
     vocab_size_padded: Int64,  # Our Vp
-) -> None:
+) raises -> None:
     var total = Int(batch_size * seq_len)
     var max_workers = parallelism_level()
     var rows_per_worker = ceildiv(total, max_workers)
@@ -473,7 +475,7 @@ def softmax_bwd_cpu[
                 Int(vocab_size_padded),
             )
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["softmax_bwd", _worker](num_workers)
 
 
 @always_inline

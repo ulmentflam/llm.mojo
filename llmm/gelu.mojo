@@ -11,6 +11,8 @@ from extensibility.managed_tensor_slice import (
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+
+from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
@@ -82,7 +84,7 @@ def gelu_fwd_cpu[
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
-) -> None:
+) raises -> None:
     var max_workers = parallelism_level()
     var chunk = ceildiv(num_params, max_workers)
     var num_workers = ceildiv(num_params, chunk)
@@ -100,7 +102,7 @@ def gelu_fwd_cpu[
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["gelu_fwd", _worker](num_workers)
 
 
 def gelu_fwd[
@@ -214,7 +216,7 @@ def gelu_bwd_cpu[
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
-) -> None:
+) raises -> None:
     var max_workers = parallelism_level()
     var chunk = ceildiv(num_params, max_workers)
     var num_workers = ceildiv(num_params, chunk)
@@ -233,7 +235,7 @@ def gelu_bwd_cpu[
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["gelu_bwd", _worker](num_workers)
 
 
 def gelu_bwd[

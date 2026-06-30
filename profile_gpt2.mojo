@@ -6,9 +6,16 @@ from std.time import global_perf_counter_ns
 from std.memory import alloc, UnsafePointer
 
 from llmm.memory import MutMemPtr
-from llmm.profiler import TraceProfiler
+from llmm.profiler import (
+    TraceProfiler,
+    thread_trace_path,
+    thread_trace_begin,
+    thread_trace_end,
+    thread_trace_span,
+    current_thread_id,
+)
 
-from train_gpt2 import GPT2
+from train_gpt2 import GPT2, GPT2_DTYPE
 
 # Convenience harness for profiling the CUDA/CPU kernels in the train_gpt2
 # training step. This is the llm.mojo analogue of llm.c's profile_gpt2.cu: it
@@ -62,9 +69,12 @@ def run_profile[
     else:
         ctx = DeviceContext()
 
-    # Build the GPT-2 124M model from the checkpoint.
+    # Build the GPT-2 124M model from the checkpoint matching the build dtype:
+    # the bf16 build (-D LLMM_BF16) loads the bf16 weights, fp32 the fp32 ones.
+    comptime use_bf16 = GPT2_DTYPE == DType.bfloat16
+    comptime checkpoint = "gpt2_124M_bf16.bin" if use_bf16 else "gpt2_124M.bin"
     var model = GPT2[target, 1](
-        "gpt2_124M.bin",
+        checkpoint,
         rank=0,
         zero_stage=0,
         ctx=ctx,
@@ -93,9 +103,18 @@ def run_profile[
     var x_ptr = rebind[MutMemPtr[DType.int32]](x)
     var y_ptr = rebind[MutMemPtr[DType.int32]](y)
 
+    # High-level phase trace (single lane), written by our in-memory tracer to
+    # LLMM_PROFILE_TRACE. Independent of the per-thread trace below.
     var prof = TraceProfiler(trace_path)
     prof.process_name(0, String("llm.mojo profile"))
     prof.thread_name(0, 0, String(target) + " step")
+
+    # Per-thread trace (LLMM_THREAD_TRACE): the harness brackets the file and
+    # writes the forward/backward/update phases on the main thread; the kernels'
+    # traced_parallelize workers append their own spans on their OS-thread lanes.
+    var tpath = thread_trace_path()
+    thread_trace_begin(tpath)
+    var main_tid = current_thread_id()
 
     for step in range(num_steps):
         var t0 = global_perf_counter_ns()
@@ -110,6 +129,10 @@ def run_profile[
         model.update(UInt32(step + 1), Scalar[DType.float32](1e-4))
         ctx.synchronize()
         var t3 = global_perf_counter_ns()
+
+        thread_trace_span(tpath, String("forward"), t0, t1, main_tid)
+        thread_trace_span(tpath, String("backward"), t1, t2, main_tid)
+        thread_trace_span(tpath, String("update"), t2, t3, main_tid)
 
         var args = (
             '{"step":'
@@ -137,6 +160,7 @@ def run_profile[
             + "s"
         )
 
+    thread_trace_end(tpath)
     prof.close()
     x.free()
     y.free()
@@ -154,10 +178,19 @@ def main() raises -> None:
     var steps = _env_int("LLMM_PROFILE_STEPS", 1)
     var trace_path = getenv("LLMM_PROFILE_TRACE")
 
-    if target == "gpu":
+    # bf16 is GPU-only (CPU stays fp32): the CPU backend can't lower masked
+    # bf16 vector loads, and per project policy CPU training is fp32. So a bf16
+    # build only ever instantiates the GPU path.
+    comptime if GPT2_DTYPE == DType.bfloat16:
+        if target != "gpu":
+            print("bf16 build supports only the GPU target (CPU stays fp32).")
+            exit(1)
         run_profile["gpu"](B, T, layers, steps, trace_path)
-    elif target == "cpu":
-        run_profile["cpu"](B, T, layers, steps, trace_path)
     else:
-        print("Unknown target:", target, "(expected 'cpu' or 'gpu')")
-        exit(1)
+        if target == "gpu":
+            run_profile["gpu"](B, T, layers, steps, trace_path)
+        elif target == "cpu":
+            run_profile["cpu"](B, T, layers, steps, trace_path)
+        else:
+            print("Unknown target:", target, "(expected 'cpu' or 'gpu')")
+            exit(1)

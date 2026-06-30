@@ -1,18 +1,20 @@
 import compiler
 from std.memory import alloc
 from std.sys import simd_width_of
+from std.gpu.primitives import block
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host import DeviceAttribute
-from std.gpu.primitives import block
 from std.math import fma, ceildiv, rsqrt
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.algorithm import sync_parallelize, vectorize
 from std.runtime.asyncrt import parallelism_level
+from std.algorithm import sync_parallelize, vectorize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+
+from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 # ===----------------------------------------------------------------------=== #
@@ -137,7 +139,7 @@ def layernorm_fwd_cpu[
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
-) -> None:
+) raises -> None:
     var total = Int(batch_size * seq_len)
     var max_workers = parallelism_level()
     var rows_per_worker = ceildiv(total, max_workers)
@@ -161,7 +163,7 @@ def layernorm_fwd_cpu[
                 Int(channels),
             )
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["layernorm_fwd", _worker](num_workers)
 
 
 @always_inline
@@ -547,7 +549,7 @@ def layernorm_fused_residual_fwd_cpu[
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
-) -> None:
+) raises -> None:
     var total = Int(batch_size * seq_len)
     var max_workers = parallelism_level()
     var rows_per_worker = ceildiv(total, max_workers)
@@ -573,7 +575,7 @@ def layernorm_fused_residual_fwd_cpu[
                 Int(channels),
             )
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["layernorm_fused_fwd", _worker](num_workers)
 
 
 @always_inline
@@ -982,12 +984,12 @@ def layernorm_bwd_cpu[
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
     d_input_ptr: MutKernelPtr[dtype],
-    d_gamma_ptr: MutKernelPtr[DType.float32],
-    d_beta_ptr: MutKernelPtr[DType.float32],
+    d_gamma_ptr: MutKernelPtr[dtype],
+    d_beta_ptr: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
-) -> None:
+) raises -> None:
     var total = Int(batch_size * seq_len)
     var c = Int(channels)
     var max_workers = parallelism_level()
@@ -1028,7 +1030,7 @@ def layernorm_bwd_cpu[
                 c,
             )
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["layernorm_bwd", _worker](num_workers)
 
     # Reduce the per-worker partials into the parameter gradients. We add into
     # whatever is already there (the atomic path accumulated the same way), so
@@ -1039,8 +1041,12 @@ def layernorm_bwd_cpu[
         for w in range(num_workers):
             acc_dgamma += dgamma_partial[w * c + j]
             acc_dbeta += dbeta_partial[w * c + j]
-        d_gamma_ptr[j] += acc_dgamma
-        d_beta_ptr[j] += acc_dbeta
+        d_gamma_ptr[j] = (
+            d_gamma_ptr[j].cast[DType.float32]() + acc_dgamma
+        ).cast[dtype]()
+        d_beta_ptr[j] = (d_beta_ptr[j].cast[DType.float32]() + acc_dbeta).cast[
+            dtype
+        ]()
 
     dgamma_partial.free()
     dbeta_partial.free()
@@ -1202,8 +1208,8 @@ def _layernorm_dgamma_dbeta_gpu[
     input_ptr: ImmutKernelPtr[dtype],
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
-    d_gamma_ptr: MutKernelPtr[DType.float32],
-    d_beta_ptr: MutKernelPtr[DType.float32],
+    d_gamma_ptr: MutKernelPtr[dtype],
+    d_beta_ptr: MutKernelPtr[dtype],
 ) -> None:
     # Channel-parallel parameter gradients (mirrors matmul_bias_bwd_gpu): each
     # block owns channel tiles and reduces over all rows with block.sum, so a
@@ -1236,10 +1242,22 @@ def _layernorm_dgamma_dbeta_gpu[
             if tid == 0:
                 # Accumulate into existing grads (matches the CPU path and the
                 # old atomic accumulate-into-buffer behavior).
-                var prev_dgamma = (d_gamma_ptr + base).load[width=width]()
-                var prev_dbeta = (d_beta_ptr + base).load[width=width]()
-                (d_gamma_ptr + base).store(prev_dgamma + sum_dgamma)
-                (d_beta_ptr + base).store(prev_dbeta + sum_dbeta)
+                var prev_dgamma = (
+                    (d_gamma_ptr + base)
+                    .load[width=width]()
+                    .cast[DType.float32]()
+                )
+                var prev_dbeta = (
+                    (d_beta_ptr + base)
+                    .load[width=width]()
+                    .cast[DType.float32]()
+                )
+                (d_gamma_ptr + base).store(
+                    (prev_dgamma + sum_dgamma).cast[dtype]()
+                )
+                (d_beta_ptr + base).store(
+                    (prev_dbeta + sum_dbeta).cast[dtype]()
+                )
         else:
             # Ragged tail. Loop bounds depend only on `base`, so every thread
             # reaches block.sum uniformly.
@@ -1256,8 +1274,12 @@ def _layernorm_dgamma_dbeta_gpu[
                 var sum_dgamma = block.sum[block_size=BLOCK_SIZE](acc_dgamma)
                 var sum_dbeta = block.sum[block_size=BLOCK_SIZE](acc_dbeta)
                 if tid == 0:
-                    d_gamma_ptr[c] += sum_dgamma
-                    d_beta_ptr[c] += sum_dbeta
+                    d_gamma_ptr[c] = (
+                        d_gamma_ptr[c].cast[DType.float32]() + sum_dgamma
+                    ).cast[dtype]()
+                    d_beta_ptr[c] = (
+                        d_beta_ptr[c].cast[DType.float32]() + sum_dbeta
+                    ).cast[dtype]()
 
 
 def layernorm_dgamma_dbeta_gpu[
@@ -1269,8 +1291,8 @@ def layernorm_dgamma_dbeta_gpu[
     input_ptr: ImmutKernelPtr[dtype],
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
-    d_gamma_ptr: MutKernelPtr[DType.float32],
-    d_beta_ptr: MutKernelPtr[DType.float32],
+    d_gamma_ptr: MutKernelPtr[dtype],
+    d_beta_ptr: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
@@ -1300,8 +1322,8 @@ def layernorm_bwd[
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
     d_input_ptr: MutKernelPtr[dtype],
-    d_gamma_ptr: MutKernelPtr[DType.float32],
-    d_beta_ptr: MutKernelPtr[DType.float32],
+    d_gamma_ptr: MutKernelPtr[dtype],
+    d_beta_ptr: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
@@ -1454,8 +1476,8 @@ def layernorm_fused_residual_bwd[
     gamma_ptr: ImmutKernelPtr[dtype],
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
-    d_gamma_ptr: MutKernelPtr[DType.float32],
-    d_beta_ptr: MutKernelPtr[DType.float32],
+    d_gamma_ptr: MutKernelPtr[dtype],
+    d_beta_ptr: MutKernelPtr[dtype],
     d_residual_ptr: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
@@ -1523,12 +1545,8 @@ struct LayerNormBwd:
         mean: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
         rstd: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
         d_x: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
-        d_gamma: MutableInputTensor[
-            dtype=DType.float32, rank=1, static_spec=...
-        ],
-        d_beta: MutableInputTensor[
-            dtype=DType.float32, rank=1, static_spec=...
-        ],
+        d_gamma: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
+        d_beta: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
         batch_size: Int64,  # Our B
         seq_len: Int64,  # Our T
         channels: Int64,  # Our C
@@ -1581,12 +1599,8 @@ struct LayerNormFusedResidualBwd:
         gamma: InputTensor[dtype=dtype, rank=1, static_spec=...],
         mean: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
         rstd: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
-        d_gamma: MutableInputTensor[
-            dtype=DType.float32, rank=1, static_spec=...
-        ],
-        d_beta: MutableInputTensor[
-            dtype=DType.float32, rank=1, static_spec=...
-        ],
+        d_gamma: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
+        d_beta: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
         d_residual: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
         batch_size: Int64,  # Our B
         seq_len: Int64,  # Our T

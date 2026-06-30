@@ -2,8 +2,8 @@ import compiler
 from std.sys import simd_width_of
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
-from std.gpu.host.info import is_cpu, is_gpu
 from std.algorithm import sync_parallelize
+from std.gpu.host.info import is_cpu, is_gpu
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -15,6 +15,8 @@ from llmm.head_layout import (
     token_layout_plane0_flat_from_head_layout_flat,
     vectorize_layout_copy,
 )
+
+from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
@@ -70,7 +72,7 @@ def _merge_cpu[
     seq_len: Int,
     num_heads: Int,
     head_dim: Int,
-) -> None:
+) raises -> None:
     @parameter
     def _worker(bh: Int):
         for t in range(seq_len):
@@ -85,7 +87,7 @@ def _merge_cpu[
                 t,
             )
 
-    sync_parallelize[_worker](batch_size * num_heads)
+    traced_parallelize["merge", _worker](batch_size * num_heads)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -103,7 +105,7 @@ def merge_fwd_cpu[
     seq_len: Int,
     num_heads: Int,
     head_dim: Int,
-) -> None:
+) raises -> None:
     _merge_cpu[dtype, width, backward=False](
         dst_ptr, src_ptr, batch_size, seq_len, num_heads, head_dim
     )
@@ -275,7 +277,7 @@ def merge_bwd_cpu[
     seq_len: Int,
     num_heads: Int,
     head_dim: Int,
-) -> None:
+) raises -> None:
     _merge_cpu[dtype, width, backward=True](
         d_src_ptr, d_dst_ptr, batch_size, seq_len, num_heads, head_dim
     )

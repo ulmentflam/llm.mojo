@@ -14,8 +14,6 @@ from extensibility.managed_tensor_slice import (
 )
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
-from llmm.split import split_fwd, split_bwd
-from llmm.merge import merge_fwd, merge_bwd
 from std.math import fma, sqrt, ceildiv, exp, log, ldexp, floor, exp2
 from std.gpu import (
     barrier,
@@ -25,6 +23,10 @@ from std.gpu import (
     thread_idx,
     WARP_SIZE,
 )
+
+from llmm.split import split_fwd, split_bwd
+from llmm.merge import merge_fwd, merge_bwd
+from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
@@ -652,7 +654,7 @@ def attention_fwd_cpu[
     num_heads: Int,
     seq_len: Int,
     head_dim: Int,
-) -> None:
+) raises -> None:
     var attention_scale = Scalar[DType.float32](1) / sqrt(
         Scalar[DType.float32](head_dim)
     )
@@ -680,7 +682,7 @@ def attention_fwd_cpu[
                 attention_scale,
             )
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["attention_fwd", _worker](num_workers)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1559,7 +1561,7 @@ def attention_bwd_cpu[
     num_heads: Int,
     seq_len: Int,
     head_dim: Int,
-) -> None:
+) raises -> None:
     var attention_scale = Scalar[DType.float32](1) / sqrt(
         Scalar[DType.float32](head_dim)
     )
@@ -1590,7 +1592,7 @@ def attention_bwd_cpu[
                 attention_scale,
             )
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["attention_bwd", _worker](num_workers)
 
 
 @always_inline

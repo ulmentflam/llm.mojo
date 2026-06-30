@@ -1,5 +1,135 @@
 from std.os import getenv
+from std.memory import alloc
+from std.sys import is_defined
+from std.ffi import external_call
 from std.time import global_perf_counter_ns
+from std.algorithm import sync_parallelize
+
+
+# Per-thread CPU trace, written directly as Perfetto/Chrome-trace JSON.
+#
+# We tried Mojo's native std.runtime.tracing (the LLVM TimeTraceProfiler that
+# Modular uses internally): it captures per-thread spans correctly, but the MAX
+# runtime only flushes them when its last DeviceContext is destroyed, and the
+# GPT2 model leaks a context reference, so the trace never gets written. This
+# mechanism sidesteps that entirely — it has no dependency on the MAX profiler,
+# works in a compiled binary (no `mojo run` needed), and is cross-platform
+# (pthread_self + plain file writes, so macOS and Linux alike, unlike nsys).
+#
+# The output file is an array of "X" (complete) events that the harness brackets
+# with `[` ... `trace_end ]` (see thread_trace_begin/end). Each event carries the
+# worker's real OS thread id (pthread_self) as `tid`, so the ~20 CPU worker
+# threads land on their own lanes in https://ui.perfetto.dev.
+
+
+@always_inline
+def thread_trace_path() -> String:
+    """The per-thread trace output path, or "" when tracing is disabled."""
+    return getenv("LLMM_THREAD_TRACE")
+
+
+def thread_trace_begin(path: String) raises:
+    """Truncate the trace file and open the JSON event array. No-op if path="".
+    """
+    if path == "":
+        return
+    var f = open(path, "w")
+    f.write("[\n")
+    f.close()
+
+
+def thread_trace_end(path: String) raises:
+    """Close the JSON array. The final no-comma metadata event terminates the
+    comma-separated span entries cleanly, yielding a valid document."""
+    if path == "":
+        return
+    var f = open(path, "a")
+    f.write('{"name":"trace_end","ph":"M","pid":0,"tid":0,"args":{}}\n]\n')
+    f.close()
+
+
+@always_inline
+def _trace_event(
+    name: String, start_ns: UInt64, end_ns: UInt64, tid: UInt64
+) -> String:
+    return (
+        '{"name":"'
+        + _json_escape(name)
+        + '","ph":"X","ts":'
+        + String(Float64(start_ns) / 1000.0)
+        + ',"dur":'
+        + String(Float64(end_ns - start_ns) / 1000.0)
+        + ',"pid":0,"tid":'
+        + String(tid)
+        + "},\n"
+    )
+
+
+def thread_trace_span(
+    path: String, name: String, start_ns: UInt64, end_ns: UInt64, tid: UInt64
+) raises:
+    """Append a single span (e.g. a harness phase on the main thread)."""
+    if path == "":
+        return
+    var f = open(path, "a")
+    f.write(_trace_event(name, start_ns, end_ns, tid))
+    f.close()
+
+
+@always_inline
+def current_thread_id() -> UInt64:
+    return UInt64(external_call["pthread_self", UInt]())
+
+
+# Drop-in replacement for `sync_parallelize` that records, per worker, the OS
+# thread it ran on and its wall-clock span, then appends one Perfetto event per
+# worker to LLMM_THREAD_TRACE.
+#
+# The instrumentation is gated at COMPILE TIME on the `LLMM_TRACE` define: unless
+# the binary is built with `-D LLMM_TRACE=1`, the whole tracing path (the getenv,
+# the allocations, the timing, the file I/O) is comptime-eliminated and this is
+# *exactly* `sync_parallelize[work_fn]` — provably zero overhead. Regular
+# train/test builds therefore pay nothing; only the profiling binary opts in.
+# Within a tracing build it is additionally runtime-gated by LLMM_THREAD_TRACE,
+# so a profiling binary run without that env var still just does the work.
+@always_inline
+def traced_parallelize[
+    origins: OriginSet,
+    //,
+    label: StaticString,
+    work_fn: def(Int) raises capturing[origins] -> None,
+](num_workers: Int) raises -> None:
+    comptime if not is_defined["LLMM_TRACE"]():
+        sync_parallelize[work_fn](num_workers)
+    else:
+        var path = getenv("LLMM_THREAD_TRACE")
+        if path == "":
+            sync_parallelize[work_fn](num_workers)
+            return
+
+        var starts = alloc[UInt64](num_workers)
+        var ends = alloc[UInt64](num_workers)
+        var tids = alloc[UInt64](num_workers)
+
+        @parameter
+        def _timed_worker(i: Int) raises:
+            tids[i] = current_thread_id()
+            starts[i] = global_perf_counter_ns()
+            work_fn(i)
+            ends[i] = global_perf_counter_ns()
+
+        sync_parallelize[_timed_worker](num_workers)
+
+        # Appended from the calling (main) thread after the barrier, so the file
+        # is written sequentially — no cross-thread contention on the handle.
+        var f = open(path, "a")
+        for i in range(num_workers):
+            f.write(_trace_event(String(label), starts[i], ends[i], tids[i]))
+        f.close()
+
+        starts.free()
+        ends.free()
+        tids.free()
 
 
 # Escape the characters that are not legal inside a JSON string literal. Trace

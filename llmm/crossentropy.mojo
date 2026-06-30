@@ -11,6 +11,8 @@ from extensibility.managed_tensor_slice import (
 from std.gpu import block_dim, block_idx, thread_idx
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
+from llmm.profiler import traced_parallelize
+
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
@@ -59,7 +61,7 @@ def crossentropy_ohe_fwd_cpu[
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
-) -> None:
+) raises -> None:
     # NOTE: This function is uniquely different from the standard cross-entropu loss calculation.
     # Instead of neeeding to sum over the full vocabulary, we can just use the one-hot nature of
     # the probabilities to calculate the loss of the targets where softmax is 1.0 and the rest are 0.0.
@@ -91,7 +93,7 @@ def crossentropy_ohe_fwd_cpu[
                 vocab_size_padded,
             )
 
-    sync_parallelize[_chunk](num_chunks)
+    traced_parallelize["crossentropy_fwd", _chunk](num_chunks)
 
 
 def crossentropy_ohe_fwd_gpu[
@@ -242,7 +244,7 @@ def crossentropy_ohe_bwd_cpu[
     batch_size: Int64,  # Our B
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
-) -> None:
+) raises -> None:
     var num_chunks = Int((batch_size * seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE)
 
     @parameter
@@ -264,7 +266,7 @@ def crossentropy_ohe_bwd_cpu[
                 vocab_size_padded,
             )
 
-    sync_parallelize[_chunk](num_chunks)
+    traced_parallelize["crossentropy_bwd", _chunk](num_chunks)
 
 
 def crossentropy_ohe_bwd_gpu[

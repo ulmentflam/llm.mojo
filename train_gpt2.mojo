@@ -1,3 +1,4 @@
+from std.math import sqrt
 from std.os import getenv
 from std.python import Python
 from std.sys import (
@@ -9,10 +10,10 @@ from std.sys import (
 from std.time import global_perf_counter_ns
 from std.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
+from std.sys import get_defined_int, is_defined
 from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.memory import alloc, UnsafePointer, memcpy, memset_zero
-from std.math import sqrt
 
 from llmm.io import read_and_copy
 from llmm.dataloader import DataLoader
@@ -64,13 +65,18 @@ from llmm.zero import (
 # ===----------------------------------------------------------------------=== #
 
 
-from std.sys import get_defined_int
-
 comptime WORLD_SIZE_DEF = get_defined_int["WORLD_SIZE", 1]()
 
 comptime NUM_PARAMETER_TENSORS = 16
 comptime NUM_ACTIVATION_TENSORS = 25
-comptime GPT2_DTYPE = DType.float32
+# Parameter/activation/gradient precision. Defaults to fp32; build with
+# -D LLMM_BF16=1 for bf16 mixed-precision training. The layernorm/attention
+# statistics stay fp32 (StatsDType) and the optimizer keeps fp32 moments + an
+# fp32 master copy of the weights (MASTER_DTYPE) — matching llm.c — so the low-
+# precision params are only ever a rounded view of the fp32 math.
+comptime USE_BF16 = is_defined["LLMM_BF16"]()
+comptime GPT2_DTYPE = DType.bfloat16 if USE_BF16 else DType.float32
+comptime MASTER_DTYPE = DType.float32
 comptime GPT2_MAGIC = 20240520
 comptime EPSILON = 1e-5
 comptime UNROLL = 4
@@ -222,6 +228,13 @@ struct Activations:
     comptime attn_merged = 24
 
 
+# The layernorm/attention statistics (mean, rstd, lse) and the per-token losses
+# are always kept in fp32 (StatsDType), independent of the activation precision —
+# matching llm.c. They live in a separate fp32 buffer so the main activations can
+# be a lower precision (bf16/fp8) while these stay numerically safe.
+comptime StatsDType = DType.float32
+
+
 struct ActivationTensors[
     dtype: DType = DType.float32,
 ]:
@@ -230,20 +243,20 @@ struct ActivationTensors[
 
     # Layer Norm 1
     var ln_1: MutMemPtr[Self.dtype]  # (L, B, T, C)
-    var ln_1_mean: MutMemPtr[Self.dtype]  # (L, B, T)
-    var ln_1_rstd: MutMemPtr[Self.dtype]  # (L, B, T)
+    var ln_1_mean: MutMemPtr[StatsDType]  # (L, B, T)  fp32
+    var ln_1_rstd: MutMemPtr[StatsDType]  # (L, B, T)  fp32
 
     # Attention
     var qkv: MutMemPtr[Self.dtype]  # (L, B, T, 3*C)
-    var lse: MutMemPtr[Self.dtype]  # (L, B, NH, T)
+    var lse: MutMemPtr[StatsDType]  # (L, B, NH, T)  fp32
     var attn: MutMemPtr[Self.dtype]  # (L, B, T, C)
     var attn_proj: MutMemPtr[Self.dtype]  # (L, B, T, C)
     var residual_2: MutMemPtr[Self.dtype]  # (L, B, T, C)
 
     # Layer Norm 2
     var ln_2: MutMemPtr[Self.dtype]  # (L, B, T, C)
-    var ln_2_mean: MutMemPtr[Self.dtype]  # (L, B, T)
-    var ln_2_rstd: MutMemPtr[Self.dtype]  # (L, B, T)
+    var ln_2_mean: MutMemPtr[StatsDType]  # (L, B, T)  fp32
+    var ln_2_rstd: MutMemPtr[StatsDType]  # (L, B, T)  fp32
 
     # MLP
     var fch: MutMemPtr[Self.dtype]  # (L, B, T, 4*C)
@@ -253,10 +266,10 @@ struct ActivationTensors[
 
     # Layer Norm Final
     var ln_f: MutMemPtr[Self.dtype]  # (B, T, C)
-    var ln_f_mean: MutMemPtr[Self.dtype]  # (B, T)
-    var ln_f_rstd: MutMemPtr[Self.dtype]  # (B, T)
+    var ln_f_mean: MutMemPtr[StatsDType]  # (B, T)  fp32
+    var ln_f_rstd: MutMemPtr[StatsDType]  # (B, T)  fp32
     var logits: MutMemPtr[Self.dtype]  # (B, T, V)
-    var losses: MutMemPtr[Self.dtype]  # (B, T)
+    var losses: MutMemPtr[StatsDType]  # (B, T)  fp32
 
     # Scratch / Split-attention
     var q: MutMemPtr[Self.dtype]  # (L, B, NH, T, HS)
@@ -266,71 +279,116 @@ struct ActivationTensors[
 
     def __init__(out self):
         var zero = 0
-        self.encoded = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.ln_1 = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.ln_1_mean = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.ln_1_rstd = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.qkv = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.lse = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.attn = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.attn_proj = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.residual_2 = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.ln_2 = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.ln_2_mean = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.ln_2_rstd = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.fch = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.fch_gelu = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.fc_proj = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.residual_3 = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.ln_f = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.ln_f_mean = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.ln_f_rstd = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.logits = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.losses = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.q = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.k = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.v = MutMemPtr[Self.dtype](unsafe_from_address=zero)
-        self.attn_merged = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        var null_a = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        var null_s = MutMemPtr[StatsDType](unsafe_from_address=zero)
+        self.encoded = null_a
+        self.ln_1 = null_a
+        self.ln_1_mean = null_s
+        self.ln_1_rstd = null_s
+        self.qkv = null_a
+        self.lse = null_s
+        self.attn = null_a
+        self.attn_proj = null_a
+        self.residual_2 = null_a
+        self.ln_2 = null_a
+        self.ln_2_mean = null_s
+        self.ln_2_rstd = null_s
+        self.fch = null_a
+        self.fch_gelu = null_a
+        self.fc_proj = null_a
+        self.residual_3 = null_a
+        self.ln_f = null_a
+        self.ln_f_mean = null_s
+        self.ln_f_rstd = null_s
+        self.logits = null_a
+        self.losses = null_s
+        self.q = null_a
+        self.k = null_a
+        self.v = null_a
+        self.attn_merged = null_a
 
     def point_activations(
         mut self,
-        activation_sizes: List[Int],
-        activations_memory: MutMemPtr[Self.dtype],
+        sizes: List[Int],
+        main_memory: MutMemPtr[Self.dtype],
+        stats_memory: MutMemPtr[StatsDType],
     ) -> None:
-        comptime ActPtr = MutMemPtr[Self.dtype]
-        comptime ActPtrPtr = UnsafePointer[ActPtr, MutAnyOrigin]
+        # Same iterative layout as the parameters, but split across two blocks:
+        # the main (param-precision) activations live in `main_memory`, the fp32
+        # statistics/losses in `stats_memory`. Each list is (field-ptr, size) in
+        # buffer order; a running cursor walks each block independently.
+        comptime MainPtrPtr = UnsafePointer[MutMemPtr[Self.dtype], MutAnyOrigin]
+        comptime StatPtrPtr = UnsafePointer[MutMemPtr[StatsDType], MutAnyOrigin]
 
-        var ptrs = List[ActPtrPtr]()
-        ptrs.append(ActPtrPtr(to=self.encoded))
-        ptrs.append(ActPtrPtr(to=self.ln_1))
-        ptrs.append(ActPtrPtr(to=self.ln_1_mean))
-        ptrs.append(ActPtrPtr(to=self.ln_1_rstd))
-        ptrs.append(ActPtrPtr(to=self.qkv))
-        ptrs.append(ActPtrPtr(to=self.lse))
-        ptrs.append(ActPtrPtr(to=self.attn))
-        ptrs.append(ActPtrPtr(to=self.attn_proj))
-        ptrs.append(ActPtrPtr(to=self.residual_2))
-        ptrs.append(ActPtrPtr(to=self.ln_2))
-        ptrs.append(ActPtrPtr(to=self.ln_2_mean))
-        ptrs.append(ActPtrPtr(to=self.ln_2_rstd))
-        ptrs.append(ActPtrPtr(to=self.fch))
-        ptrs.append(ActPtrPtr(to=self.fch_gelu))
-        ptrs.append(ActPtrPtr(to=self.fc_proj))
-        ptrs.append(ActPtrPtr(to=self.residual_3))
-        ptrs.append(ActPtrPtr(to=self.ln_f))
-        ptrs.append(ActPtrPtr(to=self.ln_f_mean))
-        ptrs.append(ActPtrPtr(to=self.ln_f_rstd))
-        ptrs.append(ActPtrPtr(to=self.logits))
-        ptrs.append(ActPtrPtr(to=self.losses))
-        ptrs.append(ActPtrPtr(to=self.q))
-        ptrs.append(ActPtrPtr(to=self.k))
-        ptrs.append(ActPtrPtr(to=self.v))
-        ptrs.append(ActPtrPtr(to=self.attn_merged))
+        # Main (param-precision) activations, in buffer order, with their sizes.
+        var mains = List[MainPtrPtr]()
+        mains.append(MainPtrPtr(to=self.encoded))
+        mains.append(MainPtrPtr(to=self.ln_1))
+        mains.append(MainPtrPtr(to=self.qkv))
+        mains.append(MainPtrPtr(to=self.attn))
+        mains.append(MainPtrPtr(to=self.attn_proj))
+        mains.append(MainPtrPtr(to=self.residual_2))
+        mains.append(MainPtrPtr(to=self.ln_2))
+        mains.append(MainPtrPtr(to=self.fch))
+        mains.append(MainPtrPtr(to=self.fch_gelu))
+        mains.append(MainPtrPtr(to=self.fc_proj))
+        mains.append(MainPtrPtr(to=self.residual_3))
+        mains.append(MainPtrPtr(to=self.ln_f))
+        mains.append(MainPtrPtr(to=self.logits))
+        mains.append(MainPtrPtr(to=self.q))
+        mains.append(MainPtrPtr(to=self.k))
+        mains.append(MainPtrPtr(to=self.v))
+        mains.append(MainPtrPtr(to=self.attn_merged))
+        var main_idx = [
+            Activations.encoded,
+            Activations.ln_1,
+            Activations.qkv,
+            Activations.attn,
+            Activations.attn_proj,
+            Activations.residual_2,
+            Activations.ln_2,
+            Activations.fch,
+            Activations.fch_gelu,
+            Activations.fc_proj,
+            Activations.residual_3,
+            Activations.ln_f,
+            Activations.logits,
+            Activations.q,
+            Activations.k,
+            Activations.v,
+            Activations.attn_merged,
+        ]
 
-        var activations_memory_iterator = activations_memory
-        for i in range(len(activation_sizes)):
-            ptrs[i][] = activations_memory_iterator
-            activations_memory_iterator += activation_sizes[i]
+        # fp32 statistics/losses, in buffer order, with their sizes.
+        var stats = List[StatPtrPtr]()
+        stats.append(StatPtrPtr(to=self.ln_1_mean))
+        stats.append(StatPtrPtr(to=self.ln_1_rstd))
+        stats.append(StatPtrPtr(to=self.lse))
+        stats.append(StatPtrPtr(to=self.ln_2_mean))
+        stats.append(StatPtrPtr(to=self.ln_2_rstd))
+        stats.append(StatPtrPtr(to=self.ln_f_mean))
+        stats.append(StatPtrPtr(to=self.ln_f_rstd))
+        stats.append(StatPtrPtr(to=self.losses))
+        var stat_idx = [
+            Activations.ln_1_mean,
+            Activations.ln_1_rstd,
+            Activations.lse,
+            Activations.ln_2_mean,
+            Activations.ln_2_rstd,
+            Activations.ln_f_mean,
+            Activations.ln_f_rstd,
+            Activations.losses,
+        ]
+
+        var a = main_memory
+        for i in range(len(mains)):
+            mains[i][] = a
+            a += sizes[main_idx[i]]
+
+        var s = stats_memory
+        for i in range(len(stats)):
+            stats[i][] = s
+            s += sizes[stat_idx[i]]
 
 
 # ===----------------------------------------------------------------------=== #
@@ -364,15 +422,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # Buffer objects managing physical memory lifetimes
     var params_buf: DeviceBuffer[GPT2_DTYPE]
     var grads_buf: DeviceBuffer[GPT2_DTYPE]
-    var m_buf: DeviceBuffer[GPT2_DTYPE]
-    var v_buf: DeviceBuffer[GPT2_DTYPE]
+    var m_buf: DeviceBuffer[MASTER_DTYPE]
+    var v_buf: DeviceBuffer[MASTER_DTYPE]
+    # fp32 master copy of the weights (size #params) for bf16/fp8 training; a
+    # size-1 placeholder under fp32, where the params are their own master.
+    var master_buf: DeviceBuffer[MASTER_DTYPE]
     var acts_buf: DeviceBuffer[GPT2_DTYPE]
     var grad_acts_buf: DeviceBuffer[GPT2_DTYPE]
+    # fp32 statistics/losses, split out from the main (param-precision) acts.
+    var acts_stats_buf: DeviceBuffer[StatsDType]
+    var grad_acts_stats_buf: DeviceBuffer[StatsDType]
     var inputs_buf: HostBuffer[DType.int32]
     var targets_buf: HostBuffer[DType.int32]
     var bucket_info_buf: HostBuffer[DType.int32]
     var workload_indices_buf: HostBuffer[DType.int32]
-    var losses_host_buf: HostBuffer[GPT2_DTYPE]
+    var losses_host_buf: HostBuffer[StatsDType]
     var logits_host_buf: HostBuffer[GPT2_DTYPE]
 
     # Model weights and their sizes
@@ -385,19 +449,22 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var grads: ParameterTensors[GPT2_DTYPE]
     var grads_memory: MutMemPtr[GPT2_DTYPE]
 
-    # Buffers for AdamW
-    var m_memory: MutMemPtr[GPT2_DTYPE]
-    var v_memory: MutMemPtr[GPT2_DTYPE]
+    # Buffers for AdamW (always fp32, independent of the parameter precision).
+    var m_memory: MutMemPtr[MASTER_DTYPE]
+    var v_memory: MutMemPtr[MASTER_DTYPE]
+    var master_memory: MutMemPtr[MASTER_DTYPE]
 
     # Activations of the model, and their sizes
     var acts: ActivationTensors[GPT2_DTYPE]
     var act_sizes: List[Int]
     var acts_memory: MutMemPtr[GPT2_DTYPE]
+    var acts_stats_memory: MutMemPtr[StatsDType]
     var num_activations: Int
 
     # Gradients of the activations
     var grad_acts: ActivationTensors[GPT2_DTYPE]
     var grad_acts_memory: MutMemPtr[GPT2_DTYPE]
+    var grad_acts_stats_memory: MutMemPtr[StatsDType]
     var num_grads: Int
 
     # Runstate Configurations
@@ -466,6 +533,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
+        var NULL_MASTER_PTR = MutMemPtr[MASTER_DTYPE](unsafe_from_address=zero)
         var NULL_INT32_PTR = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
         self.sharded_grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
@@ -473,10 +541,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.params_memory = NULL_DTYPE_PTR
         self.grads_memory = NULL_DTYPE_PTR
-        self.m_memory = NULL_DTYPE_PTR
-        self.v_memory = NULL_DTYPE_PTR
+        self.m_memory = NULL_MASTER_PTR
+        self.v_memory = NULL_MASTER_PTR
+        self.master_memory = NULL_MASTER_PTR
         self.acts_memory = NULL_DTYPE_PTR
         self.grad_acts_memory = NULL_DTYPE_PTR
+        self.acts_stats_memory = NULL_MASTER_PTR
+        self.grad_acts_stats_memory = NULL_MASTER_PTR
         self.inputs = NULL_INT32_PTR
         self.targets = NULL_INT32_PTR
         self.bucket_info = NULL_INT32_PTR
@@ -498,10 +569,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
-        self.m_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
-        self.v_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
+        self.v_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
+        self.master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](1)
+        self.grad_acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](1)
         self.inputs_buf = self.ctx.enqueue_create_host_buffer[DType.int32](1)
         self.targets_buf = self.ctx.enqueue_create_host_buffer[DType.int32](1)
         self.bucket_info_buf = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -510,7 +584,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.workload_indices_buf = self.ctx.enqueue_create_host_buffer[
             DType.int32
         ](1)
-        self.losses_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+        self.losses_host_buf = self.ctx.enqueue_create_host_buffer[StatsDType](
             1
         )
         self.logits_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
@@ -534,7 +608,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             print("Bad magic number in header: " + String(model_header.load(0)))
             model_header.free()
             raise Error("GPT2 error: Invalid magic number in header")
-        if model_header.load(1) != 3:
+        # llm.c's version convention: 3 => fp32 params, 5 => bf16 params.
+        comptime EXPECTED_VERSION = 5 if GPT2_DTYPE == DType.bfloat16 else 3
+        if Int(model_header.load(1)) != EXPECTED_VERSION:
             print("Bad version in header: " + String(model_header.load(1)))
             model_header.free()
             raise Error("GPT2 error: Invalid version in header")
@@ -725,21 +801,53 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.has_allocated_grads = True
 
     def allocate_optimizer_moments(mut self) raises:
-        self.m_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.optimizer_num_parameters
-        )
-        self.v_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.optimizer_num_parameters
-        )
-        self.m_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
-        self.v_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        var n = self.optimizer_num_parameters
+        # Adam moments are always fp32 (MASTER_DTYPE), independent of param dtype.
+        self.m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](n)
+        self.v_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](n)
+        self.m_buf.enqueue_fill(Scalar[MASTER_DTYPE](0.0))
+        self.v_buf.enqueue_fill(Scalar[MASTER_DTYPE](0.0))
         self.ctx.synchronize()
-        self.m_memory = rebind_mut_mem[GPT2_DTYPE](
+        self.m_memory = rebind_mut_mem[MASTER_DTYPE](
             self.m_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-        self.v_memory = rebind_mut_mem[GPT2_DTYPE](
+        self.v_memory = rebind_mut_mem[MASTER_DTYPE](
             self.v_buf.unsafe_ptr().as_unsafe_any_origin()
         )
+
+        comptime if USE_BF16:
+            # Mixed precision: keep an fp32 master copy of the weights, seeded
+            # from the loaded (low-precision) params promoted to fp32. A one-time
+            # host round-trip with the cast (this runs once at startup).
+            self.master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](n)
+            self.master_memory = rebind_mut_mem[MASTER_DTYPE](
+                self.master_buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+            var host_p = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n)
+            var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n)
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    host_p.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                ](self.params_memory.as_unsafe_any_origin()),
+                size=n,
+            )
+            self.ctx.synchronize()
+            for i in range(n):
+                host_m[i] = host_p[i].cast[MASTER_DTYPE]()
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[
+                    UnsafePointer[Scalar[MASTER_DTYPE], MutAnyOrigin]
+                ](self.master_memory.as_unsafe_any_origin()),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[MASTER_DTYPE], ImmutAnyOrigin]
+                ](host_m.unsafe_ptr().as_unsafe_any_origin()),
+                size=n,
+            )
+            self.ctx.synchronize()
+
         self.has_allocated_optimizer_moments = True
 
     def allocate_activations(mut self, batch_size: Int, seq_len: Int) raises:
@@ -793,12 +901,30 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         print("Number of Activations: " + String(self.num_activations))
 
-        # Re-allocate device memory and point the structures
-        self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.num_activations
+        # The fp32 statistics/losses are split into their own buffer; everything
+        # else stays in the main (param-precision) buffer.
+        var stats_size = (
+            self.act_sizes[Activations.ln_1_mean]
+            + self.act_sizes[Activations.ln_1_rstd]
+            + self.act_sizes[Activations.lse]
+            + self.act_sizes[Activations.ln_2_mean]
+            + self.act_sizes[Activations.ln_2_rstd]
+            + self.act_sizes[Activations.ln_f_mean]
+            + self.act_sizes[Activations.ln_f_rstd]
+            + self.act_sizes[Activations.losses]
         )
+        var main_size = num_activations - stats_size
+
+        # Re-allocate device memory and point the structures
+        self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](main_size)
         self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.num_activations
+            main_size
+        )
+        self.acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](
+            stats_size
+        )
+        self.grad_acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](
+            stats_size
         )
 
         self.inputs_buf = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -819,7 +945,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             DType.int32
         ](B * T)
 
-        self.losses_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+        self.losses_host_buf = self.ctx.enqueue_create_host_buffer[StatsDType](
             self.batch_size * self.seq_len
         )
         self.logits_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
@@ -834,6 +960,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.grad_acts_memory = rebind_mut_mem[GPT2_DTYPE](
             self.grad_acts_buf.unsafe_ptr().as_unsafe_any_origin()
         )
+        self.acts_stats_memory = rebind_mut_mem[StatsDType](
+            self.acts_stats_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.grad_acts_stats_memory = rebind_mut_mem[StatsDType](
+            self.grad_acts_stats_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
         self.inputs = rebind_mut_mem[DType.int32](
             self.inputs_buf.unsafe_ptr().as_unsafe_any_origin()
         )
@@ -847,8 +979,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.workload_indices_buf.unsafe_ptr().as_unsafe_any_origin()
         )
 
-        self.acts.point_activations(self.act_sizes, self.acts_memory)
-        self.grad_acts.point_activations(self.act_sizes, self.grad_acts_memory)
+        self.acts.point_activations(
+            self.act_sizes, self.acts_memory, self.acts_stats_memory
+        )
+        self.grad_acts.point_activations(
+            self.act_sizes, self.grad_acts_memory, self.grad_acts_stats_memory
+        )
         self.has_allocated_acts = True
 
     def build_encoder_buckets(mut self, batch_size: Int, seq_len: Int) raises:
@@ -872,6 +1008,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     ) raises:
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
+        var NULL_MASTER_PTR = MutMemPtr[MASTER_DTYPE](unsafe_from_address=zero)
         var NULL_INT32_PTR = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
         if (
@@ -883,8 +1020,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             raise Error("GPT2 error: Gradients not allocated")
         if (
             not self.has_allocated_optimizer_moments
-            or self.m_memory == NULL_DTYPE_PTR
-            or self.v_memory == NULL_DTYPE_PTR
+            or self.m_memory == NULL_MASTER_PTR
+            or self.v_memory == NULL_MASTER_PTR
         ):
             raise Error("GPT2 error: Optimizer moments not allocated")
 
@@ -1041,8 +1178,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
                     as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_beta),
                     EPSILON,
-                    as_mut_kernel[GPT2_DTYPE](l_ln_1_mean),
-                    as_mut_kernel[GPT2_DTYPE](l_ln_1_rstd),
+                    as_mut_kernel[StatsDType](l_ln_1_mean),
+                    as_mut_kernel[StatsDType](l_ln_1_rstd),
                     Int64(batch_size),
                     Int64(seq_len),
                     Int64(channels),
@@ -1065,8 +1202,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
                     as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_beta),
                     EPSILON,
-                    as_mut_kernel[GPT2_DTYPE](l_ln_1_mean),
-                    as_mut_kernel[GPT2_DTYPE](l_ln_1_rstd),
+                    as_mut_kernel[StatsDType](l_ln_1_mean),
+                    as_mut_kernel[StatsDType](l_ln_1_rstd),
                     Int64(batch_size),
                     Int64(seq_len),
                     Int64(channels),
@@ -1096,7 +1233,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_mut_kernel[GPT2_DTYPE](l_v),
                 as_mut_kernel[GPT2_DTYPE](l_attn),
                 as_mut_kernel[GPT2_DTYPE](l_attn_merged),
-                as_mut_kernel[GPT2_DTYPE](l_lse),
+                as_mut_kernel[StatsDType](l_lse),
                 Int64(batch_size),
                 Int64(num_heads),
                 Int64(seq_len),
@@ -1127,8 +1264,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_2_gamma),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_2_beta),
                 EPSILON,
-                as_mut_kernel[GPT2_DTYPE](l_ln_2_mean),
-                as_mut_kernel[GPT2_DTYPE](l_ln_2_rstd),
+                as_mut_kernel[StatsDType](l_ln_2_mean),
+                as_mut_kernel[StatsDType](l_ln_2_rstd),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -1184,8 +1321,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             as_immut_kernel_from_mut[GPT2_DTYPE](self.params.ln_f_gamma),
             as_immut_kernel_from_mut[GPT2_DTYPE](self.params.ln_f_beta),
             EPSILON,
-            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f_mean),
-            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f_rstd),
+            as_mut_kernel[StatsDType](self.acts.ln_f_mean),
+            as_mut_kernel[StatsDType](self.acts.ln_f_rstd),
             Int64(batch_size),
             Int64(seq_len),
             Int64(channels),
@@ -1211,7 +1348,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         if targets != NULL_INT32_PTR:
             fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=False](
                 as_mut_kernel[GPT2_DTYPE](self.acts.logits),
-                as_mut_kernel[GPT2_DTYPE](self.acts.losses),
+                as_mut_kernel[StatsDType](self.acts.losses),
                 as_immut_kernel[DType.float32](
                     ImmutMemPtr[DType.float32](unsafe_from_address=zero)
                 ),
@@ -1229,11 +1366,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # Copy losses back to host.
             var count = batch_size * seq_len
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                dst_ptr=rebind[UnsafePointer[Scalar[StatsDType], MutAnyOrigin]](
                     self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 src_ptr=rebind[
-                    UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                    UnsafePointer[Scalar[StatsDType], ImmutAnyOrigin]
                 ](self.acts.losses.as_unsafe_any_origin()),
                 size=count,
             )
@@ -1285,15 +1422,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var dloss_mean = Scalar[DType.float32](1.0) / Scalar[DType.float32](
             batch_size * seq_len
         )
-        var dloss_val = dloss_mean.cast[GPT2_DTYPE]()
+        # The dloss seed and grad_acts.losses are fp32 (StatsDType), matching
+        # the fused classifier's fp32 read. Seed via the fp32 host buffer.
         for i in range(batch_size * seq_len):
-            self.losses_host_buf[i] = dloss_val
+            self.losses_host_buf[i] = dloss_mean
 
         self.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            dst_ptr=rebind[UnsafePointer[Scalar[StatsDType], MutAnyOrigin]](
                 self.grad_acts.losses.as_unsafe_any_origin()
             ),
-            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+            src_ptr=rebind[UnsafePointer[Scalar[StatsDType], ImmutAnyOrigin]](
                 self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()
             ),
             size=batch_size * seq_len,
@@ -1302,7 +1440,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # Fused classifier backward writes d_logits in-place into acts.logits.
         fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=True](
             as_mut_kernel[GPT2_DTYPE](self.acts.logits),
-            as_mut_kernel[GPT2_DTYPE](self.acts.losses),
+            as_mut_kernel[StatsDType](self.acts.losses),
             as_immut_kernel_from_mut[DType.float32](self.grad_acts.losses),
             as_immut_kernel_from_mut[DType.int32](self.targets),
             Int64(batch_size),
@@ -1345,8 +1483,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
             as_mut_kernel[GPT2_DTYPE](last_residual_3),
             as_immut_kernel_from_mut[GPT2_DTYPE](self.params.ln_f_gamma),
-            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f_mean),
-            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f_rstd),
+            as_mut_kernel[StatsDType](self.acts.ln_f_mean),
+            as_mut_kernel[StatsDType](self.acts.ln_f_rstd),
             as_mut_kernel[GPT2_DTYPE](self.grads.ln_f_gamma),
             as_mut_kernel[GPT2_DTYPE](self.grads.ln_f_beta),
             as_mut_kernel[GPT2_DTYPE](
@@ -1520,8 +1658,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
                 as_mut_kernel[GPT2_DTYPE](l_residual_2),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_2_gamma),
-                as_mut_kernel[GPT2_DTYPE](l_ln_2_mean),
-                as_mut_kernel[GPT2_DTYPE](l_ln_2_rstd),
+                as_mut_kernel[StatsDType](l_ln_2_mean),
+                as_mut_kernel[StatsDType](l_ln_2_rstd),
                 as_mut_kernel[GPT2_DTYPE](d_l_ln_2_gamma),
                 as_mut_kernel[GPT2_DTYPE](d_l_ln_2_beta),
                 as_mut_kernel[GPT2_DTYPE](
@@ -1562,7 +1700,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_mut_kernel[GPT2_DTYPE](l_k),
                 as_mut_kernel[GPT2_DTYPE](l_v),
                 as_mut_kernel[GPT2_DTYPE](l_attn),
-                as_mut_kernel[GPT2_DTYPE](l_lse),
+                as_mut_kernel[StatsDType](l_lse),
                 Int64(batch_size),
                 Int64(num_heads),
                 Int64(seq_len),
@@ -1594,8 +1732,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
                     as_mut_kernel[GPT2_DTYPE](l_ln_1),
                     as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
-                    as_mut_kernel[GPT2_DTYPE](l_ln_1_mean),
-                    as_mut_kernel[GPT2_DTYPE](l_ln_1_rstd),
+                    as_mut_kernel[StatsDType](l_ln_1_mean),
+                    as_mut_kernel[StatsDType](l_ln_1_rstd),
                     as_mut_kernel[GPT2_DTYPE](d_block_input),
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1_gamma),
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1_beta),
@@ -1618,8 +1756,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.acts.residual_3 + prev_layer_offset
                     ),
                     as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
-                    as_mut_kernel[GPT2_DTYPE](l_ln_1_mean),
-                    as_mut_kernel[GPT2_DTYPE](l_ln_1_rstd),
+                    as_mut_kernel[StatsDType](l_ln_1_mean),
+                    as_mut_kernel[StatsDType](l_ln_1_rstd),
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1_gamma),
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1_beta),
                     as_mut_kernel[GPT2_DTYPE](
@@ -1686,7 +1824,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 Self.WORLD_SIZE
             )
 
-        var config = AdamWConfig[GPT2_DTYPE](
+        var config = AdamWConfig(
             learning_rate=learning_rate,
             beta1=beta1,
             beta2=beta2,
@@ -1694,6 +1832,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             weight_decay=weight_decay,
             grad_scale=scaled_grad_scale,
         )
+
+        # The optimizer reads/writes the fp32 master copy when USE_BF16; in pure
+        # fp32 `master_memory` is null and `has_master=USE_BF16` is False, so the
+        # params are their own master (see llmm.adamw).
 
         comptime if is_cpu[Self.target]():
             var p_ptr: MutMemPtr[GPT2_DTYPE] = self.params_memory
@@ -1725,6 +1867,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     update_num_params,
                     p_ptr.as_unsafe_any_origin(),
                     g_ptr.as_unsafe_any_origin(),
+                    self.master_memory.as_unsafe_any_origin(),
+                    USE_BF16,
                     self.m_memory.as_unsafe_any_origin(),
                     self.v_memory.as_unsafe_any_origin(),
                     t,
@@ -1758,8 +1902,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.num_parameters,
                         as_mut_kernel[GPT2_DTYPE](self.params_memory),
                         as_mut_kernel[GPT2_DTYPE](self.grads_memory),
-                        as_mut_kernel[GPT2_DTYPE](self.m_memory),
-                        as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                        as_mut_kernel[MASTER_DTYPE](self.master_memory),
+                        USE_BF16,
+                        as_mut_kernel[MASTER_DTYPE](self.m_memory),
+                        as_mut_kernel[MASTER_DTYPE](self.v_memory),
                         t,
                         config,
                         self.ctx,
@@ -1782,8 +1928,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                             as_mut_kernel[GPT2_DTYPE](
                                 self.grads_memory + offset
                             ),
-                            as_mut_kernel[GPT2_DTYPE](self.m_memory),
-                            as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                            as_mut_kernel[MASTER_DTYPE](self.master_memory),
+                            USE_BF16,
+                            as_mut_kernel[MASTER_DTYPE](self.m_memory),
+                            as_mut_kernel[MASTER_DTYPE](self.v_memory),
                             t,
                             config,
                             self.ctx,
@@ -1815,8 +1963,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                             as_mut_kernel[GPT2_DTYPE](
                                 self.sharded_grads_memory
                             ),
-                            as_mut_kernel[GPT2_DTYPE](self.m_memory),
-                            as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                            as_mut_kernel[MASTER_DTYPE](self.master_memory),
+                            USE_BF16,
+                            as_mut_kernel[MASTER_DTYPE](self.m_memory),
+                            as_mut_kernel[MASTER_DTYPE](self.v_memory),
                             t,
                             config,
                             self.ctx,
@@ -1836,8 +1986,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.num_parameters,
                     as_mut_kernel[GPT2_DTYPE](self.params_memory),
                     as_mut_kernel[GPT2_DTYPE](self.grads_memory),
-                    as_mut_kernel[GPT2_DTYPE](self.m_memory),
-                    as_mut_kernel[GPT2_DTYPE](self.v_memory),
+                    as_mut_kernel[MASTER_DTYPE](self.master_memory),
+                    USE_BF16,
+                    as_mut_kernel[MASTER_DTYPE](self.m_memory),
+                    as_mut_kernel[MASTER_DTYPE](self.v_memory),
                     t,
                     config,
                     self.ctx,
@@ -1853,33 +2005,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             padded_vocab_size=self.config.padded_vocab_size,
         )
 
-    def _copy_device_to_host(
-        mut self,
-        host: HostBuffer[GPT2_DTYPE],
-        src: MutMemPtr[GPT2_DTYPE],
-        n: Int,
-    ) raises:
+    def _copy_device_to_host[
+        dtype: DType
+    ](mut self, host: HostBuffer[dtype], src: MutMemPtr[dtype], n: Int,) raises:
         self.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            dst_ptr=rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
                 host.unsafe_ptr().as_unsafe_any_origin()
             ),
-            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+            src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
                 src.as_unsafe_any_origin()
             ),
             size=n,
         )
 
-    def _copy_host_to_device(
-        mut self,
-        dst: MutMemPtr[GPT2_DTYPE],
-        host: HostBuffer[GPT2_DTYPE],
-        n: Int,
-    ) raises:
+    def _copy_host_to_device[
+        dtype: DType
+    ](mut self, dst: MutMemPtr[dtype], host: HostBuffer[dtype], n: Int,) raises:
         self.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            dst_ptr=rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
                 dst.as_unsafe_any_origin()
             ),
-            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+            src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
                 host.unsafe_ptr().as_unsafe_any_origin()
             ),
             size=n,
@@ -1917,7 +2063,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.num_parameters
             )
             self.ctx.synchronize()
-            self._copy_device_to_host(
+            self._copy_device_to_host[GPT2_DTYPE](
                 host_params, self.params_memory, self.num_parameters
             )
             self.ctx.synchronize()
@@ -1930,20 +2076,22 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.num_parameters,
             )
 
+        # AdamW moments are fp32 (MASTER_DTYPE), independent of the parameter
+        # precision, so the state file stores them in fp32 (matching llm.c).
         var n_opt = self.optimizer_num_parameters
-        var host_m = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n_opt)
-        var host_v = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n_opt)
+        var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
+        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
         self.ctx.synchronize()
-        self._copy_device_to_host(host_m, self.m_memory, n_opt)
-        self._copy_device_to_host(host_v, self.v_memory, n_opt)
+        self._copy_device_to_host[MASTER_DTYPE](host_m, self.m_memory, n_opt)
+        self._copy_device_to_host[MASTER_DTYPE](host_v, self.v_memory, n_opt)
         self.ctx.synchronize()
-        write_state_checkpoint(
+        write_state_checkpoint[MASTER_DTYPE](
             state_path,
             make_training_state(loader, step, sampler_rng_state),
-            rebind_mut_mem[GPT2_DTYPE](
+            rebind_mut_mem[MASTER_DTYPE](
                 host_m.unsafe_ptr().as_unsafe_any_origin()
             ),
-            rebind_mut_mem[GPT2_DTYPE](
+            rebind_mut_mem[MASTER_DTYPE](
                 host_v.unsafe_ptr().as_unsafe_any_origin()
             ),
             n_opt,
@@ -1970,27 +2118,28 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             ),
             self.num_parameters,
         )
-        self._copy_host_to_device(
+        self._copy_host_to_device[GPT2_DTYPE](
             self.params_memory, host_params, self.num_parameters
         )
         self.ctx.synchronize()
 
+        # AdamW moments are fp32 (MASTER_DTYPE); read them back in fp32.
         var n_opt = self.optimizer_num_parameters
-        var host_m = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n_opt)
-        var host_v = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n_opt)
+        var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
+        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
         self.ctx.synchronize()
-        var state = read_state_checkpoint(
+        var state = read_state_checkpoint[MASTER_DTYPE](
             state_path,
-            rebind_mut_mem[GPT2_DTYPE](
+            rebind_mut_mem[MASTER_DTYPE](
                 host_m.unsafe_ptr().as_unsafe_any_origin()
             ),
-            rebind_mut_mem[GPT2_DTYPE](
+            rebind_mut_mem[MASTER_DTYPE](
                 host_v.unsafe_ptr().as_unsafe_any_origin()
             ),
             n_opt,
         )
-        self._copy_host_to_device(self.m_memory, host_m, n_opt)
-        self._copy_host_to_device(self.v_memory, host_v, n_opt)
+        self._copy_host_to_device[MASTER_DTYPE](self.m_memory, host_m, n_opt)
+        self._copy_host_to_device[MASTER_DTYPE](self.v_memory, host_v, n_opt)
         self.ctx.synchronize()
         return state^
 

@@ -20,6 +20,7 @@ from std.gpu.host import DeviceContext, DeviceAttribute
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.gelu import gelu, gelu_grad
+from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
@@ -295,7 +296,7 @@ def matmul_bias_bwd_cpu[
     d_output_ptr: ImmutKernelPtr[dtype],
     rows: Int,  # (B * T) or (batch_size * seq_len)
     out_channels: Int,  # OC
-) -> None:
+) raises -> None:
     var max_workers = parallelism_level()
     var cols_per_worker = ceildiv(out_channels, max_workers)
     var num_workers = ceildiv(out_channels, cols_per_worker)
@@ -328,7 +329,7 @@ def matmul_bias_bwd_cpu[
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["matmul_bias_bwd", _worker](num_workers)
 
 
 def matmul_bias_bwd[
@@ -498,7 +499,7 @@ def _add_into[
     dst_ptr: MutKernelPtr[dtype],
     src_ptr: MutKernelPtr[dtype],
     total: Int,
-) -> None:
+) raises -> None:
     """dst += src elementwise, f32 math, one rounding at the store."""
     var max_workers = parallelism_level()
     var chunk = ceildiv(total, max_workers)
@@ -520,7 +521,7 @@ def _add_into[
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["matmul_d_input_bwd", _worker](num_workers)
 
 
 def matmul_d_weight_bwd[

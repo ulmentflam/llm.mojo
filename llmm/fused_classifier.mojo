@@ -12,8 +12,9 @@ from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu import barrier, block_idx, grid_dim, thread_idx
 
-from llmm.softmax import softmax_phase_1_and_2_cpu, softmax_phase_1_and_2_gpu
+from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
+from llmm.softmax import softmax_phase_1_and_2_cpu, softmax_phase_1_and_2_gpu
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
@@ -98,7 +99,7 @@ def fused_classifier_cpu[
     seq_len: Int64,  # Our T
     vocab_size: Int64,  # Our V
     vocab_size_padded: Int64,  # Our Vp
-) -> None:
+) raises -> None:
     var total = Int(batch_size * seq_len)
     var max_workers = parallelism_level()
     var rows_per_worker = ceildiv(total, max_workers)
@@ -120,7 +121,7 @@ def fused_classifier_cpu[
                 Int(vocab_size_padded),
             )
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["fused_classifier", _worker](num_workers)
 
 
 @always_inline

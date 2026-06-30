@@ -8,6 +8,7 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+
 from llmm.head_layout import (
     head_layout_flat_at_head_dim_zero,
     null_immut_ptr,
@@ -15,6 +16,7 @@ from llmm.head_layout import (
     token_layout_plane0_flat_at_head_dim_zero,
     token_layout_plane0_flat_from_head_layout_flat,
 )
+from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 # ===----------------------------------------------------------------------=== #
@@ -169,7 +171,7 @@ def _split_cpu[
     seq_len: Int,
     num_heads: Int,
     head_dim: Int,
-) -> None:
+) raises -> None:
     var channels = num_heads * head_dim
 
     @parameter
@@ -203,7 +205,7 @@ def _split_cpu[
                 head_dim,
             )
 
-    sync_parallelize[_worker](batch_size * num_heads)
+    traced_parallelize["split", _worker](batch_size * num_heads)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -225,7 +227,7 @@ def split_fwd_cpu[
     seq_len: Int,
     num_heads: Int,
     head_dim: Int,
-) -> None:
+) raises -> None:
     var null_immut = null_immut_ptr[dtype]()
     _split_cpu[dtype, width, num_splits, backward=False](
         src_ptr,
@@ -481,7 +483,7 @@ def split_bwd_cpu[
     seq_len: Int,
     num_heads: Int,
     head_dim: Int,
-) -> None:
+) raises -> None:
     var null_mut = null_mut_ptr[dtype]()
     _split_cpu[dtype, width, num_splits, backward=True](
         d_src_ptr,

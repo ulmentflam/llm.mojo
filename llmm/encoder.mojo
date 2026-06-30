@@ -11,7 +11,6 @@ from layout.layout_tensor import LayoutTensor
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from llmm.memory import ImmutKernelPtr, MutKernelPtr
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu import (
@@ -22,6 +21,10 @@ from std.gpu import (
     thread_idx,
     WARP_SIZE,
 )
+
+from llmm.profiler import traced_parallelize
+from llmm.memory import ImmutKernelPtr, MutKernelPtr
+
 
 # ===----------------------------------------------------------------------=== #
 # Constants
@@ -64,7 +67,7 @@ def encoder_fwd_cpu[
     batch_size: Int,
     seq_len: Int,
     channels: Int,
-) -> None:
+) raises -> None:
     var total_rows = batch_size * seq_len
     var max_workers = parallelism_level()
     var rows_per_worker = ceildiv(total_rows, max_workers)
@@ -92,7 +95,7 @@ def encoder_fwd_cpu[
 
             vectorize[width, unroll_factor=4](channels, _simd)
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["encoder_fwd", _worker](num_workers)
 
 
 @always_inline
@@ -372,7 +375,7 @@ def wte_backward_cpu[
     dout_ptr: ImmutKernelPtr[dtype],
     num_buckets: Int,
     channels: Int,
-) -> None:
+) raises -> None:
     var max_workers = parallelism_level()
     var buckets_per_worker = ceildiv(num_buckets, max_workers)
     var num_workers = ceildiv(num_buckets, buckets_per_worker)
@@ -435,7 +438,7 @@ def wte_backward_cpu[
 
                 vectorize[width, unroll_factor=4](c_len, _simd)
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["wte_backward", _worker](num_workers)
 
 
 def wpe_backward_cpu[
@@ -447,7 +450,7 @@ def wpe_backward_cpu[
     batch_size: Int,
     seq_len: Int,
     channels: Int,
-) -> None:
+) raises -> None:
     var max_workers = parallelism_level()
     var t_per_worker = ceildiv(seq_len, max_workers)
     var num_workers = ceildiv(seq_len, t_per_worker)
@@ -481,7 +484,7 @@ def wpe_backward_cpu[
 
             vectorize[width, unroll_factor=4](channels, _simd)
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["wpe_backward", _worker](num_workers)
 
 
 @always_inline

@@ -12,6 +12,8 @@ from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.primitives import block
+
+from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 # ===----------------------------------------------------------------------=== #
@@ -57,7 +59,7 @@ def global_norm_squared_cpu[
     out_ptr: MutKernelPtr[DType.float32],
     data_ptr: ImmutKernelPtr[dtype],
     num_params: Int,
-) -> None:
+) raises -> None:
     var max_workers = parallelism_level()
     var chunk = ceildiv(num_params, max_workers)
     var num_workers = ceildiv(num_params, chunk)
@@ -83,7 +85,7 @@ def global_norm_squared_cpu[
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
-    sync_parallelize[_worker](num_workers)
+    traced_parallelize["global_norm", _worker](num_workers)
 
     var total_sum = Scalar[DType.float32](0.0)
     for w in range(num_workers):

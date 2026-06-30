@@ -24,9 +24,13 @@ if [ -z "${MOJO_PYTHON_LIBRARY:-}" ]; then
 	exit 1
 fi
 
-if [ ! -x "$ROOT/build/profile_gpt2" ]; then
-	echo "error: $ROOT/build/profile_gpt2 not found (run: make build-profile)" >&2
+# Default to the standard profiling binary; profile-threads-cpu overrides this
+# with the -D LLMM_TRACE build via PROFILE_EXE.
+PROFILE_EXE="${PROFILE_EXE:-$ROOT/build/profile_gpt2}"
+
+if [ ! -x "$PROFILE_EXE" ]; then
+	echo "error: $PROFILE_EXE not found (run: make build-profile)" >&2
 	exit 1
 fi
 
-exec "$ROOT/build/profile_gpt2" "$@"
+exec "$PROFILE_EXE" "$@"

@@ -20,6 +20,7 @@ transformers = ">=4.40"
 tiktoken = ">=0.6"
 pytest = ">=8.0"
 pytest-xdist = ">=3"
+matplotlib = ">=3.11.0,<4"
 
 [pypi-dependencies]
 pyrefly = ">=0.16"
