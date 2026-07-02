@@ -1,17 +1,19 @@
 import compiler
-from std.sys import simd_width_of
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.math import ceildiv, exp, log
 from std.gpu.host import DeviceAttribute
+from std.sys import simd_width_of, align_of
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from std.sys._assembly import inlined_assembly
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu import barrier, block_idx, grid_dim, thread_idx
 
+from llmm.vendor import HAS_CUBLAS
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 from llmm.softmax import softmax_phase_1_and_2_cpu, softmax_phase_1_and_2_gpu
@@ -21,6 +23,51 @@ from llmm.softmax import softmax_phase_1_and_2_cpu, softmax_phase_1_and_2_gpu
 # ===----------------------------------------------------------------------=== #
 
 comptime UNROLL = 4
+comptime LOG2_E = Scalar[DType.float32](1.4426950408889634)
+
+
+# ===----------------------------------------------------------------------=== #
+# Fast Exponential Approximations
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def _fast_exp2[
+    width: Int
+](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    # Hardware ex2.approx.f32 (what CUDA's __expf/__exp2f compile to) via inline
+    # PTX — Mojo's exp/exp2 are accurate polynomials (~10× the ops). Per-lane.
+    var out = SIMD[DType.float32, width](0)
+
+    comptime for i in range(width):
+        out[i] = inlined_assembly[
+            "ex2.approx.f32 $0, $1;",
+            Float32,
+            constraints="=f,f",
+            has_side_effect=False,
+        ](x[i])
+    return out
+
+
+@always_inline
+def _fast_exp[
+    width: Int
+](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    return _fast_exp2(x * LOG2_E)
+
+
+@always_inline
+def _classifier_exp[
+    width: Int
+](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    # NVIDIA fast path: hardware ex2.approx.f32 via inline PTX (what CUDA's
+    # __expf compiles to). Vendor-neutral fallback: the accurate `exp`
+    # polynomial already used on the ragged edge below and on the CPU path
+    # (mathematically identical: exp2(x*LOG2_E) == exp(x)).
+    comptime if HAS_CUBLAS:
+        return _fast_exp(x)
+    else:
+        return exp(x)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -173,15 +220,16 @@ def _fused_classifier_gpu[
             var inv_s_vec = SIMD[DType.float32, width](inv_s)
             var d_loss_vec = SIMD[DType.float32, width](d_loss)
 
+            comptime align = align_of[SIMD[dtype, width]]()
             for tile_base in range(0, vocab_size, BLOCK_SPAN):
                 var lane_base = tile_base + tid * width
                 if lane_base + width <= vocab_size:
                     var x = (
                         (logits_ptr + base + lane_base)
-                        .load[width=width]()
+                        .load[width=width, alignment=align]()
                         .cast[DType.float32]()
                     )
-                    var p = exp(x - m_vec) * inv_s_vec
+                    var p = _classifier_exp(x - m_vec) * inv_s_vec
                     var d = p * d_loss_vec
                     if (
                         lane_base <= target_idx
@@ -189,9 +237,9 @@ def _fused_classifier_gpu[
                     ):
                         var k = target_idx - lane_base
                         d[k] = d[k] - d_loss
-                    (logits_ptr + base + lane_base).store[width=width](
-                        d.cast[dtype]()
-                    )
+                    (logits_ptr + base + lane_base).store[
+                        width=width, alignment=align
+                    ](d.cast[dtype]())
                 elif lane_base < vocab_size:
                     # Ragged edge of the last tile: scalar steps, same
                     # uniform-trip-count rule as the softmax kernels.
@@ -267,8 +315,10 @@ def fused_classifier[
             vocab_size_padded,
         )
     elif is_gpu[target]():
-        # Duplicated gpu dispatch code from the softmax ops.
-        comptime BLOCK_SIZE = 256
+        # Duplicated gpu dispatch code from the softmax ops. 1024 threads/block
+        # (matching llm.c's fused_classifier_kernel5) — one block reduces the full
+        # V=50k row, so more threads = a faster per-row softmax + gradient pass.
+        comptime BLOCK_SIZE = 1024
         comptime SM_OVERPROVISION = 32
         var device_ctx = ctx
         var num_rows = Int(batch_size * seq_len)
@@ -277,8 +327,9 @@ def fused_classifier[
         )
         var num_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
 
+        # 8-wide (128-bit) vectorized loads/stores like llm.c's x128.
         comptime gpu_kernel = fused_classifier_gpu[
-            dtype, BLOCK_SIZE, write_d_logits=write_d_logits
+            dtype, BLOCK_SIZE, 8, write_d_logits=write_d_logits
         ]
         var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(

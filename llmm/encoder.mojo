@@ -1,11 +1,11 @@
 import compiler
 from layout import Layout
 from std.math import ceildiv
-from std.sys import simd_width_of
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.memory import AddressSpace
 from std.gpu.host import DeviceAttribute
+from std.sys import simd_width_of, align_of
 from std.gpu.host.info import is_cpu, is_gpu
 from layout.layout_tensor import LayoutTensor
 from extensibility.managed_tensor_slice import (
@@ -45,15 +45,27 @@ comptime WTE_C_PER_WARP = 32 * WTE_BWD_SIMD_WIDTH
 def _encoder_fwd_vector_slice[
     dtype: DType,
     width: Int,
+    aligned: Bool = False,
 ](
     out_row_ptr: MutKernelPtr[dtype],
     wte_row_ptr: ImmutKernelPtr[dtype],
     wpe_row_ptr: ImmutKernelPtr[dtype],
     c: Int,
 ) -> None:
-    var wte_val = (wte_row_ptr + c).load[width=width]()
-    var wpe_val = (wpe_row_ptr + c).load[width=width]()
-    (out_row_ptr + c).store(wte_val + wpe_val)
+    # `aligned` is opt-in: the GPU caller's c = c_base + tid*width (c_base a
+    # multiple of block_dim.x*width) plus row bases that are multiples of
+    # `channels` (itself always a multiple of width) is provably
+    # width-aligned; the CPU caller isn't re-proven here, so it keeps the
+    # unaligned default.
+    comptime if aligned:
+        comptime align = align_of[SIMD[dtype, width]]()
+        var wte_val = (wte_row_ptr + c).load[width=width, alignment=align]()
+        var wpe_val = (wpe_row_ptr + c).load[width=width, alignment=align]()
+        (out_row_ptr + c).store[width=width, alignment=align](wte_val + wpe_val)
+    else:
+        var wte_val = (wte_row_ptr + c).load[width=width]()
+        var wpe_val = (wpe_row_ptr + c).load[width=width]()
+        (out_row_ptr + c).store(wte_val + wpe_val)
 
 
 def encoder_fwd_cpu[
@@ -122,7 +134,7 @@ def encoder_fwd_gpu_kernel[
     var ix = Int((inp_ptr + bt).load())
 
     if c + width <= channels:
-        _encoder_fwd_vector_slice[dtype, width](
+        _encoder_fwd_vector_slice[dtype, width, aligned=True](
             out_ptr + bt * channels,
             wte_ptr + ix * channels,
             wpe_ptr + t * channels,
@@ -320,6 +332,7 @@ def build_wte_buckets(
 def _accumulate_token_gradients[
     dtype: DType,
     width: Int,
+    aligned: Bool = False,
 ](
     dout_ptr: ImmutKernelPtr[dtype],
     workload_indices_ptr: ImmutKernelPtr[DType.int32],
@@ -330,17 +343,33 @@ def _accumulate_token_gradients[
     start_item: Int,
     step_size: Int,
 ) -> SIMD[DType.float32, width]:
+    # `aligned` opt-in: the GPU caller's c = channel_group*(WARP_SIZE*width) +
+    # lane_id*width is provably width-aligned (channels is also always a
+    # multiple of width), so bt*channels + c is too. The CPU caller isn't
+    # re-proven here, so it keeps the unaligned default.
     var accum = SIMD[DType.float32, width](0.0)
     var item = start_item
-    while item < bucket_size:
-        var bt = Int((workload_indices_ptr + start_idx + item).load())
-        var dout_val = (
-            (dout_ptr + bt * channels + c)
-            .load[width=width]()
-            .cast[DType.float32]()
-        )
-        accum += dout_val
-        item += step_size
+    comptime if aligned:
+        comptime align = align_of[SIMD[dtype, width]]()
+        while item < bucket_size:
+            var bt = Int((workload_indices_ptr + start_idx + item).load())
+            var dout_val = (
+                (dout_ptr + bt * channels + c)
+                .load[width=width, alignment=align]()
+                .cast[DType.float32]()
+            )
+            accum += dout_val
+            item += step_size
+    else:
+        while item < bucket_size:
+            var bt = Int((workload_indices_ptr + start_idx + item).load())
+            var dout_val = (
+                (dout_ptr + bt * channels + c)
+                .load[width=width]()
+                .cast[DType.float32]()
+            )
+            accum += dout_val
+            item += step_size
     return accum
 
 
@@ -348,15 +377,31 @@ def _accumulate_token_gradients[
 def _write_dwte_accumulation[
     dtype: DType,
     width: Int,
+    aligned: Bool = False,
 ](
     dwte_ptr: MutKernelPtr[dtype],
     dwte_offset: Int,
     accum: SIMD[DType.float32, width],
 ) -> None:
-    var prev_dwte = (
-        (dwte_ptr + dwte_offset).load[width=width]().cast[DType.float32]()
-    )
-    (dwte_ptr + dwte_offset).store((prev_dwte + accum).cast[dtype]())
+    # `aligned` opt-in: the GPU caller's dwte_offset = token_idx*channels + c
+    # is provably width-aligned (channels and c are both multiples of
+    # width — see _accumulate_token_gradients); the CPU caller keeps the
+    # unaligned default.
+    comptime if aligned:
+        comptime align = align_of[SIMD[dtype, width]]()
+        var prev_dwte = (
+            (dwte_ptr + dwte_offset)
+            .load[width=width, alignment=align]()
+            .cast[DType.float32]()
+        )
+        (dwte_ptr + dwte_offset).store[width=width, alignment=align](
+            (prev_dwte + accum).cast[dtype]()
+        )
+    else:
+        var prev_dwte = (
+            (dwte_ptr + dwte_offset).load[width=width]().cast[DType.float32]()
+        )
+        (dwte_ptr + dwte_offset).store((prev_dwte + accum).cast[dtype]())
 
 
 # ===----------------------------------------------------------------------=== #
@@ -531,7 +576,7 @@ def wte_backward_gpu_kernel[
     )
 
     if c + width <= channels:
-        var accum = _accumulate_token_gradients[dtype, width](
+        var accum = _accumulate_token_gradients[dtype, width, aligned=True](
             dout_ptr,
             workload_indices_ptr,
             start_idx,
@@ -568,7 +613,7 @@ def wte_backward_gpu_kernel[
                 final_accum += val
 
         if c + width <= channels:
-            _write_dwte_accumulation[dtype, width](
+            _write_dwte_accumulation[dtype, width, aligned=True](
                 dwte_ptr,
                 token_idx * channels + c,
                 final_accum,
@@ -598,6 +643,11 @@ def wpe_backward_gpu_kernel[
     var t = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var c_per_block = BLOCK_SIZE * width
+    # GPU-only kernel (no shared CPU helper): c = tile_base + tid*width is
+    # provably width-aligned (tile_base a multiple of c_per_block=BLOCK_SIZE*
+    # width), and channels is always a multiple of width, so both
+    # (b*seq_len+t)*channels + c and t*channels + c are provably aligned too.
+    comptime align = align_of[SIMD[dtype, width]]()
 
     for tile_base in range(0, channels, c_per_block):
         var c = tile_base + tid * width
@@ -609,16 +659,20 @@ def wpe_backward_gpu_kernel[
             for b in range(batch_size):
                 var dout_val = (
                     (dout_ptr + (b * seq_len + t) * channels + c)
-                    .load[width=width]()
+                    .load[width=width, alignment=align]()
                     .cast[DType.float32]()
                 )
                 accum += dout_val
 
             var offset = t * channels + c
             var prev_dwpe = (
-                (dwpe_ptr + offset).load[width=width]().cast[DType.float32]()
+                (dwpe_ptr + offset)
+                .load[width=width, alignment=align]()
+                .cast[DType.float32]()
             )
-            (dwpe_ptr + offset).store((prev_dwpe + accum).cast[dtype]())
+            (dwpe_ptr + offset).store[width=width, alignment=align](
+                (prev_dwpe + accum).cast[dtype]()
+            )
         else:
             for col in range(c, channels):
                 var accum = Scalar[DType.float32](0.0)

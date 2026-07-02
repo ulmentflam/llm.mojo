@@ -1,9 +1,9 @@
 import compiler
-from std.sys import simd_width_of
 from std.algorithm import vectorize
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.math import fma, sqrt, ceildiv
+from std.sys import simd_width_of, align_of
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -94,31 +94,43 @@ def _adamw_update[
 ) -> None:
     # This mirrors llm.c's `adamw_update`: read the grad as fp32, keep both Adam
     # moments in fp32, and do the weight update in fp32 against the master copy.
+    # Explicit alignment (idx = global_tid*width is naturally aligned but the
+    # compiler can't prove it) so the wide 128-bit loads/stores are emitted —
+    # without it Mojo issues narrow transactions and this bandwidth-bound kernel
+    # runs at ~half speed (same fix as the fused classifier).
+    comptime align_d = align_of[SIMD[dtype, width]]()
+    comptime align_f = align_of[SIMD[DType.float32, width]]()
     var grad = (
         config.grad_scale
-        * (grads_ptr + idx).load[width=width]().cast[DType.float32]()
+        * (grads_ptr + idx)
+        .load[width=width, alignment=align_d]()
+        .cast[DType.float32]()
     )
-    var m = (m_ptr + idx).load[width=width]()
-    var v = (v_ptr + idx).load[width=width]()
+    var m = (m_ptr + idx).load[width=width, alignment=align_f]()
+    var v = (v_ptr + idx).load[width=width, alignment=align_f]()
 
     # First moment (momentum), then bias-corrected to m_hat. The correction is a
     # width-1 scalar; broadcast it so the in-place op matches widths on CPU.
     m = lerp(grad, m, config.beta1)
-    (m_ptr + idx).store[width=width](m)
+    (m_ptr + idx).store[width=width, alignment=align_f](m)
     m /= SIMD[DType.float32, width](beta1_correction)
 
     # Second moment (RMSProp), then bias-corrected to v_hat.
     v = lerp(grad * grad, v, config.beta2)
-    (v_ptr + idx).store[width=width](v)
+    (v_ptr + idx).store[width=width, alignment=align_f](v)
     v /= SIMD[DType.float32, width](beta2_correction)
 
     # The current weight comes from the master copy when we keep one, otherwise
     # the params are already fp32-equivalent and serve as their own master.
     var old_param: SIMD[DType.float32, width]
     if has_master:
-        old_param = (master_ptr + idx).load[width=width]()
+        old_param = (master_ptr + idx).load[width=width, alignment=align_f]()
     else:
-        old_param = (params_ptr + idx).load[width=width]().cast[DType.float32]()
+        old_param = (
+            (params_ptr + idx)
+            .load[width=width, alignment=align_d]()
+            .cast[DType.float32]()
+        )
 
     # Decoupled weight decay update (this is what distinguishes AdamW from Adam).
     var param = old_param - config.learning_rate * (
@@ -128,9 +140,11 @@ def _adamw_update[
     # Round the fp32 result down into the low-precision params, and keep the fp32
     # master in sync when we have one.
     # TODO: Karpathy adds a stochastic rounding function here for low-precision params.
-    (params_ptr + idx).store[width=width](param.cast[dtype]())
+    (params_ptr + idx).store[width=width, alignment=align_d](
+        param.cast[dtype]()
+    )
     if has_master:
-        (master_ptr + idx).store[width=width](param)
+        (master_ptr + idx).store[width=width, alignment=align_f](param)
 
 
 def adamw_update_cpu[

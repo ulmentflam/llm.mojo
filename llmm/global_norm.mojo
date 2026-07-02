@@ -1,8 +1,7 @@
 import compiler
 from std.memory import alloc
-from std.sys import simd_width_of
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext, DeviceAttribute
+from std.sys import simd_width_of, align_of
 from std.math import sqrt, ceildiv, max, fma
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
@@ -10,6 +9,7 @@ from extensibility.managed_tensor_slice import (
 )
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
+from std.gpu.host import DeviceContext, DeviceAttribute
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.primitives import block
 
@@ -118,10 +118,15 @@ def _global_norm_squared_for_range_gpu[
     var accumulator = SIMD[DType.float32, width](0.0)
     var accumulator_tail = Scalar[DType.float32](0.0)
 
+    comptime align = align_of[SIMD[dtype, width]]()
     var idx = index
     while idx < count:
         if idx + width <= count:
-            var val = (data_ptr + idx).load[width=width]().cast[DType.float32]()
+            var val = (
+                (data_ptr + idx)
+                .load[width=width, alignment=align]()
+                .cast[DType.float32]()
+            )
             accumulator += val * val
         else:
             for j in range(idx, count):

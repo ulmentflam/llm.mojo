@@ -267,6 +267,10 @@ def split_gpu[
     head_dim: Int64,
     channels: Int64,
 ) -> None:
+    # One element per thread: consecutive threads map to consecutive head-layout
+    # AND token-layout elements (both contiguous along hd), so this is already
+    # coalesced with maximal parallelism. (Vectorizing to width=8 measured
+    # SLOWER — fewer threads under-saturate these memory-bound permutes.)
     var head_layout_flat_index = Int(block_idx.x * block_dim.x + thread_idx.x)
     var num_elements = Int(batch_size * num_heads * seq_len * head_dim)
     if head_layout_flat_index < num_elements:

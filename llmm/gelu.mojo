@@ -1,8 +1,8 @@
 import compiler
-from std.sys import simd_width_of
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host import DeviceAttribute
+from std.sys import simd_width_of, align_of
 from std.math import sqrt, ceildiv, tanh, pi
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
@@ -51,13 +51,29 @@ def gelu[
 def _gelu_fwd[
     dtype: DType,
     width: Int,
+    aligned: Bool = False,
 ](
     idx: Int,
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
 ) -> None:
-    var x = (x_ptr + idx).load[width=width]().cast[DType.float32]()
-    (out_ptr + idx).store(gelu(x).cast[dtype]())
+    # `aligned` is opt-in: the CPU caller's worker-chunk offset isn't
+    # provably width-aligned (chunk = ceildiv(num_params, max_workers) is a
+    # runtime value, not a multiple of width in general), but the GPU
+    # caller's idx = global_tid*width IS (same proof as adamw's idx).
+    comptime if aligned:
+        comptime align = align_of[SIMD[dtype, width]]()
+        var x = (
+            (x_ptr + idx)
+            .load[width=width, alignment=align]()
+            .cast[DType.float32]()
+        )
+        (out_ptr + idx).store[width=width, alignment=align](
+            gelu(x).cast[dtype]()
+        )
+    else:
+        var x = (x_ptr + idx).load[width=width]().cast[DType.float32]()
+        (out_ptr + idx).store(gelu(x).cast[dtype]())
 
 
 def gelu_fwd_gpu[
@@ -70,7 +86,7 @@ def gelu_fwd_gpu[
 ) -> None:
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
     if idx + width <= num_params:
-        _gelu_fwd[dtype, width](idx, out_ptr, x_ptr)
+        _gelu_fwd[dtype, width, aligned=True](idx, out_ptr, x_ptr)
     elif idx < num_params:
         # Last vector straddles num_params so handle the remainder one element at a time.
         for i in range(idx, num_params):
@@ -183,13 +199,26 @@ def gelu_grad[
 def _gelu_bwd[
     dtype: DType,
     width: Int,
+    aligned: Bool = False,
 ](
     idx: Int,
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
 ) -> None:
-    var x = (x_ptr + idx).load[width=width]().cast[DType.float32]()
-    (out_ptr + idx).store(gelu_grad(x).cast[dtype]())
+    # `aligned` is opt-in — see _gelu_fwd for the CPU-vs-GPU offset proof.
+    comptime if aligned:
+        comptime align = align_of[SIMD[dtype, width]]()
+        var x = (
+            (x_ptr + idx)
+            .load[width=width, alignment=align]()
+            .cast[DType.float32]()
+        )
+        (out_ptr + idx).store[width=width, alignment=align](
+            gelu_grad(x).cast[dtype]()
+        )
+    else:
+        var x = (x_ptr + idx).load[width=width]().cast[DType.float32]()
+        (out_ptr + idx).store(gelu_grad(x).cast[dtype]())
 
 
 def gelu_bwd_gpu[
@@ -202,7 +231,7 @@ def gelu_bwd_gpu[
 ) -> None:
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
     if idx + width <= num_params:
-        _gelu_bwd[dtype, width](idx, out_ptr, x_ptr)
+        _gelu_bwd[dtype, width, aligned=True](idx, out_ptr, x_ptr)
     elif idx < num_params:
         # Last vector straddles num_params so handle the remainder one element at a time.
         for i in range(idx, num_params):

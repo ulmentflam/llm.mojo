@@ -4,10 +4,13 @@ from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+
+from llmm.profiler import traced_parallelize
+
 from llmm.head_layout import (
     head_layout_flat_at_head_dim_zero,
     layout_copy,
@@ -15,9 +18,15 @@ from llmm.head_layout import (
     token_layout_plane0_flat_from_head_layout_flat,
     vectorize_layout_copy,
 )
-
-from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
+
+
+# ===----------------------------------------------------------------------=== #
+# Constants and Comptime Variables
+# ===----------------------------------------------------------------------=== #
+
+comptime MERGE_GPU_WIDTH = 1
+comptime MERGE_GPU_STREAMING = False
 
 
 # ===----------------------------------------------------------------------=== #
@@ -115,6 +124,8 @@ def merge_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     backward: Bool,
+    width: Int = 1,
+    streaming: Bool = False,
 ](
     dst_ptr: MutKernelPtr[dtype],
     src_ptr: ImmutKernelPtr[dtype],
@@ -124,7 +135,15 @@ def merge_gpu[
     head_dim: Int64,
     channels: Int64,
 ) -> None:
-    var head_layout_flat_index = Int(block_idx.x * block_dim.x + thread_idx.x)
+    # width=1/streaming=False: one element per thread (already coalesced, max
+    # parallelism — vectorizing to width=8 was measured slower; see
+    # split.mojo::split_gpu). width>1 threads each own a `width`-wide
+    # head_dim-contiguous chunk instead (item 4 experiment) — safe because
+    # head_dim is always a multiple of the widths swept here (GPT-2 head_dim
+    # is 64) so a chunk never straddles the head_dim boundary where the
+    # head-layout -> token-layout mapping stops being +1-contiguous.
+    var chunk_index = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var head_layout_flat_index = chunk_index * width
     var num_elements = Int(batch_size * num_heads * seq_len * head_dim)
     if head_layout_flat_index < num_elements:
         var token_layout_dst_flat_index = (
@@ -137,7 +156,7 @@ def merge_gpu[
                 Int(channels),
             )
         )
-        layout_copy[dtype, 1, backward](
+        layout_copy[dtype, width, backward, streaming](
             dst_ptr,
             src_ptr,
             token_layout_dst_flat_index,
@@ -157,7 +176,13 @@ def merge_fwd_gpu[
     head_dim: Int64,
     channels: Int64,
 ) -> None:
-    merge_gpu[dtype, BLOCK_SIZE, backward=False](
+    merge_gpu[
+        dtype,
+        BLOCK_SIZE,
+        backward=False,
+        width=MERGE_GPU_WIDTH,
+        streaming=MERGE_GPU_STREAMING,
+    ](
         dst_ptr,
         src_ptr,
         batch_size,
@@ -180,7 +205,13 @@ def merge_bwd_gpu[
     head_dim: Int64,
     channels: Int64,
 ) -> None:
-    merge_gpu[dtype, BLOCK_SIZE, backward=True](
+    merge_gpu[
+        dtype,
+        BLOCK_SIZE,
+        backward=True,
+        width=MERGE_GPU_WIDTH,
+        streaming=MERGE_GPU_STREAMING,
+    ](
         d_src_ptr,
         d_dst_ptr,
         batch_size,
@@ -217,7 +248,8 @@ def merge_fwd[
         var channels = num_heads * head_dim
         var num_elements = batch_size * num_heads * seq_len * head_dim
         comptime BLOCK_SIZE = 256
-        var num_blocks = (num_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
+        var num_chunks = (num_elements + MERGE_GPU_WIDTH - 1) // MERGE_GPU_WIDTH
+        var num_blocks = (num_chunks + BLOCK_SIZE - 1) // BLOCK_SIZE
         comptime gpu_kernel = merge_fwd_gpu[dtype, BLOCK_SIZE]
         var compiled = ctx.compile_function[gpu_kernel]()
         ctx.enqueue_function(
@@ -309,7 +341,8 @@ def merge_bwd[
         var channels = num_heads * head_dim
         var num_elements = batch_size * num_heads * seq_len * head_dim
         comptime BLOCK_SIZE = 256
-        var num_blocks = (num_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
+        var num_chunks = (num_elements + MERGE_GPU_WIDTH - 1) // MERGE_GPU_WIDTH
+        var num_blocks = (num_chunks + BLOCK_SIZE - 1) // BLOCK_SIZE
         comptime gpu_kernel = merge_bwd_gpu[dtype, BLOCK_SIZE]
         var compiled = ctx.compile_function[gpu_kernel]()
         ctx.enqueue_function(

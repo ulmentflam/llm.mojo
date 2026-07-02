@@ -1,8 +1,22 @@
 import compiler
-from layout import Layout
+from layout import Layout, TileTensor
+from layout.tile_layout import row_major
 from std.memory import alloc
-from std.sys import simd_width_of
-from std.gpu.primitives import warp
+from std.sys import simd_width_of, align_of
+from std.utils.index import IndexList, Index
+from linalg.matmul import matmul
+from linalg.matmul.vendor import blas
+from _cublas.cublas import (
+    cublasGemmStridedBatchedEx,
+    ComputeType,
+    Algorithm,
+    check_cublas_error,
+    _convert_to_cublas_transpose,
+)
+from _cublas.dtype import DataType
+from linalg.matmul.vendor.blas import _get_global_handle
+from layout.tensor_core import TensorCore
+from std.gpu.primitives import warp, block
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.memory import AddressSpace
@@ -26,8 +40,10 @@ from std.gpu import (
 
 from llmm.split import split_fwd, split_bwd
 from llmm.merge import merge_fwd, merge_bwd
+from llmm.matmul import _matmul_cublaslt
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
+from llmm.vendor import HAS_CUBLAS
 
 
 # ===----------------------------------------------------------------------=== #
@@ -41,11 +57,42 @@ struct KVCache:
     var fwd_addr: Int
     var bwd_dq_addr: Int
     var bwd_dkv_addr: Int
+    # Persistent GEMM-attention scratch (heap-held DeviceBuffer addresses). The
+    # [B·nh, T, T] scores/probability planes are reused across every layer and
+    # step, so they are allocated once and kept alive here. Allocating fresh
+    # DeviceBuffers per layer races: their frees are not ordered against the
+    # async GEMM/softmax kernels that still read them.
+    var gemm_scores_addr: Int
+    var gemm_att_addr: Int
+    # Persistent GEMM-attention backward scratch (heap-held DeviceBuffer
+    # addresses), allocated once like the forward scratch above.
+    var gemm_ds_addr: Int
+    var gemm_dst_addr: Int
+    var gemm_pt_addr: Int
+    var gemm_d_addr: Int
+    var gemm_dp_addr: Int
+    # Stored softmax probs (⑳-storage): base pointer of the train's per-layer
+    # [L, B·nh, T, T] att_probs buffer, the current layer, and the per-layer
+    # stride (B·nh·T·T). When att_probs_addr != 0 the forward writes P here (per
+    # layer) and the backward READS it instead of recomputing QKᵀ.
+    var att_probs_addr: Int
+    var att_probs_layer: Int
+    var att_probs_stride: Int
 
     def __init__(out self):
         self.fwd_addr = 0
         self.bwd_dq_addr = 0
         self.bwd_dkv_addr = 0
+        self.gemm_scores_addr = 0
+        self.gemm_att_addr = 0
+        self.gemm_ds_addr = 0
+        self.gemm_dst_addr = 0
+        self.gemm_pt_addr = 0
+        self.gemm_d_addr = 0
+        self.gemm_dp_addr = 0
+        self.att_probs_addr = 0
+        self.att_probs_layer = 0
+        self.att_probs_stride = 0
 
 
 comptime KVCachePtr = UnsafePointer[
@@ -58,6 +105,9 @@ comptime KVCachePtr = UnsafePointer[
 # ===----------------------------------------------------------------------=== #
 
 comptime UNROLL = 4
+comptime USE_LT_ATTN = False  # cuBLASLt-batched attention: verified NEUTRAL — it
+# selects the identical cutlass wmma/tensorop kernels as cublasGemmStridedBatchedEx
+# (hd=64 is at the hardware floor for both APIs, same as llm.c). Path kept, off.
 comptime MAX_HEAD_DIM = 128
 comptime TAU = Scalar[DType.float32](
     8.0
@@ -846,8 +896,11 @@ def _attention_gpu_process_key_value_tile_warp[
                             ).cast[dtype]()
                     state.softmax_max_deferred = candidate_max
 
-            barrier()
-
+        # NOTE: No intra-tile barrier here. Each warp owns a disjoint set of
+        # query rows, reads only the (read-only) shared Q/K/V tiles, and writes
+        # only its own DRAM output rows and its own shared softmax-state slots.
+        # There is no inter-warp dependency inside this routine; KV-tile reload
+        # safety is enforced by the caller's barriers around the shared K/V copy.
         if lane_id == 0:
             _attention_store_online_softmax_state_to_shared[
                 use_soft_exp, use_conditional_rescale
@@ -859,7 +912,6 @@ def _attention_gpu_process_key_value_tile_warp[
                 local_query_row,
                 state,
             )
-        barrier()
 
 
 @always_inline
@@ -1155,6 +1207,464 @@ def attention_fwd_gpu[
         )
 
 
+# ===----------------------------------------------------------------------=== #
+# Attention Forward — GPU, tensor-core GEMM path
+# ===----------------------------------------------------------------------=== #
+#
+# The flash kernels above run the O(T²·d) QKᵀ and A·V math on CUDA cores at 0%
+# tensor-core utilization, which dominates the step at long T (see
+# docs/benchmarks.md). This path instead decomposes attention the way llm.c does:
+#   1. QKᵀ as a per-head tensor-core GEMM (bf16 in, fp32 scores out, scaled).
+#   2. a dedicated causal softmax that also emits log-sum-exp (for the existing
+#      flash backward, which is left untouched).
+#   3. A·V as a per-head tensor-core GEMM (bf16 probabilities × bf16 V).
+# It materializes the [B·nh, T, T] scores/probabilities, trading memory for
+# tensor-core throughput. Toggle with USE_GEMM_ATTENTION. This path is built on
+# cuBLAS(Lt) batched GEMMs (see _attn_gemm_batched/attention_bwd_gemm below), so
+# it defaults to HAS_CUBLAS (llmm/vendor.mojo) — non-NVIDIA GPU builds
+# automatically fall back to the pure-Mojo flash kernels above instead, which
+# are already vendor-neutral (no FFI). Independently overridable on NVIDIA for
+# perf experiments (e.g. -D LLMM_FORCE_PORTABLE_GPU=1 forces both off together
+# since USE_GEMM_ATTENTION derives from HAS_CUBLAS).
+
+comptime USE_GEMM_ATTENTION = HAS_CUBLAS
+
+# Softmax-forward vectorized-load A/B (item 3): width=1 is the original
+# scalar-per-thread-per-iteration load (bit-identical baseline); True switches
+# to simd_width_of[dtype]()-wide chunked loads (llm.c kernel5's 4-wide
+# `regarray` pattern). See docs/benchmarks.md for the measured verdict.
+comptime USE_SOFTMAX_VEC_LOADS = False
+
+
+@always_inline
+def _attention_softmax_causal_gpu[
+    dtype: DType,
+    BLOCK_SIZE: Int,
+    width: Int = 1,
+](
+    num_rows: Int,
+    seq_len: Int,
+    attention_scale: Scalar[DType.float32],
+    scores_ptr: ImmutKernelPtr[dtype],
+    att_ptr: MutKernelPtr[dtype],
+    lse_ptr: MutKernelPtr[DType.float32],
+) -> None:
+    # One block per scores row (grid-strided). Row r belongs to head r // T and
+    # query position i = r % T, so the causal prefix is columns [0, i]. The raw
+    # QKᵀ dot products are scaled here (kept out of the GEMM epilogue so Q/K stay
+    # unscaled for the backward pass). lse = m + log(sum exp(s - m)) matches the
+    # flash kernel's definition exactly.
+    #
+    # Both passes read the row in `width`-wide chunks per thread (the tile
+    # pattern used in layernorm's fused-residual kernel:
+    # `lane_base = tile_base + tid*width`, scalar tail for the remainder) —
+    # llm.c's softmax_forward_kernel5 similarly reads via a `regarray[4]`
+    # vector load. The causal prefix length (`valid = query_index + 1`) isn't
+    # width-aligned in general, so each tile falls back to a per-element
+    # scalar loop once `lane_base + width > valid`.
+    comptime BLOCK_SPAN = BLOCK_SIZE * width
+    comptime align = align_of[SIMD[dtype, width]]()
+    var tid = Int(thread_idx.x)
+    var stride = Int(grid_dim.x)
+    var block_row = Int(block_idx.x)
+    for row in range(block_row, num_rows, stride):
+        var query_index = row % seq_len
+        var valid = query_index + 1
+        var base = row * seq_len
+
+        var m_thread = Scalar[DType.float32].MIN_FINITE
+        var s_thread = Scalar[DType.float32](0.0)
+        for tile_base in range(0, valid, BLOCK_SPAN):
+            var lane_base = tile_base + tid * width
+            if lane_base + width <= valid:
+                var xv = (scores_ptr + base + lane_base).load[
+                    width=width, alignment=align
+                ]().cast[DType.float32]() * attention_scale
+
+                comptime for i in range(width):
+                    var x = xv[i]
+                    var new_m = max(m_thread, x)
+                    s_thread = s_thread * exp(m_thread - new_m) + exp(x - new_m)
+                    m_thread = new_m
+            elif lane_base < valid:
+                for c in range(lane_base, valid):
+                    var x = (
+                        scores_ptr[base + c].cast[DType.float32]()
+                        * attention_scale
+                    )
+                    var new_m = max(m_thread, x)
+                    s_thread = s_thread * exp(m_thread - new_m) + exp(x - new_m)
+                    m_thread = new_m
+
+        var m_row = block.max[block_size=BLOCK_SIZE](m_thread)
+        s_thread = s_thread * exp(m_thread - m_row)
+        var s_row = block.sum[block_size=BLOCK_SIZE](s_thread)
+        var inv_s = Scalar[DType.float32](1.0) / s_row
+
+        if tid == 0:
+            lse_ptr[row] = m_row + log(s_row)
+
+        # Write only the causal prefix [0, valid); the above-diagonal half of
+        # att_ptr is left at its persistent zero (memset once on allocation),
+        # which halves this store pass.
+        var m_row_vec = SIMD[DType.float32, width](m_row)
+        var inv_s_vec = SIMD[DType.float32, width](inv_s)
+        for tile_base in range(0, valid, BLOCK_SPAN):
+            var lane_base = tile_base + tid * width
+            if lane_base + width <= valid:
+                var idx = base + lane_base
+                var xv = (scores_ptr + idx).load[
+                    width=width, alignment=align
+                ]().cast[DType.float32]() * attention_scale
+                var p = exp(xv - m_row_vec) * inv_s_vec
+                (att_ptr + idx).store[alignment=align](p.cast[dtype]())
+            elif lane_base < valid:
+                for c2 in range(lane_base, valid):
+                    var idx = base + c2
+                    var p = (
+                        exp(
+                            scores_ptr[idx].cast[DType.float32]()
+                            * attention_scale
+                            - m_row
+                        )
+                        * inv_s
+                    )
+                    att_ptr[idx] = p.cast[dtype]()
+
+
+# Integrated, validated, but DISABLED: the fused flash forward below is correct
+# (bf16 loss matches the GEMM forward within noise) but, at BR=16/BC=16 with one
+# warp per query-tile, it runs the forward at ~0.16 s vs the GEMM forward's
+# ~0.075 s — poor MMA occupancy outweighs the saved [B·nh,T,T] bandwidth passes.
+# Beating the tuned GEMM needs bigger tiles (BR/BC=64) + multi-warp + occupancy
+# tuning. Kept wired behind the flag for that future work; off so the faster GEMM
+# forward ships.
+comptime USE_FLASH_FWD = False
+
+
+@always_inline
+def _flash_sh[
+    dt: DType, R: Int, C: Int
+]() -> LayoutTensor[
+    dt, Layout.row_major(R, C), MutAnyOrigin, address_space=AddressSpace.SHARED
+]:
+    return LayoutTensor[
+        dt,
+        Layout.row_major(R, C),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+
+@always_inline
+def _attention_flash_fwd_gpu[
+    dtype: DType,
+    BR: Int,
+    BC: Int,
+    HEAD_DIM: Int,
+](
+    num_tiles: Int,
+    num_query_tiles: Int,
+    seq_len: Int,
+    attention_scale: Scalar[DType.float32],
+    q_ptr: ImmutKernelPtr[dtype],
+    k_ptr: ImmutKernelPtr[dtype],
+    v_ptr: ImmutKernelPtr[dtype],
+    o_ptr: MutKernelPtr[dtype],
+    lse_ptr: MutKernelPtr[DType.float32],
+) -> None:
+    # One warp per (head, query-tile of BR rows). Streams causal KV tiles of BC
+    # with online-softmax rescale; QKᵀ and P·V on tensor cores (P·V over Vᵀ),
+    # softmax in shared. Produces per-head attn + lse (the GEMM backward consumes
+    # these unchanged). Validated bit-accurately in scratch/test_flash.mojo.
+    var q_sh = _flash_sh[dtype, BR, HEAD_DIM]()
+    var k_sh = _flash_sh[dtype, BC, HEAD_DIM]()
+    var v_sh = _flash_sh[dtype, BC, HEAD_DIM]()
+    var vt_sh = _flash_sh[dtype, HEAD_DIM, BC]()
+    var s_sh = _flash_sh[DType.float32, BR, BC]()
+    var p_sh = _flash_sh[dtype, BR, BC]()
+    var o_sh = _flash_sh[DType.float32, BR, HEAD_DIM]()
+    var pv_sh = _flash_sh[DType.float32, BR, HEAD_DIM]()
+    var m_sh = _flash_sh[DType.float32, 1, BR]()
+    var l_sh = _flash_sh[DType.float32, 1, BR]()
+
+    var qk = TensorCore[
+        DType.float32, dtype, Index(16, 8, 16), transpose_b=True
+    ]()
+    var pv = TensorCore[
+        DType.float32, dtype, Index(16, 8, 16), transpose_b=True
+    ]()
+    comptime NWARPS = BR // 16
+    comptime NTHREADS = NWARPS * 32
+    var t = Int(thread_idx.x)
+    var warp_id = t // 32  # each warp owns rows [warp_id*16, +16]
+
+    for tile in range(Int(block_idx.x), num_tiles, Int(grid_dim.x)):
+        var bh = tile // num_query_tiles
+        var query_start = (tile % num_query_tiles) * BR
+        var head_off = bh * seq_len * HEAD_DIM
+        var qoff = head_off + query_start * HEAD_DIM
+
+        var e = t
+        while e < BR * HEAD_DIM:
+            var r = e // HEAD_DIM
+            q_sh.ptr[e] = q_ptr[
+                qoff + e
+            ] if query_start + r < seq_len else Scalar[dtype](0)
+            o_sh.ptr[e] = 0.0
+            e += NTHREADS
+        if t < BR:
+            m_sh.ptr[t] = Scalar[DType.float32].MIN_FINITE
+            l_sh.ptr[t] = 0.0
+        barrier()
+
+        var last_key = min(query_start + BR, seq_len)
+        for kt in range(0, last_key, BC):
+            var e2 = t
+            while e2 < BC * HEAD_DIM:
+                var kr = e2 // HEAD_DIM
+                var ok = kt + kr < seq_len
+                k_sh.ptr[e2] = k_ptr[
+                    head_off + kt * HEAD_DIM + e2
+                ] if ok else Scalar[dtype](0)
+                v_sh.ptr[e2] = v_ptr[
+                    head_off + kt * HEAD_DIM + e2
+                ] if ok else Scalar[dtype](0)
+                e2 += NTHREADS
+            barrier()
+            e2 = t
+            while e2 < BC * HEAD_DIM:
+                vt_sh.ptr[(e2 % HEAD_DIM) * BC + (e2 // HEAD_DIM)] = v_sh.ptr[
+                    e2
+                ]
+                e2 += NTHREADS
+            barrier()
+
+            comptime for n in range(BC // 8):
+                var c0 = qk.c_reg_tile_type.stack_allocation().fill(0.0)
+                comptime for kk in range(HEAD_DIM // 16):
+                    var qa = qk.load_a(q_sh.tile[16, 16](warp_id, kk))
+                    var kb = qk.load_b(k_sh.tile[8, 16](n, kk))
+                    c0 = qk.mma_op(qa, kb, c0)
+                qk.store_d(s_sh.tile[16, 8](warp_id, n), c0)
+            barrier()
+
+            if t < BR:
+                var qi = query_start + t
+                var srow = s_sh.ptr + t * BC
+                var prow = p_sh.ptr + t * BC
+                var tile_max = Scalar[DType.float32].MIN_FINITE
+                for j in range(BC):
+                    var kj = kt + j
+                    if kj > qi or kj >= seq_len:
+                        srow[j] = Scalar[DType.float32].MIN_FINITE
+                    else:
+                        srow[j] = srow[j] * attention_scale
+                    tile_max = max(tile_max, srow[j])
+                var m_old = m_sh.ptr[t]
+                var m_new = max(m_old, tile_max)
+                var rescale = software_emulated_exp[True](m_old - m_new)
+                var tile_sum = Scalar[DType.float32](0.0)
+                for j in range(BC):
+                    var p = software_emulated_exp[True](srow[j] - m_new)
+                    tile_sum += p
+                    prow[j] = p.cast[dtype]()
+                l_sh.ptr[t] = l_sh.ptr[t] * rescale + tile_sum
+                m_sh.ptr[t] = m_new
+                var orow = o_sh.ptr + t * HEAD_DIM
+                for d in range(HEAD_DIM):
+                    orow[d] = orow[d] * rescale
+            barrier()
+
+            # O += P·V over Vᵀ. P is [BR,BC], so loop the BC dimension in 16-wide
+            # k-tiles (BC//16 dense MMAs per n) — this is what makes the big-tile
+            # version keep the tensor cores busy vs one MMA per n at BC=16.
+            comptime for n in range(HEAD_DIM // 8):
+                var oc = pv.c_reg_tile_type.stack_allocation().fill(0.0)
+                comptime for kk in range(BC // 16):
+                    var pa = pv.load_a(p_sh.tile[16, 16](warp_id, kk))
+                    var vb = pv.load_b(vt_sh.tile[8, 16](n, kk))
+                    oc = pv.mma_op(pa, vb, oc)
+                pv.store_d(pv_sh.tile[16, 8](warp_id, n), oc)
+            barrier()
+            if t < BR:
+                var orow = o_sh.ptr + t * HEAD_DIM
+                var pvrow = pv_sh.ptr + t * HEAD_DIM
+                for d in range(HEAD_DIM):
+                    orow[d] += pvrow[d]
+            barrier()
+
+        if t < BR and query_start + t < seq_len:
+            var inv = Scalar[DType.float32](1.0) / l_sh.ptr[t]
+            var orow = o_sh.ptr + t * HEAD_DIM
+            for d in range(HEAD_DIM):
+                o_ptr[qoff + t * HEAD_DIM + d] = (orow[d] * inv).cast[dtype]()
+            lse_ptr[bh * seq_len + query_start + t] = m_sh.ptr[t] + log(
+                l_sh.ptr[t]
+            )
+        barrier()
+
+
+def attention_fwd_gemm[
+    dtype: DType,
+    target: StaticString,
+](
+    output_ptr: MutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: MutKernelPtr[DType.float32],
+    batch_size: Int64,
+    num_heads: Int64,
+    seq_len: Int64,
+    head_dim: Int64,
+    ctx: DeviceContext,
+    cache: Optional[KVCachePtr] = None,
+) capturing raises:
+    var B = Int(batch_size)
+    var NH = Int(num_heads)
+    var T = Int(seq_len)
+    var hd = Int(head_dim)
+    var BH = B * NH
+    var attention_scale = Scalar[DType.float32](1.0) / sqrt(
+        Scalar[DType.float32](hd)
+    )
+    var device_ctx = ctx
+
+    # Fused flash forward (bf16, head_dim=64): one warp per (head, query-tile),
+    # streams causal KV tiles with online softmax — no [B·nh,T,T] materialization.
+    # Produces the same per-head attn + lse the GEMM backward already consumes.
+    comptime if USE_FLASH_FWD and dtype == DType.bfloat16:
+        if hd == 64:
+            comptime BR = 64
+            comptime BC = 64
+            comptime SM_OVERPROVISION_F = 32
+            var num_query_tiles = ceildiv(T, BR)
+            var num_tiles_f = BH * num_query_tiles
+            var num_sm_f = device_ctx.get_attribute(
+                DeviceAttribute.MULTIPROCESSOR_COUNT
+            )
+            var num_blocks_f = max(
+                min(num_tiles_f, SM_OVERPROVISION_F * num_sm_f), 1
+            )
+            comptime flash_kernel = _attention_flash_fwd_gpu[dtype, BR, BC, 64]
+            var flash_compiled = device_ctx.compile_function[flash_kernel]()
+            device_ctx.enqueue_function(
+                flash_compiled,
+                num_tiles_f,
+                num_query_tiles,
+                T,
+                attention_scale,
+                query_ptr,
+                key_ptr,
+                value_ptr,
+                output_ptr,
+                log_sum_exp_ptr,
+                grid_dim=(num_blocks_f,),
+                block_dim=(BR // 16 * 32,),
+            )
+            device_ctx.synchronize()
+            return
+
+    # Scratch: bf16 scores and bf16 probabilities, one [T, T] plane per head.
+    # scores feed only the softmax's max/sum and exp, so bf16 halves that pass
+    # and matches llm.c's bf16 attention-matrix precision. Allocated once and
+    # kept alive across layers/steps via the KVCache; one shared pair is safe
+    # because each layer fully consumes the scratch in stream order.
+    comptime BufType = type_of(device_ctx.enqueue_create_buffer[dtype](1))
+
+    var scores_addr = 0
+    var att_addr = 0
+    if cache:
+        scores_addr = cache.value()[].gemm_scores_addr
+        att_addr = cache.value()[].gemm_att_addr
+
+    if scores_addr == 0:
+        var scores_buf = device_ctx.enqueue_create_buffer[dtype](BH * T * T)
+        var att_buf = device_ctx.enqueue_create_buffer[dtype](BH * T * T)
+        # Zero the probability buffer's above-diagonal half once: the causal
+        # softmax then writes only the lower triangle each step (the upper stays
+        # structurally zero), and A·V / the backward read it as zero. Halves the
+        # softmax's store traffic.
+        device_ctx.enqueue_memset(att_buf, Scalar[dtype](0))
+        var sptr = alloc[BufType](1)
+        sptr.init_pointee_move(scores_buf^)
+        var aptr = alloc[BufType](1)
+        aptr.init_pointee_move(att_buf^)
+        scores_addr = Int(sptr)
+        att_addr = Int(aptr)
+        if cache:
+            cache.value()[].gemm_scores_addr = scores_addr
+            cache.value()[].gemm_att_addr = att_addr
+
+    var scores_buf_ptr = UnsafePointer[
+        mut=True, type=BufType, origin=MutUntrackedOrigin
+    ](unsafe_from_address=scores_addr)
+    var att_buf_ptr = UnsafePointer[
+        mut=True, type=BufType, origin=MutUntrackedOrigin
+    ](unsafe_from_address=att_addr)
+    var scores_base = rebind[MutKernelPtr[dtype]](scores_buf_ptr[].unsafe_ptr())
+    var scores_immut = rebind[ImmutKernelPtr[dtype]](
+        scores_buf_ptr[].unsafe_ptr()
+    )
+    var att_base = rebind[MutKernelPtr[dtype]](att_buf_ptr[].unsafe_ptr())
+    # ⑳-storage: if a per-layer att_probs buffer is provided, write the softmax
+    # probs into this layer's slice so the backward can read them (no recompute).
+    if cache and cache.value()[].att_probs_addr != 0:
+        var c = cache.value()
+        var ap = UnsafePointer[
+            mut=True, type=Scalar[dtype], origin=MutUntrackedOrigin
+        ](unsafe_from_address=c[].att_probs_addr)
+        att_base = rebind[MutKernelPtr[dtype]](
+            ap + c[].att_probs_layer * c[].att_probs_stride
+        )
+
+    # Step 1: QKᵀ for all heads in one cublasGemmStridedBatchedEx call. bf16 Q/K
+    # in, bf16 scores out; the scale is applied in the softmax so Q/K stay
+    # unscaled for backward. Batching all heads lifts the tensor-core utilization
+    # the per-head (head_dim=64) launches left on the table.
+    _attention_bmm_scoreout[dtype, dtype, target](
+        query_ptr, key_ptr, scores_base, BH, T, hd, device_ctx
+    )
+    # No fence needed: cuBLAS (via the vendor handle bound to ctx's stream) and
+    # the softmax kernel run on the *same* stream, so the softmax's read of the
+    # scores is already ordered after QKᵀ.
+
+    # Step 2: causal softmax over scores rows + log-sum-exp. (256 threads/block
+    # measured best — 512 lost occupancy.)
+    comptime BLOCK_SIZE = 256
+    comptime SM_OVERPROVISION = 32
+    var num_rows = BH * T
+    var num_sm = device_ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var num_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
+    comptime softmax_width = simd_width_of[
+        dtype
+    ]() if USE_SOFTMAX_VEC_LOADS else 1
+    comptime softmax_kernel = _attention_softmax_causal_gpu[
+        dtype, BLOCK_SIZE, softmax_width
+    ]
+    var compiled = device_ctx.compile_function[softmax_kernel]()
+    device_ctx.enqueue_function(
+        compiled,
+        num_rows,
+        T,
+        attention_scale,
+        scores_immut,
+        att_base,
+        log_sum_exp_ptr,
+        grid_dim=(num_blocks,),
+        block_dim=(BLOCK_SIZE,),
+    )
+
+    # Step 3: A·V for all heads in one batched call. bf16 probabilities × bf16 V
+    # -> bf16 attention output. Same-stream: no fence before it (A·V's read of the
+    # probabilities is ordered after the softmax's write).
+    var att_immut = rebind[ImmutKernelPtr[dtype]](att_base)
+    _attention_bmm_headout[dtype, target](
+        att_immut, value_ptr, output_ptr, BH, T, hd, device_ctx
+    )
+
+
 def attention_fwd[
     dtype: DType,
     target: StaticString,
@@ -1253,6 +1763,21 @@ def attention_fwd[
     elif is_gpu[target]():
         if Int(head_dim) > MAX_HEAD_DIM:
             raise Error("head_dim exceeds MAX_HEAD_DIM for GPU attention")
+        comptime if USE_GEMM_ATTENTION:
+            attention_fwd_gemm[dtype, target](
+                output_ptr,
+                query_ptr,
+                key_ptr,
+                value_ptr,
+                log_sum_exp_ptr,
+                batch_size,
+                num_heads,
+                seq_len,
+                head_dim,
+                ctx,
+                cache=cache,
+            )
+            return
         comptime simd_width = simd_width_of[dtype]()
         comptime is_float32 = dtype == DType.float32
         comptime Br = 16 if is_float32 else 32
@@ -2416,6 +2941,805 @@ def attention_bwd[
     )
 
 
+# ===----------------------------------------------------------------------=== #
+# Attention Backward — GPU, tensor-core GEMM path
+# ===----------------------------------------------------------------------=== #
+#
+# FlashAttention-2 backward, but with every O(T²·d) product as a tensor-core
+# GEMM. The softmax probabilities P are recomputed from the saved log-sum-exp
+# (no online accumulation, no max/sum reduction). linalg.matmul has no
+# transpose_a, so the two gradients that need Aᵀ·B (dV = Pᵀ·dO, dK = dSᵀ·Q) are
+# fed pre-transposed Pᵀ/dSᵀ, which the dS elementwise kernel emits for free.
+
+
+@always_inline
+def _gemm_scratch_buffer[
+    bdt: DType
+](
+    addr: Int, count: Int, ctx: DeviceContext, zero_on_alloc: Bool = False
+) raises -> Tuple[Int, MutKernelPtr[bdt]]:
+    # Allocate a persistent DeviceBuffer on first use (heap-held, never freed) or
+    # reconstruct the data pointer from a cached heap address. Returns the
+    # (possibly new) heap address and the device data pointer. When
+    # `zero_on_alloc` is set, the freshly allocated buffer is memset to 0 once —
+    # used for the causal P/dS buffers whose above-diagonal half must stay zero
+    # for the dense gradient GEMMs while the P+dS kernel writes only the lower
+    # triangle each step.
+    comptime BufType = type_of(ctx.enqueue_create_buffer[bdt](1))
+    var out_addr = addr
+    if out_addr == 0:
+        var buf = ctx.enqueue_create_buffer[bdt](count)
+        if zero_on_alloc:
+            ctx.enqueue_memset(buf, Scalar[bdt](0))
+        var p = alloc[BufType](1)
+        p.init_pointee_move(buf^)
+        out_addr = Int(p)
+    var bp = UnsafePointer[mut=True, type=BufType, origin=MutUntrackedOrigin](
+        unsafe_from_address=out_addr
+    )
+    return (out_addr, rebind[MutKernelPtr[bdt]](bp[].unsafe_ptr()))
+
+
+@always_inline
+def _attention_bwd_recompute_p_gpu[
+    dtype: DType,
+](
+    num_elems: Int,
+    seq_len: Int,
+    attention_scale: Scalar[DType.float32],
+    scores_ptr: ImmutKernelPtr[DType.float32],
+    lse_ptr: ImmutKernelPtr[DType.float32],
+    p_ptr: MutKernelPtr[dtype],
+) -> None:
+    # P_ij = exp(scale·S_ij − L_i) for j ≤ i, else 0. Grid-strided over the flat
+    # [B·nh, T, T] scores plane.
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var grid_stride = Int(grid_dim.x) * Int(block_dim.x)
+    var plane = seq_len * seq_len
+    var e = tid
+    while e < num_elems:
+        var rem = e % plane
+        var i = rem // seq_len
+        var j = rem % seq_len
+        var bh = e // plane
+        var p = Scalar[DType.float32](0.0)
+        if j <= i:
+            p = exp(scores_ptr[e] * attention_scale - lse_ptr[bh * seq_len + i])
+        p_ptr[e] = p.cast[dtype]()
+        e += grid_stride
+
+
+@always_inline
+def _attention_bwd_rowdot_gpu[
+    dtype: DType,
+](
+    num_rows: Int,
+    head_dim: Int,
+    do_ptr: ImmutKernelPtr[dtype],
+    o_ptr: ImmutKernelPtr[dtype],
+    d_ptr: MutKernelPtr[DType.float32],
+) -> None:
+    # D_i = Σ_d dO_i,d · O_i,d, one thread per [B·nh, T] row.
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var grid_stride = Int(grid_dim.x) * Int(block_dim.x)
+    var row = tid
+    while row < num_rows:
+        var base = row * head_dim
+        var acc = Scalar[DType.float32](0.0)
+        for d in range(head_dim):
+            acc += (
+                do_ptr[base + d].cast[DType.float32]()
+                * o_ptr[base + d].cast[DType.float32]()
+            )
+        d_ptr[row] = acc
+        row += grid_stride
+
+
+@always_inline
+def _attention_bwd_p_and_ds_gpu[
+    dtype: DType,
+    width: Int,
+    stored_p: Bool = False,
+](
+    num_blocks: Int,
+    seq_len: Int,
+    attention_scale: Scalar[DType.float32],
+    scores_ptr: ImmutKernelPtr[dtype],
+    lse_ptr: ImmutKernelPtr[DType.float32],
+    dp_ptr: ImmutKernelPtr[dtype],
+    d_ptr: ImmutKernelPtr[DType.float32],
+    p_ptr: MutKernelPtr[dtype],
+    ds_ptr: MutKernelPtr[dtype],
+) -> None:
+    # Fused P recompute + dS, one pass over the [B·nh,T,T] plane:
+    #   P_ij = exp(scale·S_ij − L_i)        (causal; j > i → 0)
+    #   dS_ij = scale·P_ij·(dP_ij − D_i)
+    # Writes P (consumed by the Pᵀ transpose → dV) and dS (→ dQ, and the dSᵀ
+    # transpose → dK). This is the backward's largest kernel and is bandwidth
+    # bound, so loads/stores are vectorized `width` elements at a time. Each
+    # thread owns a `width`-wide block; because seq_len is a multiple of `width`,
+    # a block never straddles a row, so `i`/`L_i`/`D_i` are constant across it.
+    var lane = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var grid_stride = Int(grid_dim.x) * Int(block_dim.x)
+    var plane = seq_len * seq_len
+    var b = lane
+    while b < num_blocks:
+        var e0 = b * width
+        var bh = e0 // plane
+        var rem = e0 % plane
+        var i = rem // seq_len
+        var jbase = rem % seq_len
+        # Causal: a width-block lies entirely above the diagonal iff jbase > i
+        # (width divides seq_len, so the block never straddles a row). Its P/dS
+        # are structurally zero, so skip the load+compute+store entirely — the
+        # persistent buffers hold zeros there (P from the forward softmax, dS
+        # zeroed once on allocation), and the dense gradient GEMMs read them as
+        # zero. This halves the plane traffic in the backward's largest kernel.
+        if jbase > i:
+            b += grid_stride
+            continue
+        var d_i = d_ptr[bh * seq_len + i]
+        # `stored_p`: scores_ptr already holds P (the forward's stored softmax
+        # probs), so read it directly — no QKᵀ recompute, no exp/lse, no P store.
+        # e0 = b*width for grid-strided integer b, so it is provably a multiple
+        # of width regardless of the runtime plane/seq_len values — same proof
+        # shape as adamw's idx = global_tid*width. scores_ptr/dp_ptr/p_ptr/
+        # ds_ptr all share `dtype`, so one alignment covers all four.
+        comptime align = align_of[SIMD[dtype, width]]()
+        var raw = (
+            (scores_ptr + e0)
+            .load[width=width, alignment=align]()
+            .cast[DType.float32]()
+        )
+        var dpv = (
+            (dp_ptr + e0)
+            .load[width=width, alignment=align]()
+            .cast[DType.float32]()
+        )
+
+        var pv = SIMD[DType.float32, width](0.0)
+        var dsv = SIMD[DType.float32, width](0.0)
+
+        comptime if stored_p:
+            comptime for w in range(width):
+                if jbase + w <= i:
+                    var pw = raw[w]
+                    dsv[w] = attention_scale * pw * (dpv[w] - d_i)
+            (ds_ptr + e0).store[width=width, alignment=align](dsv.cast[dtype]())
+        else:
+            var lse_i = lse_ptr[bh * seq_len + i]
+            comptime for w in range(width):
+                if jbase + w <= i:
+                    var pw = exp(raw[w] * attention_scale - lse_i)
+                    pv[w] = pw
+                    dsv[w] = attention_scale * pw * (dpv[w] - d_i)
+            (p_ptr + e0).store[width=width, alignment=align](pv.cast[dtype]())
+            (ds_ptr + e0).store[width=width, alignment=align](dsv.cast[dtype]())
+        b += grid_stride
+
+
+comptime TRANSPOSE_TILE = 32
+
+
+@always_inline
+def _attention_transpose_planes_gpu[
+    dtype: DType,
+    BLOCK_SIZE: Int,
+](
+    num_planes: Int,
+    seq_len: Int,
+    src_ptr: ImmutKernelPtr[dtype],
+    dst_ptr: MutKernelPtr[dtype],
+) -> None:
+    # Coalesced per-plane transpose of a [num_planes, T, T] buffer using 32×32
+    # shared-memory tiles (padded to avoid bank conflicts). Reads a tile
+    # coalesced, writes the transposed tile coalesced — replacing the strided
+    # scatter stores that previously dominated the backward.
+    comptime TILE = TRANSPOSE_TILE
+    comptime STRIDE = TILE + 1  # pad to avoid shared-memory bank conflicts
+    var tile = LayoutTensor[
+        dtype,
+        Layout.row_major(TILE, STRIDE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var tile_raw = rebind[MutKernelPtr[dtype]](
+        tile.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
+
+    var plane = seq_len * seq_len
+    var tiles = ceildiv(seq_len, TILE)
+    var tiles_per_plane = tiles * tiles
+    var total_tiles = num_planes * tiles_per_plane
+
+    var tx = Int(thread_idx.x) % TILE
+    var ty = Int(thread_idx.x) // TILE
+    comptime ROW_STEP = BLOCK_SIZE // TILE
+
+    var bt = Int(block_idx.x)
+    while bt < total_tiles:
+        var bh = bt // tiles_per_plane
+        var rem = bt % tiles_per_plane
+        var tile_row = (rem // tiles) * TILE
+        var tile_col = (rem % tiles) * TILE
+        var base = bh * plane
+
+        var r = ty
+        while r < TILE:
+            var gr = tile_row + r
+            var gc = tile_col + tx
+            if gr < seq_len and gc < seq_len:
+                tile_raw[r * STRIDE + tx] = src_ptr[base + gr * seq_len + gc]
+            r += ROW_STEP
+        barrier()
+
+        r = ty
+        while r < TILE:
+            var gr = tile_col + r
+            var gc = tile_row + tx
+            if gr < seq_len and gc < seq_len:
+                dst_ptr[base + gr * seq_len + gc] = tile_raw[tx * STRIDE + r]
+            r += ROW_STEP
+        barrier()
+
+        bt += Int(grid_dim.x)
+
+
+@always_inline
+def _attention_transpose_rect_gpu[
+    dtype: DType,
+    BLOCK_SIZE: Int,
+](
+    num_planes: Int,
+    rows: Int,
+    cols: Int,
+    src_ptr: ImmutKernelPtr[dtype],
+    dst_ptr: MutKernelPtr[dtype],
+) -> None:
+    # Coalesced transpose of each [rows, cols] plane → [cols, rows], 32×32 tiles.
+    # Used for the small [T,hd]↔[hd,T] transposes that let dK/dV avoid
+    # transposing the big [T,T] dS/P matrices.
+    comptime TILE = TRANSPOSE_TILE
+    comptime STRIDE = TILE + 1
+    var tile = LayoutTensor[
+        dtype,
+        Layout.row_major(TILE, STRIDE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var tile_raw = rebind[MutKernelPtr[dtype]](
+        tile.ptr.address_space_cast[AddressSpace.GENERIC]()
+    )
+
+    var src_plane = rows * cols
+    var dst_plane = cols * rows
+    var tiles_r = ceildiv(rows, TILE)
+    var tiles_c = ceildiv(cols, TILE)
+    var tiles_per_plane = tiles_r * tiles_c
+    var total_tiles = num_planes * tiles_per_plane
+
+    var tx = Int(thread_idx.x) % TILE
+    var ty = Int(thread_idx.x) // TILE
+    comptime ROW_STEP = BLOCK_SIZE // TILE
+
+    var bt = Int(block_idx.x)
+    while bt < total_tiles:
+        var bh = bt // tiles_per_plane
+        var rem = bt % tiles_per_plane
+        var tile_row = (rem // tiles_c) * TILE  # offset along rows
+        var tile_col = (rem % tiles_c) * TILE  # offset along cols
+        var src_base = bh * src_plane
+        var dst_base = bh * dst_plane
+
+        var r = ty
+        while r < TILE:
+            var gr = tile_row + r
+            var gc = tile_col + tx
+            if gr < rows and gc < cols:
+                tile_raw[r * STRIDE + tx] = src_ptr[src_base + gr * cols + gc]
+            r += ROW_STEP
+        barrier()
+
+        # dst is [cols, rows]: element (tile_col+r, tile_row+tx).
+        r = ty
+        while r < TILE:
+            var gr = tile_col + r
+            var gc = tile_row + tx
+            if gr < cols and gc < rows:
+                dst_ptr[dst_base + gr * rows + gc] = tile_raw[tx * STRIDE + r]
+            r += ROW_STEP
+        barrier()
+
+        bt += Int(grid_dim.x)
+
+
+@always_inline
+def _cublas_dt[dt: DType]() -> DataType:
+    comptime if dt == DType.bfloat16:
+        return DataType.R_16BF
+    elif dt == DType.float32:
+        return DataType.R_32F
+    else:
+        return DataType.R_16F
+
+
+@always_inline
+def _attn_gemm_batched[
+    a_dt: DType,
+    b_dt: DType,
+    c_dt: DType,
+](
+    a_ptr: ImmutKernelPtr[a_dt],
+    b_ptr: ImmutKernelPtr[b_dt],
+    c_ptr: MutKernelPtr[c_dt],
+    M: Int,
+    N: Int,
+    K: Int,
+    a_stride: Int,
+    b_stride: Int,
+    c_stride: Int,
+    transpose_b: Bool,
+    BH: Int,
+    ctx: DeviceContext,
+    transpose_a: Bool = False,
+) raises:
+    # All BH heads of a per-head GEMM C[M,N] = op(A) · op(B) in ONE
+    # cublasGemmStridedBatchedEx call. This is
+    # what llm.c does (cublasGemmStridedBatched): packing all heads into a single
+    # kernel fills the GPU and lifts the ~16 % tensor-core utilization the small
+    # per-head (head_dim=64) launches suffered. Uses the same row-major swap trick
+    # as the vendor _cublas_matmul: to get row-major C = A·op(B), call cublas
+    # (col-major) with the A/B operands swapped, computing the N×M col-major
+    # result that equals the M×N row-major one.
+    #
+    # When all three operands share a dtype, route through cuBLASLt's strided-
+    # batched path (llm.c's actual attention API) instead of the legacy
+    # cublasGemmStridedBatchedEx — its heuristic can pick a faster kernel for the
+    # head_dim=64 shapes. The col-major swap maps to _matmul_cublaslt directly:
+    # A_lt=b, B_lt=a, m=N, n=M, k=K, transA=transpose_b, transB=transpose_a.
+    comptime if USE_LT_ATTN and a_dt == b_dt and a_dt == c_dt:
+        var d = rebind[MutKernelPtr[a_dt]](c_ptr)
+        var bb = rebind[ImmutKernelPtr[a_dt]](b_ptr)
+        var aa = rebind[ImmutKernelPtr[a_dt]](a_ptr)
+        # bias/aux are unused with epilogue=1; pass valid dummies (never read).
+        var nb = aa
+        var na = d
+        if transpose_b:
+            if transpose_a:
+                _matmul_cublaslt[a_dt, True, True](
+                    d,
+                    bb,
+                    aa,
+                    nb,
+                    na,
+                    N,
+                    M,
+                    K,
+                    Int32(1),
+                    False,
+                    ctx,
+                    BH,
+                    b_stride,
+                    a_stride,
+                    c_stride,
+                )
+            else:
+                _matmul_cublaslt[a_dt, True, False](
+                    d,
+                    bb,
+                    aa,
+                    nb,
+                    na,
+                    N,
+                    M,
+                    K,
+                    Int32(1),
+                    False,
+                    ctx,
+                    BH,
+                    b_stride,
+                    a_stride,
+                    c_stride,
+                )
+        else:
+            if transpose_a:
+                _matmul_cublaslt[a_dt, False, True](
+                    d,
+                    bb,
+                    aa,
+                    nb,
+                    na,
+                    N,
+                    M,
+                    K,
+                    Int32(1),
+                    False,
+                    ctx,
+                    BH,
+                    b_stride,
+                    a_stride,
+                    c_stride,
+                )
+            else:
+                _matmul_cublaslt[a_dt, False, False](
+                    d,
+                    bb,
+                    aa,
+                    nb,
+                    na,
+                    N,
+                    M,
+                    K,
+                    Int32(1),
+                    False,
+                    ctx,
+                    BH,
+                    b_stride,
+                    a_stride,
+                    c_stride,
+                )
+        return
+
+    var handle = _get_global_handle[a_dt](ctx)
+    var alpha = Float32(1.0)
+    var beta = Float32(0.0)
+    var op_b = _convert_to_cublas_transpose(transpose_b)
+    var op_a = _convert_to_cublas_transpose(transpose_a)
+    var lda = K if transpose_b else N
+    var ldb = M if transpose_a else K
+    check_cublas_error(
+        cublasGemmStridedBatchedEx(
+            handle._get_cublas(),
+            op_b,
+            op_a,
+            Int64(N),
+            Int64(M),
+            Int64(K),
+            UnsafePointer(to=alpha)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            _cublas_dt[b_dt](),
+            Int64(lda),
+            Int64(b_stride),
+            a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            _cublas_dt[a_dt](),
+            Int64(ldb),
+            Int64(a_stride),
+            UnsafePointer(to=beta)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            c_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            _cublas_dt[c_dt](),
+            Int64(N),
+            Int64(c_stride),
+            Int64(BH),
+            ComputeType.COMPUTE_32F,
+            Algorithm.DEFAULT,
+        )
+    )
+
+
+@always_inline
+def _attention_bmm_kvgrad[
+    dtype: DType,
+    target: StaticString,
+](
+    at_ptr: ImmutKernelPtr[dtype],
+    big_ptr: ImmutKernelPtr[dtype],
+    out_ptr: MutKernelPtr[dtype],
+    BH: Int,
+    T: Int,
+    hd: Int,
+    ctx: DeviceContext,
+) capturing raises:
+    # C[hd,T] = A[hd,T] · B[T,T], all heads batched. With A = Qᵀ, B = dS this is
+    # dKᵀ; with A = dOᵀ, B = P this is dVᵀ — letting dK/dV skip transposing [T,T].
+    _attn_gemm_batched[dtype, dtype, dtype](
+        at_ptr,
+        big_ptr,
+        out_ptr,
+        hd,
+        T,
+        T,
+        hd * T,
+        T * T,
+        hd * T,
+        False,
+        BH,
+        ctx,
+    )
+
+
+@always_inline
+def _attention_bmm_scoreout[
+    dtype: DType,
+    out_dtype: DType,
+    target: StaticString,
+](
+    a_ptr: ImmutKernelPtr[dtype],
+    b_ptr: ImmutKernelPtr[dtype],
+    out_ptr: MutKernelPtr[out_dtype],
+    BH: Int,
+    T: Int,
+    hd: Int,
+    ctx: DeviceContext,
+) capturing raises:
+    # C[T,T] = A[T,hd] · B[T,hd]ᵀ, all heads batched. out_dtype selects the
+    # written-out precision: bf16 for QKᵀ (feeds only exp in the P recompute) and
+    # (optionally) fp32 for dO·Vᵀ. cuBLAS writes the fp32 accumulator straight
+    # into c; the scale is deferred to the softmax/dS.
+    _attn_gemm_batched[dtype, dtype, out_dtype](
+        a_ptr,
+        b_ptr,
+        out_ptr,
+        T,
+        T,
+        hd,
+        T * hd,
+        T * hd,
+        T * T,
+        True,
+        BH,
+        ctx,
+    )
+
+
+@always_inline
+def _attention_bmm_headout[
+    dtype: DType,
+    target: StaticString,
+](
+    a_ptr: ImmutKernelPtr[dtype],
+    b_ptr: ImmutKernelPtr[dtype],
+    out_ptr: MutKernelPtr[dtype],
+    BH: Int,
+    T: Int,
+    hd: Int,
+    ctx: DeviceContext,
+) capturing raises:
+    # C[T,hd] = A[T,T] · B[T,hd], all heads batched. dQ = dS·K (the 1/√d scale is
+    # already folded into dS); also the forward A·V. No epilogue.
+    _attn_gemm_batched[dtype, dtype, dtype](
+        a_ptr,
+        b_ptr,
+        out_ptr,
+        T,
+        hd,
+        T,
+        T * T,
+        T * hd,
+        T * hd,
+        False,
+        BH,
+        ctx,
+    )
+
+
+def attention_bwd_gemm[
+    dtype: DType,
+    target: StaticString,
+](
+    d_query_ptr: MutKernelPtr[dtype],
+    d_key_ptr: MutKernelPtr[dtype],
+    d_value_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    query_ptr: ImmutKernelPtr[dtype],
+    key_ptr: ImmutKernelPtr[dtype],
+    value_ptr: ImmutKernelPtr[dtype],
+    output_ptr: ImmutKernelPtr[dtype],
+    log_sum_exp_ptr: ImmutKernelPtr[DType.float32],
+    batch_size: Int64,
+    num_heads: Int64,
+    seq_len: Int64,
+    head_dim: Int64,
+    ctx: DeviceContext,
+    cache: Optional[KVCachePtr] = None,
+) capturing raises:
+    var B = Int(batch_size)
+    var NH = Int(num_heads)
+    var T = Int(seq_len)
+    var hd = Int(head_dim)
+    var BH = B * NH
+    var plane = BH * T * T
+    var attention_scale = Scalar[DType.float32](1.0) / sqrt(
+        Scalar[DType.float32](hd)
+    )
+    var device_ctx = ctx
+
+    # Persistent scratch (allocated once, kept alive in the KVCache). The f32
+    # score buffer holds QKᵀ then is read by the P-recompute kernel; dP has its
+    # own fp32 buffer; P reuses the forward probability buffer.
+    var sc_addr = 0
+    var p_addr = 0
+    var ds_addr = 0
+    var dst_addr = 0
+    var pt_addr = 0
+    var d_addr = 0
+    var dp_addr = 0
+    if cache:
+        sc_addr = cache.value()[].gemm_scores_addr
+        p_addr = cache.value()[].gemm_att_addr
+        ds_addr = cache.value()[].gemm_ds_addr
+        dst_addr = cache.value()[].gemm_dst_addr
+        pt_addr = cache.value()[].gemm_pt_addr
+        d_addr = cache.value()[].gemm_d_addr
+        dp_addr = cache.value()[].gemm_dp_addr
+
+    # gemm_scores_addr is bf16 (the forward allocates it bf16); in the backward it
+    # is only Phase-C dKᵀ scratch, so the types must agree.
+    var sc = _gemm_scratch_buffer[dtype](sc_addr, plane, device_ctx)
+    var pp = _gemm_scratch_buffer[dtype](p_addr, plane, device_ctx)
+    var dss = _gemm_scratch_buffer[dtype](
+        ds_addr, plane, device_ctx, zero_on_alloc=True
+    )
+    var dstt = _gemm_scratch_buffer[dtype](dst_addr, plane, device_ctx)
+    var ptt = _gemm_scratch_buffer[dtype](pt_addr, plane, device_ctx)
+    var dd = _gemm_scratch_buffer[DType.float32](d_addr, BH * T, device_ctx)
+    var dpp = _gemm_scratch_buffer[DType.float32](dp_addr, plane, device_ctx)
+    if cache:
+        cache.value()[].gemm_scores_addr = sc[0]
+        cache.value()[].gemm_att_addr = pp[0]
+        cache.value()[].gemm_ds_addr = dss[0]
+        cache.value()[].gemm_dst_addr = dstt[0]
+        cache.value()[].gemm_pt_addr = ptt[0]
+        cache.value()[].gemm_d_addr = dd[0]
+        cache.value()[].gemm_dp_addr = dpp[0]
+
+    var score_buf = sc[1]
+    var p_buf = pp[1]
+    var ds_buf = dss[1]
+    var dst_buf = dstt[1]
+    var pt_buf = ptt[1]
+    var d_buf = dd[1]
+    var dp_buf = dpp[1]
+    # Backward scores are bf16 (they only feed exp): QKᵀ writes them into pt_buf,
+    # which is free until Phase C reuses it for Qᵀ. Halves the P+dS read pass.
+    var scores_immut = rebind[ImmutKernelPtr[dtype]](pt_buf)
+    var dp_immut = rebind[ImmutKernelPtr[dtype]](dst_buf)
+    var p_immut = rebind[ImmutKernelPtr[dtype]](p_buf)
+    var d_immut = rebind[ImmutKernelPtr[DType.float32]](d_buf)
+    # storage: read the forward's stored probs (this layer's att_probs slice)
+    # instead of recomputing QKᵀ → P. `scores_immut` then points at the stored P.
+    var use_stored = cache and cache.value()[].att_probs_addr != 0
+    if use_stored:
+        var c = cache.value()
+        var ap = UnsafePointer[
+            mut=True, type=Scalar[dtype], origin=MutUntrackedOrigin
+        ](unsafe_from_address=c[].att_probs_addr)
+        var att_slice = ap + c[].att_probs_layer * c[].att_probs_stride
+        scores_immut = rebind[ImmutKernelPtr[dtype]](att_slice)
+        p_immut = rebind[ImmutKernelPtr[dtype]](att_slice)
+    # score_buf / dp_buf (fp32) are retained only as Phase-C dKᵀ/dVᵀ scratch.
+    _ = score_buf
+
+    comptime BLOCK_SIZE = 256
+    comptime SM_OVERPROVISION = 32
+    var num_sm = device_ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+
+    @parameter
+    def _grid(work: Int) -> Int:
+        return max(min(ceildiv(work, BLOCK_SIZE), SM_OVERPROVISION * num_sm), 1)
+
+    # Phase A: dP = dO·Vᵀ. QKᵀ (scores) is only recomputed when the forward's
+    # probs were NOT stored — otherwise we read them directly (skip a big matmul).
+    if not use_stored:
+        _attention_bmm_scoreout[dtype, dtype, target](
+            query_ptr, key_ptr, pt_buf, BH, T, hd, device_ctx
+        )
+    _attention_bmm_scoreout[dtype, dtype, target](
+        d_output_ptr, value_ptr, dst_buf, BH, T, hd, device_ctx
+    )
+    # No fence: Phase B runs on the same stream and is ordered after Phase A's
+    # cuBLAS writes to pt_buf/dst_buf.
+
+    # Phase B (default-stream kernels, ordered with no inter-fences): D_i, then
+    # the fused P-recompute + dS over the scores plane.
+    comptime d_kernel = _attention_bwd_rowdot_gpu[dtype]
+    var d_compiled = device_ctx.compile_function[d_kernel]()
+    device_ctx.enqueue_function(
+        d_compiled,
+        BH * T,
+        hd,
+        d_output_ptr,
+        output_ptr,
+        d_buf,
+        grid_dim=(_grid(BH * T),),
+        block_dim=(BLOCK_SIZE,),
+    )
+    # Vectorized: each thread handles `PDS_WIDTH` contiguous elements. T is a
+    # power of two ≥ 32, so PDS_WIDTH=8 divides plane and never straddles a row.
+    comptime PDS_WIDTH = 8
+    var pds_blocks = plane // PDS_WIDTH
+    if use_stored:
+        comptime pds_stored = _attention_bwd_p_and_ds_gpu[
+            dtype, PDS_WIDTH, stored_p=True
+        ]
+        var pds_c = device_ctx.compile_function[pds_stored]()
+        device_ctx.enqueue_function(
+            pds_c,
+            pds_blocks,
+            T,
+            attention_scale,
+            scores_immut,
+            log_sum_exp_ptr,
+            dp_immut,
+            d_immut,
+            p_buf,
+            ds_buf,
+            grid_dim=(_grid(pds_blocks),),
+            block_dim=(BLOCK_SIZE,),
+        )
+    else:
+        comptime pds_recompute = _attention_bwd_p_and_ds_gpu[
+            dtype, PDS_WIDTH, stored_p=False
+        ]
+        var pds_c = device_ctx.compile_function[pds_recompute]()
+        device_ctx.enqueue_function(
+            pds_c,
+            pds_blocks,
+            T,
+            attention_scale,
+            scores_immut,
+            log_sum_exp_ptr,
+            dp_immut,
+            d_immut,
+            p_buf,
+            ds_buf,
+            grid_dim=(_grid(pds_blocks),),
+            block_dim=(BLOCK_SIZE,),
+        )
+
+    # No fence: the gradient matmuls run on the same stream, ordered after P+dS.
+
+    # dQ = dS·K, dK = dSᵀ·Q, dV = Pᵀ·dO — all batched cuBLAS. cublasGemmStrided-
+    # BatchedEx does transpose_a natively, so dK/dV are computed *directly* rather
+    # than forming dKᵀ/dVᵀ and running four rect-transpose kernels (⑮ dropped
+    # those + two sync phases). dS already carries the 1/√d scale; dV is unscaled.
+    var ds_immut = rebind[ImmutKernelPtr[dtype]](ds_buf)
+    _ = score_buf
+    _ = pt_buf
+    _ = dst_buf
+    _ = dp_buf
+    _attention_bmm_headout[dtype, target](
+        ds_immut, key_ptr, d_query_ptr, BH, T, hd, device_ctx
+    )
+    _attn_gemm_batched[dtype, dtype, dtype](
+        ds_immut,
+        query_ptr,
+        d_key_ptr,
+        T,
+        hd,
+        T,
+        T * T,
+        T * hd,
+        T * hd,
+        False,
+        BH,
+        device_ctx,
+        transpose_a=True,
+    )
+    _attn_gemm_batched[dtype, dtype, dtype](
+        p_immut,
+        d_output_ptr,
+        d_value_ptr,
+        T,
+        hd,
+        T,
+        T * T,
+        T * hd,
+        T * hd,
+        False,
+        BH,
+        device_ctx,
+        transpose_a=True,
+    )
+    # Fence: downstream QKV-merge reads dQ/dK/dV.
+    device_ctx.synchronize()
+
+
 def attention_bwd[
     dtype: DType,
     target: StaticString,
@@ -2458,6 +3782,25 @@ def attention_bwd[
     elif is_gpu[target]():
         if Int(head_dim) > MAX_HEAD_DIM:
             raise Error("head_dim exceeds MAX_HEAD_DIM for GPU attention")
+        comptime if USE_GEMM_ATTENTION:
+            attention_bwd_gemm[dtype, target](
+                d_query_ptr,
+                d_key_ptr,
+                d_value_ptr,
+                d_output_ptr,
+                query_ptr,
+                key_ptr,
+                value_ptr,
+                output_ptr,
+                log_sum_exp_ptr,
+                batch_size,
+                num_heads,
+                seq_len,
+                head_dim,
+                ctx,
+                cache=cache,
+            )
+            return
         comptime simd_width = simd_width_of[dtype]()
         comptime is_float32 = dtype == DType.float32
         comptime Br = 32

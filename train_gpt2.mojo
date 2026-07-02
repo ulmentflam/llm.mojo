@@ -81,7 +81,7 @@ from llmm.zero import (
 comptime WORLD_SIZE_DEF = get_defined_int["WORLD_SIZE", 1]()
 
 comptime NUM_PARAMETER_TENSORS = 16
-comptime NUM_ACTIVATION_TENSORS = 25
+comptime NUM_ACTIVATION_TENSORS = 26
 # Parameter/activation/gradient precision. Defaults to fp32; build with
 # -D LLMM_BF16=1 for bf16 mixed-precision training. The layernorm/attention
 # statistics stay fp32 (StatsDType) and the optimizer keeps fp32 moments + an
@@ -340,6 +340,10 @@ struct Activations:
     comptime k = 22
     comptime v = 23
     comptime attn_merged = 24
+    # Stored softmax probabilities [L, B, NH, T, T] (bf16). Persisting them lets
+    # the backward READ P instead of recomputing QKᵀ (llm.c's approach), dropping
+    # one big batched matmul per layer.
+    comptime att_probs = 25
 
 
 # The layernorm/attention statistics (mean, rstd, lse) and the per-token losses
@@ -390,6 +394,9 @@ struct ActivationTensors[
     var k: MutMemPtr[Self.dtype]  # (L, B, NH, T, HS)
     var v: MutMemPtr[Self.dtype]  # (L, B, NH, T, HS)
     var attn_merged: MutMemPtr[Self.dtype]  # (L, B, T, C)
+    var att_probs: MutMemPtr[
+        Self.dtype
+    ]  # (L, B, NH, T, T) stored softmax probs
 
     def __init__(out self):
         var zero = 0
@@ -420,6 +427,7 @@ struct ActivationTensors[
         self.k = null_a
         self.v = null_a
         self.attn_merged = null_a
+        self.att_probs = null_a
 
     def point_activations(
         mut self,
@@ -453,6 +461,7 @@ struct ActivationTensors[
         mains.append(MainPtrPtr(to=self.k))
         mains.append(MainPtrPtr(to=self.v))
         mains.append(MainPtrPtr(to=self.attn_merged))
+        mains.append(MainPtrPtr(to=self.att_probs))
         var main_idx = [
             Activations.encoded,
             Activations.ln_1,
@@ -471,6 +480,7 @@ struct ActivationTensors[
             Activations.k,
             Activations.v,
             Activations.attn_merged,
+            Activations.att_probs,
         ]
 
         # fp32 statistics/losses, in buffer order, with their sizes.
@@ -672,6 +682,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
     # Gradients of the activations
     var grad_acts: ActivationTensors[GPT2_DTYPE]
+    # Same shape as `act_sizes`, but on GPU builds the three tensors that are
+    # dead on the GPU backward path (`fch`, `logits`, `att_probs` — see the
+    # per-tensor trace above `zero_gradients`) are sized to 0, shrinking
+    # `grad_acts_buf` by ~1.9 GB. On CPU this stays identical to `act_sizes`
+    # (the CPU `matmul_d_weight_bwd` path reads the `fch`/`logits` scratch
+    # args; `att_probs` is unused on both targets but kept full-size on CPU
+    # for simplicity/symmetry).
+    var grad_act_sizes: List[Int]
     var grad_acts_memory: MutMemPtr[GPT2_DTYPE]
     var grad_acts_stats_memory: MutMemPtr[StatsDType]
     var num_grads: Int
@@ -808,6 +826,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.act_sizes = List[Int]()
         for _ in range(NUM_ACTIVATION_TENSORS):
             self.act_sizes.append(0)
+
+        self.grad_act_sizes = List[Int]()
+        for _ in range(NUM_ACTIVATION_TENSORS):
+            self.grad_act_sizes.append(0)
 
         # Two ways to initialize the model, mirroring llm.c's main():
         #  - `checkpoint_path` ends with ".bin": load config + weights from a
@@ -1237,6 +1259,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.act_sizes[Activations.k] = L * B * T * C
         self.act_sizes[Activations.v] = L * B * T * C
         self.act_sizes[Activations.attn_merged] = L * B * T * C
+        self.act_sizes[Activations.att_probs] = L * B * NH * T * T
 
         # Count total activations
         var num_activations = 0
@@ -1245,6 +1268,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.num_activations = num_activations
 
         print("Number of Activations: " + String(self.num_activations))
+
+        # `grad_act_sizes` mirrors `act_sizes`, except that on GPU builds
+        # `fch`, `logits`, and `att_probs` are zeroed out: those three
+        # `grad_acts` tensors are never meaningfully read or written on the
+        # GPU backward path (`logits`/`fch` grads are passed only as the
+        # unused `scratch` arg of `matmul_bwd`'s GPU d_weight path —
+        # llmm/matmul.mojo `matmul_d_weight_bwd`, `is_gpu[target]()` branch
+        # never touches `scratch_ptr`, cuBLAS and vendor-neutral fallback
+        # alike; `att_probs`'s grad is never referenced at all — backward
+        # reads the *forward*-stored probs via `acts.att_probs`/`kv_cache`,
+        # and dP/dS/P live in separate persistent GEMM scratch). This drops
+        # `grad_acts_buf` by ~1.9 GB. The CPU d_weight path's `else` branch
+        # DOES materialize into `scratch_ptr` (host transpose), so CPU keeps
+        # the full sizes; `att_probs` is unused on both targets but left
+        # full-size on CPU for simplicity.
+        for i in range(NUM_ACTIVATION_TENSORS):
+            self.grad_act_sizes[i] = self.act_sizes[i]
+        comptime if is_gpu[Self.target]():
+            self.grad_act_sizes[Activations.fch] = 0
+            self.grad_act_sizes[Activations.logits] = 0
+            self.grad_act_sizes[Activations.att_probs] = 0
 
         # The fp32 statistics/losses are split into their own buffer; everything
         # else stays in the main (param-precision) buffer.
@@ -1260,11 +1304,29 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
         var main_size = num_activations - stats_size
 
+        var num_grad_activations = 0
+        for i in range(NUM_ACTIVATION_TENSORS):
+            num_grad_activations += self.grad_act_sizes[i]
+        # `stats_size` is identical for grad_act_sizes (none of the three
+        # shrunk tensors are stats entries).
+        var grad_main_size = num_grad_activations - stats_size
+        print("Number of Activation Gradients: " + String(num_grad_activations))
+
         # Re-allocate device memory and point the structures
         self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](main_size)
+        # Zero once so the stored att_probs' above-diagonal half stays 0 (the
+        # causal softmax writes only the lower triangle each step).
+        self.ctx.enqueue_memset(self.acts_buf, Scalar[GPT2_DTYPE](0))
         self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            main_size
+            grad_main_size
         )
+        # One-time full zero at allocation time. Per step, `zero_gradients`
+        # (GPU path) only re-zeroes the five accumulator tensors (encoded,
+        # attn_proj, residual_2, fc_proj, residual_3); every other grad_acts
+        # tensor is overwritten before its first read or never touched on
+        # the GPU path (see the per-tensor trace this alloc-time zero backs
+        # up as defense-in-depth for step 0).
+        self.ctx.enqueue_memset(self.grad_acts_buf, Scalar[GPT2_DTYPE](0))
         self.acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](
             stats_size
         )
@@ -1328,7 +1390,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.act_sizes, self.acts_memory, self.acts_stats_memory
         )
         self.grad_acts.point_activations(
-            self.act_sizes, self.grad_acts_memory, self.grad_acts_stats_memory
+            self.grad_act_sizes,
+            self.grad_acts_memory,
+            self.grad_acts_stats_memory,
         )
         self.has_allocated_acts = True
 
@@ -1350,6 +1414,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         targets: MutMemPtr[DType.int32],
         batch_size: Int,
         seq_len: Int,
+        grad_accum_steps: Int = 1,
     ) raises:
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
@@ -1571,6 +1636,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
             # Attention Forward (handles QKV Split/Transpose and Merge Heads internally).
             var head_dim = channels // num_heads
+            # Point the KVCache at this layer's stored-probs slice so the forward
+            # writes P there and the backward reads it (skips the QKᵀ recompute).
+            self.kv_cache.att_probs_addr = Int(self.acts.att_probs)
+            self.kv_cache.att_probs_layer = layer
+            self.kv_cache.att_probs_stride = (
+                batch_size * num_heads * seq_len * seq_len
+            )
             attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](l_q),
@@ -1689,14 +1761,29 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
         self.ctx.synchronize()
 
-        # Fused classifier (cross entropy loss).
+        # Fused classifier: cross-entropy loss AND dlogits in ONE pass (llm.c's
+        # structure). Since dL/dloss = 1/(B·T·grad_accum_steps) is a constant, we
+        # seed it here and write dlogits in-place into acts.logits now — the
+        # backward reads them directly and skips a second 206M-element pass.
         if targets != NULL_INT32_PTR:
-            fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=False](
+            var dloss_mean = Scalar[DType.float32](1.0) / Scalar[DType.float32](
+                batch_size * seq_len * grad_accum_steps
+            )
+            for i in range(batch_size * seq_len):
+                self.losses_host_buf[i] = dloss_mean
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[UnsafePointer[Scalar[StatsDType], MutAnyOrigin]](
+                    self.grad_acts.losses.as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[StatsDType], ImmutAnyOrigin]
+                ](self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()),
+                size=batch_size * seq_len,
+            )
+            fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=True](
                 as_mut_kernel[GPT2_DTYPE](self.acts.logits),
                 as_mut_kernel[StatsDType](self.acts.losses),
-                as_immut_kernel[DType.float32](
-                    ImmutMemPtr[DType.float32](unsafe_from_address=zero)
-                ),
+                as_immut_kernel_from_mut[DType.float32](self.grad_acts.losses),
                 as_immut_kernel_from_mut[DType.int32](self.targets),
                 Int64(batch_size),
                 Int64(seq_len),
@@ -1737,8 +1824,84 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             comptime if Self.WORLD_SIZE > 1:
                 if self.zero_ctx.zero_stage >= 2:
                     self.sharded_grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
-        if self.has_allocated_acts:
-            self.grad_acts_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+
+        comptime if is_cpu[Self.target]():
+            # CPU backward kernels were not audited for overwrite-vs-accumulate
+            # semantics (that trace only covers the GPU dispatch), so keep the
+            # original full-buffer zero here (guarded exactly as before this
+            # change). This is not the perf target.
+            if self.has_allocated_acts:
+                self.grad_acts_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        else:
+            if self.has_allocated_acts:
+                # Of the 18 tensors in grad_acts_buf, only 5 are read-modify-
+                # write accumulators: `encoded`, `attn_proj`, `residual_2`,
+                # `fc_proj`, and `residual_3` are the `+=` targets of the
+                # fused-residual-backward broadcast (layernorm.mojo
+                # ~1653-1663). Every other tensor is overwritten before its
+                # first read (e.g. cuBLASLt d_input GEMMs, beta=0) or never
+                # touched on the GPU path (`fch`, `logits`, `att_probs` are
+                # passed only as an unused GPU-path scratch arg). Zeroing just
+                # these accumulators instead of the full 3.29 GB buffer drops
+                # the fill from ~17.5 ms to ~1.6 ms/step.
+                #
+                # `attn_proj`+`residual_2` and `fc_proj`+`residual_3` are
+                # adjacent in `ActivationTensors.point_activations`'s buffer
+                # layout (no stats tensor in between — those live in a
+                # separate buffer), so each pair is one contiguous fill.
+                # Offsets/counts are derived from `self.grad_act_sizes` (not
+                # `self.act_sizes`, and not hardcoded): on GPU builds `fch`,
+                # `logits`, `att_probs` are sized 0 in `grad_act_sizes` (see
+                # `allocate_activations`), which shifts the fc_proj/
+                # residual_3 offset down by `fch`'s size — using `act_sizes`
+                # here (the *forward* acts layout, still full-size) would
+                # compute an offset into memory `grad_acts_buf` no longer
+                # has. This also still tracks other config changes
+                # (`Self.recompute` shrinking `fch`/`fch_gelu`).
+                var off_encoded = 0
+                var cnt_encoded = self.grad_act_sizes[Activations.encoded]
+
+                var off_attn_proj = (
+                    self.grad_act_sizes[Activations.encoded]
+                    + self.grad_act_sizes[Activations.ln_1]
+                    + self.grad_act_sizes[Activations.qkv]
+                    + self.grad_act_sizes[Activations.attn]
+                )
+                var cnt_attn_proj_residual_2 = (
+                    self.grad_act_sizes[Activations.attn_proj]
+                    + self.grad_act_sizes[Activations.residual_2]
+                )
+
+                var off_fc_proj = (
+                    off_attn_proj
+                    + cnt_attn_proj_residual_2
+                    + self.grad_act_sizes[Activations.ln_2]
+                    + self.grad_act_sizes[Activations.fch]
+                    + self.grad_act_sizes[Activations.fch_gelu]
+                )
+                var cnt_fc_proj_residual_3 = (
+                    self.grad_act_sizes[Activations.fc_proj]
+                    + self.grad_act_sizes[Activations.residual_3]
+                )
+
+                self.ctx.enqueue_memset(
+                    self.grad_acts_buf.create_sub_buffer[GPT2_DTYPE](
+                        off_encoded, cnt_encoded
+                    ),
+                    Scalar[GPT2_DTYPE](0),
+                )
+                self.ctx.enqueue_memset(
+                    self.grad_acts_buf.create_sub_buffer[GPT2_DTYPE](
+                        off_attn_proj, cnt_attn_proj_residual_2
+                    ),
+                    Scalar[GPT2_DTYPE](0),
+                )
+                self.ctx.enqueue_memset(
+                    self.grad_acts_buf.create_sub_buffer[GPT2_DTYPE](
+                        off_fc_proj, cnt_fc_proj_residual_3
+                    ),
+                    Scalar[GPT2_DTYPE](0),
+                )
         self.ctx.synchronize()
 
     def backward(
@@ -1772,39 +1935,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # Backward Pass
         ##############################################################
 
-        # Seed dL/dloss. Dividing by grad_accum_steps makes the gradients that
-        # accumulate over the micro-step loop equal the mean over the full
-        # (B * T * grad_accum_steps) batch, matching llm.c.
-        var dloss_mean = Scalar[DType.float32](1.0) / Scalar[DType.float32](
-            batch_size * seq_len * grad_accum_steps
-        )
-        # The dloss seed and grad_acts.losses are fp32 (StatsDType), matching
-        # the fused classifier's fp32 read. Seed via the fp32 host buffer.
-        for i in range(batch_size * seq_len):
-            self.losses_host_buf[i] = dloss_mean
-
-        self.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[StatsDType], MutAnyOrigin]](
-                self.grad_acts.losses.as_unsafe_any_origin()
-            ),
-            src_ptr=rebind[UnsafePointer[Scalar[StatsDType], ImmutAnyOrigin]](
-                self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()
-            ),
-            size=batch_size * seq_len,
-        )
-
-        # Fused classifier backward writes d_logits in-place into acts.logits.
-        fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=True](
-            as_mut_kernel[GPT2_DTYPE](self.acts.logits),
-            as_mut_kernel[StatsDType](self.acts.losses),
-            as_immut_kernel_from_mut[DType.float32](self.grad_acts.losses),
-            as_immut_kernel_from_mut[DType.int32](self.targets),
-            Int64(batch_size),
-            Int64(seq_len),
-            Int64(vocab_size),
-            Int64(vocab_size_padded),
-            self.ctx,
-        )
+        # NOTE: The fused classifier (cross-entropy loss + dlogits) now runs ONCE,
+        # in forward(), which already wrote dlogits in-place into acts.logits with
+        # the constant dL/dloss = 1/(B·T·grad_accum_steps). The backward reads them
+        # directly here, eliminating a redundant 206M-element pass (matches llm.c).
 
         # LM head matmul backward (wte has no bias).
         matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
@@ -2044,7 +2178,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx,
             )
 
-            # Attention backward.
+            # Attention backward — point the cache at this layer's stored probs
+            # so the backward reads P instead of recomputing QKᵀ.
+            self.kv_cache.att_probs_addr = Int(self.acts.att_probs)
+            self.kv_cache.att_probs_layer = layer
+            self.kv_cache.att_probs_stride = (
+                batch_size * num_heads * seq_len * seq_len
+            )
             attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
                 as_mut_kernel[GPT2_DTYPE](d_l_qkv),
                 as_mut_kernel[GPT2_DTYPE](d_l_q),
@@ -3019,7 +3159,13 @@ def train[
         var accumulated_loss = Float32(0.0)
         for micro_step in range(grad_accum_steps):
             train_loader.next_batch()
-            model.forward(train_loader.inputs, train_loader.targets, B, T)
+            model.forward(
+                train_loader.inputs,
+                train_loader.targets,
+                B,
+                T,
+                grad_accum_steps,
+            )
             accumulated_loss += model.mean_loss
             model.backward(grad_accum_steps, micro_step)
         model.ctx.synchronize()

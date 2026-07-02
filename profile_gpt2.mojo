@@ -126,7 +126,22 @@ def run_profile[
         ctx.synchronize()
         var t2 = global_perf_counter_ns()
 
-        model.update(UInt32(step + 1), Scalar[DType.float32](1e-4))
+        # Gradient-norm reduction + clip scale, exactly as the real training
+        # loop does (train_gpt2.mojo's main(), ~:3130-3143) and as llm.c's own
+        # profile_gpt2.cu does (gpt2_calculate_grad_norm between backward and
+        # update) — folded into the "update" timing bucket below so the
+        # forward/backward numbers stay directly comparable to before.
+        var grad_norm = model.calculate_grad_norm()
+        var grad_clip = Float32(1.0)
+        var grad_scale = (
+            grad_clip / grad_norm if grad_norm > grad_clip else Float32(1.0)
+        )
+
+        model.update(
+            UInt32(step + 1),
+            Scalar[DType.float32](1e-4),
+            grad_scale=grad_scale,
+        )
         ctx.synchronize()
         var t3 = global_perf_counter_ns()
 

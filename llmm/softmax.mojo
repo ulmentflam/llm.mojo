@@ -1,10 +1,10 @@
 import compiler
-from std.sys import simd_width_of
+from std.gpu.primitives import block
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
-from std.gpu.host import DeviceAttribute
-from std.gpu.primitives import block
 from std.math import fma, ceildiv, exp
+from std.gpu.host import DeviceAttribute
+from std.sys import simd_width_of, align_of
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -39,7 +39,15 @@ def _softmax_comp_max[
     mut s: SIMD[DType.float32, width],
     mut m: SIMD[DType.float32, width],
 ) -> None:
-    var x = (logits_ptr + idx).load[width=width]().cast[DType.float32]()
+    # Explicit 16-byte alignment so the wide (128-bit) load is actually emitted:
+    # idx = row*Vp + tile*BLOCK_SPAN + tid*width is 16-aligned but the compiler
+    # can't prove it (Vp is runtime). This is the classifier's biggest read path.
+    comptime align = align_of[SIMD[dtype, width]]()
+    var x = (
+        (logits_ptr + idx)
+        .load[width=width, alignment=align]()
+        .cast[DType.float32]()
+    )
     var new_m = max(m, x)
     s = s * exp(m - new_m) + exp(x - new_m)
     m = new_m
@@ -238,16 +246,23 @@ def _softmax_fwd_gpu[
         var inv_s = Scalar[DType.float32](1) / s_row
         var m_vec = SIMD[DType.float32, width](m_row)
         var inv_s_vec = SIMD[DType.float32, width](inv_s)
+        # base = row*Vp + tile_base + tid*width: Vp (vocab_size_padded) is
+        # always a multiple of 128 (padded_vocab_size invariant), tile_base is
+        # a multiple of BLOCK_SPAN=BLOCK_SIZE*width, and tid*width is a
+        # multiple of width — so base is provably width-aligned though the
+        # compiler can't see it (row/tid are runtime). Same proof as the
+        # fused classifier's _softmax_comp_max above.
+        comptime align = align_of[SIMD[dtype, width]]()
         for tile_base in range(0, vocab_size, BLOCK_SPAN):
             var lane_base = tile_base + tid * width
             if lane_base + width <= vocab_size:
                 var base = row * vocab_size_padded + lane_base
                 var x = (
                     (logits_ptr + base)
-                    .load[width=width]()
+                    .load[width=width, alignment=align]()
                     .cast[DType.float32]()
                 )
-                (probs_ptr + base).store[width=width](
+                (probs_ptr + base).store[width=width, alignment=align](
                     (exp(x - m_vec) * inv_s_vec).cast[dtype]()
                 )
             elif lane_base < vocab_size:
@@ -377,15 +392,36 @@ struct SoftmaxFwd:
 def _softmax_dot[
     dtype: DType,
     width: Int,
+    aligned: Bool = False,
 ](
     idx: Int,
     probs_ptr: ImmutKernelPtr[dtype],
     d_probs_ptr: ImmutKernelPtr[dtype],
     mut accumulator: SIMD[DType.float32, width],
 ) -> None:
-    var d_prob = (d_probs_ptr + idx).load[width=width]().cast[DType.float32]()
-    var prob = (probs_ptr + idx).load[width=width]().cast[DType.float32]()
-    accumulator = fma(prob, d_prob, accumulator)
+    # `aligned` is opt-in: the CPU caller's unroll_width chunking isn't
+    # provably width-aligned, but the GPU caller's idx = row*Vp + tile_base +
+    # tid*width IS (Vp is padded to a multiple of width — same proof as the
+    # classifier's _softmax_comp_max, which already carries this hint).
+    comptime if aligned:
+        comptime align = align_of[SIMD[dtype, width]]()
+        var d_prob = (
+            (d_probs_ptr + idx)
+            .load[width=width, alignment=align]()
+            .cast[DType.float32]()
+        )
+        var prob = (
+            (probs_ptr + idx)
+            .load[width=width, alignment=align]()
+            .cast[DType.float32]()
+        )
+        accumulator = fma(prob, d_prob, accumulator)
+    else:
+        var d_prob = (
+            (d_probs_ptr + idx).load[width=width]().cast[DType.float32]()
+        )
+        var prob = (probs_ptr + idx).load[width=width]().cast[DType.float32]()
+        accumulator = fma(prob, d_prob, accumulator)
 
 
 @always_inline
@@ -497,11 +533,12 @@ def _softmax_bwd_gpu[
         var accumulator = SIMD[DType.float32, width](0.0)
         var accumulator_tail = Scalar[DType.float32](0.0)
 
+        comptime align = align_of[SIMD[dtype, width]]()
         for tile_base in range(0, vocab_size, BLOCK_SPAN):
             var lane_base = tile_base + tid * width
             if lane_base + width <= vocab_size:
                 var idx = row * vocab_size_padded + lane_base
-                _softmax_dot[dtype, width](
+                _softmax_dot[dtype, width, aligned=True](
                     idx, probs_ptr, d_probs_ptr, accumulator
                 )
             elif lane_base < vocab_size:
@@ -523,15 +560,19 @@ def _softmax_bwd_gpu[
             if lane_base + width <= vocab_size:
                 var base = row * vocab_size_padded + lane_base
                 var p = (
-                    (probs_ptr + base).load[width=width]().cast[DType.float32]()
+                    (probs_ptr + base)
+                    .load[width=width, alignment=align]()
+                    .cast[DType.float32]()
                 )
                 var g = (
                     (d_probs_ptr + base)
-                    .load[width=width]()
+                    .load[width=width, alignment=align]()
                     .cast[DType.float32]()
                 )
                 var d = p * (g - dot_vec)
-                (d_logits_ptr + base).store[width=width](d.cast[dtype]())
+                (d_logits_ptr + base).store[width=width, alignment=align](
+                    d.cast[dtype]()
+                )
             elif lane_base < vocab_size:
                 for i in range(lane_base, vocab_size):
                     var base = row * vocab_size_padded + i

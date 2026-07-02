@@ -1,4 +1,5 @@
 from std.algorithm import vectorize
+from std.gpu.memory import CacheOperation, load as gpu_cache_load
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
@@ -118,20 +119,46 @@ def layout_copy[
     dtype: DType,
     width: Int,
     backward: Bool,
+    streaming: Bool = False,
 ](
     dst_ptr: MutKernelPtr[dtype],
     src_ptr: ImmutKernelPtr[dtype],
     dst_flat_index: Int,
     src_flat_index: Int,
 ) -> None:
+    # `streaming` (item 4 experiment): llm.c's permute/unpermute use
+    # __ldcs/__stcs ("this data is touched exactly once, don't pollute the
+    # cache") on every load/store — this is a genuinely single-touch
+    # permutation, so the streaming hint is a legitimate match. Mojo exposes
+    # the load side via std.gpu.memory's `load[cache_policy=STREAMING]` and
+    # the store side via UnsafePointer.store's `non_temporal=True` (maps to
+    # `st.global.cs`). Both are only honored at >= 4-byte transactions (see
+    # std/gpu/memory/memory.mojo's `_load_impl` width floor), so this is only
+    # meaningful at width >= 2 for bf16 — at width=1 (2B) the load silently
+    # falls back to a plain load, which is why width and streaming are
+    # swept together, not compared at width=1.
     comptime if backward:
-        (dst_ptr + src_flat_index).store(
-            (src_ptr + dst_flat_index).load[width=width]()
-        )
+        comptime if streaming:
+            (dst_ptr + src_flat_index).store[width=width, non_temporal=True](
+                gpu_cache_load[
+                    width=width, cache_policy=CacheOperation.STREAMING
+                ](src_ptr + dst_flat_index)
+            )
+        else:
+            (dst_ptr + src_flat_index).store(
+                (src_ptr + dst_flat_index).load[width=width]()
+            )
     else:
-        (dst_ptr + dst_flat_index).store(
-            (src_ptr + src_flat_index).load[width=width]()
-        )
+        comptime if streaming:
+            (dst_ptr + dst_flat_index).store[width=width, non_temporal=True](
+                gpu_cache_load[
+                    width=width, cache_policy=CacheOperation.STREAMING
+                ](src_ptr + src_flat_index)
+            )
+        else:
+            (dst_ptr + dst_flat_index).store(
+                (src_ptr + src_flat_index).load[width=width]()
+            )
 
 
 @always_inline
