@@ -1,0 +1,32 @@
+# Python dependencies for llm.mojo (pip requirements without pixi)
+#
+# This file specifies Python packages needed to run:
+#   - train_gpt2.py: PyTorch training reference and data utilities
+#   - data/*.py: dataset download and tokenization scripts
+#   - scripts/benchmark_train.py: benchmark plotting
+#   - profile_gpt2.py: profiling support (stdlib only; see Makefile for ncu/nsys)
+#
+# NOTE: pixi.toml is the canonical environment definition. This file provides
+# pip-only equivalents for users without pixi. Version constraints are derived
+# from pixi.toml and loosened to >= where applicable for flexibility.
+
+# Core training dependencies
+torch>=2.2
+numpy>=1.26
+
+# LLM ecosystem and tokenization
+transformers>=4.40
+tiktoken>=0.6
+
+# Dataset utilities
+datasets>=2.18  # Hugging Face datasets (for fineweb.py, tinystories.py)
+requests>=2.0   # HTTP downloads (used by utils.download_file)
+tqdm>=4.0       # Progress bars (used by utils.download_file)
+
+# Optional: visualization for benchmarks
+# Only needed if running scripts/benchmark_train.py
+matplotlib>=3.11.0,<4
+
+# Testing (optional; needed for pytest equivalence tests)
+# pytest>=8.0
+# pytest-xdist>=3

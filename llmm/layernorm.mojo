@@ -588,6 +588,7 @@ def _layernorm_fused_residual_fwd_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int = 4,
+    aligned: Bool = True,
 ](
     num_rows: Int,
     tid: Int,
@@ -616,35 +617,56 @@ def _layernorm_fused_residual_fwd_gpu[
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
 
+    # `aligned` (comptime): True keeps the vectorized fast path with explicit
+    # 16-byte alignment on the global loads/stores (byte-identical to before)
+    # for the production invariant channels % width == 0, where idx =
+    # row*channels + lane_base is provably width-aligned. False (odd channel
+    # counts, e.g. the equivalence suite's 767) falls back to a fully scalar
+    # sweep — row*channels is not provably width-aligned there, and a forced
+    # over-aligned SIMD access crashes with CUDA_ERROR_MISALIGNED_ADDRESS.
+    comptime align = align_of[SIMD[dtype, width]]()
+
     for row in range(block_row, num_rows, stride):
         # Pass 1: Add input tensors, store to residual (global + shared), mean.
-        # Explicit 16-byte alignment so the wide loads/stores are emitted (idx is
-        # naturally aligned but the compiler can't prove it — Vp/channels runtime).
-        comptime align = align_of[SIMD[dtype, width]]()
         var sum_thread = SIMD[DType.float32, width](0.0)
         var sum_tail = Scalar[DType.float32](0.0)
 
-        for tile_base in range(0, channels, BLOCK_SPAN):
-            var lane_base = tile_base + tid * width
-            if lane_base + width <= channels:
-                var idx = row * channels + lane_base
-                var val1 = (inp1_ptr + idx).load[width=width, alignment=align]()
-                var val2 = (inp2_ptr + idx).load[width=width, alignment=align]()
-                var sum_val = val1 + val2
-                (residual_ptr + idx).store[alignment=align](sum_val)
-                var sv_f = sum_val.cast[DType.float32]()
-                (s_res.ptr + lane_base).store[width=width](sv_f)
-                sum_thread += sv_f
-            elif lane_base < channels:
-                for i in range(lane_base, channels):
-                    var idx = row * channels + i
-                    var val1 = (inp1_ptr + idx).load[width=1]()
-                    var val2 = (inp2_ptr + idx).load[width=1]()
+        comptime if aligned:
+            for tile_base in range(0, channels, BLOCK_SPAN):
+                var lane_base = tile_base + tid * width
+                if lane_base + width <= channels:
+                    var idx = row * channels + lane_base
+                    var val1 = (inp1_ptr + idx).load[
+                        width=width, alignment=align
+                    ]()
+                    var val2 = (inp2_ptr + idx).load[
+                        width=width, alignment=align
+                    ]()
                     var sum_val = val1 + val2
-                    (residual_ptr + idx).store(sum_val)
+                    (residual_ptr + idx).store[alignment=align](sum_val)
                     var sv_f = sum_val.cast[DType.float32]()
-                    s_res.ptr[i] = sv_f[0]
-                    sum_tail += sv_f
+                    (s_res.ptr + lane_base).store[width=width](sv_f)
+                    sum_thread += sv_f
+                elif lane_base < channels:
+                    for i in range(lane_base, channels):
+                        var idx = row * channels + i
+                        var val1 = (inp1_ptr + idx).load[width=1]()
+                        var val2 = (inp2_ptr + idx).load[width=1]()
+                        var sum_val = val1 + val2
+                        (residual_ptr + idx).store(sum_val)
+                        var sv_f = sum_val.cast[DType.float32]()
+                        s_res.ptr[i] = sv_f[0]
+                        sum_tail += sv_f
+        else:
+            for i in range(tid, channels, BLOCK_SIZE):
+                var idx = row * channels + i
+                var val1 = inp1_ptr[idx]
+                var val2 = inp2_ptr[idx]
+                var sum_val = val1 + val2
+                residual_ptr[idx] = sum_val
+                var sv_f = sum_val.cast[DType.float32]()
+                s_res.ptr[i] = sv_f
+                sum_tail += sv_f
         barrier()
 
         var mean_thread = sum_thread.reduce_add() + sum_tail
@@ -656,17 +678,23 @@ def _layernorm_fused_residual_fwd_gpu[
         var var_thread = SIMD[DType.float32, width](0.0)
         var var_tail = Scalar[DType.float32](0.0)
         var mean_vec = SIMD[DType.float32, width](mean)
-        for tile_base in range(0, channels, BLOCK_SPAN):
-            var lane_base = tile_base + tid * width
-            if lane_base + width <= channels:
-                var x = (s_res.ptr + lane_base).load[width=width]()
-                var diff = x - mean_vec
-                var_thread = fma(diff, diff, var_thread)
-            elif lane_base < channels:
-                for i in range(lane_base, channels):
-                    var x = s_res.ptr[i]
-                    var diff = x - mean
-                    var_tail = fma(diff, diff, var_tail)
+        comptime if aligned:
+            for tile_base in range(0, channels, BLOCK_SPAN):
+                var lane_base = tile_base + tid * width
+                if lane_base + width <= channels:
+                    var x = (s_res.ptr + lane_base).load[width=width]()
+                    var diff = x - mean_vec
+                    var_thread = fma(diff, diff, var_thread)
+                elif lane_base < channels:
+                    for i in range(lane_base, channels):
+                        var x = s_res.ptr[i]
+                        var diff = x - mean
+                        var_tail = fma(diff, diff, var_tail)
+        else:
+            for i in range(tid, channels, BLOCK_SIZE):
+                var x = s_res.ptr[i]
+                var diff = x - mean
+                var_tail = fma(diff, diff, var_tail)
 
         var variance_thread = var_thread.reduce_add() + var_tail
         var variance = block.sum[block_size=BLOCK_SIZE](
@@ -676,33 +704,43 @@ def _layernorm_fused_residual_fwd_gpu[
 
         # Pass 3: Output (Normed) — read residual from shared.
         var rstd_vec = SIMD[DType.float32, width](rstd)
-        for tile_base in range(0, channels, BLOCK_SPAN):
-            var lane_base = tile_base + tid * width
-            if lane_base + width <= channels:
-                var idx = row * channels + lane_base
-                var x = (s_res.ptr + lane_base).load[width=width]()
-                var g = (
-                    (gamma_ptr + lane_base)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var b = (
-                    (beta_ptr + lane_base)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var n = rstd_vec * (x - mean_vec)
-                var o = fma(n, g, b)
-                (normed_ptr + idx).store[alignment=align](o.cast[dtype]())
-            elif lane_base < channels:
-                for i in range(lane_base, channels):
-                    var idx = row * channels + i
-                    var x = s_res.ptr[i]
-                    var g = gamma_ptr[i].cast[DType.float32]()
-                    var b = beta_ptr[i].cast[DType.float32]()
-                    var n = rstd * (x - mean)
-                    var o = n * g + b
-                    (normed_ptr + idx).store(o.cast[dtype]())
+        comptime if aligned:
+            for tile_base in range(0, channels, BLOCK_SPAN):
+                var lane_base = tile_base + tid * width
+                if lane_base + width <= channels:
+                    var idx = row * channels + lane_base
+                    var x = (s_res.ptr + lane_base).load[width=width]()
+                    var g = (
+                        (gamma_ptr + lane_base)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var b = (
+                        (beta_ptr + lane_base)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var n = rstd_vec * (x - mean_vec)
+                    var o = fma(n, g, b)
+                    (normed_ptr + idx).store[alignment=align](o.cast[dtype]())
+                elif lane_base < channels:
+                    for i in range(lane_base, channels):
+                        var idx = row * channels + i
+                        var x = s_res.ptr[i]
+                        var g = gamma_ptr[i].cast[DType.float32]()
+                        var b = beta_ptr[i].cast[DType.float32]()
+                        var n = rstd * (x - mean)
+                        var o = n * g + b
+                        (normed_ptr + idx).store(o.cast[dtype]())
+        else:
+            for i in range(tid, channels, BLOCK_SIZE):
+                var idx = row * channels + i
+                var x = s_res.ptr[i]
+                var g = gamma_ptr[i].cast[DType.float32]()
+                var b = beta_ptr[i].cast[DType.float32]()
+                var n = rstd * (x - mean)
+                var o = n * g + b
+                normed_ptr[idx] = o.cast[dtype]()
 
         # Store the Mean and RSTD
         if tid == 0:
@@ -818,6 +856,7 @@ def layernorm_fused_residual_fwd_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int = 4,
+    aligned: Bool = True,
 ](
     residual_ptr: MutKernelPtr[dtype],
     normed_ptr: MutKernelPtr[dtype],
@@ -832,7 +871,9 @@ def layernorm_fused_residual_fwd_gpu[
     seq_len: Int64,
     channels: Int64,
 ) -> None:
-    _layernorm_fused_residual_fwd_gpu[dtype, BLOCK_SIZE, width](
+    _layernorm_fused_residual_fwd_gpu[
+        dtype, BLOCK_SIZE, width, aligned=aligned
+    ](
         Int(batch_size * seq_len),
         Int(thread_idx.x),
         Int(grid_dim.x),
@@ -890,33 +931,59 @@ def layernorm_fused_residual_fwd[
         # overhead; the block-per-row kernel is kept.)
         comptime BLOCK_SIZE = 256
         comptime SM_OVERPROVISION = 32
+        comptime width = 4
         var device_ctx = ctx
         var num_rows = Int(batch_size * seq_len)
         var num_sm = device_ctx.get_attribute(
             DeviceAttribute.MULTIPROCESSOR_COUNT
         )
         var num_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
-        comptime gpu_kernel = layernorm_fused_residual_fwd_gpu[
-            dtype, BLOCK_SIZE
-        ]
-        var compiled = device_ctx.compile_function[gpu_kernel]()
-        device_ctx.enqueue_function(
-            compiled,
-            residual_ptr,
-            normed_ptr,
-            inp1_ptr,
-            inp2_ptr,
-            gamma_ptr,
-            beta_ptr,
-            epsilon,
-            mean_ptr,
-            rstd_ptr,
-            batch_size,
-            seq_len,
-            channels,
-            grid_dim=(num_blocks,),
-            block_dim=(BLOCK_SIZE,),
-        )
+        # Dispatch aligned vs. scalar-fallback kernels at the host; see
+        # _layernorm_fused_residual_fwd_gpu's docstring.
+        if Int(channels) % width == 0:
+            comptime gpu_kernel = layernorm_fused_residual_fwd_gpu[
+                dtype, BLOCK_SIZE, width, aligned=True
+            ]
+            var compiled = device_ctx.compile_function[gpu_kernel]()
+            device_ctx.enqueue_function(
+                compiled,
+                residual_ptr,
+                normed_ptr,
+                inp1_ptr,
+                inp2_ptr,
+                gamma_ptr,
+                beta_ptr,
+                epsilon,
+                mean_ptr,
+                rstd_ptr,
+                batch_size,
+                seq_len,
+                channels,
+                grid_dim=(num_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            comptime gpu_kernel_u = layernorm_fused_residual_fwd_gpu[
+                dtype, BLOCK_SIZE, width, aligned=False
+            ]
+            var compiled_u = device_ctx.compile_function[gpu_kernel_u]()
+            device_ctx.enqueue_function(
+                compiled_u,
+                residual_ptr,
+                normed_ptr,
+                inp1_ptr,
+                inp2_ptr,
+                gamma_ptr,
+                beta_ptr,
+                epsilon,
+                mean_ptr,
+                rstd_ptr,
+                batch_size,
+                seq_len,
+                channels,
+                grid_dim=(num_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
     else:
         raise Error("Invalid target")
 
@@ -1088,6 +1155,9 @@ def _layernorm_bwd_cpu[
 def layernorm_bwd_cpu[
     dtype: DType,
     width: Int,
+    # Parameter-gradient dtype: production keeps pdtype == dtype; the test
+    # harness (registered ops) accumulates d_gamma/d_beta in fp32.
+    pdtype: DType = dtype,
 ](
     d_output_ptr: ImmutKernelPtr[dtype],
     input_ptr: ImmutKernelPtr[dtype],
@@ -1095,8 +1165,8 @@ def layernorm_bwd_cpu[
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
     d_input_ptr: MutKernelPtr[dtype],
-    d_gamma_ptr: MutKernelPtr[dtype],
-    d_beta_ptr: MutKernelPtr[dtype],
+    d_gamma_ptr: MutKernelPtr[pdtype],
+    d_beta_ptr: MutKernelPtr[pdtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
@@ -1154,9 +1224,9 @@ def layernorm_bwd_cpu[
             acc_dbeta += dbeta_partial[w * c + j]
         d_gamma_ptr[j] = (
             d_gamma_ptr[j].cast[DType.float32]() + acc_dgamma
-        ).cast[dtype]()
+        ).cast[pdtype]()
         d_beta_ptr[j] = (d_beta_ptr[j].cast[DType.float32]() + acc_dbeta).cast[
-            dtype
+            pdtype
         ]()
 
     dgamma_partial.free()
@@ -1168,6 +1238,7 @@ def _layernorm_bwd_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int = 4,
+    aligned: Bool = True,
 ](
     num_rows: Int,
     tid: Int,
@@ -1187,10 +1258,15 @@ def _layernorm_bwd_gpu[
     # handled by _layernorm_dgamma_dbeta_gpu, which needs no atomics either.
     comptime BLOCK_SPAN = BLOCK_SIZE * width
     # idx = row*channels + i, where i = tile_base + tid*width. tile_base is a
-    # multiple of BLOCK_SPAN (= BLOCK_SIZE*width) and channels (the model's C,
-    # e.g. 768/1024/1280/1600) is always a multiple of width, so idx is
-    # provably width-aligned even though the compiler can't see it (row and
-    # tid are runtime). Same fix as the fused classifier/adamw.
+    # multiple of BLOCK_SPAN (= BLOCK_SIZE*width) and, when `aligned` is True,
+    # channels is a multiple of width (the caller only sets aligned=True when
+    # it has checked channels % width == 0 on the host), so idx is provably
+    # width-aligned even though the compiler can't see it (row and tid are
+    # runtime). Same fix as the fused classifier/adamw. When `aligned` is
+    # False (odd channel counts, e.g. the equivalence-suite's 767), the
+    # per-row base offset row*channels is not provably width-aligned, so we
+    # fall back to a fully scalar (width=1) sweep that needs no alignment
+    # guarantee at all.
     comptime align = align_of[SIMD[dtype, width]]()
 
     for row in range(block_row, num_rows, stride):
@@ -1204,41 +1280,53 @@ def _layernorm_bwd_gpu[
         var sum_gdy_xhat_tail = Scalar[DType.float32](0.0)
 
         # Pass 1: Row-statistic reduction (sum_gdy, sum_gdy_xhat).
-        for tile_base in range(0, channels, BLOCK_SPAN):
-            var i = tile_base + tid * width
-            if i + width <= channels:
-                var idx = row * channels + i
-                var dy = (
-                    (d_output_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var x = (
-                    (input_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var g = (
-                    (gamma_ptr + i)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var x_hat = (x - mean_vec) * rstd_vec
-
-                var gdy = g * dy
-                sum_gdy_thread += gdy
-                sum_gdy_xhat_thread += gdy * x_hat
-            elif i < channels:
-                for j in range(i, channels):
-                    var idx = row * channels + j
-                    var dy = d_output_ptr[idx].cast[DType.float32]()
-                    var x = input_ptr[idx].cast[DType.float32]()
-                    var g = gamma_ptr[j].cast[DType.float32]()
-                    var x_hat = (x - mean) * rstd
+        comptime if aligned:
+            for tile_base in range(0, channels, BLOCK_SPAN):
+                var i = tile_base + tid * width
+                if i + width <= channels:
+                    var idx = row * channels + i
+                    var dy = (
+                        (d_output_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var x = (
+                        (input_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var g = (
+                        (gamma_ptr + i)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var x_hat = (x - mean_vec) * rstd_vec
 
                     var gdy = g * dy
-                    sum_gdy_tail += gdy
-                    sum_gdy_xhat_tail += gdy * x_hat
+                    sum_gdy_thread += gdy
+                    sum_gdy_xhat_thread += gdy * x_hat
+                elif i < channels:
+                    for j in range(i, channels):
+                        var idx = row * channels + j
+                        var dy = d_output_ptr[idx].cast[DType.float32]()
+                        var x = input_ptr[idx].cast[DType.float32]()
+                        var g = gamma_ptr[j].cast[DType.float32]()
+                        var x_hat = (x - mean) * rstd
+
+                        var gdy = g * dy
+                        sum_gdy_tail += gdy
+                        sum_gdy_xhat_tail += gdy * x_hat
+        else:
+            for i in range(tid, channels, BLOCK_SIZE):
+                var idx = row * channels + i
+                var dy = d_output_ptr[idx].cast[DType.float32]()
+                var x = input_ptr[idx].cast[DType.float32]()
+                var g = gamma_ptr[i].cast[DType.float32]()
+                var x_hat = (x - mean) * rstd
+
+                var gdy = g * dy
+                sum_gdy_tail += gdy
+                sum_gdy_xhat_tail += gdy * x_hat
 
         var sum_gdy = block.sum[block_size=BLOCK_SIZE](
             sum_gdy_thread.reduce_add() + sum_gdy_tail
@@ -1249,51 +1337,66 @@ def _layernorm_bwd_gpu[
 
         # Pass 2: Compute input gradient.
         var inv_c = 1.0 / Float32(channels)
-        for tile_base in range(0, channels, BLOCK_SPAN):
-            var i = tile_base + tid * width
-            if i + width <= channels:
-                var idx = row * channels + i
-                var dy = (
-                    (d_output_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var x = (
-                    (input_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var g = (
-                    (gamma_ptr + i)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var x_hat = (x - mean_vec) * rstd_vec
-                var d_input = rstd_vec * (
-                    g * dy - (sum_gdy * inv_c) - (x_hat * sum_gdy_xhat * inv_c)
-                )
-                (d_input_ptr + idx).store[width=width, alignment=align](
-                    d_input.cast[dtype]()
-                )
-            elif i < channels:
-                for j in range(i, channels):
-                    var idx = row * channels + j
-                    var dy = d_output_ptr[idx].cast[DType.float32]()
-                    var x = input_ptr[idx].cast[DType.float32]()
-                    var g = gamma_ptr[j].cast[DType.float32]()
-                    var x_hat = (x - mean) * rstd
-                    var d_input = rstd * (
+        comptime if aligned:
+            for tile_base in range(0, channels, BLOCK_SPAN):
+                var i = tile_base + tid * width
+                if i + width <= channels:
+                    var idx = row * channels + i
+                    var dy = (
+                        (d_output_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var x = (
+                        (input_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var g = (
+                        (gamma_ptr + i)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var x_hat = (x - mean_vec) * rstd_vec
+                    var d_input = rstd_vec * (
                         g * dy
                         - (sum_gdy * inv_c)
                         - (x_hat * sum_gdy_xhat * inv_c)
                     )
-                    d_input_ptr[idx] = d_input.cast[dtype]()
+                    (d_input_ptr + idx).store[width=width, alignment=align](
+                        d_input.cast[dtype]()
+                    )
+                elif i < channels:
+                    for j in range(i, channels):
+                        var idx = row * channels + j
+                        var dy = d_output_ptr[idx].cast[DType.float32]()
+                        var x = input_ptr[idx].cast[DType.float32]()
+                        var g = gamma_ptr[j].cast[DType.float32]()
+                        var x_hat = (x - mean) * rstd
+                        var d_input = rstd * (
+                            g * dy
+                            - (sum_gdy * inv_c)
+                            - (x_hat * sum_gdy_xhat * inv_c)
+                        )
+                        d_input_ptr[idx] = d_input.cast[dtype]()
+        else:
+            for i in range(tid, channels, BLOCK_SIZE):
+                var idx = row * channels + i
+                var dy = d_output_ptr[idx].cast[DType.float32]()
+                var x = input_ptr[idx].cast[DType.float32]()
+                var g = gamma_ptr[i].cast[DType.float32]()
+                var x_hat = (x - mean) * rstd
+                var d_input = rstd * (
+                    g * dy - (sum_gdy * inv_c) - (x_hat * sum_gdy_xhat * inv_c)
+                )
+                d_input_ptr[idx] = d_input.cast[dtype]()
 
 
 def layernorm_bwd_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int = 4,
+    aligned: Bool = True,
 ](
     d_output_ptr: MutKernelPtr[dtype],
     input_ptr: ImmutKernelPtr[dtype],
@@ -1305,7 +1408,7 @@ def layernorm_bwd_gpu[
     seq_len: Int64,
     channels: Int64,
 ) -> None:
-    _layernorm_bwd_gpu[dtype, BLOCK_SIZE, width](
+    _layernorm_bwd_gpu[dtype, BLOCK_SIZE, width, aligned=aligned](
         Int(batch_size * seq_len),
         Int(thread_idx.x),
         Int(grid_dim.x),
@@ -1326,6 +1429,7 @@ def _layernorm_bwd_residual_gpu[
     BLOCK_SIZE: Int,
     width: Int = 4,
     store_scratch: Bool = True,
+    aligned: Bool = True,
 ](
     num_rows: Int,
     tid: Int,
@@ -1357,10 +1461,13 @@ def _layernorm_bwd_residual_gpu[
     # post-broadcast value is dead within this step (every access after the
     # broadcast read is a write) and is re-zeroed before next step's use, so
     # skipping the store changes no observable value, only saves the write.
+    #
+    # `aligned` (comptime): True keeps the vectorized fast path below,
+    # byte-identical to before, for the production invariant
+    # channels % width == 0 (so row*channels is always width-aligned). False
+    # (odd channel counts) falls back to a fully scalar sweep — see
+    # _layernorm_bwd_gpu for the same proof/pattern.
     comptime BLOCK_SPAN = BLOCK_SIZE * width
-    # Same alignment proof as _layernorm_bwd_gpu: idx = row*channels + i is
-    # provably width-aligned (channels % width == 0, tile_base is a multiple
-    # of BLOCK_SPAN).
     comptime align = align_of[SIMD[dtype, width]]()
 
     for row in range(block_row, num_rows, stride):
@@ -1374,41 +1481,53 @@ def _layernorm_bwd_residual_gpu[
         var sum_gdy_xhat_tail = Scalar[DType.float32](0.0)
 
         # Pass 1: Row-statistic reduction (sum_gdy, sum_gdy_xhat).
-        for tile_base in range(0, channels, BLOCK_SPAN):
-            var i = tile_base + tid * width
-            if i + width <= channels:
-                var idx = row * channels + i
-                var dy = (
-                    (d_output_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var x = (
-                    (input_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var g = (
-                    (gamma_ptr + i)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var x_hat = (x - mean_vec) * rstd_vec
-
-                var gdy = g * dy
-                sum_gdy_thread += gdy
-                sum_gdy_xhat_thread += gdy * x_hat
-            elif i < channels:
-                for j in range(i, channels):
-                    var idx = row * channels + j
-                    var dy = d_output_ptr[idx].cast[DType.float32]()
-                    var x = input_ptr[idx].cast[DType.float32]()
-                    var g = gamma_ptr[j].cast[DType.float32]()
-                    var x_hat = (x - mean) * rstd
+        comptime if aligned:
+            for tile_base in range(0, channels, BLOCK_SPAN):
+                var i = tile_base + tid * width
+                if i + width <= channels:
+                    var idx = row * channels + i
+                    var dy = (
+                        (d_output_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var x = (
+                        (input_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var g = (
+                        (gamma_ptr + i)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var x_hat = (x - mean_vec) * rstd_vec
 
                     var gdy = g * dy
-                    sum_gdy_tail += gdy
-                    sum_gdy_xhat_tail += gdy * x_hat
+                    sum_gdy_thread += gdy
+                    sum_gdy_xhat_thread += gdy * x_hat
+                elif i < channels:
+                    for j in range(i, channels):
+                        var idx = row * channels + j
+                        var dy = d_output_ptr[idx].cast[DType.float32]()
+                        var x = input_ptr[idx].cast[DType.float32]()
+                        var g = gamma_ptr[j].cast[DType.float32]()
+                        var x_hat = (x - mean) * rstd
+
+                        var gdy = g * dy
+                        sum_gdy_tail += gdy
+                        sum_gdy_xhat_tail += gdy * x_hat
+        else:
+            for i in range(tid, channels, BLOCK_SIZE):
+                var idx = row * channels + i
+                var dy = d_output_ptr[idx].cast[DType.float32]()
+                var x = input_ptr[idx].cast[DType.float32]()
+                var g = gamma_ptr[i].cast[DType.float32]()
+                var x_hat = (x - mean) * rstd
+
+                var gdy = g * dy
+                sum_gdy_tail += gdy
+                sum_gdy_xhat_tail += gdy * x_hat
 
         var sum_gdy = block.sum[block_size=BLOCK_SIZE](
             sum_gdy_thread.reduce_add() + sum_gdy_tail
@@ -1419,67 +1538,86 @@ def _layernorm_bwd_residual_gpu[
 
         # Pass 2: Compute input gradient, then fuse the broadcast accumulate.
         var inv_c = 1.0 / Float32(channels)
-        for tile_base in range(0, channels, BLOCK_SPAN):
-            var i = tile_base + tid * width
-            if i + width <= channels:
-                var idx = row * channels + i
-                var dy = (
-                    (d_output_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var x = (
-                    (input_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var g = (
-                    (gamma_ptr + i)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var x_hat = (x - mean_vec) * rstd_vec
-                var d_input = rstd_vec * (
-                    g * dy - (sum_gdy * inv_c) - (x_hat * sum_gdy_xhat * inv_c)
-                )
-                comptime if store_scratch:
-                    (d_input_ptr + idx).store[width=width, alignment=align](
-                        d_input.cast[dtype]()
+        comptime if aligned:
+            for tile_base in range(0, channels, BLOCK_SPAN):
+                var i = tile_base + tid * width
+                if i + width <= channels:
+                    var idx = row * channels + i
+                    var dy = (
+                        (d_output_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
                     )
-                var g1 = (
-                    (d_inp1_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                var g2 = (
-                    (d_inp2_ptr + idx)
-                    .load[width=width, alignment=align]()
-                    .cast[DType.float32]()
-                )
-                (d_inp1_ptr + idx).store[width=width, alignment=align](
-                    (g1 + d_input).cast[dtype]()
-                )
-                (d_inp2_ptr + idx).store[width=width, alignment=align](
-                    (g2 + d_input).cast[dtype]()
-                )
-            elif i < channels:
-                for j in range(i, channels):
-                    var idx = row * channels + j
-                    var dy = d_output_ptr[idx].cast[DType.float32]()
-                    var x = input_ptr[idx].cast[DType.float32]()
-                    var g = gamma_ptr[j].cast[DType.float32]()
-                    var x_hat = (x - mean) * rstd
-                    var d_input = rstd * (
+                    var x = (
+                        (input_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var g = (
+                        (gamma_ptr + i)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var x_hat = (x - mean_vec) * rstd_vec
+                    var d_input = rstd_vec * (
                         g * dy
                         - (sum_gdy * inv_c)
                         - (x_hat * sum_gdy_xhat * inv_c)
                     )
                     comptime if store_scratch:
-                        d_input_ptr[idx] = d_input.cast[dtype]()
-                    var g1 = d_inp1_ptr[idx].cast[DType.float32]()
-                    var g2 = d_inp2_ptr[idx].cast[DType.float32]()
-                    d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
-                    d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
+                        (d_input_ptr + idx).store[width=width, alignment=align](
+                            d_input.cast[dtype]()
+                        )
+                    var g1 = (
+                        (d_inp1_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    var g2 = (
+                        (d_inp2_ptr + idx)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    (d_inp1_ptr + idx).store[width=width, alignment=align](
+                        (g1 + d_input).cast[dtype]()
+                    )
+                    (d_inp2_ptr + idx).store[width=width, alignment=align](
+                        (g2 + d_input).cast[dtype]()
+                    )
+                elif i < channels:
+                    for j in range(i, channels):
+                        var idx = row * channels + j
+                        var dy = d_output_ptr[idx].cast[DType.float32]()
+                        var x = input_ptr[idx].cast[DType.float32]()
+                        var g = gamma_ptr[j].cast[DType.float32]()
+                        var x_hat = (x - mean) * rstd
+                        var d_input = rstd * (
+                            g * dy
+                            - (sum_gdy * inv_c)
+                            - (x_hat * sum_gdy_xhat * inv_c)
+                        )
+                        comptime if store_scratch:
+                            d_input_ptr[idx] = d_input.cast[dtype]()
+                        var g1 = d_inp1_ptr[idx].cast[DType.float32]()
+                        var g2 = d_inp2_ptr[idx].cast[DType.float32]()
+                        d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
+                        d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
+        else:
+            for i in range(tid, channels, BLOCK_SIZE):
+                var idx = row * channels + i
+                var dy = d_output_ptr[idx].cast[DType.float32]()
+                var x = input_ptr[idx].cast[DType.float32]()
+                var g = gamma_ptr[i].cast[DType.float32]()
+                var x_hat = (x - mean) * rstd
+                var d_input = rstd * (
+                    g * dy - (sum_gdy * inv_c) - (x_hat * sum_gdy_xhat * inv_c)
+                )
+                comptime if store_scratch:
+                    d_input_ptr[idx] = d_input.cast[dtype]()
+                var g1 = d_inp1_ptr[idx].cast[DType.float32]()
+                var g2 = d_inp2_ptr[idx].cast[DType.float32]()
+                d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
+                d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
 
 
 def layernorm_bwd_residual_gpu[
@@ -1487,6 +1625,7 @@ def layernorm_bwd_residual_gpu[
     BLOCK_SIZE: Int,
     width: Int = 4,
     store_scratch: Bool = True,
+    aligned: Bool = True,
 ](
     d_output_ptr: MutKernelPtr[dtype],
     input_ptr: ImmutKernelPtr[dtype],
@@ -1500,7 +1639,9 @@ def layernorm_bwd_residual_gpu[
     seq_len: Int64,
     channels: Int64,
 ) -> None:
-    _layernorm_bwd_residual_gpu[dtype, BLOCK_SIZE, width, store_scratch](
+    _layernorm_bwd_residual_gpu[
+        dtype, BLOCK_SIZE, width, store_scratch, aligned=aligned
+    ](
         Int(batch_size * seq_len),
         Int(thread_idx.x),
         Int(grid_dim.x),
@@ -1720,13 +1861,16 @@ def layernorm_dgamma_dbeta_gpu[
 @always_inline
 def _layernorm_dparam_gpu[
     dtype: DType,
+    # Parameter-gradient dtype: production keeps pdtype == dtype; the test
+    # harness (registered ops) accumulates d_gamma/d_beta in fp32.
+    pdtype: DType = dtype,
 ](
     d_output_ptr: ImmutKernelPtr[dtype],
     input_ptr: ImmutKernelPtr[dtype],
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
-    d_gamma_ptr: MutKernelPtr[dtype],
-    d_beta_ptr: MutKernelPtr[dtype],
+    d_gamma_ptr: MutKernelPtr[pdtype],
+    d_beta_ptr: MutKernelPtr[pdtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
@@ -1763,7 +1907,7 @@ def _layernorm_dparam_gpu[
         grid_dim=(ln_col_blocks, LN_ROW_BLOCKS),
         block_dim=(BLOCK_SIZE,),
     )
-    comptime ln_fin_k = _ln_dparam_finalize_gpu[dtype]
+    comptime ln_fin_k = _ln_dparam_finalize_gpu[pdtype]
     var ln_fin_c = device_ctx.compile_function[ln_fin_k]()
     device_ctx.enqueue_function(
         ln_fin_c,
@@ -1780,6 +1924,9 @@ def _layernorm_dparam_gpu[
 def layernorm_bwd[
     dtype: DType,
     target: StaticString,
+    # Parameter-gradient dtype: production keeps pdtype == dtype; the test
+    # harness (registered ops) accumulates d_gamma/d_beta in fp32.
+    pdtype: DType = dtype,
 ](
     d_output_ptr: MutKernelPtr[dtype],
     input_ptr: ImmutKernelPtr[dtype],
@@ -1787,8 +1934,8 @@ def layernorm_bwd[
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
     d_input_ptr: MutKernelPtr[dtype],
-    d_gamma_ptr: MutKernelPtr[dtype],
-    d_beta_ptr: MutKernelPtr[dtype],
+    d_gamma_ptr: MutKernelPtr[pdtype],
+    d_beta_ptr: MutKernelPtr[pdtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
@@ -1796,7 +1943,7 @@ def layernorm_bwd[
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
-        layernorm_bwd_cpu[dtype, width](
+        layernorm_bwd_cpu[dtype, width, pdtype](
             d_output_ptr,
             input_ptr,
             gamma_ptr,
@@ -1824,26 +1971,56 @@ def layernorm_bwd[
         )
 
         # Kernel 1: d_input, one block per row tile (reduces over channels).
+        # Dispatch aligned vs. scalar-fallback kernels at the host: the
+        # vectorized fast path requires channels % width == 0 (so every
+        # row's base offset row*channels is width-aligned); production
+        # shapes satisfy this, but the equivalence suite's odd channel
+        # counts (e.g. 767) don't, and would otherwise crash with
+        # CUDA_ERROR_MISALIGNED_ADDRESS. See _layernorm_bwd_gpu.
         var num_row_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
-        comptime dinput_kernel = layernorm_bwd_gpu[dtype, BLOCK_SIZE, width]
-        var dinput_compiled = device_ctx.compile_function[dinput_kernel]()
-        device_ctx.enqueue_function(
-            dinput_compiled,
-            d_output_ptr,
-            input_ptr,
-            gamma_ptr,
-            mean_ptr,
-            rstd_ptr,
-            d_input_ptr,
-            batch_size,
-            seq_len,
-            channels,
-            grid_dim=(num_row_blocks,),
-            block_dim=(BLOCK_SIZE,),
-        )
+        if Int(channels) % width == 0:
+            comptime dinput_kernel = layernorm_bwd_gpu[
+                dtype, BLOCK_SIZE, width, aligned=True
+            ]
+            var dinput_compiled = device_ctx.compile_function[dinput_kernel]()
+            device_ctx.enqueue_function(
+                dinput_compiled,
+                d_output_ptr,
+                input_ptr,
+                gamma_ptr,
+                mean_ptr,
+                rstd_ptr,
+                d_input_ptr,
+                batch_size,
+                seq_len,
+                channels,
+                grid_dim=(num_row_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            comptime dinput_kernel_u = layernorm_bwd_gpu[
+                dtype, BLOCK_SIZE, width, aligned=False
+            ]
+            var dinput_compiled_u = device_ctx.compile_function[
+                dinput_kernel_u
+            ]()
+            device_ctx.enqueue_function(
+                dinput_compiled_u,
+                d_output_ptr,
+                input_ptr,
+                gamma_ptr,
+                mean_ptr,
+                rstd_ptr,
+                d_input_ptr,
+                batch_size,
+                seq_len,
+                channels,
+                grid_dim=(num_row_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
 
         # Kernel 2: d_gamma/d_beta.
-        _layernorm_dparam_gpu[dtype](
+        _layernorm_dparam_gpu[dtype, pdtype](
             d_output_ptr,
             input_ptr,
             mean_ptr,
@@ -1937,6 +2114,9 @@ def layernorm_fused_residual_bwd_broadcast_gpu[
 def layernorm_fused_residual_bwd[
     dtype: DType,
     target: StaticString,
+    # Parameter-gradient dtype: production keeps pdtype == dtype; the test
+    # harness (registered ops) accumulates d_gamma/d_beta in fp32.
+    pdtype: DType = dtype,
 ](
     d_inp1_ptr: MutKernelPtr[dtype],
     d_inp2_ptr: MutKernelPtr[dtype],
@@ -1945,8 +2125,8 @@ def layernorm_fused_residual_bwd[
     gamma_ptr: ImmutKernelPtr[dtype],
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
-    d_gamma_ptr: MutKernelPtr[dtype],
-    d_beta_ptr: MutKernelPtr[dtype],
+    d_gamma_ptr: MutKernelPtr[pdtype],
+    d_beta_ptr: MutKernelPtr[pdtype],
     d_residual_ptr: MutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
@@ -1955,7 +2135,7 @@ def layernorm_fused_residual_bwd[
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
-        layernorm_bwd[dtype, target](
+        layernorm_bwd[dtype, target, pdtype](
             d_output_ptr,
             residual_ptr,
             gamma_ptr,
@@ -2000,28 +2180,54 @@ def layernorm_fused_residual_bwd[
         )
         var num_row_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
 
-        comptime dinput_kernel = layernorm_bwd_residual_gpu[
-            dtype, BLOCK_SIZE, width, STORE_SCRATCH
-        ]
-        var dinput_compiled = device_ctx.compile_function[dinput_kernel]()
-        device_ctx.enqueue_function(
-            dinput_compiled,
-            d_output_ptr,
-            residual_ptr,
-            gamma_ptr,
-            mean_ptr,
-            rstd_ptr,
-            d_residual_ptr,
-            d_inp1_ptr,
-            d_inp2_ptr,
-            batch_size,
-            seq_len,
-            channels,
-            grid_dim=(num_row_blocks,),
-            block_dim=(BLOCK_SIZE,),
-        )
+        # Same aligned/scalar-fallback host dispatch as layernorm_bwd's
+        # Kernel 1 above; see the comment there.
+        if Int(channels) % width == 0:
+            comptime dinput_kernel = layernorm_bwd_residual_gpu[
+                dtype, BLOCK_SIZE, width, STORE_SCRATCH, aligned=True
+            ]
+            var dinput_compiled = device_ctx.compile_function[dinput_kernel]()
+            device_ctx.enqueue_function(
+                dinput_compiled,
+                d_output_ptr,
+                residual_ptr,
+                gamma_ptr,
+                mean_ptr,
+                rstd_ptr,
+                d_residual_ptr,
+                d_inp1_ptr,
+                d_inp2_ptr,
+                batch_size,
+                seq_len,
+                channels,
+                grid_dim=(num_row_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            comptime dinput_kernel_u = layernorm_bwd_residual_gpu[
+                dtype, BLOCK_SIZE, width, STORE_SCRATCH, aligned=False
+            ]
+            var dinput_compiled_u = device_ctx.compile_function[
+                dinput_kernel_u
+            ]()
+            device_ctx.enqueue_function(
+                dinput_compiled_u,
+                d_output_ptr,
+                residual_ptr,
+                gamma_ptr,
+                mean_ptr,
+                rstd_ptr,
+                d_residual_ptr,
+                d_inp1_ptr,
+                d_inp2_ptr,
+                batch_size,
+                seq_len,
+                channels,
+                grid_dim=(num_row_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
 
-        _layernorm_dparam_gpu[dtype](
+        _layernorm_dparam_gpu[dtype, pdtype](
             d_output_ptr,
             residual_ptr,
             mean_ptr,
@@ -2050,8 +2256,16 @@ struct LayerNormBwd:
         mean: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
         rstd: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
         d_x: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
-        d_gamma: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
-        d_beta: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
+        # The pytest harness accumulates parameter grads in fp32 for every
+        # kernel dtype (see tests/kernels/layernorm.py), so the registered op
+        # takes fp32 here and forwards pdtype=float32. Production training
+        # calls layernorm_bwd directly with pdtype == dtype.
+        d_gamma: MutableInputTensor[
+            dtype=DType.float32, rank=1, static_spec=...
+        ],
+        d_beta: MutableInputTensor[
+            dtype=DType.float32, rank=1, static_spec=...
+        ],
         batch_size: Int64,  # Our B
         seq_len: Int64,  # Our T
         channels: Int64,  # Our C
@@ -2074,7 +2288,7 @@ struct LayerNormBwd:
         if d_beta.size() != Int(channels):
             raise Error("d_beta size mismatch")
 
-        layernorm_bwd[dtype, target](
+        layernorm_bwd[dtype, target, DType.float32](
             d_output.unsafe_ptr(),
             x.unsafe_ptr(),
             gamma.unsafe_ptr(),
@@ -2104,8 +2318,13 @@ struct LayerNormFusedResidualBwd:
         gamma: InputTensor[dtype=dtype, rank=1, static_spec=...],
         mean: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
         rstd: InputTensor[dtype=DType.float32, rank=1, static_spec=...],
-        d_gamma: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
-        d_beta: MutableInputTensor[dtype=dtype, rank=1, static_spec=...],
+        # fp32 parameter grads for the pytest harness; see LayerNormBwd.
+        d_gamma: MutableInputTensor[
+            dtype=DType.float32, rank=1, static_spec=...
+        ],
+        d_beta: MutableInputTensor[
+            dtype=DType.float32, rank=1, static_spec=...
+        ],
         d_residual: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
         batch_size: Int64,  # Our B
         seq_len: Int64,  # Our T
@@ -2134,7 +2353,7 @@ struct LayerNormFusedResidualBwd:
         if d_residual.size() != row_elems:
             raise Error("d_residual size mismatch")
 
-        layernorm_fused_residual_bwd[dtype, target](
+        layernorm_fused_residual_bwd[dtype, target, DType.float32](
             d_inp1.unsafe_ptr(),
             d_inp2.unsafe_ptr(),
             d_output.unsafe_ptr(),

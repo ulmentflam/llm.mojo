@@ -98,7 +98,7 @@ HAVE_NVCC := $(shell command -v nvcc 2>/dev/null)
 
 SHELL := /bin/bash
 
-.PHONY: help install update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
+.PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build         build-mojo build-train train train-cpu \
         build-profile build-profile-bf16 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
@@ -116,9 +116,14 @@ help:
 	@echo "Usage: make <target>"
 	@echo ""
 	@echo "Setup:"
-	@echo "  install       Install pixi dependencies (first-time setup)"
-	@echo "  install-cuda  Install CUDA/GPU-enabled pixi dependencies"
-	@echo "  update        Update pixi dependencies and refresh pixi.lock"
+	@echo "  install               Quick setup: pixi deps + git hooks (no dataset/weights)"
+	@echo "  install-cuda          Same as install, with CUDA/GPU-enabled pixi dependencies"
+	@echo "  install-with-data     install + dataset/weights (needed for train/verify/benchmark)"
+	@echo "  install-cuda-with-data  install-cuda + dataset/weights"
+	@echo "  data                  Download the Tiny Shakespeare dataset + GPT-2 124M starter weights"
+	@echo "                        (idempotent — skips files already present; ~1.5 GB total)"
+	@echo "  install-hooks         Install git pre-commit/pre-push hooks (make lint / make check)"
+	@echo "  update                Update pixi dependencies and refresh pixi.lock"
 	@echo ""
 	@echo "Quality gates:"
 	@echo "  check         Run lint (incl. typecheck), build-mojo, build train_gpt2, and build-profile"
@@ -187,14 +192,60 @@ help:
 	@echo "  help          Show this help message"
 	@echo "  clean         Remove cache directories"
 
+# `install`/`install-cuda` are the quick path: pixi deps + git hooks only, no
+# network-heavy dataset/weights download. Use `install-with-data`/
+# `install-cuda-with-data` for that (needed before `make train`/`make verify`/
+# `make benchmark*` will work) — or run `make data` standalone at any point.
 install:
 	pixi install
+	@$(MAKE) install-hooks
 
 install-cuda:
 	pixi install -e cuda
+	@$(MAKE) install-hooks
+
+install-with-data: install
+	@$(MAKE) data
+
+install-cuda-with-data: install-cuda
+	@$(MAKE) data
 
 update:
 	pixi update
+
+# ---------------------------------------------------------------------------
+# Dataset + starter-weights download. One-time (~1.5 GB); each file is a real
+# Make target so already-downloaded files are skipped on re-run. Needed before
+# `make train`, `make verify`, or `make benchmark*` will work.
+# ---------------------------------------------------------------------------
+STARTER_PACK_URL := https://huggingface.co/datasets/karpathy/llmc-starter-pack/resolve/main
+STARTER_PACK_FILES := gpt2_tokenizer.bin gpt2_124M.bin gpt2_124M_bf16.bin gpt2_124M_debug_state.bin
+
+data: data/.tinyshakespeare/tiny_shakespeare_train.bin $(STARTER_PACK_FILES)
+	@echo "Data ready: tokenized Tiny Shakespeare + GPT-2 124M starter weights."
+
+data/.tinyshakespeare/tiny_shakespeare_train.bin:
+	pixi run python data/tinyshakespeare.py
+
+$(STARTER_PACK_FILES):
+	curl -fL -o $@ "$(STARTER_PACK_URL)/$@?download=true"
+
+# Writes git hook shims (respecting core.hooksPath, whatever it's set to)
+# that run `pre-commit run --hook-stage ...` per .pre-commit-config.yaml.
+# Tolerant: skips (doesn't fail `make install`) if pre-commit isn't on PATH.
+install-hooks:
+	@if command -v pre-commit >/dev/null 2>&1; then \
+		hooks_dir=$$(git rev-parse --git-path hooks); \
+		mkdir -p "$$hooks_dir"; \
+		printf '#!/usr/bin/env bash\nexec pre-commit run --hook-stage pre-commit\n' > "$$hooks_dir/pre-commit"; \
+		chmod +x "$$hooks_dir/pre-commit"; \
+		printf '#!/usr/bin/env bash\nexec pre-commit run --hook-stage pre-push\n' > "$$hooks_dir/pre-push"; \
+		chmod +x "$$hooks_dir/pre-push"; \
+		echo "Installed git hooks: pre-commit -> make lint, pre-push -> make check"; \
+	else \
+		echo "pre-commit not found on PATH — skipping git hook install."; \
+		echo "  Install it (e.g. 'pipx install pre-commit') then run: make install-hooks"; \
+	fi
 
 check: lint build-mojo build build-profile
 

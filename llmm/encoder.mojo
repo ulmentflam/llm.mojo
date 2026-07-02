@@ -114,6 +114,7 @@ def encoder_fwd_cpu[
 def encoder_fwd_gpu_kernel[
     dtype: DType,
     width: Int,
+    aligned: Bool = True,
 ](
     out_ptr: MutKernelPtr[dtype],
     inp_ptr: ImmutKernelPtr[DType.int32],
@@ -122,38 +123,57 @@ def encoder_fwd_gpu_kernel[
     seq_len: Int,
     channels: Int,
 ) -> None:
+    # `aligned` (comptime): True is the production fast path — requires
+    # channels % width == 0 (checked on the host), which makes
+    # bt*channels + c / ix*channels + c / t*channels + c provably
+    # width-aligned. False (odd channels, e.g. the equivalence suite's 33)
+    # can't make that guarantee since bt/ix/t*channels isn't a multiple of
+    # width in general, so it falls back to one scalar element per thread —
+    # see _encoder_fwd_vector_slice's docstring for the same proof shape.
     var bt = Int(block_idx.x)
-    var c_base = Int(block_idx.y) * Int(block_dim.x) * width
     var tid = Int(thread_idx.x)
-    var c = c_base + tid * width
-
-    if c >= channels:
-        return
-
     var t = bt % seq_len
     var ix = Int((inp_ptr + bt).load())
 
-    if c + width <= channels:
-        _encoder_fwd_vector_slice[dtype, width, aligned=True](
+    comptime if aligned:
+        var c_base = Int(block_idx.y) * Int(block_dim.x) * width
+        var c = c_base + tid * width
+
+        if c >= channels:
+            return
+
+        if c + width <= channels:
+            _encoder_fwd_vector_slice[dtype, width, aligned=True](
+                out_ptr + bt * channels,
+                wte_ptr + ix * channels,
+                wpe_ptr + t * channels,
+                c,
+            )
+        else:
+            for i in range(c, channels):
+                _encoder_fwd_vector_slice[dtype, 1](
+                    out_ptr + bt * channels,
+                    wte_ptr + ix * channels,
+                    wpe_ptr + t * channels,
+                    i,
+                )
+    else:
+        var c = Int(block_idx.y) * Int(block_dim.x) + tid
+        if c >= channels:
+            return
+        _encoder_fwd_vector_slice[dtype, 1](
             out_ptr + bt * channels,
             wte_ptr + ix * channels,
             wpe_ptr + t * channels,
             c,
         )
-    else:
-        for i in range(c, channels):
-            _encoder_fwd_vector_slice[dtype, 1](
-                out_ptr + bt * channels,
-                wte_ptr + ix * channels,
-                wpe_ptr + t * channels,
-                i,
-            )
 
 
 def encoder_fwd_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int = 4,
+    aligned: Bool = True,
 ](
     out_ptr: MutKernelPtr[dtype],
     inp_ptr: ImmutKernelPtr[DType.int32],
@@ -162,7 +182,7 @@ def encoder_fwd_gpu[
     seq_len: Int,
     channels: Int,
 ) -> None:
-    encoder_fwd_gpu_kernel[dtype, width](
+    encoder_fwd_gpu_kernel[dtype, width, aligned=aligned](
         out_ptr, inp_ptr, wte_ptr, wpe_ptr, seq_len, channels
     )
 
@@ -201,21 +221,43 @@ def encoder_fwd[
         comptime width = 4
         var device_ctx = ctx
         var grid_x = batch_size * seq_len
-        var grid_y = ceildiv(channels, BLOCK_SIZE * width)
 
-        comptime gpu_kernel = encoder_fwd_gpu[dtype, BLOCK_SIZE, width]
-        var compiled = device_ctx.compile_function[gpu_kernel]()
-        device_ctx.enqueue_function(
-            compiled,
-            out_ptr,
-            inp_ptr,
-            wte_ptr,
-            wpe_ptr,
-            seq_len,
-            channels,
-            grid_dim=(grid_x, grid_y),
-            block_dim=(BLOCK_SIZE,),
-        )
+        # Dispatch aligned vs. scalar-fallback kernels at the host; see
+        # encoder_fwd_gpu_kernel's docstring.
+        if channels % width == 0:
+            var grid_y = ceildiv(channels, BLOCK_SIZE * width)
+            comptime gpu_kernel = encoder_fwd_gpu[
+                dtype, BLOCK_SIZE, width, aligned=True
+            ]
+            var compiled = device_ctx.compile_function[gpu_kernel]()
+            device_ctx.enqueue_function(
+                compiled,
+                out_ptr,
+                inp_ptr,
+                wte_ptr,
+                wpe_ptr,
+                seq_len,
+                channels,
+                grid_dim=(grid_x, grid_y),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            var grid_y_u = ceildiv(channels, BLOCK_SIZE)
+            comptime gpu_kernel_u = encoder_fwd_gpu[
+                dtype, BLOCK_SIZE, width, aligned=False
+            ]
+            var compiled_u = device_ctx.compile_function[gpu_kernel_u]()
+            device_ctx.enqueue_function(
+                compiled_u,
+                out_ptr,
+                inp_ptr,
+                wte_ptr,
+                wpe_ptr,
+                seq_len,
+                channels,
+                grid_dim=(grid_x, grid_y_u),
+                block_dim=(BLOCK_SIZE,),
+            )
     else:
         raise Error("Invalid target")
 
@@ -537,6 +579,7 @@ def wte_backward_gpu_kernel[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int = 4,
+    aligned: Bool = True,
 ](
     dwte_ptr: MutKernelPtr[dtype],
     bucket_info_ptr: ImmutKernelPtr[DType.int32],
@@ -544,6 +587,13 @@ def wte_backward_gpu_kernel[
     dout_ptr: ImmutKernelPtr[dtype],
     channels: Int,
 ) -> None:
+    # `aligned` (comptime): True is the production fast path — requires
+    # channels % width == 0 (checked on the host), which makes
+    # bt*channels + c / token_idx*channels + c provably width-aligned. False
+    # (odd channels, e.g. the equivalence suite's 33) forces the scalar,
+    # per-element accumulate/write path for every channel group, not just
+    # the true tail — see _accumulate_token_gradients's docstring for the
+    # same proof shape.
     var bucket = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var warp_id = tid // WARP_SIZE
@@ -575,25 +625,40 @@ def wte_backward_gpu_kernel[
         accum_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
     )
 
-    if c + width <= channels:
-        var accum = _accumulate_token_gradients[dtype, width, aligned=True](
-            dout_ptr,
-            workload_indices_ptr,
-            start_idx,
-            bucket_size,
-            channels,
-            c,
-            start_item=warp_id,
-            step_size=num_warps,
-        )
-        for k in range(width):
-            accum_shared_ptr[tid * width + k] = accum[k]
+    comptime if aligned:
+        if c + width <= channels:
+            var accum = _accumulate_token_gradients[dtype, width, aligned=True](
+                dout_ptr,
+                workload_indices_ptr,
+                start_idx,
+                bucket_size,
+                channels,
+                c,
+                start_item=warp_id,
+                step_size=num_warps,
+            )
+            for k in range(width):
+                accum_shared_ptr[tid * width + k] = accum[k]
+        else:
+            var accum = SIMD[DType.float32, width](0.0)
+            var item = warp_id
+            while item < bucket_size:
+                var bt = Int((workload_indices_ptr + start_idx + item).load())
+                for k in range(channels - c):
+                    var val = dout_ptr[bt * channels + c + k].cast[
+                        DType.float32
+                    ]()
+                    accum[k] += val
+                item += num_warps
+            for k in range(width):
+                accum_shared_ptr[tid * width + k] = accum[k]
     else:
         var accum = SIMD[DType.float32, width](0.0)
+        var lanes = min(width, channels - c)
         var item = warp_id
         while item < bucket_size:
             var bt = Int((workload_indices_ptr + start_idx + item).load())
-            for k in range(channels - c):
+            for k in range(lanes):
                 var val = dout_ptr[bt * channels + c + k].cast[DType.float32]()
                 accum[k] += val
             item += num_warps
@@ -612,14 +677,23 @@ def wte_backward_gpu_kernel[
                     val[k] = accum_shared_ptr[partner_tid * width + k]
                 final_accum += val
 
-        if c + width <= channels:
-            _write_dwte_accumulation[dtype, width, aligned=True](
-                dwte_ptr,
-                token_idx * channels + c,
-                final_accum,
-            )
+        comptime if aligned:
+            if c + width <= channels:
+                _write_dwte_accumulation[dtype, width, aligned=True](
+                    dwte_ptr,
+                    token_idx * channels + c,
+                    final_accum,
+                )
+            else:
+                for k in range(channels - c):
+                    var prev_dwte = dwte_ptr[token_idx * channels + c + k].cast[
+                        DType.float32
+                    ]()
+                    dwte_ptr[token_idx * channels + c + k] = (
+                        prev_dwte + final_accum[k]
+                    ).cast[dtype]()
         else:
-            for k in range(channels - c):
+            for k in range(min(width, channels - c)):
                 var prev_dwte = dwte_ptr[token_idx * channels + c + k].cast[
                     DType.float32
                 ]()
@@ -633,6 +707,7 @@ def wpe_backward_gpu_kernel[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int = 4,
+    aligned: Bool = True,
 ](
     dwpe_ptr: MutKernelPtr[dtype],
     dout_ptr: ImmutKernelPtr[dtype],
@@ -640,51 +715,71 @@ def wpe_backward_gpu_kernel[
     seq_len: Int,
     channels: Int,
 ) -> None:
+    # GPU-only kernel (no shared CPU helper): c = tile_base + tid*width is
+    # provably width-aligned (tile_base a multiple of c_per_block=BLOCK_SIZE*
+    # width). `aligned` (comptime): True additionally requires
+    # channels % width == 0 (checked on the host), which makes both
+    # (b*seq_len+t)*channels + c and t*channels + c provably aligned too.
+    # False (odd channels, e.g. the equivalence suite's 33) falls back to a
+    # fully scalar sweep — channels isn't a multiple of width there, so
+    # t*channels + c isn't provably aligned even though c itself is.
     var t = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var c_per_block = BLOCK_SIZE * width
-    # GPU-only kernel (no shared CPU helper): c = tile_base + tid*width is
-    # provably width-aligned (tile_base a multiple of c_per_block=BLOCK_SIZE*
-    # width), and channels is always a multiple of width, so both
-    # (b*seq_len+t)*channels + c and t*channels + c are provably aligned too.
     comptime align = align_of[SIMD[dtype, width]]()
 
-    for tile_base in range(0, channels, c_per_block):
-        var c = tile_base + tid * width
-        if c >= channels:
-            break
+    comptime if aligned:
+        for tile_base in range(0, channels, c_per_block):
+            var c = tile_base + tid * width
+            if c >= channels:
+                break
 
-        if c + width <= channels:
-            var accum = SIMD[DType.float32, width](0.0)
-            for b in range(batch_size):
-                var dout_val = (
-                    (dout_ptr + (b * seq_len + t) * channels + c)
+            if c + width <= channels:
+                var accum = SIMD[DType.float32, width](0.0)
+                for b in range(batch_size):
+                    var dout_val = (
+                        (dout_ptr + (b * seq_len + t) * channels + c)
+                        .load[width=width, alignment=align]()
+                        .cast[DType.float32]()
+                    )
+                    accum += dout_val
+
+                var offset = t * channels + c
+                var prev_dwpe = (
+                    (dwpe_ptr + offset)
                     .load[width=width, alignment=align]()
                     .cast[DType.float32]()
                 )
+                (dwpe_ptr + offset).store[width=width, alignment=align](
+                    (prev_dwpe + accum).cast[dtype]()
+                )
+            else:
+                for col in range(c, channels):
+                    var accum = Scalar[DType.float32](0.0)
+                    for b in range(batch_size):
+                        var dout_val = dout_ptr[
+                            (b * seq_len + t) * channels + col
+                        ].cast[DType.float32]()
+                        accum += dout_val
+
+                    var offset = t * channels + col
+                    var prev_dwpe = dwpe_ptr[offset].cast[DType.float32]()
+                    dwpe_ptr[offset] = (prev_dwpe + accum).cast[dtype]()
+    else:
+        for tile_base in range(0, channels, BLOCK_SIZE):
+            var col = tile_base + tid
+            if col >= channels:
+                break
+            var accum = Scalar[DType.float32](0.0)
+            for b in range(batch_size):
+                var dout_val = dout_ptr[
+                    (b * seq_len + t) * channels + col
+                ].cast[DType.float32]()
                 accum += dout_val
 
-            var offset = t * channels + c
-            var prev_dwpe = (
-                (dwpe_ptr + offset)
-                .load[width=width, alignment=align]()
-                .cast[DType.float32]()
-            )
-            (dwpe_ptr + offset).store[width=width, alignment=align](
-                (prev_dwpe + accum).cast[dtype]()
-            )
-        else:
-            for col in range(c, channels):
-                var accum = Scalar[DType.float32](0.0)
-                for b in range(batch_size):
-                    var dout_val = dout_ptr[
-                        (b * seq_len + t) * channels + col
-                    ].cast[DType.float32]()
-                    accum += dout_val
-
-                var offset = t * channels + col
-                var prev_dwpe = dwpe_ptr[offset].cast[DType.float32]()
-                dwpe_ptr[offset] = (prev_dwpe + accum).cast[dtype]()
+            var offset = t * channels + col
+            var prev_dwpe = dwpe_ptr[offset].cast[DType.float32]()
+            dwpe_ptr[offset] = (prev_dwpe + accum).cast[dtype]()
 
 
 def encoder_bwd[
@@ -723,38 +818,73 @@ def encoder_bwd[
         comptime BLOCK_SIZE = 256
         comptime width = 4
         var device_ctx = ctx
+        # Dispatch aligned vs. scalar-fallback kernels at the host; see
+        # wte_backward_gpu_kernel/wpe_backward_gpu_kernel's docstrings.
+        var aligned = channels % width == 0
 
         if num_buckets > 0:
-            comptime wte_kernel = wte_backward_gpu_kernel[
-                dtype, BLOCK_SIZE, width
-            ]
-            var wte_compiled = device_ctx.compile_function[wte_kernel]()
-            device_ctx.enqueue_function(
-                wte_compiled,
-                dwte_ptr,
-                bucket_info_ptr,
-                workload_indices_ptr,
-                dout_ptr,
-                channels,
-                grid_dim=(num_buckets,),
-                block_dim=(BLOCK_SIZE,),
-            )
+            if aligned:
+                comptime wte_kernel = wte_backward_gpu_kernel[
+                    dtype, BLOCK_SIZE, width, aligned=True
+                ]
+                var wte_compiled = device_ctx.compile_function[wte_kernel]()
+                device_ctx.enqueue_function(
+                    wte_compiled,
+                    dwte_ptr,
+                    bucket_info_ptr,
+                    workload_indices_ptr,
+                    dout_ptr,
+                    channels,
+                    grid_dim=(num_buckets,),
+                    block_dim=(BLOCK_SIZE,),
+                )
+            else:
+                comptime wte_kernel_u = wte_backward_gpu_kernel[
+                    dtype, BLOCK_SIZE, width, aligned=False
+                ]
+                var wte_compiled_u = device_ctx.compile_function[wte_kernel_u]()
+                device_ctx.enqueue_function(
+                    wte_compiled_u,
+                    dwte_ptr,
+                    bucket_info_ptr,
+                    workload_indices_ptr,
+                    dout_ptr,
+                    channels,
+                    grid_dim=(num_buckets,),
+                    block_dim=(BLOCK_SIZE,),
+                )
 
         if seq_len > 0:
-            comptime wpe_kernel = wpe_backward_gpu_kernel[
-                dtype, BLOCK_SIZE, width
-            ]
-            var wpe_compiled = device_ctx.compile_function[wpe_kernel]()
-            device_ctx.enqueue_function(
-                wpe_compiled,
-                dwpe_ptr,
-                dout_ptr,
-                batch_size,
-                seq_len,
-                channels,
-                grid_dim=(seq_len,),
-                block_dim=(BLOCK_SIZE,),
-            )
+            if aligned:
+                comptime wpe_kernel = wpe_backward_gpu_kernel[
+                    dtype, BLOCK_SIZE, width, aligned=True
+                ]
+                var wpe_compiled = device_ctx.compile_function[wpe_kernel]()
+                device_ctx.enqueue_function(
+                    wpe_compiled,
+                    dwpe_ptr,
+                    dout_ptr,
+                    batch_size,
+                    seq_len,
+                    channels,
+                    grid_dim=(seq_len,),
+                    block_dim=(BLOCK_SIZE,),
+                )
+            else:
+                comptime wpe_kernel_u = wpe_backward_gpu_kernel[
+                    dtype, BLOCK_SIZE, width, aligned=False
+                ]
+                var wpe_compiled_u = device_ctx.compile_function[wpe_kernel_u]()
+                device_ctx.enqueue_function(
+                    wpe_compiled_u,
+                    dwpe_ptr,
+                    dout_ptr,
+                    batch_size,
+                    seq_len,
+                    channels,
+                    grid_dim=(seq_len,),
+                    block_dim=(BLOCK_SIZE,),
+                )
     else:
         raise Error("Invalid target")
 

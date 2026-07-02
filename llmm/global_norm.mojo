@@ -105,6 +105,7 @@ def _global_norm_squared_for_range_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int,
+    aligned: Bool = True,
 ](
     data_ptr: ImmutKernelPtr[dtype],
     count: Int,
@@ -112,6 +113,13 @@ def _global_norm_squared_for_range_gpu[
 ) -> Scalar[
     DType.float32
 ]:
+    # `aligned` (comptime): idx = global_tid*width is always a multiple of
+    # width, but data_ptr arrives pre-offset by block_idx.y*stride from the
+    # launcher — only when stride % width == 0 (checked on the host) is the
+    # slice base, and hence data_ptr + idx, provably width-aligned. For odd
+    # strides (e.g. the equivalence suite's cols=33) the False variant loads
+    # without the over-alignment promise, which would otherwise crash with
+    # CUDA_ERROR_MISALIGNED_ADDRESS.
     var index = (block_idx.x * block_dim.x + thread_idx.x) * width
     var grid_width = block_dim.x * grid_dim.x * width
 
@@ -122,12 +130,18 @@ def _global_norm_squared_for_range_gpu[
     var idx = index
     while idx < count:
         if idx + width <= count:
-            var val = (
-                (data_ptr + idx)
-                .load[width=width, alignment=align]()
-                .cast[DType.float32]()
-            )
-            accumulator += val * val
+            comptime if aligned:
+                var val = (
+                    (data_ptr + idx)
+                    .load[width=width, alignment=align]()
+                    .cast[DType.float32]()
+                )
+                accumulator += val * val
+            else:
+                var val = (
+                    (data_ptr + idx).load[width=width]().cast[DType.float32]()
+                )
+                accumulator += val * val
         else:
             for j in range(idx, count):
                 var val = data_ptr[j].cast[DType.float32]()
@@ -144,6 +158,7 @@ def global_norm_squared_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int,
+    aligned: Bool = True,
 ](
     out_ptr: MutKernelPtr[DType.float32],
     data_ptr: ImmutKernelPtr[dtype],
@@ -152,7 +167,7 @@ def global_norm_squared_gpu[
 ) -> None:
     var tid = Int(thread_idx.x)
     var block_sum = _global_norm_squared_for_range_gpu[
-        dtype, BLOCK_SIZE, width
+        dtype, BLOCK_SIZE, width, aligned=aligned
     ](data_ptr + Int(block_idx.y) * stride, count, tid)
     if tid == 0:
         var out_index = Int(block_idx.y * grid_dim.x + block_idx.x)
@@ -219,17 +234,37 @@ def global_norm_squared[
         var grid_y = Int(num_slices)
         var count = data.size() // Int(num_slices)
 
-        comptime norm_kernel = global_norm_squared_gpu[dtype, BLOCK_SIZE, width]
-        var compiled_norm = device_ctx.compile_function[norm_kernel]()
-        device_ctx.enqueue_function(
-            compiled_norm,
-            output.unsafe_ptr(),
-            data.unsafe_ptr(),
-            count,
-            Int(stride),
-            grid_dim=(grid_x, grid_y),
-            block_dim=(BLOCK_SIZE,),
-        )
+        # Dispatch aligned vs. unaligned-load kernels at the host: the slice
+        # base offset block_idx.y*stride is width-aligned only when
+        # stride % width == 0; see _global_norm_squared_for_range_gpu.
+        if Int(stride) % width == 0:
+            comptime norm_kernel = global_norm_squared_gpu[
+                dtype, BLOCK_SIZE, width, aligned=True
+            ]
+            var compiled_norm = device_ctx.compile_function[norm_kernel]()
+            device_ctx.enqueue_function(
+                compiled_norm,
+                output.unsafe_ptr(),
+                data.unsafe_ptr(),
+                count,
+                Int(stride),
+                grid_dim=(grid_x, grid_y),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            comptime norm_kernel_u = global_norm_squared_gpu[
+                dtype, BLOCK_SIZE, width, aligned=False
+            ]
+            var compiled_norm_u = device_ctx.compile_function[norm_kernel_u]()
+            device_ctx.enqueue_function(
+                compiled_norm_u,
+                output.unsafe_ptr(),
+                data.unsafe_ptr(),
+                count,
+                Int(stride),
+                grid_dim=(grid_x, grid_y),
+                block_dim=(BLOCK_SIZE,),
+            )
 
         var grid_size_actual = grid_x * grid_y
         comptime aggregate_kernel = global_norm_aggregate_gpu[BLOCK_SIZE]

@@ -1268,3 +1268,46 @@ experiment. Negative results were retained in this log as documented dead ends.
 - **Record dead ends in this file.** More than half the session's measured
   ideas were neutral or worse; the documented negative results are what kept
   later rounds from re-treading them.
+
+### Post-parity: equivalence-suite fallout from the optimization work (2026-07-01 night)
+
+`make test` was red. Two pre-existing-at-HEAD breaks from the optimization
+commits, root-caused via ordered-pair reproductions (Opus analysis, orchestrator-
+verified):
+
+1. **`tests/test_zero_equivalence.mojo` compile error** — the conditional
+   `GPT2_DTYPE` (bf16 flag, June 30) broke an fp32-typed host copy in the test.
+   Fixed: stage through a `GPT2_DTYPE` host buffer (the read loop already casts).
+2. **183/235 pytest CUDA equivalence failures, order-dependent** — two mechanisms:
+   - **(A, dominant)** the ㉖–㉘ explicit-alignment hints assume production dims
+     (`channels % width == 0`, `seq_len % width == 0`); the suite's deliberately
+     odd shapes (channels=767, seq_len=7) hit `CUDA_ERROR_MISALIGNED_ADDRESS`,
+     which **permanently poisons the single shared CUDA context** of the pytest
+     process — every later GPU test fails at model setup. Hence "183 fail
+     together, each passes alone". Fix: host-side dispatch between the (unchanged)
+     aligned fast path and a safe fallback when the shape invariant doesn't hold.
+   - **(B)** the attention backward P-scratch was allocated **without**
+     `zero_on_alloc` while the P+dS kernel writes only the causal lower triangle
+     and `dV = Pᵀ·dO` reads the full plane — fresh dirty allocations on the
+     test path (cache=None) corrupt dV's upper-triangle half. Training was
+     protected by the separate acts-buffer memset (stored att_probs), so parity
+     results are unaffected. Fix: `zero_on_alloc=True` (one-time, perf-neutral).
+
+Lesson: the kernel fast paths encode shape invariants that the training loop
+always satisfies but the equivalence suite deliberately violates — every
+invariant-based optimization needs either a runtime guard + fallback or an
+explicit shape assertion, and `make test` must be part of the change gates (this
+suite hadn't run since June 29, so the breaks accumulated invisibly).
+
+**RESOLVED (same night):** full CUDA pytest suite **235 passed / 0 failed** (was
+183 failed). Fixes: (B) `zero_on_alloc=True` on the attention P scratch;
+(A) host-side runtime dispatch between the byte-identical aligned fast path and
+a scalar fallback wherever a shape invariant can be violated — layernorm bwd ×2
++ fused-residual fwd, attention P+dS (also fixing the odd-seq_len tail-drop),
+global_norm (odd strides), encoder fwd/wte-bwd/wpe-bwd (channels=33); plus a
+`pdtype` (fp32 param-grad) parameter on the layernorm-backward ops for the test
+harness's fp32 dgamma/dbeta convention (production defaults unchanged).
+gelu/adamw sites audited safe-by-construction (`idx = tid*width`);
+classifier/softmax rely on `Vp % 4 == 0`, which every fixture and production
+config satisfies. Gates: verify-gpu 16/16 TENSOR OK; bf16 harness losses
+bit-identical; step 135.7 ms (parity regime intact); test_zero_equivalence 3/3.

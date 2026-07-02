@@ -1,0 +1,18 @@
+repos:
+  - repo: local
+    hooks:
+      - id: make-lint
+        name: make lint (ruff, mojo format --check, latexindent, pyrefly)
+        entry: make lint
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: make-check
+        name: make check (lint + build-mojo + build + build-profile)
+        entry: make check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

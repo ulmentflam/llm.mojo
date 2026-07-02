@@ -3040,6 +3040,7 @@ def _attention_bwd_p_and_ds_gpu[
     dtype: DType,
     width: Int,
     stored_p: Bool = False,
+    aligned: Bool = True,
 ](
     num_blocks: Int,
     seq_len: Int,
@@ -3059,63 +3060,108 @@ def _attention_bwd_p_and_ds_gpu[
     # bound, so loads/stores are vectorized `width` elements at a time. Each
     # thread owns a `width`-wide block; because seq_len is a multiple of `width`,
     # a block never straddles a row, so `i`/`L_i`/`D_i` are constant across it.
+    #
+    # `aligned` (comptime): True is the production path above — requires
+    # seq_len % width == 0 (checked on the host before dispatch). False (the
+    # equivalence suite's odd seq_len, e.g. 7) falls back to a scalar,
+    # one-element-per-iteration grid-stride sweep over the *whole* [B·nh,T,T]
+    # plane below: with seq_len not a multiple of width, a width-wide block
+    # can straddle a row boundary, so `jbase + w` would silently address the
+    # wrong row's i/L_i/D_i for the wrapped lanes — this is a correctness bug,
+    # not just an alignment one, so the fallback recomputes bh/i/j per element
+    # instead of trying to patch up the vectorized indexing.
     var lane = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var grid_stride = Int(grid_dim.x) * Int(block_dim.x)
     var plane = seq_len * seq_len
-    var b = lane
-    while b < num_blocks:
-        var e0 = b * width
-        var bh = e0 // plane
-        var rem = e0 % plane
-        var i = rem // seq_len
-        var jbase = rem % seq_len
-        # Causal: a width-block lies entirely above the diagonal iff jbase > i
-        # (width divides seq_len, so the block never straddles a row). Its P/dS
-        # are structurally zero, so skip the load+compute+store entirely — the
-        # persistent buffers hold zeros there (P from the forward softmax, dS
-        # zeroed once on allocation), and the dense gradient GEMMs read them as
-        # zero. This halves the plane traffic in the backward's largest kernel.
-        if jbase > i:
+
+    comptime if aligned:
+        var b = lane
+        while b < num_blocks:
+            var e0 = b * width
+            var bh = e0 // plane
+            var rem = e0 % plane
+            var i = rem // seq_len
+            var jbase = rem % seq_len
+            # Causal: a width-block lies entirely above the diagonal iff
+            # jbase > i (width divides seq_len, so the block never straddles
+            # a row). Its P/dS are structurally zero, so skip the
+            # load+compute+store entirely — the persistent buffers hold
+            # zeros there (P is zero-on-alloc scratch, dS zeroed once on
+            # allocation), and the dense gradient GEMMs read them as zero.
+            # This halves the plane traffic in the backward's largest
+            # kernel.
+            if jbase > i:
+                b += grid_stride
+                continue
+            var d_i = d_ptr[bh * seq_len + i]
+            # `stored_p`: scores_ptr already holds P (the forward's stored
+            # softmax probs), so read it directly — no QKᵀ recompute, no
+            # exp/lse, no P store. e0 = b*width for grid-strided integer b,
+            # so it is provably a multiple of width regardless of the
+            # runtime plane/seq_len values — same proof shape as adamw's
+            # idx = global_tid*width. scores_ptr/dp_ptr/p_ptr/ds_ptr all
+            # share `dtype`, so one alignment covers all four.
+            comptime align = align_of[SIMD[dtype, width]]()
+            var raw = (
+                (scores_ptr + e0)
+                .load[width=width, alignment=align]()
+                .cast[DType.float32]()
+            )
+            var dpv = (
+                (dp_ptr + e0)
+                .load[width=width, alignment=align]()
+                .cast[DType.float32]()
+            )
+
+            var pv = SIMD[DType.float32, width](0.0)
+            var dsv = SIMD[DType.float32, width](0.0)
+
+            comptime if stored_p:
+                comptime for w in range(width):
+                    if jbase + w <= i:
+                        var pw = raw[w]
+                        dsv[w] = attention_scale * pw * (dpv[w] - d_i)
+                (ds_ptr + e0).store[width=width, alignment=align](
+                    dsv.cast[dtype]()
+                )
+            else:
+                var lse_i = lse_ptr[bh * seq_len + i]
+                comptime for w in range(width):
+                    if jbase + w <= i:
+                        var pw = exp(raw[w] * attention_scale - lse_i)
+                        pv[w] = pw
+                        dsv[w] = attention_scale * pw * (dpv[w] - d_i)
+                (p_ptr + e0).store[width=width, alignment=align](
+                    pv.cast[dtype]()
+                )
+                (ds_ptr + e0).store[width=width, alignment=align](
+                    dsv.cast[dtype]()
+                )
             b += grid_stride
-            continue
-        var d_i = d_ptr[bh * seq_len + i]
-        # `stored_p`: scores_ptr already holds P (the forward's stored softmax
-        # probs), so read it directly — no QKᵀ recompute, no exp/lse, no P store.
-        # e0 = b*width for grid-strided integer b, so it is provably a multiple
-        # of width regardless of the runtime plane/seq_len values — same proof
-        # shape as adamw's idx = global_tid*width. scores_ptr/dp_ptr/p_ptr/
-        # ds_ptr all share `dtype`, so one alignment covers all four.
-        comptime align = align_of[SIMD[dtype, width]]()
-        var raw = (
-            (scores_ptr + e0)
-            .load[width=width, alignment=align]()
-            .cast[DType.float32]()
-        )
-        var dpv = (
-            (dp_ptr + e0)
-            .load[width=width, alignment=align]()
-            .cast[DType.float32]()
-        )
-
-        var pv = SIMD[DType.float32, width](0.0)
-        var dsv = SIMD[DType.float32, width](0.0)
-
-        comptime if stored_p:
-            comptime for w in range(width):
-                if jbase + w <= i:
-                    var pw = raw[w]
-                    dsv[w] = attention_scale * pw * (dpv[w] - d_i)
-            (ds_ptr + e0).store[width=width, alignment=align](dsv.cast[dtype]())
-        else:
-            var lse_i = lse_ptr[bh * seq_len + i]
-            comptime for w in range(width):
-                if jbase + w <= i:
-                    var pw = exp(raw[w] * attention_scale - lse_i)
-                    pv[w] = pw
-                    dsv[w] = attention_scale * pw * (dpv[w] - d_i)
-            (p_ptr + e0).store[width=width, alignment=align](pv.cast[dtype]())
-            (ds_ptr + e0).store[width=width, alignment=align](dsv.cast[dtype]())
-        b += grid_stride
+    else:
+        # num_blocks here is the TOTAL element count (B·nh·T·T), not a
+        # width-block count — the host passes `plane` directly in this mode.
+        var idx = lane
+        while idx < num_blocks:
+            var bh = idx // plane
+            var rem = idx % plane
+            var i = rem // seq_len
+            var j = rem % seq_len
+            if j <= i:
+                var d_i = d_ptr[bh * seq_len + i]
+                var raw = scores_ptr[idx].cast[DType.float32]()
+                var dpv = dp_ptr[idx].cast[DType.float32]()
+                comptime if stored_p:
+                    var pw = raw
+                    var dsv = attention_scale * pw * (dpv - d_i)
+                    ds_ptr[idx] = dsv.cast[dtype]()
+                else:
+                    var lse_i = lse_ptr[bh * seq_len + i]
+                    var pw = exp(raw * attention_scale - lse_i)
+                    var dsv = attention_scale * pw * (dpv - d_i)
+                    p_ptr[idx] = pw.cast[dtype]()
+                    ds_ptr[idx] = dsv.cast[dtype]()
+            idx += grid_stride
 
 
 comptime TRANSPOSE_TILE = 32
@@ -3571,7 +3617,9 @@ def attention_bwd_gemm[
     # gemm_scores_addr is bf16 (the forward allocates it bf16); in the backward it
     # is only Phase-C dKᵀ scratch, so the types must agree.
     var sc = _gemm_scratch_buffer[dtype](sc_addr, plane, device_ctx)
-    var pp = _gemm_scratch_buffer[dtype](p_addr, plane, device_ctx)
+    var pp = _gemm_scratch_buffer[dtype](
+        p_addr, plane, device_ctx, zero_on_alloc=True
+    )
     var dss = _gemm_scratch_buffer[dtype](
         ds_addr, plane, device_ctx, zero_on_alloc=True
     )
@@ -3650,47 +3698,91 @@ def attention_bwd_gemm[
         block_dim=(BLOCK_SIZE,),
     )
     # Vectorized: each thread handles `PDS_WIDTH` contiguous elements. T is a
-    # power of two ≥ 32, so PDS_WIDTH=8 divides plane and never straddles a row.
+    # power of two ≥ 32, so PDS_WIDTH=8 divides plane and never straddles a row
+    # for production shapes. The equivalence suite's odd seq_len (e.g. 7)
+    # violates that, so dispatch a scalar per-element fallback in that case —
+    # see _attention_bwd_p_and_ds_gpu's docstring.
     comptime PDS_WIDTH = 8
-    var pds_blocks = plane // PDS_WIDTH
+    var pds_aligned = T % PDS_WIDTH == 0
+    var pds_blocks = plane // PDS_WIDTH if pds_aligned else plane
     if use_stored:
-        comptime pds_stored = _attention_bwd_p_and_ds_gpu[
-            dtype, PDS_WIDTH, stored_p=True
-        ]
-        var pds_c = device_ctx.compile_function[pds_stored]()
-        device_ctx.enqueue_function(
-            pds_c,
-            pds_blocks,
-            T,
-            attention_scale,
-            scores_immut,
-            log_sum_exp_ptr,
-            dp_immut,
-            d_immut,
-            p_buf,
-            ds_buf,
-            grid_dim=(_grid(pds_blocks),),
-            block_dim=(BLOCK_SIZE,),
-        )
+        if pds_aligned:
+            comptime pds_stored = _attention_bwd_p_and_ds_gpu[
+                dtype, PDS_WIDTH, stored_p=True, aligned=True
+            ]
+            var pds_c = device_ctx.compile_function[pds_stored]()
+            device_ctx.enqueue_function(
+                pds_c,
+                pds_blocks,
+                T,
+                attention_scale,
+                scores_immut,
+                log_sum_exp_ptr,
+                dp_immut,
+                d_immut,
+                p_buf,
+                ds_buf,
+                grid_dim=(_grid(pds_blocks),),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            comptime pds_stored_u = _attention_bwd_p_and_ds_gpu[
+                dtype, PDS_WIDTH, stored_p=True, aligned=False
+            ]
+            var pds_c = device_ctx.compile_function[pds_stored_u]()
+            device_ctx.enqueue_function(
+                pds_c,
+                pds_blocks,
+                T,
+                attention_scale,
+                scores_immut,
+                log_sum_exp_ptr,
+                dp_immut,
+                d_immut,
+                p_buf,
+                ds_buf,
+                grid_dim=(_grid(pds_blocks),),
+                block_dim=(BLOCK_SIZE,),
+            )
     else:
-        comptime pds_recompute = _attention_bwd_p_and_ds_gpu[
-            dtype, PDS_WIDTH, stored_p=False
-        ]
-        var pds_c = device_ctx.compile_function[pds_recompute]()
-        device_ctx.enqueue_function(
-            pds_c,
-            pds_blocks,
-            T,
-            attention_scale,
-            scores_immut,
-            log_sum_exp_ptr,
-            dp_immut,
-            d_immut,
-            p_buf,
-            ds_buf,
-            grid_dim=(_grid(pds_blocks),),
-            block_dim=(BLOCK_SIZE,),
-        )
+        if pds_aligned:
+            comptime pds_recompute = _attention_bwd_p_and_ds_gpu[
+                dtype, PDS_WIDTH, stored_p=False, aligned=True
+            ]
+            var pds_c = device_ctx.compile_function[pds_recompute]()
+            device_ctx.enqueue_function(
+                pds_c,
+                pds_blocks,
+                T,
+                attention_scale,
+                scores_immut,
+                log_sum_exp_ptr,
+                dp_immut,
+                d_immut,
+                p_buf,
+                ds_buf,
+                grid_dim=(_grid(pds_blocks),),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            comptime pds_recompute_u = _attention_bwd_p_and_ds_gpu[
+                dtype, PDS_WIDTH, stored_p=False, aligned=False
+            ]
+            var pds_c = device_ctx.compile_function[pds_recompute_u]()
+            device_ctx.enqueue_function(
+                pds_c,
+                pds_blocks,
+                T,
+                attention_scale,
+                scores_immut,
+                log_sum_exp_ptr,
+                dp_immut,
+                d_immut,
+                p_buf,
+                ds_buf,
+                grid_dim=(_grid(pds_blocks),),
+                block_dim=(BLOCK_SIZE,),
+            )
 
     # No fence: the gradient matmuls run on the same stream, ordered after P+dS.
 

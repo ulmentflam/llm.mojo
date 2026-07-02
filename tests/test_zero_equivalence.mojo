@@ -8,7 +8,7 @@ from std.python import Python
 from llmm.memory import MutMemPtr
 from llmm.zero import ZeroContext, CpuCoordinator
 
-from train_gpt2 import GPT2
+from train_gpt2 import GPT2, GPT2_DTYPE
 
 comptime NUM_PARAMS = 4592
 comptime B = 2
@@ -146,7 +146,9 @@ def run_zero_equivalence_test(stage: Int) raises:
         )
         baseline_model.ctx.synchronize()
 
-        var host_out_baseline = ctx.enqueue_create_host_buffer[DType.float32](
+        # Match params_buf's dtype (GPT2_DTYPE folds per -D LLMM_BF16); the
+        # read loop below casts each element to fp32.
+        var host_out_baseline = ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             NUM_PARAMS
         )
         baseline_model.params_buf.enqueue_copy_to(host_out_baseline)
