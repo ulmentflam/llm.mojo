@@ -46,7 +46,7 @@ from _cublas.cublaslt import (
 )
 from linalg.matmul.vendor.blas import _get_global_handle, Backend
 
-from llmm.gelu import gelu, gelu_grad, gelu_fwd_gpu
+from llmm.gelu import gelu, gelu_grad, gelu_fwd_gpu, bias_gelu_fwd
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 from llmm.vendor import HAS_CUBLAS, HAS_METAL
@@ -593,10 +593,11 @@ def matmul_fwd[
             (out_ptr + offset).store(v.cast[elem_dtype]())
 
     # Vendor-neutral matmul with the fused bias/gelu epilogue lambdas: used
-    # unconditionally on CPU, and on GPU whenever HAS_CUBLAS is False (no
-    # NVIDIA cuBLASLt on this build/accelerator — see llmm/vendor.mojo).
-    # `linalg.matmul.matmul` applies the epilogue inline on both targets. The
-    # host fences bracket the call (matching matmul_d_input_bwd's portable
+    # on the CPU target only (linalg applies the epilogue inline; there is no
+    # separate-kernel penalty on the CPU path). The non-CUBLAS GPU targets use
+    # the plain-GEMM + standalone bias_gelu_fwd split below instead, because
+    # Metal's fused epilogue (linalg.matmul elementwise_lambda_fn) is broken.
+    # The host fences bracket the call (matching matmul_d_input_bwd's portable
     # fallback below): empirically required on the GPU target — without them
     # this raced against neighboring kernels (CUDA_ERROR_ILLEGAL_ADDRESS) even
     # though the fast cuBLASLt path needs none (its epilogue is inside the
@@ -621,6 +622,9 @@ def matmul_fwd[
             matmul[transpose_b=True, target=target](c, a, b, ctx=ctx)
         ctx.synchronize()
 
+    # Fused epilogue on cuBLASLt; split GEMM+bias_gelu elsewhere (Metal's
+    # fused-bias epilogue is broken) — see
+    # docs/ai/ai_assisted_optimizations_and_benchmarks.md (2026-07-02).
     comptime if is_gpu[target]():
         comptime if HAS_CUBLAS:
             comptime if use_gelu and not USE_GELU_FUSION:
@@ -674,7 +678,22 @@ def matmul_fwd[
                     ctx,
                 )
         else:
-            _portable_matmul()
+            # Vendor-neutral GPU: plain GEMM (no epilogue) + standalone
+            # bias(+GELU) kernel; fences as in _portable_matmul.
+            ctx.synchronize()
+            matmul[transpose_b=True, target=target](c, a, b, ctx=ctx)
+            ctx.synchronize()
+            comptime if has_bias or use_gelu:
+                bias_gelu_fwd[
+                    dtype, target, has_bias=has_bias, use_gelu=use_gelu
+                ](
+                    out_ptr,
+                    pre_gelu_ptr,
+                    bias_ptr,
+                    rows,
+                    out_channels,
+                    ctx,
+                )
     else:
         # CPU: keep the fused epilogue lambda (linalg applies it inline; there is
         # no separate-kernel penalty on the CPU path).

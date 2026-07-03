@@ -41,7 +41,6 @@ from llmm.layernorm import (
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
 from llmm.matmul import matmul_fwd, matmul_bwd
-from llmm.gelu import bias_gelu_fwd
 from llmm.softmax import softmax_fwd, softmax_bwd
 from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
 from llmm.global_norm import (
@@ -1733,27 +1732,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
 
-            # Matmul QKV. On Metal the fused-bias matmul epilogue is broken
-            # (linalg.matmul elementwise_lambda_fn), so run the plain GEMM and
-            # apply bias with a standalone kernel; see bias_gelu_fwd.
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
+            # Matmul QKV.
+            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](l_ln_1),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_bias),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
                 Int64(3 * channels),
-                self.ctx,
-            )
-            bias_gelu_fwd[GPT2_DTYPE, Self.target, has_bias=True](
-                as_mut_kernel[GPT2_DTYPE](l_qkv),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_bias),
-                batch_size * seq_len,
-                3 * channels,
                 self.ctx,
             )
 
@@ -1782,25 +1771,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 cache=rebind[KVCachePtr](UnsafePointer(to=self.kv_cache)),
             )
 
-            # Matmul Attn Proj (plain GEMM + standalone bias; see QKV note).
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
+            # Matmul Attn Proj
+            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
                 as_mut_kernel[GPT2_DTYPE](l_attn_proj),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](l_attn_merged),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_bias),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
                 Int64(channels),
-                self.ctx,
-            )
-            bias_gelu_fwd[GPT2_DTYPE, Self.target, has_bias=True](
-                as_mut_kernel[GPT2_DTYPE](l_attn_proj),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_bias),
-                batch_size * seq_len,
-                channels,
                 self.ctx,
             )
             # LayerNorm 2 & Residual.
@@ -1820,50 +1801,31 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx,
             )
 
-            # Matmul FC (plain GEMM, then standalone bias + GELU writing the
-            # pre-activation into l_fch; see QKV note).
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
+            # Matmul FC (fused GELU).
+            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=True](
                 as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](l_fch),
                 as_mut_kernel[GPT2_DTYPE](l_ln_2),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
                 Int64(4 * channels),
                 self.ctx,
             )
-            bias_gelu_fwd[
-                GPT2_DTYPE, Self.target, has_bias=True, use_gelu=True
-            ](
-                as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
-                as_mut_kernel[GPT2_DTYPE](l_fch),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
-                batch_size * seq_len,
-                4 * channels,
-                self.ctx,
-            )
 
-            # Matmul Proj (plain GEMM + standalone bias; see QKV note).
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
+            # Matmul Proj.
+            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
                 as_mut_kernel[GPT2_DTYPE](l_fc_proj),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(4 * channels),
                 Int64(channels),
-                self.ctx,
-            )
-            bias_gelu_fwd[GPT2_DTYPE, Self.target, has_bias=True](
-                as_mut_kernel[GPT2_DTYPE](l_fc_proj),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
-                batch_size * seq_len,
-                channels,
                 self.ctx,
             )
 

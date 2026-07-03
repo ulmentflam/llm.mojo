@@ -1589,3 +1589,41 @@ make train-metal
 | NVIDIA Nsight Systems (nsys) | NO | `make profile-nsys` exits cleanly with a note |
 | `make benchmark-metal` | YES | no llm.c dependency |
 | `make benchmark-gpu` (NVIDIA) | NO | requires nvcc + CUDA |
+
+### 2026-07-02: Metal-support commit regressed the CUDA forward (caught & fixed)
+
+Commit f37cbd7 ("Metal support") is almost entirely CUDA-clean (audited hunk-by-
+hunk: Metal-gated or provably neutral; the f8c0a86 coalesced merge kernel is a
+clean bit-identical NVIDIA win). ONE exception: it **unconditionally de-fused**
+the four per-layer forward matmuls (plain GEMM + separate `bias_gelu_fwd`) for
+ALL targets — routing around Metal's broken fused-bias epilogue but also undoing
+change ⑳ on CUDA: forward 44.7→48.6 ms (step ~135→~136.5-137.7, parity lost by
+~2 ms) and bf16 numerics shifted (step-0 loss 8.791504→8.792923, the extra bf16
+rounding the ㉛ fusion A/B predicted). It also left the recompute-path
+rematerialization on the OLD fused call, breaking its bit-identity contract with
+the new forward when `recompute=True`. Fix: per-target gate (`HAS_CUBLAS` →
+fused, else split) at the four sites + the recompute site.
+
+**Measurement-hygiene lesson (how this was almost missed):** the first empirical
+"no regression" verdict came from a benchmark agent that claimed to rebuild but
+ran a 6-hour-stale binary — bit-identical losses and unchanged timings looked
+like a clean bill of health and directly contradicted the (correct) static
+audit. Always verify the binary's mtime AFTER building, and treat
+"losses bit-identical" as suspicious whenever the diff should have changed
+numerics.
+
+**Regression guard (canonical, referenced from `matmul_fwd`'s dispatch):** the
+bias(+GELU) handling is target-dispatched INSIDE `llmm/matmul.mojo::matmul_fwd`
+— call sites in `train_gpt2.mojo` stay single fused-style calls with no vendor
+branching. On `HAS_CUBLAS` the bias/GELU MUST remain fused into the cuBLASLt
+GEMM epilogue (change ⑳): de-fusing costs ~4 ms/step of forward and changes
+bf16 numerics through an extra rounding round-trip (step-0 loss
+8.791504 → 8.792923), forfeiting llm.c parity. The split GEMM + `bias_gelu_fwd`
+path exists ONLY for targets whose fused-bias epilogue is unavailable or broken
+(Metal). Any future change to this dispatch must be validated with a
+freshly-built binary (verify the output mtime actually changed — a stale binary
+once masked this exact regression) against the bit-identity reference losses:
+8.791504 / 8.778885 / 8.727783 / 8.6381035 (bf16 harness, B=4 T=1024 L=12,
+steps 0–3), plus `make verify-gpu` and the portable-path
+(`-D LLMM_FORCE_PORTABLE_GPU=1`) verify, which exercises the split branch on
+NVIDIA hardware.

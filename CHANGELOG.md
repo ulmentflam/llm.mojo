@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-07-01
 
+### Fixed
+
+- **CUDA forward regression from the Metal-support commit** (2026-07-02) — `f37cbd7`
+  unconditionally de-fused the per-layer bias(+GELU) from the cuBLASLt GEMM epilogue
+  for all targets (a workaround Metal needs), costing CUDA ~4 ms/step of forward and
+  shifting bf16 numerics (step-0 loss 8.791504 → 8.792923), and leaving the
+  gradient-checkpointing rematerialization on the old fused path. Fixed by moving the
+  fused-vs-split decision into the kernel layer (`matmul_fwd` in `llmm/matmul.mojo`:
+  fused epilogue on `HAS_CUBLAS`, split GEMM + `bias_gelu_fwd` elsewhere) and reverting
+  the `train_gpt2.mojo` call sites to single un-branched calls (byte-identical to
+  pre-Metal). CUDA losses bit-identical to the parity reference again, forward back to
+  ~44–46 ms; portable, recompute (`LLMM_RECOMPUTE=1`), and CPU paths all verify green
+  (CPU also regained its fused epilogue: ~105 vs ~170 ms/step). The regression was
+  initially masked by a stale benchmark binary — validation now requires a
+  freshness-checked build (see docs/ai/ai_assisted_optimizations_and_benchmarks.md).
+
 ### Performance
 
 - **Merge kernel: coalesced-write + 8-wide vectorization** (2026-07-02) — Flipped `merge_fwd_gpu`'s thread→element mapping from head-layout-indexed (coalesced read, strided write) to token-layout-indexed with width=8 (coalesced 16-byte read *and* write from the same thread), landing as a new `merge_fwd_gpu_coalesced` kernel with host-side dispatch (`head_dim % 8 == 0`) alongside the always-correct width=1 fallback. ~14% faster in isolation (61.5 → 52.9 µs/call), bit-identical output. Found via a 4-agent parallel investigation (one real win, three rigorous dead ends — see the doc for all four). Gates: `make verify-gpu` green, full `make test` 235/235 including the odd-head_dim equivalence fixture.
