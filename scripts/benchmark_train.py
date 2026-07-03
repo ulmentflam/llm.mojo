@@ -42,6 +42,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import textwrap
 import matplotlib
 import matplotlib.pyplot as plt
 
@@ -80,11 +81,30 @@ DEFAULT_METAL_STEPS = 10
 MAGIC_MODEL = 20240326
 MAGIC_TOKENIZER = 20240328
 
-# Per-implementation-family colors; bf16 bars are hatched to read at a glance.
+# Per-implementation-family colors: a FIXED assignment (never cycled, never by
+# position) so the same implementation always reads as the same hue across
+# every chart variant (e.g. PyTorch is #eda100 on the Metal chart and the CUDA
+# chart alike, even when llm.c isn't present). Precision (fp32 vs bf16) is
+# encoded separately via hatching over the same hue — never by color.
 FAMILY_COLORS = {
-    "llm.mojo": "#1f77b4",
-    "llm.c": "#d62728",
-    "PyTorch": "#ff7f0e",
+    "llm.mojo": "#2a78d6",  # blue
+    "llm.c": "#1baf7a",  # aqua
+    "PyTorch": "#eda100",  # yellow (below 3:1 contrast on white — acceptable
+    # only because every bar carries a direct value label; keep those labels).
+}
+FAMILY_COLOR_FALLBACK = "#008300"  # green, for a hypothetical 4th implementation
+
+# Ink / neutral palette — text and chart scaffolding never borrow a series hue.
+TEXT_INK = "#1a1a19"  # titles, value labels, bar edges
+TEXT_GRAY = "#5f5e56"  # subtitle, spines, ticks, error bars
+GRID_COLOR = "#e5e4dd"  # recessive horizontal gridlines, behind the bars
+LEGEND_FILL = "#cccccc"  # neutral swatch fill for the fp32/bf16 precision key
+
+# Known accelerator chip -> human-meaningful platform/product name. Used to
+# replace the machine hostname in filenames and figure text (e.g. any box
+# with an NVIDIA GB10 reports as "DGX Spark", regardless of its hostname).
+KNOWN_ACCELERATORS = {
+    "GB10": "DGX Spark",
 }
 
 
@@ -160,6 +180,9 @@ def hardware_info():
         # is the human date shown on the figure itself (e.g. "July 31st, 2026").
         "date": now.strftime("%Y-%m-%d %H:%M:%S"),
         "date_display": f"{now.strftime('%B')} {_ordinal(now.day)}, {now.year}",
+        # NOTE: `host` (the machine's actual hostname) is kept only for the
+        # console summary — it must never appear in a filename or in the figure
+        # itself. Use `platform` (derived below) for anything user-facing.
         "host": platform.node(),
         "os": platform.platform(),
         "cpu": platform.processor() or platform.machine(),
@@ -178,6 +201,9 @@ def hardware_info():
                     break
     except Exception:
         pass
+    # Human-meaningful platform/silicon description, computed last so it can
+    # see the final "cpu"/"gpu" fields (e.g. the CPU sysctl override above).
+    info["platform"] = platform_description(info)
     return info
 
 
@@ -198,6 +224,29 @@ def have_gpu():
     return bool(gpu_name())
 
 
+def platform_description(info):
+    """Human-meaningful platform/silicon description, used everywhere a
+    machine hostname would otherwise leak into a filename or figure (e.g.
+    "DGX Spark" for an NVIDIA GB10 box, "Mac M4 Max" for Apple Silicon).
+
+    Never returns socket.gethostname()/platform.node() — falls back to
+    "<os>-<arch>" (e.g. "linux-aarch64") when the silicon isn't recognized.
+    """
+    if is_apple_silicon():
+        chip = info.get(
+            "gpu", ""
+        )  # populated with apple_chip_name(), e.g. "Apple M4 Max"
+        if chip and chip != "none":
+            short = chip[len("Apple ") :] if chip.startswith("Apple ") else chip
+            return f"Mac {short}"
+        return "Mac"
+    gpu = info.get("gpu", "") or ""
+    for chip, label in KNOWN_ACCELERATORS.items():
+        if chip in gpu:
+            return label
+    return f"{sys.platform}-{platform.machine()}"
+
+
 def _slug(s):
     return re.sub(r"[^A-Za-z0-9.]+", "-", s).strip("-") or "x"
 
@@ -205,11 +254,14 @@ def _slug(s):
 def default_output(info, device):
     """A self-describing path under figures/ so runs on different hardware/dates/
     hyperparameters never overwrite and are identifiable at a glance, e.g.
-    figures/benchmark_gpu_b4_t1024_2026-06-30_2127_NVIDIA-GB10_spark-c265.png
+    figures/benchmark_gpu_b4_t1024_2026-06-30_2127_NVIDIA-GB10_DGX-Spark.png
+
+    The trailing component is a human-meaningful platform/silicon description
+    (see platform_description()), never the machine's hostname.
     """
     date = info["date"][:16].replace(" ", "_").replace(":", "")  # YYYY-MM-DD_HHMM
     hw = _slug(info["gpu"]) if info["gpu"] != "none" else _slug(info["cpu"])
-    name = f"benchmark_{device}_b{B}_t{T}_{date}_{hw}_{_slug(info['host'])}.png"
+    name = f"benchmark_{device}_b{B}_t{T}_{date}_{hw}_{_slug(info['platform'])}.png"
     return os.path.join(FIGURES, name)
 
 
@@ -490,6 +542,52 @@ def summarize(name, label, family, precision, samples):
     }
 
 
+def _hardware_subtitle(info):
+    """Build a de-duplicated hardware/date subtitle from info's platform/gpu/cpu
+    fields.
+
+    On Apple Silicon, `platform` ("Mac M4 Max"), `gpu` ("Apple M4 Max"), and
+    `cpu` (also "Apple M4 Max" from the sysctl brand string) all encode the
+    same chip name — naively joining them repeats "M4 Max" three times. This
+    collapses any component whose chip name is already implied by `platform`
+    (or by `gpu`, for the cpu check) into a single mention, folding the core
+    count onto whichever component survives.
+    """
+
+    def norm(s):
+        return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+    def chip(s):
+        return s[len("Apple ") :] if s.startswith("Apple ") else s
+
+    platform_str = info.get("platform", "") or ""
+    gpu = info.get("gpu", "") or ""
+    cpu = info.get("cpu", "") or ""
+    cores = info.get("cores", "")
+    date_display = info.get("date_display", "")
+
+    parts = []
+    if platform_str:
+        parts.append(platform_str)
+
+    gpu_redundant = gpu and gpu != "none" and norm(chip(gpu)) in norm(platform_str)
+    if gpu and gpu != "none" and not gpu_redundant:
+        parts.append(gpu)
+
+    cpu_redundant = cpu and (
+        norm(chip(cpu)) in norm(platform_str) or norm(chip(cpu)) in norm(gpu)
+    )
+    if cpu and not cpu_redundant:
+        parts.append(f"{cpu} ({cores} cores)" if cores else cpu)
+    elif cores and parts and "cores)" not in parts[0]:
+        # Core count would otherwise be lost if cpu was folded away as a dup.
+        parts[0] = f"{parts[0]} ({cores} cores)"
+
+    if date_display:
+        parts.append(date_display)
+    return "  |  ".join(parts)
+
+
 def plot_bars(device, series, info, outpath):
 
     matplotlib.use("Agg")
@@ -498,61 +596,115 @@ def plot_bars(device, series, info, outpath):
     if not series:
         return
     n = len(series)
-    fig, ax = plt.subplots(figsize=(max(7.0, 1.7 * n), 6.0))
+    # Content-scaled width (with a floor so a 2-bar Metal chart doesn't look
+    # cramped); constrained layout + bbox_inches="tight" on save (below) do the
+    # rest of the work to guarantee nothing — bars, title, or subtitle — clips.
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.8 * n), 6.0), layout="constrained")
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
 
     xs = range(n)
     means = [s["mean"] for s in series]
     stds = [s["std"] for s in series]
-    colors = [FAMILY_COLORS.get(s["family"], "#7f7f7f") for s in series]
-    hatches = ["//" if s["precision"] == "bf16" else "" for s in series]
+    colors = [FAMILY_COLORS.get(s["family"], FAMILY_COLOR_FALLBACK) for s in series]
+
+    # Recessive horizontal gridlines behind the bars.
+    ax.set_axisbelow(True)
+    ax.yaxis.grid(True, color=GRID_COLOR, linewidth=0.8, zorder=0)
+    ax.xaxis.grid(False)
 
     bars = ax.bar(
-        xs, means, yerr=stds, color=colors, capsize=4, edgecolor="black", linewidth=0.6
+        xs,
+        means,
+        width=0.62,
+        yerr=stds,
+        color=colors,
+        capsize=4,
+        ecolor=TEXT_GRAY,
+        error_kw=dict(elinewidth=1.2, capthick=1.2),
+        edgecolor=TEXT_INK,
+        linewidth=1.2,
+        zorder=3,
     )
-    for b, h in zip(bars, hatches):
-        if h:
-            b.set_hatch(h)
+    # Precision stays encoded by texture, not color: bf16 bars get a subtle
+    # white 45-degree hatch over the SAME implementation hue used for fp32.
+    # Matplotlib gotcha: hatch lines are drawn in the edgecolor, so getting
+    # WHITE hatch lines with an INK outline takes two artists at the SAME
+    # position — the hatched bar itself (edgecolor=white, linewidth=0 so no
+    # white border shows) plus an unfilled ink-outline rectangle on top.
+    # NOTE: ax.bar() defaults to align="center" (x is the bar's CENTER) while
+    # Rectangle.get_x() returns its LEFT edge — the overlay must convert, or
+    # it lands half a bar-width off its base bar.
+    for b, s in zip(bars, series):
+        if s["precision"] == "bf16":
+            b.set_hatch("///")
+            b.set_edgecolor("white")
+            b.set_linewidth(0)
+            ax.bar(
+                b.get_x() + b.get_width() / 2,
+                b.get_height(),
+                width=b.get_width(),
+                fill=False,
+                edgecolor=TEXT_INK,
+                linewidth=1.2,
+                zorder=4,
+            )
 
     ax.set_xticks(list(xs))
     ax.set_xticklabels([s["label"] for s in series])
-    ax.set_ylabel("train-loop time per step (ms)")
-    ax.set_ylim(0, max(m + sd for m, sd in zip(means, stds)) * 1.18)
+    ax.set_ylabel("train-loop time per step (ms)", color=TEXT_INK)
 
-    # Annotate each bar with the mean and throughput.
+    # Headroom above the tallest bar+error so the two-line value/throughput
+    # label never collides with the error bar cap or the axes top.
+    top = max(m + sd for m, sd in zip(means, stds))
+    ax.set_ylim(0, top * 1.15)
+
+    # Recessive spines/ticks; drop the top and right spines entirely.
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(TEXT_GRAY)
+    ax.spines["bottom"].set_color(TEXT_GRAY)
+    ax.tick_params(colors=TEXT_GRAY)
+
+    # Annotate each bar with the mean and throughput, in ink (never series color).
     for b, s in zip(bars, series):
         ax.text(
             b.get_x() + b.get_width() / 2,
-            b.get_height() + max(means) * 0.012 + s["std"],
+            b.get_height() + s["std"] + top * 0.02,
             f"{s['mean']:.1f} ms\n{s['tok_s']:.0f} tok/s",
             ha="center",
             va="bottom",
             fontsize=8,
+            color=TEXT_INK,
         )
 
-    sub = (
-        f"{info['date_display']}   |   {info['gpu']}   |   {info['cpu']}  "
-        f"({info['cores']} cores)   |   {info['host']}"
-    )
     dev_label = {"gpu": "GPU", "cpu": "CPU", "metal": "Metal GPU"}.get(
         device, device.upper()
     )
     # Hyperparameters belong on the figure itself so a saved PNG is self-describing:
     # batch, sequence length, and the resulting tokens/step the bars are measured at.
     cfg = f"B={B}, T={T}  ({B * T} tok/step)"
-    fig.suptitle(
-        f"GPT-2 124M {dev_label} training-loop time  —  {cfg}  (lower is better)\n"
-        + sub,
-        fontsize=11,
-    )
+    title = f"GPT-2 124M {dev_label} training-loop time — {cfg} (lower is better)"
+    # Machine/date details move to a smaller, de-duplicated, wrapped subtitle
+    # line rather than crowding (and overflowing) the main title.
+    sub = _hardware_subtitle(info)
+    sub_wrapped = textwrap.fill(sub, width=max(60, int(fig.get_figwidth() * 11)))
 
-    legend = [
-        Patch(facecolor="#cccccc", edgecolor="black", label="fp32"),
-        Patch(facecolor="#cccccc", edgecolor="black", hatch="//", label="bf16"),
-    ]
-    ax.legend(handles=legend, fontsize=9, loc="upper right")
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
+    fig.suptitle(title, fontsize=13, color=TEXT_INK)
+    ax.set_title(sub_wrapped, fontsize=9.5, color=TEXT_GRAY, pad=8)
+
+    # Precision legend only when both fp32 and bf16 appear — otherwise the x
+    # tick labels already carry the precision, and a legend is redundant.
+    precisions = {s["precision"] for s in series}
+    if {"fp32", "bf16"} <= precisions:
+        legend = [
+            Patch(facecolor=LEGEND_FILL, edgecolor=TEXT_INK, label="fp32"),
+            Patch(facecolor=LEGEND_FILL, edgecolor=TEXT_INK, hatch="///", label="bf16"),
+        ]
+        ax.legend(handles=legend, fontsize=9, loc="upper right", frameon=False)
+
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
-    fig.savefig(outpath, dpi=130)
+    fig.savefig(outpath, dpi=130, bbox_inches="tight")
     print(f"\n{dev_label} bar chart written to {outpath}")
 
 

@@ -18,7 +18,7 @@ Earlier benchmarks pinned `T=64` (llm.c's CPU reference default), which hides ho
 each implementation scales with sequence length. This entry runs every config at the
 real `T=1024` (4096 tokens/step).
 
-**Hardware:** NVIDIA GB10 (Grace-Blackwell, `spark-c265`), aarch64, 20 cores, Linux 6.17.
+**Hardware:** NVIDIA GB10 (Grace-Blackwell, `DGX Spark`), aarch64, 20 cores, Linux 6.17.
 
 ### Throughput (forward + backward + optimizer per step)
 
@@ -33,7 +33,7 @@ real `T=1024` (4096 tokens/step).
 | PyTorch            | fp32      |       975.45 |  935.22| 173.06|  4199 |
 | PyTorch            | bf16      |       954.97 |  832.45| 192.68|  4289 |
 
-Figure: `figures/benchmark_gpu_b4_t1024_2026-06-30_0909_NVIDIA-GB10_spark-c265.png`
+Figure: `figures/benchmark_gpu_b4_t1024_2026-06-30_0909_NVIDIA-GB10_DGX-Spark.png`
 
 **Headline findings**
 - At T=1024 **llm.mojo is ~12× slower than llm.c bf16** (2.6 s vs 0.22 s) and ~2.7×
@@ -1565,7 +1565,7 @@ Profiling and optimization for the Metal backend are future work.
 make build-profile
 
 # Throughput histogram: llm.mojo Metal vs PyTorch MPS
-# Writes figures/benchmark_metal_b4_t1024_<date>_Apple-M4-Max_<host>.png
+# Writes figures/benchmark_metal_b4_t1024_<date>_Apple-M4-Max_Mac-M4-Max.png
 make benchmark-metal BENCH_B=4 BENCH_T=1024 BENCH_METAL_STEPS=5
 
 # Same via the auto dispatcher (picks Metal on Apple Silicon automatically)

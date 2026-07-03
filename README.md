@@ -76,11 +76,11 @@ Benchmark Results: (NVIDIA DGX Spark)
 
 ### Single GPU
 
-!['Best Single GPU Benchmark'](figures/benchmark_gpu_b4_t64_2026-07-01_2137_NVIDIA-GB10_spark-c265.png)
+!['Best Single GPU Benchmark'](figures/benchmark_gpu_b4_t64_2026-07-01_2137_NVIDIA-GB10_DGX-Spark.png)
 
 ### Single CPU
 
-!['Best Single CPU Benchmark'](figures/benchmark_cpu_b4_t64_2026-07-01_2154_NVIDIA-GB10_spark-c265.png)
+!['Best Single CPU Benchmark'](figures/benchmark_cpu_b4_t64_2026-07-01_2154_NVIDIA-GB10_DGX-Spark.png)
 
 ## Test
 
@@ -122,7 +122,7 @@ A special thanks to https://github.com/dorjeduck/llm.mojo and @dorjeduck for wri
 
 After I reached functional success, my kernels were dramatically underperforming Karpathy and PyTorch. I did the initial profiling and caught that attention was the initial bottleneck. After a few attempts at writing a more optimal attention kernel, I decided to leverage AI agents for optimizing the kernel. Originally I leveraged Google Gemini, and after quickly running out of credits, I decided to leverage OpenCode and NVIDIA Nemotron 3 Ultra. After Nemotron 3 struggled for a few days on the optimization, I pivoted to Claude Opus (and more recently Fable) to optimize the kernel, eventually reaching parity in bfloat16. The full exploration is documented in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`. My initial results are documented below:
 
-!['Bad Times'](figures/benchmark_gpu_b4_t1024_2026-06-30_0909_NVIDIA-GB10_spark-c265.png)
+!['Bad Times'](figures/benchmark_gpu_b4_t1024_2026-06-30_0909_NVIDIA-GB10_DGX-Spark.png)
 
 ## Changelog
 
