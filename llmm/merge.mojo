@@ -193,6 +193,52 @@ def merge_fwd_gpu[
     )
 
 
+comptime MERGE_FWD_COALESCED_WIDTH = 8
+
+
+def merge_fwd_gpu_coalesced[
+    dtype: DType,
+    width: Int,
+](
+    dst_ptr: MutKernelPtr[dtype],  # token layout [B, T, NH*hd]
+    src_ptr: ImmutKernelPtr[dtype],  # head layout  [B, NH, T, hd]
+    batch_size: Int64,
+    seq_len: Int64,
+    num_heads: Int64,
+    head_dim: Int64,
+    channels: Int64,
+) -> None:
+    # merge_gpu (above) indexes threads by HEAD-layout position: coalesced
+    # read, strided write. Empirically (scratch/proto_lnsplit_merge.mojo,
+    # GB10 bf16 B=4 T=1024 NH=12 hd=64) that orientation alone is no better
+    # than the reverse (~61.5 vs ~62.4 us/call, a tie) — but indexing by
+    # TOKEN-layout position instead, with each thread owning a `width`-wide
+    # chunk within one head_dim run, gives a coalesced `width`-wide load AND
+    # store from the same thread (head_dim is the fastest-varying axis in
+    # both layouts, so a width-wide run is contiguous in both simultaneously
+    # as long as width | head_dim) — ~61.5 -> ~52.9 us/call, ~14%, verified
+    # bit-identical to the width=1 kernel. Only dispatched when
+    # head_dim % width == 0 (checked on the host in merge_fwd); the plain
+    # merge_fwd_gpu above is the always-correct fallback for odd shapes.
+    var hd = Int(head_dim)
+    var nh = Int(num_heads)
+    var t_len = Int(seq_len)
+    var chunk_index = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var token_flat = chunk_index * width
+    var num_elements = Int(batch_size * seq_len * channels)
+    if token_flat < num_elements:
+        var d = token_flat % hd
+        var r = token_flat // hd
+        var h = r % nh
+        var r2 = r // nh
+        var t = r2 % t_len
+        var b = r2 // t_len
+        var head_flat = ((b * nh + h) * t_len + t) * hd + d
+        (dst_ptr + token_flat).store[width=width](
+            (src_ptr + head_flat).load[width=width]()
+        )
+
+
 def merge_bwd_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
@@ -248,22 +294,52 @@ def merge_fwd[
         var channels = num_heads * head_dim
         var num_elements = batch_size * num_heads * seq_len * head_dim
         comptime BLOCK_SIZE = 256
-        var num_chunks = (num_elements + MERGE_GPU_WIDTH - 1) // MERGE_GPU_WIDTH
-        var num_blocks = (num_chunks + BLOCK_SIZE - 1) // BLOCK_SIZE
-        comptime gpu_kernel = merge_fwd_gpu[dtype, BLOCK_SIZE]
-        var compiled = ctx.compile_function[gpu_kernel]()
-        ctx.enqueue_function(
-            compiled,
-            src_ptr,
-            dst_ptr,
-            Int64(batch_size),
-            Int64(seq_len),
-            Int64(num_heads),
-            Int64(head_dim),
-            Int64(channels),
-            grid_dim=(num_blocks,),
-            block_dim=(BLOCK_SIZE,),
-        )
+        # Dispatch on the host between the coalesced-write fast path (real,
+        # measured ~14% win — see merge_fwd_gpu_coalesced's docstring) and the
+        # always-correct width=1 fallback, gated on head_dim being a multiple
+        # of the coalesced kernel's width (production GPT-2 head_dim=64 always
+        # qualifies; this guards odd shapes in the equivalence-suite fixtures).
+        if Int(head_dim) % MERGE_FWD_COALESCED_WIDTH == 0:
+            comptime coalesced_width = MERGE_FWD_COALESCED_WIDTH
+            var num_chunks_c = (
+                num_elements + coalesced_width - 1
+            ) // coalesced_width
+            var num_blocks_c = (num_chunks_c + BLOCK_SIZE - 1) // BLOCK_SIZE
+            comptime coalesced_kernel = merge_fwd_gpu_coalesced[
+                dtype, coalesced_width
+            ]
+            var compiled_c = ctx.compile_function[coalesced_kernel]()
+            ctx.enqueue_function(
+                compiled_c,
+                dst_ptr,
+                src_ptr,
+                Int64(batch_size),
+                Int64(seq_len),
+                Int64(num_heads),
+                Int64(head_dim),
+                Int64(channels),
+                grid_dim=(num_blocks_c,),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            var num_chunks = (
+                num_elements + MERGE_GPU_WIDTH - 1
+            ) // MERGE_GPU_WIDTH
+            var num_blocks = (num_chunks + BLOCK_SIZE - 1) // BLOCK_SIZE
+            comptime gpu_kernel = merge_fwd_gpu[dtype, BLOCK_SIZE]
+            var compiled = ctx.compile_function[gpu_kernel]()
+            ctx.enqueue_function(
+                compiled,
+                src_ptr,
+                dst_ptr,
+                Int64(batch_size),
+                Int64(seq_len),
+                Int64(num_heads),
+                Int64(head_dim),
+                Int64(channels),
+                grid_dim=(num_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
     else:
         raise Error("Invalid target")
 

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Merge kernel: coalesced-write + 8-wide vectorization** (2026-07-02) — Flipped `merge_fwd_gpu`'s thread→element mapping from head-layout-indexed (coalesced read, strided write) to token-layout-indexed with width=8 (coalesced 16-byte read *and* write from the same thread), landing as a new `merge_fwd_gpu_coalesced` kernel with host-side dispatch (`head_dim % 8 == 0`) alongside the always-correct width=1 fallback. ~14% faster in isolation (61.5 → 52.9 µs/call), bit-identical output. Found via a 4-agent parallel investigation (one real win, three rigorous dead ends — see the doc for all four). Gates: `make verify-gpu` green, full `make test` 235/235 including the odd-head_dim equivalence fixture.
+
 - **GPU kernel alignment sweep** — Applied explicit `alignment=align_of[SIMD[dtype,width]]()` across backward-pass kernels (layernorm, attention, softmax, gelu, encoder) to match llm.c memory patterns. Win: ~1.5 ms per step (kernel-level measurement). All 16 gradient tensors verified.
 
 - **Selective gradient zeroing** — Removed unnecessary 17.5 ms/step memset of the 3.29 GB `grad_acts_buf`. Replaced wholesale-fill with targeted 308 MB fills of accumulators only ({encoded, attn_proj, residual_2, fc_proj, residual_3}), exploiting the fused-residual-backward dataflow. Validated by fp32 equivalence checks, bf16 bit-identical loss trajectories, and poison-test (sentinel-fill) verification.
@@ -23,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **🎯 Step-time parity reached with llm.c** — llm.mojo bf16 (B=4, T=1024, NVIDIA GB10) now matches llm.c step-for-step: **134.6 ms (mojo) vs 134.7 ms (llm.c)**, equal in quiet-window interleaved A/B testing. Cumulative optimization: fp32 baseline (2612 ms, June 30) → bf16 parity (134.7 ms, July 1) = **~19.4× speedup**. Full training-fidelity constraints maintained: fp32 optimizer state, bf16 loss bit-stability, and working non-CUDA GPU fallback (`LLMM_FORCE_PORTABLE_GPU`).
 
+- **Ahead of llm.c, 3 repeated runs (2026-07-02)** — after the merge kernel fix, on a quiet GPU: llm.mojo **135.15–136.10 ms** vs llm.c **136.49–140.46 ms**, consistently at or ahead across all three, with tighter variance (std 0.9–1.1 vs 1.1–4.9).
+
 ### Changed
 
 - **Non-CUDA GPU compatibility** — Introduced `HAS_CUBLAS` and `LLMM_FORCE_PORTABLE_GPU` flag to maintain vendor-neutral GPU paths. cuBLAS fast paths (classifier, linear GEMMs) now fall back to MAX `linalg.matmul` on non-NVIDIA; attention falls back to pure-Mojo flash algorithm. Portable mode tested and green (e.g., 5.3557653 loss = within noise).
@@ -32,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Technical Details
 
 - Session entries ㉘–㉝ in `docs/ai/ai_assisted_optimizations_and_benchmarks.md` document the full campaign: root-cause profiling, A/B measurements, dead-end hypotheses, and the unified-memory pressure diagnosis that explained the earlier 1.36× GEMM slowdown.
+- The 2026-07-02 sections (softmax re-investigation + four-agent parallel investigation) document the merge kernel win above plus three dead ends with mechanism: cuBLASLt workspace-size tuning (already matched llm.c, no effect at any budget), softmax fast-exp/cache-eviction hints (statistical ties under locked-clock ncu), and layernorm dgamma/dbeta fusion + the entire async-copy/latency-hiding lever family (GB10's memory-bound kernels proven bandwidth-bound, not latency-bound). Scratch prototypes for all four kept in-tree with RESULT-header summaries.
 
 ---
 

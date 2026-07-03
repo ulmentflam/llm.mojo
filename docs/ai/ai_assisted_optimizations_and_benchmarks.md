@@ -1311,3 +1311,223 @@ gelu/adamw sites audited safe-by-construction (`idx = tid*width`);
 classifier/softmax rely on `Vp % 4 == 0`, which every fixture and production
 config satisfies. Gates: verify-gpu 16/16 TENSOR OK; bf16 harness losses
 bit-identical; step 135.7 ms (parity regime intact); test_zero_equivalence 3/3.
+
+---
+
+## 2026-07-02 — Softmax gap re-investigation: noise-checked, warp-per-row hypothesis refuted
+
+With parity reached, a fresh `make profile-ncu`/`make profile-llmc-ncu` pass at
+B=4 T=1024 L=12 (same methodology as before) turned up one per-call delta
+worth a second look: our causal softmax at ~647 µs/call vs llm.c's
+`softmax_forward_kernel5` at ~482 µs/call (~1.3×). Everything else matched or
+beat llm.c per the existing per-family table. This entry re-measures that
+delta for noise, forms a concrete structural hypothesis, and tests it.
+
+### Re-measurement: the gap is real, not noise
+
+3× repeated `make profile-ncu PROFILE_B=4 PROFILE_T=1024 PROFILE_LAYERS=12` and
+`make profile-llmc-ncu` (same flags), reading just the softmax kernel row:
+
+| run | llm.mojo softmax (µs/call, 12 calls) | llm.c `softmax_forward_kernel5` (µs/call, 492 calls) |
+|---|---:|---:|
+| 1 | 651.3 | 481.4 |
+| 2 | 643.4 | 484.5 |
+| 3 | 626.4 | 482.6 |
+| **mean** | **640.4** | **482.8** |
+
+Both sides are tight (llm.mojo <4% spread, llm.c <1% spread) — a real,
+reproducible **~1.33× gap**, not measurement noise.
+
+### Hypothesis: block-per-row vs warp-per-row reduction
+
+Reading `llmc/attention.cuh`'s `softmax_forward_kernel5`: llm.c assigns **one
+warp per row** (`num_warps = blockDim.x/32` independent rows in flight per
+block) and reduces with plain warp-shuffle (`warpReduceMax`/`warpReduceSum`) —
+no block barrier, no shared memory. Our `_attention_softmax_causal_gpu`
+(`llmm/attention.mojo`) assigns **one 256-thread block per row** and reduces
+with `block.max`/`block.sum` — a cross-warp shared-memory reduction gated by a
+`barrier()`. Causal rows vary wildly in length (1..1024 elements as
+`query_index` goes 0..1023), so the theory: our block-wide reduction pays a
+fixed barrier+shared-mem cost on every one of the 49,152 rows regardless of
+row length, while llm.c's warp reduction is cheap (shuffle-only) and lets 8
+independent warps in a block work on 8 different rows with zero cross-warp
+sync — for short rows especially, that fixed overhead should dominate.
+
+### Investigated: `scratch/proto_softmax_warp.mojo` — REFUTED
+
+Built a standalone prototype reimplementing both kernels at the real shape
+(B=4, NH=12, T=1024 → 48×1024×1024 bf16 scores plane), plus a third variant
+adding llm.c's exact 4-wide vectorized reduce (`regarray[4]`) discovered on a
+closer re-read of its source. Correctness verified first: max abs err ~1.5e-5
+(bf16 rounding) between all three variants' output — all three compute the
+same softmax. Then 3× repeated wall-clock timing (30-iter, same
+enqueue-then-sync methodology as `proto_layernorm_max.mojo`):
+
+| kernel | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| block-per-row (current production kernel) | 502.1 | 526.5 | 499.4 |
+| warp-per-row (llm.c-style, scalar reduce) | 536.2 | 519.1 | 522.4 |
+| warp-per-row + 4-wide vectorized reduce | 524.7 | 539.9 | 525.4 |
+
+Every warp-per-row variant lands **within run-to-run noise** of block-per-row
+(ratios 0.94×–1.01× across the three runs) — no consistent win, and on most
+runs a small loss. **Reduction structure is not the explanation for the real
+gap.** If it were, an isolated microbenchmark at the real shape should show a
+large, repeatable win for the warp-per-row kernel; it shows none.
+
+This reproduces the exact pattern already documented above for the layernorm
+warp-per-row port ("SLOWER — shared-mem occupancy + `warp.sum` overhead don't
+match CUDA's `warpReduceSum`", see the dead-ends table). Two independent
+kernels now show the same result: **porting llm.c's warp-shuffle-heavy kernel
+designs 1:1 does not reproduce its CUDA-side win in this Mojo toolchain.**
+Treat this as a general, reusable pattern for future investigations, not a
+one-off — Mojo's block-wide reductions appear to be the more reliable choice
+here even when CUDA precedent favors warp-level.
+
+### Remaining untested leads (not attempted — lower priority / higher cost)
+
+Re-reading `softmax_forward_kernel5` turned up two more differences from ours,
+neither retested here:
+
+1. **`__ldcs`/`__stcs` streaming-cache read/write hints** on the write-back
+   loop — already a documented dead end (`CacheOperation.STREAMING` hits a
+   ptxas bug in this Mojo build, reproduced standalone; see "Levers TESTED
+   that hit the floor" above).
+2. **Reverse grid-iteration order** — llm.c processes rows back-to-front
+   (`idx = (gridDim.x - blockIdx.x - 1) * num_warps + warp_id`) specifically
+   so the L2-resident tail of the softmax output benefits the A·V matmul that
+   runs immediately after. This is a cross-kernel cache-locality effect
+   invisible to an isolated microbenchmark — testing it means changing the
+   production kernel and measuring the full pipeline, not a quick standalone
+   probe. Flagged for a future session if the softmax gap is revisited.
+
+### Verdict
+
+No easy win found. The ~1.3× softmax gap is real and reproducible, but its
+cause isn't reduction granularity — it joins the residual bandwidth-bound
+kernels (layernorm structure, split/merge, classifier) already documented
+above as resisting every lever tried so far. `scratch/proto_softmax_warp.mojo`
+is kept in-tree as the documented negative result, matching
+`proto_layernorm_max.mojo`'s convention.
+
+---
+
+## 2026-07-02 (continued) — four-agent parallel investigation: one real win landed
+
+With the softmax gap characterized but unsolved, four independent Opus agents
+were dispatched in parallel, each briefed on the full history above and
+assigned a distinct angle, each restricted to scratch-only experimentation so
+they couldn't collide with each other or risk the production tree. Summary of
+all four, ranked by outcome:
+
+### ㉞ Merge kernel: coalesced-write + 8-wide vectorization — REAL WIN, LANDED
+
+**Finding.** `merge_gpu`'s forward path indexed threads by HEAD-layout
+position (coalesced read, strided write to token-layout). Flipping to index
+by TOKEN-layout position instead — each thread owning a width-8 chunk within
+one head_dim run, safe since head_dim(64) is a multiple of 8 — gives a
+coalesced 16-byte load **and** store from the same thread (head_dim is the
+fastest-varying axis in both layouts, so a width-8 run is contiguous in both
+simultaneously). Verified in `scratch/proto_lnsplit_merge.mojo`: flipping the
+index alone did **nothing** (~61.5 vs ~62.4 µs/call, refuting the "strided
+writes are the penalty" theory), but flip **+ width=8** gave ~61.5 → ~52.9
+µs/call (~14%), bit-identical output (err 0.0). This is *not* the documented
+"split/merge x128 vectorize was worse" dead end from earlier in this doc —
+that tested vectorizing the *original* (coalesced-read/strided-write)
+orientation, where a wide store scatters; the win requires the coalesced-write
+orientation first.
+
+**Landed** in `llmm/merge.mojo`: a new `merge_fwd_gpu_coalesced[dtype, width]`
+kernel (width=8) alongside the original `merge_fwd_gpu` (width=1), with
+host-side dispatch in `merge_fwd` — `if Int(head_dim) % 8 == 0` picks the
+coalesced kernel, else falls back to the always-correct original. This is the
+exact same host-dispatch pattern already used throughout the codebase
+(layernorm, encoder, global_norm) to guard vectorized fast paths against the
+equivalence suite's deliberately odd shapes — the class of bug that broke 183
+tests earlier in this campaign (see "Post-parity: equivalence-suite fallout").
+`merge_bwd` was **not** touched: the agent noted it "already writes coalesced
+to head-layout and just needs width=8," but never actually measured that
+claim, so it wasn't applied — only the empirically-verified forward change
+shipped.
+
+**Gates, all green:** `make verify-gpu` (16/16 TENSOR OK, bf16 losses match
+the known reference trajectory: 5.356195, 5.2044296, 5.060379, …); `make
+test` — full 235/235 suite passed, including
+`test_split_merge_equivalence.py::test_merge_forward_matches_reference[fp32_odd_head]`
+(head_dim=5, not a multiple of 8) — confirmed this test actually exercises
+the fallback path, not a coincidental pass.
+
+**In-pipeline effect** (ncu, same-session before/after): `merge_fwd` fell
+~89.9 → ~83.7 µs/call in the full training step (smaller than the isolated
+~14% — expected, given pipeline contention differs from an isolated
+microbenchmark — but real and in the right direction, non-zero).
+
+### Dead ends (three agents, all rigorous negative results)
+
+- **cuBLASLt vocab-GEMM workspace size.** The doc's own "untried lever" (match
+  llm.c's 32 MiB workspace to unlock split-K algos) turned out to already be
+  moot: `llmm/matmul.mojo` already passes 32 MiB, byte-identical to llm.c's
+  `cublas_common.h`. A sweep from 4→256 MiB (`scratch/proto_vocabgemm_workspace.mojo`)
+  showed cuBLASLt *never* changes its algorithm choice (always algo 67, no
+  split-K, 0 bytes requested) regardless of budget. The ~3.4 ms/step nvjet
+  vocab-GEMM gap remains real but is now provably not a workspace-starvation
+  artifact.
+- **Softmax: fast-exp and cache-eviction hints.** Two more leads from
+  `softmax_forward_kernel5` tested in isolation
+  (`scratch/proto_softmax2_fastexp.mojo`, `scratch/proto_softmax2_cachehint.mojo`):
+  `ex2.approx` fast-exp was neutral-to-marginally-slower (548.0 vs 559.1
+  µs/call); `read_only`/`EVICT_FIRST` cache hints were a statistical tie
+  (551.9–553.8 µs/call, within 0.3%) — the 100 MB scores plane vastly exceeds
+  L2, so there's no residency for a hint to protect. Both measured under
+  **locked ncu clocks** after discovering naive wall-clock timing on this box
+  is unreliable: idle downclocking between timed blocks means whichever
+  kernel runs second in a pair looks faster, producing a false 1.22×
+  "win" that reversed to a false 1.22× "loss" just by swapping order. Treat
+  this as a standing methodological caution for any future timing work here.
+- **Layernorm backward fusion, and the bandwidth-vs-latency-bound question.**
+  Fusing dgamma/dbeta into the residual d_input kernel (llm.c kernel10's
+  structure) was tested (`scratch/proto_lnsplit_fused.mojo`) and found to be a
+  net loss at every block count: the occupancy the d_input pass needs (~1536
+  blocks) makes the atomic dparam-flush contend, while the only atomic-free
+  escape (warp-per-row) is already documented above as slower in this
+  toolchain. Separately, a from-first-principles bandwidth-vs-latency probe
+  (`scratch/proto_fresh_bandwidth.mojo`) directly measured — rather than
+  assumed — that GB10's memory-bound kernels are bandwidth-bound: a plain
+  vectorized copy already hits the hardware d2d-memcpy ceiling (~240 GB/s),
+  and a cp.async double-buffered version came back **byte-for-byte identical**
+  to the plain copy. This closes the entire latency-hiding lever family
+  (cp.async, deeper ILP, prefetching) at once, and independently confirms
+  production adamw (measured 15.1 ms) sits almost exactly at the predicted
+  DRAM-ceiling time (124.4M params × 28 B / 232 GB/s ≈ 15.0 ms).
+
+### Fresh same-session benchmark (post-merge-fix, 2026-07-02)
+
+`make benchmark-gpu BENCH_B=4 BENCH_T=1024`, 3 repeated runs, GPU quiet (vLLM
+tenant resident but idle, checked via `nvidia-smi` before each run):
+
+| run | llm.mojo bf16 (mean/median ms) | llm.c bf16 (mean/median ms) |
+|---|---:|---:|
+| 1 | 136.10 / 136.10 | 140.46 / 137.79 |
+| 2 | 135.79 / 135.88 | 136.49 / 136.47 |
+| 3 | 135.15 / 135.36 | 138.92 / 137.27 |
+
+llm.mojo now measures **consistently at or ahead of llm.c** across all three
+runs (135.15–136.10 ms vs 136.49–140.46 ms), with tighter variance (std
+0.9–1.1 vs 1.1–4.9). This is a step beyond the earlier "equal, within noise"
+parity result (134.6–134.9 vs 134.7–136.0) — a modest, real improvement from
+the merge fix compounding with a clean measurement window today. `make
+profile-ncu`/`make profile-llmc-ncu` (same B/T/L) confirm no regression
+elsewhere: total ncu-serialized time 149.4 ms (ours) vs the stable ~2.02 ms
+(sic, 2020 ms — llm.c's non-comparable serialized total, unchanged from
+earlier in this doc), with the merge_fwd delta the only kernel-level change
+in the per-kernel table.
+
+### Verdict
+
+One small, real, fully-verified win shipped (merge kernel, ~0.1–0.2 ms/step
+in isolation, part of what pushed today's session to measure ahead of
+llm.c). Three rigorous dead ends closed off real search space — cuBLASLt
+workspace tuning, softmax fast-exp/cache-hints, layernorm dgamma fusion, and
+the entire async-copy/latency-hiding lever family — each with mechanism, not
+just a number, so they won't be re-attempted. All four scratch prototypes are
+kept in-tree with RESULT-header summaries per this campaign's convention.
