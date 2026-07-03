@@ -33,13 +33,14 @@ def check_tensor[
     n: Int,
     label: String,
     tol: Float32,
-) -> Bool:
-    # Allocate host memory (of the device dtype) to copy the device tensor into
-    var host_ptr = alloc[Scalar[dtype]](n)
+) raises -> Bool:
+    # Allocate a Metal-registered host buffer so enqueue_copy works on
+    # both Metal (which rejects plain-malloc dst pointers) and CUDA.
+    var host_buf = ctx.enqueue_create_host_buffer[dtype](n)
     try:
         ctx.enqueue_copy(
             dst_ptr=rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
-                host_ptr
+                host_buf.unsafe_ptr().as_unsafe_any_origin()
             ),
             src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
                 device_ptr.as_unsafe_any_origin()
@@ -49,7 +50,6 @@ def check_tensor[
         ctx.synchronize()
     except e:
         print("Error copying tensor to host for " + label + ":", e)
-        host_ptr.free()
         return False
 
     var print_upto: Int = 5
@@ -60,7 +60,7 @@ def check_tensor[
 
     for i in range(n):
         # look at the difference at position i of these two tensors
-        var actual = host_ptr[i].cast[DType.float32]()
+        var actual = host_buf[i].cast[DType.float32]()
         var diff = abs(actual - expected_ptr[i])
 
         # keep track of the overall error
@@ -85,7 +85,7 @@ def check_tensor[
     else:
         print("TENSOR NOT OK, maxdiff =", maxdiff)
 
-    host_ptr.free()
+    _ = host_buf^
     return ok
 
 
@@ -216,12 +216,17 @@ def run_test[
         if step == 0:
             # error checking at step 0 for reference activations/gradients
 
-            # copy logits from device buffer to host first
-            var host_logits = alloc[Scalar[DType.float32]](B * T * V_p)
+            # copy logits from device buffer to host first.
+            # NOTE: on Metal the enqueue_copy dst must be a *registered* buffer
+            # (a raw `alloc` pointer raises "Invalid Metal buffer pointer"), so
+            # use a device-context host buffer.
+            var host_logits = ctx.enqueue_create_host_buffer[DType.float32](
+                B * T * V_p
+            )
             ctx.enqueue_copy(
                 dst_ptr=rebind[
                     UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-                ](host_logits),
+                ](host_logits.unsafe_ptr().as_unsafe_any_origin()),
                 src_ptr=rebind[
                     UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
                 ](model.acts.logits.as_unsafe_any_origin()),
@@ -282,7 +287,7 @@ def run_test[
                 print("NOT ", end="")
             print("OK (LOGITS)")
             allok = allok and logits_ok
-            host_logits.free()
+            _ = host_logits^
 
             # compare the achieved loss
             if abs(model.mean_loss - expected_loss[0]) >= loss_tol:

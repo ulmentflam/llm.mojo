@@ -1531,3 +1531,61 @@ workspace tuning, softmax fast-exp/cache-hints, layernorm dgamma fusion, and
 the entire async-copy/latency-hiding lever family — each with mechanism, not
 just a number, so they won't be re-attempted. All four scratch prototypes are
 kept in-tree with RESULT-header summaries per this campaign's convention.
+
+---
+
+## Apple Silicon (Metal GPU) benchmarking setup
+
+### What is compared and why llm.c is absent
+
+llm.c has **no Metal/Apple-GPU port** — it is CUDA-only on the GPU side. On Apple
+Silicon the GPU comparison is therefore **llm.mojo (Metal) vs PyTorch MPS (Metal
+Performance Shaders)**, not vs llm.c.
+
+- **llm.mojo side:** the same `build/profile_gpt2` binary used for NVIDIA benchmarks,
+  invoked with the `gpu` target. On Apple Silicon, Mojo's GPU backend dispatches to
+  Metal automatically — no extra build flags or env vars are required.
+- **PyTorch MPS side:** `train_gpt2.py --device mps` (the repo-local script, which
+  already calls `torch.mps.synchronize()` before timing for accurate per-step
+  measurement).
+- **llm.c:** skipped on Apple with a printed notice — `"llm.c has no Metal port —
+  baseline is PyTorch MPS"`.
+
+At B=4, T=1024, fp32, llm.mojo on Metal runs at approximately **6.5 s/step** on an
+M4 Max (fp32 only; bf16 is not yet profiled on Metal). This is substantially slower
+than the NVIDIA GB10 numbers because (a) fp32 has no tensor-core acceleration,
+(b) Metal's compute throughput is lower than GB10's, and (c) the same GEMM-level
+optimizations (cuBLASLt, CUDA-specific attention kernels) do not apply to Metal.
+Profiling and optimization for the Metal backend are future work.
+
+### How to run
+
+```sh
+# Build the profiling harness (one-time, unless .mojo sources change)
+make build-profile
+
+# Throughput histogram: llm.mojo Metal vs PyTorch MPS
+# Writes figures/benchmark_metal_b4_t1024_<date>_Apple-M4-Max_<host>.png
+make benchmark-metal BENCH_B=4 BENCH_T=1024 BENCH_METAL_STEPS=5
+
+# Same via the auto dispatcher (picks Metal on Apple Silicon automatically)
+make benchmark BENCH_B=4 BENCH_T=1024
+
+# Perfetto trace of one Metal training step (open at https://ui.perfetto.dev)
+make profile-metal
+# Or equivalently:
+make profile PROFILE_TARGET=gpu
+
+# Train on Metal GPU
+make train-metal
+```
+
+### Tool availability on Apple Silicon
+
+| tool | available | notes |
+|------|-----------|-------|
+| Perfetto tracer (in-process) | YES | `make profile-metal` — cross-platform |
+| NVIDIA Nsight Compute (ncu) | NO | `make profile-ncu` exits cleanly with a note |
+| NVIDIA Nsight Systems (nsys) | NO | `make profile-nsys` exits cleanly with a note |
+| `make benchmark-metal` | YES | no llm.c dependency |
+| `make benchmark-gpu` (NVIDIA) | NO | requires nvcc + CUDA |

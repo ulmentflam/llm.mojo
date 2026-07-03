@@ -507,14 +507,10 @@ def _attention_forward_query_row[
     ](state, output_row, log_sum_exp_out, head_dim)
 
 
-@always_inline
-def _attention_shared_memory_row_pointer[
-    dtype: DType,
-](shared_tensor: LayoutTensor, row_index: Int,) -> ImmutKernelPtr[dtype]:
-    var base_ptr = rebind[ImmutKernelPtr[dtype]](
-        shared_tensor.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
-    return base_ptr + row_index * MAX_HEAD_DIM
+# NOTE: The former `_attention_shared_memory_row_pointer` helper was removed:
+# it cast SHARED (threadgroup) pointers to AddressSpace.GENERIC, which Metal
+# AIR silently mis-compiles (loads return 0, stores go to device memory).
+# GPU kernels now index shared LayoutTensors via SHARED-typed pointers.
 
 
 @always_inline
@@ -522,7 +518,7 @@ def _attention_copy_rows_dram_to_shared[
     dtype: DType,
     BLOCK_SIZE: Int,
 ](
-    shared_tensor: LayoutTensor,
+    mut shared_tensor: LayoutTensor,
     dram_ptr: ImmutKernelPtr[dtype],
     dram_row_start: Int,
     row_count: Int,
@@ -532,9 +528,13 @@ def _attention_copy_rows_dram_to_shared[
     # collectively fills the shared tile. Uses synchronous stores because the
     # a copy_dram_to_sram_async thread_layout API is not available;
     # callers issue a barrier() after this returns to ensure visibility.
-    var shared_ptr = rebind[MutKernelPtr[dtype]](
-        shared_tensor.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
+    # Metal fix: rebind to MutAnyOrigin+SHARED so writes go to threadgroup memory.
+    # address_space_cast[GENERIC] corrupts threadgroup pointers on Metal AIR.
+    var shared_ptr = rebind[
+        UnsafePointer[
+            Scalar[dtype], MutAnyOrigin, address_space=AddressSpace.SHARED
+        ]
+    ](shared_tensor.ptr)
     var thread_id = Int(thread_idx.x)
     var element_count = row_count * head_dim
     var element_index = thread_id
@@ -579,19 +579,25 @@ def _attention_load_online_softmax_state_from_shared[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
-    softmax_max_true_ptr: MutKernelPtr[DType.float32],
-    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
-    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
+    softmax_max_deferred_shared: LayoutTensor,
+    softmax_max_true_shared: LayoutTensor,
+    softmax_denominator_true_shared: LayoutTensor,
+    output_rescale_factor_shared: LayoutTensor,
     local_query_row: Int,
     mut state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
 ) -> None:
-    state.softmax_max_deferred = softmax_max_deferred_ptr[local_query_row]
-    state.softmax_max_true = softmax_max_true_ptr[local_query_row]
-    state.softmax_denominator_true = softmax_denominator_true_ptr[
+    state.softmax_max_deferred = softmax_max_deferred_shared.ptr[
         local_query_row
-    ]
-    state.output_rescale_factor = output_rescale_factor_ptr[local_query_row]
+    ].cast[DType.float32]()
+    state.softmax_max_true = softmax_max_true_shared.ptr[local_query_row].cast[
+        DType.float32
+    ]()
+    state.softmax_denominator_true = softmax_denominator_true_shared.ptr[
+        local_query_row
+    ].cast[DType.float32]()
+    state.output_rescale_factor = output_rescale_factor_shared.ptr[
+        local_query_row
+    ].cast[DType.float32]()
 
 
 @always_inline
@@ -599,19 +605,25 @@ def _attention_store_online_softmax_state_to_shared[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
-    softmax_max_true_ptr: MutKernelPtr[DType.float32],
-    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
-    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
+    mut softmax_max_deferred_shared: LayoutTensor,
+    mut softmax_max_true_shared: LayoutTensor,
+    mut softmax_denominator_true_shared: LayoutTensor,
+    mut output_rescale_factor_shared: LayoutTensor,
     local_query_row: Int,
     state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
 ) -> None:
-    softmax_max_deferred_ptr[local_query_row] = state.softmax_max_deferred
-    softmax_max_true_ptr[local_query_row] = state.softmax_max_true
-    softmax_denominator_true_ptr[
-        local_query_row
-    ] = state.softmax_denominator_true
-    output_rescale_factor_ptr[local_query_row] = state.output_rescale_factor
+    # Rebind to MutAnyOrigin+SHARED so writes go to threadgroup memory on Metal.
+    comptime _F32SharedPtr = UnsafePointer[
+        Scalar[DType.float32], MutAnyOrigin, address_space=AddressSpace.SHARED
+    ]
+    var p_max_def = rebind[_F32SharedPtr](softmax_max_deferred_shared.ptr)
+    var p_max_true = rebind[_F32SharedPtr](softmax_max_true_shared.ptr)
+    var p_denom = rebind[_F32SharedPtr](softmax_denominator_true_shared.ptr)
+    var p_rescale = rebind[_F32SharedPtr](output_rescale_factor_shared.ptr)
+    p_max_def[local_query_row] = state.softmax_max_deferred
+    p_max_true[local_query_row] = state.softmax_max_true
+    p_denom[local_query_row] = state.softmax_denominator_true
+    p_rescale[local_query_row] = state.output_rescale_factor
 
 
 @always_inline
@@ -621,14 +633,22 @@ def _attention_init_online_softmax_state_shared[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
-    softmax_max_true_ptr: MutKernelPtr[DType.float32],
-    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
-    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
+    mut softmax_max_deferred_shared: LayoutTensor,
+    mut softmax_max_true_shared: LayoutTensor,
+    mut softmax_denominator_true_shared: LayoutTensor,
+    mut output_rescale_factor_shared: LayoutTensor,
     query_tile_start: Int,
     query_tile_rows: Int,
     seq_len: Int,
 ) -> None:
+    # Rebind to MutAnyOrigin+SHARED so writes go to threadgroup memory on Metal.
+    comptime _F32SharedPtr = UnsafePointer[
+        Scalar[DType.float32], MutAnyOrigin, address_space=AddressSpace.SHARED
+    ]
+    var p_max_def = rebind[_F32SharedPtr](softmax_max_deferred_shared.ptr)
+    var p_max_true = rebind[_F32SharedPtr](softmax_max_true_shared.ptr)
+    var p_denom = rebind[_F32SharedPtr](softmax_denominator_true_shared.ptr)
+    var p_rescale = rebind[_F32SharedPtr](output_rescale_factor_shared.ptr)
     var thread_id = Int(thread_idx.x)
     var row_index = thread_id
     var initial_state = OnlineSoftmaxState[
@@ -636,16 +656,10 @@ def _attention_init_online_softmax_state_shared[
     ]()
     while row_index < query_tile_rows:
         if query_tile_start + row_index < seq_len:
-            softmax_max_deferred_ptr[
-                row_index
-            ] = initial_state.softmax_max_deferred
-            softmax_max_true_ptr[row_index] = initial_state.softmax_max_true
-            softmax_denominator_true_ptr[
-                row_index
-            ] = initial_state.softmax_denominator_true
-            output_rescale_factor_ptr[
-                row_index
-            ] = initial_state.output_rescale_factor
+            p_max_def[row_index] = initial_state.softmax_max_deferred
+            p_max_true[row_index] = initial_state.softmax_max_true
+            p_denom[row_index] = initial_state.softmax_denominator_true
+            p_rescale[row_index] = initial_state.output_rescale_factor
         row_index += BLOCK_SIZE
 
 
@@ -761,10 +775,10 @@ def _attention_gpu_process_key_value_tile_warp[
     query_shared: LayoutTensor,
     key_shared: LayoutTensor,
     value_shared: LayoutTensor,
-    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
-    softmax_max_true_ptr: MutKernelPtr[DType.float32],
-    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
-    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
+    mut softmax_max_deferred_shared: LayoutTensor,
+    mut softmax_max_true_shared: LayoutTensor,
+    mut softmax_denominator_true_shared: LayoutTensor,
+    mut output_rescale_factor_shared: LayoutTensor,
     reduction_shared: LayoutTensor,
 ) -> None:
     comptime NUM_WARPS = BLOCK_SIZE // WARP_SIZE
@@ -776,10 +790,6 @@ def _attention_gpu_process_key_value_tile_warp[
     comptime ELEMENTS_PER_THREAD = MAX_HEAD_DIM // WARP_SIZE
     var d_start = lane_id * ELEMENTS_PER_THREAD
 
-    var reduction_shared_ptr = rebind[MutKernelPtr[DType.float32]](
-        reduction_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
-
     comptime for local_row in range(ROWS_PER_WARP):
         var query_index = (
             query_tile_start + warp_index * ROWS_PER_WARP + local_row
@@ -790,15 +800,25 @@ def _attention_gpu_process_key_value_tile_warp[
         _attention_load_online_softmax_state_from_shared[
             use_soft_exp, use_conditional_rescale
         ](
-            softmax_max_deferred_ptr,
-            softmax_max_true_ptr,
-            softmax_denominator_true_ptr,
-            output_rescale_factor_ptr,
+            softmax_max_deferred_shared,
+            softmax_max_true_shared,
+            softmax_denominator_true_shared,
+            output_rescale_factor_shared,
             local_query_row,
             state,
         )
 
-        comptime for key_column in range(Bc):
+        # NOTE: This is a runtime loop (not comptime) on purpose. The Metal GPU
+        # compiler (MetalAIRPass) crashes when the inner KV loop is fully
+        # unrolled at compile-time inside the already-unrolled outer
+        # `comptime for local_row` loop: the resulting function body is too
+        # large for the Metal LLVM/AIR backend and causes an ICE. On NVIDIA
+        # (HAS_CUBLAS=True) the flash-forward kernel is not called at all
+        # (USE_GEMM_ATTENTION=True takes precedence), so removing the unroll
+        # has zero effect on NVIDIA forward performance. The backward kernels
+        # never used comptime-unrolled KV loops and compile fine on both
+        # targets.
+        for key_column in range(Bc):
             var key_index = key_tile_start + key_column
             var is_active_and_valid = (
                 (query_index < seq_len)
@@ -806,20 +826,19 @@ def _attention_gpu_process_key_value_tile_warp[
                 and (key_index <= query_index)
             )
 
+            # Metal fix: access shared Q/K/V rows directly via .ptr to preserve
+            # AddressSpace.SHARED — the old _attention_shared_memory_row_pointer
+            # path casts to GENERIC which silently returns zeros on Metal AIR.
+            var q_base = local_query_row * MAX_HEAD_DIM
+            var k_base = key_column * MAX_HEAD_DIM
             var local_sum = Scalar[DType.float32](0.0)
-            var q_row_ptr = _attention_shared_memory_row_pointer[dtype](
-                query_shared, local_query_row
-            )
-            var k_row_ptr = _attention_shared_memory_row_pointer[dtype](
-                key_shared, key_column
-            )
             if is_active_and_valid:
                 for d in range(ELEMENTS_PER_THREAD):
                     var idx = d_start + d
                     if idx < head_dim:
                         local_sum += (
-                            q_row_ptr[idx].cast[DType.float32]()
-                            * k_row_ptr[idx].cast[DType.float32]()
+                            query_shared.ptr[q_base + idx].cast[DType.float32]()
+                            * key_shared.ptr[k_base + idx].cast[DType.float32]()
                         )
 
             var S_ij = warp.sum(local_sum) * attention_scale
@@ -837,9 +856,7 @@ def _attention_gpu_process_key_value_tile_warp[
                     true_rescale, state.softmax_denominator_true, true_weight
                 )
 
-                var v_row_ptr = _attention_shared_memory_row_pointer[dtype](
-                    value_shared, key_column
-                )
+                var v_base = key_column * MAX_HEAD_DIM
 
                 comptime if use_conditional_rescale:
                     var candidate_max = max(state.softmax_max_deferred, S_ij)
@@ -854,7 +871,7 @@ def _attention_gpu_process_key_value_tile_warp[
                         for d in range(ELEMENTS_PER_THREAD):
                             var idx = d_start + d
                             if idx < head_dim:
-                                var v_val = v_row_ptr[idx]
+                                var v_val = value_shared.ptr[v_base + idx]
                                 var out_val = output_row[idx]
                                 output_row[idx] = (
                                     rescale_factor
@@ -870,7 +887,7 @@ def _attention_gpu_process_key_value_tile_warp[
                         for d in range(ELEMENTS_PER_THREAD):
                             var idx = d_start + d
                             if idx < head_dim:
-                                var v_val = v_row_ptr[idx]
+                                var v_val = value_shared.ptr[v_base + idx]
                                 var out_val = output_row[idx]
                                 output_row[idx] = (
                                     out_val.cast[DType.float32]()
@@ -888,7 +905,7 @@ def _attention_gpu_process_key_value_tile_warp[
                     for d in range(ELEMENTS_PER_THREAD):
                         var idx = d_start + d
                         if idx < head_dim:
-                            var v_val = v_row_ptr[idx]
+                            var v_val = value_shared.ptr[v_base + idx]
                             var out_val = output_row[idx]
                             output_row[idx] = (
                                 rescale_factor * out_val.cast[DType.float32]()
@@ -905,10 +922,10 @@ def _attention_gpu_process_key_value_tile_warp[
             _attention_store_online_softmax_state_to_shared[
                 use_soft_exp, use_conditional_rescale
             ](
-                softmax_max_deferred_ptr,
-                softmax_max_true_ptr,
-                softmax_denominator_true_ptr,
-                output_rescale_factor_ptr,
+                softmax_max_deferred_shared,
+                softmax_max_true_shared,
+                softmax_denominator_true_shared,
+                output_rescale_factor_shared,
                 local_query_row,
                 state,
             )
@@ -931,10 +948,10 @@ def _attention_gpu_finalize_query_rows_warp[
     head_index: Int,
     output_ptr: MutKernelPtr[dtype],
     log_sum_exp_ptr: MutKernelPtr[DType.float32],
-    softmax_max_deferred_ptr: MutKernelPtr[DType.float32],
-    softmax_max_true_ptr: MutKernelPtr[DType.float32],
-    softmax_denominator_true_ptr: MutKernelPtr[DType.float32],
-    output_rescale_factor_ptr: MutKernelPtr[DType.float32],
+    softmax_max_deferred_shared: LayoutTensor,
+    softmax_max_true_shared: LayoutTensor,
+    softmax_denominator_true_shared: LayoutTensor,
+    output_rescale_factor_shared: LayoutTensor,
 ) -> None:
     comptime NUM_WARPS = BLOCK_SIZE // WARP_SIZE
     comptime ROWS_PER_WARP = Br // NUM_WARPS
@@ -952,10 +969,10 @@ def _attention_gpu_finalize_query_rows_warp[
         _attention_load_online_softmax_state_from_shared[
             use_soft_exp, use_conditional_rescale
         ](
-            softmax_max_deferred_ptr,
-            softmax_max_true_ptr,
-            softmax_denominator_true_ptr,
-            output_rescale_factor_ptr,
+            softmax_max_deferred_shared,
+            softmax_max_true_shared,
+            softmax_denominator_true_shared,
+            output_rescale_factor_shared,
             local_query_row,
             state,
         )
@@ -1062,24 +1079,9 @@ def _attention_gpu_forward_query_tile_block[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var softmax_max_deferred_ptr = rebind[MutKernelPtr[DType.float32]](
-        softmax_max_deferred_shared.ptr.address_space_cast[
-            AddressSpace.GENERIC
-        ]()
-    )
-    var softmax_max_true_ptr = rebind[MutKernelPtr[DType.float32]](
-        softmax_max_true_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
-    var softmax_denominator_true_ptr = rebind[MutKernelPtr[DType.float32]](
-        softmax_denominator_true_shared.ptr.address_space_cast[
-            AddressSpace.GENERIC
-        ]()
-    )
-    var output_rescale_factor_ptr = rebind[MutKernelPtr[DType.float32]](
-        output_rescale_factor_shared.ptr.address_space_cast[
-            AddressSpace.GENERIC
-        ]()
-    )
+    # Metal fix: pass the LayoutTensors directly to helper functions instead of
+    # casting to GENERIC pointers. The old pattern corrupted threadgroup pointers
+    # on Metal AIR; using .ptr[i] on the LayoutTensor preserves AddressSpace.SHARED.
 
     # Load this CTA's query tile once; it is reused across every KV tile.
     _attention_copy_rows_dram_to_shared[dtype, BLOCK_SIZE](
@@ -1097,10 +1099,10 @@ def _attention_gpu_forward_query_tile_block[
     _attention_init_online_softmax_state_shared[
         Br, BLOCK_SIZE, use_soft_exp, use_conditional_rescale
     ](
-        softmax_max_deferred_ptr,
-        softmax_max_true_ptr,
-        softmax_denominator_true_ptr,
-        output_rescale_factor_ptr,
+        softmax_max_deferred_shared,
+        softmax_max_true_shared,
+        softmax_denominator_true_shared,
+        output_rescale_factor_shared,
         query_tile_start,
         query_tile_rows,
         seq_len,
@@ -1137,10 +1139,10 @@ def _attention_gpu_forward_query_tile_block[
             query_shared,
             key_shared,
             value_shared,
-            softmax_max_deferred_ptr,
-            softmax_max_true_ptr,
-            softmax_denominator_true_ptr,
-            output_rescale_factor_ptr,
+            softmax_max_deferred_shared,
+            softmax_max_true_shared,
+            softmax_denominator_true_shared,
+            output_rescale_factor_shared,
             reduction_shared,
         )
         barrier()
@@ -1156,10 +1158,10 @@ def _attention_gpu_forward_query_tile_block[
         head_index,
         output_ptr,
         log_sum_exp_ptr,
-        softmax_max_deferred_ptr,
-        softmax_max_true_ptr,
-        softmax_denominator_true_ptr,
-        output_rescale_factor_ptr,
+        softmax_max_deferred_shared,
+        softmax_max_true_shared,
+        softmax_denominator_true_shared,
+        output_rescale_factor_shared,
     )
 
 
@@ -1395,9 +1397,9 @@ def _attention_flash_fwd_gpu[
         DType.float32, dtype, Index(16, 8, 16), transpose_b=True
     ]()
     comptime NWARPS = BR // 16
-    comptime NTHREADS = NWARPS * 32
+    comptime NTHREADS = NWARPS * WARP_SIZE
     var t = Int(thread_idx.x)
-    var warp_id = t // 32  # each warp owns rows [warp_id*16, +16]
+    var warp_id = t // WARP_SIZE  # each warp owns rows [warp_id*16, +16]
 
     for tile in range(Int(block_idx.x), num_tiles, Int(grid_dim.x)):
         var bh = tile // num_query_tiles
@@ -2133,12 +2135,9 @@ def _attention_copy_tile[
     row_count: Int,
     head_dim: Int,
 ) -> None:
-    var dest_ptr = rebind[MutKernelPtr[dtype]](
-        dest.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
-    var src_ptr = rebind[ImmutKernelPtr[dtype]](
-        src.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
+    # Metal fix: rebind dest.ptr to the correct MutAnyOrigin+address_space so
+    # writes go to the right memory space. address_space_cast[GENERIC] corrupted
+    # threadgroup writes on Metal AIR. src is read-only; no rebind needed.
     var thread_id = Int(thread_idx.x)
     var element_count = row_count * head_dim
     var element_index = thread_id
@@ -2146,13 +2145,23 @@ def _attention_copy_tile[
         var local_row = element_index // head_dim
         var column = element_index % head_dim
         comptime if is_dram_to_shared:
-            dest_ptr[local_row * MAX_HEAD_DIM + column] = src_ptr[
+            var dest_ptr = rebind[
+                UnsafePointer[
+                    Scalar[dtype],
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                ]
+            ](dest.ptr)
+            dest_ptr[local_row * MAX_HEAD_DIM + column] = src.ptr[
                 local_row * head_dim + column
-            ]
+            ].cast[dtype]()
         else:
-            dest_ptr[local_row * head_dim + column] = src_ptr[
+            var dest_ptr = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+                dest.ptr
+            )
+            dest_ptr[local_row * head_dim + column] = src.ptr[
                 local_row * MAX_HEAD_DIM + column
-            ]
+            ].cast[dtype]()
         element_index += BLOCK_SIZE
 
 
@@ -2259,12 +2268,7 @@ def _attention_gpu_bwd_dq_tile_block[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var lse_shared_ptr = rebind[MutKernelPtr[DType.float32]](
-        lse_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
-    var D_shared_ptr = rebind[MutKernelPtr[DType.float32]](
-        D_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
+    # Metal fix: use lse_shared.ptr / D_shared.ptr directly (no GENERIC cast).
 
     # Load Q, dO, O tiles into SRAM once and reuse across every KV inner tile.
     _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, True](
@@ -2279,21 +2283,25 @@ def _attention_gpu_bwd_dq_tile_block[
 
     var thread_id = Int(thread_idx.x)
     if thread_id < query_tile_rows:
-        lse_shared_ptr[thread_id] = lse_head[query_tile_start + thread_id]
+        lse_shared.ptr[thread_id] = lse_head[query_tile_start + thread_id]
         for d in range(head_dim):
             dq_shared[thread_id, d] = Scalar[dtype](0.0)
     barrier()
 
-    # Compute row dot products D_i
+    # Compute row dot products D_i = dO_i · O_i (inline — Metal fix: use
+    # shared .ptr directly to preserve AddressSpace.SHARED on Metal AIR).
     if thread_id < query_tile_rows:
-        D_shared_ptr[thread_id] = _attention_query_key_dot_product[
-            dtype, width
-        ](
-            _attention_shared_memory_row_pointer[dtype](do_shared, thread_id),
-            _attention_shared_memory_row_pointer[dtype](o_shared, thread_id),
-            head_dim,
-            Scalar[DType.float32](1.0),
-        )
+        var d_val: Scalar[DType.float32] = 0.0
+        for d in range(head_dim):
+            d_val += (
+                do_shared.ptr[thread_id * MAX_HEAD_DIM + d].cast[
+                    DType.float32
+                ]()
+                * o_shared.ptr[thread_id * MAX_HEAD_DIM + d].cast[
+                    DType.float32
+                ]()
+            )
+        D_shared.ptr[thread_id] = d_val
     barrier()
 
     var local_row = thread_id % Br
@@ -2343,41 +2351,43 @@ def _attention_gpu_bwd_dq_tile_block[
 
         if local_row < query_tile_rows:
             var global_i = query_tile_start + local_row
-            var q_row = _attention_shared_memory_row_pointer[dtype](
-                q_shared, local_row
-            )
-            var do_row = _attention_shared_memory_row_pointer[dtype](
-                do_shared, local_row
-            )
-            var L_i = lse_shared_ptr[local_row]
-            var D_i = D_shared_ptr[local_row]
+            var q_base = local_row * MAX_HEAD_DIM
+            var L_i = lse_shared.ptr[local_row]
+            var D_i = D_shared.ptr[local_row]
 
             for j in range(thread_row_index, key_tile_rows, 4):
                 var global_j = key_tile_start + j
                 if global_j > global_i:
                     continue
 
-                var k_row = _attention_shared_memory_row_pointer[dtype](
-                    key_shared, j
-                )
-                var v_row = _attention_shared_memory_row_pointer[dtype](
-                    val_shared, j
-                )
+                var k_base = j * MAX_HEAD_DIM
 
-                var S_ij = _attention_query_key_dot_product[dtype, width](
-                    q_row, k_row, head_dim, attention_scale
-                )
+                # Metal fix: inline dot products via shared .ptr to preserve
+                # AddressSpace.SHARED — _attention_query_key_dot_product takes
+                # ImmutKernelPtr (GENERIC) which reads device memory on Metal.
+                var S_ij: Scalar[DType.float32] = 0.0
+                for d in range(head_dim):
+                    S_ij += (
+                        q_shared.ptr[q_base + d].cast[DType.float32]()
+                        * key_shared.ptr[k_base + d].cast[DType.float32]()
+                    )
+                S_ij *= attention_scale
                 var P_ij = software_emulated_exp[use_soft_exp](S_ij - L_i)
-                var dP_ij = _attention_query_key_dot_product[dtype, width](
-                    do_row, v_row, head_dim, Scalar[DType.float32](1.0)
-                )
+                var dP_ij: Scalar[DType.float32] = 0.0
+                for d in range(head_dim):
+                    dP_ij += (
+                        do_shared.ptr[q_base + d].cast[DType.float32]()
+                        * val_shared.ptr[k_base + d].cast[DType.float32]()
+                    )
                 var dS_ij = P_ij * (dP_ij - D_i)
 
                 var factor = attention_scale * dS_ij
                 var d = 0
                 while d + width <= head_dim:
                     var k_vec = (
-                        (k_row + d).load[width=width]().cast[DType.float32]()
+                        (key_shared.ptr + k_base + d)
+                        .load[width=width]()
+                        .cast[DType.float32]()
                     )
                     var dq_vec = (private_dq + d).load[width=width]()
                     (private_dq + d).store[width=width](
@@ -2386,7 +2396,8 @@ def _attention_gpu_bwd_dq_tile_block[
                     d += width
                 for tail in range(d, head_dim):
                     private_dq[tail] += (
-                        factor * k_row[tail].cast[DType.float32]()
+                        factor
+                        * key_shared.ptr[k_base + tail].cast[DType.float32]()
                     )
 
         for col_base in range(0, head_dim, 8):
@@ -2581,12 +2592,7 @@ def _attention_gpu_bwd_dkv_tile_block[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var lse_shared_ptr = rebind[MutKernelPtr[DType.float32]](
-        lse_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
-    var D_shared_ptr = rebind[MutKernelPtr[DType.float32]](
-        D_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
+    # Metal fix: use lse_shared.ptr / D_shared.ptr directly (no GENERIC cast).
 
     # Load K, V tiles into SRAM once; reused across every query inner tile.
     _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, True](
@@ -2645,23 +2651,22 @@ def _attention_gpu_bwd_dkv_tile_block[
         )
 
         if thread_id < query_tile_rows:
-            lse_shared_ptr[thread_id] = lse_head[query_tile_start + thread_id]
+            lse_shared.ptr[thread_id] = lse_head[query_tile_start + thread_id]
         barrier()
 
-        # Compute row dot products D_i
+        # Compute D_i = dO_i · O_i (inline — Metal fix: use shared .ptr directly).
         if thread_id < query_tile_rows:
-            D_shared_ptr[thread_id] = _attention_query_key_dot_product[
-                dtype, width
-            ](
-                _attention_shared_memory_row_pointer[dtype](
-                    do_shared, thread_id
-                ),
-                _attention_shared_memory_row_pointer[dtype](
-                    o_shared, thread_id
-                ),
-                head_dim,
-                Scalar[DType.float32](1.0),
-            )
+            var d_val: Scalar[DType.float32] = 0.0
+            for d in range(head_dim):
+                d_val += (
+                    do_shared.ptr[thread_id * MAX_HEAD_DIM + d].cast[
+                        DType.float32
+                    ]()
+                    * o_shared.ptr[thread_id * MAX_HEAD_DIM + d].cast[
+                        DType.float32
+                    ]()
+                )
+            D_shared.ptr[thread_id] = d_val
         barrier()
 
         # Per-thread dK/dV partials in local memory, same rationale as dQ pass.
@@ -2685,41 +2690,44 @@ def _attention_gpu_bwd_dkv_tile_block[
 
         if local_col < key_tile_rows:
             var global_j = key_tile_start + local_col
-            var k_row = _attention_shared_memory_row_pointer[dtype](
-                key_shared, local_col
-            )
-            var v_row = _attention_shared_memory_row_pointer[dtype](
-                val_shared, local_col
-            )
+            var k_base = local_col * MAX_HEAD_DIM
 
             for i in range(thread_col_index, query_tile_rows, 4):
                 var global_i = query_tile_start + i
                 if global_j > global_i:
                     continue
 
-                var q_row = _attention_shared_memory_row_pointer[dtype](
-                    q_shared, i
-                )
-                var do_row = _attention_shared_memory_row_pointer[dtype](
-                    do_shared, i
-                )
-                var L_i = lse_shared_ptr[i]
-                var D_i = D_shared_ptr[i]
+                var q_base = i * MAX_HEAD_DIM
+                var L_i = lse_shared.ptr[i]
+                var D_i = D_shared.ptr[i]
 
-                var S_ij = _attention_query_key_dot_product[dtype, width](
-                    q_row, k_row, head_dim, attention_scale
-                )
+                # Metal fix: inline dot products via shared .ptr to preserve
+                # AddressSpace.SHARED — _attention_query_key_dot_product takes
+                # ImmutKernelPtr (GENERIC) which reads device memory on Metal.
+                var S_ij: Scalar[DType.float32] = 0.0
+                for d in range(head_dim):
+                    S_ij += (
+                        q_shared.ptr[q_base + d].cast[DType.float32]()
+                        * key_shared.ptr[k_base + d].cast[DType.float32]()
+                    )
+                S_ij *= attention_scale
                 var P_ij = software_emulated_exp[use_soft_exp](S_ij - L_i)
-                var dP_ij = _attention_query_key_dot_product[dtype, width](
-                    do_row, v_row, head_dim, Scalar[DType.float32](1.0)
-                )
+                var dP_ij: Scalar[DType.float32] = 0.0
+                for d in range(head_dim):
+                    dP_ij += (
+                        do_shared.ptr[q_base + d].cast[DType.float32]()
+                        * val_shared.ptr[k_base + d].cast[DType.float32]()
+                    )
                 var dS_ij = P_ij * (dP_ij - D_i)
 
                 var dk_factor = attention_scale * dS_ij
+                var dv_factor = P_ij
                 var d = 0
                 while d + width <= head_dim:
                     var q_vec = (
-                        (q_row + d).load[width=width]().cast[DType.float32]()
+                        (q_shared.ptr + q_base + d)
+                        .load[width=width]()
+                        .cast[DType.float32]()
                     )
                     var dk_vec = (private_dk + d).load[width=width]()
                     (private_dk + d).store[width=width](
@@ -2727,17 +2735,10 @@ def _attention_gpu_bwd_dkv_tile_block[
                             SIMD[DType.float32, width](dk_factor), q_vec, dk_vec
                         )
                     )
-                    d += width
-                for tail in range(d, head_dim):
-                    private_dk[tail] += (
-                        dk_factor * q_row[tail].cast[DType.float32]()
-                    )
-
-                var dv_factor = P_ij
-                d = 0
-                while d + width <= head_dim:
                     var do_vec = (
-                        (do_row + d).load[width=width]().cast[DType.float32]()
+                        (do_shared.ptr + q_base + d)
+                        .load[width=width]()
+                        .cast[DType.float32]()
                     )
                     var dv_vec = (private_dv + d).load[width=width]()
                     (private_dv + d).store[width=width](
@@ -2749,8 +2750,13 @@ def _attention_gpu_bwd_dkv_tile_block[
                     )
                     d += width
                 for tail in range(d, head_dim):
+                    private_dk[tail] += (
+                        dk_factor
+                        * q_shared.ptr[q_base + tail].cast[DType.float32]()
+                    )
                     private_dv[tail] += (
-                        dv_factor * do_row[tail].cast[DType.float32]()
+                        dv_factor
+                        * do_shared.ptr[q_base + tail].cast[DType.float32]()
                     )
 
         for col_base in range(0, head_dim, 8):
@@ -3183,15 +3189,13 @@ def _attention_transpose_planes_gpu[
     # scatter stores that previously dominated the backward.
     comptime TILE = TRANSPOSE_TILE
     comptime STRIDE = TILE + 1  # pad to avoid shared-memory bank conflicts
+    # Metal fix: use tile.ptr[i] directly to preserve AddressSpace.SHARED.
     var tile = LayoutTensor[
         dtype,
         Layout.row_major(TILE, STRIDE),
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var tile_raw = rebind[MutKernelPtr[dtype]](
-        tile.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
 
     var plane = seq_len * seq_len
     var tiles = ceildiv(seq_len, TILE)
@@ -3215,7 +3219,7 @@ def _attention_transpose_planes_gpu[
             var gr = tile_row + r
             var gc = tile_col + tx
             if gr < seq_len and gc < seq_len:
-                tile_raw[r * STRIDE + tx] = src_ptr[base + gr * seq_len + gc]
+                tile.ptr[r * STRIDE + tx] = src_ptr[base + gr * seq_len + gc]
             r += ROW_STEP
         barrier()
 
@@ -3224,7 +3228,7 @@ def _attention_transpose_planes_gpu[
             var gr = tile_col + r
             var gc = tile_row + tx
             if gr < seq_len and gc < seq_len:
-                dst_ptr[base + gr * seq_len + gc] = tile_raw[tx * STRIDE + r]
+                dst_ptr[base + gr * seq_len + gc] = tile.ptr[tx * STRIDE + r]
             r += ROW_STEP
         barrier()
 
@@ -3247,15 +3251,13 @@ def _attention_transpose_rect_gpu[
     # transposing the big [T,T] dS/P matrices.
     comptime TILE = TRANSPOSE_TILE
     comptime STRIDE = TILE + 1
+    # Metal fix: use tile.ptr[i] directly to preserve AddressSpace.SHARED.
     var tile = LayoutTensor[
         dtype,
         Layout.row_major(TILE, STRIDE),
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var tile_raw = rebind[MutKernelPtr[dtype]](
-        tile.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
 
     var src_plane = rows * cols
     var dst_plane = cols * rows
@@ -3282,7 +3284,7 @@ def _attention_transpose_rect_gpu[
             var gr = tile_row + r
             var gc = tile_col + tx
             if gr < rows and gc < cols:
-                tile_raw[r * STRIDE + tx] = src_ptr[src_base + gr * cols + gc]
+                tile.ptr[r * STRIDE + tx] = src_ptr[src_base + gr * cols + gc]
             r += ROW_STEP
         barrier()
 
@@ -3292,7 +3294,7 @@ def _attention_transpose_rect_gpu[
             var gr = tile_col + r
             var gc = tile_row + tx
             if gr < cols and gc < rows:
-                dst_ptr[dst_base + gr * rows + gc] = tile_raw[tx * STRIDE + r]
+                dst_ptr[dst_base + gr * rows + gc] = tile.ptr[tx * STRIDE + r]
             r += ROW_STEP
         barrier()
 
@@ -3895,8 +3897,22 @@ def attention_bwd[
             return
         comptime simd_width = simd_width_of[dtype]()
         comptime is_float32 = dtype == DType.float32
-        comptime Br = 32
-        comptime Bc = 16 if is_float32 else 32
+        # Apple Metal shared-memory hard limit: 32768 bytes/threadgroup.
+        # This portable (non-GEMM) backward path only runs when
+        # USE_GEMM_ATTENTION = HAS_CUBLAS = False — i.e. on Metal/non-Nvidia
+        # hardware. The tile-size choices below are therefore provably dead on
+        # Nvidia, where the early `return` above (USE_GEMM_ATTENTION path) is
+        # taken instead.
+        #
+        # Shared-memory budgets (sizeof = bytes per element):
+        #   dQ kernel:  (4·Br + 2·Bc)·128·sizeof + 2·Br·4 + Br·128·4  bytes
+        #   dKV kernel: (4·Bc + 3·Br)·128·sizeof + 2·Br·4 + 2·Bc·128·4 bytes
+        #
+        # With the values below:
+        #   float32  (sizeof=4): Br=8,  Bc=8  → dQ=25 664,  dKV=30 784 bytes ✓
+        #   bfloat16 (sizeof=2): Br=16, Bc=8  → dQ=22 656,  dKV=22 656 bytes ✓
+        comptime Br = 8 if is_float32 else 16
+        comptime Bc = 8
         comptime BLOCK_SIZE_DQ = Br * 4
         comptime BLOCK_SIZE_DKV = Bc * 4
         comptime SM_OVERPROVISION = 32

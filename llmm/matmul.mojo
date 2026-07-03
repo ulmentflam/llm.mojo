@@ -49,7 +49,7 @@ from linalg.matmul.vendor.blas import _get_global_handle, Backend
 from llmm.gelu import gelu, gelu_grad, gelu_fwd_gpu
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
-from llmm.vendor import HAS_CUBLAS
+from llmm.vendor import HAS_CUBLAS, HAS_METAL
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1182,7 +1182,26 @@ def matmul_d_input_bwd[
                     ctx,
                 )
         else:
-            _portable_matmul_d_input()
+            comptime if HAS_METAL:
+                # Apple Metal path: linalg.matmul's elementwise_lambda_fn epilogue
+                # produces wrong results on Metal (same bug class as the forward
+                # bias epilogue — see probe_matmul_bias.mojo / probe_matmul_bwd.mojo).
+                # Fix: plain GEMM into d_input, then a standalone gelu-grad scaling
+                # kernel. Mirrors the USE_GELU_FUSION=False cuBLAS path above.
+                ctx.synchronize()
+                matmul[transpose_b=False, target=target](
+                    c_d_input, a_d_output, b_weight, ctx=ctx
+                )
+                comptime if use_gelu:
+                    _launch_matmul_gelu_backward_scaling_gpu[dtype](
+                        d_input_ptr,
+                        pre_gelu_ptr,
+                        rows * in_channels,
+                        ctx,
+                    )
+                ctx.synchronize()
+            else:
+                _portable_matmul_d_input()
     else:
         _portable_matmul_d_input()
 
@@ -1218,6 +1237,40 @@ def _add_into[
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
     traced_parallelize["matmul_d_input_bwd", _worker](num_workers)
+
+
+def _gpu_transpose_kernel[
+    dtype: DType
+](
+    dst: MutKernelPtr[dtype],
+    src: ImmutKernelPtr[dtype],
+    rows: Int,
+    cols: Int,
+) -> None:
+    """Transpose src[rows, cols] (row-major) into dst[cols, rows] (row-major).
+    Used on Apple Metal to materialise d_outputᵀ[OC, rows] into the scratch
+    buffer so `linalg.matmul.matmul(transpose_b=False)` can compute
+    d_weight[OC, C] = scratch[OC, rows] @ input[rows, C].
+    1-D grid: thread i handles element (i/cols, i%cols)."""
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if idx < rows * cols:
+        var r = idx / cols
+        var c = idx % cols
+        dst[c * rows + r] = src[idx]  # src[idx] == src[r*cols + c]
+
+
+def _gpu_add_into_kernel[
+    dtype: DType
+](dst: MutKernelPtr[dtype], src: MutKernelPtr[dtype], total: Int,) -> None:
+    """Elementwise dst[i] += src[i] with fp32 accumulation.
+    Used on Apple Metal to fold a freshly-computed d_weight GEMM result into
+    the running gradient accumulator (beta=1 path, avoiding the epilogue-
+    reads-overwritten-C double-count that the CPU branch guards against)."""
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if idx < total:
+        dst[idx] = (
+            dst[idx].cast[DType.float32]() + src[idx].cast[DType.float32]()
+        ).cast[dtype]()
 
 
 def matmul_d_weight_bwd[
@@ -1281,27 +1334,104 @@ def matmul_d_weight_bwd[
                 ctx,
             )
         else:
-            # Vendor-neutral GPU fallback: MAX's vendor BLAS wrapper
-            # (linalg.matmul.vendor.blas), which auto-resolves to
-            # ROCBLAS/HIPBLASLT on AMD (has_amd_gpu_accelerator()) and
-            # natively supports transpose_a + a beta-accumulate, unlike
-            # `linalg.matmul.matmul` (rejects transpose_a — see the CPU
-            # branch's comment above) — so d_weight = d_outputᵀ @ input is a
-            # single GEMM call here, no separate transpose/add kernel needed.
-            # (The CPU else-branch below can't be reused as-is for GPU: its
-            # accumulate path's `_add_into` is a host-thread loop that
-            # dereferences dst/src pointers directly, which would segfault on
-            # device memory.)
-            blas.matmul(
-                ctx,
-                c_d_weight,
-                a_d_output,
-                b_input,
-                c_row_major=True,  # our TileTensors are row-major storage
-                transpose_a=True,
-                transpose_b=False,
-                beta=Float32(1.0) if accumulate else Float32(0.0),
-            )
+            comptime if HAS_METAL:
+                # Apple Metal path: linalg.matmul rejects transpose_a, so
+                # we materialise d_outputᵀ[OC, rows] into the scratch buffer
+                # via _gpu_transpose_kernel, then compute
+                #   d_weight[OC, C] = scratch[OC, rows] @ input[rows, C]
+                # with the portable MAX GEMM (transpose_b=False).
+                # For accumulate=True we write the GEMM into a temp device
+                # buffer and add with _gpu_add_into_kernel — mirroring the
+                # CPU branch's strategy (avoid the epilogue-reads-overwritten-
+                # C double-count bug; see CPU branch comment above).
+                # AMD stays on blas.matmul (rocBLAS/hipBLASLt supports transA
+                # natively — no transpose pre-step or add kernel needed there).
+                comptime _TRANS_BLOCK = 256
+                var t_total = rows * out_channels
+                # Use a local device buffer for the transpose — never scratch_ptr.
+                # On GPU builds the caller may pass a zero-sized scratch (e.g.
+                # grad_acts.logits / grad_acts.fch with those tensors sized 0 on
+                # GPU; see allocate_activations). Writing to them would overflow.
+                var transpose_buf = ctx.enqueue_create_buffer[dtype](t_total)
+                var transpose_ptr = rebind[MutKernelPtr[dtype]](
+                    transpose_buf.unsafe_ptr()
+                )
+                comptime t_k = _gpu_transpose_kernel[dtype]
+                var t_c = ctx.compile_function[t_k]()
+                ctx.enqueue_function(
+                    t_c,
+                    transpose_ptr,
+                    d_output_ptr,
+                    rows,
+                    out_channels,
+                    grid_dim=(ceildiv(t_total, _TRANS_BLOCK),),
+                    block_dim=(_TRANS_BLOCK,),
+                )
+                # transpose_ptr now holds d_outputᵀ [OC, rows] row-major.
+                var scratch_t_gpu = TileTensor(
+                    Span[Scalar[dtype], MutAnyOrigin](
+                        ptr=transpose_ptr, length=out_channels * rows
+                    ),
+                    row_major(out_channels, rows),
+                )
+                comptime if accumulate:
+                    # Materialise GEMM into a temp device buffer, then GPU-add
+                    # into d_weight. This avoids the epilogue-reads-overwritten-
+                    # C double-count (linalg.matmul writes to d_weight_ptr first,
+                    # so any += epilogue there would read the new result, not the
+                    # old accumulated value). Same fix as the CPU branch above.
+                    var temp_buf = ctx.enqueue_create_buffer[dtype](
+                        out_channels * in_channels
+                    )
+                    var temp_ptr = rebind[MutKernelPtr[dtype]](
+                        temp_buf.unsafe_ptr()
+                    )
+                    var c_temp = TileTensor(
+                        Span[Scalar[dtype], MutAnyOrigin](
+                            ptr=temp_ptr, length=out_channels * in_channels
+                        ),
+                        row_major(out_channels, in_channels),
+                    )
+                    ctx.synchronize()
+                    matmul[transpose_b=False, target=target](
+                        c_temp, scratch_t_gpu, b_input, ctx=ctx
+                    )
+                    ctx.synchronize()
+                    comptime _ADD_BLOCK = 256
+                    var a_total = out_channels * in_channels
+                    comptime add_k = _gpu_add_into_kernel[dtype]
+                    var add_c = ctx.compile_function[add_k]()
+                    ctx.enqueue_function(
+                        add_c,
+                        d_weight_ptr,
+                        temp_ptr,
+                        a_total,
+                        grid_dim=(ceildiv(a_total, _ADD_BLOCK),),
+                        block_dim=(_ADD_BLOCK,),
+                    )
+                    ctx.synchronize()
+                    # temp_buf destructor runs here; GPU is already done (synced).
+                else:
+                    ctx.synchronize()
+                    matmul[transpose_b=False, target=target](
+                        c_d_weight, scratch_t_gpu, b_input, ctx=ctx
+                    )
+                    ctx.synchronize()
+            else:
+                # AMD / other vendor-BLAS GPU: blas.matmul resolves to
+                # rocBLAS/hipBLASLt which supports transpose_a natively and
+                # folds beta-accumulation in a single GEMM call — no separate
+                # transpose or add kernel needed. Behaviour unchanged.
+                blas.matmul(
+                    ctx,
+                    c_d_weight,
+                    a_d_output,
+                    b_input,
+                    c_row_major=True,  # our TileTensors are row-major storage
+                    transpose_a=True,
+                    transpose_b=False,
+                    beta=Float32(1.0) if accumulate else Float32(0.0),
+                )
     else:
         ctx.synchronize()
         var scratch_t = TileTensor(

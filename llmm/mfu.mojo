@@ -1,9 +1,10 @@
 """Model FLOPs Utilization (MFU) estimation, ported from llm.c's `llmc/mfu.h`.
 
 We estimate the GPU's promised peak TFLOPs by looking the device up in a small
-hand-maintained database of NVIDIA cards (keyed by the exact name reported by the
-driver), scaled from a per-architecture tensor-core archetype by the card's core
-count and clock. MFU is then achieved-FLOPs / promised-FLOPs for the step.
+hand-maintained database (NVIDIA cards keyed by exact driver name; Apple Silicon
+keyed by substring of Metal MTLDevice.name), scaled from a per-architecture
+tensor-core archetype by the card's core count and clock. MFU is then
+achieved-FLOPs / promised-FLOPs for the step.
 
 Devices not in the table (or running on CPU) return -1 => "unknown", exactly as
 llm.c does; add an entry below for a new card.
@@ -113,6 +114,62 @@ def _ada(name: String, nc: Float32, mhz: Float32) -> GPUEntry:
     return GPUEntry(name, ADA_TF32, ADA_BF16, ADA_CORES, ADA_CLOCK, nc, mhz)
 
 
+# ===----------------------------------------------------------------------=== #
+# Apple Silicon GPU helpers
+#
+# Apple GPUs have no dedicated tensor cores; all numeric precisions (fp32,
+# fp16, bf16) share the same ALU throughput.  We therefore set tf32 == bf16_32
+# to the measured fp32 peak so that both the fp32 and bf16 builds get the same
+# denominator — which is conservative (slightly understates bf16 MFU) but
+# correct absent published contrary data.
+#
+# M5 added Neural Accelerators that support mma-style FP16 ops via Metal 4,
+# but those are NOT used by this codebase's compute kernels, so we keep the
+# same parity assumption for M5.
+#
+# Peak values: Apple does not publish official TFLOPS figures. Values below
+# are measured shader FP32 throughput reported by independent benchmarks:
+#   Notebookcheck GPU database: https://www.notebookcheck.net/
+#   Nanoreview GPU benchmarks:  https://nanoreview.net/en/gpu/
+#   cpu-monkey GPU specs:       https://www.cpu-monkey.com/en/
+#   flopper.io GPU specs:       https://flopper.io/gpu/
+#   check-mac.com FP32 list:    https://www.check-mac.com/en/benchmark-fp32-3
+#
+# Derivation formula (for cross-checking):
+#   peak_fp32 = gpu_cores × 128 ALUs/core × 2 FLOP/cycle × clock_GHz
+# e.g. M4 Max 40-core at ~1.58 GHz → 40×128×2×1.58e9 ≈ 16.2 TFLOPS.
+# Theoretical boost-clock estimates (≈1.8 GHz) give ~18.4 TFLOPS; measured
+# sustained values from benchmark sites converge around 16.2 TFLOPS, which
+# is the figure used here.
+#
+# Where a chip ships in two GPU-core counts (e.g. M4 Max 32- or 40-core) the
+# Metal MTLDevice.name string is identical ("Apple M4 Max") for both variants.
+# We use the higher-core-count TFLOPS as the peak, which understates MFU for
+# the lower-core variant by a proportional amount — acceptable for a training
+# throughput indicator.
+#
+# Name matching: entries whose name starts with "Apple " use substring matching
+# in get_flops_promised (Pass 2).  Entries are ordered Ultra → Max → Pro →
+# base within each generation so that a more-specific entry always wins before
+# a shorter prefix like "Apple M4" could match "Apple M4 Max".
+# ===----------------------------------------------------------------------=== #
+
+
+def _apple(name: String, fp32_tflops: Float32) -> GPUEntry:
+    """Apple Silicon GPU entry with a directly-known FP32 peak TFLOPS.
+    Identity scaling (cores == new_cores, clock == new_mhz) means the tf32 /
+    bf16_32 values are used as-is.  fp32 == bf16 (no tensor cores)."""
+    return GPUEntry(
+        name,
+        fp32_tflops,
+        fp32_tflops,
+        Float32(1.0),
+        Float32(1.0),
+        Float32(1.0),
+        Float32(1.0),
+    )
+
+
 def _gpu_db() -> List[GPUEntry]:
     """The NVIDIA card database, keyed by exact driver name (matches llm.c)."""
     var db = List[GPUEntry]()
@@ -156,16 +213,85 @@ def _gpu_db() -> List[GPUEntry]:
     # Identity scaling (cores == new_cores, clock == new_mhz): use the GB10 peaks
     # directly. The driver reports this device as "NVIDIA GB10".
     db.append(GPUEntry("NVIDIA GB10", GB10_TF32, GB10_BF16, 1.0, 1.0, 1.0, 1.0))
+
+    # ===--- Apple Silicon GPU entries (substring-matched in Pass 2) ---===
+    # Ordered Ultra → Max → Pro → base so that the most-specific name is
+    # found before any shorter prefix (e.g. "Apple M4" must not match
+    # "Apple M4 Max" before "Apple M4 Max" is checked).
+    #
+    # M-Ultra: two Max dies fused via die-to-die interconnect.
+    # Sources: cpu-monkey / notebookcheck / nanoreview; ≈ 2× the Max 38/40-core values.
+    db.append(_apple("Apple M1 Ultra", Float32(21.0)))  # 64 GPU cores (2×32)
+    db.append(_apple("Apple M2 Ultra", Float32(27.2)))  # 76 GPU cores (2×38)
+    db.append(_apple("Apple M3 Ultra", Float32(28.4)))  # 80 GPU cores (2×40)
+    # M-Max
+    db.append(
+        _apple("Apple M1 Max", Float32(10.4))
+    )  # 32 GPU cores; 24-core ≈ 7.8 T
+    db.append(
+        _apple("Apple M2 Max", Float32(13.6))
+    )  # 38 GPU cores; 30-core ≈ 10.7 T
+    db.append(
+        _apple("Apple M3 Max", Float32(14.2))
+    )  # 40 GPU cores; 30-core ≈ 10.6 T
+    db.append(
+        _apple("Apple M4 Max", Float32(16.2))
+    )  # 40 GPU cores; 32-core ≈ 14.75 T
+    db.append(
+        _apple("Apple M5 Max", Float32(16.59))
+    )  # 40 GPU cores (flopper.io)
+    # M-Pro
+    db.append(
+        _apple("Apple M1 Pro", Float32(5.2))
+    )  # 16 GPU cores; 14-core ≈ 4.5 T
+    db.append(
+        _apple("Apple M2 Pro", Float32(6.8))
+    )  # 19 GPU cores; 16-core ≈ 5.7 T
+    db.append(
+        _apple("Apple M3 Pro", Float32(7.4))
+    )  # 18 GPU cores; 14-core ≈ 5.8 T
+    db.append(
+        _apple("Apple M4 Pro", Float32(9.2))
+    )  # 20 GPU cores (check-mac.com)
+    # M-base
+    db.append(_apple("Apple M1", Float32(2.6)))  # 8 GPU cores; 7-core ≈ 1.8 T
+    db.append(_apple("Apple M2", Float32(3.6)))  # 10 GPU cores; 8-core ≈ 2.9 T
+    db.append(_apple("Apple M3", Float32(3.5)))  # 10 GPU cores (cpu-monkey)
+    db.append(_apple("Apple M4", Float32(4.26)))  # 10 GPU cores (cpu-monkey)
+    db.append(_apple("Apple M5", Float32(4.15)))  # 10 GPU cores (flopper.io)
     return db^
 
 
 def get_flops_promised(device: String, use_bf16: Bool) -> Float32:
     """Promised peak TFLOPs (units of 1e12) for `device` at the given precision,
     or -1 if the device is unknown / lacks data for the precision. The bf16 build
-    uses the bf16-with-fp32-accumulate column; the fp32 build uses TF32."""
+    uses the bf16-with-fp32-accumulate column; the fp32 build uses TF32.
+
+    Two lookup passes:
+      Pass 1 — exact match: used for NVIDIA cards whose driver names are stable
+               and fully known (matches llm.c behaviour).
+      Pass 2 — substring match for Apple Silicon: Metal MTLDevice.name returns
+               e.g. "Apple M4 Max" and our table key IS that string, but we use
+               find() rather than == so a future driver suffix (e.g. "Apple M4
+               Max GPU") still hits the right entry.  Entries are ordered
+               most-specific-first (Ultra > Max > Pro > base) in _gpu_db() so
+               the first substring hit is always the correct tier.
+    """
     var db = _gpu_db()
+    # Pass 1: exact match (NVIDIA and other fully-known names).
     for ref entry in db:
         if entry.name == device:
+            var value = entry.bf16_32 if use_bf16 else entry.tf32
+            if value < 0.0:
+                return Float32(-1.0)
+            return (
+                value
+                * (entry.new_cores / entry.cores)
+                * (entry.new_mhz / entry.clock_mhz)
+            )
+    # Pass 2: substring match for Apple Silicon.
+    for ref entry in db:
+        if entry.name.startswith("Apple ") and entry.name in device:
             var value = entry.bf16_32 if use_bf16 else entry.tf32
             if value < 0.0:
                 return Float32(-1.0)

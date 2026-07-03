@@ -10,22 +10,27 @@ on its own and so this runs anywhere.
 Configurations
   CPU  (fp32 throughout — llm.mojo CPU training is fp32 by policy):
     llm.mojo (fp32) | llm.c (OpenMP) | llm.c (1 thread) | PyTorch (fp32)
-  GPU:
+  GPU (NVIDIA, requires CUDA):
     llm.mojo (fp32) | llm.mojo (bf16) | llm.c CUDA (fp32) | llm.c CUDA (bf16)
     | PyTorch (fp32) | PyTorch (bf16)
+  Metal (Apple Silicon, fp32):
+    llm.mojo fp32 (Metal GPU via build/profile_gpt2 gpu) | PyTorch MPS fp32
+    NOTE: llm.c has no Metal port — the baseline is PyTorch on MPS, not llm.c.
 
 Device selection:
-  --device cpu   only the CPU figure (works on macOS / any box, no CUDA)
-  --device gpu   only the GPU figure (requires an NVIDIA GPU + the binaries)
-  --device auto  CPU always; GPU too iff an NVIDIA GPU is detected (default)
+  --device cpu    only the CPU figure (works on macOS / any box, no CUDA)
+  --device gpu    only the NVIDIA GPU figure (requires CUDA + the binaries)
+  --device metal  Apple Silicon Metal GPU figure (llm.mojo + PyTorch MPS)
+  --device auto   CPU always; on Apple Silicon: Metal; on NVIDIA: GPU (default)
 
 Prereqs (built by the Makefile): build/profile_gpt2 (llm.mojo fp32 harness),
-build/profile_gpt2_bf16 (llm.mojo bf16 harness), the llm.c binaries
-third_party/llm.c/{train_gpt2, train_gpt2cu, train_gpt2fp32cu}, and PyTorch in
-the pixi env. The llm.c inputs are staged into build/llmc/ with their magic
-numbers patched to the values llm.c expects (the byte layout is otherwise
-identical). The PyTorch reference is llm.c's train_gpt2.py run with random d12
-(=GPT-2 124M) weights, so it needs no network.
+build/profile_gpt2_bf16 (llm.mojo bf16 harness, GPU/CUDA mode only), the llm.c
+binaries third_party/llm.c/{train_gpt2, train_gpt2cu, train_gpt2fp32cu} (CPU/GPU
+modes only), and PyTorch in the pixi env. The llm.c inputs are staged into
+build/llmc/ with their magic numbers patched to the values llm.c expects (the
+byte layout is otherwise identical). The PyTorch reference is llm.c's train_gpt2.py
+run with random d12 (=GPT-2 124M) weights for CUDA mode, or the repo-local
+train_gpt2.py with --device mps for Metal mode.
 """
 
 import argparse
@@ -46,6 +51,9 @@ from matplotlib.patches import Patch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LLMC = os.path.join(ROOT, "third_party", "llm.c")
 TORCH_REF = os.path.join(LLMC, "train_gpt2.py")
+# Local train_gpt2.py (used for the PyTorch MPS reference in Metal mode — it
+# already has --device mps support with proper torch.mps.synchronize() timing).
+TORCH_TRAIN_PY = os.path.join(ROOT, "train_gpt2.py")
 STAGE = os.path.join(ROOT, "build", "llmc")
 DATA = os.path.join(ROOT, "data", ".tinyshakespeare")
 FIGURES = os.path.join(ROOT, "figures")
@@ -57,9 +65,15 @@ MOJO_BF16_BIN = os.path.join(ROOT, "build", "profile_gpt2_bf16")
 # directly comparable. Set from --batch-size / --seq-len in main(); every config
 # (Mojo harness env, llm.c CUDA -b/-t, PyTorch flags, and — via LLMC_B/LLMC_T —
 # the llm.c CPU reference) is fed the same pair. The defaults (B=4, T=64) match
-# what llm.c's CPU reference historically hardcoded.
+# what llm.c's CPU reference historically hardcoded. For Metal mode the default
+# is B=4, T=1024 (the real training config, ~6.5 s/step) but can be overridden
+# with --batch-size / --seq-len just like the other modes.
 B, T = 4, 64
 WARMUP = 5  # leading steps to drop (allocation / first-touch / clock spin-up)
+# Default step counts per mode. Metal fp32 at B=4 T=1024 is ~6.5 s/step, so a
+# small default (10 measured steps after warmup = ~70 s) is appropriate. Override
+# on the command line with --metal-steps N.
+DEFAULT_METAL_STEPS = 10
 
 # llm.c expects different magic numbers than llm.mojo writes; the byte layout is
 # otherwise the same, so we patch a copy. (model, tokenizer.)
@@ -84,6 +98,44 @@ def libpython():
     return ""
 
 
+def is_apple_silicon():
+    """True on macOS aarch64 (M1/M2/M3/M4 etc.)."""
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def apple_chip_name():
+    """Return the Apple chip name, e.g. 'Apple M4 Max'.
+
+    On Apple Silicon, ``machdep.cpu.brand_string`` is the most reliable sysctl
+    key — it returns the full chip name that the CPU information panel shows.
+    Falls back to system_profiler for completeness.
+    """
+    try:
+        out = subprocess.check_output(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        if out:
+            return out
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(
+            ["system_profiler", "SPHardwareDataType"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        for line in out.splitlines():
+            if "Chip:" in line:
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return platform.processor() or platform.machine()
+
+
 def _ordinal(day):
     # 1->1st, 2->2nd, 3->3rd, 4->4th ... 11/12/13 are always "th".
     if 11 <= day % 100 <= 13:
@@ -95,6 +147,14 @@ def _ordinal(day):
 
 def hardware_info():
     now = datetime.datetime.now()
+    # On Apple Silicon there is no NVIDIA GPU; we populate "gpu" with the Apple
+    # chip name so the filename slug and figure subtitle are self-describing
+    # (e.g. "Apple M4 Max" → slug "Apple-M4-Max") and have_gpu() stays False.
+    if is_apple_silicon():
+        gpu_field = apple_chip_name()
+    else:
+        gpu_field = gpu_name() or "none"
+
     info = {
         # `date` keeps the timestamp for unique output filenames; `date_display`
         # is the human date shown on the figure itself (e.g. "July 31st, 2026").
@@ -104,7 +164,7 @@ def hardware_info():
         "os": platform.platform(),
         "cpu": platform.processor() or platform.machine(),
         "cores": str(os.cpu_count()),
-        "gpu": gpu_name() or "none",
+        "gpu": gpu_field,
     }
     try:
         if sys.platform == "darwin":
@@ -301,6 +361,67 @@ def bench_torch(device, dtype, steps):
     return [float(x) for x in _TORCH_RE.findall(out)]
 
 
+def bench_torch_mps(steps):
+    """Benchmark our local train_gpt2.py on Apple MPS (Metal Performance Shaders).
+
+    Uses the repo-local train_gpt2.py (not llm.c's reference) because it already
+    has --device mps support with torch.mps.synchronize() for accurate timing.
+    The output format matches _TORCH_RE: '({ms:.2f} ms | {tok/s:.0f} tok/s)'.
+    """
+    if not os.path.exists(TORCH_TRAIN_PY):
+        print(
+            f"  (skip PyTorch MPS: {TORCH_TRAIN_PY} not found)",
+            flush=True,
+        )
+        return []
+    cmd = [
+        sys.executable,
+        TORCH_TRAIN_PY,
+        "--device",
+        "mps",
+        "--model",
+        "d12",  # random GPT-2 124M weights, no HF download
+        "--write_tensors",
+        "0",
+        "--num_iterations",
+        str(steps),
+        "--batch_size",
+        str(B),
+        "--sequence_length",
+        str(T),
+        # grad_accum = total_batch_size // (B*T) = 1 — one fwd+bwd+update/step.
+        "--total_batch_size",
+        str(B * T),
+        "--dtype",
+        "float32",
+        "--inference_only",
+        "0",
+        "--overfit_single_batch",
+        "1",
+        "--val_loss_every",
+        "0",
+        "--sample_every",
+        "0",
+        "--tensorcores",
+        "0",
+        "--compile",
+        "0",
+    ]
+    out = _run(cmd, cwd=ROOT, timeout=3600)
+    samples = [float(x) for x in _TORCH_RE.findall(out)]
+    if not samples:
+        # Surface the failure clearly so the Metal run still emits the Mojo half.
+        print(
+            "  WARNING: PyTorch MPS arm returned no timing samples.\n"
+            "  This may mean train_gpt2.py --device mps is not yet fully "
+            "implemented or MPS is unavailable.\n"
+            "  llm.mojo Metal timings will still be reported.\n"
+            "  Captured output (last 20 lines):\n" + "\n".join(out.splitlines()[-20:]),
+            flush=True,
+        )
+    return samples
+
+
 # --------------------------------------------------------------------------- #
 # Staging llm.c inputs (magic-patched copies + data symlinks) into build/llmc
 # --------------------------------------------------------------------------- #
@@ -412,7 +533,9 @@ def plot_bars(device, series, info, outpath):
         f"{info['date_display']}   |   {info['gpu']}   |   {info['cpu']}  "
         f"({info['cores']} cores)   |   {info['host']}"
     )
-    dev_label = "GPU" if device == "gpu" else "CPU"
+    dev_label = {"gpu": "GPU", "cpu": "CPU", "metal": "Metal GPU"}.get(
+        device, device.upper()
+    )
     # Hyperparameters belong on the figure itself so a saved PNG is self-describing:
     # batch, sequence length, and the resulting tokens/step the bars are measured at.
     cfg = f"B={B}, T={T}  ({B * T} tok/step)"
@@ -434,8 +557,11 @@ def plot_bars(device, series, info, outpath):
 
 
 def print_summary(info, device, rows):
+    dev_label = {"gpu": "GPU", "cpu": "CPU", "metal": "METAL GPU"}.get(
+        device, device.upper()
+    )
     print("=" * 84)
-    print(f"  {device.upper()}    Date: {info['date']}")
+    print(f"  {dev_label}    Date: {info['date']}")
     print(f"  Host:  {info['host']}  ({info['os']})")
     print(f"  CPU:   {info['cpu']}  ({info['cores']} cores)")
     print(f"  GPU:   {info['gpu']}")
@@ -545,6 +671,39 @@ def gpu_series(steps):
     )
 
 
+def metal_series(steps):
+    """Benchmark series for Apple Silicon Metal GPU.
+
+    llm.c has NO Metal port — the baseline is PyTorch on MPS (Metal Performance
+    Shaders) via the repo-local train_gpt2.py.  The llm.mojo side uses the same
+    build/profile_gpt2 binary with target 'gpu': on Apple Silicon, Mojo's GPU
+    backend dispatches to Metal automatically (no extra flags needed).
+
+    At B=4, T=1024, fp32, expect ~6.5 s/step for llm.mojo Metal.
+    """
+    print(
+        "NOTE: llm.c has no Metal port — baseline is PyTorch MPS "
+        "(train_gpt2.py --device mps).",
+        flush=True,
+    )
+    print(f"[metal] llm.mojo fp32  (B={B} T={T} x{steps}) ...", flush=True)
+    yield summarize(
+        "metal/llm.mojo-fp32",
+        "llm.mojo\nfp32",
+        "llm.mojo",
+        "fp32",
+        bench_mojo(MOJO_FP32_BIN, "gpu", steps),
+    )
+    print(f"[metal] PyTorch MPS fp32  (B={B} T={T} x{steps}) ...", flush=True)
+    yield summarize(
+        "metal/torch-mps-fp32",
+        "PyTorch MPS\nfp32",
+        "PyTorch",
+        "fp32",
+        bench_torch_mps(steps),
+    )
+
+
 def main():
     # B/T are module globals read by the bench_* helpers; the arg defaults below
     # reference them, so the declaration must precede first use.
@@ -552,7 +711,17 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--device", choices=["cpu", "gpu", "auto"], default="auto")
+    ap.add_argument(
+        "--device",
+        choices=["cpu", "gpu", "metal", "auto"],
+        default="auto",
+        help=(
+            "cpu: CPU comparison only; "
+            "gpu: NVIDIA GPU (requires CUDA); "
+            "metal: Apple Silicon Metal GPU (llm.mojo + PyTorch MPS); "
+            "auto: CPU always, plus Metal on Apple Silicon or GPU on NVIDIA (default)"
+        ),
+    )
     ap.add_argument(
         "--batch-size",
         type=int,
@@ -568,8 +737,20 @@ def main():
     )
     ap.add_argument("--cpu-steps", type=int, default=40)
     ap.add_argument("--gpu-steps", type=int, default=40)
+    ap.add_argument(
+        "--metal-steps",
+        type=int,
+        default=DEFAULT_METAL_STEPS,
+        help=(
+            f"measured steps for the Metal run (default {DEFAULT_METAL_STEPS}). "
+            "fp32 Metal at B=4 T=1024 is ~6.5 s/step; keep this modest."
+        ),
+    )
     ap.add_argument("--output-cpu", default=None, help="output PNG for the CPU figure")
     ap.add_argument("--output-gpu", default=None, help="output PNG for the GPU figure")
+    ap.add_argument(
+        "--output-metal", default=None, help="output PNG for the Metal GPU figure"
+    )
     ap.add_argument(
         "--stage-only",
         action="store_true",
@@ -582,15 +763,27 @@ def main():
     if not 0 < T <= 1024:
         ap.error(f"--seq-len must be in 1..1024 (GPT-2's max), got {T}")
 
+    # Determine which modes to run.
+    # Metal and GPU are mutually exclusive in auto mode: Apple Silicon has Metal,
+    # NVIDIA Linux boxes have GPU. Explicit --device gpu on Apple will also run
+    # as Metal (since the Mojo 'gpu' target dispatches to Metal on Apple Silicon).
+    on_apple = is_apple_silicon()
+    do_metal = args.device == "metal" or (args.device in ("gpu", "auto") and on_apple)
+    do_gpu = (
+        args.device == "gpu" or (args.device == "auto" and have_gpu() and not on_apple)
+    ) and not do_metal
     do_cpu = args.device in ("cpu", "auto")
-    do_gpu = args.device == "gpu" or (args.device == "auto" and have_gpu())
-    if args.device == "gpu" and not have_gpu():
+
+    if args.device == "gpu" and not have_gpu() and not on_apple:
         print("warning: --device gpu but no NVIDIA GPU detected", file=sys.stderr)
 
-    stage_llmc(need_cpu=do_cpu, need_gpu=do_gpu)
+    # Stage llm.c inputs only when needed (Metal mode has no llm.c dependency).
+    if do_cpu or do_gpu:
+        stage_llmc(need_cpu=do_cpu, need_gpu=do_gpu)
     if args.stage_only:
         print(f"staged llm.c inputs into {STAGE}")
         return
+
     info = hardware_info()
     cores = int(info["cores"])
 
@@ -608,6 +801,23 @@ def main():
             print_summary(info, "gpu", series)
             plot_bars(
                 "gpu", series, info, args.output_gpu or default_output(info, "gpu")
+            )
+
+    if do_metal:
+        series = [s for s in metal_series(args.metal_steps) if s]
+        if series:
+            print_summary(info, "metal", series)
+            plot_bars(
+                "metal",
+                series,
+                info,
+                args.output_metal or default_output(info, "metal"),
+            )
+        else:
+            print(
+                "Metal benchmark produced no results. "
+                "Ensure build/profile_gpt2 is built (make build-profile).",
+                file=sys.stderr,
             )
 
 

@@ -41,6 +41,7 @@ from llmm.layernorm import (
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
 from llmm.matmul import matmul_fwd, matmul_bwd
+from llmm.gelu import bias_gelu_fwd
 from llmm.softmax import softmax_fwd, softmax_bwd
 from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
 from llmm.global_norm import (
@@ -71,6 +72,7 @@ from llmm.zero import (
     ShardedParameter,
     CpuCoordinator,
 )
+from llmm.vendor import HAS_METAL
 
 
 # ===----------------------------------------------------------------------=== #
@@ -653,8 +655,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var grad_acts_stats_buf: DeviceBuffer[StatsDType]
     var inputs_buf: HostBuffer[DType.int32]
     var targets_buf: HostBuffer[DType.int32]
+    # Device-resident copies of the token/target indices. On Metal a HostBuffer
+    # pointer read from inside a GPU kernel silently returns zeros (the encoder
+    # would then embed token 0 everywhere and the classifier would score against
+    # target 0), so the GPU kernels must read these device buffers, uploaded via
+    # enqueue_copy each forward. On CPU these are size-1 placeholders (the host
+    # buffers are read directly).
+    var inputs_dev_buf: DeviceBuffer[DType.int32]
+    var targets_dev_buf: DeviceBuffer[DType.int32]
     var bucket_info_buf: HostBuffer[DType.int32]
     var workload_indices_buf: HostBuffer[DType.int32]
+    # Device-resident copies of bucket_info / workload_indices. On Metal a
+    # HostBuffer pointer read from inside a GPU kernel silently returns zeros,
+    # so the wte-backward GPU kernel must read these device copies instead.
+    var bucket_info_dev_buf: DeviceBuffer[DType.int32]
+    var workload_indices_dev_buf: DeviceBuffer[DType.int32]
     var losses_host_buf: HostBuffer[StatsDType]
     var logits_host_buf: HostBuffer[GPT2_DTYPE]
 
@@ -703,8 +718,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var targets: MutMemPtr[
         DType.int32
     ]  # The target tokens for the current forward pass.
+    # Device-resident token/target pointers for GPU kernels (see *_dev_buf).
+    var inputs_dev: MutMemPtr[DType.int32]
+    var targets_dev: MutMemPtr[DType.int32]
     var bucket_info: MutMemPtr[DType.int32]
     var workload_indices: MutMemPtr[DType.int32]
+    var bucket_info_dev: MutMemPtr[DType.int32]
+    var workload_indices_dev: MutMemPtr[DType.int32]
     var num_wte_buckets: Int
     var wte_bucket_capacity: Int
     var mean_loss: Float32  # The mean loss for the current forward pass.
@@ -777,8 +797,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.grad_acts_stats_memory = NULL_MASTER_PTR
         self.inputs = NULL_INT32_PTR
         self.targets = NULL_INT32_PTR
+        self.inputs_dev = NULL_INT32_PTR
+        self.targets_dev = NULL_INT32_PTR
         self.bucket_info = NULL_INT32_PTR
         self.workload_indices = NULL_INT32_PTR
+        self.bucket_info_dev = NULL_INT32_PTR
+        self.workload_indices_dev = NULL_INT32_PTR
         self.num_wte_buckets = 0
         self.wte_bucket_capacity = 0
 
@@ -805,6 +829,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.grad_acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](1)
         self.inputs_buf = self.ctx.enqueue_create_host_buffer[DType.int32](1)
         self.targets_buf = self.ctx.enqueue_create_host_buffer[DType.int32](1)
+        self.inputs_dev_buf = self.ctx.enqueue_create_buffer[DType.int32](1)
+        self.targets_dev_buf = self.ctx.enqueue_create_buffer[DType.int32](1)
+        self.bucket_info_dev_buf = self.ctx.enqueue_create_buffer[DType.int32](
+            1
+        )
+        self.workload_indices_dev_buf = self.ctx.enqueue_create_buffer[
+            DType.int32
+        ](1)
         self.bucket_info_buf = self.ctx.enqueue_create_host_buffer[DType.int32](
             1
         )
@@ -892,6 +924,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.mean_loss = -1.0  # -1.0 designates no loss has been computed yet.
         self.inputs = MutMemPtr[DType.int32](unsafe_from_address=zero)
         self.targets = MutMemPtr[DType.int32](unsafe_from_address=zero)
+        self.inputs_dev = MutMemPtr[DType.int32](unsafe_from_address=zero)
+        self.targets_dev = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
         # Print out the model summary (rank 0 only).
         if self.zero_ctx.rank == 0:
@@ -1340,6 +1374,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.targets_buf = self.ctx.enqueue_create_host_buffer[DType.int32](
             self.batch_size * self.seq_len
         )
+        # GPU-visible device copies of the token/target indices (see field docs).
+        self.inputs_dev_buf = self.ctx.enqueue_create_buffer[DType.int32](
+            self.batch_size * self.seq_len
+        )
+        self.targets_dev_buf = self.ctx.enqueue_create_buffer[DType.int32](
+            self.batch_size * self.seq_len
+        )
 
         # Encoder backward scratch: one bucket per (token, channel_group).
         var wte_c_per_warp = 128
@@ -1379,11 +1420,29 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.targets = rebind_mut_mem[DType.int32](
             self.targets_buf.unsafe_ptr().as_unsafe_any_origin()
         )
+        self.inputs_dev = rebind_mut_mem[DType.int32](
+            self.inputs_dev_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.targets_dev = rebind_mut_mem[DType.int32](
+            self.targets_dev_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
         self.bucket_info = rebind_mut_mem[DType.int32](
             self.bucket_info_buf.unsafe_ptr().as_unsafe_any_origin()
         )
         self.workload_indices = rebind_mut_mem[DType.int32](
             self.workload_indices_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.bucket_info_dev_buf = self.ctx.enqueue_create_buffer[DType.int32](
+            self.wte_bucket_capacity * 4
+        )
+        self.workload_indices_dev_buf = self.ctx.enqueue_create_buffer[
+            DType.int32
+        ](B * T)
+        self.bucket_info_dev = rebind_mut_mem[DType.int32](
+            self.bucket_info_dev_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.workload_indices_dev = rebind_mut_mem[DType.int32](
+            self.workload_indices_dev_buf.unsafe_ptr().as_unsafe_any_origin()
         )
 
         self.acts.point_activations(
@@ -1464,7 +1523,61 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         if targets != NULL_INT32_PTR:
             memcpy(dest=self.targets, src=targets, count=batch_size * seq_len)
 
+        # On GPU, upload the token/target indices into device-resident buffers.
+        # A HostBuffer pointer read from inside a Metal kernel silently yields
+        # zeros, so the encoder / fused classifier must read these device copies.
+        # `enc_inputs` / `cls_targets` pick the correct pointer per target below.
+        var enc_inputs = self.inputs
+        var cls_targets = self.targets
+        comptime if is_gpu[Self.target]():
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[
+                    UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
+                ](self.inputs_dev.as_unsafe_any_origin()),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin]
+                ](self.inputs.as_unsafe_any_origin()),
+                size=batch_size * seq_len,
+            )
+            enc_inputs = self.inputs_dev
+            if targets != NULL_INT32_PTR:
+                self.ctx.enqueue_copy(
+                    dst_ptr=rebind[
+                        UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
+                    ](self.targets_dev.as_unsafe_any_origin()),
+                    src_ptr=rebind[
+                        UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin]
+                    ](self.targets.as_unsafe_any_origin()),
+                    size=batch_size * seq_len,
+                )
+                cls_targets = self.targets_dev
+            self.ctx.synchronize()
+
         self.build_encoder_buckets(batch_size, seq_len)
+
+        # On GPU (Metal), bucket_info/workload_indices are HostBuffers and their
+        # raw pointers read as zeros inside Metal kernels. Upload the just-built
+        # host data to device buffers so the wte-backward GPU kernel reads correctly.
+        comptime if is_gpu[Self.target]():
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[
+                    UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
+                ](self.bucket_info_dev.as_unsafe_any_origin()),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin]
+                ](self.bucket_info.as_unsafe_any_origin()),
+                size=self.num_wte_buckets * 4,
+            )
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[
+                    UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
+                ](self.workload_indices_dev.as_unsafe_any_origin()),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin]
+                ](self.workload_indices.as_unsafe_any_origin()),
+                size=batch_size * seq_len,
+            )
+            self.ctx.synchronize()
 
         comptime if Self.WORLD_SIZE > 1:
             # ZeRO-3: Gather all parameter shards into params_buf before running forward.
@@ -1489,7 +1602,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # Forward the encoder.
         encoder_fwd[GPT2_DTYPE, Self.target](
             as_mut_kernel[GPT2_DTYPE](self.acts.encoded),
-            as_immut_kernel_from_mut[DType.int32](self.inputs),
+            as_immut_kernel_from_mut[DType.int32](enc_inputs),
             as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
             as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wpe),
             batch_size,
@@ -1620,17 +1733,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
 
-            # Matmul QKV.
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
+            # Matmul QKV. On Metal the fused-bias matmul epilogue is broken
+            # (linalg.matmul elementwise_lambda_fn), so run the plain GEMM and
+            # apply bias with a standalone kernel; see bias_gelu_fwd.
+            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](l_ln_1),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_bias),
+                as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
                 Int64(3 * channels),
+                self.ctx,
+            )
+            bias_gelu_fwd[GPT2_DTYPE, Self.target, has_bias=True](
+                as_mut_kernel[GPT2_DTYPE](l_qkv),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_bias),
+                batch_size * seq_len,
+                3 * channels,
                 self.ctx,
             )
 
@@ -1659,17 +1782,25 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 cache=rebind[KVCachePtr](UnsafePointer(to=self.kv_cache)),
             )
 
-            # Matmul Attn Proj
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
+            # Matmul Attn Proj (plain GEMM + standalone bias; see QKV note).
+            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
                 as_mut_kernel[GPT2_DTYPE](l_attn_proj),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](l_attn_merged),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_bias),
+                as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
                 Int64(channels),
+                self.ctx,
+            )
+            bias_gelu_fwd[GPT2_DTYPE, Self.target, has_bias=True](
+                as_mut_kernel[GPT2_DTYPE](l_attn_proj),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_bias),
+                batch_size * seq_len,
+                channels,
                 self.ctx,
             )
             # LayerNorm 2 & Residual.
@@ -1689,31 +1820,50 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx,
             )
 
-            # Matmul FC (fused GELU).
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=True](
+            # Matmul FC (plain GEMM, then standalone bias + GELU writing the
+            # pre-activation into l_fch; see QKV note).
+            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
                 as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
-                as_mut_kernel[GPT2_DTYPE](l_fch),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](l_ln_2),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
+                as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
                 Int64(4 * channels),
                 self.ctx,
             )
+            bias_gelu_fwd[
+                GPT2_DTYPE, Self.target, has_bias=True, use_gelu=True
+            ](
+                as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                as_mut_kernel[GPT2_DTYPE](l_fch),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
+                batch_size * seq_len,
+                4 * channels,
+                self.ctx,
+            )
 
-            # Matmul Proj.
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
+            # Matmul Proj (plain GEMM + standalone bias; see QKV note).
+            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
                 as_mut_kernel[GPT2_DTYPE](l_fc_proj),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
+                as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(4 * channels),
                 Int64(channels),
+                self.ctx,
+            )
+            bias_gelu_fwd[GPT2_DTYPE, Self.target, has_bias=True](
+                as_mut_kernel[GPT2_DTYPE](l_fc_proj),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
+                batch_size * seq_len,
+                channels,
                 self.ctx,
             )
 
@@ -1784,7 +1934,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_mut_kernel[GPT2_DTYPE](self.acts.logits),
                 as_mut_kernel[StatsDType](self.acts.losses),
                 as_immut_kernel_from_mut[DType.float32](self.grad_acts.losses),
-                as_immut_kernel_from_mut[DType.int32](self.targets),
+                as_immut_kernel_from_mut[DType.int32](cls_targets),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(vocab_size),
@@ -2266,11 +2416,19 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
 
         # Encoder backward: scatter token grads into wte, sum position grads into wpe.
+        # On GPU (Metal), bucket_info/workload_indices are HostBuffers whose raw
+        # pointers read as zeros inside Metal kernels — use device copies uploaded
+        # during forward's build_encoder_buckets phase.
+        var enc_bucket_info = self.bucket_info
+        var enc_workload_indices = self.workload_indices
+        comptime if is_gpu[Self.target]():
+            enc_bucket_info = self.bucket_info_dev
+            enc_workload_indices = self.workload_indices_dev
         encoder_bwd[GPT2_DTYPE, Self.target](
             as_mut_kernel[GPT2_DTYPE](self.grads.wte),
             as_mut_kernel[GPT2_DTYPE](self.grads.wpe),
-            as_immut_kernel_from_mut[DType.int32](self.bucket_info),
-            as_immut_kernel_from_mut[DType.int32](self.workload_indices),
+            as_immut_kernel_from_mut[DType.int32](enc_bucket_info),
+            as_immut_kernel_from_mut[DType.int32](enc_workload_indices),
             as_immut_kernel_from_mut[GPT2_DTYPE](self.grad_acts.encoded),
             self.num_wte_buckets,
             batch_size,
@@ -2278,6 +2436,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             channels,
             self.ctx,
         )
+
+        # Wait for all GPU backward kernels to finish. Metal's enqueue_copy
+        # (device→host) requires the source buffer to be idle; without this
+        # synchronize the runtime raises "Invalid Metal buffer pointer" when
+        # callers try to read gradient values immediately after backward().
+        comptime if is_gpu[Self.target]():
+            self.ctx.synchronize()
 
         comptime if Self.WORLD_SIZE > 1:
             # ZeRO-0 (DDP) and ZeRO-1 use allreduce: full gradient sum is replicated
@@ -3417,43 +3582,32 @@ def main() raises:
     print("Rank:", rank, "World size:", world_size, "ZeRO stage:", zero_stage)
 
     var use_cpu = getenv("LLMM_USE_CPU")
+    # Apple GPU uses the Metal device path by default; override with
+    # LLMM_USE_CPU=1 (runtime) or -D LLMM_DISABLE_METAL=1 (compile-time).
+    # Multi-rank collectives are NVIDIA-only, so world_size>1 on Apple GPU
+    # falls back to the CPU coordinator path (see below).
     var run_on_cpu = (
-        (use_cpu != "") or not has_accelerator() or has_apple_gpu_accelerator()
+        (use_cpu != "")
+        or not has_accelerator()
+        or (has_apple_gpu_accelerator() and not HAS_METAL)
     )
 
-    if run_on_cpu:
-        if has_apple_gpu_accelerator() and use_cpu == "":
+    if not run_on_cpu and has_apple_gpu_accelerator():
+        print(
+            "Note: Metal (Apple GPU) training is experimental. Set"
+            " LLMM_USE_CPU=1 or build with -D LLMM_DISABLE_METAL=1 to fall"
+            " back to CPU."
+        )
+        if world_size > 1:
             print(
-                "==============================================================================="
+                "WARNING: multi-rank training (world_size="
+                + String(world_size)
+                + ") is not supported on Apple GPU (collectives require"
+                " NVIDIA). Falling back to CPU coordinator."
             )
-            print(
-                "WARNING: Apple Silicon GPU training is disabled — using CPU"
-                " instead."
-            )
-            print("")
-            print(
-                "An Apple Metal accelerator is present, but this trainer does"
-                " not run on it yet."
-            )
-            print("Known blockers on Apple Silicon today:")
-            print(
-                "  • Metal / KGEN: several llmm GPU kernels compile in Mojo but"
-                " fail at the"
-            )
-            print(
-                '    metallib stage ("could not elaborate the generated KGEN")'
-                " or miscompile"
-            )
-            print("    when lowered through MAX's Apple-GPU path.")
-            print("")
-            print(
-                "CPU training is correct and fast enough for dev; GPU support"
-                " here is WIP."
-            )
-            print(
-                "==============================================================================="
-            )
+            run_on_cpu = True
 
+    if run_on_cpu:
         print("Training on CPU.")
         if world_size == 1:
             _dispatch_world_size["cpu"](

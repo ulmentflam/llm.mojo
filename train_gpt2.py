@@ -4,6 +4,7 @@ import math
 import glob
 import struct
 import inspect
+import contextlib
 from dataclasses import dataclass
 from typing import BinaryIO, Optional, Any, cast
 
@@ -1407,7 +1408,7 @@ if __name__ == "__main__":
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
     print(f"Using device: {device}")
-    device_type = "cuda" if "cuda" in device else "cpu"
+    device_type = "cuda" if "cuda" in device else ("mps" if device == "mps" else "cpu")
 
     # Calculate the gradient accumulation from the desired total batch size and the current run configuration.
     tokens_per_fwd_bwd = B * T * ddp_world_size
@@ -1436,7 +1437,17 @@ if __name__ == "__main__":
         "bfloat16": torch.bfloat16,
         # "float8": torch.float8,
     }[args.dtype]
-    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    # On MPS, torch.amp.autocast does not support float32 (warns and disables itself).
+    # Use nullcontext for float32 on MPS to avoid noise; use proper MPS autocast for fp16/bf16.
+    # On CPU, autocast with float32 is also a no-op so nullcontext is cleaner.
+    if device_type in ("mps", "cpu") and ptdtype == torch.float32:
+        ctx = contextlib.nullcontext()
+        print_zero_rank(f"Precision: float32 (no autocast on {device_type})")
+    else:
+        ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+        print_zero_rank(
+            f"Precision: {args.dtype} via torch.amp.autocast(device_type={device_type!r})"
+        )
 
     # RNG Setup
     torch.manual_seed(42)
@@ -1485,10 +1496,15 @@ if __name__ == "__main__":
     model.train()
     model.to(device)
     if args.compile:
-        if hasattr(config, "coordinate_descent_tuning"):
-            config.coordinate_descent_tuning = True  # suggested by @Chillee
-        print_zero_rank("Compiling the model...")
-        model = cast(nn.Module, torch.compile(model))
+        if device_type == "mps":
+            print_zero_rank(
+                "[NOTE] torch.compile is not supported on MPS (AssertionError: duplicate template name) — skipping compilation."
+            )
+        else:
+            if hasattr(config, "coordinate_descent_tuning"):
+                config.coordinate_descent_tuning = True  # suggested by @Chillee
+            print_zero_rank("Compiling the model...")
+            model = cast(nn.Module, torch.compile(model))
 
     """
     Our own version of simple DistributedDataLoader
@@ -1747,9 +1763,13 @@ if __name__ == "__main__":
         print_zero_rank(
             f"Average of last 20 timings: {sum(timings) / len(timings):.2f} ms"
         )
-    print_zero_rank(
-        f"Peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB"
-    )
+    if device_type == "cuda":
+        print_zero_rank(
+            f"Peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB"
+        )
+    elif device_type == "mps":
+        peak_mem = torch.mps.driver_allocated_memory()
+        print_zero_rank(f"Peak MPS memory (driver): {peak_mem // 1024 // 1024} MiB")
 
     # Cleanup
     if ddp:

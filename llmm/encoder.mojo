@@ -607,12 +607,17 @@ def wte_backward_gpu_kernel[
     var channel_group = Int(info[3])
 
     var c = channel_group * c_per_warp + lane_id * width
-    if c >= channels:
-        return
-
+    # Metal fix: do NOT return early before barrier(). On Metal, barrier()
+    # requires ALL threads in the threadgroup to reach it. The original early
+    # returns (if c >= channels / if warp_id >= bucket_size) caused threads to
+    # exit before the barrier, producing wrong results on Apple GPU. We replace
+    # them with boolean flags that gate the per-thread work while ensuring all
+    # threads still write to shared memory and call barrier(). Nvidia behavior
+    # is preserved: the computed results are bit-identical, only inactive threads
+    # now do a trivial extra zero-write before reaching the barrier.
+    var c_valid = c < channels
     var num_warps = BLOCK_SIZE // WARP_SIZE
-    if warp_id >= bucket_size:
-        return
+    var active = warp_id < bucket_size
 
     comptime SMEM_SIZE = BLOCK_SIZE * width
     var accum_shared = LayoutTensor[
@@ -621,60 +626,75 @@ def wte_backward_gpu_kernel[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    var accum_shared_ptr = rebind[MutKernelPtr[DType.float32]](
-        accum_shared.ptr.address_space_cast[AddressSpace.GENERIC]()
-    )
+    # Metal fix #2: use accum_shared.ptr directly (the layernorm.mojo pattern).
+    # The previous `address_space_cast[AddressSpace.GENERIC]() + rebind` pattern
+    # produces silent zero reads on Apple GPU Metal — the cast corrupts the
+    # shared-memory pointer and all loads return 0. Direct .ptr access keeps
+    # the pointer in AddressSpace.SHARED which Metal resolves correctly.
+    # On Nvidia CUDA, both patterns compile identically (SMEM is generic there),
+    # so this change preserves Nvidia behavior exactly.
 
-    comptime if aligned:
-        if c + width <= channels:
-            var accum = _accumulate_token_gradients[dtype, width, aligned=True](
-                dout_ptr,
-                workload_indices_ptr,
-                start_idx,
-                bucket_size,
-                channels,
-                c,
-                start_item=warp_id,
-                step_size=num_warps,
-            )
-            for k in range(width):
-                accum_shared_ptr[tid * width + k] = accum[k]
+    # All threads zero their slot first so inactive warps don't leave garbage.
+    for k in range(width):
+        accum_shared.ptr[tid * width + k] = 0.0
+
+    if c_valid and active:
+        comptime if aligned:
+            if c + width <= channels:
+                var accum = _accumulate_token_gradients[
+                    dtype, width, aligned=True
+                ](
+                    dout_ptr,
+                    workload_indices_ptr,
+                    start_idx,
+                    bucket_size,
+                    channels,
+                    c,
+                    start_item=warp_id,
+                    step_size=num_warps,
+                )
+                for k in range(width):
+                    accum_shared.ptr[tid * width + k] = accum[k]
+            else:
+                var accum = SIMD[DType.float32, width](0.0)
+                var item = warp_id
+                while item < bucket_size:
+                    var bt = Int(
+                        (workload_indices_ptr + start_idx + item).load()
+                    )
+                    for k in range(channels - c):
+                        var val = dout_ptr[bt * channels + c + k].cast[
+                            DType.float32
+                        ]()
+                        accum[k] += val
+                    item += num_warps
+                for k in range(width):
+                    accum_shared.ptr[tid * width + k] = accum[k]
         else:
             var accum = SIMD[DType.float32, width](0.0)
+            var lanes = min(width, channels - c)
             var item = warp_id
             while item < bucket_size:
                 var bt = Int((workload_indices_ptr + start_idx + item).load())
-                for k in range(channels - c):
+                for k in range(lanes):
                     var val = dout_ptr[bt * channels + c + k].cast[
                         DType.float32
                     ]()
                     accum[k] += val
                 item += num_warps
             for k in range(width):
-                accum_shared_ptr[tid * width + k] = accum[k]
-    else:
-        var accum = SIMD[DType.float32, width](0.0)
-        var lanes = min(width, channels - c)
-        var item = warp_id
-        while item < bucket_size:
-            var bt = Int((workload_indices_ptr + start_idx + item).load())
-            for k in range(lanes):
-                var val = dout_ptr[bt * channels + c + k].cast[DType.float32]()
-                accum[k] += val
-            item += num_warps
-        for k in range(width):
-            accum_shared_ptr[tid * width + k] = accum[k]
+                accum_shared.ptr[tid * width + k] = accum[k]
 
     barrier()
 
-    if warp_id == 0:
+    if c_valid and warp_id == 0:
         var final_accum = SIMD[DType.float32, width](0.0)
         for w in range(num_warps):
             if w < bucket_size:
                 var partner_tid = w * WARP_SIZE + lane_id
                 var val = SIMD[DType.float32, width](0.0)
                 for k in range(width):
-                    val[k] = accum_shared_ptr[partner_tid * width + k]
+                    val[k] = accum_shared.ptr[partner_tid * width + k]
                 final_accum += val
 
         comptime if aligned:

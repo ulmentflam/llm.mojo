@@ -771,6 +771,14 @@ def _ln_fused_residual_warp_gpu[
     # replacing one block/row + slow block.sum. gamma/beta cached in shared once
     # per block; the residual row cached in shared for passes 2/3. Assumes
     # channels % (WARP_SIZE*width) == 0 (holds for GPT-2 C=768, width=8).
+    #
+    # METAL HAZARD (dead code, not dispatched): this kernel allocates
+    #   s_weight[CAP] + s_bias[CAP] + s_res[WARPS * CAP] shared-memory slots.
+    # For dtype=float32 and WARPS=8: 1024*4*(2+8) = 40 960 bytes, which exceeds
+    # Metal's 32 768-byte threadgroup-memory limit.
+    # Do NOT dispatch this kernel on Apple GPU with float32.  Either reduce CAP
+    # or switch to the production _layernorm_fused_residual_fwd_gpu path
+    # (uses only s_res[LN_CAP=2048] = 8 192 bytes → safely within limit).
     comptime CAP = 1024
     var s_weight = LayoutTensor[
         dtype,

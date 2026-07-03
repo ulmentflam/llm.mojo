@@ -3,7 +3,7 @@ from std.memory import UnsafePointer, memcpy, alloc
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu.host.info import is_cpu
 from std.sys.info import size_of
-from std.sys import has_accelerator
+from std.sys import has_accelerator, has_nvidia_gpu_accelerator
 from std.algorithm import sync_parallelize
 from layout.tile_layout import row_major
 
@@ -190,7 +190,7 @@ def test_sharded_parameter_gather_cpu() raises:
 
 
 def test_sharded_parameter_gather_gpu() raises:
-    if not has_accelerator():
+    if not has_nvidia_gpu_accelerator():
         return
     var ctx = DeviceContext()
     var z_ctx = ZeroContext[target="gpu"](

@@ -93,17 +93,25 @@ BENCH_B ?= 4
 BENCH_T ?= 64
 BENCH_CPU_STEPS ?= 40
 BENCH_GPU_STEPS ?= 40
+# Metal fp32 at B=4 T=1024 is ~6.5 s/step; default to 10 measured steps so the
+# full run is ~70 s of GPU time (manageable for a local Mac). Override with
+# BENCH_METAL_STEPS=N on the command line.
+BENCH_METAL_STEPS ?= 10
 BENCH_ARGS := --batch-size $(BENCH_B) --seq-len $(BENCH_T)
 HAVE_NVCC := $(shell command -v nvcc 2>/dev/null)
+# Detect Apple Silicon so make benchmark auto-selects the Metal path.
+IS_DARWIN := $(shell uname -s 2>/dev/null)
+IS_APPLE_SILICON := $(shell [ "$$(uname -s)" = "Darwin" ] && [ "$$(uname -m)" = "arm64" ] && echo 1 || echo 0)
 
 SHELL := /bin/bash
 
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        typecheck check clean build         build-mojo build-train train train-cpu \
+        typecheck check clean build         build-mojo build-train train train-cpu train-metal \
         build-profile build-profile-bf16 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
-        build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu \
+        profile-metal \
+        build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures \
@@ -131,32 +139,38 @@ help:
 	@echo "  build-train   Alias for build"
 	@echo "  train         Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
 	@echo "  train-cpu     Build and run build/train_gpt2 on CPU (LLMM_USE_CPU=1)"
+	@echo "  train-metal   Build (WORLD_SIZE=1) and run on Apple Metal GPU (experimental)"
 	@echo ""
 	@echo "Profiling:"
 	@echo "  build-profile Compile profile_gpt2.mojo to build/profile_gpt2"
 	@echo "  build-profile-bf16  Compile the bf16 (-D LLMM_BF16) harness, build/profile_gpt2_bf16"
 	@echo "  profile       Run one step and emit a Perfetto trace (alias: profile-trace)"
 	@echo "  profile-trace Write build/profile_gpt2.<target>.perfetto-trace.json (ui.perfetto.dev)"
+	@echo "  profile-metal Run one step on the Metal GPU and emit a Perfetto trace (Apple Silicon)"
 	@echo "  profile-cpu   Run the profile on CPU and emit a Perfetto trace"
 	@echo "  profile-threads-cpu  CPU per-thread Perfetto trace (all worker threads)"
-	@echo "  profile-ncu   Profile our Mojo bf16 GPU kernels with ncu + profile_gpt2.py table"
-	@echo "  profile-nsys  Capture a GPU nsys timeline of our Mojo bf16 kernels"
-	@echo "  profile-fp32-ncu   Same ncu table for the fp32 build (vs profile-llmc-fp32-ncu)"
-	@echo "  profile-fp32-nsys  fp32 GPU nsys timeline"
+	@echo "  profile-ncu   Profile Mojo bf16 GPU kernels with ncu (NVIDIA only)"
+	@echo "  profile-nsys  Capture a GPU nsys timeline of Mojo bf16 kernels (NVIDIA only)"
+	@echo "  profile-fp32-ncu   Same ncu table for the fp32 build (NVIDIA only)"
+	@echo "  profile-fp32-nsys  fp32 GPU nsys timeline (NVIDIA only)"
 	@echo "  profile-nsys-cpu  Capture a CPU nsys timeline showing all worker threads"
+	@echo "  NOTE: profile-ncu / profile-nsys / profile-llmc-* require NVIDIA Nsight tools"
+	@echo "        and are not available on Apple Silicon (darwin)."
 	@echo ""
-	@echo "Benchmark (vs llm.c submodule):"
+	@echo "Benchmark (vs llm.c submodule on NVIDIA; vs PyTorch MPS on Apple Silicon):"
 	@echo "  build-llmc    Build llm.c CPU (train_gpt2) + CUDA (train_gpt2cu, if nvcc)"
 	@echo "  build-llmc-cpu  Build only the llm.c CPU reference (portable, macOS-ok)"
 	@echo "  build-llmc-gpu  Build only the llm.c CUDA reference (needs nvcc)"
-	@echo "  benchmark     Histogram of train-loop time: llm.mojo vs llm.c (CPU + GPU)"
-	@echo "  benchmark-cpu Only the CPU comparison (no CUDA needed)"
-	@echo "  benchmark-gpu Only the GPU comparison (NVIDIA)"
-	@echo "                (hyperparams: BENCH_B, BENCH_T, e.g. BENCH_T=1024)"
-	@echo "  profile-llmc-ncu  Profile llm.c bf16 CUDA kernels with ncu (same table)"
-	@echo "  profile-llmc-nsys Capture an nsys timeline of llm.c bf16 CUDA kernels"
-	@echo "  profile-llmc-fp32-ncu   Profile llm.c fp32 CUDA kernels with ncu (vs make profile-fp32-ncu)"
-	@echo "  profile-llmc-fp32-nsys  nsys timeline of llm.c fp32 CUDA kernels"
+	@echo "  benchmark     Histogram of train-loop time (auto: Metal on Apple, NVIDIA GPU on Linux)"
+	@echo "  benchmark-cpu Only the CPU comparison (no CUDA / Metal needed)"
+	@echo "  benchmark-gpu Only the NVIDIA GPU comparison"
+	@echo "  benchmark-metal  Apple Silicon Metal GPU: llm.mojo vs PyTorch MPS (no llm.c dep)"
+	@echo "                   llm.c has no Metal port — baseline is PyTorch MPS"
+	@echo "                   (hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS)"
+	@echo "  profile-llmc-ncu  Profile llm.c bf16 CUDA kernels with ncu (NVIDIA only)"
+	@echo "  profile-llmc-nsys Capture an nsys timeline of llm.c bf16 CUDA kernels (NVIDIA only)"
+	@echo "  profile-llmc-fp32-ncu   Profile llm.c fp32 CUDA kernels with ncu (NVIDIA only)"
+	@echo "  profile-llmc-fp32-nsys  nsys timeline of llm.c fp32 CUDA kernels (NVIDIA only)"
 	@echo "  lint          Lint Python, Mojo, C, CUDA, LaTeX sources, and typecheck"
 	@echo "  lint-python   Lint Python sources with ruff"
 	@echo "  lint-mojo     Lint Mojo sources with mojo format --check"
@@ -263,6 +277,13 @@ train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 train-cpu: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@LLMM_USE_CPU=1 $(TRAIN_RUNNER)
 
+# Metal (Apple GPU) training: force WORLD_SIZE=1 because multi-GPU collectives
+# are NVIDIA-only. Metal is the default device on Apple Silicon (no extra flags
+# needed); this target just pins the world size and makes intent explicit.
+train-metal: WORLD_SIZE := 1
+train-metal: $(TRAIN_BIN) $(TRAIN_RUNNER)
+	@$(TRAIN_RUNNER)
+
 # Compiles the single-step profiling harness. Depends on train_gpt2.mojo because
 # it imports GPT2 from it (the llm.mojo analogue of profile_gpt2.cu #include'ing
 # train_gpt2.cu).
@@ -308,39 +329,74 @@ profile-threads-cpu: $(PROFILE_TRACE_BIN) $(PROFILE_RUNNER)
 	@PROFILE_EXE=$(PROFILE_TRACE_BIN) LLMM_THREAD_TRACE=$(PROFILE_THREAD_TRACE) $(PROFILE_RUNNER) $(PROFILE_TARGET)
 	@echo "Per-thread Perfetto trace: $(PROFILE_THREAD_TRACE) (open at https://ui.perfetto.dev)"
 
+# Metal GPU Perfetto trace (Apple Silicon). The Mojo profiling harness runs its
+# 'gpu' target on Metal automatically — no extra flags needed. This is a thin
+# alias for `make profile PROFILE_TARGET=gpu` that makes the intent explicit and
+# is discoverable from `make help`. The Perfetto trace is written to
+# build/profile_gpt2.gpu.perfetto-trace.json (same path as the Linux GPU trace).
+profile-metal: $(PROFILE_BIN) $(PROFILE_RUNNER)
+	@LLMM_PROFILE_TRACE=$(PROFILE_TRACE) $(PROFILE_RUNNER) gpu
+	@echo "Metal Perfetto trace: $(PROFILE_BIN).gpu.perfetto-trace.json (open at https://ui.perfetto.dev)"
+
 # Per-kernel GPU profile via NVIDIA Nsight Compute (ncu), printed as a table by
 # profile_gpt2.py. Defaults to the bf16 build (PROFILE_PROF_BIN); use
 # profile-fp32-ncu for the fp32 build. Add `--full` for the heavy metric set,
 # `--sudo` if the GPU performance counters need elevated access (DRAM/tensor
 # metrics otherwise show as n/a). The raw CSV is saved alongside the binary.
+# NOTE: ncu is an NVIDIA-only tool. On Apple Silicon (darwin) this target prints
+# a notice and exits cleanly instead of failing.
 profile-ncu: $(PROFILE_PROF_BIN) $(PROFILE_SCRIPT)
-	$(PROFILE_ENV) pixi run -e cuda python $(PROFILE_SCRIPT) \
-		--exe $(PROFILE_PROF_BIN) --target $(PROFILE_TARGET) \
-		--output $(PROFILE_PROF_BIN).ncu.csv
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "SKIPPED: profile-ncu requires NVIDIA Nsight Compute (ncu) — not available on Apple Silicon."; \
+		echo "  Use 'make profile-metal' for a Perfetto trace on the Metal GPU."; \
+	else \
+		$(PROFILE_ENV) pixi run -e cuda python $(PROFILE_SCRIPT) \
+			--exe $(PROFILE_PROF_BIN) --target $(PROFILE_TARGET) \
+			--output $(PROFILE_PROF_BIN).ncu.csv; \
+	fi
 
 # fp32 build of the same per-kernel profile (mirrors profile-llmc-fp32-ncu).
+# NOTE: NVIDIA-only. See profile-ncu for the darwin guard note.
 profile-fp32-ncu: PROFILE_PROF_BIN := $(PROFILE_BIN)
 profile-fp32-ncu: $(PROFILE_BIN) $(PROFILE_SCRIPT)
-	$(PROFILE_ENV) pixi run -e cuda python $(PROFILE_SCRIPT) \
-		--exe $(PROFILE_BIN) --target $(PROFILE_TARGET) \
-		--output $(PROFILE_BIN).ncu.csv
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "SKIPPED: profile-fp32-ncu requires NVIDIA ncu — not available on Apple Silicon."; \
+		echo "  Use 'make profile-metal' for a Perfetto trace on the Metal GPU."; \
+	else \
+		$(PROFILE_ENV) pixi run -e cuda python $(PROFILE_SCRIPT) \
+			--exe $(PROFILE_BIN) --target $(PROFILE_TARGET) \
+			--output $(PROFILE_BIN).ncu.csv; \
+	fi
 
 # Timeline capture via NVIDIA Nsight Systems. The report's thread timeline shows
 # every CPU worker thread (the ~20 sync_parallelize workers), which the in-process
 # Perfetto tracer cannot see. Open the .nsys-rep in the Nsight Systems UI
 # (File > Open). Defaults to the bf16 build; use profile-fp32-nsys for fp32, or
 # profile-nsys-cpu for the CPU path.
+# NOTE: nsys is an NVIDIA-only tool. On Apple Silicon (darwin) this target prints
+# a notice and exits cleanly instead of failing.
 profile-nsys: $(PROFILE_PROF_BIN)
-	$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
-		-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET)
-	@echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "SKIPPED: profile-nsys requires NVIDIA Nsight Systems (nsys) — not available on Apple Silicon."; \
+		echo "  Use 'make profile-metal' for a Perfetto trace on the Metal GPU."; \
+	else \
+		$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
+			-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET); \
+		echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"; \
+	fi
 
 # fp32 build of the GPU timeline.
+# NOTE: NVIDIA-only. See profile-nsys for the darwin guard note.
 profile-fp32-nsys: PROFILE_PROF_BIN := $(PROFILE_BIN)
 profile-fp32-nsys: $(PROFILE_BIN)
-	$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
-		-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET)
-	@echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "SKIPPED: profile-fp32-nsys requires NVIDIA nsys — not available on Apple Silicon."; \
+		echo "  Use 'make profile-metal' for a Perfetto trace on the Metal GPU."; \
+	else \
+		$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
+			-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET); \
+		echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"; \
+	fi
 
 # CPU thread timeline — runs in the default pixi env (no GPU required) and traces
 # only OS-runtime + CPU samples, so the ~20 worker threads show on the timeline.
@@ -394,10 +450,25 @@ benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
 	pixi run python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
 		--gpu-steps $(BENCH_GPU_STEPS)
 
-# CPU always; GPU too iff an NVIDIA GPU is present.
+# Apple Silicon Metal GPU benchmark: llm.mojo (Metal) vs PyTorch MPS.
+# No llm.c dependency — llm.c has no Metal port; the baseline is PyTorch MPS.
+# Hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS (default 10 due to ~6.5 s/step).
+benchmark-metal: $(PROFILE_BIN) $(BENCH_SCRIPT)
+	pixi run python $(BENCH_SCRIPT) --device metal $(BENCH_ARGS) \
+		--metal-steps $(BENCH_METAL_STEPS)
+
+# Auto mode: on Apple Silicon run the Metal benchmark; on NVIDIA run CPU + GPU.
+ifeq ($(IS_APPLE_SILICON),1)
+benchmark: $(PROFILE_BIN) $(BENCH_SCRIPT)
+	@echo "Apple Silicon detected — running Metal benchmark (llm.c CUDA not available)."
+	@echo "  llm.c has no Metal port; baseline is PyTorch MPS."
+	pixi run python $(BENCH_SCRIPT) --device auto $(BENCH_ARGS) \
+		--cpu-steps $(BENCH_CPU_STEPS) --metal-steps $(BENCH_METAL_STEPS)
+else
 benchmark: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc $(BENCH_SCRIPT)
 	pixi run python $(BENCH_SCRIPT) --device auto $(BENCH_ARGS) \
 		--cpu-steps $(BENCH_CPU_STEPS) --gpu-steps $(BENCH_GPU_STEPS)
+endif
 
 # One short, deterministic train step of llm.c's CUDA build — the target for
 # profiling Karpathy's GPU kernels. Same B/T as our harness (shared PROFILE_B/T)
@@ -413,20 +484,28 @@ stage-llmc: $(BENCH_SCRIPT)
 
 # Profile Karpathy's CUDA kernels with ncu, through the SAME analysis table as
 # our Mojo kernels (profile_gpt2.py categorizes both by kernel name). Compare
-# against `make profile-ncu` (our kernels).
+# against `make profile-ncu` (our kernels). NVIDIA-only — not available on Apple.
 profile-llmc-ncu: build-llmc-gpu stage-llmc $(PROFILE_SCRIPT)
-	pixi run -e cuda python $(PROFILE_SCRIPT) \
-		--exe $(abspath $(LLMC_GPU_BIN)) \
-		--exe-args "$(LLMC_GPU_ARGS)" \
-		--cwd build/llmc \
-		--output build/profile_llmc.ncu.csv
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "SKIPPED: profile-llmc-ncu requires NVIDIA ncu — not available on Apple Silicon."; \
+	else \
+		pixi run -e cuda python $(PROFILE_SCRIPT) \
+			--exe $(abspath $(LLMC_GPU_BIN)) \
+			--exe-args "$(LLMC_GPU_ARGS)" \
+			--cwd build/llmc \
+			--output build/profile_llmc.ncu.csv; \
+	fi
 
-# nsys timeline of llm.c's CUDA training step.
+# nsys timeline of llm.c's CUDA training step. NVIDIA-only — not available on Apple.
 profile-llmc-nsys: build-llmc-gpu stage-llmc
-	cd build/llmc && pixi run -e cuda nsys profile --force-overwrite true \
-		--trace=cuda,nvtx,osrt -o $(abspath build/profile_llmc) \
-		$(abspath $(LLMC_GPU_BIN)) $(LLMC_GPU_ARGS)
-	@echo "nsys report: build/profile_llmc.nsys-rep"
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "SKIPPED: profile-llmc-nsys requires NVIDIA nsys — not available on Apple Silicon."; \
+	else \
+		cd build/llmc && pixi run -e cuda nsys profile --force-overwrite true \
+			--trace=cuda,nvtx,osrt -o $(abspath build/profile_llmc) \
+			$(abspath $(LLMC_GPU_BIN)) $(LLMC_GPU_ARGS); \
+		echo "nsys report: build/profile_llmc.nsys-rep"; \
+	fi
 
 # llm.c's *fp32* CUDA build (train_gpt2fp32cu). Unlike the bf16 build it has no
 # -e / -x flags: it loads gpt2_124M.bin and runs a full epoch. We point the data
@@ -442,19 +521,27 @@ LLMC_FP32_GPU_ARGS = \
 LLMC_FP32_LAUNCH_COUNT := 400
 
 profile-llmc-fp32-ncu: build-llmc-gpu stage-llmc $(PROFILE_SCRIPT)
-	pixi run -e cuda python $(PROFILE_SCRIPT) \
-		--exe $(abspath $(LLMC_FP32_GPU_BIN)) \
-		--exe-args "$(LLMC_FP32_GPU_ARGS)" \
-		--launch-count $(LLMC_FP32_LAUNCH_COUNT) \
-		--cwd build/llmc \
-		--output build/profile_llmc_fp32.ncu.csv
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "SKIPPED: profile-llmc-fp32-ncu requires NVIDIA ncu — not available on Apple Silicon."; \
+	else \
+		pixi run -e cuda python $(PROFILE_SCRIPT) \
+			--exe $(abspath $(LLMC_FP32_GPU_BIN)) \
+			--exe-args "$(LLMC_FP32_GPU_ARGS)" \
+			--launch-count $(LLMC_FP32_LAUNCH_COUNT) \
+			--cwd build/llmc \
+			--output build/profile_llmc_fp32.ncu.csv; \
+	fi
 
-# nsys timeline of llm.c's fp32 CUDA training step.
+# nsys timeline of llm.c's fp32 CUDA training step. NVIDIA-only — not available on Apple.
 profile-llmc-fp32-nsys: build-llmc-gpu stage-llmc
-	cd build/llmc && pixi run -e cuda nsys profile --force-overwrite true \
-		--trace=cuda,nvtx,osrt -o $(abspath build/profile_llmc_fp32) \
-		$(abspath $(LLMC_FP32_GPU_BIN)) $(LLMC_FP32_GPU_ARGS)
-	@echo "nsys report: build/profile_llmc_fp32.nsys-rep"
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "SKIPPED: profile-llmc-fp32-nsys requires NVIDIA nsys — not available on Apple Silicon."; \
+	else \
+		cd build/llmc && pixi run -e cuda nsys profile --force-overwrite true \
+			--trace=cuda,nvtx,osrt -o $(abspath build/profile_llmc_fp32) \
+			$(abspath $(LLMC_FP32_GPU_BIN)) $(LLMC_FP32_GPU_ARGS); \
+		echo "nsys report: build/profile_llmc_fp32.nsys-rep"; \
+	fi
 
 # Builds llmm.mojoc into the persistent cache the pytest suite consumes
 # (tests/.mef_cache/<source-fingerprint>/llmm.mojoc, via the bridge so

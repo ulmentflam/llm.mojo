@@ -13,6 +13,7 @@ from std.gpu.host.info import is_cpu, is_gpu
 from comm.reducescatter import reducescatter
 from comm.sync import enable_p2p, init_signal_buffer
 from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from std.sys import has_nvidia_gpu_accelerator
 
 
 # ===----------------------------------------------------------------------=== #
@@ -217,7 +218,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         self.zero_stage = zero_stage
         self.ctx = ctx
         self.cpu_coordinator_ptr = cpu_coord
-        comptime if not is_cpu[Self.target]():
+        comptime if not is_cpu[Self.target]() and has_nvidia_gpu_accelerator():
             _ = enable_p2p()
             self.signal_buffer = ctx.enqueue_create_buffer[DType.uint8](
                 max(Self.N, MAX_GPUS) * size_of[Signal]()
@@ -261,39 +262,47 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             coord_ptr[].barrier2[].wait()
         else:
             comptime if Self.N >= 2:
-                var in_layout = row_major(size)
-                var out_layout = row_major(size)
+                comptime if has_nvidia_gpu_accelerator():
+                    var in_layout = row_major(size)
+                    var out_layout = row_major(size)
 
-                var input_tensors = InlineArray[
-                    TileTensor[dtype, type_of(in_layout), MutAnyOrigin],
-                    Self.N,
-                ](uninitialized=True)
-                for i in range(Self.N):
-                    input_tensors[i] = TileTensor(
+                    var input_tensors = InlineArray[
+                        TileTensor[dtype, type_of(in_layout), MutAnyOrigin],
+                        Self.N,
+                    ](uninitialized=True)
+                    for i in range(Self.N):
+                        input_tensors[i] = TileTensor(
+                            Span[Scalar[dtype], MutAnyOrigin](
+                                ptr=ptr, length=size
+                            ),
+                            in_layout,
+                        )
+
+                    var output_tensor = TileTensor(
                         Span[Scalar[dtype], MutAnyOrigin](ptr=ptr, length=size),
-                        in_layout,
+                        out_layout,
                     )
 
-                var output_tensor = TileTensor(
-                    Span[Scalar[dtype], MutAnyOrigin](ptr=ptr, length=size),
-                    out_layout,
-                )
+                    var rank_sigs = self.get_rank_sigs_any()
 
-                var rank_sigs = self.get_rank_sigs_any()
-
-                allreduce[
-                    dtype,
-                    Self.N,
-                    type_of(in_layout),
-                    MutAnyOrigin,
-                    type_of(out_layout),
-                ](
-                    input_tensors,
-                    output_tensor,
-                    rank_sigs,
-                    self.ctx,
-                )
-                self.ctx.synchronize()
+                    allreduce[
+                        dtype,
+                        Self.N,
+                        type_of(in_layout),
+                        MutAnyOrigin,
+                        type_of(out_layout),
+                    ](
+                        input_tensors,
+                        output_tensor,
+                        rank_sigs,
+                        self.ctx,
+                    )
+                    self.ctx.synchronize()
+                else:
+                    raise Error(
+                        "Multi-GPU collectives require Nvidia GPUs; not"
+                        " supported on this hardware"
+                    )
 
     def reducescatter[
         dtype: DType
@@ -325,43 +334,49 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             coord_ptr[].barrier2[].wait()
         else:
             comptime if Self.N >= 2:
-                var in_layout = row_major(sharded_size)
-                var out_layout = row_major(sharded_size)
+                comptime if has_nvidia_gpu_accelerator():
+                    var in_layout = row_major(sharded_size)
+                    var out_layout = row_major(sharded_size)
 
-                var input_tensors = InlineArray[
-                    TileTensor[dtype, type_of(in_layout), MutAnyOrigin],
-                    Self.N,
-                ](uninitialized=True)
-                for i in range(Self.N):
-                    input_tensors[i] = TileTensor(
+                    var input_tensors = InlineArray[
+                        TileTensor[dtype, type_of(in_layout), MutAnyOrigin],
+                        Self.N,
+                    ](uninitialized=True)
+                    for i in range(Self.N):
+                        input_tensors[i] = TileTensor(
+                            Span[Scalar[dtype], MutAnyOrigin](
+                                ptr=input_ptr + i * sharded_size,
+                                length=sharded_size,
+                            ),
+                            in_layout,
+                        )
+
+                    var output_tensor = TileTensor(
                         Span[Scalar[dtype], MutAnyOrigin](
-                            ptr=input_ptr + i * sharded_size,
-                            length=sharded_size,
+                            ptr=output_ptr, length=sharded_size
                         ),
-                        in_layout,
+                        out_layout,
                     )
 
-                var output_tensor = TileTensor(
-                    Span[Scalar[dtype], MutAnyOrigin](
-                        ptr=output_ptr, length=sharded_size
-                    ),
-                    out_layout,
-                )
+                    var rank_sigs = self.get_rank_sigs_any()
 
-                var rank_sigs = self.get_rank_sigs_any()
-
-                reducescatter[
-                    dtype,
-                    Self.N,
-                    type_of(in_layout),
-                    MutAnyOrigin,
-                ](
-                    input_tensors,
-                    output_tensor,
-                    rank_sigs,
-                    self.ctx,
-                )
-                self.ctx.synchronize()
+                    reducescatter[
+                        dtype,
+                        Self.N,
+                        type_of(in_layout),
+                        MutAnyOrigin,
+                    ](
+                        input_tensors,
+                        output_tensor,
+                        rank_sigs,
+                        self.ctx,
+                    )
+                    self.ctx.synchronize()
+                else:
+                    raise Error(
+                        "Multi-GPU collectives require Nvidia GPUs; not"
+                        " supported on this hardware"
+                    )
 
     def allgather[
         dtype: DType
@@ -388,52 +403,58 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             coord_ptr[].barrier2[].wait()
         else:
             comptime if Self.N >= 2:
-                var in_layout = row_major(sharded_size)
-                var out_layout = row_major(sharded_size)
+                comptime if has_nvidia_gpu_accelerator():
+                    var in_layout = row_major(sharded_size)
+                    var out_layout = row_major(sharded_size)
 
-                var input_tensors = InlineArray[
-                    TileTensor[dtype, type_of(in_layout), MutAnyOrigin],
-                    Self.N,
-                ](uninitialized=True)
-                for i in range(Self.N):
-                    input_tensors[i] = TileTensor(
-                        Span[Scalar[dtype], MutAnyOrigin](
-                            ptr=ptr + i * sharded_size,
-                            length=sharded_size,
-                        ),
-                        in_layout,
+                    var input_tensors = InlineArray[
+                        TileTensor[dtype, type_of(in_layout), MutAnyOrigin],
+                        Self.N,
+                    ](uninitialized=True)
+                    for i in range(Self.N):
+                        input_tensors[i] = TileTensor(
+                            Span[Scalar[dtype], MutAnyOrigin](
+                                ptr=ptr + i * sharded_size,
+                                length=sharded_size,
+                            ),
+                            in_layout,
+                        )
+
+                    var output_tensors = InlineArray[
+                        TileTensor[dtype, type_of(out_layout), MutAnyOrigin],
+                        Self.N,
+                    ](uninitialized=True)
+                    for i in range(Self.N):
+                        output_tensors[i] = TileTensor(
+                            Span[Scalar[dtype], MutAnyOrigin](
+                                ptr=ptr + i * sharded_size,
+                                length=sharded_size,
+                            ),
+                            out_layout,
+                        )
+
+                    var rank_sigs = self.get_rank_sigs_any()
+
+                    allgather[
+                        dtype,
+                        Self.N,
+                        type_of(in_layout),
+                        MutAnyOrigin,
+                        type_of(out_layout),
+                        MutAnyOrigin,
+                    ](
+                        input_tensors,
+                        output_tensors,
+                        rank_sigs,
+                        self.ctx,
+                        my_rank=self.rank,
                     )
-
-                var output_tensors = InlineArray[
-                    TileTensor[dtype, type_of(out_layout), MutAnyOrigin],
-                    Self.N,
-                ](uninitialized=True)
-                for i in range(Self.N):
-                    output_tensors[i] = TileTensor(
-                        Span[Scalar[dtype], MutAnyOrigin](
-                            ptr=ptr + i * sharded_size,
-                            length=sharded_size,
-                        ),
-                        out_layout,
+                    self.ctx.synchronize()
+                else:
+                    raise Error(
+                        "Multi-GPU collectives require Nvidia GPUs; not"
+                        " supported on this hardware"
                     )
-
-                var rank_sigs = self.get_rank_sigs_any()
-
-                allgather[
-                    dtype,
-                    Self.N,
-                    type_of(in_layout),
-                    MutAnyOrigin,
-                    type_of(out_layout),
-                    MutAnyOrigin,
-                ](
-                    input_tensors,
-                    output_tensors,
-                    rank_sigs,
-                    self.ctx,
-                    my_rank=self.rank,
-                )
-                self.ctx.synchronize()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -546,62 +567,72 @@ struct ShardedParameter[
                 )
                 zero_ctx.ctx.synchronize()
             else:
-                var input_tensors = InlineArray[
-                    TileTensor[Self.dtype, in_layout, ImmutAnyOrigin],
-                    Self.N_GPUS,
-                ](uninitialized=True)
+                comptime if has_nvidia_gpu_accelerator():
+                    var input_tensors = InlineArray[
+                        TileTensor[Self.dtype, in_layout, ImmutAnyOrigin],
+                        Self.N_GPUS,
+                    ](uninitialized=True)
 
-                var out_tile = TileTensor(
-                    Span[Scalar[Self.dtype], MutAnyOrigin](
-                        ptr=rebind[
-                            UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
-                        ](full_buffer.unsafe_ptr().as_unsafe_any_origin()),
-                        length=self.size,
-                    ),
-                    out_tensor_layout,
-                )
-
-                var output_tensors = InlineArray[
-                    TileTensor[Self.dtype, out_layout, MutAnyOrigin],
-                    Self.N_GPUS,
-                ](uninitialized=True)
-
-                for i in range(Self.N_GPUS):
-                    input_tensors[i] = TileTensor(
-                        Span[Scalar[Self.dtype], ImmutAnyOrigin](
+                    var out_tile = TileTensor(
+                        Span[Scalar[Self.dtype], MutAnyOrigin](
                             ptr=rebind[
-                                UnsafePointer[
-                                    Scalar[Self.dtype], ImmutAnyOrigin
-                                ]
-                            ](all_sharded_buffers[i].as_unsafe_any_origin()),
-                            length=self.sharded_size,
+                                UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+                            ](full_buffer.unsafe_ptr().as_unsafe_any_origin()),
+                            length=self.size,
                         ),
-                        in_tensor_layout,
+                        out_tensor_layout,
                     )
-                    output_tensors[i] = out_tile
 
-                var rank_sigs_any = InlineArray[
-                    UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS
-                ](uninitialized=True)
-                for i in range(MAX_GPUS):
-                    rank_sigs_any[i] = (
-                        zero_ctx.signal_ptr() + i
-                    ).as_unsafe_any_origin()
+                    var output_tensors = InlineArray[
+                        TileTensor[Self.dtype, out_layout, MutAnyOrigin],
+                        Self.N_GPUS,
+                    ](uninitialized=True)
 
-                allgather[
-                    Self.dtype,
-                    Self.N_GPUS,
-                    in_layout,
-                    ImmutAnyOrigin,
-                    out_layout,
-                    MutAnyOrigin,
-                ](
-                    input_tensors,
-                    output_tensors,
-                    rank_sigs_any,
-                    zero_ctx.ctx,
-                    my_rank=zero_ctx.rank,
-                )
-                zero_ctx.ctx.synchronize()
+                    for i in range(Self.N_GPUS):
+                        input_tensors[i] = TileTensor(
+                            Span[Scalar[Self.dtype], ImmutAnyOrigin](
+                                ptr=rebind[
+                                    UnsafePointer[
+                                        Scalar[Self.dtype], ImmutAnyOrigin
+                                    ]
+                                ](
+                                    all_sharded_buffers[
+                                        i
+                                    ].as_unsafe_any_origin()
+                                ),
+                                length=self.sharded_size,
+                            ),
+                            in_tensor_layout,
+                        )
+                        output_tensors[i] = out_tile
+
+                    var rank_sigs_any = InlineArray[
+                        UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS
+                    ](uninitialized=True)
+                    for i in range(MAX_GPUS):
+                        rank_sigs_any[i] = (
+                            zero_ctx.signal_ptr() + i
+                        ).as_unsafe_any_origin()
+
+                    allgather[
+                        Self.dtype,
+                        Self.N_GPUS,
+                        in_layout,
+                        ImmutAnyOrigin,
+                        out_layout,
+                        MutAnyOrigin,
+                    ](
+                        input_tensors,
+                        output_tensors,
+                        rank_sigs_any,
+                        zero_ctx.ctx,
+                        my_rank=zero_ctx.rank,
+                    )
+                    zero_ctx.ctx.synchronize()
+                else:
+                    raise Error(
+                        "Multi-GPU collectives require Nvidia GPUs; not"
+                        " supported on this hardware"
+                    )
 
         return full_buffer

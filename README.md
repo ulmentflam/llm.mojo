@@ -72,6 +72,7 @@ Benchmark Results: (NVIDIA DGX Spark)
 - We run OpenMP-enabled llm.c with 20 threads.
 - CPU comparisons are all done in float32. GPU comparisons are done in float32 and mixed-precision bfloat16.
 - All benchmarks and metrics are designed to match hyperparameters in an apples-to-apples comparison.
+- **Apple Silicon (M1/M2/M3/M4):** use `make benchmark-metal` — llm.mojo (Metal GPU) vs PyTorch MPS; llm.c has no Metal port so it is replaced by the PyTorch MPS baseline. See `docs/ai/ai_assisted_optimizations_and_benchmarks.md` for the full Apple Silicon benchmarking setup.
 
 ### Single GPU
 

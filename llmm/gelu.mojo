@@ -156,6 +156,89 @@ def gelu_fwd[
         raise Error("Invalid target")
 
 
+# ===----------------------------------------------------------------------=== #
+# Fused bias (+ optional GELU) epilogue — Metal route-around for matmul_fwd.
+#
+# On the Metal GPU target, linalg.matmul's fused `elementwise_lambda_fn`
+# epilogue produces WRONG results (see probe_matmul_bias.mojo: has_bias=False
+# passes with max_abs=0, has_bias=True fails with max_abs≈74). This standalone
+# elementwise pass adds the per-column bias (and applies GELU, caching the
+# pre-activation) to the raw GEMM output that a plain `matmul_fwd[has_bias=
+# False, use_gelu=False]` wrote, matching the CPU epilogue exactly.
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def _bias_gelu_kernel[
+    dtype: DType,
+    has_bias: Bool,
+    use_gelu: Bool,
+](
+    out_ptr: MutKernelPtr[dtype],
+    pre_gelu_ptr: MutKernelPtr[dtype],
+    bias_ptr: ImmutKernelPtr[dtype],
+    n: Int,
+    out_channels: Int,
+) -> None:
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while i < n:
+        var v = out_ptr[i].cast[DType.float32]()
+        comptime if has_bias:
+            var col = i % out_channels
+            v = v + bias_ptr[col].cast[DType.float32]()
+        comptime if use_gelu:
+            pre_gelu_ptr[i] = v.cast[dtype]()
+            out_ptr[i] = gelu[DType.float32, 1](v).cast[dtype]()
+        else:
+            out_ptr[i] = v.cast[dtype]()
+        i += stride
+
+
+def bias_gelu_fwd[
+    dtype: DType,
+    target: StaticString,
+    has_bias: Bool = True,
+    use_gelu: Bool = False,
+](
+    out_ptr: MutKernelPtr[dtype],
+    pre_gelu_ptr: MutKernelPtr[dtype],
+    bias_ptr: ImmutKernelPtr[dtype],
+    rows: Int,
+    out_channels: Int,
+    ctx: DeviceContext,
+) raises -> None:
+    var n = rows * out_channels
+    comptime if is_cpu[target]():
+        for i in range(n):
+            var v = out_ptr[i].cast[DType.float32]()
+            comptime if has_bias:
+                v = v + bias_ptr[i % out_channels].cast[DType.float32]()
+            comptime if use_gelu:
+                pre_gelu_ptr[i] = v.cast[dtype]()
+                out_ptr[i] = gelu[DType.float32, 1](v).cast[dtype]()
+            else:
+                out_ptr[i] = v.cast[dtype]()
+    elif is_gpu[target]():
+        comptime BLOCK_SIZE = 256
+        var device_ctx = ctx
+        var num_blocks = ceildiv(n, BLOCK_SIZE)
+        comptime gpu_kernel = _bias_gelu_kernel[dtype, has_bias, use_gelu]
+        var compiled = device_ctx.compile_function[gpu_kernel]()
+        device_ctx.enqueue_function(
+            compiled,
+            out_ptr,
+            pre_gelu_ptr,
+            bias_ptr,
+            n,
+            out_channels,
+            grid_dim=(num_blocks,),
+            block_dim=(BLOCK_SIZE,),
+        )
+    else:
+        raise Error("Invalid target")
+
+
 @compiler.register("gelu_fwd")
 struct GeluFwd:
     @staticmethod
