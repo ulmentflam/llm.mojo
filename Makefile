@@ -97,6 +97,10 @@ BENCH_GPU_STEPS ?= 40
 # full run is ~70 s of GPU time (manageable for a local Mac). Override with
 # BENCH_METAL_STEPS=N on the command line.
 BENCH_METAL_STEPS ?= 10
+# Seconds to sleep between Metal benchmark arms so each arm starts comparably cool
+# (M4 Max hits the thermal throttle cliff at ~8 s of sustained load — P16).
+# Set to 0 to skip cooldown (useful for quick dev runs with small BENCH_METAL_STEPS).
+BENCH_COOLDOWN_S ?= 30
 BENCH_ARGS := --batch-size $(BENCH_B) --seq-len $(BENCH_T)
 HAVE_NVCC := $(shell command -v nvcc 2>/dev/null)
 # Detect Apple Silicon so make benchmark auto-selects the Metal path.
@@ -164,9 +168,10 @@ help:
 	@echo "  benchmark     Histogram of train-loop time (auto: Metal on Apple, NVIDIA GPU on Linux)"
 	@echo "  benchmark-cpu Only the CPU comparison (no CUDA / Metal needed)"
 	@echo "  benchmark-gpu Only the NVIDIA GPU comparison"
-	@echo "  benchmark-metal  Apple Silicon Metal GPU: llm.mojo vs PyTorch MPS (no llm.c dep)"
+	@echo "  benchmark-metal  Apple Silicon Metal GPU: llm.mojo fp32+bf16 vs PyTorch MPS fp32+bf16"
+	@echo "                   (4 arms in one graph, mirroring benchmark-gpu's fp32+bf16 layout)"
 	@echo "                   llm.c has no Metal port — baseline is PyTorch MPS"
-	@echo "                   (hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS)"
+	@echo "                   (hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS, BENCH_COOLDOWN_S)"
 	@echo "  profile-llmc-ncu  Profile llm.c bf16 CUDA kernels with ncu (NVIDIA only)"
 	@echo "  profile-llmc-nsys Capture an nsys timeline of llm.c bf16 CUDA kernels (NVIDIA only)"
 	@echo "  profile-llmc-fp32-ncu   Profile llm.c fp32 CUDA kernels with ncu (NVIDIA only)"
@@ -450,20 +455,24 @@ benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
 	pixi run python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
 		--gpu-steps $(BENCH_GPU_STEPS)
 
-# Apple Silicon Metal GPU benchmark: llm.mojo (Metal) vs PyTorch MPS.
+# Apple Silicon Metal GPU benchmark: llm.mojo fp32+bf16 vs PyTorch MPS fp32+bf16.
+# 4 arms in one graph, mirroring how benchmark-gpu combines fp32+bf16 for NVIDIA.
 # No llm.c dependency — llm.c has no Metal port; the baseline is PyTorch MPS.
-# Hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS (default 10 due to ~6.5 s/step).
-benchmark-metal: $(PROFILE_BIN) $(BENCH_SCRIPT)
+# Hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS (default 10 due to ~6.5 s/step),
+#              BENCH_COOLDOWN_S (default 30 s — thermal discipline for M4 Max).
+benchmark-metal: $(PROFILE_BIN) $(PROFILE_BIN_BF16) $(BENCH_SCRIPT)
 	pixi run python $(BENCH_SCRIPT) --device metal $(BENCH_ARGS) \
-		--metal-steps $(BENCH_METAL_STEPS)
+		--metal-steps $(BENCH_METAL_STEPS) --cooldown-s $(BENCH_COOLDOWN_S)
 
 # Auto mode: on Apple Silicon run the Metal benchmark; on NVIDIA run CPU + GPU.
 ifeq ($(IS_APPLE_SILICON),1)
-benchmark: $(PROFILE_BIN) $(BENCH_SCRIPT)
+benchmark: $(PROFILE_BIN) $(PROFILE_BIN_BF16) $(BENCH_SCRIPT)
 	@echo "Apple Silicon detected — running Metal benchmark (llm.c CUDA not available)."
 	@echo "  llm.c has no Metal port; baseline is PyTorch MPS."
+	@echo "  4 arms: llm.mojo fp32+bf16, PyTorch MPS fp32+bf16."
 	pixi run python $(BENCH_SCRIPT) --device auto $(BENCH_ARGS) \
-		--cpu-steps $(BENCH_CPU_STEPS) --metal-steps $(BENCH_METAL_STEPS)
+		--cpu-steps $(BENCH_CPU_STEPS) --metal-steps $(BENCH_METAL_STEPS) \
+		--cooldown-s $(BENCH_COOLDOWN_S)
 else
 benchmark: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc $(BENCH_SCRIPT)
 	pixi run python $(BENCH_SCRIPT) --device auto $(BENCH_ARGS) \

@@ -13,9 +13,12 @@ Configurations
   GPU (NVIDIA, requires CUDA):
     llm.mojo (fp32) | llm.mojo (bf16) | llm.c CUDA (fp32) | llm.c CUDA (bf16)
     | PyTorch (fp32) | PyTorch (bf16)
-  Metal (Apple Silicon, fp32):
-    llm.mojo fp32 (Metal GPU via build/profile_gpt2 gpu) | PyTorch MPS fp32
+  Metal (Apple Silicon, fp32 + bf16):
+    llm.mojo fp32 (build/profile_gpt2 gpu) | llm.mojo bf16 (build/profile_gpt2_bf16 gpu)
+    | PyTorch MPS fp32 | PyTorch MPS bf16
     NOTE: llm.c has no Metal port — the baseline is PyTorch on MPS, not llm.c.
+    A --cooldown-s pause (default 30 s) runs between arms to prevent M4 Max thermal
+    throttling from skewing later arms (see P16 in metal_port_gotchas_and_optimizations.md).
 
 Device selection:
   --device cpu    only the CPU figure (works on macOS / any box, no CUDA)
@@ -24,13 +27,13 @@ Device selection:
   --device auto   CPU always; on Apple Silicon: Metal; on NVIDIA: GPU (default)
 
 Prereqs (built by the Makefile): build/profile_gpt2 (llm.mojo fp32 harness),
-build/profile_gpt2_bf16 (llm.mojo bf16 harness, GPU/CUDA mode only), the llm.c
-binaries third_party/llm.c/{train_gpt2, train_gpt2cu, train_gpt2fp32cu} (CPU/GPU
-modes only), and PyTorch in the pixi env. The llm.c inputs are staged into
-build/llmc/ with their magic numbers patched to the values llm.c expects (the
-byte layout is otherwise identical). The PyTorch reference is llm.c's train_gpt2.py
-run with random d12 (=GPT-2 124M) weights for CUDA mode, or the repo-local
-train_gpt2.py with --device mps for Metal mode.
+build/profile_gpt2_bf16 (llm.mojo bf16 harness, used for both GPU/CUDA and Metal
+modes), the llm.c binaries third_party/llm.c/{train_gpt2, train_gpt2cu,
+train_gpt2fp32cu} (CPU/GPU modes only), and PyTorch in the pixi env. The llm.c
+inputs are staged into build/llmc/ with their magic numbers patched to the values
+llm.c expects (the byte layout is otherwise identical). The PyTorch reference is
+llm.c's train_gpt2.py run with random d12 (=GPT-2 124M) weights for CUDA mode, or
+the repo-local train_gpt2.py with --device mps for Metal mode (fp32 and bf16).
 """
 
 import argparse
@@ -43,6 +46,7 @@ import struct
 import subprocess
 import sys
 import textwrap
+import time
 import matplotlib
 import matplotlib.pyplot as plt
 
@@ -413,16 +417,19 @@ def bench_torch(device, dtype, steps):
     return [float(x) for x in _TORCH_RE.findall(out)]
 
 
-def bench_torch_mps(steps):
+def bench_torch_mps(steps, dtype="float32"):
     """Benchmark our local train_gpt2.py on Apple MPS (Metal Performance Shaders).
 
     Uses the repo-local train_gpt2.py (not llm.c's reference) because it already
     has --device mps support with torch.mps.synchronize() for accurate timing.
     The output format matches _TORCH_RE: '({ms:.2f} ms | {tok/s:.0f} tok/s)'.
+
+    dtype: "float32" or "bfloat16". The repo-local train_gpt2.py supports both via
+    torch.amp.autocast(device_type='mps', dtype=...) — see the --dtype flag.
     """
     if not os.path.exists(TORCH_TRAIN_PY):
         print(
-            f"  (skip PyTorch MPS: {TORCH_TRAIN_PY} not found)",
+            f"  (skip PyTorch MPS {dtype}: {TORCH_TRAIN_PY} not found)",
             flush=True,
         )
         return []
@@ -445,7 +452,7 @@ def bench_torch_mps(steps):
         "--total_batch_size",
         str(B * T),
         "--dtype",
-        "float32",
+        dtype,
         "--inference_only",
         "0",
         "--overfit_single_batch",
@@ -464,7 +471,7 @@ def bench_torch_mps(steps):
     if not samples:
         # Surface the failure clearly so the Metal run still emits the Mojo half.
         print(
-            "  WARNING: PyTorch MPS arm returned no timing samples.\n"
+            f"  WARNING: PyTorch MPS {dtype} arm returned no timing samples.\n"
             "  This may mean train_gpt2.py --device mps is not yet fully "
             "implemented or MPS is unavailable.\n"
             "  llm.mojo Metal timings will still be reported.\n"
@@ -588,7 +595,7 @@ def _hardware_subtitle(info):
     return "  |  ".join(parts)
 
 
-def plot_bars(device, series, info, outpath):
+def plot_bars(device, series, info, outpath, footer=None):
 
     matplotlib.use("Agg")
 
@@ -684,31 +691,57 @@ def plot_bars(device, series, info, outpath):
     # Hyperparameters belong on the figure itself so a saved PNG is self-describing:
     # batch, sequence length, and the resulting tokens/step the bars are measured at.
     cfg = f"B={B}, T={T}  ({B * T} tok/step)"
-    title = f"GPT-2 124M {dev_label} training-loop time — {cfg} (lower is better)"
+    # "(lower is better)" lives on the subtitle, not the title: the title must
+    # end clear of the right-margin legend column (constrained layout centers
+    # the suptitle across the FULL figure width, legend column included).
+    title = f"GPT-2 124M {dev_label} training-loop time — {cfg}"
     # Machine/date details move to a smaller, de-duplicated, wrapped subtitle
     # line rather than crowding (and overflowing) the main title.
-    sub = _hardware_subtitle(info)
+    sub = _hardware_subtitle(info) + "  |  lower is better"
     sub_wrapped = textwrap.fill(sub, width=max(60, int(fig.get_figwidth() * 11)))
 
-    fig.suptitle(title, fontsize=13, color=TEXT_INK)
+    # Left-anchored so the title can never run under the right-margin legend.
+    fig.suptitle(title, fontsize=13, color=TEXT_INK, x=0.02, ha="left")
     ax.set_title(sub_wrapped, fontsize=9.5, color=TEXT_GRAY, pad=8)
 
     # Precision legend only when both fp32 and bf16 appear — otherwise the x
     # tick labels already carry the precision, and a legend is redundant.
+    # Placed OUTSIDE the axes (constrained layout reserves space for it) so it
+    # can never collide with the value annotation above the tallest bar.
     precisions = {s["precision"] for s in series}
     if {"fp32", "bf16"} <= precisions:
         legend = [
             Patch(facecolor=LEGEND_FILL, edgecolor=TEXT_INK, label="fp32"),
             Patch(facecolor=LEGEND_FILL, edgecolor=TEXT_INK, hatch="///", label="bf16"),
         ]
-        ax.legend(handles=legend, fontsize=9, loc="upper right", frameon=False)
+        fig.legend(
+            handles=legend,
+            fontsize=9,
+            loc="outside right upper",
+            frameon=False,
+        )
+
+    if footer:
+        # supxlabel participates in constrained layout, so the figure grows to
+        # fit the footer instead of overlapping the x tick labels (the old
+        # fig.text(0.5, 0.0, ...) was invisible to the layout engine). Wrap so
+        # a long footer becomes extra lines rather than overflowing the width.
+        footer_wrapped = textwrap.fill(
+            footer, width=max(80, int(fig.get_figwidth() * 13))
+        )
+        fig.supxlabel(
+            footer_wrapped,
+            fontsize=7.5,
+            color=TEXT_GRAY,
+            style="italic",
+        )
 
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
     fig.savefig(outpath, dpi=130, bbox_inches="tight")
     print(f"\n{dev_label} bar chart written to {outpath}")
 
 
-def print_summary(info, device, rows):
+def print_summary(info, device, rows, footer=None):
     dev_label = {"gpu": "GPU", "cpu": "CPU", "metal": "METAL GPU"}.get(
         device, device.upper()
     )
@@ -730,6 +763,8 @@ def print_summary(info, device, rows):
             f"{r['median']:>9.2f} {r['std']:>8.2f} {r['tok_s']:>9.0f}"
         )
     print("=" * 84)
+    if footer:
+        print(f"  Note: {footer}")
 
 
 # --------------------------------------------------------------------------- #
@@ -823,21 +858,37 @@ def gpu_series(steps):
     )
 
 
-def metal_series(steps):
-    """Benchmark series for Apple Silicon Metal GPU.
+def metal_series(steps, cooldown_s=30):
+    """Benchmark series for Apple Silicon Metal GPU — 4 arms: fp32 + bf16 for both
+    llm.mojo and PyTorch MPS.
 
     llm.c has NO Metal port — the baseline is PyTorch on MPS (Metal Performance
-    Shaders) via the repo-local train_gpt2.py.  The llm.mojo side uses the same
-    build/profile_gpt2 binary with target 'gpu': on Apple Silicon, Mojo's GPU
-    backend dispatches to Metal automatically (no extra flags needed).
+    Shaders) via the repo-local train_gpt2.py.
 
-    At B=4, T=1024, fp32, expect ~6.5 s/step for llm.mojo Metal.
+    The llm.mojo fp32 arm uses build/profile_gpt2 (the fp32 harness) with target
+    'gpu': on Apple Silicon, Mojo's GPU backend dispatches to Metal automatically.
+    The llm.mojo bf16 arm uses build/profile_gpt2_bf16 (the -D LLMM_BF16 build),
+    which auto-loads gpt2_124M_bf16.bin.
+
+    PyTorch MPS bf16 uses train_gpt2.py --device mps --dtype bfloat16 with
+    torch.amp.autocast(device_type='mps', dtype=torch.bfloat16).
+
+    cooldown_s: seconds to sleep between arms so each starts comparably cool
+    (M4 Max hits the thermal throttle cliff at ~8 s of sustained load — P16 in
+    docs/ai/metal_port_gotchas_and_optimizations.md).
     """
     print(
         "NOTE: llm.c has no Metal port — baseline is PyTorch MPS "
         "(train_gpt2.py --device mps).",
         flush=True,
     )
+    if cooldown_s > 0:
+        print(
+            f"  Thermal discipline: {cooldown_s}s cooldown between arms "
+            "(M4 Max throttle cliff ~8 s, P16).",
+            flush=True,
+        )
+
     print(f"[metal] llm.mojo fp32  (B={B} T={T} x{steps}) ...", flush=True)
     yield summarize(
         "metal/llm.mojo-fp32",
@@ -846,13 +897,44 @@ def metal_series(steps):
         "fp32",
         bench_mojo(MOJO_FP32_BIN, "gpu", steps),
     )
+
+    if cooldown_s > 0:
+        print(f"  Cooling down {cooldown_s}s ...", flush=True)
+        time.sleep(cooldown_s)
+
+    print(f"[metal] llm.mojo bf16  (B={B} T={T} x{steps}) ...", flush=True)
+    yield summarize(
+        "metal/llm.mojo-bf16",
+        "llm.mojo\nbf16",
+        "llm.mojo",
+        "bf16",
+        bench_mojo(MOJO_BF16_BIN, "gpu", steps),
+    )
+
+    if cooldown_s > 0:
+        print(f"  Cooling down {cooldown_s}s ...", flush=True)
+        time.sleep(cooldown_s)
+
     print(f"[metal] PyTorch MPS fp32  (B={B} T={T} x{steps}) ...", flush=True)
     yield summarize(
         "metal/torch-mps-fp32",
         "PyTorch MPS\nfp32",
         "PyTorch",
         "fp32",
-        bench_torch_mps(steps),
+        bench_torch_mps(steps, "float32"),
+    )
+
+    if cooldown_s > 0:
+        print(f"  Cooling down {cooldown_s}s ...", flush=True)
+        time.sleep(cooldown_s)
+
+    print(f"[metal] PyTorch MPS bf16  (B={B} T={T} x{steps}) ...", flush=True)
+    yield summarize(
+        "metal/torch-mps-bf16",
+        "PyTorch MPS\nbf16",
+        "PyTorch",
+        "bf16",
+        bench_torch_mps(steps, "bfloat16"),
     )
 
 
@@ -870,7 +952,7 @@ def main():
         help=(
             "cpu: CPU comparison only; "
             "gpu: NVIDIA GPU (requires CUDA); "
-            "metal: Apple Silicon Metal GPU (llm.mojo + PyTorch MPS); "
+            "metal: Apple Silicon Metal GPU (llm.mojo fp32+bf16, PyTorch MPS fp32+bf16); "
             "auto: CPU always, plus Metal on Apple Silicon or GPU on NVIDIA (default)"
         ),
     )
@@ -894,8 +976,20 @@ def main():
         type=int,
         default=DEFAULT_METAL_STEPS,
         help=(
-            f"measured steps for the Metal run (default {DEFAULT_METAL_STEPS}). "
-            "fp32 Metal at B=4 T=1024 is ~6.5 s/step; keep this modest."
+            f"measured steps per arm for the Metal run (default {DEFAULT_METAL_STEPS}). "
+            "fp32 Metal at B=4 T=1024 is ~6.5 s/step; keep this modest. "
+            "All four arms (llm.mojo fp32/bf16, PyTorch MPS fp32/bf16) use this count."
+        ),
+    )
+    ap.add_argument(
+        "--cooldown-s",
+        type=int,
+        default=30,
+        help=(
+            "seconds to sleep between Metal benchmark arms (default 30). "
+            "The M4 Max hits the thermal throttle cliff at ~8 s of sustained load "
+            "(P16 in docs/ai/metal_port_gotchas_and_optimizations.md); a per-arm "
+            "cooldown ensures each arm starts comparably cool. Set to 0 to skip."
         ),
     )
     ap.add_argument("--output-cpu", default=None, help="output PNG for the CPU figure")
@@ -956,19 +1050,29 @@ def main():
             )
 
     if do_metal:
-        series = [s for s in metal_series(args.metal_steps) if s]
+        cooldown_s = args.cooldown_s
+        metal_footer = (
+            f"Thermal discipline: {cooldown_s}s cooldown between each of the 4 arms "
+            f"(M4 Max throttle cliff ~8 s, P16). "
+            "llm.c has no Metal port — baseline is PyTorch MPS."
+            if cooldown_s > 0
+            else "llm.c has no Metal port — baseline is PyTorch MPS."
+        )
+        series = [s for s in metal_series(args.metal_steps, cooldown_s=cooldown_s) if s]
         if series:
-            print_summary(info, "metal", series)
+            print_summary(info, "metal", series, footer=metal_footer)
             plot_bars(
                 "metal",
                 series,
                 info,
                 args.output_metal or default_output(info, "metal"),
+                footer=metal_footer,
             )
         else:
             print(
                 "Metal benchmark produced no results. "
-                "Ensure build/profile_gpt2 is built (make build-profile).",
+                "Ensure build/profile_gpt2 and build/profile_gpt2_bf16 are built "
+                "(make build-profile build-profile-bf16).",
                 file=sys.stderr,
             )
 

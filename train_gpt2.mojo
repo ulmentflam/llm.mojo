@@ -38,6 +38,7 @@ from llmm.layernorm import (
     layernorm_bwd,
     layernorm_fused_residual_fwd,
     layernorm_fused_residual_bwd,
+    residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
 from llmm.matmul import matmul_fwd, matmul_bwd
@@ -1550,7 +1551,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     size=batch_size * seq_len,
                 )
                 cls_targets = self.targets_dev
-            self.ctx.synchronize()
+            # Metal: in-order queue guarantees host→device copies complete
+            # before subsequent GPU kernels see inputs_dev/targets_dev; staging
+            # buffer reuse is safe because forward() syncs at the mean_loss
+            # read-back (line ~1925) before the next micro-step can overwrite.
+            comptime if not HAS_METAL:
+                self.ctx.synchronize()
 
         self.build_encoder_buckets(batch_size, seq_len)
 
@@ -1576,7 +1582,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 ](self.workload_indices.as_unsafe_any_origin()),
                 size=batch_size * seq_len,
             )
-            self.ctx.synchronize()
+            # Metal: in-order queue ensures bucket_info_dev/workload_indices_dev
+            # are visible to encoder_fwd before it starts — no explicit sync needed.
+            comptime if not HAS_METAL:
+                self.ctx.synchronize()
 
         comptime if Self.WORLD_SIZE > 1:
             # ZeRO-3: Gather all parameter shards into params_buf before running forward.
@@ -1748,8 +1757,26 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
             # Attention Forward (handles QKV Split/Transpose and Merge Heads internally).
             var head_dim = channels // num_heads
-            # Point the KVCache at this layer's stored-probs slice so the forward
-            # writes P there and the backward reads it (skips the QKᵀ recompute).
+            # Store-P: the forward stores this layer's softmax probs P into
+            # acts.att_probs[layer] so the backward reads them back instead of
+            # recomputing QKᵀ. Enabled on BOTH targets.
+            #
+            # NOTE (Metal recompute): the QKᵀ-recompute backward is now
+            # numerically correct — the root-cause bug was in attention.mojo,
+            # where the Metal backward reused the single, layer-overwritten
+            # gemm_att scratch (p_buf) as "the stored P". Since forward and
+            # backward run as two separate whole-model loops, p_buf held only the
+            # LAST forward layer's P at backward time, aliasing every backward
+            # layer to it and amplifying gradients with depth. That fast-path is
+            # removed; disabling the store (att_probs_addr=0) now takes the true
+            # per-layer QKᵀ recompute (correct, verified 16/16). It is NOT enabled
+            # because it is a net LOSS with the current tensor-core Metal GEMM
+            # kernels: measured +3.5% step time (fp32 736.6→762.9 ms, bf16
+            # 587.1→606.8 ms, B=4 T=1024) — the att_probs store is no longer the
+            # bottleneck, so the extra backward QKᵀ GEMM costs more than the store
+            # saves. Flip these two assignments to `if not HAS_METAL` /
+            # att_probs_addr=0 to trade that 3.5% for ~2.4 GB (fp32) less memory
+            # if T-scaling (att_probs grows as T²) ever makes the store dominate.
             self.kv_cache.att_probs_addr = Int(self.acts.att_probs)
             self.kv_cache.att_probs_layer = layer
             self.kv_cache.att_probs_stride = (
@@ -1871,7 +1898,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             Int64(vocab_size_padded),
             self.ctx,
         )
-        self.ctx.synchronize()
+        # Metal: matmul_fwd and fused_classifier are both GPU kernels; the
+        # in-order queue sequences them without an explicit sync.
+        comptime if not HAS_METAL:
+            self.ctx.synchronize()
 
         # Fused classifier: cross-entropy loss AND dlogits in ONE pass (llm.c's
         # structure). Since dL/dloss = 1/(B·T·grad_accum_steps) is a constant, we
@@ -1904,8 +1934,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx,
             )
 
-            # Sync context before reading losses on CPU.
-            self.ctx.synchronize()
+            # Non-Metal: ensure fused_classifier completes before the
+            # device→host copy that follows (no in-order guarantee on CUDA).
+            # Metal: in-order queue sequences fused_classifier → enqueue_copy
+            # automatically; the actual CPU read is guarded by the sync below.
+            comptime if not HAS_METAL:
+                self.ctx.synchronize()
 
             # Copy losses back to host.
             var count = batch_size * seq_len
@@ -2014,7 +2048,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     ),
                     Scalar[GPT2_DTYPE](0),
                 )
-        self.ctx.synchronize()
+        # Metal: enqueue_memset/fill ops and subsequent backward kernels are
+        # all on the same in-order queue; no sync needed for GPU→GPU ordering.
+        comptime if not HAS_METAL:
+            self.ctx.synchronize()
 
     def backward(
         mut self, grad_accum_steps: Int = 1, micro_step: Int = 0
@@ -2218,16 +2255,30 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
 
-            # MLP projection backward.
+            # GOTCHA (gradient flow): GELU lives at the 4C boundary between FC
+            # and PROJ. Its gradient must fuse into THIS (PROJ) backward —
+            # use_gelu=True here, use_gelu=False in the FC backward below. The
+            # reverse assignment was wrong (C2): gelu'() ran at C-wide stride
+            # instead of 4C-wide, corrupting d_ln_2. (llm.c: gelu fuses into the
+            # fcproj backward, not the fc one.) See metal_port_gotchas_and_optimizations.md C2.
+            #
+            # MLP projection backward (fused GELU). The GELU nonlinearity sits
+            # between the FC matmul (produces fch, 4C-wide pre-activation) and
+            # this projection matmul (consumes fch_gelu, 4C-wide). Its gradient
+            # must therefore be applied at the 4C boundary — i.e. fused into
+            # THIS backward, which crosses that boundary going from d_fc_proj to
+            # d(fch_gelu) and on to d(fch). With use_gelu=True and pre_gelu=l_fch,
+            # matmul_d_input_bwd computes d_l_fch_gelu = gelu'(l_fch) ⊙
+            # (d_fc_proj @ proj_weight) = d_fch (post-GELU-grad, still 4C-wide).
             var loop_t0 = global_perf_counter_ns()
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
+            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
                 as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
                 as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
                 as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
                 as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
                 as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](l_fch),
                 as_mut_kernel[GPT2_DTYPE](d_l_attn),
                 Int64(batch_size),
                 Int64(seq_len),
@@ -2236,20 +2287,49 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx,
             )
 
-            # MLP FC backward (fused GELU).
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
+            # MLP FC backward (no GELU — d_l_fch_gelu already carries d_fch, the
+            # post-GELU-grad, from the fused projection backward above). This
+            # matmul lives entirely below the GELU, so it just backprops the
+            # linear FC: d_l_ln_2 = d_fch @ fc_weight.
+            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
                 as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
                 as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
                 as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
                 as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
                 as_mut_kernel[GPT2_DTYPE](l_ln_2),
                 as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
-                as_mut_kernel[GPT2_DTYPE](l_fch),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](d_l_fch),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
                 Int64(4 * channels),
+                self.ctx,
+            )
+
+            # GOTCHA (gradient flow): the fused LN backward only adds LN_dinp to
+            # its targets (`d_inp1 += LN_dinp; d_inp2 += LN_dinp`). The incoming
+            # residual gradient dR must be seeded into both targets BEFORE the fused
+            # kernel runs; omitting this drops the identity-skip and causes block
+            # gradients to decay geometrically with depth (C1, July 2026).
+            # See docs/ai/metal_port_gotchas_and_optimizations.md C1.
+            #
+            # Seed the incoming residual-stream gradient before the fused ln_2
+            # backward. The forward op is residual_2 = block_input + attn_proj
+            # (then ln_2 = LN(residual_2)); its backward must produce
+            # d_block_input = d_attn_proj = LN2_dinp + d_residual_2, where the
+            # incoming d_residual_2 = dR (grad flowing back through the residual
+            # stream). That incoming gradient is exactly what the MLP-proj
+            # backward just consumed as d_output (d_l_fc_proj), since the next
+            # residual add is residual_3 = residual_2 + fc_proj. The fused kernel
+            # only does `+= LN2_dinp`, so we pre-add dR into both targets here;
+            # without this the residual identity skip is dropped and block
+            # gradients decay geometrically with depth.
+            residual_grad_broadcast[GPT2_DTYPE, Self.target](
+                as_mut_kernel[GPT2_DTYPE](d_block_input),
+                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
+                as_immut_kernel_from_mut[GPT2_DTYPE](d_l_fc_proj),
+                batch_size * seq_len * channels,
                 self.ctx,
             )
 
@@ -2290,8 +2370,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx,
             )
 
-            # Attention backward — point the cache at this layer's stored probs
-            # so the backward reads P instead of recomputing QKᵀ.
+            # Attention backward — read the forward-stored probs P from
+            # acts.att_probs[layer] (see the forward store note; recompute is
+            # correct but a net perf loss with the current Metal GEMM kernels).
             self.kv_cache.att_probs_addr = Int(self.acts.att_probs)
             self.kv_cache.att_probs_layer = layer
             self.kv_cache.att_probs_stride = (
@@ -2336,13 +2417,32 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
             # LayerNorm 1 backward.
             if layer == 0:
+                # d_block_input (encoded) already holds the accumulated residual
+                # gradient dR_0 (seed + ln_2 backward above). The plain
+                # layernorm_bwd overwrites its d_x output, so route the LN1 input
+                # gradient into a dead scratch (grad_acts.residual_3[0] — layer
+                # 1's backward already consumed it) and then add it into encoded,
+                # preserving the residual identity skip into the encoder.
+                var ln1_scratch = self.grad_acts.residual_3
+                # GOTCHA (gradient flow): layernorm_bwd reconstructs
+                # xhat = (input - mean)/rstd from the PRE-NORM INPUT, not the
+                # normed output. For layer 0, that input is acts.encoded (the
+                # encoder output), not l_ln_1 (the LN output). Passing l_ln_1
+                # corrupts xhat and hence dgamma; dbeta is unaffected (it only
+                # depends on d_out, not xhat). Bug class: C3 (July 2026).
+                # See docs/ai/metal_port_gotchas_and_optimizations.md C3.
+                # LN1's forward INPUT for layer 0 is the encoder output
+                # (acts.encoded); layernorm_bwd needs that pre-norm input to
+                # form xhat = (input - mean)*rstd, NOT l_ln_1 (the normed
+                # OUTPUT). Passing the output corrupts xhat and hence the
+                # gamma gradient (dbeta, which ignores xhat, stays correct).
                 layernorm_bwd[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
-                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_mut_kernel[GPT2_DTYPE](self.acts.encoded),
                     as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
                     as_mut_kernel[StatsDType](l_ln_1_mean),
                     as_mut_kernel[StatsDType](l_ln_1_rstd),
-                    as_mut_kernel[GPT2_DTYPE](d_block_input),
+                    as_mut_kernel[GPT2_DTYPE](ln1_scratch),
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1_gamma),
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1_beta),
                     Int64(batch_size),
@@ -2350,8 +2450,35 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(channels),
                     self.ctx,
                 )
+                # encoded += LN1_dinp (the second broadcast target, attn_proj[0],
+                # is already consumed and dead, so the extra add is harmless).
+                residual_grad_broadcast[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](d_block_input),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](ln1_scratch),
+                    batch_size * seq_len * channels,
+                    self.ctx,
+                )
             else:
                 var prev_layer_offset = (layer - 1) * layer_stride
+                # Seed the incoming residual gradient d_R_L (accumulated into
+                # d_block_input by the ln_2 residual backward above) into the
+                # ln_1 residual-backward targets residual_2[L-1] / fc_proj[L-1]
+                # — the two forward inputs whose sum is this layer's block input
+                # (residual_3[L-1] = residual_2[L-1] + fc_proj[L-1]). The fused
+                # `+= LN1_dinp` then yields the full d_R_L split that becomes
+                # layer L-1's incoming residual gradient.
+                residual_grad_broadcast[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.grad_acts.residual_2 + prev_layer_offset
+                    ),
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.grad_acts.fc_proj + prev_layer_offset
+                    ),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](d_block_input),
+                    batch_size * seq_len * channels,
+                    self.ctx,
+                )
                 layernorm_fused_residual_bwd[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](
                         self.grad_acts.residual_2 + prev_layer_offset
@@ -2653,7 +2780,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # kernel reduces them into out_buf[0].
             var out_buf = self.ctx.enqueue_create_buffer[DType.float32](grid_x)
             out_buf.enqueue_fill(Scalar[DType.float32](0.0))
-            self.ctx.synchronize()
+            # Metal: unsafe_ptr() is a CPU-side query (pointer value, not
+            # content); the fill and subsequent norm kernel are sequenced by
+            # the in-order queue — no sync needed here.
+            comptime if not HAS_METAL:
+                self.ctx.synchronize()
             var out_ptr = rebind_mut_mem[DType.float32](
                 out_buf.unsafe_ptr().as_unsafe_any_origin()
             )
@@ -2681,10 +2812,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 grid_dim=(1,),
                 block_dim=(BLOCK_SIZE,),
             )
-            self.ctx.synchronize()
+            # Metal: aggregate kernel → enqueue_copy (device→host) sequenced
+            # by in-order queue; no sync needed before creating the host buffer.
+            comptime if not HAS_METAL:
+                self.ctx.synchronize()
 
             var host_out = self.ctx.enqueue_create_host_buffer[DType.float32](1)
-            self.ctx.synchronize()
+            # Metal: HostBuffer pointer is valid immediately after creation;
+            # the subsequent enqueue_copy is sequenced after the agg kernel.
+            comptime if not HAS_METAL:
+                self.ctx.synchronize()
             self.ctx.enqueue_copy(
                 dst_ptr=rebind[
                     UnsafePointer[Scalar[DType.float32], MutAnyOrigin]

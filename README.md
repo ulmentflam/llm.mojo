@@ -30,10 +30,10 @@ curl -fsSL https://pixi.sh/install.sh | sh
 
 ### Step 3: Install Dependencies and Git Hooks
 
-Quick setup — pixi environment + git `pre-commit`/`pre-push` hooks (which run
+Quick setup: pixi environment + git `pre-commit`/`pre-push` hooks (which run
 `make lint` and `make check` respectively; see `make install-hooks`; requires
-[pre-commit](https://pre-commit.com/) to already be on your `PATH` — skipped,
-not fatal, if not found):
+[pre-commit](https://pre-commit.com/) to already be on your `PATH`, and is
+skipped, not fatal, if not found):
 
 ```bash
 make install
@@ -46,7 +46,7 @@ make install-cuda
 ```
 
 `make install`/`make install-cuda` do **not** download the Tiny Shakespeare
-dataset or GPT-2 124M starter weights (~1.5 GB) — that's a separate step,
+dataset or GPT-2 124M starter weights (~1.5 GB). That's a separate step,
 needed before `make train`, `make verify`, or `make benchmark*` will work:
 
 ```bash
@@ -68,11 +68,7 @@ For additional help, see `make help`.
 
 Benchmark Results: (NVIDIA DGX Spark)
 
-- Below are the average training loop times, observed across llm.mojo, llm.c, and PyTorch.
-- We run OpenMP-enabled llm.c with 20 threads.
-- CPU comparisons are all done in float32. GPU comparisons are done in float32 and mixed-precision bfloat16.
-- All benchmarks and metrics are designed to match hyperparameters in an apples-to-apples comparison.
-- **Apple Silicon (M1/M2/M3/M4):** use `make benchmark-metal` — llm.mojo (Metal GPU) vs PyTorch MPS; llm.c has no Metal port so it is replaced by the PyTorch MPS baseline. See `docs/ai/ai_assisted_optimizations_and_benchmarks.md` for the full Apple Silicon benchmarking setup.
+Average training loop times across llm.mojo, llm.c, and PyTorch, all with matched hyperparameters in an apples-to-apples comparison. llm.c runs OpenMP-enabled with 20 threads. CPU comparisons are float32, and GPU comparisons run both float32 and bfloat16. On Apple Silicon, `make benchmark-metal` runs llm.mojo (Metal GPU) against PyTorch MPS (llm.c has no Metal port, so PyTorch MPS fills in as the baseline). See the [Apple Silicon (Metal GPU)](#apple-silicon-metal-gpu) section for those results.
 
 ### Single GPU
 
@@ -81,6 +77,21 @@ Benchmark Results: (NVIDIA DGX Spark)
 ### Single CPU
 
 !['Best Single CPU Benchmark'](figures/benchmark_cpu_b4_t64_2026-07-01_2154_NVIDIA-GB10_DGX-Spark.png)
+
+### Apple Silicon (Metal GPU)
+
+I ported this to Metal GPU on Apple Silicon as well. The initial Metal port came in around 3627 ms/step, about 4.1× slower than PyTorch MPS at the time. After a round of kernel work it landed at 498.9 ms in bf16, which is 1.72× faster. Official run on an M4 Max (B=4, T=1024, cold GPU, 30 s inter-arm cooldowns, 2026-07-03):
+
+| configuration | mean ms/step | tok/s | vs PyTorch MPS |
+|---|---:|---:|---|
+| llm.mojo bf16 | **498.9** | **8210** | **1.72× faster** (vs MPS bf16) |
+| llm.mojo fp32 | 652.1 | 6282 | **1.27× faster** (vs MPS fp32) |
+| PyTorch MPS fp32 | 830.3 | 4933 | — |
+| PyTorch MPS bf16 | 857.3 | 4778 | — |
+
+!['Metal GPU Benchmark'](figures/benchmark_metal_b4_t1024_2026-07-03_1048_Apple-M4-Max_Mac-M4-Max.png)
+
+Run `make benchmark-metal` to reproduce. It runs all four arms in one shot, with 30 s cooldowns between them (the M4 Max throttles after ~8 s of sustained GPU load, so these are not optional). Correctness is gated by `make test`, which checks 16 gradient tensors plus the 10-step loss trajectory against PyTorch. The full gotcha catalog (address-space bugs, in-order queue semantics, threadgroup limits, the correctness campaign) is in [`docs/ai/metal_port_gotchas_and_optimizations.md`](docs/ai/metal_port_gotchas_and_optimizations.md), and the benchmarking setup is in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
 ## Test
 

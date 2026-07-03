@@ -171,7 +171,8 @@ def _apple(name: String, fp32_tflops: Float32) -> GPUEntry:
 
 
 def _gpu_db() -> List[GPUEntry]:
-    """The NVIDIA card database, keyed by exact driver name (matches llm.c)."""
+    """GPU database: NVIDIA cards keyed by exact driver name (matches llm.c),
+    followed by Apple Silicon entries keyed by MTLDevice.name substring."""
     var db = List[GPUEntry]()
     db.append(_volta("Tesla V100-SXM2-16GB", 640, 1530))
     db.append(_volta("Tesla V100-PCIE-32GB", 640, 1530))

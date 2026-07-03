@@ -2119,6 +2119,54 @@ def layernorm_fused_residual_bwd_broadcast_gpu[
             )
 
 
+def residual_grad_broadcast[
+    dtype: DType,
+    target: StaticString,
+](
+    d_inp1_ptr: MutKernelPtr[dtype],
+    d_inp2_ptr: MutKernelPtr[dtype],
+    src_ptr: ImmutKernelPtr[dtype],
+    count: Int,
+    ctx: DeviceContext,
+) capturing raises:
+    """Residual-skip gradient carry: d_inp1 += src; d_inp2 += src.
+
+    The fused residual layernorm backward computes only the layernorm
+    input-gradient and accumulates it into d_inp1/d_inp2. The forward op is
+    `out = LayerNorm(inp1 + inp2)`, so the true input gradients are
+    `LN_dinp + d(inp1+inp2)` where `d(inp1+inp2)` is the incoming residual-
+    stream gradient. This helper seeds that incoming residual gradient into
+    d_inp1/d_inp2 before the fused backward runs, so the residual identity
+    skip is preserved (without it the block gradients decay geometrically
+    with depth). Dispatches CPU/GPU like the other kernels here."""
+    comptime if is_cpu[target]():
+        comptime width = simd_width_of[dtype]()
+        _layernorm_fused_residual_bwd_broadcast_cpu[dtype, width](
+            d_inp1_ptr, d_inp2_ptr, src_ptr, count
+        )
+    elif is_gpu[target]():
+        comptime BLOCK_SIZE = 256
+        comptime width = 4
+        var device_ctx = ctx
+        var num_threads = ceildiv(count, width)
+        var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
+        comptime gpu_kernel = layernorm_fused_residual_bwd_broadcast_gpu[
+            dtype, width
+        ]
+        var compiled = device_ctx.compile_function[gpu_kernel]()
+        device_ctx.enqueue_function(
+            compiled,
+            d_inp1_ptr,
+            d_inp2_ptr,
+            src_ptr,
+            count,
+            grid_dim=(num_blocks,),
+            block_dim=(BLOCK_SIZE,),
+        )
+    else:
+        raise Error("Invalid target")
+
+
 def layernorm_fused_residual_bwd[
     dtype: DType,
     target: StaticString,

@@ -159,40 +159,74 @@ def gelu_fwd[
 # ===----------------------------------------------------------------------=== #
 # Fused bias (+ optional GELU) epilogue — Metal route-around for matmul_fwd.
 #
-# On the Metal GPU target, linalg.matmul's fused `elementwise_lambda_fn`
-# epilogue produces WRONG results (see probe_matmul_bias.mojo: has_bias=False
-# passes with max_abs=0, has_bias=True fails with max_abs≈74). This standalone
-# elementwise pass adds the per-column bias (and applies GELU, caching the
-# pre-activation) to the raw GEMM output that a plain `matmul_fwd[has_bias=
-# False, use_gelu=False]` wrote, matching the CPU epilogue exactly.
+# GOTCHA (Metal): linalg.matmul's fused `elementwise_lambda_fn` epilogue
+# produces WRONG results on Apple GPU (probe_matmul_bias.mojo: has_bias=False
+# passes with max_abs=0, has_bias=True fails with max_abs≈74; see also
+# docs/ai/ai_assisted_optimizations_and_benchmarks.md). Root cause is a bug in
+# how the Metal backend lowers the elementwise lambda into the GEMM kernel.
+#
+# On NVIDIA, matmul_fwd uses the cuBLASLt BIAS (and optionally GELU_AUX_BIAS)
+# epilogue directly inside the GEMM, so this function is not called from the
+# NVIDIA path when USE_GELU_FUSION=True (see matmul.mojo). On Metal, matmul_fwd
+# runs a plain GEMM (no epilogue) and then calls bias_gelu_fwd in a separate
+# pass to apply the bias and GELU, matching the CPU epilogue exactly.
 # ===----------------------------------------------------------------------=== #
 
 
 @always_inline
-def _bias_gelu_kernel[
+def _bias_gelu_kernel_vec[
     dtype: DType,
     has_bias: Bool,
     use_gelu: Bool,
+    vec: Int,
 ](
     out_ptr: MutKernelPtr[dtype],
     pre_gelu_ptr: MutKernelPtr[dtype],
     bias_ptr: ImmutKernelPtr[dtype],
-    n: Int,
+    rows: Int,
     out_channels: Int,
 ) -> None:
-    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
-    var stride = Int(grid_dim.x) * Int(block_dim.x)
-    while i < n:
-        var v = out_ptr[i].cast[DType.float32]()
+    # 2D grid following the encoder_fwd_gpu_kernel convention:
+    #   grid_dim = (rows, num_col_tiles),  block_dim = (BLOCK_SIZE,)
+    #   block_idx.x = row,  block_idx.y = column-tile
+    # col_base is the first column this thread owns; the bias index equals
+    # col_base with NO i % out_channels modulo — the row coordinate lives in
+    # block_idx.x, not encoded in a flat linear index.
+    var row = Int(block_idx.x)
+    var col_base = (
+        Int(block_idx.y) * Int(block_dim.x) + Int(thread_idx.x)
+    ) * vec
+    if row >= rows or col_base >= out_channels:
+        return
+    var i_base = row * out_channels + col_base
+    if col_base + vec <= out_channels:
+        # Full vector: all vec elements are within the row.
+        var v = (out_ptr + i_base).load[width=vec]().cast[DType.float32]()
         comptime if has_bias:
-            var col = i % out_channels
-            v = v + bias_ptr[col].cast[DType.float32]()
+            v = (
+                v
+                + (bias_ptr + col_base).load[width=vec]().cast[DType.float32]()
+            )
         comptime if use_gelu:
-            pre_gelu_ptr[i] = v.cast[dtype]()
-            out_ptr[i] = gelu[DType.float32, 1](v).cast[dtype]()
+            (pre_gelu_ptr + i_base).store(v.cast[dtype]())
+            (out_ptr + i_base).store(gelu[DType.float32, vec](v).cast[dtype]())
         else:
-            out_ptr[i] = v.cast[dtype]()
-        i += stride
+            (out_ptr + i_base).store(v.cast[dtype]())
+    else:
+        # Tail: fewer than vec columns remain before the row boundary.
+        # Guarded generically; never reached when out_channels % vec == 0
+        # (all real OC values — 768, 2304, 3072 — are divisible by 8).
+        for k in range(out_channels - col_base):
+            var v = (out_ptr + i_base + k)[].cast[DType.float32]()
+            comptime if has_bias:
+                v = v + (bias_ptr + col_base + k)[].cast[DType.float32]()
+            comptime if use_gelu:
+                (pre_gelu_ptr + i_base + k)[] = v.cast[dtype]()
+                (out_ptr + i_base + k)[] = gelu[DType.float32, 1](v).cast[
+                    dtype
+                ]()
+            else:
+                (out_ptr + i_base + k)[] = v.cast[dtype]()
 
 
 def bias_gelu_fwd[
@@ -220,19 +254,26 @@ def bias_gelu_fwd[
             else:
                 out_ptr[i] = v.cast[dtype]()
     elif is_gpu[target]():
+        # Vectorized 2D-grid dispatch: rows × column-tiles, each thread
+        # handles `VEC` contiguous columns.  Eliminates the per-element
+        # `i % out_channels` modulo (row index lives in block_idx.x) and
+        # issues vec-wide SIMD loads/stores instead of scalar ones.
         comptime BLOCK_SIZE = 256
+        comptime VEC = simd_width_of[dtype]()
         var device_ctx = ctx
-        var num_blocks = ceildiv(n, BLOCK_SIZE)
-        comptime gpu_kernel = _bias_gelu_kernel[dtype, has_bias, use_gelu]
+        var num_col_tiles = ceildiv(out_channels, BLOCK_SIZE * VEC)
+        comptime gpu_kernel = _bias_gelu_kernel_vec[
+            dtype, has_bias, use_gelu, VEC
+        ]
         var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
             out_ptr,
             pre_gelu_ptr,
             bias_ptr,
-            n,
+            rows,
             out_channels,
-            grid_dim=(num_blocks,),
+            grid_dim=(rows, num_col_tiles),
             block_dim=(BLOCK_SIZE,),
         )
     else:
@@ -338,7 +379,6 @@ def gelu_bwd_cpu[
         var base = w * chunk
         var count = min(chunk, num_params - base)
 
-        # NOTE: I've written this block enough times now thia should be it's own helper function.
         @always_inline
         def _simd[
             w: Int,

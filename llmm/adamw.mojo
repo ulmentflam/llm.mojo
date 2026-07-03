@@ -27,7 +27,6 @@ comptime UNROLL = 4
 # ===----------------------------------------------------------------------=== #
 
 
-# NOTE: If we reuse this function, we can move it to a shared file.
 @always_inline
 def lerp[
     start_dtype: DType,

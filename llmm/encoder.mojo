@@ -607,14 +607,16 @@ def wte_backward_gpu_kernel[
     var channel_group = Int(info[3])
 
     var c = channel_group * c_per_warp + lane_id * width
-    # Metal fix: do NOT return early before barrier(). On Metal, barrier()
-    # requires ALL threads in the threadgroup to reach it. The original early
-    # returns (if c >= channels / if warp_id >= bucket_size) caused threads to
-    # exit before the barrier, producing wrong results on Apple GPU. We replace
-    # them with boolean flags that gate the per-thread work while ensuring all
-    # threads still write to shared memory and call barrier(). Nvidia behavior
-    # is preserved: the computed results are bit-identical, only inactive threads
-    # now do a trivial extra zero-write before reaching the barrier.
+    # GOTCHA (Metal): barrier() requires EVERY thread in the threadgroup to
+    # reach it — no thread may exit early. The original code had two early
+    # `return` statements before the barrier (one for c >= channels, one for
+    # warp_id >= bucket_size); on Apple GPU those threads never reached the
+    # barrier, causing wrong results. On Nvidia the warp-scheduler handles
+    # divergent exits before a barrier without issue.
+    # Fix: replace the returns with boolean flags (c_valid, active) that gate
+    # per-thread work but let all threads reach the barrier(). Inactive threads
+    # do a trivial zero-write to their shared-memory slot first; that slot is
+    # not used by the reduction, so the result is bit-identical on both targets.
     var c_valid = c < channels
     var num_warps = BLOCK_SIZE // WARP_SIZE
     var active = warp_id < bucket_size
@@ -626,13 +628,15 @@ def wte_backward_gpu_kernel[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    # Metal fix #2: use accum_shared.ptr directly (the layernorm.mojo pattern).
-    # The previous `address_space_cast[AddressSpace.GENERIC]() + rebind` pattern
-    # produces silent zero reads on Apple GPU Metal — the cast corrupts the
-    # shared-memory pointer and all loads return 0. Direct .ptr access keeps
-    # the pointer in AddressSpace.SHARED which Metal resolves correctly.
-    # On Nvidia CUDA, both patterns compile identically (SMEM is generic there),
-    # so this change preserves Nvidia behavior exactly.
+    # GOTCHA (Metal): access shared memory via .ptr directly — do NOT cast to
+    # AddressSpace.GENERIC. The previous pattern:
+    #   rebind[MutKernelPtr[...]](accum_shared.ptr.address_space_cast[GENERIC]())
+    # silently returns zeros on Apple GPU: Metal's address-space model keeps
+    # threadgroup (shared) memory in a distinct address space and a GENERIC cast
+    # corrupts the pointer. Direct .ptr access keeps the pointer in
+    # AddressSpace.SHARED, which Metal resolves correctly.
+    # On Nvidia CUDA shared memory is addressable as GENERIC, so both patterns
+    # compile identically — this change is a no-op there.
 
     # All threads zero their slot first so inactive warps don't leave garbage.
     for k in range(width):

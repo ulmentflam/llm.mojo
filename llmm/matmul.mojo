@@ -1,7 +1,8 @@
 import compiler
 from std.memory import alloc
 from std.math import ceildiv
-from layout import TileTensor
+from layout import Layout, TileTensor
+from layout.layout_tensor import LayoutTensor
 from linalg.matmul import matmul
 from std.sys import simd_width_of
 from std.gpu.primitives import block
@@ -17,7 +18,8 @@ from extensibility.managed_tensor_slice import (
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize, sync_parallelize
 from std.gpu.host import DeviceContext, DeviceAttribute
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.gpu.memory import AddressSpace
+from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
 from std.atomic import Atomic
 from std.ffi import _get_global_or_null, external_call
 from std.sys import size_of
@@ -622,9 +624,9 @@ def matmul_fwd[
             matmul[transpose_b=True, target=target](c, a, b, ctx=ctx)
         ctx.synchronize()
 
-    # Fused epilogue on cuBLASLt; split GEMM+bias_gelu elsewhere (Metal's
-    # fused-bias epilogue is broken) — see
-    # docs/ai/ai_assisted_optimizations_and_benchmarks.md (2026-07-02).
+    # Fused epilogue on cuBLASLt; split GEMM+bias_gelu elsewhere — Metal's
+    # elementwise_lambda_fn epilogue produces scrambled output on Metal AIR (G2).
+    # See docs/ai/metal_port_gotchas_and_optimizations.md G2.
     comptime if is_gpu[target]():
         comptime if HAS_CUBLAS:
             comptime if use_gelu and not USE_GELU_FUSION:
@@ -679,10 +681,18 @@ def matmul_fwd[
                 )
         else:
             # Vendor-neutral GPU: plain GEMM (no epilogue) + standalone
-            # bias(+GELU) kernel; fences as in _portable_matmul.
-            ctx.synchronize()
+            # bias(+GELU) kernel. NVIDIA without cuBLAS: host fences guard a real
+            # race (CUDA_ERROR_ILLEGAL_ADDRESS without them). Metal: fences are
+            # removed (comptime if not HAS_METAL) because the in-order command
+            # queue sequences linalg.matmul and the epilogue kernel automatically —
+            # validated by _attn_gemm_batched_metal running fence-free and test_gpt2
+            # passing. Removing Metal fences saves ~90 ms/step (see P13).
+            # See docs/ai/metal_port_gotchas_and_optimizations.md P13.
+            comptime if not HAS_METAL:
+                ctx.synchronize()
             matmul[transpose_b=True, target=target](c, a, b, ctx=ctx)
-            ctx.synchronize()
+            comptime if not HAS_METAL:
+                ctx.synchronize()
             comptime if has_bias or use_gelu:
                 bias_gelu_fwd[
                     dtype, target, has_bias=has_bias, use_gelu=use_gelu
@@ -1207,7 +1217,8 @@ def matmul_d_input_bwd[
                 # bias epilogue — see probe_matmul_bias.mojo / probe_matmul_bwd.mojo).
                 # Fix: plain GEMM into d_input, then a standalone gelu-grad scaling
                 # kernel. Mirrors the USE_GELU_FUSION=False cuBLAS path above.
-                ctx.synchronize()
+                # Metal: linalg.matmul is stream-ordered; no host fence needed
+                # (same stream-ordering guarantee as _attn_gemm_batched_metal).
                 matmul[transpose_b=False, target=target](
                     c_d_input, a_d_output, b_weight, ctx=ctx
                 )
@@ -1218,7 +1229,6 @@ def matmul_d_input_bwd[
                         rows * in_channels,
                         ctx,
                     )
-                ctx.synchronize()
             else:
                 _portable_matmul_d_input()
     else:
@@ -1292,6 +1302,91 @@ def _gpu_add_into_kernel[
         ).cast[dtype]()
 
 
+def _gpu_transpose_add_into_kernel[
+    dtype: DType,
+    accumulate: Bool,
+    BLOCK_SIZE: Int,
+](
+    dst: MutKernelPtr[dtype],  # d_weight[OC, C] row-major
+    src: MutKernelPtr[dtype],  # d_weight_T[C, OC] row-major (read-only here)
+    C_: Int,
+    OC_: Int,
+) -> None:
+    """Tiled shared-memory transpose-fold src[C,OC] into dst[OC,C].
+    See docs/ai/metal_port_gotchas_and_optimizations.md P14 (choosing the
+    smaller operand to pre-transpose) and P15 (32×33 padding eliminates
+    bank conflicts in this kernel).
+
+    Each 32×32 tile of src is loaded coalesced into shared memory padded to
+    32×33 (one extra column to avoid bank conflicts on the transposed read),
+    then written transposed back to dst with coalesced stores.
+
+    Metal safety: no early-returns before barrier() — all threads in the
+    threadgroup reach each barrier() call. Out-of-bounds guards are placed
+    inside the load/store loops so inactive threads still hit the barrier.
+    Metal fix: tile.ptr[i] is used directly to preserve AddressSpace.SHARED;
+    GENERIC address-space casts corrupt threadgroup pointers on Metal AIR.
+
+    accumulate=False: dst[oc*C+c]  = src[c*OC+oc]           (overwrite)
+    accumulate=True:  dst[oc*C+c] += src[c*OC+oc]  (fp32 accumulation)
+    """
+    comptime TILE = 32
+    comptime STRIDE = TILE + 1  # 33 — avoids shared-memory bank conflicts
+    var tile = LayoutTensor[
+        dtype,
+        Layout.row_major(TILE, STRIDE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var tiles_c = ceildiv(C_, TILE)  # tiles along C  dimension (src rows)
+    var tiles_oc = ceildiv(OC_, TILE)  # tiles along OC dimension (src cols)
+    var total_tiles = tiles_c * tiles_oc
+
+    # Flatten 1-D block: tx = column-within-tile, ty = row-within-tile.
+    var tx = Int(thread_idx.x) % TILE
+    var ty = Int(thread_idx.x) // TILE
+    comptime ROW_STEP = BLOCK_SIZE // TILE  # = 8 for BLOCK_SIZE=256
+
+    var bt = Int(block_idx.x)
+    while bt < total_tiles:
+        var tile_c = (bt // tiles_oc) * TILE  # row offset in C  dimension
+        var tile_oc = (bt % tiles_oc) * TILE  # col offset in OC dimension
+
+        # Phase 1 — coalesced load from global memory into shared memory.
+        # Thread tx reads src column (tile_oc + tx); consecutive tx values map
+        # to consecutive src columns → coalesced read.
+        # Guard is inside the loop so all threads still reach barrier().
+        var r = ty
+        while r < TILE:
+            var gr = tile_c + r  # global C  index (src row)
+            var goc = tile_oc + tx  # global OC index (src col)
+            if gr < C_ and goc < OC_:
+                tile.ptr[r * STRIDE + tx] = src[gr * OC_ + goc]
+            r += ROW_STEP
+        barrier()
+
+        # Phase 2 — transposed write from shared memory to global memory.
+        # Thread tx writes to dst column (tile_c + tx); consecutive tx values
+        # map to consecutive dst columns → coalesced write.
+        r = ty
+        while r < TILE:
+            var goc = tile_oc + r  # global OC index (dst row)
+            var gc = tile_c + tx  # global C  index (dst col)
+            if goc < OC_ and gc < C_:
+                var v = tile.ptr[tx * STRIDE + r].cast[DType.float32]()
+                comptime if accumulate:
+                    dst[goc * C_ + gc] = (
+                        dst[goc * C_ + gc].cast[DType.float32]() + v
+                    ).cast[dtype]()
+                else:
+                    dst[goc * C_ + gc] = v.cast[dtype]()
+            r += ROW_STEP
+        barrier()
+
+        bt += Int(grid_dim.x)
+
+
 def matmul_d_weight_bwd[
     dtype: DType,
     target: StaticString,
@@ -1354,88 +1449,160 @@ def matmul_d_weight_bwd[
             )
         else:
             comptime if HAS_METAL:
-                # Apple Metal path: linalg.matmul rejects transpose_a, so
-                # we materialise d_outputᵀ[OC, rows] into the scratch buffer
-                # via _gpu_transpose_kernel, then compute
-                #   d_weight[OC, C] = scratch[OC, rows] @ input[rows, C]
-                # with the portable MAX GEMM (transpose_b=False).
-                # For accumulate=True we write the GEMM into a temp device
-                # buffer and add with _gpu_add_into_kernel — mirroring the
-                # CPU branch's strategy (avoid the epilogue-reads-overwritten-
-                # C double-count bug; see CPU branch comment above).
-                # AMD stays on blas.matmul (rocBLAS/hipBLASLt supports transA
-                # natively — no transpose pre-step or add kernel needed there).
+                # Apple Metal: linalg.matmul rejects transpose_a (issue #6626).
+                # To compute d_weight[OC,C] = d_outputᵀ[OC,rows] @ input[rows,C]
+                # we choose which operand to pre-transpose based on relative size:
+                #
+                #   C < OC  → transpose the SMALLER input[rows,C] → input_T[C,rows],
+                #             compute d_weight_T[C,OC] = input_T @ d_output
+                #             (transpose_b=False, no big-matrix transpose), then
+                #             fold into d_weight[OC,C] via _gpu_transpose_add_into_kernel.
+                #             For LM-head (C=768, OC=50304, rows=4096) this replaces
+                #             the rows×OC transpose (206 M elements) with rows×C
+                #             (3.1 M) + C×OC result-fold (38.6 M) — ~5× less work.
+                #
+                #   C ≥ OC  → transpose d_output (original strategy, smaller matrix
+                #             in this case; e.g. proj: C=3072, OC=768).
+                #
+                # All ops are stream-ordered on Metal; no host fence needed (P13).
+                # See docs/ai/metal_port_gotchas_and_optimizations.md G6 (why
+                # linalg.matmul rejects transpose_a), P14 (smaller-operand choice),
+                # P15 (tiled transpose-add kernel eliminates bank conflicts).
                 comptime _TRANS_BLOCK = 256
-                var t_total = rows * out_channels
-                # Use a local device buffer for the transpose — never scratch_ptr.
-                # On GPU builds the caller may pass a zero-sized scratch (e.g.
-                # grad_acts.logits / grad_acts.fch with those tensors sized 0 on
-                # GPU; see allocate_activations). Writing to them would overflow.
-                var transpose_buf = ctx.enqueue_create_buffer[dtype](t_total)
-                var transpose_ptr = rebind[MutKernelPtr[dtype]](
-                    transpose_buf.unsafe_ptr()
-                )
-                comptime t_k = _gpu_transpose_kernel[dtype]
-                var t_c = ctx.compile_function[t_k]()
-                ctx.enqueue_function(
-                    t_c,
-                    transpose_ptr,
-                    d_output_ptr,
-                    rows,
-                    out_channels,
-                    grid_dim=(ceildiv(t_total, _TRANS_BLOCK),),
-                    block_dim=(_TRANS_BLOCK,),
-                )
-                # transpose_ptr now holds d_outputᵀ [OC, rows] row-major.
-                var scratch_t_gpu = TileTensor(
-                    Span[Scalar[dtype], MutAnyOrigin](
-                        ptr=transpose_ptr, length=out_channels * rows
-                    ),
-                    row_major(out_channels, rows),
-                )
-                comptime if accumulate:
-                    # Materialise GEMM into a temp device buffer, then GPU-add
-                    # into d_weight. This avoids the epilogue-reads-overwritten-
-                    # C double-count (linalg.matmul writes to d_weight_ptr first,
-                    # so any += epilogue there would read the new result, not the
-                    # old accumulated value). Same fix as the CPU branch above.
-                    var temp_buf = ctx.enqueue_create_buffer[dtype](
-                        out_channels * in_channels
+                if in_channels < out_channels:
+                    # ---- small-operand path: transpose input (C × rows << OC × rows) ----
+                    var t_in_total = rows * in_channels
+                    var input_T_buf = ctx.enqueue_create_buffer[dtype](
+                        t_in_total
                     )
-                    var temp_ptr = rebind[MutKernelPtr[dtype]](
-                        temp_buf.unsafe_ptr()
+                    var input_T_ptr = rebind[MutKernelPtr[dtype]](
+                        input_T_buf.unsafe_ptr()
                     )
-                    var c_temp = TileTensor(
-                        Span[Scalar[dtype], MutAnyOrigin](
-                            ptr=temp_ptr, length=out_channels * in_channels
-                        ),
-                        row_major(out_channels, in_channels),
-                    )
-                    ctx.synchronize()
-                    matmul[transpose_b=False, target=target](
-                        c_temp, scratch_t_gpu, b_input, ctx=ctx
-                    )
-                    ctx.synchronize()
-                    comptime _ADD_BLOCK = 256
-                    var a_total = out_channels * in_channels
-                    comptime add_k = _gpu_add_into_kernel[dtype]
-                    var add_c = ctx.compile_function[add_k]()
+                    comptime t_k = _gpu_transpose_kernel[dtype]
+                    var t_c = ctx.compile_function[t_k]()
+                    # Transpose input[rows, C] → input_T[C, rows]
                     ctx.enqueue_function(
-                        add_c,
-                        d_weight_ptr,
-                        temp_ptr,
-                        a_total,
-                        grid_dim=(ceildiv(a_total, _ADD_BLOCK),),
-                        block_dim=(_ADD_BLOCK,),
+                        t_c,
+                        input_T_ptr,
+                        input_ptr,
+                        rows,
+                        in_channels,
+                        grid_dim=(ceildiv(t_in_total, _TRANS_BLOCK),),
+                        block_dim=(_TRANS_BLOCK,),
                     )
-                    ctx.synchronize()
-                    # temp_buf destructor runs here; GPU is already done (synced).
-                else:
-                    ctx.synchronize()
+                    # input_T_ptr holds inputᵀ [C, rows] row-major.
+                    var a_input_T = TileTensor(
+                        Span[Scalar[dtype], ImmutAnyOrigin](
+                            ptr=rebind[ImmutKernelPtr[dtype]](input_T_ptr),
+                            length=t_in_total,
+                        ),
+                        row_major(in_channels, rows),
+                    )
+                    # d_weight_T[C, OC] = input_T[C, rows] @ d_output[rows, OC]
+                    var dw_t_total = in_channels * out_channels
+                    var dw_t_buf = ctx.enqueue_create_buffer[dtype](dw_t_total)
+                    var dw_t_ptr = rebind[MutKernelPtr[dtype]](
+                        dw_t_buf.unsafe_ptr()
+                    )
+                    var c_dw_t = TileTensor(
+                        Span[Scalar[dtype], MutAnyOrigin](
+                            ptr=dw_t_ptr, length=dw_t_total
+                        ),
+                        row_major(in_channels, out_channels),
+                    )
                     matmul[transpose_b=False, target=target](
-                        c_d_weight, scratch_t_gpu, b_input, ctx=ctx
+                        c_dw_t, a_input_T, a_d_output, ctx=ctx
                     )
-                    ctx.synchronize()
+                    # Fold d_weight_T[C,OC] into d_weight[OC,C] with a tiled
+                    # shared-memory transpose-add kernel (32×32 tiles, 32×33
+                    # padded smem to avoid bank conflicts, coalesced r/w).
+                    comptime tadd_k = _gpu_transpose_add_into_kernel[
+                        dtype, accumulate, _TRANS_BLOCK
+                    ]
+                    var tadd_c = ctx.compile_function[tadd_k]()
+                    var tadd_tiles = ceildiv(in_channels, 32) * ceildiv(
+                        out_channels, 32
+                    )
+                    ctx.enqueue_function(
+                        tadd_c,
+                        d_weight_ptr,
+                        dw_t_ptr,
+                        in_channels,
+                        out_channels,
+                        grid_dim=(tadd_tiles,),
+                        block_dim=(_TRANS_BLOCK,),
+                    )
+                    # input_T_buf / dw_t_buf destruct here; the GPU commands hold
+                    # the underlying allocations alive until stream completion.
+                else:
+                    # ---- large-C path: transpose d_output (C ≥ OC, OC×rows ≤ C×rows) ----
+                    var t_total = rows * out_channels
+                    # Use a local device buffer — never scratch_ptr. On GPU builds
+                    # the caller may pass a zero-sized scratch (e.g. grad_acts.logits
+                    # / grad_acts.fch on GPU; see allocate_activations).
+                    var transpose_buf = ctx.enqueue_create_buffer[dtype](
+                        t_total
+                    )
+                    var transpose_ptr = rebind[MutKernelPtr[dtype]](
+                        transpose_buf.unsafe_ptr()
+                    )
+                    comptime t_k = _gpu_transpose_kernel[dtype]
+                    var t_c = ctx.compile_function[t_k]()
+                    ctx.enqueue_function(
+                        t_c,
+                        transpose_ptr,
+                        d_output_ptr,
+                        rows,
+                        out_channels,
+                        grid_dim=(ceildiv(t_total, _TRANS_BLOCK),),
+                        block_dim=(_TRANS_BLOCK,),
+                    )
+                    # transpose_ptr holds d_outputᵀ [OC, rows] row-major.
+                    var scratch_t_gpu = TileTensor(
+                        Span[Scalar[dtype], MutAnyOrigin](
+                            ptr=transpose_ptr, length=out_channels * rows
+                        ),
+                        row_major(out_channels, rows),
+                    )
+                    comptime if accumulate:
+                        # Materialise GEMM into a temp device buffer, then GPU-add
+                        # into d_weight. Avoids the epilogue-reads-overwritten-C
+                        # double-count (see CPU branch comment above).
+                        var temp_buf = ctx.enqueue_create_buffer[dtype](
+                            out_channels * in_channels
+                        )
+                        var temp_ptr = rebind[MutKernelPtr[dtype]](
+                            temp_buf.unsafe_ptr()
+                        )
+                        var c_temp = TileTensor(
+                            Span[Scalar[dtype], MutAnyOrigin](
+                                ptr=temp_ptr,
+                                length=out_channels * in_channels,
+                            ),
+                            row_major(out_channels, in_channels),
+                        )
+                        matmul[transpose_b=False, target=target](
+                            c_temp, scratch_t_gpu, b_input, ctx=ctx
+                        )
+                        comptime _ADD_BLOCK = 256
+                        var a_total = out_channels * in_channels
+                        comptime add_k = _gpu_add_into_kernel[dtype]
+                        var add_c = ctx.compile_function[add_k]()
+                        ctx.enqueue_function(
+                            add_c,
+                            d_weight_ptr,
+                            temp_ptr,
+                            a_total,
+                            grid_dim=(ceildiv(a_total, _ADD_BLOCK),),
+                            block_dim=(_ADD_BLOCK,),
+                        )
+                        # temp_buf / transpose_buf destruct here; stream keeps
+                        # allocations alive until GPU completion.
+                    else:
+                        matmul[transpose_b=False, target=target](
+                            c_d_weight, scratch_t_gpu, b_input, ctx=ctx
+                        )
+                    # transpose_buf destructs here.
             else:
                 # AMD / other vendor-BLAS GPU: blas.matmul resolves to
                 # rocBLAS/hipBLASLt which supports transpose_a natively and

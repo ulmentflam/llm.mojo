@@ -218,6 +218,11 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         self.zero_stage = zero_stage
         self.ctx = ctx
         self.cpu_coordinator_ptr = cpu_coord
+        # P2P signaling (enable_p2p / init_signal_buffer) uses CUDA IPC handles
+        # that have no Metal equivalent. On Apple GPU or CPU the signal_buffer
+        # is a 1-byte dummy that is never used; the GPU collective methods
+        # (allreduce / reducescatter / allgather) raise at runtime for N>=2 on
+        # non-NVIDIA targets — see the comments in those methods.
         comptime if not is_cpu[Self.target]() and has_nvidia_gpu_accelerator():
             _ = enable_p2p()
             self.signal_buffer = ctx.enqueue_create_buffer[DType.uint8](
@@ -261,6 +266,11 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             _allreduce_cpu[dtype](self.rank, Self.N, size, coord_ptr)
             coord_ptr[].barrier2[].wait()
         else:
+            # Multi-GPU collectives use the `comm` package's allreduce /
+            # reducescatter / allgather, which rely on CUDA P2P (NVLink /
+            # CUDA IPC) — there is no equivalent for Apple Metal. For N>=2
+            # on a non-NVIDIA GPU this branch raises at runtime; single-GPU
+            # (N==1) returns early above and never hits this check.
             comptime if Self.N >= 2:
                 comptime if has_nvidia_gpu_accelerator():
                     var in_layout = row_major(size)
@@ -333,6 +343,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             )
             coord_ptr[].barrier2[].wait()
         else:
+            # Same CUDA P2P requirement as allreduce — raises on non-NVIDIA for N>=2.
             comptime if Self.N >= 2:
                 comptime if has_nvidia_gpu_accelerator():
                     var in_layout = row_major(sharded_size)
@@ -402,6 +413,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             _allgather_cpu[dtype](self.rank, Self.N, sharded_size, coord_ptr)
             coord_ptr[].barrier2[].wait()
         else:
+            # Same CUDA P2P requirement as allreduce — raises on non-NVIDIA for N>=2.
             comptime if Self.N >= 2:
                 comptime if has_nvidia_gpu_accelerator():
                     var in_layout = row_major(sharded_size)
@@ -567,6 +579,7 @@ struct ShardedParameter[
                 )
                 zero_ctx.ctx.synchronize()
             else:
+                # Same CUDA P2P requirement — raises on non-NVIDIA for N_GPUS>=2.
                 comptime if has_nvidia_gpu_accelerator():
                     var input_tensors = InlineArray[
                         TileTensor[Self.dtype, in_layout, ImmutAnyOrigin],

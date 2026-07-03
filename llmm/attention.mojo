@@ -2,7 +2,8 @@ import compiler
 from layout import Layout, TileTensor
 from layout.tile_layout import row_major
 from std.memory import alloc
-from std.sys import simd_width_of, align_of
+from std.sys import simd_width_of, align_of, is_defined
+from std.time import global_perf_counter_ns
 from std.utils.index import IndexList, Index
 from linalg.matmul import matmul
 from linalg.matmul.vendor import blas
@@ -43,7 +44,7 @@ from llmm.merge import merge_fwd, merge_bwd
 from llmm.matmul import _matmul_cublaslt
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
-from llmm.vendor import HAS_CUBLAS
+from llmm.vendor import HAS_CUBLAS, HAS_METAL
 
 
 # ===----------------------------------------------------------------------=== #
@@ -511,6 +512,7 @@ def _attention_forward_query_row[
 # it cast SHARED (threadgroup) pointers to AddressSpace.GENERIC, which Metal
 # AIR silently mis-compiles (loads return 0, stores go to device memory).
 # GPU kernels now index shared LayoutTensors via SHARED-typed pointers.
+# See docs/ai/metal_port_gotchas_and_optimizations.md G3.
 
 
 @always_inline
@@ -817,7 +819,7 @@ def _attention_gpu_process_key_value_tile_warp[
         # (USE_GEMM_ATTENTION=True takes precedence), so removing the unroll
         # has zero effect on NVIDIA forward performance. The backward kernels
         # never used comptime-unrolled KV loops and compile fine on both
-        # targets.
+        # targets. See docs/ai/metal_port_gotchas_and_optimizations.md G8.
         for key_column in range(Bc):
             var key_index = key_tile_start + key_column
             var is_active_and_valid = (
@@ -1223,19 +1225,21 @@ def attention_fwd_gpu[
 # It materializes the [B·nh, T, T] scores/probabilities, trading memory for
 # tensor-core throughput. Toggle with USE_GEMM_ATTENTION. This path is built on
 # cuBLAS(Lt) batched GEMMs (see _attn_gemm_batched/attention_bwd_gemm below), so
-# it defaults to HAS_CUBLAS (llmm/vendor.mojo) — non-NVIDIA GPU builds
-# automatically fall back to the pure-Mojo flash kernels above instead, which
-# are already vendor-neutral (no FFI). Independently overridable on NVIDIA for
-# perf experiments (e.g. -D LLMM_FORCE_PORTABLE_GPU=1 forces both off together
-# since USE_GEMM_ATTENTION derives from HAS_CUBLAS).
+# it is enabled on NVIDIA (HAS_CUBLAS) and Apple Silicon (HAS_METAL): on Metal,
+# scalar dot-product loops use zero GPU matrix-unit throughput while linalg.matmul
+# dispatches to Metal's matrix shaders — 8–10× faster (see P11). Other GPU targets
+# (AMD, portable) fall back to the flash kernels (vendor-neutral, no FFI).
+# Independently overridable on NVIDIA with LLMM_FORCE_PORTABLE_GPU=1 (forces both
+# off; USE_GEMM_ATTENTION derives from HAS_CUBLAS when Metal is absent).
+# See docs/ai/metal_port_gotchas_and_optimizations.md P11.
 
-comptime USE_GEMM_ATTENTION = HAS_CUBLAS
+comptime USE_GEMM_ATTENTION = HAS_CUBLAS or HAS_METAL
 
 # Softmax-forward vectorized-load A/B (item 3): width=1 is the original
 # scalar-per-thread-per-iteration load (bit-identical baseline); True switches
 # to simd_width_of[dtype]()-wide chunked loads (llm.c kernel5's 4-wide
 # `regarray` pattern). See docs/benchmarks.md for the measured verdict.
-comptime USE_SOFTMAX_VEC_LOADS = False
+comptime USE_SOFTMAX_VEC_LOADS = True
 
 
 @always_inline
@@ -3302,6 +3306,637 @@ def _attention_transpose_rect_gpu[
 
 
 @always_inline
+def _attn_batched_gemm_gpu[
+    dt: DType,
+    BM: Int,  # output rows per threadgroup  (= BK)
+    BN: Int,  # output cols per threadgroup
+    BK: Int,  # K-tile step  (must equal BM so A-tile = B-tile element count)
+](
+    bh: Int,  # total batch×head count (BH = B*NH)
+    M: Int,  # output rows (T or HD)
+    N: Int,  # output cols (HD or T)
+    K: Int,  # inner dimension (T)
+    a_ptr: ImmutKernelPtr[dt],  # [bh, M, K]
+    b_ptr: ImmutKernelPtr[dt],  # [bh, K, N]
+    c_ptr: MutKernelPtr[dt],  # [bh, M, N]
+    a_stride: Int,  # M*K
+    b_stride: Int,  # K*N
+    c_stride: Int,  # M*N
+    tiles_m: Int,  # ceildiv(M, BM)
+    tiles_n: Int,  # ceildiv(N, BN)
+) -> None:
+    # Generic tiled batched GEMM: C[bh, M, N] = A[bh, M, K] · B[bh, K, N].
+    # One threadgroup per (head, m-tile, n-tile); flat grid encodes the triple.
+    # BM = BK is required so A-tile [BM,BK] and B-tile [BK,BN] can both be loaded
+    # in one barrier using the same (ty,tx) thread mapping for B and the first
+    # BM*BK threads for A.
+    #
+    # Shared-memory layout (Metal: access via .ptr directly, no GENERIC casts):
+    #   a_sh[BM, BK+1]  — +1 column padding avoids bank conflicts
+    #   b_sh[BK, BN+1]
+    #
+    # Thread mapping: ty = tid // BN  (output row in tile),  tx = tid % BN  (col).
+    # All BM*BN threads load one B element each (ty ∈ [0,BK), tx ∈ [0,BN)).
+    # First BM*BK threads load one A element each.
+    # NOTE: BN must equal N when used for headout (N=HD=64, BN=64) so the full N
+    # dimension is covered in one tile (no n-tile loop needed, tiles_n=1).
+    var a_sh = LayoutTensor[
+        dt,
+        Layout.row_major(BM, BK + 1),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var b_sh = LayoutTensor[
+        dt,
+        Layout.row_major(BK, BN + 1),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var tid = Int(thread_idx.x)  # [0, BM*BN)
+    var ty = tid // BN  # output-tile row   [0, BM)
+    var tx = tid % BN  # output-tile col   [0, BN)
+
+    # Decode flat block index → (head, m-tile, n-tile).
+    var bid = Int(block_idx.x)
+    var bh_idx = bid // (tiles_m * tiles_n)
+    var rem = bid % (tiles_m * tiles_n)
+    var tile_m = rem // tiles_n
+    var tile_n = rem % tiles_n
+    var m_off = tile_m * BM
+    var n_off = tile_n * BN
+
+    var a_base = bh_idx * a_stride + m_off * K
+    var b_base = bh_idx * b_stride + n_off
+    var c_base = bh_idx * c_stride + m_off * N + n_off
+
+    var acc = Scalar[dt](0.0)
+
+    for k in range(0, K, BK):
+        # Load A tile [BM, BK]: first BM*BK threads, each loads one element.
+        # (BM=BK, so BM*BK = BK*BK ≤ BM*BN always when BK ≤ BN.)
+        if tid < BM * BK:
+            var ra = tid // BK  # row in A tile  [0, BM)
+            var ca = tid % BK  # col in A tile  [0, BK)
+            a_sh.ptr[ra * (BK + 1) + ca] = a_ptr[a_base + ra * K + k + ca]
+        # Load B tile [BK, BN]: all threads, one element each.
+        # ty ∈ [0, BM=BK) serves as the k-row index; tx as the n-col index.
+        b_sh.ptr[ty * (BN + 1) + tx] = b_ptr[b_base + (k + ty) * N + tx]
+        barrier()
+
+        # Accumulate: acc += sum_{kk} A_sh[ty, kk] * B_sh[kk, tx]
+        for kk in range(BK):
+            acc = fma(
+                a_sh.ptr[ty * (BK + 1) + kk],
+                b_sh.ptr[kk * (BN + 1) + tx],
+                acc,
+            )
+        barrier()
+
+    # Boundary guard: write if within M×N (needed when tiles don't divide evenly).
+    if m_off + ty < M and n_off + tx < N:
+        c_ptr[c_base + ty * N + tx] = acc
+
+
+def _launch_batched_headout[
+    dtype: DType,
+](
+    a_ptr: ImmutKernelPtr[dtype],  # [BH, T, T]   — dS or P (big matrix)
+    b_ptr: ImmutKernelPtr[dtype],  # [BH, T, HD]  — K or dO (small matrix)
+    c_ptr: MutKernelPtr[dtype],  # [BH, T, HD]  — output
+    BH: Int,
+    T: Int,
+    HD: Int,
+    ctx: DeviceContext,
+) raises:
+    # Batched headout GEMM: C[BH,T,HD] = A[BH,T,T] · B[BH,T,HD].
+    # Used on Metal for dQ = dS·K and (forward) A·V.
+    # Tile: BM=BK=16 rows, BN=HD=64 cols (full N in one tile), 1024 threads/group.
+    # Grid: (BH × T/BM) flat blocks.
+    comptime BM = 16
+    comptime BK = 16  # must equal BM
+    comptime BN = 64  # = HD; covers all 64 head-dim cols in one tile
+    comptime THREADS = BM * BN  # = 1024
+    var tiles_m = ceildiv(T, BM)
+    var tiles_n = ceildiv(HD, BN)  # = 1 when HD=64=BN
+    var num_blocks = BH * tiles_m * tiles_n
+    comptime k = _attn_batched_gemm_gpu[dtype, BM, BN, BK]
+    var compiled = ctx.compile_function[k]()
+    ctx.enqueue_function(
+        compiled,
+        BH,
+        T,
+        HD,
+        T,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        T * T,
+        T * HD,
+        T * HD,
+        tiles_m,
+        tiles_n,
+        grid_dim=(num_blocks,),
+        block_dim=(THREADS,),
+    )
+
+
+def _launch_batched_kvgrad[
+    dtype: DType,
+](
+    a_ptr: ImmutKernelPtr[dtype],  # [BH, HD, T]  — Qᵀ or dOᵀ (small matrix)
+    b_ptr: ImmutKernelPtr[dtype],  # [BH, T,  T]  — dS or P   (big matrix)
+    c_ptr: MutKernelPtr[dtype],  # [BH, HD, T]  — output dKᵀ or dVᵀ
+    BH: Int,
+    T: Int,
+    HD: Int,
+    ctx: DeviceContext,
+) raises:
+    # Batched kvgrad GEMM: C[BH,HD,T] = A[BH,HD,T] · B[BH,T,T].
+    # Used on Metal for dKᵀ = Qᵀ·dS and dVᵀ = dOᵀ·P (after rect-transposing Q/dO).
+    # Tile: BM=BK=16 rows (of HD=64), BN=32 cols (of T=1024), 512 threads/group.
+    # Grid: (BH × HD/BM × T/BN) flat blocks.
+    comptime BM = 16
+    comptime BK = 16  # must equal BM
+    comptime BN = 32  # T=1024 needs tiles_n = T/BN steps
+    comptime THREADS = BM * BN  # = 512
+    var tiles_m = ceildiv(HD, BM)  # = 4 when HD=64
+    var tiles_n = ceildiv(T, BN)  # = 32 when T=1024
+    var num_blocks = BH * tiles_m * tiles_n
+    comptime k = _attn_batched_gemm_gpu[dtype, BM, BN, BK]
+    var compiled = ctx.compile_function[k]()
+    ctx.enqueue_function(
+        compiled,
+        BH,
+        HD,
+        T,
+        T,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        HD * T,
+        T * T,
+        HD * T,
+        tiles_m,
+        tiles_n,
+        grid_dim=(num_blocks,),
+        block_dim=(THREADS,),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metal-only batched headout kernel (4-rows-per-thread):
+# C[BH,M,N] = A[BH,M,K] · B[BH,K,N] where M=K=T, N=HD.
+#
+# Each thread computes 4 consecutive C rows (register tiling). With BM=64,
+# BN=HD=64, BK=16, THREADS=1024: BM×BK = BK×BN = THREADS → 100% A and B
+# loading efficiency (every thread loads exactly 1 element per tile per pass,
+# no idle threads). 4 FMAs per B-read → 4× better register reuse vs 1-per-thread.
+# Grid: (tiles_n, tiles_m, BH) 3D — eliminates integer divisions per block.
+# Shared mem: A_sh[64,17] + B_sh[16,65] = 8.3 KB per block.
+# ---------------------------------------------------------------------------
+@always_inline
+def _attn_headout4_gpu[
+    dt: DType,
+    BM: Int,  # output rows per block; BM × BK must equal THREADS
+    BN: Int,  # output cols per block (= HD = 64)
+    BK: Int,  # K-tile step; BK × BN must equal THREADS; ROWS_PER_THREAD = BM//(THREADS//BN)
+](
+    bh: Int,
+    M: Int,  # T
+    N: Int,  # HD
+    K: Int,  # T (the common K-dimension)
+    a_ptr: ImmutKernelPtr[dt],  # [BH, M, K]
+    b_ptr: ImmutKernelPtr[dt],  # [BH, K, N]
+    c_ptr: MutKernelPtr[dt],  # [BH, M, N]
+    a_stride: Int,  # M*K
+    b_stride: Int,  # K*N
+    c_stride: Int,  # M*N
+) -> None:
+    # With BM=64, BN=64, BK=16, THREADS=1024:
+    #   ROWS_PER_THREAD = BM / (THREADS / BN) = 64 / (1024 / 64) = 64 / 16 = 4
+    # ty = tid // BN: which "4-row group" this thread belongs to [0, THREADS/BN)
+    # tx = tid %  BN: which output column                         [0, BN)
+    comptime ROWS_PER_THREAD = BM * BN // (BM * BK)  # = BN // BK = 64 // 16 = 4
+    var a_sh = LayoutTensor[
+        dt,
+        Layout.row_major(BM, BK + 1),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var b_sh = LayoutTensor[
+        dt,
+        Layout.row_major(BK, BN + 1),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var tid = Int(thread_idx.x)
+    var bh_idx = Int(block_idx.z)  # head index (no integer division!)
+    var tile_m = Int(block_idx.y)  # M-tile index
+    var tile_n = Int(block_idx.x)  # N-tile index
+    var m_off = tile_m * BM
+    var n_off = tile_n * BN
+
+    var ty = tid // BN  # output row-group [0, THREADS/BN = BM/ROWS)
+    var tx = tid % BN  # output col       [0, BN)
+
+    var a_base = bh_idx * a_stride + m_off * K
+    var b_base = bh_idx * b_stride + n_off
+    var c_base = bh_idx * c_stride + m_off * N + n_off
+
+    # Four register accumulators (one per output row per thread).
+    var acc0 = Scalar[dt](0.0)
+    var acc1 = Scalar[dt](0.0)
+    var acc2 = Scalar[dt](0.0)
+    var acc3 = Scalar[dt](0.0)
+
+    for k in range(0, K, BK):
+        # Load A tile [BM, BK]: tid → row = tid//BK, col = tid%BK.
+        # BM×BK = THREADS → every thread loads exactly 1 element — 0% idle.
+        # SIMD coalescing: 32 consecutive tids → 2 rows × 16 cols each (2 cache
+        # lines, both fully utilised because rows are K=1024 apart in memory).
+        var ra = tid // BK
+        var ca = tid % BK
+        a_sh.ptr[ra * (BK + 1) + ca] = a_ptr[a_base + ra * K + k + ca]
+
+        # Load B tile [BK, BN]: tid → row = tid//BN, col = tid%BN.
+        # BK×BN = THREADS → every thread loads exactly 1 element.
+        # SIMD coalescing: 32 consecutive tids → same BK row, 32 consecutive
+        # BN cols → 1 cache line per SIMD pair → perfect coalescing.
+        var rb = tid // BN
+        var cb = tid % BN
+        b_sh.ptr[rb * (BN + 1) + cb] = b_ptr[b_base + (k + rb) * N + cb]
+
+        barrier()
+
+        # Inner K-tile loop: 4 FMAs per B-read (register tile over 4 output rows).
+        # A reads: ty is uniform within each SIMD group → all 4 A-reads are BROADCASTs.
+        # B reads: tx varies 0..31 within SIMD → bank = (kk+tx)%32 cycles all banks.
+        # comptime for forces compile-time unroll: BK=16 iterations, each yields a
+        # B-broadcast and 4 FMAs → the Metal shader sees 16 inlined instruction groups.
+        comptime for kk in range(BK):
+            var bv = b_sh.ptr[kk * (BN + 1) + tx]
+            acc0 = fma(
+                a_sh.ptr[(ty * ROWS_PER_THREAD + 0) * (BK + 1) + kk], bv, acc0
+            )
+            acc1 = fma(
+                a_sh.ptr[(ty * ROWS_PER_THREAD + 1) * (BK + 1) + kk], bv, acc1
+            )
+            acc2 = fma(
+                a_sh.ptr[(ty * ROWS_PER_THREAD + 2) * (BK + 1) + kk], bv, acc2
+            )
+            acc3 = fma(
+                a_sh.ptr[(ty * ROWS_PER_THREAD + 3) * (BK + 1) + kk], bv, acc3
+            )
+
+        barrier()
+
+    # Write outputs (boundary guard in case M is not a multiple of BM).
+    var row_base = m_off + ty * ROWS_PER_THREAD
+    var c_off = c_base + ty * ROWS_PER_THREAD * N + tx
+    if row_base + 0 < M and n_off + tx < N:
+        c_ptr[c_off + 0 * N] = acc0
+    if row_base + 1 < M and n_off + tx < N:
+        c_ptr[c_off + 1 * N] = acc1
+    if row_base + 2 < M and n_off + tx < N:
+        c_ptr[c_off + 2 * N] = acc2
+    if row_base + 3 < M and n_off + tx < N:
+        c_ptr[c_off + 3 * N] = acc3
+
+
+def _launch_headout4[
+    dtype: DType
+](
+    a_ptr: ImmutKernelPtr[dtype],  # [BH, T, T]
+    b_ptr: ImmutKernelPtr[dtype],  # [BH, T, HD]
+    c_ptr: MutKernelPtr[dtype],  # [BH, T, HD]
+    BH: Int,
+    T: Int,
+    HD: Int,
+    ctx: DeviceContext,
+) raises:
+    # C[BH,T,HD] = A[BH,T,T] · B[BH,T,HD].
+    # BM=64 rows per block; THREADS=1024; BK=16; BN=HD=64; ROWS_PER_THREAD=4.
+    # 3D grid: (tiles_n=1, tiles_m, BH) → block_idx gives indices without division.
+    comptime BM = 64
+    comptime BN = 64  # must equal HD for GPT-2 124M
+    comptime BK = 16  # BM*BK = BN*BK = 1024 = THREADS
+    comptime THREADS = BM * BK  # = 1024
+    var tiles_m = ceildiv(T, BM)  # = T/64 = 16
+    var tiles_n = ceildiv(HD, BN)  # = HD/64 = 1 (when HD=BN=64)
+    comptime k = _attn_headout4_gpu[dtype, BM, BN, BK]
+    var compiled = ctx.compile_function[k]()
+    ctx.enqueue_function(
+        compiled,
+        BH,
+        T,
+        HD,
+        T,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        T * T,
+        T * HD,
+        T * HD,
+        grid_dim=(tiles_n, tiles_m, BH),
+        block_dim=(THREADS,),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metal-only transposed-A batched kernel (4-rows-per-thread):
+# C[BH,M,N] = A[BH,K,M]ᵀ · B[BH,K,N]   (i.e. C[m,n] = Σ_k A[k,m]·B[k,n])
+#
+# This is the "transpose_a" GEMM that dK = dSᵀ·Q and dV = Pᵀ·dO need. Instead of
+# the old three-pass path (rect-transpose the [T,HD] operand → generic 1-elem/
+# thread kvgrad GEMM producing dKᵀ/dVᵀ → rect-transpose the result back), it
+# folds the A-transpose into the shared-memory load and reuses headout4's fast
+# register-tiled inner loop, so dK/dV each cost one launch with zero transpose
+# traffic and the same 4-FMA-per-B-read efficiency as dQ.
+#
+# A stored [BH,K,M] = the [BH,T,T] dS/P plane (K=query axis, M=key axis).
+# B stored [BH,K,N] = the [BH,T,HD] Q/dO plane (K=query axis, N=head dim).
+# The A-load is coalesced (consecutive threads → consecutive M, which is the
+# contiguous inner stride of the [K,M] plane) and staged into shared transposed,
+# so the inner loop reads A_sh[kk, m] as a per-SIMD broadcast exactly like
+# headout4. Grid: (tiles_n, tiles_m, BH) 3D — no per-block integer division.
+# ---------------------------------------------------------------------------
+@always_inline
+def _attn_headout4_transA_gpu[
+    dt: DType,
+    BM: Int,  # output rows per block (over M = T); BM × BK == THREADS
+    BN: Int,  # output cols per block (= HD = 64); BK × BN == THREADS
+    BK: Int,  # K-tile step over the summed query axis
+](
+    bh: Int,
+    M: Int,  # T (key axis → dK/dV rows)
+    N: Int,  # HD
+    K: Int,  # T (query axis, summed)
+    a_ptr: ImmutKernelPtr[dt],  # [BH, K, M]  — dS or P
+    b_ptr: ImmutKernelPtr[dt],  # [BH, K, N]  — Q or dO
+    c_ptr: MutKernelPtr[dt],  # [BH, M, N]  — dK or dV
+    a_stride: Int,  # K*M
+    b_stride: Int,  # K*N
+    c_stride: Int,  # M*N
+) -> None:
+    comptime ROWS_PER_THREAD = BM * BN // (BM * BK)  # = BN // BK
+    var a_sh = LayoutTensor[
+        dt,
+        Layout.row_major(BK, BM + 1),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var b_sh = LayoutTensor[
+        dt,
+        Layout.row_major(BK, BN + 1),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var tid = Int(thread_idx.x)
+    var bh_idx = Int(block_idx.z)
+    var tile_m = Int(block_idx.y)
+    var tile_n = Int(block_idx.x)
+    var m_off = tile_m * BM
+    var n_off = tile_n * BN
+
+    var ty = tid // BN  # output row-group [0, BM/ROWS)
+    var tx = tid % BN  # output col       [0, BN)
+
+    var a_base = bh_idx * a_stride
+    var b_base = bh_idx * b_stride
+    var c_base = bh_idx * c_stride + m_off * N + n_off
+
+    var acc0 = Scalar[dt](0.0)
+    var acc1 = Scalar[dt](0.0)
+    var acc2 = Scalar[dt](0.0)
+    var acc3 = Scalar[dt](0.0)
+
+    for k in range(0, K, BK):
+        # Load A tile [BK, BM] transposed into a_sh[k_local, m_local]:
+        # A[k0+k_local, m_off+m_local]. Row-major [K,M] → m is contiguous, so
+        # consecutive tids (→ consecutive m_local) coalesce.
+        var ra = tid // BM  # k-row in tile  [0, BK)
+        var ca = tid % BM  # m-col in tile  [0, BM)
+        a_sh.ptr[ra * (BM + 1) + ca] = a_ptr[a_base + (k + ra) * M + m_off + ca]
+
+        # Load B tile [BK, BN] into b_sh[k_local, n_local]: B[k0+k_local, n_off+n].
+        var rb = tid // BN
+        var cb = tid % BN
+        b_sh.ptr[rb * (BN + 1) + cb] = b_ptr[b_base + (k + rb) * N + n_off + cb]
+
+        barrier()
+
+        # 4 FMAs per B-read: A_sh[kk, m] is a per-SIMD broadcast (ty uniform in a
+        # SIMD group); b_sh[kk, tx] cycles all banks over tx.
+        comptime for kk in range(BK):
+            var bv = b_sh.ptr[kk * (BN + 1) + tx]
+            acc0 = fma(
+                a_sh.ptr[kk * (BM + 1) + ty * ROWS_PER_THREAD + 0], bv, acc0
+            )
+            acc1 = fma(
+                a_sh.ptr[kk * (BM + 1) + ty * ROWS_PER_THREAD + 1], bv, acc1
+            )
+            acc2 = fma(
+                a_sh.ptr[kk * (BM + 1) + ty * ROWS_PER_THREAD + 2], bv, acc2
+            )
+            acc3 = fma(
+                a_sh.ptr[kk * (BM + 1) + ty * ROWS_PER_THREAD + 3], bv, acc3
+            )
+
+        barrier()
+
+    var row_base = m_off + ty * ROWS_PER_THREAD
+    var c_off = c_base + ty * ROWS_PER_THREAD * N + tx
+    if row_base + 0 < M and n_off + tx < N:
+        c_ptr[c_off + 0 * N] = acc0
+    if row_base + 1 < M and n_off + tx < N:
+        c_ptr[c_off + 1 * N] = acc1
+    if row_base + 2 < M and n_off + tx < N:
+        c_ptr[c_off + 2 * N] = acc2
+    if row_base + 3 < M and n_off + tx < N:
+        c_ptr[c_off + 3 * N] = acc3
+
+
+def _launch_headout4_transA[
+    dtype: DType
+](
+    a_ptr: ImmutKernelPtr[dtype],  # [BH, T, T]   — dS or P
+    b_ptr: ImmutKernelPtr[dtype],  # [BH, T, HD]  — Q or dO
+    c_ptr: MutKernelPtr[dtype],  # [BH, T, HD]  — dK or dV
+    BH: Int,
+    T: Int,
+    HD: Int,
+    ctx: DeviceContext,
+) raises:
+    # C[BH,T,HD] = A[BH,T,T]ᵀ · B[BH,T,HD]  (dK = dSᵀ·Q, dV = Pᵀ·dO).
+    # Mirrors _launch_headout4's geometry: BM=64 rows, BN=HD=64, BK=16,
+    # THREADS=1024, ROWS_PER_THREAD=4. K (the summed query axis) = T.
+    comptime BM = 64
+    comptime BN = 64  # must equal HD for GPT-2 124M
+    comptime BK = 16  # BM*BK = BN*BK = 1024 = THREADS
+    comptime THREADS = BM * BK  # = 1024
+    var tiles_m = ceildiv(T, BM)
+    var tiles_n = ceildiv(HD, BN)  # = 1 when HD=BN=64
+    comptime k = _attn_headout4_transA_gpu[dtype, BM, BN, BK]
+    var compiled = ctx.compile_function[k]()
+    ctx.enqueue_function(
+        compiled,
+        BH,
+        T,
+        HD,
+        T,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        T * T,
+        T * HD,
+        T * HD,
+        grid_dim=(tiles_n, tiles_m, BH),
+        block_dim=(THREADS,),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metal-only batched scoreout kernel: C[BH,T,T] = A[BH,T,HD] · B[BH,T,HD]ᵀ
+#
+# K = HD = 64 is small enough to load the ENTIRE K-dimension into shared memory
+# in one step — no outer K-tile loop, one barrier, 64 FMAs per thread.
+# Grid: BH × (T/BM) × (T/BN) = 48×32×32 = 49152 blocks at 1024 threads each.
+# Shared mem: A_sh[32,65] + B_sh[32,65] = 16640 B per block.
+# ---------------------------------------------------------------------------
+@always_inline
+def _attn_batched_scoreout_gpu[
+    dt: DType,
+    BM: Int,  # output rows per block (= N tile)  — both BM and BN must equal T//tiles
+    BN: Int,  # output cols per block
+    BK: Int,  # = HD = 64; entire K loaded in one tile (BM//2 * BK must equal THREADS)
+](
+    bh: Int,
+    M: Int,  # T
+    N: Int,  # T
+    K: Int,  # HD
+    a_ptr: ImmutKernelPtr[dt],  # [BH, T, HD] — Q or dO
+    b_ptr: ImmutKernelPtr[
+        dt
+    ],  # [BH, T, HD] — K or V (accessed as row-major, col is K dim)
+    c_ptr: MutKernelPtr[dt],  # [BH, T, T]  — output scores (written in fp32)
+    tiles_m: Int,
+    tiles_n: Int,
+) -> None:
+    # Shared mem: A_sh[BM, BK+1] and B_sh[BN, BK+1] — +1 padding avoids bank conflicts.
+    var a_sh = LayoutTensor[
+        dt,
+        Layout.row_major(BM, BK + 1),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var b_sh = LayoutTensor[
+        dt,
+        Layout.row_major(BN, BK + 1),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var tid = Int(thread_idx.x)  # [0, BM*BN = THREADS)
+    var ty = tid // BN  # output row in C-tile: [0, BM)
+    var tx = tid % BN  # output col in C-tile: [0, BN)
+
+    var bid = Int(block_idx.x)
+    var bh_idx = bid // (tiles_m * tiles_n)
+    var rem = bid % (tiles_m * tiles_n)
+    var tile_m = rem // tiles_n
+    var tile_n = rem % tiles_n
+    var m_off = tile_m * BM
+    var n_off = tile_n * BN
+
+    # Base pointers into A[bh,m_off,0] and B[bh,n_off,0] and C[bh,m_off,n_off]
+    var a_base = bh_idx * M * K + m_off * K
+    var b_base = bh_idx * N * K + n_off * K
+    var c_base = bh_idx * M * N + m_off * N + n_off
+
+    # Load A tile [BM, BK] = 2*THREADS elements using THREADS threads (2 each).
+    # THREADS = BM*BN but the A tile has BM*BK elements. We require BM*BK = 2*THREADS
+    # i.e. BK = 2*BN, which holds for BM=BN=32 and BK=64.
+    # Pass 1: tid in [0, THREADS) → flat element index ia = tid
+    #         ia // BK = row ∈ [0, BM//2), ia % BK = col ∈ [0, BK)
+    # Pass 2: ia = tid + BM//2 * BK (= tid + THREADS) → row ∈ [BM//2, BM)
+    var ia = tid
+    a_sh.ptr[ia // BK * (BK + 1) + ia % BK] = a_ptr[
+        a_base + ia // BK * K + ia % BK
+    ]
+    ia = tid + BM // 2 * BK
+    a_sh.ptr[ia // BK * (BK + 1) + ia % BK] = a_ptr[
+        a_base + ia // BK * K + ia % BK
+    ]
+
+    # Load B tile [BN, BK] = 2*THREADS elements; same pattern as A.
+    var ib = tid
+    b_sh.ptr[ib // BK * (BK + 1) + ib % BK] = b_ptr[
+        b_base + ib // BK * K + ib % BK
+    ]
+    ib = tid + BN // 2 * BK
+    b_sh.ptr[ib // BK * (BK + 1) + ib % BK] = b_ptr[
+        b_base + ib // BK * K + ib % BK
+    ]
+
+    barrier()
+
+    # Compute: C[ty, tx] = Σ_{kk=0}^{K-1} A_sh[ty, kk] · B_sh[tx, kk]
+    # A_sh read: a_sh.ptr[ty * (BK+1) + kk] — ty is same for all threads in a SIMD group
+    #            → BROADCAST (32 threads same location) ✓
+    # B_sh read: b_sh.ptr[tx * (BK+1) + kk] — tx cycles 0..31 within SIMD
+    #            bank = (tx * 65 + kk) % 32 = (tx + kk) % 32 → all 32 banks ✓
+    var acc = Scalar[dt](0.0)
+    for kk in range(K):
+        acc = fma(
+            a_sh.ptr[ty * (BK + 1) + kk], b_sh.ptr[tx * (BK + 1) + kk], acc
+        )
+
+    if m_off + ty < M and n_off + tx < N:
+        c_ptr[c_base + ty * N + tx] = acc
+
+
+def _launch_batched_scoreout[
+    dtype: DType
+](
+    a_ptr: ImmutKernelPtr[dtype],  # [BH, T, HD] — Q or dO
+    b_ptr: ImmutKernelPtr[dtype],  # [BH, T, HD] — K or V
+    c_ptr: MutKernelPtr[dtype],  # [BH, T, T]  — output
+    BH: Int,
+    T: Int,
+    HD: Int,
+    ctx: DeviceContext,
+) raises:
+    # C[BH,T,T] = A[BH,T,HD] · B[BH,T,HD]ᵀ in one launch covering all BH heads.
+    # Tile sizes: BM=BN=32, BK=HD=64 (full K in shared mem; BK = 2*BN required).
+    comptime BM = 32
+    comptime BN = 32
+    comptime BK = 64  # must equal HD for GPT-2 124M
+    comptime THREADS = BM * BN  # = 1024
+    var tiles_m = ceildiv(T, BM)
+    var tiles_n = ceildiv(T, BN)
+    var num_blocks = BH * tiles_m * tiles_n  # 48 × 32 × 32 = 49152 at T=1024
+    comptime k = _attn_batched_scoreout_gpu[dtype, BM, BN, BK]
+    var compiled = ctx.compile_function[k]()
+    ctx.enqueue_function(
+        compiled,
+        BH,
+        T,
+        T,
+        HD,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        tiles_m,
+        tiles_n,
+        grid_dim=(num_blocks,),
+        block_dim=(THREADS,),
+    )
+
+
+@always_inline
 def _cublas_dt[dt: DType]() -> DataType:
     comptime if dt == DType.bfloat16:
         return DataType.R_16BF
@@ -3309,6 +3944,153 @@ def _cublas_dt[dt: DType]() -> DataType:
         return DataType.R_32F
     else:
         return DataType.R_16F
+
+
+def _launch_transpose_planes[
+    dtype: DType,
+](
+    src_ptr: ImmutKernelPtr[dtype],
+    dst_ptr: MutKernelPtr[dtype],
+    num_planes: Int,
+    seq_len: Int,
+    ctx: DeviceContext,
+) raises:
+    # Metal helper: per-plane transpose of a [num_planes, T, T] buffer via the
+    # coalesced 32×32-tile kernel. Used so the dK/dV gradient GEMMs can avoid the
+    # transpose_a linalg.matmul cannot express (#6626) — we materialise dSᵀ / Pᵀ
+    # and run plain (transpose_a-free) per-head GEMMs.
+    comptime BLOCK_SIZE = 256
+    comptime SM_OVERPROVISION = 32
+    var tiles = ceildiv(seq_len, TRANSPOSE_TILE)
+    var total_tiles = num_planes * tiles * tiles
+    var num_sm = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var num_blocks = max(min(total_tiles, SM_OVERPROVISION * num_sm), 1)
+    comptime k = _attention_transpose_planes_gpu[dtype, BLOCK_SIZE]
+    var compiled = ctx.compile_function[k]()
+    ctx.enqueue_function(
+        compiled,
+        num_planes,
+        seq_len,
+        src_ptr,
+        dst_ptr,
+        grid_dim=(num_blocks,),
+        block_dim=(BLOCK_SIZE,),
+    )
+
+
+def _launch_rect_transpose[
+    dtype: DType,
+](
+    src_ptr: ImmutKernelPtr[dtype],
+    dst_ptr: MutKernelPtr[dtype],
+    num_planes: Int,
+    rows: Int,
+    cols: Int,
+    ctx: DeviceContext,
+) raises:
+    # NOTE: No longer on the Metal backward path — the four Phase-C rect-transposes
+    # (Q→Qᵀ, dKᵀ→dK, dO→dOᵀ, dVᵀ→dV) were eliminated by folding the A-transpose
+    # into `_launch_headout4_transA`'s shared-memory load. Retained as a general
+    # coalesced rect-transpose helper.
+    # Metal helper: per-plane transpose of a [num_planes, rows, cols] buffer →
+    # [num_planes, cols, rows] via the coalesced 32×32-tile rect-transpose kernel.
+    # Used for the small [T,HD]↔[HD,T] transposes in Phase C of the backward pass
+    # (transposing Q and dO before their GEMMs, and transposing dKᵀ/dVᵀ after).
+    # Each [T,HD] plane is 256 KB (16× smaller than a [T,T] plane at T=1024,HD=64),
+    # making this ~16× cheaper than _launch_transpose_planes on the same BH planes.
+    comptime BLOCK_SIZE = 256
+    comptime SM_OVERPROVISION = 32
+    var tiles_r = ceildiv(rows, TRANSPOSE_TILE)
+    var tiles_c = ceildiv(cols, TRANSPOSE_TILE)
+    var total_tiles = num_planes * tiles_r * tiles_c
+    var num_sm = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var num_blocks = max(min(total_tiles, SM_OVERPROVISION * num_sm), 1)
+    comptime k = _attention_transpose_rect_gpu[dtype, BLOCK_SIZE]
+    var compiled = ctx.compile_function[k]()
+    ctx.enqueue_function(
+        compiled,
+        num_planes,
+        rows,
+        cols,
+        src_ptr,
+        dst_ptr,
+        grid_dim=(num_blocks,),
+        block_dim=(BLOCK_SIZE,),
+    )
+
+
+@always_inline
+def _attn_gemm_batched_metal[
+    dt: DType,
+](
+    a_ptr: ImmutKernelPtr[dt],
+    b_ptr: ImmutKernelPtr[dt],
+    c_ptr: MutKernelPtr[dt],
+    M: Int,
+    N: Int,
+    K: Int,
+    a_stride: Int,
+    b_stride: Int,
+    c_stride: Int,
+    transpose_b: Bool,
+    BH: Int,
+    ctx: DeviceContext,
+) raises:
+    # Metal (vendor-neutral) batched GEMM: one `linalg.matmul` per head over the
+    # BH contiguous [.,.] planes. Row-major C[M,N] = A[M,K] · op_b(B), where
+    # op_b(B) is B[K,N] (transpose_b=False) or B[N,K]ᵀ (transpose_b=True). Matches
+    # cuBLAS's per-head semantics for the transpose_a=False calls (QKᵀ, A·V, dQ,
+    # dO·Vᵀ); the two transpose_a=True gradients (dK, dV) are handled by the
+    # caller pre-transposing the square [T,T] plane (see attention_bwd_gemm).
+    #
+    # No synchronize() brackets: linalg.matmul enqueues on ctx's stream, so the
+    # per-head GEMMs are ordered against the surrounding softmax / P+dS / transpose
+    # kernels (also on ctx's stream) without host fences. The forward/backward
+    # callers place the one required drain (attention_fwd_gemm's trailing fence /
+    # attention_bwd_gemm's final synchronize). Dropping the per-call brackets
+    # removed ~11 full-GPU drains per backward layer.
+    if transpose_b:
+        for bh in range(BH):
+            var a = TileTensor(
+                Span[Scalar[dt], ImmutAnyOrigin](
+                    ptr=a_ptr + bh * a_stride, length=M * K
+                ),
+                row_major(M, K),
+            )
+            var b = TileTensor(
+                Span[Scalar[dt], ImmutAnyOrigin](
+                    ptr=b_ptr + bh * b_stride, length=N * K
+                ),
+                row_major(N, K),
+            )
+            var c = TileTensor(
+                Span[Scalar[dt], MutAnyOrigin](
+                    ptr=c_ptr + bh * c_stride, length=M * N
+                ),
+                row_major(M, N),
+            )
+            matmul[transpose_b=True, target="gpu"](c, a, b, ctx=ctx)
+    else:
+        for bh in range(BH):
+            var a = TileTensor(
+                Span[Scalar[dt], ImmutAnyOrigin](
+                    ptr=a_ptr + bh * a_stride, length=M * K
+                ),
+                row_major(M, K),
+            )
+            var b = TileTensor(
+                Span[Scalar[dt], ImmutAnyOrigin](
+                    ptr=b_ptr + bh * b_stride, length=K * N
+                ),
+                row_major(K, N),
+            )
+            var c = TileTensor(
+                Span[Scalar[dt], MutAnyOrigin](
+                    ptr=c_ptr + bh * c_stride, length=M * N
+                ),
+                row_major(M, N),
+            )
+            matmul[transpose_b=False, target="gpu"](c, a, b, ctx=ctx)
 
 
 @always_inline
@@ -3331,6 +4113,25 @@ def _attn_gemm_batched[
     ctx: DeviceContext,
     transpose_a: Bool = False,
 ) raises:
+    comptime if HAS_METAL:
+        # All three operands share a dtype on the Metal attention path (fp32/bf16),
+        # so the rebinds are identity. transpose_a is never True here — the caller
+        # pre-transposes for dK/dV (linalg.matmul has no transpose_a).
+        _attn_gemm_batched_metal[a_dt](
+            a_ptr,
+            rebind[ImmutKernelPtr[a_dt]](b_ptr),
+            rebind[MutKernelPtr[a_dt]](c_ptr),
+            M,
+            N,
+            K,
+            a_stride,
+            b_stride,
+            c_stride,
+            transpose_b,
+            BH,
+            ctx,
+        )
+        return
     # All BH heads of a per-head GEMM C[M,N] = op(A) · op(B) in ONE
     # cublasGemmStridedBatchedEx call. This is
     # what llm.c does (cublasGemmStridedBatched): packing all heads into a single
@@ -3428,46 +4229,50 @@ def _attn_gemm_batched[
                 )
         return
 
-    var handle = _get_global_handle[a_dt](ctx)
-    var alpha = Float32(1.0)
-    var beta = Float32(0.0)
-    var op_b = _convert_to_cublas_transpose(transpose_b)
-    var op_a = _convert_to_cublas_transpose(transpose_a)
-    var lda = K if transpose_b else N
-    var ldb = M if transpose_a else K
-    check_cublas_error(
-        cublasGemmStridedBatchedEx(
-            handle._get_cublas(),
-            op_b,
-            op_a,
-            Int64(N),
-            Int64(M),
-            Int64(K),
-            UnsafePointer(to=alpha)
-            .bitcast[NoneType]()
-            .as_immutable()
-            .as_unsafe_any_origin(),
-            b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
-            _cublas_dt[b_dt](),
-            Int64(lda),
-            Int64(b_stride),
-            a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
-            _cublas_dt[a_dt](),
-            Int64(ldb),
-            Int64(a_stride),
-            UnsafePointer(to=beta)
-            .bitcast[NoneType]()
-            .as_immutable()
-            .as_unsafe_any_origin(),
-            c_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
-            _cublas_dt[c_dt](),
-            Int64(N),
-            Int64(c_stride),
-            Int64(BH),
-            ComputeType.COMPUTE_32F,
-            Algorithm.DEFAULT,
+    # cuBLAS-symbol-using tail: comptime-excluded on Metal so its FFI symbols are
+    # never referenced (they don't link on a Metal build). The Metal branch above
+    # returns before here.
+    comptime if not HAS_METAL:
+        var handle = _get_global_handle[a_dt](ctx)
+        var alpha = Float32(1.0)
+        var beta = Float32(0.0)
+        var op_b = _convert_to_cublas_transpose(transpose_b)
+        var op_a = _convert_to_cublas_transpose(transpose_a)
+        var lda = K if transpose_b else N
+        var ldb = M if transpose_a else K
+        check_cublas_error(
+            cublasGemmStridedBatchedEx(
+                handle._get_cublas(),
+                op_b,
+                op_a,
+                Int64(N),
+                Int64(M),
+                Int64(K),
+                UnsafePointer(to=alpha)
+                .bitcast[NoneType]()
+                .as_immutable()
+                .as_unsafe_any_origin(),
+                b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+                _cublas_dt[b_dt](),
+                Int64(lda),
+                Int64(b_stride),
+                a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+                _cublas_dt[a_dt](),
+                Int64(ldb),
+                Int64(a_stride),
+                UnsafePointer(to=beta)
+                .bitcast[NoneType]()
+                .as_immutable()
+                .as_unsafe_any_origin(),
+                c_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+                _cublas_dt[c_dt](),
+                Int64(N),
+                Int64(c_stride),
+                Int64(BH),
+                ComputeType.COMPUTE_32F,
+                Algorithm.DEFAULT,
+            )
         )
-    )
 
 
 @always_inline
@@ -3483,8 +4288,18 @@ def _attention_bmm_kvgrad[
     hd: Int,
     ctx: DeviceContext,
 ) capturing raises:
+    # NOTE: No longer on the Metal backward path. dK/dV now use the fused
+    # transpose_a kernel `_launch_headout4_transA` (dK = dSᵀ·Q, dV = Pᵀ·dO in one
+    # launch each, zero transpose passes), which is ~2.4× faster than this generic
+    # 1-elem/thread kvgrad GEMM and eliminates the four rect-transposes that used
+    # to bracket it. Retained for the cuBLAS/reference path and as a fallback.
     # C[hd,T] = A[hd,T] · B[T,T], all heads batched. With A = Qᵀ, B = dS this is
     # dKᵀ; with A = dOᵀ, B = P this is dVᵀ — letting dK/dV skip transposing [T,T].
+    # Metal: dispatch all BH heads in a single custom tiled kernel instead of
+    # 48 serial linalg.matmul calls, saturating the GPU with enough tiles.
+    comptime if HAS_METAL:
+        _launch_batched_kvgrad[dtype](at_ptr, big_ptr, out_ptr, BH, T, hd, ctx)
+        return
     _attn_gemm_batched[dtype, dtype, dtype](
         at_ptr,
         big_ptr,
@@ -3550,6 +4365,12 @@ def _attention_bmm_headout[
 ) capturing raises:
     # C[T,hd] = A[T,T] · B[T,hd], all heads batched. dQ = dS·K (the 1/√d scale is
     # already folded into dS); also the forward A·V. No epilogue.
+    # Metal: use the 4-rows-per-thread batched kernel. BM=64 rows per block with
+    # BM×BK=BK×BN=THREADS=1024 gives 100% A/B load efficiency. 3D grid eliminates
+    # integer divisions per block. All 48 heads in one launch vs 48 serial matmuls.
+    comptime if HAS_METAL:
+        _launch_headout4[dtype](a_ptr, b_ptr, out_ptr, BH, T, hd, ctx)
+        return
     _attn_gemm_batched[dtype, dtype, dtype](
         a_ptr,
         b_ptr,
@@ -3662,7 +4483,18 @@ def attention_bwd_gemm[
         var att_slice = ap + c[].att_probs_layer * c[].att_probs_stride
         scores_immut = rebind[ImmutKernelPtr[dtype]](att_slice)
         p_immut = rebind[ImmutKernelPtr[dtype]](att_slice)
+    # NOTE (Metal): do NOT reuse the forward's gemm_att scratch (p_buf) as the
+    # stored P here. The forward writes P into that single reused buffer per
+    # layer, and forward/backward run as two separate whole-model loops, so by
+    # the time the backward for layer L runs, p_buf holds the LAST forward
+    # layer's P — not layer L's. Reusing it aliased every backward layer to the
+    # final layer's probabilities, producing per-layer-amplified gradients that
+    # compounded with depth. Instead, when the store is disabled (att_probs_addr
+    # == 0) we fall through to the true recompute path below: QKᵀ is recomputed
+    # from this layer's Q/K into pt_buf, and pds_recompute re-derives P from the
+    # per-layer saved log-sum-exp — both correct and self-contained per layer.
     # score_buf / dp_buf (fp32) are retained only as Phase-C dKᵀ/dVᵀ scratch.
+    # See docs/ai/metal_port_gotchas_and_optimizations.md P12 for the full story.
     _ = score_buf
 
     comptime BLOCK_SIZE = 256
@@ -3673,6 +4505,14 @@ def attention_bwd_gemm[
     def _grid(work: Int) -> Int:
         return max(min(ceildiv(work, BLOCK_SIZE), SM_OVERPROVISION * num_sm), 1)
 
+    # Env-gated per-phase timing (LLMM_ATTN_PROFILE build): inserts synchronize
+    # fences and prints per-phase ms. Compiled out of the production path — the
+    # timer variable itself only exists in the profiling build.
+    comptime _PROF = is_defined["LLMM_ATTN_PROFILE"]()
+    var _tp = UInt64(0)
+    comptime if _PROF:
+        _tp = global_perf_counter_ns()
+
     # Phase A: dP = dO·Vᵀ. QKᵀ (scores) is only recomputed when the forward's
     # probs were NOT stored — otherwise we read them directly (skip a big matmul).
     if not use_stored:
@@ -3682,6 +4522,11 @@ def attention_bwd_gemm[
     _attention_bmm_scoreout[dtype, dtype, target](
         d_output_ptr, value_ptr, dst_buf, BH, T, hd, device_ctx
     )
+    comptime if _PROF:
+        device_ctx.synchronize()
+        var _n = global_perf_counter_ns()
+        print("  A scoreout(dP)", Float64(_n - _tp) / 1e6, "ms")
+        _tp = _n
     # No fence: Phase B runs on the same stream and is ordered after Phase A's
     # cuBLAS writes to pt_buf/dst_buf.
 
@@ -3699,6 +4544,11 @@ def attention_bwd_gemm[
         grid_dim=(_grid(BH * T),),
         block_dim=(BLOCK_SIZE,),
     )
+    comptime if _PROF:
+        device_ctx.synchronize()
+        var _n = global_perf_counter_ns()
+        print("  B rowdot(D)", Float64(_n - _tp) / 1e6, "ms")
+        _tp = _n
     # Vectorized: each thread handles `PDS_WIDTH` contiguous elements. T is a
     # power of two ≥ 32, so PDS_WIDTH=8 divides plane and never straddles a row
     # for production shapes. The equivalence suite's odd seq_len (e.g. 7)
@@ -3786,52 +4636,93 @@ def attention_bwd_gemm[
                 block_dim=(BLOCK_SIZE,),
             )
 
+    comptime if _PROF:
+        device_ctx.synchronize()
+        var _n = global_perf_counter_ns()
+        print("  B pds(P+dS)", Float64(_n - _tp) / 1e6, "ms")
+        _tp = _n
+
     # No fence: the gradient matmuls run on the same stream, ordered after P+dS.
 
-    # dQ = dS·K, dK = dSᵀ·Q, dV = Pᵀ·dO — all batched cuBLAS. cublasGemmStrided-
-    # BatchedEx does transpose_a natively, so dK/dV are computed *directly* rather
-    # than forming dKᵀ/dVᵀ and running four rect-transpose kernels (⑮ dropped
-    # those + two sync phases). dS already carries the 1/√d scale; dV is unscaled.
+    # dQ = dS·K, dK = dSᵀ·Q, dV = Pᵀ·dO — all per-head GEMMs.
+    # cuBLAS does transpose_a natively in one strided-batched call.
+    # Metal (linalg.matmul has no transpose_a): instead of materialising the large
+    # [T,T] dSᵀ / Pᵀ planes (4 MB × 48 = 192 MB each, ~754 MB transpose traffic),
+    # we transpose the small [T,HD] operands Q and dO (256 KB × 48 = 12 MB each):
+    #   dKᵀ[HD,T] = Qᵀ[HD,T] · dS[T,T]  then  dK[T,HD] = (dKᵀ)ᵀ
+    #   dVᵀ[HD,T] = dOᵀ[HD,T] · P[T,T]  then  dV[T,HD] = (dVᵀ)ᵀ
+    # Total rect-transpose traffic: 4 × 12 MB ≈ 50 MB (~15× less than the old path).
+    # Scratch reuse (same stream, no aliasing): pt_buf → Qᵀ → (reused) dVᵀ;
+    # score_buf → dKᵀ; dst_buf → dOᵀ. dS already carries the 1/√d scale.
     var ds_immut = rebind[ImmutKernelPtr[dtype]](ds_buf)
-    _ = score_buf
-    _ = pt_buf
-    _ = dst_buf
     _ = dp_buf
     _attention_bmm_headout[dtype, target](
         ds_immut, key_ptr, d_query_ptr, BH, T, hd, device_ctx
     )
-    _attn_gemm_batched[dtype, dtype, dtype](
-        ds_immut,
-        query_ptr,
-        d_key_ptr,
-        T,
-        hd,
-        T,
-        T * T,
-        T * hd,
-        T * hd,
-        False,
-        BH,
-        device_ctx,
-        transpose_a=True,
-    )
-    _attn_gemm_batched[dtype, dtype, dtype](
-        p_immut,
-        d_output_ptr,
-        d_value_ptr,
-        T,
-        hd,
-        T,
-        T * T,
-        T * hd,
-        T * hd,
-        False,
-        BH,
-        device_ctx,
-        transpose_a=True,
-    )
-    # Fence: downstream QKV-merge reads dQ/dK/dV.
-    device_ctx.synchronize()
+    comptime if _PROF:
+        device_ctx.synchronize()
+        var _n = global_perf_counter_ns()
+        print("  C dQ=dS.K headout", Float64(_n - _tp) / 1e6, "ms")
+        _tp = _n
+    comptime if HAS_METAL:
+        # Phase C-Metal: fused transpose_a GEMMs — dK/dV are computed directly
+        # from the [T,T] plane with ZERO transpose passes. The transposed-A
+        # register-tiled kernel reads dS/P as the [K=query, M=key] operand and
+        # Q/dO as [K=query, N=head], emitting dK[T,HD]/dV[T,HD] in one launch
+        # each (headout4's 4-FMA-per-B-read efficiency). This replaces the old
+        # 6-op path (4 rect-transposes of the small [T,HD] operands + 2 generic
+        # 1-elem/thread kvgrad GEMMs producing dKᵀ/dVᵀ): the generic kvgrad was
+        # ~2.4× slower than headout4 for identical FLOPs, and the 4 transposes
+        # added launch+bandwidth overhead. dS already carries the 1/√d scale.
+        #   dK[T,HD] = dSᵀ · Q   (A=dS[BH,T,T], B=Q[BH,T,HD])
+        #   dV[T,HD] = Pᵀ · dO    (A=P [BH,T,T], B=dO[BH,T,HD])
+        _launch_headout4_transA[dtype](
+            ds_immut, query_ptr, d_key_ptr, BH, T, hd, device_ctx
+        )
+        _launch_headout4_transA[dtype](
+            p_immut, d_output_ptr, d_value_ptr, BH, T, hd, device_ctx
+        )
+        comptime if _PROF:
+            device_ctx.synchronize()
+            var _n = global_perf_counter_ns()
+            print("  C dK/dV (2 transA GEMM)", Float64(_n - _tp) / 1e6, "ms")
+            _tp = _n
+    else:
+        _attn_gemm_batched[dtype, dtype, dtype](
+            ds_immut,
+            query_ptr,
+            d_key_ptr,
+            T,
+            hd,
+            T,
+            T * T,
+            T * hd,
+            T * hd,
+            False,
+            BH,
+            device_ctx,
+            transpose_a=True,
+        )
+        _attn_gemm_batched[dtype, dtype, dtype](
+            p_immut,
+            d_output_ptr,
+            d_value_ptr,
+            T,
+            hd,
+            T,
+            T * T,
+            T * hd,
+            T * hd,
+            False,
+            BH,
+            device_ctx,
+            transpose_a=True,
+        )
+    # NOTE: No explicit fence needed here — all kernels are on the same stream
+    # (same DeviceContext command queue), so GPU ordering is guaranteed without
+    # a CPU-GPU synchronize. The caller's ctx.synchronize() or any downstream
+    # same-stream GPU op (split_bwd, optimizer, etc.) will correctly wait for
+    # these gradients to be written.
 
 
 def attention_bwd[
@@ -3897,7 +4788,7 @@ def attention_bwd[
             return
         comptime simd_width = simd_width_of[dtype]()
         comptime is_float32 = dtype == DType.float32
-        # Apple Metal shared-memory hard limit: 32768 bytes/threadgroup.
+        # Apple Metal shared-memory hard limit: 32768 bytes/threadgroup (G9).
         # This portable (non-GEMM) backward path only runs when
         # USE_GEMM_ATTENTION = HAS_CUBLAS = False — i.e. on Metal/non-Nvidia
         # hardware. The tile-size choices below are therefore provably dead on
@@ -3910,8 +4801,14 @@ def attention_bwd[
         #
         # With the values below:
         #   float32  (sizeof=4): Br=8,  Bc=8  → dQ=25 664,  dKV=30 784 bytes ✓
-        #   bfloat16 (sizeof=2): Br=16, Bc=8  → dQ=22 656,  dKV=22 656 bytes ✓
-        comptime Br = 8 if is_float32 else 16
+        #   bfloat16 (sizeof=2): Br=8,  Bc=8  → dQ=13 376,  dKV=13 376 bytes ✓
+        #
+        # bf16 previously used Br=16 (BLOCK_SIZE_DQ=64, two Metal simdgroups);
+        # that configuration produced intermittently corrupted dQ/dK/dV on
+        # Apple M4 Max (grad norms 1e6–1e14 in training) while the fp32 Br=8
+        # single-simdgroup geometry is fully validated — so bf16 pins to the
+        # same Br=8. See docs/ai/metal_port_gotchas_and_optimizations.md G9, P19.
+        comptime Br = 8
         comptime Bc = 8
         comptime BLOCK_SIZE_DQ = Br * 4
         comptime BLOCK_SIZE_DKV = Bc * 4

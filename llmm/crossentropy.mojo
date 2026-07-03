@@ -62,7 +62,7 @@ def crossentropy_ohe_fwd_cpu[
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
 ) raises -> None:
-    # NOTE: This function is uniquely different from the standard cross-entropu loss calculation.
+    # NOTE: This function is uniquely different from the standard cross-entropy loss calculation.
     # Instead of neeeding to sum over the full vocabulary, we can just use the one-hot nature of
     # the probabilities to calculate the loss of the targets where softmax is 1.0 and the rest are 0.0.
     # This means we can calculate the loss in a single vectorized operation

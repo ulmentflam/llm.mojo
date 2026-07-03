@@ -60,10 +60,14 @@ def _fast_exp[
 def _classifier_exp[
     width: Int
 ](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
-    # NVIDIA fast path: hardware ex2.approx.f32 via inline PTX (what CUDA's
-    # __expf compiles to). Vendor-neutral fallback: the accurate `exp`
-    # polynomial already used on the ragged edge below and on the CPU path
-    # (mathematically identical: exp2(x*LOG2_E) == exp(x)).
+    # NVIDIA (HAS_CUBLAS=True): hardware ex2.approx.f32 via inline PTX, the
+    # same approximation __expf uses in CUDA — about 10× fewer ops than the
+    # accurate polynomial and within ~1 ULP for softmax inputs.
+    # Metal / portable (HAS_CUBLAS=False): accurate `exp` polynomial, already
+    # used on the scalar ragged edge and the CPU path. Mathematically identical
+    # (exp2(x*LOG2_E) == exp(x)); slightly slower but fully portable.
+    # The inline PTX assembly in _fast_exp2 does NOT compile on Metal —
+    # HAS_CUBLAS must be False to exclude it (guaranteed by vendor.mojo).
     comptime if HAS_CUBLAS:
         return _fast_exp(x)
     else:
@@ -211,7 +215,7 @@ def _fused_classifier_gpu[
             losses_ptr[row] = log(s_row) + m_row - x_t
 
         comptime if write_d_logits:
-            # NOTE: Same as _syncronize() in Karpathy's kernel
+            # barrier() matches __syncthreads() in Karpathy's kernel
             barrier()
 
             var d_loss = d_losses_ptr[row]

@@ -5,29 +5,32 @@ from std.sys import (
 )
 
 # ===----------------------------------------------------------------------=== #
-# Vendor GPU dispatch
+# Vendor GPU dispatch — flag glossary
 # ===----------------------------------------------------------------------=== #
 #
-# Single source of truth for whether the NVIDIA-only fast paths (hand-rolled
-# cuBLAS/cuBLASLt FFI in matmul.mojo/attention.mojo, inline PTX ex2.approx in
-# fused_classifier.mojo) are compiled in. Every GPU dispatch that currently
-# assumes "GPU == NVIDIA" should branch on HAS_CUBLAS, nested inside the
-# existing `is_gpu[target]()` check, so CPU dispatch and (when HAS_CUBLAS is
-# True) the NVIDIA GPU dispatch are completely unaffected.
+# HAS_CUBLAS — True on NVIDIA: enables the cuBLAS/cuBLASLt FFI fast path
+#   (matmul.mojo / attention.mojo) and inline PTX ex2.approx
+#   (fused_classifier.mojo). On Apple GPU this is always False; those
+#   CUDA-specific code paths are excluded entirely at compile time.
 #
-# Defaults to auto-detection (has_nvidia_gpu_accelerator()), so existing
-# NVIDIA builds need zero flag changes. Overridable for portability
-# testing/CI on NVIDIA hardware, or to force the vendor-neutral fallback if
-# the auto-detected accelerator is wrong for some reason:
-#   mojo build -D LLMM_FORCE_PORTABLE_GPU=1 ...
+#   Auto-detected via has_nvidia_gpu_accelerator(). Override to force the
+#   vendor-neutral fallback on NVIDIA hardware (e.g. portability CI):
+#     mojo build -D LLMM_FORCE_PORTABLE_GPU=1 ...
+#   This flag has no effect on the Metal path (HAS_METAL is unaffected).
+#
 comptime _FORCE_PORTABLE_GPU = is_defined["LLMM_FORCE_PORTABLE_GPU"]()
 comptime HAS_CUBLAS = has_nvidia_gpu_accelerator() and not _FORCE_PORTABLE_GPU
 
-# HAS_METAL: true when an Apple GPU accelerator is present and Metal is not
-# disabled. Defaults to auto-detection (has_apple_gpu_accelerator()), so
-# Apple Silicon builds use the Metal device path by default. Override with:
-#   mojo build -D LLMM_DISABLE_METAL=1 ...
-# to force the CPU fallback even on Apple Silicon (e.g. for debugging or CI).
-# Keep HAS_CUBLAS untouched — the two flags are independent.
+# HAS_METAL — True on Apple Silicon: enables the Metal device path, which
+#   uses linalg.matmul for GEMM and the standalone bias_gelu_fwd epilogue
+#   (because linalg's fused elementwise_lambda_fn is broken on Metal —
+#   see gelu.mojo). On NVIDIA this is always False; those Metal-specific
+#   branches are excluded at compile time.
+#
+#   Auto-detected via has_apple_gpu_accelerator(). Override to force the
+#   CPU fallback on Apple Silicon (e.g. for debugging or CI without GPU):
+#     mojo build -D LLMM_DISABLE_METAL=1 ...
+#   This flag has no effect on the NVIDIA path (HAS_CUBLAS is unaffected).
+#
 comptime _DISABLE_METAL = is_defined["LLMM_DISABLE_METAL"]()
 comptime HAS_METAL = has_apple_gpu_accelerator() and not _DISABLE_METAL

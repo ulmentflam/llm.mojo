@@ -41,7 +41,6 @@ def zero_gpu(
     ptr: MutKernelPtr[DType.float32],
     size: Int,
 ) -> None:
-    # NOTE: This may be worth using in the future, also it could be an op in a mojo built-in library or even in tensor.
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < size:
         _zero_gpu(idx, ptr)

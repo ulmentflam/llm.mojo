@@ -1536,6 +1536,13 @@ kept in-tree with RESULT-header summaries per this campaign's convention.
 
 ## Apple Silicon (Metal GPU) benchmarking setup
 
+> **Extended coverage:** the July 2026 Apple Silicon port campaign — including a
+> full gotcha catalog (silent-wrong-results, hard failures, and performance
+> findings), probe scripts, and the Metal-specific optimization log — is
+> documented in [`docs/ai/metal_port_gotchas_and_optimizations.md`](metal_port_gotchas_and_optimizations.md).
+> The section below covers how to run and compare benchmarks on Apple Silicon.
+> Refer to that document for the *why* behind `HAS_METAL` branches in the code.
+
 ### What is compared and why llm.c is absent
 
 llm.c has **no Metal/Apple-GPU port** — it is CUDA-only on the GPU side. On Apple
