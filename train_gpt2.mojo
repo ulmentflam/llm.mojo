@@ -3707,30 +3707,41 @@ def main() raises:
             run_on_cpu = True
 
     if run_on_cpu:
-        print("Training on CPU.")
-        if world_size == 1:
-            _dispatch_world_size["cpu"](
-                args,
-                0,
-                world_size,
-                Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+        # CPU training is fp32 by policy (matching profile_gpt2.mojo): a bf16
+        # build must not instantiate the "cpu" dispatch — the CPU bf16 GEMM
+        # packing path crashes AArch64 instruction selection at compile time.
+        comptime if USE_BF16:
+            raise Error(
+                "bf16 build supports only the GPU target (CPU stays fp32)."
+                " Rebuild without -D LLMM_BF16=1 to train on CPU."
             )
         else:
-            var cpu_coord_ptr = alloc[CpuCoordinator](1)
-            cpu_coord_ptr[] = CpuCoordinator(world_size)
+            print("Training on CPU.")
+            if world_size == 1:
+                _dispatch_world_size["cpu"](
+                    args,
+                    0,
+                    world_size,
+                    Optional[
+                        UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
+                    ](),
+                )
+            else:
+                var cpu_coord_ptr = alloc[CpuCoordinator](1)
+                cpu_coord_ptr[] = CpuCoordinator(world_size)
 
-            @parameter
-            def _run_rank(rank: Int):
-                try:
-                    _dispatch_world_size["cpu"](
-                        args, rank, world_size, cpu_coord_ptr
-                    )
-                except e:
-                    print("Rank", rank, "failed:", e)
+                @parameter
+                def _run_rank(rank: Int):
+                    try:
+                        _dispatch_world_size["cpu"](
+                            args, rank, world_size, cpu_coord_ptr
+                        )
+                    except e:
+                        print("Rank", rank, "failed:", e)
 
-            sync_parallelize[_run_rank](world_size)
-            cpu_coord_ptr[].free()
-            cpu_coord_ptr.free()
+                sync_parallelize[_run_rank](world_size)
+                cpu_coord_ptr[].free()
+                cpu_coord_ptr.free()
     elif has_accelerator():
         print("GPU detected — training on GPU.")
         _dispatch_world_size["gpu"](

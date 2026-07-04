@@ -1634,3 +1634,85 @@ once masked this exact regression) against the bit-identity reference losses:
 steps 0–3), plus `make verify-gpu` and the portable-path
 (`-D LLMM_FORCE_PORTABLE_GPU=1`) verify, which exercises the split branch on
 NVIDIA hardware.
+
+### 2026-07-03: Correction to the ㉚-era dataflow note — the "clobber" WAS real
+
+The 2026-07-01 note above ("my static dataflow read … predicted a clobber that
+does NOT happen in practice") is **retracted**. The training-correctness campaign
+(CHANGELOG 2026-07-03) proved the static analysis was right all along: the
+residual-skip gradient was never seeded into the junction backward
+(`layernorm_fused_residual_bwd` only accumulated the LN term), so block
+gradients decayed geometrically with depth — wpe's gradient was ~10⁶× too
+small. The empirical gates that "overruled" the analysis were vacuous: the old
+`test_gpt2` used a flat absolute tolerance of 2.0 (meaningless for near-zero
+gradients) and never asserted the loss trajectory. Two more latent bugs fell in
+the same sweep (GELU-grad fused into the wrong MLP backward; layer-0 LN1
+backward fed the normed output instead of the pre-norm input — also flagged in
+the 07-01 analysis).
+
+**Process lesson (the mirror image of the stale-binary lesson):** when a
+careful static derivation and a passing test disagree, interrogate the TEST's
+sensitivity before discarding the derivation. A gate can only overrule analysis
+if it could actually have caught the predicted failure.
+
+**Consequences for the performance record:** all pre-2026-07-03 bit-identity
+reference losses are obsolete (the old backward did less work); the CUDA-parity
+claim (134.6 vs 134.7 ms) was measured with the incorrect, cheaper backward and
+must be re-validated post-correctness — re-benchmark in progress.
+
+### Post-correctness CUDA benchmark (2026-07-03, official 40-step run, vLLM idle)
+
+Hardened correctness gate green, then `make benchmark-gpu BENCH_B=4 BENCH_T=1024`
+(figure: `figures/benchmark_gpu_b4_t1024_2026-07-03_1119_NVIDIA-GB10_DGX-Spark.png`):
+
+| config | median ms | tok/s |
+|---|---:|---:|
+| **llm.mojo bf16** | **135.97** | **30,154** |
+| **llm.c CUDA bf16** | **135.77** | 30,210 |
+| llm.mojo fp32 | 417.72 | 9,816 |
+| llm.c CUDA fp32 | 298.53 (n=3) | 13,771 |
+| PyTorch bf16 / fp32 | 514.51 / 587.57 | 7,957 / 6,966 |
+
+**Parity CONFIRMED with the corrected backward: 1.002× (135.84 vs 135.58 mean).**
+The three correctness fixes (residual-skip seeding, GELU-grad swap, LN1 input) plus
+unconditional store-P cost only ~1 ms net vs the old (incorrect) 134.7 ms — the
+earlier parity result survives the correctness campaign. New bf16 harness reference
+trajectory (B=4 T=1024 L=12, repeated batch): 8.791564 / 7.937944 / 6.013462 /
+3.675395 / 2.128407 / 0.884390 / 0.202385 / 0.107844 — note the loss now actually
+COLLAPSES (the old broken backward hovered ~8.2–8.8 over the same steps; gradients
+were decaying geometrically with depth). Per-phase steady state: fwd ~50 ms,
+bwd ~83 ms, upd ~16.5 ms.
+
+Open fp32 note: llm.mojo fp32 is 1.40× behind llm.c fp32 (417 vs 298) — fp32 was
+never the optimization target (bf16 is the shipped config); recorded as a possible
+future workstream.
+
+### Post-correctness CPU benchmark (2026-07-03)
+
+First pass produced a FALSE regression signal: an agent stacked three concurrent
+`benchmark-cpu` runs; the llm.mojo arm of the surviving run absorbed the
+contention (732 ms mean, std 116 — vs llm.c/PyTorch arms that ran after cleanup
+and matched their July-1 references). Clean-box harness measurement:
+**llm.mojo CPU fp32 ≈ 448 ms/step** (fwd 112 + bwd 300 + upd 35.5, B=4 T=64) —
+matching the July-1 value (454 ms) within noise. **No CPU regression from the
+Metal + correctness changes**; still ~4× faster than llm.c OpenMP (1808 ms,
+flat vs July 1). A discarded duplicate agent report also carried an internally
+inconsistent table (ms vs tok/s contradictory) — sanity-check tok/s = B·T/ms
+before trusting any benchmark table. Official rerun on a quiet box in progress;
+figure regenerated.
+
+**Official clean CPU rerun (2026-07-03 11:47, quiet box, single instance,
+figure `figures/benchmark_cpu_b4_t64_2026-07-03_1147_NVIDIA-GB10_DGX-Spark.png`):**
+
+| config | mean ms | median ms | tok/s |
+|---|---:|---:|---:|
+| **llm.mojo fp32** | **457.87** | 452.63 | **559** |
+| llm.c OpenMP (20t) | 1815.94 | 1817.58 | 141 |
+| llm.c 1-thread | 6913.65 | 6910.79 | 37 |
+| PyTorch fp32 | 632.74 | 539.52 | 405 |
+
+llm.mojo CPU = 457.9 vs July-1's 454.2 ms — **flat through the Metal +
+correctness changes** (correct backward included). Still ~4.0× faster than
+llm.c OpenMP and ~1.2× faster than PyTorch (medians). All cross-arm references
+match July 1 within noise, confirming the earlier 732 ms reading was pure
+run-stacking contention.
