@@ -20,7 +20,7 @@ If you already cloned without that flag, run `git submodule update --init` from
 the repo root (the Makefile also does this automatically the first time a
 `benchmark`/`profile-llmc-*` target needs it).
 
-### Step 2: Install Pixi & Make
+### Step 2: Install Pixi
 
 If you don't have it, install [pixi](https://pixi.sh/latest/):
 
