@@ -2,6 +2,7 @@
 Common utilities for data processing.
 """
 
+import functools
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -16,11 +17,16 @@ import numpy as np
 from tqdm import tqdm
 
 
+@functools.lru_cache(maxsize=1)
 def get_gpt2_encoding() -> "tiktoken.Encoding":
     """Return the GPT-2 tiktoken encoding without scanning plugin modules.
 
     iCloud-synced pixi envs can pick up duplicate ``tiktoken_ext/openai_public *.py``
     copies, which makes ``tiktoken.get_encoding("gpt2")`` raise on duplicate names.
+
+    Cached: construction builds the 50K-merge BPE table (~240ms). Callers like
+    fineweb.py invoke this once per document from pool workers — uncached, that
+    is a ~385x tokenization slowdown (measured on the GB10).
     """
     import tiktoken
     from tiktoken_ext import openai_public
@@ -63,7 +69,9 @@ HEADERS_INFO: dict = {
 MAGIC_NUMBER = 20240522
 
 
-def write_datafile(filename: str, tokens: list[int], model_desc: str = "gpt-2") -> None:
+def write_datafile(
+    filename: str, tokens: "list[int] | np.ndarray", model_desc: str = "gpt-2"
+) -> None:
     """
     Saves token data as a binary file, for reading in the target language.
     - First comes a header with 256 int32s

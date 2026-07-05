@@ -14,6 +14,7 @@ Example of downloading the 100B sample of FineWeb-Edu, from the data directory:
 100B runs for a few hours, depending on your internet and computer.
 """
 
+import functools
 import os
 import argparse
 import multiprocessing as mp
@@ -53,9 +54,15 @@ def tokenize_gpt2(doc: dict) -> np.ndarray:
     return tokens_np.astype(np.uint16)
 
 
+@functools.lru_cache(maxsize=1)
+def _get_llama_tokenizer():
+    """Cached: from_pretrained is far too slow to run once per document."""
+    return AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+
+
 def tokenize_llama(doc: dict) -> np.ndarray:
     """Tokenize a single document and return a numpy array of uint32 tokens."""
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+    tokenizer = _get_llama_tokenizer()
     assert tokenizer is not None, "Failed to load Llama-3 tokenizer"
     eot = tokenizer.encode("")[0]  # the tokenizer adds the EOT token (128000)
     tokens = [eot]  # the special <|endoftext|> token delimits all documents
@@ -143,7 +150,7 @@ def main(
                 all_tokens_np[token_count : token_count + remainder] = tokens[
                     :remainder
                 ]
-                write_datafile(filename, all_tokens_np.tolist(), model_desc)
+                write_datafile(filename, all_tokens_np, model_desc)
                 shard_index += 1
                 progress_bar = None
                 # populate the next shard with the leftovers of the current doc
@@ -156,7 +163,7 @@ def main(
             filename = os.path.join(
                 data_cache_dir, f"{name}_{split}_{shard_index:06d}.bin"
             )
-            write_datafile(filename, all_tokens_np[:token_count].tolist(), model_desc)
+            write_datafile(filename, all_tokens_np[:token_count], model_desc)
 
 
 if __name__ == "__main__":
