@@ -3247,9 +3247,12 @@ def train[
 
     # Number of training/validation batches. With -x set we run exactly that
     # many steps; otherwise we run a single epoch over the training tokens.
+    # One step consumes total_batch_size tokens (grad accumulation included),
+    # matching llm.c — dividing by tokens_per_fwdbwd would count micro-batches
+    # and inflate the epoch (and the cosine-decay horizon) by grad_accum_steps.
     var train_num_batches = args.max_steps
     if train_num_batches <= 0:
-        train_num_batches = train_loader.num_tokens // tokens_per_fwdbwd
+        train_num_batches = train_loader.num_tokens // total_batch_size
     var val_num_batches = args.val_max_steps
     if val_loader.num_tokens // tokens_per_fwdbwd < val_num_batches:
         val_num_batches = val_loader.num_tokens // tokens_per_fwdbwd
