@@ -2963,6 +2963,26 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
         self.ctx.synchronize()
 
+        # Mixed precision: the fp32 master copy was seeded from the *initial*
+        # params in allocate_optimizer_moments, which runs before this resume
+        # load. Re-seed it from the just-loaded params — otherwise the first
+        # post-resume update() writes bf16(stale_initial_master - delta) back
+        # into params, discarding all trained progress (loss returns to ~11.0
+        # for a from-scratch d12 run). The state file has no master copy, so
+        # promoting the loaded low-precision params is the best restoration
+        # (matches llm.c's fallback when master weights are absent).
+        comptime if USE_BF16:
+            var host_master = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
+                self.num_parameters
+            )
+            self.ctx.synchronize()
+            for i in range(self.num_parameters):
+                host_master[i] = host_params[i].cast[MASTER_DTYPE]()
+            self._copy_host_to_device[MASTER_DTYPE](
+                self.master_memory, host_master, self.num_parameters
+            )
+            self.ctx.synchronize()
+
         # AdamW moments are fp32 (MASTER_DTYPE); read them back in fp32.
         var n_opt = self.optimizer_num_parameters
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
