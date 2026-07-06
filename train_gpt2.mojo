@@ -3720,14 +3720,15 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
             cpu_coord_ptr.free()
 
 
-def _dispatch_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
-    # Grouped GPU dispatch: Apple (Metal) specifics first, then the shared GPU
-    # path. Returns False when the caller should fall back to CPU (Apple GPU
-    # with world_size > 1: collectives are NVIDIA-only; or a host with no
-    # accelerator). The "gpu" instantiation is comptime-guarded because the
-    # stdlib's GPU-arch lookup is a comptime constraint that fails the whole
+def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
+    """Dispatch GPU training when this build and host support it; else False."""
+    # The "gpu" target is comptime-guarded: stdlib GPU-arch lookup fails the
     # build on hosts with no accelerator (e.g. CPU-only Linux).
     comptime if has_accelerator():
+        # Metal disabled at compile time (-D LLMM_DISABLE_METAL=1).
+        comptime if has_apple_gpu_accelerator() and not HAS_METAL:
+            return False
+
         if has_apple_gpu_accelerator():
             print(
                 "Note: Metal (Apple GPU) training is experimental. Set"
@@ -3735,13 +3736,14 @@ def _dispatch_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
                 " back to CPU."
             )
             if world_size > 1:
-                print(
-                    "WARNING: multi-rank training (world_size="
+                raise Error(
+                    "multi-rank training (world_size="
                     + String(world_size)
                     + ") is not supported on Apple GPU (collectives require"
-                    " NVIDIA). Falling back to CPU coordinator."
+                    " NVIDIA). Re-run with WORLD_SIZE=1, set LLMM_USE_CPU=1,"
+                    " or use an NVIDIA backend."
                 )
-                return False
+
         print("GPU detected — training on GPU.")
         _dispatch_world_size["gpu"](
             args,
@@ -3770,15 +3772,5 @@ def main() raises:
         args.zero_stage,
     )
 
-    var use_cpu = getenv("LLMM_USE_CPU")
-    # Apple GPU uses the Metal device path by default; override with
-    # LLMM_USE_CPU=1 (runtime) or -D LLMM_DISABLE_METAL=1 (compile-time).
-    var run_on_cpu = (
-        (use_cpu != "")
-        or not has_accelerator()
-        or (has_apple_gpu_accelerator() and not HAS_METAL)
-    )
-    if not run_on_cpu:
-        run_on_cpu = not _dispatch_gpu(args, rank, world_size)
-    if run_on_cpu:
+    if getenv("LLMM_USE_CPU") != "" or not _try_gpu(args, rank, world_size):
         _dispatch_cpu(args, world_size)
