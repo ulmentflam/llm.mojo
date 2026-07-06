@@ -205,3 +205,7 @@ _deps
 *.swp
 *.swo
 *~
+
+# Training run logs and dataset download logs
+logs/
+data/*.log

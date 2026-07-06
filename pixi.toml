@@ -5,9 +5,6 @@ name = "llm.mojo"
 platforms = ["osx-arm64", "linux-aarch64"]
 version = "0.1.0"
 
-[system-requirements]
-cuda = "12.2"
-
 [tasks]
 
 [dependencies]
@@ -28,6 +25,9 @@ pyrefly = ">=0.16"
 
 [environments]
 cuda = ["cuda"]
+
+[feature.cuda.system-requirements]
+cuda = "12.2"
 
 [feature.cuda.target.linux-aarch64.dependencies]
 pytorch-gpu = ">=2.2"

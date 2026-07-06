@@ -1,5 +1,5 @@
 from std.os import getenv
-from std.sys import argv, exit
+from std.sys import argv, exit, has_accelerator
 from std.gpu.host.info import is_cpu
 from std.gpu.host import DeviceContext
 from std.time import global_perf_counter_ns
@@ -196,14 +196,30 @@ def main() raises -> None:
     # bf16 is GPU-only (CPU stays fp32): the CPU backend can't lower masked
     # bf16 vector loads, and per project policy CPU training is fp32. So a bf16
     # build only ever instantiates the GPU path.
+    # The "gpu" instantiations are comptime-guarded: the stdlib's GPU-arch
+    # lookup fails the whole build on hosts with no accelerator.
     comptime if GPT2_DTYPE == DType.bfloat16:
         if target != "gpu":
             print("bf16 build supports only the GPU target (CPU stays fp32).")
             exit(1)
-        run_profile["gpu"](B, T, layers, steps, trace_path)
+        comptime if has_accelerator():
+            run_profile["gpu"](B, T, layers, steps, trace_path)
+        else:
+            print(
+                "No accelerator detected on this host; GPU profiling"
+                " unavailable."
+            )
+            exit(1)
     else:
         if target == "gpu":
-            run_profile["gpu"](B, T, layers, steps, trace_path)
+            comptime if has_accelerator():
+                run_profile["gpu"](B, T, layers, steps, trace_path)
+            else:
+                print(
+                    "No accelerator detected on this host; GPU profiling"
+                    " unavailable."
+                )
+                exit(1)
         elif target == "cpu":
             run_profile["cpu"](B, T, layers, steps, trace_path)
         else:

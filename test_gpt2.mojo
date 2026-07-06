@@ -1,6 +1,6 @@
 from std.collections import InlineArray, List
 from std.time import perf_counter_ns
-from std.sys import exit, argv
+from std.sys import exit, argv, has_accelerator
 from std.os import getenv
 from std.sys.info import size_of
 from std.memory import alloc, UnsafePointer, memcpy
@@ -236,7 +236,18 @@ def run_test[
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
 
     if state_header[0] != 20240520:
-        print("Bad magic model file")
+        if state_header[0] == 20240327:
+            # llm.c's downloadable debug state (magic 20240327, version 2) has
+            # no activation tensors, so this test can't consume it. The
+            # reference files must be regenerated with the PyTorch script.
+            print(
+                "gpt2_124M_debug_state.bin is llm.c's downloaded debug state,"
+                " which lacks the activation tensors this test checks."
+                " Regenerate the reference files with:"
+                " pixi run python train_gpt2.py"
+            )
+        else:
+            print("Bad magic model file")
         exit(1)
     if state_header[1] != 3:
         print("Bad version in model file:", state_header[1])
@@ -649,15 +660,21 @@ def main() raises:
         recompute = True
 
     if target == "gpu":
-        print("=== Running GPU Tests ===")
-        # GPU version can run with dedicated tolerances
-        var gpu_ok: Bool
-        if recompute:
-            gpu_ok = run_test["gpu", True](100.0, 0.1)
+        # The "gpu" instantiation is comptime-guarded: the stdlib's GPU-arch
+        # lookup fails the whole build on hosts with no accelerator.
+        comptime if has_accelerator():
+            print("=== Running GPU Tests ===")
+            # GPU version can run with dedicated tolerances
+            var gpu_ok: Bool
+            if recompute:
+                gpu_ok = run_test["gpu", True](100.0, 0.1)
+            else:
+                gpu_ok = run_test["gpu", False](100.0, 0.1)
+            print("GPU Test Result:", gpu_ok)
+            if not gpu_ok:
+                exit(1)
         else:
-            gpu_ok = run_test["gpu", False](100.0, 0.1)
-        print("GPU Test Result:", gpu_ok)
-        if not gpu_ok:
+            print("No accelerator detected on this host; GPU tests unavailable.")
             exit(1)
     else:
         print("=== Running CPU Tests ===")

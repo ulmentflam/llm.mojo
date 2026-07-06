@@ -93,6 +93,9 @@ comptime USE_BF16 = is_defined["LLMM_BF16"]()
 comptime GPT2_DTYPE = DType.bfloat16 if USE_BF16 else DType.float32
 comptime MASTER_DTYPE = DType.float32
 comptime GPT2_MAGIC = 20240520
+# llm.c's model-file magic (the HF starter-pack gpt2_124M*.bin that `make data`
+# downloads); same header layout and version convention as ours.
+comptime GPT2_MAGIC_LEGACY = 20240326
 comptime EPSILON = 1e-5
 comptime UNROLL = 4
 
@@ -874,11 +877,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var model_header = alloc[Int32](256)
             read_and_copy[DType.int32](model_file, model_header, 256)
 
-            if model_header.load(0) != GPT2_MAGIC:
-                print(
-                    "Bad magic number in header: "
-                    + String(model_header.load(0))
-                )
+            var model_magic = model_header.load(0)
+            if model_magic != GPT2_MAGIC and model_magic != GPT2_MAGIC_LEGACY:
+                print("Bad magic number in header: " + String(model_magic))
                 model_header.free()
                 raise Error("GPT2 error: Invalid magic number in header")
             # llm.c's version convention: 3 => fp32 params, 5 => bf16 params.
@@ -3593,11 +3594,12 @@ def _error_usage() raises:
     raise Error("invalid command-line usage")
 
 
-def main() raises:
+def _parse_train_args(
+    mut args: TrainArgs, mut rank: Int, mut world_size: Int
+) raises -> Bool:
+    # Seeds TrainArgs from env vars, then parses llm.c-style flags over them.
+    # Returns False when -h/--help was handled and the caller should exit.
     var cli = argv()
-    var args = default_train_args()
-    var rank = 0
-    var world_size = 1
 
     # Env variables seed the defaults; command-line flags override them below.
     var env_rank = getenv("RANK")
@@ -3621,7 +3623,7 @@ def main() raises:
         # Help takes no value, so handle it before the "must have a value" check.
         if flag == "-h" or flag == "--help":
             _print_usage()
-            return
+            return False
         if (
             i + 1 >= len(cli)
             or not flag.startswith("-")
@@ -3679,73 +3681,67 @@ def main() raises:
             print("Unknown flag: " + flag)
             _error_usage()
         i += 2
+    return True
 
-    var zero_stage = args.zero_stage
-    print("Rank:", rank, "World size:", world_size, "ZeRO stage:", zero_stage)
 
-    var use_cpu = getenv("LLMM_USE_CPU")
-    # Apple GPU uses the Metal device path by default; override with
-    # LLMM_USE_CPU=1 (runtime) or -D LLMM_DISABLE_METAL=1 (compile-time).
-    # Multi-rank collectives are NVIDIA-only, so world_size>1 on Apple GPU
-    # falls back to the CPU coordinator path (see below).
-    var run_on_cpu = (
-        (use_cpu != "")
-        or not has_accelerator()
-        or (has_apple_gpu_accelerator() and not HAS_METAL)
-    )
-
-    if not run_on_cpu and has_apple_gpu_accelerator():
-        print(
-            "Note: Metal (Apple GPU) training is experimental. Set"
-            " LLMM_USE_CPU=1 or build with -D LLMM_DISABLE_METAL=1 to fall"
-            " back to CPU."
+def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
+    # CPU training is fp32 by policy (matching profile_gpt2.mojo): a bf16
+    # build must not instantiate the "cpu" dispatch — the CPU bf16 GEMM
+    # packing path crashes AArch64 instruction selection at compile time.
+    comptime if USE_BF16:
+        raise Error(
+            "bf16 build supports only the GPU target (CPU stays fp32)."
+            " Rebuild without -D LLMM_BF16=1 to train on CPU."
         )
-        if world_size > 1:
-            print(
-                "WARNING: multi-rank training (world_size="
-                + String(world_size)
-                + ") is not supported on Apple GPU (collectives require"
-                " NVIDIA). Falling back to CPU coordinator."
-            )
-            run_on_cpu = True
-
-    if run_on_cpu:
-        # CPU training is fp32 by policy (matching profile_gpt2.mojo): a bf16
-        # build must not instantiate the "cpu" dispatch — the CPU bf16 GEMM
-        # packing path crashes AArch64 instruction selection at compile time.
-        comptime if USE_BF16:
-            raise Error(
-                "bf16 build supports only the GPU target (CPU stays fp32)."
-                " Rebuild without -D LLMM_BF16=1 to train on CPU."
+    else:
+        print("Training on CPU.")
+        if world_size == 1:
+            _dispatch_world_size["cpu"](
+                args,
+                0,
+                world_size,
+                Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
             )
         else:
-            print("Training on CPU.")
-            if world_size == 1:
-                _dispatch_world_size["cpu"](
-                    args,
-                    0,
-                    world_size,
-                    Optional[
-                        UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
-                    ](),
+            var cpu_coord_ptr = alloc[CpuCoordinator](1)
+            cpu_coord_ptr[] = CpuCoordinator(world_size)
+
+            @parameter
+            def _run_rank(rank: Int):
+                try:
+                    _dispatch_world_size["cpu"](
+                        args, rank, world_size, cpu_coord_ptr
+                    )
+                except e:
+                    print("Rank", rank, "failed:", e)
+
+            sync_parallelize[_run_rank](world_size)
+            cpu_coord_ptr[].free()
+            cpu_coord_ptr.free()
+
+
+def _dispatch_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
+    # Grouped GPU dispatch: Apple (Metal) specifics first, then the shared GPU
+    # path. Returns False when the caller should fall back to CPU (Apple GPU
+    # with world_size > 1: collectives are NVIDIA-only; or a host with no
+    # accelerator). The "gpu" instantiation is comptime-guarded because the
+    # stdlib's GPU-arch lookup is a comptime constraint that fails the whole
+    # build on hosts with no accelerator (e.g. CPU-only Linux).
+    comptime if has_accelerator():
+        if has_apple_gpu_accelerator():
+            print(
+                "Note: Metal (Apple GPU) training is experimental. Set"
+                " LLMM_USE_CPU=1 or build with -D LLMM_DISABLE_METAL=1 to fall"
+                " back to CPU."
+            )
+            if world_size > 1:
+                print(
+                    "WARNING: multi-rank training (world_size="
+                    + String(world_size)
+                    + ") is not supported on Apple GPU (collectives require"
+                    " NVIDIA). Falling back to CPU coordinator."
                 )
-            else:
-                var cpu_coord_ptr = alloc[CpuCoordinator](1)
-                cpu_coord_ptr[] = CpuCoordinator(world_size)
-
-                @parameter
-                def _run_rank(rank: Int):
-                    try:
-                        _dispatch_world_size["cpu"](
-                            args, rank, world_size, cpu_coord_ptr
-                        )
-                    except e:
-                        print("Rank", rank, "failed:", e)
-
-                sync_parallelize[_run_rank](world_size)
-                cpu_coord_ptr[].free()
-                cpu_coord_ptr.free()
-    elif has_accelerator():
+                return False
         print("GPU detected — training on GPU.")
         _dispatch_world_size["gpu"](
             args,
@@ -3753,3 +3749,36 @@ def main() raises:
             world_size,
             Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
         )
+        return True
+    else:
+        return False
+
+
+def main() raises:
+    var args = default_train_args()
+    var rank = 0
+    var world_size = 1
+    if not _parse_train_args(args, rank, world_size):
+        return
+
+    print(
+        "Rank:",
+        rank,
+        "World size:",
+        world_size,
+        "ZeRO stage:",
+        args.zero_stage,
+    )
+
+    var use_cpu = getenv("LLMM_USE_CPU")
+    # Apple GPU uses the Metal device path by default; override with
+    # LLMM_USE_CPU=1 (runtime) or -D LLMM_DISABLE_METAL=1 (compile-time).
+    var run_on_cpu = (
+        (use_cpu != "")
+        or not has_accelerator()
+        or (has_apple_gpu_accelerator() and not HAS_METAL)
+    )
+    if not run_on_cpu:
+        run_on_cpu = not _dispatch_gpu(args, rank, world_size)
+    if run_on_cpu:
+        _dispatch_cpu(args, world_size)
