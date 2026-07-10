@@ -42,6 +42,10 @@ PROFILE_BIN_BF16 := build/profile_gpt2_bf16
 # GPU-only, same policy as bf16. At Chunk A, fp8 selects the bf16 GEMM path
 # (inert flag) — Chunks B/D/E wire the actual fp8 GEMM.
 PROFILE_BIN_FP8 := build/profile_gpt2_fp8
+# fp4 (NVFP4) build (-D LLMM_PRECISION=fp4, docs/ai/fp4_training_recipes_
+# research.md). GPU-only, same policy as bf16/fp8. See build-fp4 above for
+# what's fp4 vs bf16 in this build (MLP fc/fc_proj of the middle blocks).
+PROFILE_BIN_FP4 := build/profile_gpt2_fp4
 # Separate binary built with -D LLMM_TRACE=1 so the per-thread kernel
 # instrumentation is compiled in. The default PROFILE_BIN omits it, so its
 # kernels are byte-for-byte the training build (zero tracing overhead) — that is
@@ -125,7 +129,7 @@ SHELL := /bin/bash
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 \
-        build-profile build-profile-bf16 build-profile-fp8 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
+        build-profile build-profile-bf16 build-profile-fp8 build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
         build-infer build-infer-bf16 build-infer-fp8 data-hellaswag eval eval-cpu benchmark-eval \
@@ -173,6 +177,7 @@ help:
 	@echo "  build-profile Compile profile_gpt2.mojo to build/profile_gpt2"
 	@echo "  build-profile-bf16  Compile the bf16 (-D LLMM_BF16) harness, build/profile_gpt2_bf16"
 	@echo "  build-profile-fp8   Compile the fp8 (-D LLMM_PRECISION=fp8) harness, build/profile_gpt2_fp8"
+	@echo "  build-profile-fp4   Compile the fp4 (-D LLMM_PRECISION=fp4) harness, build/profile_gpt2_fp4"
 	@echo "  profile       Run one step and emit a Perfetto trace (alias: profile-trace)"
 	@echo "  profile-trace Write build/profile_gpt2.<target>.perfetto-trace.json (ui.perfetto.dev)"
 	@echo "  profile-metal Run one step on the Metal GPU and emit a Perfetto trace (Apple Silicon)"
@@ -407,6 +412,13 @@ build-profile-fp8: $(PROFILE_BIN_FP8)
 $(PROFILE_BIN_FP8): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP8) $(PROFILE_MOJO_SRC)
+
+# fp4 build of the profiling harness (see build-fp4 above).
+build-profile-fp4: $(PROFILE_BIN_FP4)
+
+$(PROFILE_BIN_FP4): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP4) $(PROFILE_MOJO_SRC)
 
 build-infer: $(INFER_BIN)
 

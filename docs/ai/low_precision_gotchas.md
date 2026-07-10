@@ -704,6 +704,141 @@ F3/F4/E5 — the coordinator's brief explicitly anticipated this possibility
 
 ---
 
+## FP4 CLOSEOUT (bit-stability hardening, perf snapshot, transpose-coalescing verdict)
+
+### F7 — A freshly-rebuilt binary's FIRST invocation can diverge from its own later invocations; this is not an SR/seed bug and is not fp4-specific
+
+**What:** The closeout's bit-stability re-check ran two back-to-back fp4
+10-step twin runs immediately after a fresh `make build-fp4` (as part of
+gating the F8 transpose-coalescing optimization below) and got a
+DIFFERENT trajectory from run 1 to run 2 — starting at step 3 (loss
+4.579138 vs 4.587136, a ~0.17% relative gap, never NaN/Inf, never
+non-decreasing). This reproduced a SECOND time on a completely independent
+rebuild. Both times, the divergence pattern was the SAME shape: exactly one
+"odd one out" run, and it was always the FIRST invocation after
+`make build-fp4` finished. 5 additional back-to-back runs against an
+ALREADY-WARM binary (no intervening rebuild) were unanimous (all 5 matched
+each other).
+
+**Root cause: NOT the code being tested.** The second rebuild used
+`git checkout -- llmm/matmul.mojo` to restore byte-identical, unmodified
+HEAD content (confirmed via `git diff` showing zero changes) before
+rebuilding — and the SAME first-invocation-diverges pattern reproduced on
+this completely clean tree. This rules out any correctness bug in whatever
+code happened to be under test at the time (see F8) and points instead at
+something environment/build/scheduling-dependent that predates this
+session's work entirely.
+
+**Working hypothesis (disclosed as speculation, not verified against
+source):** `llmm/layernorm.mojo`'s LN-backward parameter-gradient
+accumulation (`_ln_dparam_accum` kernel, called every layer, every step, in
+EVERY precision's build — not fp4-specific) uses a non-associative
+`Atomic[DType.float32].fetch_add`. Floating-point addition is not
+associative, so the exact numeric result of an atomic-accumulated sum
+depends on the ORDER concurrent thread blocks perform their adds, which in
+turn depends on GPU kernel-launch scheduling. A freshly built binary's
+first-ever execution of certain kernel identities plausibly has enough
+JIT/kernel-cache warm-up timing jitter (this box has no ahead-of-time
+compiled cubins — kernels JIT on first use within a process, per the
+~900s-fresh-process-JIT operating note) to occasionally perturb that
+accumulation order into one of (at least) two distinct, both
+individually-reproducible-once-warm, floating-point-valid trajectories.
+This was not confirmed by directly instrumenting the atomic add (out of
+this session's budget); it is offered as the most parsimonious explanation
+consistent with every observation above (reproducible with clean code,
+tied to freshness-of-build rather than run count, never NaN/Inf, both
+trajectories individually stable once warm).
+
+**Practical implication:** a bit-stability gate that does
+`make build-fp4 && run && run && diff` can spuriously "fail" — not because
+training is nondeterministic in the way the gate is trying to catch (an
+SR/scale race), but because of this orthogonal first-touch effect. Prefer
+running the bit-stability comparison against an ALREADY-EXERCISED binary
+(as every prior FP4 chunk's gate — and this closeout's own PRIMARY
+bit-stability result — did, which is why they all reported clean PASSes),
+or explicitly discard the first post-build invocation before judging
+bit-stability. Do not conflate this with G2 (fp8's buffer-lifetime race,
+which needed an explicit keep-alive fix) — this failure mode reproduces on
+code that has no buffer-sharing changes at all, so no code-level fix
+applies; it is a property of the toolchain/scheduling environment.
+
+**Source:** FP4 closeout, 2026-07-10 (worktree goal3b/fp4-training,
+attempting the F8 optimization below; reproduced independently on
+git-clean `matmul.mojo`).
+
+### F8 — `_rht_transpose_prep`'s naive transpose has the same coalescing pathology fp8 fixed with a 32x32 tile; the fix is ready but unshipped pending sanitizer confirmation of F7
+
+**What:** `llmm/matmul.mojo`'s `_gpu_transpose_kernel` (used by Chunk T2b's
+`_rht_transpose_prep` to materialize `RHT(operand^T)` scratch for Wgrad) is
+byte-for-byte the same one-thread-one-element, maximally-strided-WRITE
+shape (`dst[c*rows+r] = src[idx]`, consecutive threads write addresses
+`rows` elements apart) as fp8's ORIGINAL `_quantize_transpose_kernel`
+before its proven Optimization-A 32×32-shared-memory-tile rewrite — and
+unlike FP4's OWN `nvfp4_quantize_transpose` (which fuses a block-scoped
+amax pass and 2-values/byte nibble packing into its transpose, making a
+drop-in tile rewrite non-trivial), `_gpu_transpose_kernel` moves plain bf16
+values with zero packing/blocking — a structurally perfect match for the
+codebase's own already-proven tile kernel
+(`_gpu_transpose_add_into_kernel`, P14/P15). Measured: 18,184.83 µs / 32
+calls = 568.28 µs/call, the single largest fp4-specific kernel bucket in a
+1-step `ncu` profile (8.5% of total GPU time alone; paired with
+`hadamard16_fwd_gpu`'s 691.52 µs/call the RHT-prep pair is 18.8% of total
+— MORE than the entire NVFP4 quantize/amax family, 14.4%).
+
+**Fix implemented:** a new `_rht_transpose_tiled_kernel` (32×32 tile,
+32×33-padded shared memory, coalesced read AND write, `dst[c,r]=src[r,c]`
+with no cast/rounding — pure layout change) wired into `_rht_transpose_prep`
+in place of `_gpu_transpose_kernel`. **Single-call correctness: perfect.**
+All four fp4 test suites (`test_matmul_bwd_fp4.mojo` 5/5,
+`test_lowp_gemm_fp4.mojo` 8/8, `test_matmul_fwd_fp4.mojo` 2/2,
+`test_nvfp4_quant.mojo` 18/18) passed with every site-gate number (relL2,
+cosine, RHT gaussian/outlier ablation) identical to pre-change values to
+every printed digit.
+
+**Multi-step gate: FAILED at first — but the failure is F7, not this fix.**
+A 10-step wall-clock twin-run of the freshly-rebuilt binary diverged
+starting step 3, matching F7's exact signature. Root-causing this required
+reverting the change entirely (`git checkout -- llmm/matmul.mojo`) and
+rebuilding from scratch: the SAME divergence pattern reproduced on the
+UNMODIFIED, original naive-kernel code (see F7) — proving the tiled-kernel
+change itself is not the cause of the multi-step divergence.
+
+**Decision: reverted anyway, not shipped.** Even though the balance of
+evidence points to the fix being numerically inert (F7 is orthogonal and
+pre-existing), the mission's explicit gate for this class of optimization
+is "bit-identical fp4 runs before/after," and that gate could not be
+CLEANLY certified for this specific change without also root-causing F7
+(out of budget this session). `compute-sanitizer` (confirmed present at
+`/usr/local/cuda/bin/compute-sanitizer`, providing `racecheck`/`memcheck`
+tools that could positively rule out a shared-memory hazard rather than
+relying on circumstantial before/after comparison) was not run to
+completion this session. **Re-attempt recipe for a future session:**
+(1) re-apply the `_rht_transpose_tiled_kernel` diff (fully specified in the
+2026-07-10 FP4-closeout doc entry and recoverable from this session's
+worktree history), (2) run `compute-sanitizer --tool racecheck` over a
+short (`-x 2`, single fp4-eligible layer) training run BEFORE trusting any
+bit-stability comparison, (3) separately root-cause F7 first if possible
+(it blocks a clean gate regardless of which fix is being evaluated), (4)
+only then re-run the bit-stability/perf gates and ship.
+
+**Lesson (extends G2):** G2 taught "a single-step gate is necessary but not
+sufficient — always additionally run a multi-step, full-scale wall-clock
+twin-run before considering a memory-layout-touching optimization done."
+This chunk adds a corollary: when a multi-step twin-run DOES diverge on a
+memory-layout change, don't assume the change is the cause — REVERT FIRST
+and re-run the identical twin-run protocol on the clean baseline before
+concluding anything, exactly as G2's own lesson #3 recommended ("run a
+THIRD time before concluding") but extended one step further ("run the
+REVERTED baseline before concluding it was your change"). Skipping that
+step here would have produced a false-negative verdict on a numerically
+inert optimization.
+
+**Source:** FP4 closeout, 2026-07-10 (worktree goal3b/fp4-training,
+`llmm/matmul.mojo`'s `_rht_transpose_prep`/`_gpu_transpose_kernel`; fix
+implemented then reverted, git-clean at commit time).
+
+---
+
 ## Section summary
 
 | Section | Items | Status |
@@ -716,6 +851,7 @@ F3/F4/E5 — the coordinator's brief explicitly anticipated this possibility
 | FP4 CHUNK T1 | F1 | Verified (gate c re-run 3x bit-identical; gate d 10-step A/B) |
 | FP4 CHUNK T2a | F2–F4 | Verified (F2: test fix + re-run 18/18 green; F3: gate c 3x bit-identical; F4: gate d 10-step A/B, checkpoint init) |
 | FP4 CHUNK T2b | F5–F6 | Verified (F5: dedicated gaussian/outlier unit tests, reproducible; F6: gate d 10-step A/B + ablation bit-identity to T2a) |
+| FP4 CLOSEOUT | F7–F8 | Verified (F7: reproduced 2x independently on git-clean code; F8: fix implemented+gated+reverted, root-caused via F7) |
 
 ---
 

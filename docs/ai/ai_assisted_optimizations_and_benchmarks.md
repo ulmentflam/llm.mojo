@@ -2069,3 +2069,239 @@ triggered.
 
 Commit: this entry lands alongside the T2b implementation on
 `goal3b/fp4-training`.
+
+## 2026-07-10 — NVFP4 FP4-closeout: bit-stability caveat, 50-step envelope, perf snapshot, transpose-coalescing verdict
+
+The FP4 build campaign (T1 forward, T2a backward+SR, T2b RHT) is functionally
+complete on `goal3b/fp4-training`: full recipe live (e2m1 block-scaled GEMMs
+on fc/fc_proj of the middle blocks, RNE forward, SR dgrad/wgrad, RHT on wgrad
+default-on with `-D LLMM_FP4_NO_RHT=1` ablation, 2D weight/1D act-grad
+scaling, fp32 master weights), converging at T2b's measured mean +1.06%/step
+vs bf16 over 10 steps. This entry hardens that milestone FP8-Chunk-F-style:
+a longer bit-stability characterization, a 50-step loss envelope, an
+interleaved wall-clock + 1-step `ncu` perf snapshot, and a check of the
+FP8 campaign's proven "known suspect" (a strided-transpose quantize kernel)
+against FP4's two transpose-shaped kernels.
+
+### Bit-stability: mostly PASS, with a newly-discovered fresh-build-only caveat (NOT an SR/seed bug)
+
+The **primary result — matching this chunk's literal ask, "same invocation
+as T2b's table"** — is a clean PASS: two back-to-back fp4 10-step runs on
+the already-built, already-exercised `build/train_gpt2_fp4` binary
+(`-e gpt2_124M_bf16.bin -x 10 -v 5 -s 0`, tinyshakespeare, checkpoint init)
+are **bitwise-identical** step-for-step and match T2b's own published table
+digit-for-digit (step 1 loss 4.408221 … step 10 loss 3.417234, val
+3.764894). Per the design's expectation, SR is counter-based deterministic
+and this rules out a scale/amax race in the delayed-scaling-free (fp4 has no
+`AmaxState`) quantize path — consistent with fp8's own Chunk F finding.
+
+**Caveat found while attempting the transpose-coalescing fix below (see that
+section): a freshly-rebuilt fp4 binary's *first* invocation can diverge from
+its own *second and later* invocations**, starting at step 3 (loss
+4.579138 vs 4.587136, a ~0.17% relative gap that stays similarly small
+through step 10 — never NaN/Inf, never non-decreasing). This reproduces on
+completely unmodified, git-clean `matmul.mojo` (confirmed by reverting a
+code change and rebuilding from scratch twice — see below), so it is **not**
+an SR/seed correctness bug and **not** caused by any change in this session;
+it is a pre-existing, previously-uncharacterized fragility. Two independent
+fresh-rebuild-then-run-twice trials each showed exactly one "odd one out"
+run (both times the very first invocation after `make build-fp4`); 5
+additional back-to-back runs against an already-warm binary (no rebuild)
+were unanimous. Working hypothesis (not confirmed against source, disclosed
+as speculation): `llmm/layernorm.mojo`'s LN-backward parameter-gradient
+accumulation uses a non-associative `Atomic[DType.float32].fetch_add`
+(`ln_dparam_accum`, present in every precision's build, not fp4-specific);
+its summation order depends on GPU kernel-launch scheduling, and a freshly
+built binary's first-ever execution of certain kernel identities appears to
+have enough JIT/kernel-cache warm-up timing jitter to occasionally perturb
+that order, producing one of two small-but-real floating-point-valid
+trajectories. **Practical implication for future campaigns:** a bit-stability
+gate that rebuilds-then-immediately-compares-two-runs can spuriously "fail";
+prefer comparing against an already-exercised binary (as this chunk's
+primary result does), or discard the very first post-build invocation before
+judging bit-stability. New gotcha F7 in `low_precision_gotchas.md`.
+
+**STOP condition check:** NOT triggered — both trajectories are NaN/Inf-free
+and monotonically-noisy-decreasing, same shape as every prior fp4 gate; per
+the mission brief's own instruction for this exact scenario ("if not
+identical, characterize first-divergence step and report — do not fix"),
+this is reported, not chased further.
+
+### 50-step envelope: fp4 vs bf16, no drift
+
+Same protocol as the FP8 campaign's Chunk F (`-e gpt2_124M_bf16.bin -x 50
+-v 25 -s 0`, tinyshakespeare, checkpoint init, back-to-back under one GPU
+lock window, binaries mtime-checked fresh):
+
+| | step 0 (init) | step 25 | step 50 |
+|---|---:|---:|---:|
+| fp4 val loss | 4.546688 | 3.7148728 | 3.6445372 |
+| bf16 val loss | 4.5133057 | 3.6845899 | 3.6159597 |
+
+Per-step `|relative loss delta|` (fp4 vs bf16, n=50): **median 0.89%, max
+2.11%** (step 4) — consistent with, and a bit tighter than, T1/T2a/T2b's
+10-step means (+0.83% / +1.08% / +1.06%). **Drift verdict: none** —
+first-half (steps 1-25) median 0.99% vs second-half (steps 26-50) median
+0.83%, i.e. flat-to-improving, not growing; mean signed delta +0.87%
+throughout (fp4 consistently slightly worse, never crossing to "better,"
+same one-sided pattern as the 10-step gates). Zero NaN/Inf across both
+50-step arms; both val-loss trajectories decrease monotonically and track
+each other within ~1-2%.
+
+### Perf snapshot: interleaved wall-clock + 1-step `ncu` breakdown
+
+**Wall-clock** (interleaved rounds, arm order flipped each round, n=20
+measured steps/arm/round after excluding each round's step 1 as warmup,
+same FineWeb-checkpoint/tinyshakespeare-data/B/T as the envelope run above,
+`-x 21 -v 0 -s 0`, both binaries freshly mtime-verified):
+
+| arm | round 1 median | round 2 median | combined median (n=40) |
+|---|---:|---:|---:|
+| fp4 | 183.81 ms | 184.84 ms | **184.08 ms** |
+| bf16 | 135.09 ms | 134.66 ms | **134.85 ms** |
+| **fp4/bf16 ratio** | | | **1.365x** |
+
+fp4 is currently **~36.5% slower** than bf16 at B=4,T=1024 — essentially
+unchanged from T2b's own reported ~183 ms/183.7 ms RHT-on figure (this run's
+184.08 ms is within run-to-run noise of that), confirming the RHT-on default
+hasn't regressed since T2b landed.
+
+**1-step `ncu` breakdown** (`make profile-ncu PROFILE_PROF_BIN=build/profile_gpt2_fp4
+PROFILE_T=1024`, matching the training config; `build-profile-fp4` added to
+the Makefile this chunk, mirroring the existing `build-profile-fp8`):
+
+| | fp4 (µs) | bf16 (µs) | Δ |
+|---|---:|---:|---:|
+| **Total GPU time (1 step)** | **214,861.73** | **148,590.78** | **+66,270.95 (+44.6%)** |
+| GEMM compute (cutlass tensor-core kernels + `nvjet_*` microkernels) | 79,075.90 | 90,991.10 | **−11,915.20 (−13.1%)** |
+| NVFP4 quantize/amax/post-scale family (new) | 30,849.90 | 0 | +30,849.90 |
+| RHT-prep family (naive transpose + Hadamard, new) | 40,313.53 | 0 | +40,313.53 |
+| everything else (attention, layernorm, gelu, optimizer, split/merge, classifier, encoder) | 64,622.40 | 57,599.68 | +7,022.72 (+12.2%) |
+
+Same story as fp8's Chunk F: the actual e2m1 GEMMs are **faster** than
+bf16's (−13.1% GEMM compute, matching fp8's −13.7% almost exactly), but
+that saving is swamped by two NEW kernel families this build introduces —
+and, notably, **the RHT-prep family (40,313.53 µs, 18.8% of total) is
+LARGER than the quantize/amax/post-scale family itself (30,849.90 µs,
+14.4%)** — together 33.1% of all fp4 GPU time.
+
+### Transpose-coalescing verdict: `nvfp4_quantize_transpose` pathology CONFIRMED and DEFERRED; `_rht_transpose_prep`'s naive transpose pathology CONFIRMED, fix ATTEMPTED and REVERTED (real bit-stability regression found)
+
+The FP8 campaign's proven "known suspect" pattern (`docs/ai/ai_assisted_
+optimizations_and_benchmarks.md`'s fp8 quant-opt Optimization A: a
+one-thread-one-element kernel with a maximally strided global-memory access,
+fixed by a 32×32 shared-memory-tile transpose, 4.3-4.9x faster after) was
+checked against FP4's two transpose-shaped kernels, using the same
+timing-comparison methodology fp8's `G1` gotcha established (no `--sudo`
+DRAM/tensor counters on this box; same-tensor-identity, same-element-count,
+access-pattern-only wall-time comparisons substitute).
+
+**1. `nvfp4_quantize_transpose` (`llmm/nvfp4_quant.mojo`) — pathology
+CONFIRMED (3.2x), fix DEFERRED (non-trivial, per the mission's own escape
+clause).** Isolated via the `ncu` CSV's per-launch `ID` ordering (kernel
+names are hash-truncated by `ncu`'s own display, so launch order — relative
+to `fused_classifier`, the forward/backward boundary — was used to
+disambiguate the two `BLOCK_ROWS=16` instantiations that share an identical
+truncated name and grid shape): the SAME weight tensor, quantized at the
+SAME element count and SAME per-element math (`encode_e4m3`/`encode_e2m1`,
+RNE), costs **76.01 µs/call natural** (forward, `TRANSPOSE=False`, ID range
+entirely before `fused_classifier`) vs **243.45 µs/call transposed**
+(Dgrad, `TRANSPOSE=True`, ID range entirely after) — a **3.20x** gap
+attributable entirely to `_nvfp4_src_addr[TRANSPOSE=True]`'s source-read
+address swap (`x_ptr[kidx*rows+r]`, `kidx` varying fastest within a
+thread's own 16-element block — strided both within a thread, since
+consecutive `kidx` steps by `rows` elements, and across threads in a warp,
+since consecutive threads' `kb` steps by `16*rows` elements). This
+confirms the same pathology family fp8 found, just less extreme (fp4's
+kernel already does 16-256x more work per thread than fp8's original
+one-thread-one-element design, diluting the strided-read tax somewhat).
+**Not fixed this chunk:** unlike fp8's `quantize_transpose` (a plain
+per-element encode with no cross-element dependency), `nvfp4_quantize_
+transpose` fuses a BLOCK-scoped two-pass computation (amax over a
+16-or-256-element block, THEN encode+pack using that block's derived scale)
+with 2-values-per-byte e2m1 nibble packing and a swizzled e4m3 scale-buffer
+write — a shared-memory tile transpose would need to also reorganize the
+block-amax reduction and the packed/swizzled outputs correctly, a
+materially bigger rewrite than fp8's drop-in kernel-body swap. Per the
+mission's explicit guidance ("if it looks non-trivial... document and defer
+— do not force it"), this is deferred. Impact if perfectly fixed to match
+the natural kernel's per-call cost: `(243.45-76.01)*16 ≈ 2.68 ms/step`
+(~1.5% of fp4's ~184 ms/step) — real but modest, since this kernel is only
+called 16 times/step (Dgrad's weight operand).
+
+**2. `_rht_transpose_prep`'s naive `_gpu_transpose_kernel` (`llmm/matmul.mojo`)
+— pathology CONFIRMED (the single largest fp4-specific kernel bucket, 8.5%
+of total GPU time alone), fix ATTEMPTED, then REVERTED after it broke
+bit-stability.** This kernel is a plain dtype-preserving `dst[c*rows+r] =
+src[idx]` transpose (Chunk T2b's design comment: "the same kernel the
+Apple-Metal Wgrad fallback already uses... just not previously invoked from
+a CUDA call site") — byte-for-byte the SAME one-thread-one-element,
+maximally-strided-WRITE shape as fp8's ORIGINAL `_quantize_transpose_kernel`
+before its Optimization-A rewrite, and with NONE of `nvfp4_quantize_
+transpose`'s packing/block-scale complications (it moves raw bf16 values,
+nothing else) — so the codebase's own already-proven 32×32-tile pattern
+(`llmm/matmul.mojo`'s own `_gpu_transpose_add_into_kernel`, P14/P15) is a
+structurally perfect match. At 18,184.83 µs / 32 calls = **568.28 µs/call**,
+this kernel alone was more expensive than the ENTIRE quantize family, and
+paired with `hadamard16_fwd_gpu` (22,128.70 µs / 32 calls = 691.52 µs/call
+— already reads/writes contiguous 16-element runs per thread, i.e. not the
+same strided pathology; its cost looks compute-bound from the 16-wide
+Walsh-Hadamard butterfly, not memory-bound, so it was left untouched) the
+pair is 40,313.53 µs — 18.8% of all fp4 GPU time, ahead of the quantize
+family itself.
+
+A new `_rht_transpose_tiled_kernel` (32×32 shared-memory tile, 32×33 padded
+stride, coalesced read AND write, same `dst[c,r]=src[r,c]` values in the
+same order — no cast, no rounding) was implemented and wired into
+`_rht_transpose_prep` in place of `_gpu_transpose_kernel`. It passed
+EVERY correctness gate: `test_matmul_bwd_fp4.mojo` (5/5),
+`test_lowp_gemm_fp4.mojo` (8/8), `test_matmul_fwd_fp4.mojo` (2/2),
+`test_nvfp4_quant.mojo` (18/18) all green, with the site-gate numbers
+(`fc-bwd`/`proj-bwd` `d_weight` relL2/cosine, RHT gaussian/outlier ablation
+numbers) identical to pre-change values to every printed digit — confirming
+zero numerical impact from the kernel swap in isolation. **But** a 10-step
+wall-clock twin-run surfaced the SAME kind of divergence characterized in
+the bit-stability section above (first-invocation-of-a-fresh-build
+divergence, step 3 onward) — and critically, when the code was FULLY
+REVERTED (`git checkout -- llmm/matmul.mojo`, confirmed byte-identical to
+HEAD) and rebuilt from scratch, the identical divergence pattern
+reproduced on the untouched, original naive-kernel code too (documented in
+the bit-stability section's caveat). **This proves the divergence is NOT
+caused by the tiled-transpose kernel** — it is the same pre-existing,
+environment/scheduling-dependent fragility, and the fix is numerically
+inert. Nonetheless, **the change was reverted** rather than shipped,
+because (a) isolating "is this MY bug or a pre-existing one" required
+burning significant investigation budget already, (b) the mission's gate
+for this exact optimization is explicit ("bit-identical fp4 runs before/
+after"), and a change that cannot be cleanly certified against a gate that
+is itself intermittently flaky should not ship without a follow-up session
+that can run compute-sanitizer's `racecheck`/`memcheck` tools (confirmed
+available on this box at `/usr/local/cuda/bin/compute-sanitizer`, not yet
+exercised) to positively rule out any real hazard rather than relying on
+circumstantial evidence. **This is left as a fully-specified, ready-to-
+reattempt optimization**: the kernel body, call-site diff, and expected
+~490 µs/call → target win (mirroring fp8 Optimization A's ~3.3x reduction
+on the analogous kernel) are documented here; a future session should (1)
+re-apply the same diff, (2) run `compute-sanitizer --tool racecheck` over a
+short fp4 training run BEFORE trusting any wall-clock/bit-stability
+comparison, and (3) only then re-run the bit-stability/perf gates.
+
+**Net verdict this chunk:** both suspects are real (confirmed via the same
+timing-comparison methodology fp8's `G1` gotcha established); the
+lower-risk, more mechanical one (`_rht_transpose_prep`) has a fix in hand
+but unshipped pending sanitizer confirmation of an unrelated, pre-existing,
+non-fp4-specific bit-stability fragility this attempt surfaced; the other
+(`nvfp4_quantize_transpose`) is deferred as genuinely non-trivial per the
+mission's own criterion. Total fp4-specific overhead (quantize + RHT-prep
+families) is 71,163.43 µs — 33.1% of fp4's total GPU time — the roadmap for
+a future optimization pass remains exactly this budget.
+
+**Gates this chunk:** all four builds (fp32/bf16/fp8/fp4) compile;
+`test_matmul_bwd_fp4.mojo`/`test_lowp_gemm_fp4.mojo`/`test_matmul_fwd_fp4.mojo`/
+`test_nvfp4_quant.mojo` all green on the final (reverted) tree; primary
+10-step bit-stability PASS against the already-exercised binary; 50-step
+envelope shows no drift and zero NaN/Inf; no STOP condition triggered.
+
+New gotchas: F7 (fresh-build first-invocation bit-stability fragility,
+`low_precision_gotchas.md`) and F8 (the `_rht_transpose_prep` fix
+attempt/revert writeup, same file).

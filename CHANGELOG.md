@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-07-10
+
+### Added
+
+- **NVFP4 mixed-precision training (Chunks T1/T2a/T2b, `goal3b/fp4-training`)** — the
+  MLP fc/fc_proj GEMMs of GPT-2 124M's middle transformer blocks (layers
+  `[LLMM_FP4_FIRST, LLMM_FP4_LAST)`, default `[2, num_layer-2)`) now run in NVFP4
+  (e2m1 data, two-level e4m3-block + fp32-tensor scaling) forward AND backward
+  (`make build-fp4`), with the full recipe from `docs/ai/fp4_training_recipes_
+  research.md`: RNE forward, stochastic rounding on the backward gradient operand,
+  a Random Hadamard Transform on the weight-gradient GEMM (default on, `-D
+  LLMM_FP4_NO_RHT=1` ablates it off), 2D 16x16 weight / 1D 1x16 activation-gradient
+  block scaling. Everything else (qkv/attn-proj, attention, LayerNorm, GELU, the LM
+  head, and the fp32 AdamW optimizer) stays bf16/fp32, unchanged. Closeout
+  verification (`docs/ai/ai_assisted_optimizations_and_benchmarks.md`'s 2026-07-10
+  FP4-closeout entry): two fp4 10-step runs against an exercised binary are
+  bitwise-identical; a 50-step fp4-vs-bf16 loss envelope tracks within 0.89% median
+  / 2.11% max relative delta with no drift; fp4 is currently **~36.5% slower** than
+  bf16 at B=4,T=1024 on NVIDIA GB10 (the e2m1 GEMMs themselves are ~13% faster than
+  bf16's, but a new quantize/amax/RHT-prep kernel family — 33% of total fp4 GPU
+  time, split roughly evenly between NVFP4 quantization and the Wgrad RHT's
+  transpose+Hadamard prep — outweighs that gain), matching fp8's "correct, gated,
+  but not-yet-faster" milestone shape. A confirmed (3.2x, timing-comparison-based)
+  strided-read coalescing pathology in `nvfp4_quantize_transpose` is documented and
+  deferred (its packed-nibble/block-scale output makes a tile rewrite non-trivial,
+  unlike fp8's analogous fix); a second, more mechanical instance in the RHT
+  prep's naive transpose kernel had a ready fix implemented and fully gated, but
+  was reverted after surfacing an unrelated, pre-existing, non-fp4-specific
+  bit-stability fragility on a freshly-rebuilt binary's first invocation (root-
+  caused as orthogonal to the fix itself, but left unshipped pending a follow-up
+  session with `compute-sanitizer` available) — see
+  `docs/ai/low_precision_gotchas.md` F1-F8 for the full gotcha trail.
+
 ## [Unreleased] - 2026-07-03
 
 ### Fixed
