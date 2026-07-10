@@ -1881,3 +1881,159 @@ official run above was invoked as `pixi run -e cuda python
 scripts/benchmark_train.py ...` to get all six arms; a first invocation via
 the make target produced a 4-arm table (its incomplete figure was deleted).
 README updated with the new GPU table + TF32 note and the 07-03 CPU table.
+
+## 2026-07-10 — matmul dbias fusion (perf-hunt candidate #2): landed, smaller win than projected
+
+Branch `goal1/dbias-fusion` (HEAD `a8f9f56` → `1812b3b`), companion to the
+LN-backward fusion running in parallel on `goal1/ln-bwd-fusion`. Both apply
+the same "fuse row-reduction accum + finalize into one kernel9-style launch"
+technique from `docs/ai/perf_hunt_analysis_2026-07-10.md` candidate #2.
+
+### The change
+
+`llmm/matmul.mojo`: `_dbias_accum_gpu` (row-block partials into an fp32
+scratch, `[row_blocks=16, OC]`, contention-free — no atomics) +
+`_dbias_finalize_gpu` (separate launch summing the 16 partials into
+`d_bias`) become one kernel, `_dbias_fused_gpu`. The last row-block to
+finish a given column-block detects it itself: every writer thread
+`threadfence(Scope.GPU)`s to publish its scratch write GPU-wide, thread 0
+then does an `Atomic[DType.int32].fetch_add` on a persistent per-column-block
+arrival counter and broadcasts "am I last?" to the rest of the block via a
+1-element shared-memory flag (the classic CUDA `threadFenceReduction`
+sample / llm.c's own `global_sum_deterministic` idiom — NOT llm.c's actual
+`matmul_backward_bias_kernel9`, which instead just launches a second
+`reduce_add_sum_kernel` whenever `grid_size_y > 1`; we added the
+last-block-flag trick ourselves to always collapse to one launch
+regardless of grid shape). The finalizing block resets its own counter
+slot back to 0 so the next call (next layer / next grad-accum micro-batch)
+starts clean — no host-side memset between launches, mirroring how the
+scratch buffer itself is already fully overwritten every call.
+
+NVIDIA-only: `threadfence` comptime-asserts `is_nvidia_gpu()`, so the fused
+kernel is gated on `HAS_CUBLAS`; Apple Metal keeps the original two-launch
+`_dbias_accum_gpu`/`_dbias_finalize_gpu` path untouched (same file already
+had this `HAS_CUBLAS`/`HAS_METAL` vendor-branch convention throughout). CPU
+path (`matmul_bias_bwd_cpu`) untouched. `accumulate` (the += vs = flag
+controlling whether grad-accum micro-batches accumulate into `d_bias`) is
+preserved exactly — same comptime branch, same semantics, in the fused
+finalize.
+
+Left `train_gpt2.mojo` untouched: the persistent scratch/counter buffers use
+the same lazy-global-alloc pattern as the pre-existing `_dbias_scratch`
+(keyed by `ctx.id()`, allocated once, `KGEN_CompilerRT_InsertGlobal`), so no
+new call-site allocation lines were needed anywhere outside `matmul.mojo`.
+
+### Correctness
+
+- **`make verify-gpu`** (strict IEEE, TF32 off): PASS — 16/16 gradient
+  tensors OK including all four dbias grads (`dqkvb`, `dattprojb`, `dfcb`,
+  `dfcprojb`), 10-step loss trajectory LOSS OK at every step.
+- **`make verify-gpu-tf32`**: PASS — same 16/16 + 10-step loss.
+- **`make verify-cpu`**: PASS (CPU dispatch untouched, as expected).
+- **bf16 twin-run** (no `verify-gpu-bf16` gate exists — `test_gpt2.mojo`
+  built with `-D LLMM_BF16=1` hits the pre-existing, unrelated
+  `bf16-build-needs-gpu-only-dispatch` AArch64 codegen crash the instant it
+  tries to also instantiate the CPU dispatch path; this is why the project
+  uses the training harness + eyeball trajectory comparison for bf16
+  instead). Protocol: `build/train_gpt2_bf16 -e d12 -i
+  data/.tinyshakespeare/tiny_shakespeare_train.bin -j
+  .../tiny_shakespeare_val.bin -b 4 -t 1024 -x 10 -a 1 -v 0` (overfit a
+  single repeated batch, 10 steps, deterministic seed-42 init), run twice
+  on this branch's build and once on a fresh `a8f9f56` (pre-change) build in
+  an isolated scratch worktree:
+
+  | step | post-change run 1 | post-change run 2 | pre-change (`a8f9f56`) |
+  |---:|---:|---:|---:|
+  | 1 | 10.981078 | 10.981078 | 10.981078 |
+  | 2 | 9.642143 | 9.642093 | 9.642070 |
+  | 3 | 9.168756 | 9.168754 | 9.168803 |
+  | 4 | 9.002479 | 9.002632 | 9.002519 |
+  | 5 | 8.515045 | 8.515085 | 8.514950 |
+  | 6 | 8.215796 | 8.215932 | 8.215901 |
+  | 7 | 7.885313 | 7.885362 | 7.885328 |
+  | 8 | 7.534991 | 7.535023 | 7.535129 |
+  | 9 | 12.027554 | 12.033727 | 12.023992 |
+  | 10 | 7.115456 | 7.118252 | 7.111630 |
+
+  Step 1 bit-identical across all three. From step 2 on, the pre-change run
+  sits inside or immediately adjacent to the two post-change runs' own
+  spread at every step, same order of magnitude as the post-change
+  run-to-run wiggle (including the step-9 gradient-norm spike, where all
+  three runs show the same ~90+ norm blowup). No systematic drift, no
+  growing divergence. **Determinism note:** this candidate does NOT change
+  determinism — `_dbias_accum_gpu` was already atomics-free (contention-free
+  per-row-block scratch writes) and `_dbias_finalize_gpu` already summed the
+  16 partials in the same fixed order every call; the fused kernel preserves
+  that exact same summation order (only the *launch structure* changed, via
+  an atomic *arrival counter*, not atomics on the reduced data itself). The
+  observed step-to-step wiggle is pre-existing and traces elsewhere (e.g.
+  `layernorm.mojo`'s `Atomic[DType.float32].fetch_add` dgamma/dbeta
+  accumulation, per the 07-10 regression-sweep note above) — unaffected by
+  this commit.
+
+### Perf: real win, but far under the projected/target numbers
+
+**ncu, same-session before/after (a8f9f56 vs `1812b3b`), 1-step captures,
+`make profile-ncu PROFILE_T=1024` / `profile-fp32-ncu`, quiet box (0% util,
+43-46 °C pre-run):**
+
+| precision | kernel(s) | launches before | launches after | time before | time after | Δ |
+|---|---|---:|---:|---:|---:|---:|
+| bf16 | dbias accum+finalize → fused | 96 (48+48) | 48 | 4978.79 µs (4733.73+245.06) | 4689.63 µs | **−289 µs (−0.29 ms)** |
+| fp32 | dbias accum+finalize → fused | 96 (48+48) | 48 | 7239.91 µs (6995.94+243.97) | 7109.86 µs | **−130 µs (−0.13 ms)** |
+
+Launch count halves exactly as designed (96→48/step, both precisions,
+confirmed directly in the ncu per-kernel table) — the fusion mechanism
+works correctly. But the **family-time saving is only ~0.13–0.29 ms**,
+roughly **7–20× smaller** than this session's −2.0 ms (fp32) / −1.3 ms
+(bf16) acceptance bar, and smaller still than the ranked-candidate analysis's
+−3.0/−2.0 ms projection. **Target NOT met — reporting honestly per the task
+brief.**
+
+**Root cause of the shortfall:** `_dbias_finalize_gpu` was already cheap —
+243–245 µs total across 48 calls, both precisions (this matches the
+perf-hunt analysis's own "auxiliary launch-count trims" note that
+`_dbias_finalize` was "0.25 ms" — a figure that, read carefully, upper-bounds
+what removing it could ever save, and contradicts that same document's
+separate 2.0/3.0 ms projection for this candidate). The real ~2 ms bf16 /
+~2 ms fp32 gap to llm.c's `matmul_backward_bias_kernel9` (2.81 ms bf16,
+per the analysis doc) is dominated by the **accum kernel's own per-thread
+access pattern** — one scalar thread per output column reading each row
+individually — not by launch count or the finalize pass. llm.c's kernel9
+instead uses a warp/block cooperative reduction with `x128` (128-bit)
+vectorized loads across `bt_per_block` rows per warp. Closing that
+remaining gap would mean rewriting `_dbias_accum_gpu`'s core per-thread
+work to vectorize the row loads — a materially larger change than "fuse the
+two kernels" (this task's scope), and out of scope for this branch; flagged
+as a follow-up candidate (`#2b`) if further dbias work is prioritized.
+
+**Wall-clock (interleaved A/B, one flock window, quiet box):** two
+interleaving designs were tried. A naive fixed-order design
+(after_fp32, after_bf16, before_fp32, before_bf16 every round) showed an
+apparent +4.17 ms fp32 / +3.23 ms bf16 "win" — but a second, order-controlled
+design (fp32 and bf16 pairs run back-to-back, alternating which build goes
+first each round to cancel thermal-drift bias) showed −1.10 ms fp32 / +0.17 ms
+bf16 (i.e. no measurable win, one arm even nominally regressed). n=60
+samples/arm (3 rounds × 25 steps, WARMUP=5 dropped/run) give a per-arm
+std of 1.0–1.8 ms, i.e. a standard error on the mean difference of
+~0.2–0.3 ms — the *same order of magnitude* as the true effect the ncu
+numbers established (0.13–0.29 ms). **Wall-clock is not powered to resolve
+an effect this small; the two wall-clock runs bracketing zero in opposite
+directions is itself consistent with that** (not a contradiction of the ncu
+result — the ncu per-kernel-family measurement is the reliable, targeted
+evidence here, not the whole-step wall clock).
+
+### Verdict
+
+Landing anyway: the fusion is a correct, bit-identical/no-regression,
+strictly-positive (if small) win that removes 48 pure-overhead launches/step
+on the shipped NVIDIA path, with zero risk to Apple Metal (untouched
+fallback) or CPU (untouched). It does not deliver the −2.0/−3.0 ms the
+ranked-candidate analysis projected; that projection conflated "extra
+finalize launch" with the true bottleneck (the accum kernel's scalar access
+pattern). Recorded here so the next dbias pass starts from the corrected
+root cause instead of re-deriving it.
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Sonnet agent), directed by Evan Owen.
