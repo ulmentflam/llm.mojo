@@ -1716,3 +1716,71 @@ correctness changes** (correct backward included). Still ~4.0× faster than
 llm.c OpenMP and ~1.2× faster than PyTorch (medians). All cross-arm references
 match July 1 within noise, confirming the earlier 732 ms reading was pure
 run-stacking contention.
+
+## 2026-07-10 — NVFP4 forward-pass training integration (goal3b chunk T1)
+
+First fp4 bits in the training loop: `make build-fp4` (`-D LLMM_PRECISION=fp4`)
+runs GPT-2 124M with **NVFP4 (e2m1, two-level block scaling) forward GEMMs on
+the MLP fc/fc_proj linears of the middle transformer blocks only** — layers
+`[LLMM_FP4_FIRST, LLMM_FP4_LAST)`, default `[2, num_layer-2)` (d12: layers
+2–9 fp4; first two + last two blocks, qkv/attn_proj, embeddings, LN, and the
+lm_head all stay bf16, per the recipe in `fp4_training_recipes_research.md`).
+The backward pass is **all-bf16 by design at this stage** — fp4 backward
+(stochastic rounding + random Hadamard transform) is chunk T2's scope.
+Entry point: `llmm/matmul.mojo:matmul_fwd_fp4` (nvfp4_quantize weight 16×16 /
+activation 1×16 blocks, RNE, both scale levels fresh in-kernel — no AmaxState
+— then `lowp_gemm_fp4` = cuBLASLt block-scaled e2m1 GEMM, then the existing
+bf16 bias/GELU epilogue). Commits `135bf27` + gate recalibration `cac1968` on
+`goal3b/fp4-training`.
+
+### Gate (c) — per-site forward accuracy (`tests/test_matmul_fwd_fp4.mojo`)
+
+fp4 vs the production bf16 `matmul_fwd` at real shapes (rows=4096 = B4·T1024),
+bit-identical across three runs:
+
+| site | shape | rel_l2 | cosine |
+|---|---|---:|---:|
+| fc (+gelu) | 768→3072 | 0.15126 | 0.99030 |
+| proj | 3072→768 | 0.15124 | 0.98944 |
+
+Both PASS the calibrated gate (relL2 < 0.20, cosine > 0.985). **Calibration
+story:** the test originally inherited fp8's cosine>0.999 floor, which is
+mathematically unreachable at fp4's ~0.151 relL2 floor — for orthogonal
+quantization noise, cosine ≈ 1/√(1+relL2²) ≈ 0.9886, matching measurement
+almost exactly. Recalibrated to 0.985 in `cac1968` (see the gotcha entry in
+`low_precision_gotchas.md`).
+
+### Gate (d) — 10-step fp4 vs bf16 training (tinyshakespeare, B4 T1024): PASS
+
+Same invocation, back-to-back under the GPU lock. No NaN/Inf anywhere
+("(nanz)" is the warmup z-score token); loss decreases in both arms
+(fp4 val 4.547→3.756; bf16 val 4.513→3.709):
+
+| step | fp4 loss | bf16 loss | Δ rel |
+|---:|---:|---:|---:|
+| 1 | 4.408221 | 4.369226 | +0.89% |
+| 2 | 4.354415 | 4.418465 | −1.45% |
+| 3 | 4.508152 | 4.510433 | −0.05% |
+| 4 | 4.094811 | 4.026239 | +1.70% |
+| 5 | 3.642526 | 3.578290 | +1.80% |
+| 6 | 3.829161 | 3.767685 | +1.63% |
+| 7 | 3.563787 | 3.534359 | +0.83% |
+| 8 | 3.697817 | 3.655098 | +1.17% |
+| 9 | 3.287052 | 3.253812 | +1.02% |
+| 10 | 3.416172 | 3.390009 | +0.77% |
+| val (post-10) | 3.755988 | 3.709412 | +1.26% |
+
+Honest cost of fwd-only RNE fp4: **mean per-step loss delta +0.83%**, final
+val +1.26% — small but real, and larger than fp8's (which tracked within
+noise), exactly as e2m1's 1 mantissa bit predicts. The recipe's full
+convergence envelope (SR + RHT, fp4 backward) applies in chunk T2; this gate
+only certifies the forward integration is sound. Caveat: bf16 training is not
+run-to-run deterministic here, so individual step deltas carry wobble — the
+consistent ~+1% trend is the signal, not any single row. Throughput note:
+fp4 arm ran ~29.2k tok/s vs bf16's ~30.3k (quantize-kernel overhead currently
+outweighs the e2m1 GEMM gain at these shapes; performance is not this chunk's
+gate).
+
+All four builds (fp32/bf16/fp8/fp4) compile from one tree; bf16 build proven
+bit-identical pre/post (comptime-gating proof, gate b), fp8 suites 10/10 +
+8/8 (gates 0/a).

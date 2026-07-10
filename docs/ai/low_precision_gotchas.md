@@ -479,6 +479,37 @@ knob in `train_gpt2.mojo` (default off = full fp8, comptime-inert).
 
 ---
 
+## FP4 CHUNK T1 (forward-pass integration)
+
+### F1 — Cosine and relL2 gate thresholds are geometrically coupled: never mix floors across precisions
+
+**What:** Chunk T1's gate-(c) test (`tests/test_matmul_fwd_fp4.mojo`) initially failed both MLP
+sites (fc cosine 0.99030, proj 0.98944 vs a `>0.999` floor) while comfortably passing its relL2
+bound (0.151 < 0.20). The cosine floor had been inherited from the fp8 sibling test
+(`test_matmul_fwd_lowp.mojo`), where it is self-consistent with fp8's ~0.036 relL2 floor. It is
+**mathematically unreachable** at fp4's calibrated ~0.151 relL2 floor: for quantization noise
+roughly orthogonal to the signal, `cosine ≈ 1/sqrt(1 + relL2²)`, so relL2 0.151 caps cosine at
+~0.9886 — matching the measured 0.989–0.990 almost exactly (bit-identical across three runs).
+
+**Rule:** when writing a two-metric (cosine + relL2) accuracy gate, derive the cosine floor FROM
+the calibrated relL2 floor via `1/sqrt(1+relL2²)` minus margin — a copy-pasted cosine floor from
+a higher-precision sibling silently demands sub-floor error. Conversely, if measured cosine lands
+much LOWER than the geometry predicts from measured relL2, the error is correlated with the
+signal (systematic bias, e.g. a scale bug), not quantization noise — a real red flag even when
+both raw numbers look "close to 1". Recalibrated to 0.985 in commit `cac1968`
+(coordinator-approved, per the campaign's calibrate-gates-against-measurement precedent).
+
+**Gate (d) note (fp4 fwd-only cost):** 10-step fp4-fwd/bf16-bwd training vs bf16 shows mean
+per-step loss delta +0.83%, final val +1.26% (4.547→3.756 vs 4.513→3.709, both decreasing, no
+NaN/Inf) — a real but small degradation, unlike fp8 which tracked within noise. This is the
+expected e2m1 RNE forward cost; chunk T2 (SR + RHT + fp4 backward) owns the full convergence
+envelope. Full tables in `ai_assisted_optimizations_and_benchmarks.md` (2026-07-10 entry).
+
+**Source:** Chunk T1 gate validation, 2026-07-10 (worktree goal3b/fp4-training, commits
+135bf27 + cac1968).
+
+---
+
 ## Section summary
 
 | Section | Items | Status |
@@ -487,6 +518,8 @@ knob in `train_gpt2.mojo` (default off = full fp8, comptime-inert).
 | cuBLASLt | C1–C5 | Verified (C1: Probe 4; C2–C3: Probe FP4; C4–C5: FP4-GEMM chunk, tests/test_lowp_gemm_fp4.mojo) |
 | TF32/fp32 | TF1–TF3 | Verified (TF1–TF2: goal1 branch; TF3: GB10 incidents) |
 | ARCHITECTURE | A1–A3 | A1–A2: design doc confirmed; A3: agent-reported |
+| FP8 CHUNK D/E | E1–E5 | Verified (E1–E4: goal2 integration; E5: four-line-of-evidence investigation) |
+| FP4 CHUNK T1 | F1 | Verified (gate c re-run 3x bit-identical; gate d 10-step A/B) |
 
 ---
 
