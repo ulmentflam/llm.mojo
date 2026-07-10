@@ -13,6 +13,6 @@ if pgrep -f "autosentr[y] run" >/dev/null; then
 fi
 
 mkdir -p log124M
-setsid nohup autosentry run > scratch/autosentry.out 2>&1 < /dev/null &
+setsid nohup /home/evan/.local/bin/autosentry run > scratch/autosentry.out 2>&1 < /dev/null &
 disown
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ensure_autosentry: launched supervisor (was not running)" >> scratch/ensure_autosentry.log
