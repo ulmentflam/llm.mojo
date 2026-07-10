@@ -52,6 +52,7 @@ from llmm.gelu import gelu, gelu_grad, gelu_fwd_gpu, bias_gelu_fwd
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 from llmm.vendor import HAS_CUBLAS, HAS_METAL
+from llmm.lowp import PrecisionSpec, FP8_SPEC, quantize, quantize_transpose
 
 
 # ===----------------------------------------------------------------------=== #
@@ -149,6 +150,17 @@ def _lt_dt[dtype: DType]() -> DataType:
         return DataType.R_16BF
     elif dtype == DType.float32:
         return DataType.R_32F
+    elif dtype == DType.float8_e4m3fn:
+        # Confirmed present in the vendored `_cublas.dtype.DataType` enum
+        # (docs/ai/fp8_training_design.md open item — resolved in Chunk B):
+        # same mapping MAX's own
+        # `linalg.matmul.vendor.blas._convert_to_cublas_datatype` uses at the
+        # pinned toolchain commit, and exercised end-to-end by
+        # tests/probe_fp8/probe4b_cublaslt_fp8_bf16out.mojo (PASSES on this
+        # GB10/sm_121 box: native e4m3 x e4m3 -> bf16 cuBLASLt GEMM).
+        return DataType.R_8F_E4M3
+    elif dtype == DType.float8_e5m2:
+        return DataType.R_8F_E5M2
     else:
         return DataType.R_16F
 
@@ -463,6 +475,394 @@ def _matmul_cublaslt[
     check_cublas_error(cublasLtMatrixLayoutDestroy(b_l))
     check_cublas_error(cublasLtMatrixLayoutDestroy(c_l))
     check_cublas_error(cublasLtMatrixLayoutDestroy(d_l))
+
+
+# ===----------------------------------------------------------------------=== #
+# FP8 GEMM (Chunk B) — cuBLASLt native e4m3/e5m2 x e4m3/e5m2 -> bf16, TN-only.
+#
+# Probe result (tests/probe_fp8/RESULTS.md probe4): e4m3 x e4m3 -> e4m3 output
+# fails at runtime (CUBLAS_STATUS_NOT_SUPPORTED, likely needs
+# CUBLASLT_MATMUL_DESC_D_SCALE_POINTER — unexplored, out of scope); e4m3 x
+# e4m3 -> bf16 output WORKS (max_rel_err ~3e-3, bf16-rounding precision) and
+# is TN-only (transA=CUBLAS_OP_T, transB=CUBLAS_OP_N; A/B column-major,
+# ld=k). This is the primary/only vendor body wired up here — the design
+# doc's "MAX linalg fp8" and "emulated bf16" fallback bodies (§0/§6) are NOT
+# implemented in this worktree: probe3 showed MAX's generic `linalg.matmul`
+# hits the same broken fp8->f32 `pop.cast` GPU lowering as probe2, so it is
+# not a viable fallback on this toolchain either, and the "emulated" body
+# would itself need the same broken GPU fp8 arithmetic (probe2/2c) — so on
+# THIS box/toolchain there is exactly one working body, not three, and
+# `lowp_gemm` below has no comptime branch to select between them. A future
+# toolchain where MAX's fp8 path lowers on sm_121 (or emulation becomes
+# viable) would add that branch here.
+#
+# Two additional open items from docs/ai/fp8_training_design.md §7, resolved
+# empirically in this worktree (probe script + RESULTS below; the probe
+# itself is not committed — see this chunk's final report):
+#
+#   (a) TN operand orientation. TN's "free" (zero-copy, pure relabeling —
+#       no data movement) duality holds whenever a GEMM operand's *natural*
+#       row-major storage already has the contraction dimension as its
+#       trailing axis: the "A" role (transA=True) then reads that buffer
+#       as-is; the "B" role (transB=False) reads it as-is but the result is
+#       implicitly transposed. Working through all three block GEMMs (fwd:
+#       out=inp@Wᵀ; dgrad: dinp=dout@W; wgrad: dW=doutᵀ@inp) against this
+#       rule:
+#         - FORWARD (contraction dim = C): weight[OC,C] trailing=C ✓,
+#           input[rows,C] trailing=C ✓ — BOTH operands are TN-native. No
+#           transpose needed; this is exactly what
+#           tests/probe_fp8/probe4b_cublaslt_fp8_bf16out.mojo already
+#           exercises (transA=True on weight, transB=False on input).
+#         - DGRAD (contraction dim = OC): d_output[rows,OC] trailing=OC ✓
+#           (native, B role) but weight[OC,C] trailing=C ✗ (needs
+#           weight's TRANSPOSE, [C,OC], for the A role). One transposed
+#           fp8 copy of the weight is required.
+#         - WGRAD (contraction dim = rows): NEITHER d_output[rows,OC] nor
+#           input[rows,C] has `rows` as its trailing axis — BOTH need a
+#           transposed fp8 copy (input -> [C,rows] for the A role,
+#           d_output -> [OC,rows] for the B role). This is the expensive
+#           case; `quantize_transpose` (llmm/lowp.mojo) fuses the
+#           transpose into the quantize pass (one kernel, not a separate
+#           transpose + quantize) to amortize it.
+#       `lowp_gemm` below exposes `transpose_a`/`transpose_b` comptime bools
+#       so Chunk D (transpose_a=False, transpose_b=False for fwd) and
+#       Chunk E (dgrad: transpose_a=True, transpose_b=False; wgrad:
+#       transpose_a=True, transpose_b=True) select the right quantize body
+#       per operand without re-deriving this.
+#
+#   (b) beta=1 accumulate (wgrad grad-accum). Probed directly (e4m3 x e4m3
+#       -> bf16 D, CUBLASLT_MATMUL_DESC_A/B_SCALE_POINTER set, beta=1.0 vs
+#       beta=0.0 on an identical GEMM): **SUPPORTED.** The bf16 D buffer
+#       seeded with 1.0 everywhere and GEMM'd with beta=1 came back
+#       (GEMM_result + 1.0) to within bf16 rounding, matching the beta=0
+#       run's GEMM_result exactly offset by the seeded 1.0 — i.e. cuBLASLt's
+#       fp8-operand GEMM accumulates into an existing bf16 D exactly like
+#       the bf16/fp32 path does. This is a MORE favorable answer than the
+#       design doc's speculative "may need a bf16-scratch + add fallback" —
+#       Chunk E can pass `accumulate=True` straight through to
+#       `_matmul_cublaslt_fp8`'s `beta`, no special-casing needed.
+#
+#   Also probed: CUBLASLT_MATMUL_DESC_A_SCALE_POINTER /
+#   _B_SCALE_POINTER (device fp32 scalars) ARE honored on this GB10/sm_121
+#   toolchain — setting a_scale=2.0, b_scale=3.0 multiplied the bf16 output
+#   by 6.0x relative to the unscaled run, matching cuBLASLt's documented
+#   semantics ("scaling factor value that converts data in matrix A to the
+#   compute data type range"). `lowp_gemm` passes each operand's
+#   **scale_inv** (not scale) through these pointers — cuBLASLt multiplies
+#   fp8_A * a_scale_inv and fp8_B * b_scale_inv inside the fp32-compute GEMM,
+#   so `d_bf16 = (x * scale_x) @ (w * scale_w) * scale_inv_x * scale_inv_w ≈
+#   x @ w` comes out already correctly descaled — no separate
+#   `dequantize_accum` elementwise pass is needed for this vendor path
+#   (unlike the design §3 sketch, which anticipated a manual dequantize
+#   kernel; that helper may still matter for a future non-cuBLASLt/emulated
+#   body, but is not required here).
+# ===----------------------------------------------------------------------=== #
+
+
+def _matmul_cublaslt_fp8[
+    a_dtype: DType,
+    b_dtype: DType,
+    out_dtype: DType,
+](
+    d_ptr: MutKernelPtr[out_dtype],
+    a_ptr: ImmutKernelPtr[
+        DType.uint8
+    ],  # fp8 `a_dtype`-encoded bytes, [k,m] col-major (ld=k)
+    b_ptr: ImmutKernelPtr[
+        DType.uint8
+    ],  # fp8 `b_dtype`-encoded bytes, [k,n] col-major (ld=k)
+    a_scale_inv_ptr: ImmutKernelPtr[DType.float32],  # device scalar, 1/scale_a
+    b_scale_inv_ptr: ImmutKernelPtr[DType.float32],  # device scalar, 1/scale_b
+    m: Int,
+    n: Int,
+    k: Int,
+    accumulate: Bool,
+    ctx: DeviceContext,
+) raises -> None:
+    """Raw cuBLASLt fp8 GEMM: `D[m,n] = op(A)*op(B)` (fp32 compute, bf16 `D`),
+    TN-only (`transA=CUBLAS_OP_T`, `transB=CUBLAS_OP_N` — cuBLASLt's fp8
+    requirement; not caller-selectable, unlike `_matmul_cublaslt`'s bf16/fp32
+    path). `a_ptr`/`b_ptr` must already be the correctly-oriented fp8 bytes —
+    this function does no quantization or transpose; see `lowp_gemm` (which
+    calls this) for that, and the module-level comment above for which
+    operands of which GEMM need a transposed quantize. `k` must be a multiple
+    of 16 (fp8 tensor-core alignment; unchecked here — caller's
+    responsibility, same as `_matmul_cublaslt`'s implicit assumptions).
+    """
+    var handle = _get_global_handle[a_dtype, Backend.CUBLASLT](ctx)
+    var lt = handle._get_cublas()
+    var cuda_stream = CUDA(ctx.stream())
+    comptime dt_a = _lt_dt[a_dtype]()
+    comptime dt_b = _lt_dt[b_dtype]()
+    comptime dt_out = _lt_dt[out_dtype]()
+
+    var desc = cublasLtMatmulDesc_t()
+    check_cublas_error(
+        cublasLtMatmulDescCreate(
+            UnsafePointer(to=desc).as_unsafe_any_origin(),
+            ComputeType.COMPUTE_32F,
+            DataType.R_32F,
+        )
+    )
+    _lt_set_op(
+        desc, cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_TRANSA, True
+    )
+    _lt_set_op(
+        desc, cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_TRANSB, False
+    )
+
+    var a_sp = a_scale_inv_ptr
+    check_cublas_error(
+        cublasLtMatmulDescSetAttribute(
+            desc,
+            cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            UnsafePointer(to=a_sp)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[ImmutKernelPtr[DType.float32]](),
+        )
+    )
+    var b_sp = b_scale_inv_ptr
+    check_cublas_error(
+        cublasLtMatmulDescSetAttribute(
+            desc,
+            cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            UnsafePointer(to=b_sp)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[ImmutKernelPtr[DType.float32]](),
+        )
+    )
+
+    var a_l = cublasLtMatrixLayout_t()
+    check_cublas_error(
+        cublasLtMatrixLayoutCreate(
+            UnsafePointer(to=a_l).as_unsafe_any_origin(),
+            dt_a,
+            UInt64(k),
+            UInt64(m),
+            Int64(k),
+        )
+    )
+    var b_l = cublasLtMatrixLayout_t()
+    check_cublas_error(
+        cublasLtMatrixLayoutCreate(
+            UnsafePointer(to=b_l).as_unsafe_any_origin(),
+            dt_b,
+            UInt64(k),
+            UInt64(n),
+            Int64(k),
+        )
+    )
+    var c_l = cublasLtMatrixLayout_t()
+    check_cublas_error(
+        cublasLtMatrixLayoutCreate(
+            UnsafePointer(to=c_l).as_unsafe_any_origin(),
+            dt_out,
+            UInt64(m),
+            UInt64(n),
+            Int64(m),
+        )
+    )
+    var d_l = cublasLtMatrixLayout_t()
+    check_cublas_error(
+        cublasLtMatrixLayoutCreate(
+            UnsafePointer(to=d_l).as_unsafe_any_origin(),
+            dt_out,
+            UInt64(m),
+            UInt64(n),
+            Int64(m),
+        )
+    )
+
+    var pref = cublasLtMatmulPreference_t()
+    check_cublas_error(
+        cublasLtMatmulPreferenceCreate(
+            UnsafePointer(to=pref).as_unsafe_any_origin()
+        )
+    )
+    var ws_size = _CUBLASLT_WS_BYTES
+    check_cublas_error(
+        cublasLtMatmulPreferenceSetAttribute(
+            pref,
+            Preference.MAX_WORKSPACE_BYTES,
+            UnsafePointer(to=ws_size)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[Int](),
+        )
+    )
+
+    var heur = cublasLtMatmulHeuristicResult_t()
+    var cnt = 0
+    check_cublas_error(
+        cublasLtMatmulAlgoGetHeuristic(
+            lt,
+            desc,
+            a_l,
+            b_l,
+            c_l,
+            d_l,
+            pref,
+            1,
+            UnsafePointer(to=heur).as_unsafe_any_origin(),
+            UnsafePointer(to=cnt).as_unsafe_any_origin(),
+        )
+    )
+    if cnt == 0:
+        raise Error(
+            "no cuBLASLt algorithm for the fp8 TN GEMM (a_dtype="
+            + String(a_dtype)
+            + " b_dtype="
+            + String(b_dtype)
+            + " out_dtype="
+            + String(out_dtype)
+            + ") -- mixed e4m3/e5m2 operand pairs are not universally"
+            " supported; e4m3 x e4m3 is the confirmed-working combination"
+            " on this toolchain (tests/probe_fp8/RESULTS.md probe4)"
+        )
+
+    var ws = _cublaslt_workspace(ctx)
+    var alpha = Float32(1.0)
+    var beta = Float32(1.0) if accumulate else Float32(0.0)
+    check_cublas_error(
+        cublasLtMatmul(
+            lt,
+            desc,
+            UnsafePointer(to=alpha)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            a_l,
+            b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            b_l,
+            UnsafePointer(to=beta)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            c_l,
+            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            d_l,
+            UnsafePointer(to=heur.algo).as_immutable().as_unsafe_any_origin(),
+            ws,
+            _CUBLASLT_WS_BYTES,
+            cuda_stream.value()[],
+        )
+    )
+
+    check_cublas_error(cublasLtMatmulPreferenceDestroy(pref))
+    check_cublas_error(cublasLtMatmulDescDestroy(desc))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(a_l))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(b_l))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(c_l))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(d_l))
+
+
+def lowp_gemm[
+    a_out_dtype: DType,
+    b_out_dtype: DType,
+    in_dtype: DType,
+    out_dtype: DType,
+    target: StaticString,
+    transpose_a: Bool = False,
+    transpose_b: Bool = False,
+](
+    d_ptr: MutKernelPtr[out_dtype],
+    a_ptr: ImmutKernelPtr[in_dtype],
+    b_ptr: ImmutKernelPtr[in_dtype],
+    a_fp8_scratch: MutKernelPtr[DType.uint8],
+    b_fp8_scratch: MutKernelPtr[DType.uint8],
+    a_scale: Float32,
+    a_scale_inv_ptr: ImmutKernelPtr[DType.float32],
+    b_scale: Float32,
+    b_scale_inv_ptr: ImmutKernelPtr[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    accumulate: Bool,
+    ctx: DeviceContext,
+) raises -> None:
+    """The dtype-generic fp8 GEMM entry point (docs/ai/fp8_training_design.md
+    §3/§5): quantizes `a_ptr`/`b_ptr` (bf16 or fp32) into fp8 scratch buffers
+    at the caller-chosen scale, then runs `_matmul_cublaslt_fp8` (the only
+    vendor body available on this toolchain — see the comment block above),
+    producing bf16 `d_ptr` already correctly descaled (no separate dequantize
+    pass needed, per the scale-pointer probe result above).
+
+    `m`, `n`, `k` follow this file's existing column-major convention: `m` is
+    D's trailing (fastest-varying, "column") dimension in row-major terms,
+    `n` its leading dimension, `k` the contraction dimension — identical to
+    `_matmul_cublaslt`'s `m`/`n`/`k` at each of its three call sites
+    (`matmul_fwd`, `matmul_d_input_bwd`, `matmul_d_weight_bwd`).
+
+    `transpose_a`/`transpose_b` select `quantize` (operand's natural
+    row-major layout already fits the TN "A-role"/"B-role" free pattern) vs
+    `quantize_transpose` (needs a physically transposed fp8 copy) per
+    operand — see the module comment above for the derivation per GEMM:
+      - forward:       transpose_a=False, transpose_b=False
+      - dgrad (d_input): transpose_a=True,  transpose_b=False
+      - wgrad (d_weight): transpose_a=True,  transpose_b=True
+
+    When `transpose_a`: `a_ptr` is logically `[k, m]` row-major (source
+    shape), `a_fp8_scratch` becomes `[m, k]` row-major (transposed) fp8
+    bytes. When not: `a_ptr` is `[m, k]` row-major already, copied through
+    `quantize` unchanged (mirrored for `b_ptr`/`[k, n]`/`[n, k]`).
+
+    `a_fp8_scratch`/`b_fp8_scratch` must be at least `m*k`/`k*n` bytes.
+    `a_scale`/`b_scale` are the quantize-time multipliers (`fp8_max / amax`,
+    per docs/ai/fp8_training_design.md §1.3 — computed by Chunk C's
+    `AmaxState`/`update_scale`, out of this chunk's scope);
+    `a_scale_inv_ptr`/`b_scale_inv_ptr` are DEVICE fp32 scalars holding their
+    reciprocals (cuBLASLt's `A_SCALE_POINTER`/`B_SCALE_POINTER` require a
+    device pointer, not a host value — keep them in sync with `a_scale`/
+    `b_scale` at the call site; `tests/test_lowp_gemm.mojo` shows the
+    single-scalar-buffer pattern).
+    """
+    comptime assert is_gpu[
+        target
+    ](), "lowp_gemm is GPU-only per docs/ai/fp8_training_design.md landmine #1"
+    comptime assert HAS_CUBLAS, (
+        "lowp_gemm's only implemented vendor body is cuBLASLt fp8"
+        " (tests/probe_fp8/RESULTS.md probe3/probe4) -- no MAX-linalg or"
+        " emulated fallback exists on this toolchain (see the module comment"
+        " above _matmul_cublaslt_fp8)"
+    )
+
+    comptime if transpose_a:
+        quantize_transpose[FP8_SPEC, a_out_dtype, in_dtype, target](
+            a_fp8_scratch, a_ptr, a_scale, k, m, ctx
+        )
+    else:
+        quantize[FP8_SPEC, a_out_dtype, in_dtype, target](
+            a_fp8_scratch, a_ptr, a_scale, m * k, ctx
+        )
+
+    comptime if transpose_b:
+        quantize_transpose[FP8_SPEC, b_out_dtype, in_dtype, target](
+            b_fp8_scratch, b_ptr, b_scale, k, n, ctx
+        )
+    else:
+        quantize[FP8_SPEC, b_out_dtype, in_dtype, target](
+            b_fp8_scratch, b_ptr, b_scale, n * k, ctx
+        )
+
+    _matmul_cublaslt_fp8[a_out_dtype, b_out_dtype, out_dtype](
+        d_ptr,
+        a_fp8_scratch.as_immutable(),
+        b_fp8_scratch.as_immutable(),
+        a_scale_inv_ptr,
+        b_scale_inv_ptr,
+        m,
+        n,
+        k,
+        accumulate,
+        ctx,
+    )
 
 
 def _launch_gelu_fwd_gpu[
