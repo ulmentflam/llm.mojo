@@ -251,6 +251,23 @@ def compute_amax[
     PerTensor (fp8) only; `spec.scaling == Block1D/Block2D` (NVFP4's
     per-block reduction, §3 seam) is not implemented — comptime error rather
     than a silently-scalar result for a block-scaled spec.
+
+    DELIBERATELY STAYS UNIMPLEMENTED for FP4 (reconciled during the FP4-GEMM
+    chunk, docs/ai/fp4_training_recipes_research.md): `llmm/nvfp4_quant.mojo`'s
+    `nvfp4_quantize` does not call `compute_amax`/`AmaxState` at all. It
+    computes its own fp32 per-tensor scale fresh every call, fully
+    device-resident, via its own two-pass reduction
+    (`nvfp4_compute_tensor_scale`) — and its e4m3 per-block scales are
+    derived in the same quantize kernel launch from that fresh tensor scale,
+    with no separate reduction pass. There is no delayed/history-based
+    scaling step for FP4 to plug into this file's machinery: fp8's
+    `PerTensor` case needs `AmaxState`'s ring buffer because a single
+    per-tensor scale is coarse and benefits from smoothing across
+    `amax_history_len` steps; NVFP4's 16-element block scale already adapts
+    *within* a tensor, so amortizing the coarser tensor-level scale over
+    steps buys little and was not built. Filling in `Block1D`/`Block2D` here
+    would be parallel, unused machinery — see `FP4_SPEC` in `llmm/lowp.mojo`
+    for the corresponding note on the spec-constant side of this decision.
     """
 
     comptime if spec.scaling == ScalingKind.PerTensor:
@@ -440,8 +457,10 @@ struct AmaxState[spec: PrecisionSpec](Movable):
 
     Block1D/Block2D (NVFP4, §3 seam) is stubbed: `__init__`, `update_scale`
     raise a clear comptime error rather than silently allocating/updating the
-    wrong shape. The FP4 chunk fills these in with a `[rows/block,
-    cols/block]` `spec.scale_dtype` tensor per site.
+    wrong shape. UPDATE (FP4-GEMM chunk): this stays a deliberate stub, not a
+    pending TODO — `llmm/nvfp4_quant.mojo`'s `nvfp4_quantize` computes both
+    scale levels itself, fresh every call, and never consults `AmaxState`.
+    See `compute_amax`'s docstring above for the full rationale.
 
     `(Movable)` (added by Chunk D): `List[AmaxState[spec]]` — the
     per-layer/per-site storage `train_gpt2.mojo`'s `LowpState` container uses
