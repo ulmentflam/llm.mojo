@@ -6,11 +6,11 @@ This document synthesizes the FP4 research campaign into a go/no-go decision fra
 
 ## TL;DR — Go/No-Go Picture
 
-**The verdict: FP4 is reachable, but conditionally.** MAX's own FP4 kernels do not run on GB10 (sm_121 consumer Blackwell; they require sm_100 datacenter hardware and are inference-only regardless). However, NVIDIA's cuBLASLt library ships production sm_120 NVFP4 block-scaled GEMM kernels (both forward and backward) that are almost certainly compatible with sm_121 via a simple 5-line runtime probe. llm.mojo already uses cuBLASLt for bf16 matmuls, so the plumbing exists. **The single open question is whether cuBLASLt dispatches its sm_120 kernels to this sm_121 device; that probe is running now and is the gate to proceeding.** If it passes, the path forward is clear and well-documented by NVIDIA's 2025 research. If it fails, a hand-written Mojo FP4 kernel is feasible but requires more work. **Realistic speedup at 124M scale is ~2× FP8 (not 4× due to quant/dequant overhead), and the loss convergence gap is honest and potentially significant — this is a parity/research exercise, not a throughput win.**
+**The verdict: FP4 is reachable.** MAX's own FP4 kernels do not run on GB10 (sm_121 consumer Blackwell; they require sm_100 datacenter hardware and are inference-only regardless). However, NVIDIA's cuBLASLt library ships production sm_120 NVFP4 block-scaled GEMM kernels that run unmodified on sm_121 via direction-agnostic GEMMs (all of forward, Dgrad, Wgrad map to the same kernel family with different operands). llm.mojo already uses cuBLASLt for bf16 matmuls, so the plumbing exists. **The dispatch compatibility question is empirically resolved (§1b, probe passed 2026-07-10; see `docs/ai/fp4_modular_support_research.md` §6 for full details).** The path forward is clear and well-documented by NVIDIA's 2025 research. **Realistic speedup at 124M scale is ~2× FP8 (not 4× due to quant/dequant overhead), and the loss convergence gap is honest and potentially significant — this is a parity/research exercise, not a throughput win.**
 
 ---
 
-## 1. The Technical Path (Pending Probe)
+## 1. The Technical Path (Probe Complete, Dispatch Confirmed)
 
 ### 1a. Chosen approach: cuBLASLt NVFP4 interop
 
@@ -22,21 +22,17 @@ This document synthesizes the FP4 research campaign into a go/no-go decision fra
 - Gets NVFP4 (vs16 blocks) directly, which is more stable for training than MXFP4.
 - Supports all three GEMMs (forward, Dgrad, Wgrad) with both quantized and mixed-precision outputs.
 
-### 1b. The one open empirical question (pending probe result)
+### 1b. Dispatch compatibility: sm_120 → sm_121 (empirically CONFIRMED)
 
-**Dispatch compatibility: sm_120 → sm_121.**
+**The probe result: DISPATCHES.** cuBLASLt's sm_120 NVFP4 kernels were originally a source of uncertainty — they are compiled as separate cubins targeting the sm_120 arch, and whether cuBLASLt's kernel-selection heuristic would serve them to sm_121 was **INFERRED** (not empirically verified) at the time the research doc was written.
 
-cuBLASLt's sm_120 NVFP4 kernels are compiled as separate cubins targeting the sm_120 arch. Consumer Blackwell (GB10, sm_121) shares the same 5th-gen Tensor Cores as datacenter Blackwell's consumer variant, and the ISA is compatible — but cuBLASLt's heuristic for selecting which cubin to load is unverified on sm_121.
+A direct probe (§5 of `fp4_modular_support_research.md`, results in `tests/probe_fp4/RESULTS.md`) ran ~40 lines of C++/CUDA that reuses the `cublasLt` bindings already in `llmm/matmul.mojo`: allocate tiny e2m1-packed A/B and e4m3 scale tensors, build a cuBLASLt descriptor with `CUDA_R_4F_E2M1` and block-scale attributes, call `cublasLtMatmulAlgoGetHeuristic()` + `cublasLtMatmul()`. The result: `CUBLAS_STATUS_SUCCESS` end-to-end, and `nsys` profile confirmed the GPU executed the exact sm_120-targeted cubin (unmodified) on sm_121 hardware, with numeric correctness verified vs. independent reference (rel L2 = 0.1445, matching software dequant).
 
-**What to do:** ~40 lines of C++/CUDA that reuses the `cublasLt` bindings already in `llmm/matmul.mojo`. Allocate tiny e2m1-packed A/B and e4m3 scale tensors, build a cuBLASLt descriptor with `CUDA_R_4F_E2M1` and block-scale attributes, call `cublasLtMatmulAlgoGetHeuristic()` + `cublasLtMatmul()`, and observe whether it returns `CUBLAS_STATUS_SUCCESS` or `CUBLAS_STATUS_NOT_SUPPORTED`. **This probe is in flight.**
+**Next step:** Proceed directly to §3's recipe. The dispatch compatibility question is resolved; the path is unblocked. No driver/toolkit update is required.
 
-**If the probe passes:** Proceed directly to §3's recipe. The path is unblocked.
+### 1c. Fallback approach (not needed; cuBLASLt path is validated)
 
-**If the probe fails:** Fall back to path (b) below — hand-written Mojo FP4 kernel using `float4_e2m1fn` DType and `mma.sync…mxf8f6f4.block_scale…e2m1` PTX intrinsics. The project already has the muscle for this (pre-MAX era); more work, but feasible.
-
-### 1c. Fallback approach (if dispatch fails)
-
-Hand-written Mojo FP4 kernel with `float4_e2m1fn` and inline PTX. Mojo's stdlib and the LLVM backend already support the instruction family; the compiler emits `mma.sync…kind::mxf8f6f4.block_scale…e2m1…` correctly on sm_120/sm_121. This is the "build our own" path the project has done before, now for FP4. Slower to deliver (new kernel from scratch), but gives full control over layout and epilogue.
+Hand-written Mojo FP4 kernel with `float4_e2m1fn` and inline PTX is no longer the immediate next step, since cuBLASLt dispatch is confirmed. Mojo's stdlib and the LLVM backend already support the instruction family; the compiler emits `mma.sync…kind::mxf8f6f4.block_scale…e2m1…` correctly on sm_120/sm_121. Keep this path in reserve ("build our own" approach the project has done before, now for FP4) only if future kernel requirements (layout, epilogue, performance tuning) cannot be met by cuBLASLt.
 
 ---
 
@@ -129,6 +125,14 @@ For implementation depth, recipe details, and citations:
 
 - **[`fp4_modular_support_research.md`](fp4_modular_support_research.md)** — Modular/MAX toolchain support, cuBLASLt verification, the sm_121 dispatch probe, and fallback kernel paths. Read for GPU-vendor plumbing details and the probe specification.
 - **[`fp4_training_recipes_research.md`](fp4_training_recipes_research.md)** — NVFP4 format details, stochastic rounding, Random Hadamard Transform, 2D vs 1D scaling, the √3 noise floor, small-model scaling law, and the full checklist with paper citations. Read for numerics and training recipe.
+
+---
+
+## Status Update (2026-07-10)
+
+The empirical dispatch probe has **completed with a CONFIRMED verdict**: cuBLASLt's sm_120 NVFP4 kernels dispatch successfully to sm_121 hardware without modification, with numeric correctness validated (see `tests/probe_fp4/RESULTS.md` and `docs/ai/fp4_modular_support_research.md` §6). 
+
+**FP4 training build campaign is now underway** on branch `goal3b/fp4-training`, starting with Hadamard + NVFP4 quantize kernels. The campaign rides on the FP8 shared dtype-generic scaling infrastructure currently being built on branch `goal2/fp8-training`. Key dependency: device-side stochastic rounding RNG and per-layer precision routing must coordinate with FP8 pipeline infrastructure.
 
 ---
 
