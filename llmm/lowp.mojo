@@ -446,6 +446,79 @@ def quantize[
     )
 
 
+# ===----------------------------------------------------------------------=== #
+# Device-pointer-scale variants (Chunk D).
+#
+# `quantize`/`quantize_transpose` above take `scale: Float32` — a HOST value.
+# That is exactly right for Chunk B's own gate (a host-computed amax/scale in
+# a unit test), but Chunk C's `AmaxState.scale`/`scale_inv` (llmm/amax.mojo)
+# are DEVICE-resident fp32 scalars, deliberately never read back to host on
+# the training step path (design §4's landmine-2 audit: "Host readback? no").
+# A GPU kernel launch's scalar arguments are copied host->device at launch
+# time regardless of whether the source is a host variable or (as here) a
+# device pointer being dereferenced — so passing `scale: Float32` to
+# `quantize` would force a host readback of `AmaxState.scale` right before
+# every single quantize call, once per fp8 GEMM operand per step. These
+# `_devscale` twins take `scale_ptr: ImmutKernelPtr[DType.float32]` instead
+# and dereference it *inside* the kernel (`scale_ptr[0]`), so the scale
+# value never leaves the device — the call site passes
+# `AmaxState.scale`'s own device pointer straight through. Otherwise
+# identical to `quantize`/`quantize_transpose` (same encode path, same
+# stochastic-rounding seam, same GPU-only guard).
+# ===----------------------------------------------------------------------=== #
+
+
+def _quantize_kernel_devscale[
+    in_dtype: DType, out_dtype: DType, mode: Int
+](
+    out_ptr: MutKernelPtr[DType.uint8],
+    in_ptr: ImmutKernelPtr[in_dtype],
+    scale_ptr: ImmutKernelPtr[DType.float32],
+    n: Int,
+) -> None:
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if idx < n:
+        var v = in_ptr[idx].cast[DType.float32]() * scale_ptr[0]
+        out_ptr[idx] = encode_fp8[out_dtype, mode](v)
+
+
+def quantize_devscale[
+    spec: PrecisionSpec,
+    out_dtype: DType,
+    in_dtype: DType,
+    target: StaticString,
+](
+    out_ptr: MutKernelPtr[DType.uint8],
+    in_ptr: ImmutKernelPtr[in_dtype],
+    scale_ptr: ImmutKernelPtr[DType.float32],
+    n: Int,
+    ctx: DeviceContext,
+) raises -> None:
+    """Device-pointer-scale twin of `quantize` — see the module comment
+    above. `scale_ptr` is a device fp32 scalar (e.g. `AmaxState.scale`'s
+    `unsafe_ptr()`); the kernel reads it directly, no host readback.
+    """
+    comptime assert is_gpu[target](), (
+        "quantize_devscale is GPU-only per"
+        " docs/ai/fp8_training_design.md landmine #1 (low-precision kernels"
+        " must never be instantiated for the cpu target)"
+    )
+    comptime BLOCK_SIZE = 256
+    var num_blocks = ceildiv(n, BLOCK_SIZE)
+    comptime kmode = RoundMode.SR if spec.stochastic_rounding else RoundMode.RNE
+    comptime kernel = _quantize_kernel_devscale[in_dtype, out_dtype, kmode]
+    var compiled = ctx.compile_function[kernel]()
+    ctx.enqueue_function(
+        compiled,
+        out_ptr,
+        in_ptr,
+        scale_ptr,
+        n,
+        grid_dim=(num_blocks,),
+        block_dim=(BLOCK_SIZE,),
+    )
+
+
 def _quantize_transpose_kernel[
     in_dtype: DType, out_dtype: DType, mode: Int
 ](
@@ -507,6 +580,65 @@ def quantize_transpose[
         out_ptr,
         in_ptr,
         scale,
+        rows,
+        cols,
+        grid_dim=(num_blocks,),
+        block_dim=(BLOCK_SIZE,),
+    )
+
+
+def _quantize_transpose_kernel_devscale[
+    in_dtype: DType, out_dtype: DType, mode: Int
+](
+    out_ptr: MutKernelPtr[DType.uint8],  # [cols, rows] row-major (transposed)
+    in_ptr: ImmutKernelPtr[in_dtype],  # [rows, cols] row-major
+    scale_ptr: ImmutKernelPtr[DType.float32],
+    rows: Int,
+    cols: Int,
+) -> None:
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if idx < rows * cols:
+        var r = idx // cols
+        var c = idx % cols
+        var v = in_ptr[idx].cast[DType.float32]() * scale_ptr[0]
+        out_ptr[c * rows + r] = encode_fp8[out_dtype, mode](v)
+
+
+def quantize_transpose_devscale[
+    spec: PrecisionSpec,
+    out_dtype: DType,
+    in_dtype: DType,
+    target: StaticString,
+](
+    out_ptr: MutKernelPtr[DType.uint8],
+    in_ptr: ImmutKernelPtr[in_dtype],
+    scale_ptr: ImmutKernelPtr[DType.float32],
+    rows: Int,
+    cols: Int,
+    ctx: DeviceContext,
+) raises -> None:
+    """Device-pointer-scale twin of `quantize_transpose` — see the module
+    comment above `quantize_devscale`. Not needed by Chunk D (the forward
+    GEMM is TN-native — `transpose_a=False, transpose_b=False`, see
+    `lowp_gemm`'s docstring in llmm/matmul.mojo), but Chunk E's dgrad/wgrad
+    orientations need a transposed fp8 copy AND a device-resident scale, so
+    this twin is provided here alongside `quantize_devscale` rather than
+    left for Chunk E to duplicate.
+    """
+    comptime assert is_gpu[target](), "quantize_transpose_devscale is GPU-only"
+    comptime BLOCK_SIZE = 256
+    var total = rows * cols
+    var num_blocks = ceildiv(total, BLOCK_SIZE)
+    comptime kmode = RoundMode.SR if spec.stochastic_rounding else RoundMode.RNE
+    comptime kernel = _quantize_transpose_kernel_devscale[
+        in_dtype, out_dtype, kmode
+    ]
+    var compiled = ctx.compile_function[kernel]()
+    ctx.enqueue_function(
+        compiled,
+        out_ptr,
+        in_ptr,
+        scale_ptr,
         rows,
         cols,
         grid_dim=(num_blocks,),
