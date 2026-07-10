@@ -1,5 +1,5 @@
 import compiler
-from std.memory import alloc
+from std.memory import alloc, stack_allocation
 from std.math import ceildiv
 from layout import Layout, TileTensor
 from layout.layout_tensor import LayoutTensor
@@ -20,6 +20,7 @@ from std.algorithm import vectorize, sync_parallelize
 from std.gpu.host import DeviceContext, DeviceAttribute
 from std.gpu.memory import AddressSpace
 from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
+from std.gpu.intrinsics import threadfence, Scope
 from std.atomic import Atomic
 from std.ffi import _get_global_or_null, external_call
 from std.sys import size_of
@@ -906,6 +907,31 @@ def _dbias_scratch(ctx: DeviceContext) raises -> MutKernelPtr[DType.float32]:
     return rebind[MutKernelPtr[DType.float32]](hp[].unsafe_ptr())
 
 
+def _dbias_counters(ctx: DeviceContext) raises -> MutKernelPtr[DType.int32]:
+    # Persistent per-column-block "arrival" counters for the fused dbias
+    # reduction's last-block-finalizes signal (NVIDIA-only, kernel9-style —
+    # see `_dbias_fused_gpu`). One counter per column-block (`bx` in the
+    # launch grid); zeroed on allocation, and the block that finalizes a
+    # column-block resets its own slot back to 0 immediately after use, so no
+    # per-call host-side memset is needed (mirrors `_dbias_scratch` below).
+    # CAP=4096 column-blocks is far beyond any OC/256 this model produces
+    # (largest bias is the 4C=3072-wide MLP fc, i.e. 12 column-blocks).
+    comptime CAP = 4096
+    comptime BufType = type_of(ctx.enqueue_create_buffer[DType.int32](1))
+    var name = String(t"LLMM_DBIAS_COUNTERS_{ctx.id()}")
+    if gp := _get_global_or_null(name):
+        var p = gp.value().bitcast[BufType]()
+        return rebind[MutKernelPtr[DType.int32]](p[].unsafe_ptr())
+    var buf = ctx.enqueue_create_buffer[DType.int32](CAP)
+    ctx.enqueue_memset(buf, Int32(0))
+    var hp = alloc[BufType](1)
+    hp.init_pointee_move(buf^)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), hp.bitcast[NoneType]()
+    )
+    return rebind[MutKernelPtr[DType.int32]](hp[].unsafe_ptr())
+
+
 def _dbias_accum_gpu[
     dtype: DType,
 ](
@@ -954,6 +980,84 @@ def _dbias_finalize_gpu[
             ]()
         else:
             d_bias_ptr[col] = v.cast[dtype]()
+
+
+def _dbias_fused_gpu[
+    dtype: DType,
+    accumulate: Bool,
+](
+    d_bias_ptr: MutKernelPtr[dtype],
+    scratch: MutKernelPtr[DType.float32],
+    counters: MutKernelPtr[DType.int32],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    rows: Int,
+    out_channels: Int,
+    row_tile: Int,
+    row_blocks: Int,
+) -> None:
+    # NVIDIA-only (HAS_CUBLAS-gated): matmul_backward_bias_kernel9-style fused
+    # dbias reduction — one launch per call site instead of the accum+finalize
+    # pair above. Same partial layout as `_dbias_accum_gpu`
+    # (row-block-contention-free [row_blocks, OC] scratch), but the last
+    # row-block to finish for a given column-block finalizes in the same
+    # launch instead of a second kernel doing it. "Last block" is detected
+    # with the classic CUDA global-sync idiom (NVIDIA's `threadFenceReduction`
+    # sample / llm.c's own `global_sum_deterministic`): each writer thread
+    # __threadfence()s to publish its scratch write GPU-wide, thread 0 then
+    # atomically increments a per-column-block arrival counter and broadcasts
+    # via shared memory whether it was the last of `row_blocks` arrivals; only
+    # that block reads the full column back out of scratch and finalizes.
+    #
+    # GOTCHA: this relies on `threadfence(Scope.GPU)`, which is NVIDIA-only
+    # (comptime-asserts `is_nvidia_gpu()`) — never call this kernel outside a
+    # `HAS_CUBLAS` branch (see `matmul_bias_bwd` below); Apple Metal keeps the
+    # portable `_dbias_accum_gpu` + `_dbias_finalize_gpu` two-launch path.
+    var bx = Int(block_idx.x)
+    var by = Int(block_idx.y)
+    var col = bx * Int(block_dim.x) + Int(thread_idx.x)
+
+    if col < out_channels:
+        var r0 = by * row_tile
+        var r1 = min(r0 + row_tile, rows)
+        var acc = Scalar[DType.float32](0.0)
+        for r in range(r0, r1):
+            acc += d_output_ptr[r * out_channels + col].cast[DType.float32]()
+        scratch[by * out_channels + col] = acc
+
+    # Every thread that may have written above must fence its own write —
+    # __threadfence() only orders the calling thread's prior stores, so a
+    # single "leader" fence would not publish the other 255 threads' columns.
+    threadfence[Scope.GPU]()
+
+    var flag = stack_allocation[
+        1, DType.int32, address_space=AddressSpace.SHARED
+    ]()
+    if Int(thread_idx.x) == 0:
+        var arrived = Atomic[DType.int32].fetch_add(counters + bx, 1)
+        flag[0] = 1 if arrived == Int32(row_blocks - 1) else 0
+    barrier()
+    if flag[0] == 0:
+        return
+    if col >= out_channels:
+        return
+
+    var total = Scalar[DType.float32](0.0)
+    for rb in range(row_blocks):
+        total += scratch[rb * out_channels + col]
+    comptime if accumulate:
+        d_bias_ptr[col] = (d_bias_ptr[col].cast[DType.float32]() + total).cast[
+            dtype
+        ]()
+    else:
+        d_bias_ptr[col] = total.cast[dtype]()
+
+    # Self-reset: the next call reusing this column-block's counter slot
+    # (next layer / next grad-accum micro-batch) must see 0 again. No
+    # host-side memset between launches (mirrors the scratch buffer, which
+    # `_dbias_accum_gpu`'s comment already notes is fully overwritten, not
+    # zeroed, every call).
+    if Int(thread_idx.x) == 0:
+        counters[bx] = 0
 
 
 @always_inline
@@ -1024,10 +1128,9 @@ def matmul_bias_bwd[
         )
     elif is_gpu[target]():
         # Coalesced, row-parallel dbias: one thread per column, grid.y row-blocks
-        # atomically accumulate per-column partials into an fp32 scratch, then a
-        # finalize pass writes bf16 d_bias (and re-zeros the scratch). Replaces
-        # the uncoalesced row-strided block-reduction (was ~2.6× slower per call
-        # than llm.c's).
+        # split the row reduction into per-row-block partials in an fp32
+        # scratch. Replaces the uncoalesced row-strided block-reduction (was
+        # ~2.6× slower per call than llm.c's).
         comptime BLOCK_SIZE = 256
         comptime ROW_BLOCKS = 16
         var device_ctx = ctx
@@ -1037,29 +1140,54 @@ def matmul_bias_bwd[
         var col_blocks = max(ceildiv(oc, BLOCK_SIZE), 1)
         var scratch = _dbias_scratch(device_ctx)
 
-        comptime accum_k = _dbias_accum_gpu[dtype]
-        var accum_c = device_ctx.compile_function[accum_k]()
-        device_ctx.enqueue_function(
-            accum_c,
-            scratch,
-            d_output_ptr,
-            rows,
-            oc,
-            row_tile,
-            grid_dim=(col_blocks, ROW_BLOCKS),
-            block_dim=(BLOCK_SIZE,),
-        )
-        comptime fin_k = _dbias_finalize_gpu[dtype, accumulate]
-        var fin_c = device_ctx.compile_function[fin_k]()
-        device_ctx.enqueue_function(
-            fin_c,
-            d_bias_ptr,
-            scratch,
-            oc,
-            ROW_BLOCKS,
-            grid_dim=(col_blocks,),
-            block_dim=(BLOCK_SIZE,),
-        )
+        comptime if HAS_CUBLAS:
+            # matmul_backward_bias_kernel9-style single launch: last row-block
+            # to finish a column-block finalizes in-kernel via a threadfence +
+            # atomic-counter "last block" flag. NVIDIA-only (threadfence is
+            # CUDA-only) — see `_dbias_fused_gpu`.
+            var counters = _dbias_counters(device_ctx)
+            comptime fused_k = _dbias_fused_gpu[dtype, accumulate]
+            var fused_c = device_ctx.compile_function[fused_k]()
+            device_ctx.enqueue_function(
+                fused_c,
+                d_bias_ptr,
+                scratch,
+                counters,
+                d_output_ptr,
+                rows,
+                oc,
+                row_tile,
+                ROW_BLOCKS,
+                grid_dim=(col_blocks, ROW_BLOCKS),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            # Portable (Apple Metal) path: two launches — contention-free
+            # per-row-block partials, then a separate finalize pass writes
+            # d_bias (and re-zeros the scratch for the next call).
+            comptime accum_k = _dbias_accum_gpu[dtype]
+            var accum_c = device_ctx.compile_function[accum_k]()
+            device_ctx.enqueue_function(
+                accum_c,
+                scratch,
+                d_output_ptr,
+                rows,
+                oc,
+                row_tile,
+                grid_dim=(col_blocks, ROW_BLOCKS),
+                block_dim=(BLOCK_SIZE,),
+            )
+            comptime fin_k = _dbias_finalize_gpu[dtype, accumulate]
+            var fin_c = device_ctx.compile_function[fin_k]()
+            device_ctx.enqueue_function(
+                fin_c,
+                d_bias_ptr,
+                scratch,
+                oc,
+                ROW_BLOCKS,
+                grid_dim=(col_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
     else:
         raise Error("Invalid target")
 
