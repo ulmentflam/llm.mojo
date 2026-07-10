@@ -36,7 +36,7 @@ from std.gpu.host import DeviceContext
 from llmm.memory import MutMemPtr
 from llmm.io import write_buffer
 
-from train_gpt2 import GPT2, Parameters
+from train_gpt2 import GPT2, Parameters, GPT2_DTYPE
 from test_gpt2 import read_to_dtype_pointer
 
 
@@ -114,8 +114,13 @@ def main() raises:
         makedirs(out_dir)
 
     var ctx = DeviceContext()
+    # Storage stays bf16 under fp8 (docs/ai/fp8_training_design.md §1.1), so
+    # LLMM_PRECISION=fp8/bf16 builds must load the bf16 checkpoint
+    # (EXPECTED_VERSION=5, train_gpt2.mojo); the plain fp32 build loads the
+    # fp32 one (matches test_gpt2.mojo's own "gpt2_124M.bin" convention).
+    comptime checkpoint = "gpt2_124M_bf16.bin" if GPT2_DTYPE == DType.bfloat16 else "gpt2_124M.bin"
     var model = GPT2["gpu", 1, False](
-        "gpt2_124M.bin",
+        checkpoint,
         rank=0,
         zero_stage=0,
         ctx=ctx,
