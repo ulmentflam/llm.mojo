@@ -2320,6 +2320,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             as_mut_kernel[GPT2_DTYPE](
                 self.grad_acts.residual_3 + last_layer * layer_stride
             ),
+            # No incoming residual gradient to seed here (ln_f receives only
+            # the LM-head matmul backward's d_output); HAS_RESID_IN defaults
+            # False, so this placeholder is never read.
+            as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
             Int64(batch_size),
             Int64(seq_len),
             Int64(channels),
@@ -2505,27 +2509,22 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # gradients to decay geometrically with depth (C1, July 2026).
             # See docs/ai/metal_port_gotchas_and_optimizations.md C1.
             #
-            # Seed the incoming residual-stream gradient before the fused ln_2
-            # backward. The forward op is residual_2 = block_input + attn_proj
+            # HAS_RESID_IN=True fuses that seed into the SAME kernel pass as
+            # the `+= LN2_dinp` accumulate (GPU: one launch instead of a
+            # separate `residual_grad_broadcast` kernel before this call;
+            # CPU: unchanged — see layernorm_fused_residual_bwd's CPU
+            # branch). The forward op is residual_2 = block_input + attn_proj
             # (then ln_2 = LN(residual_2)); its backward must produce
             # d_block_input = d_attn_proj = LN2_dinp + d_residual_2, where the
             # incoming d_residual_2 = dR (grad flowing back through the residual
             # stream). That incoming gradient is exactly what the MLP-proj
             # backward just consumed as d_output (d_l_fc_proj), since the next
-            # residual add is residual_3 = residual_2 + fc_proj. The fused kernel
-            # only does `+= LN2_dinp`, so we pre-add dR into both targets here;
-            # without this the residual identity skip is dropped and block
-            # gradients decay geometrically with depth.
-            residual_grad_broadcast[GPT2_DTYPE, Self.target](
-                as_mut_kernel[GPT2_DTYPE](d_block_input),
-                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
-                as_immut_kernel_from_mut[GPT2_DTYPE](d_l_fc_proj),
-                batch_size * seq_len * channels,
-                self.ctx,
-            )
-
-            # LayerNorm 2 fused residual backward.
-            layernorm_fused_residual_bwd[GPT2_DTYPE, Self.target](
+            # residual add is residual_3 = residual_2 + fc_proj. Without this
+            # seed the residual identity skip is dropped and block gradients
+            # decay geometrically with depth.
+            layernorm_fused_residual_bwd[
+                GPT2_DTYPE, Self.target, HAS_RESID_IN=True
+            ](
                 as_mut_kernel[GPT2_DTYPE](d_block_input),
                 as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
                 as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
@@ -2538,6 +2537,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_mut_kernel[GPT2_DTYPE](
                     self.grad_acts.residual_2 + layer_offset
                 ),
+                as_immut_kernel_from_mut[GPT2_DTYPE](d_l_fc_proj),
                 Int64(batch_size),
                 Int64(seq_len),
                 Int64(channels),
@@ -2658,19 +2658,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 # — the two forward inputs whose sum is this layer's block input
                 # (residual_3[L-1] = residual_2[L-1] + fc_proj[L-1]). The fused
                 # `+= LN1_dinp` then yields the full d_R_L split that becomes
-                # layer L-1's incoming residual gradient.
-                residual_grad_broadcast[GPT2_DTYPE, Self.target](
-                    as_mut_kernel[GPT2_DTYPE](
-                        self.grad_acts.residual_2 + prev_layer_offset
-                    ),
-                    as_mut_kernel[GPT2_DTYPE](
-                        self.grad_acts.fc_proj + prev_layer_offset
-                    ),
-                    as_immut_kernel_from_mut[GPT2_DTYPE](d_block_input),
-                    batch_size * seq_len * channels,
-                    self.ctx,
-                )
-                layernorm_fused_residual_bwd[GPT2_DTYPE, Self.target](
+                # layer L-1's incoming residual gradient. HAS_RESID_IN=True
+                # fuses this seed into the same kernel pass as the LN1
+                # input-gradient accumulate (see the ln_2 call site above for
+                # the full rationale).
+                layernorm_fused_residual_bwd[
+                    GPT2_DTYPE, Self.target, HAS_RESID_IN=True
+                ](
                     as_mut_kernel[GPT2_DTYPE](
                         self.grad_acts.residual_2 + prev_layer_offset
                     ),
@@ -2689,6 +2683,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     as_mut_kernel[GPT2_DTYPE](
                         self.grad_acts.residual_3 + prev_layer_offset
                     ),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](d_block_input),
                     Int64(batch_size),
                     Int64(seq_len),
                     Int64(channels),
