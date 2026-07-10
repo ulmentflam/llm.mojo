@@ -150,6 +150,86 @@ layout scheme itself was right.
 **Source:** `tests/probe_fp4/RESULTS.md` (goal3/fp4-research branch), "Numeric check" and
 first-pass-version note.
 
+### C4 — cuBLASLt's VEC16_UE4M3 scale mode is single-level; NVFP4's two-level scale needs a
+post-GEMM correction the vendor call does NOT apply for you
+
+**Finding:** `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3` only consumes the e4m3 CODE from the
+scale-pointer buffer and applies `decode_e4m3(code)` per 16-element block *inside* the GEMM —
+it has **no notion of a second, per-tensor fp32 multiplier**. NVIDIA's own NVFP4 recipe (and
+`llmm/nvfp4_quant.mojo`'s `nvfp4_quantize`) is a genuinely two-level scheme
+(`original ≈ e2m1_value * decode_e4m3(block_code) * tensor_scale`, so the block scale is
+*already* pre-divided by `tensor_scale` before being narrowed to e4m3 — see `nvfp4_quant.mojo`'s
+module docstring). Feed that scale buffer straight to `A/B_SCALE_POINTER` and cuBLASLt's raw
+output is `D_true / (tensor_scale_A * tensor_scale_B)`, not `D_true`.
+
+**Symptom:** A first-pass FP4 GEMM (this chunk) that omitted the correction produced rel-L2 in
+the 1e2–1e13 range (not a modest error — `tensor_scale` for gaussian data is a small fraction,
+so `1/tensor_scale` blows the result up by orders of magnitude) while a same-harness bf16
+control arm through the *identical* cuBLASLt call path landed fine (~0.0017 rel-L2) — proof the
+bug was in the FP4-specific scale handling, not the GEMM dispatch/layout/readback (that class of
+bug is C3's "always run a control arm" lesson, generalized: a broken harness makes *both* arms
+wrong identically; a broken FP4-specific step makes only the FP4 arm wrong while the control
+stays correct).
+
+**Fix:** Apply a small elementwise post-GEMM kernel multiplying the raw `bf16` D buffer by
+`tensor_scale_A * tensor_scale_B` (both are device-resident fp32 scalars, no host readback
+needed — matches the codebase's existing "no host sync for scale state" principle). See
+`llmm/matmul.mojo`'s `_nvfp4_post_scale_gpu`/`lowp_gemm_fp4`.
+
+**Caveat this introduces:** the post-scale multiplies the *entire* `D` buffer, so it is only
+correct when the GEMM wrote a fresh `D` (`beta=0`). A `beta=1` accumulate (needed for Wgrad
+grad-accumulation across micro-steps) would incorrectly rescale the pre-existing accumulated
+value too. `lowp_gemm_fp4` currently raises rather than silently mis-accumulate; supporting
+`accumulate=True` correctly needs an extra raw-output scratch buffer (post-scale-then-add
+instead of post-scale-in-place) — deferred to whichever chunk actually wires Wgrad
+accumulation.
+
+**Source:** `tests/test_lowp_gemm_fp4.mojo` (goal3b/fp4-training branch, FP4-GEMM chunk),
+gaussian-512/MLP-shape test cases; `llmm/matmul.mojo`'s `_nvfp4_post_scale_gpu` module comment.
+
+### C5 — NVFP4 "2D 16x16" weight block scaling is a *shared value*, not a *shrunk buffer*
+
+**Finding:** cuBLASLt's block-scale layout is inherently one e4m3 scale per **physical row**
+per 16-element K-block ("the scaling factor is stored for each 16-element block in the
+innermost dimension of the corresponding data tensor" — `cublasLtMatmulMatrixScale_t`
+docstring). There is no native cuBLASLt concept of a physically-compressed `rows/16`-row scale
+tensor. The recipe's "2D 16x16" weight scaling (one shared scale per 16-row × 16-column tile,
+so the same weight quantizes identically read row-major in Fprop or column-major in Dgrad) has
+to be realized as: compute one e4m3 value per 16×16 tile, then **replicate that same code
+across all 16 physical scale-buffer rows the tile covers** — the buffer's row extent must
+always equal the data tensor's actual row count, never `rows/16`.
+
+**Symptom:** An earlier version of `llmm/nvfp4_quant.mojo`'s `nvfp4_scale_buffer_size`/
+`_nvfp4_quantize_gpu` sized/wrote the 2D-scaled (`BLOCK_ROWS=16`) scale buffer at `rows/16`
+physical rows — self-consistent with (and therefore invisible to) its own
+`nvfp4_dequant_reference`, since both sides of that pure-software round-trip agreed on the same
+(wrong) convention. It only surfaced once the buffer was fed to the *real* cuBLASLt GEMM (which
+reads swizzle offsets assuming the full `rows` row count from the operand's own matrix layout,
+not from anything `nvfp4_quantize` told it): cuBLASLt read past the undersized buffer for
+weight rows beyond the first `rows/16` and returned `NaN`s for the affected output elements
+(GPT-2 MLP-shape test, `b_block_rows=16`, N=3072 → NaN at the 214th weight row; N=768 → NaN at
+row 48). A pure quantize→dequant roundtrip test (`tests/test_nvfp4_quant.mojo`) could not have
+caught this class of bug — it exercises the same (buggy) convention on both ends of the
+comparison and can never disagree with itself.
+
+**Lesson (generalizes C3's control-arm lesson):** a self-consistent software round-trip only
+proves the quantize/dequant pair agree with *each other*; it proves nothing about whether they
+agree with the actual consuming hardware API's own layout contract. Only feeding the real
+buffer to the real vendor call (or a byte-for-byte contract test against the vendor's
+documented layout) exercises that.
+
+**Fix:** `nvfp4_scale_buffer_size(rows, k, BLOCK_ROWS)` now always sizes for `rows` physical
+rows regardless of `BLOCK_ROWS`; `_nvfp4_quantize_gpu` computes one scale value per
+`BLOCK_ROWS`-row tile as before but writes it to all `BLOCK_ROWS` physical row offsets;
+`nvfp4_dequant_reference` reads from a tile's first physical row (all rows in the tile carry
+the same code). `BLOCK_ROWS=1` (activations/gradients) is numerically a no-op change (a
+1-row "tile" already behaved this way).
+
+**Source:** `tests/test_lowp_gemm_fp4.mojo` (goal3b/fp4-training branch, FP4-GEMM chunk),
+`test_fp4_gemm_mlp_fc_up_shape`/`test_fp4_gemm_mlp_fc_down_shape`; fix in
+`llmm/nvfp4_quant.mojo`'s `nvfp4_scale_buffer_size`/`_nvfp4_quantize_gpu`/
+`nvfp4_dequant_reference`.
+
 ---
 
 ## TF32 / fp32 (goal1/fp32-parity branch)
@@ -297,7 +377,7 @@ Coordinator merges to goal2/fp8-training when chunks complete.
 | Section | Items | Status |
 |---------|-------|--------|
 | TOOLCHAIN | T1–T5 | Verified (T1–T2: Probes 1–5; T3–T5: observed) |
-| cuBLASLt | C1–C3 | Verified (C1: Probe 4; C2–C3: Probe FP4) |
+| cuBLASLt | C1–C5 | Verified (C1: Probe 4; C2–C3: Probe FP4; C4–C5: FP4-GEMM chunk, tests/test_lowp_gemm_fp4.mojo) |
 | TF32/fp32 | TF1–TF3 | Verified (TF1–TF2: goal1 branch; TF3: GB10 incidents) |
 | ARCHITECTURE | A1–A3 | A1–A2: design doc confirmed; A3: agent-reported |
 

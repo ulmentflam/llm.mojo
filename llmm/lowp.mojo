@@ -98,6 +98,56 @@ comptime FP8_SPEC = PrecisionSpec(
     False,
 )
 
+# NVFP4 (docs/ai/fp4_training_recipes_research.md §1): e2m1 data for BOTH
+# forward and backward-gradient operands (unlike fp8's asymmetric e4m3/e5m2
+# split — NVFP4 uses one element format everywhere), e4m3 per-block scale
+# (`scale_dtype`), `Block1D` (1x16) as the *default* granularity — activations
+# and gradients use 1x16 blocks; the weight path additionally uses `Block2D`
+# (16x16, `ScalingKind.Block2D`) at specific call sites, selected by the
+# caller (`llmm/nvfp4_quant.mojo`'s `nvfp4_quantize[..., BLOCK_ROWS=16]`), not
+# by a second spec constant — `block=16` here describes the along-K block
+# extent, which is identical (16) for both granularities; only the row extent
+# (`BLOCK_ROWS`, a `nvfp4_quantize` template parameter, not a `PrecisionSpec`
+# field) differs.
+#
+# `amax_history_len=0`, `margin=0`: deliberately inert, NOT a stub-pending
+# value. NVFP4 quantization computes its two-level scale (fp32 per-tensor +
+# e4m3 per-block) FRESH every `nvfp4_quantize` call, entirely device-resident
+# (`nvfp4_compute_tensor_scale` inside `llmm/nvfp4_quant.mojo`) — there is no
+# delayed/history-based scaling step for FP4 to configure (unlike fp8's
+# `PerTensor` scaling, which amortizes an amax reduction across
+# `amax_history_len` steps precisely because its single per-tensor scale is
+# coarse and benefits from temporal smoothing). NVFP4's 16-element block
+# scale already adapts *within* a tensor, so the coarser tensor-level scale
+# does not need delayed smoothing to stay accurate — see the `AmaxState`
+# Block1D/Block2D seam note in `llmm/amax.mojo` for the full reconciliation
+# (decision: FP4 does not use `AmaxState` at all; both scale levels are
+# computed in-kernel by `nvfp4_quantize`).
+#
+# `stochastic_rounding=True`/`hadamard=True`: precision-level markers ("this
+# regime uses these techniques"), not a blanket per-operand switch the way
+# fp8's `quantize`/`quantize_transpose` read `spec.stochastic_rounding`
+# uniformly for every operand. The recipe requires SR only on *gradient*
+# operands (weights/activations stay RNE) and RHT only on *Wgrad* operands
+# (`llmm/hadamard.mojo`) — that per-operand-role selection is a call-site
+# decision for the training-integration chunk that wires
+# `llmm/nvfp4_quant.mojo`'s `round_mode`/`ROUND_MODE_STOCHASTIC` template
+# parameter and `llmm/hadamard.mojo`'s `hadamard16_fwd_gpu` per GEMM operand,
+# not something `FP4_SPEC` itself can express with a single struct-wide bool
+# (nor should it: `PrecisionSpec` is one value per precision, not per
+# operand-role).
+comptime FP4_SPEC = PrecisionSpec(
+    DType.float4_e2m1fn,
+    DType.float4_e2m1fn,
+    DType.float8_e4m3fn,
+    ScalingKind.Block1D,
+    16,
+    0,
+    0,
+    True,
+    True,
+)
+
 # fp32/bf16 have no low-precision GEMM transient, so their "spec" is an inert
 # placeholder: never read because call sites gate on `LOWP_ENABLED` (only True
 # for fp8/fp4) before consulting `SPEC`. Kept dtype-valid (not zero-initialized
@@ -516,21 +566,28 @@ def quantize_transpose[
 
 def precision_spec[name: StaticString]() -> PrecisionSpec:
     """Resolve a `LLMM_PRECISION` name ("fp32" | "bf16" | "fp8" | "fp4") to its
-    `PrecisionSpec`. "fp8" -> `FP8_SPEC`; "fp32"/"bf16" -> an inert placeholder
-    (never consulted — see `_INERT_SPEC`). "fp4" is a documented extension seam
-    (docs/ai/fp8_training_design.md §3) not yet implemented; using it is a clear
-    comptime error rather than a silently-wrong spec.
+    `PrecisionSpec`. "fp8" -> `FP8_SPEC`; "fp4" -> `FP4_SPEC`; "fp32"/"bf16" ->
+    an inert placeholder (never consulted — see `_INERT_SPEC`).
+
+    "fp4" resolving to a real spec (rather than a comptime error) means
+    `-D LLMM_PRECISION=fp4` now compiles past `train_gpt2.mojo`'s unconditional
+    `comptime SPEC = precision_spec[PRECISION]()` — but that is *only* this
+    one seam closing, not a functional fp4 trainer: no GEMM call site in
+    `train_gpt2.mojo` reads `SPEC`/dispatches to `lowp_gemm_fp4`
+    (`llmm/matmul.mojo`) yet, and `LLMM_PRECISION=fp4` is not one of this
+    repo's gated build targets (`build`/`build-bf16`/`build-fp8`). Wiring the
+    actual training-loop GEMM/quantize call sites to `FP4_SPEC` is the next
+    chunk's job (same shape as fp8's Chunk A -> Chunks D/E progression: the
+    flag existing and resolving to a real spec precedes the GEMM wiring, it
+    does not imply it).
     """
 
     comptime if name == "fp8":
         return FP8_SPEC
+    elif name == "fp4":
+        return FP4_SPEC
     elif name == "fp32" or name == "bf16":
         return _INERT_SPEC
-    elif name == "fp4":
-        comptime assert False, (
-            "LLMM_PRECISION=fp4 is a documented extension seam"
-            " (docs/ai/fp8_training_design.md §3) not yet implemented"
-        )
     else:
         comptime assert (
             False

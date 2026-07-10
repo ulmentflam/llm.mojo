@@ -45,6 +45,7 @@ from _cublas.cublaslt import (
     Preference,
     cublasLtMatmulHeuristicResult_t,
     cublasLtMatmulAlgoGetHeuristic,
+    cublasLtMatmulMatrixScale_t,
 )
 from linalg.matmul.vendor.blas import _get_global_handle, Backend
 
@@ -53,6 +54,12 @@ from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 from llmm.vendor import HAS_CUBLAS, HAS_METAL
 from llmm.lowp import PrecisionSpec, FP8_SPEC, quantize, quantize_transpose
+from llmm.nvfp4_quant import (
+    nvfp4_quantize,
+    ROUND_MODE_RNE,
+    NVFP4_SR_SEED,
+    NVFP4_SR_STREAM,
+)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -161,6 +168,17 @@ def _lt_dt[dtype: DType]() -> DataType:
         return DataType.R_8F_E4M3
     elif dtype == DType.float8_e5m2:
         return DataType.R_8F_E5M2
+    elif dtype == DType.float4_e2m1fn:
+        # NVFP4 data operand (tests/probe_fp4/RESULTS.md, DISPATCHES on this
+        # GB10/sm_121 box). Confirmed present in the vendored
+        # `_cublas.dtype.DataType` enum at `R_4F_E2M1 = Self(33)`
+        # (max/kernels/src/_cublas/dtype.mojo) — same enum value the probe's
+        # C++ `CUDA_R_4F_E2M1` resolves to (`cuda_bf16.h`/`library_types.h`
+        # numbering is vendor-fixed, not toolchain-specific). Packed 2
+        # elements/byte; the *element* count (not byte count) is what
+        # `cublasLtMatrixLayoutCreate`'s rows/cols/ld expect for this dtype —
+        # see `_matmul_cublaslt_fp4`.
+        return DataType.R_4F_E2M1
     else:
         return DataType.R_16F
 
@@ -861,6 +879,519 @@ def lowp_gemm[
         n,
         k,
         accumulate,
+        ctx,
+    )
+
+
+# ===----------------------------------------------------------------------=== #
+# FP4 (NVFP4) GEMM — cuBLASLt native e2m1 x e2m1 -> bf16, block-scaled, TN-only.
+#
+# Validated end-to-end by tests/probe_fp4/probe_fp4.cu (see
+# tests/probe_fp4/RESULTS.md): `CUDA_R_4F_E2M1` A/B operands,
+# `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3` block-scale mode on both
+# operands, `A/B_SCALE_POINTER` set to swizzled (cuBLAS 128x4-tile/32x4x4)
+# e4m3 scale buffers, `bf16` D, `fp32` compute — `CUBLAS_STATUS_SUCCESS`
+# end-to-end on this GB10 (sm_121), dispatching the real
+# `cutlass3x_sm120_bstensorop_..._ue4m3xe2m1_..._vs16` tensor-core kernel
+# (confirmed via `nsys profile` in the probe), rel L2 = 0.1445 vs an fp32
+# reference at M=N=K=512 (matching the probe's own pure-software dequant
+# reference to 4 decimal places).
+#
+# This is a direct Mojo port of that probe's cuBLASLt call sequence — same
+# enums/attributes, same TN/K-major-operand/col-major-D layout convention as
+# `_matmul_cublaslt`/`_matmul_cublaslt_fp8` above (op(A)=T reads A's physical
+# [K,M] col-major buffer, which is byte-identical to a [M,K] row-major
+# buffer with K as the trailing/contiguous axis — the same "free" TN duality
+# `_matmul_cublaslt_fp8`'s module comment derives for fp8; it holds
+# identically here since NVFP4 packing preserves element order along K).
+#
+# Scope note: unlike `_matmul_cublaslt_fp8`, this raw GEMM (and
+# `lowp_gemm_fp4` below) does not expose `transpose_a`/`transpose_b` —
+# `llmm/nvfp4_quant.mojo`'s `nvfp4_quantize` has no fused transpose+quantize
+# counterpart to `llmm/lowp.mojo`'s `quantize_transpose` (out of this
+# chunk's file-ownership scope), and the forward orientation (both operands'
+# natural row-major storage already has the contraction dim `C` trailing —
+# weight`[OC,C]`, input`[rows,C]`) is TN-native with no transpose needed
+# anyway, exactly like fp8's forward case. Dgrad/Wgrad orientations (which
+# fp8 handles via `quantize_transpose`) are deferred to the training-
+# integration chunk: per the recipe, weights use 2D 16x16 block scaling
+# specifically so the *same* quantized buffer can serve both Fprop
+# (row-major read) and Dgrad (column-major read) without requantizing —
+# that reuse is a genuine per-role integration decision belonging to
+# `train_gpt2.mojo`'s wiring, not machinery this GEMM-layer chunk should
+# pre-build and leave untested.
+# ===----------------------------------------------------------------------=== #
+
+comptime _NVFP4_LT_SCALE_MODE = (
+    cublasLtMatmulMatrixScale_t.MATRIX_SCALE_VEC16_UE4M3
+)
+
+
+def _matmul_cublaslt_fp4[
+    out_dtype: DType,
+](
+    d_ptr: MutKernelPtr[out_dtype],
+    # packed e2m1, [k,m] col-major, ld=k elements (== k/2 bytes).
+    a_ptr: ImmutKernelPtr[DType.uint8],
+    # packed e2m1, [k,n] col-major, ld=k elements (== k/2 bytes).
+    b_ptr: ImmutKernelPtr[DType.uint8],
+    a_scale_ptr: ImmutKernelPtr[DType.uint8],  # swizzled e4m3 block scales
+    b_scale_ptr: ImmutKernelPtr[DType.uint8],  # swizzled e4m3 block scales
+    m: Int,
+    n: Int,
+    k: Int,
+    accumulate: Bool,
+    ctx: DeviceContext,
+) raises -> None:
+    """Raw cuBLASLt NVFP4 GEMM: `D[m,n] = op(A)*op(B)` (fp32 compute, bf16
+    `D`), TN-only (`transA=CUBLAS_OP_T`, `transB=CUBLAS_OP_N`, matching
+    `_matmul_cublaslt_fp4`'s probe origin and `_matmul_cublaslt_fp8`'s
+    convention). `a_ptr`/`b_ptr` are already packed e2m1 bytes (2
+    elements/byte) and `a_scale_ptr`/`b_scale_ptr` are already
+    cuBLAS-swizzled e4m3 block-scale buffers (`llmm/nvfp4_quant.mojo`'s
+    `nvfp4_quantize` output layout) — this function does no quantization;
+    see `lowp_gemm_fp4` for that. `k` must be a multiple of 16 (NVFP4 block
+    size; unchecked here, `nvfp4_quantize` enforces it upstream).
+
+    `m`/`n`/`k` are *element* counts of the logical (unpacked) e2m1 tensors —
+    `cublasLtMatrixLayoutCreate`'s rows/cols/ld for `CUDA_R_4F_E2M1` are in
+    element units even though the physical buffer is 2 elements/byte (matches
+    tests/probe_fp4/probe_fp4.cu's `cublasLtMatrixLayoutCreate(&Adesc,
+    CUDA_R_4F_E2M1, K, M, K)`).
+    """
+    var handle = _get_global_handle[DType.uint8, Backend.CUBLASLT](ctx)
+    var lt = handle._get_cublas()
+    var cuda_stream = CUDA(ctx.stream())
+    comptime dt_ab = _lt_dt[DType.float4_e2m1fn]()
+    comptime dt_out = _lt_dt[out_dtype]()
+
+    var desc = cublasLtMatmulDesc_t()
+    check_cublas_error(
+        cublasLtMatmulDescCreate(
+            UnsafePointer(to=desc).as_unsafe_any_origin(),
+            ComputeType.COMPUTE_32F,
+            DataType.R_32F,
+        )
+    )
+    _lt_set_op(
+        desc, cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_TRANSA, True
+    )
+    _lt_set_op(
+        desc, cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_TRANSB, False
+    )
+
+    var scale_mode = _NVFP4_LT_SCALE_MODE
+    check_cublas_error(
+        cublasLtMatmulDescSetAttribute(
+            desc,
+            cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+            UnsafePointer(to=scale_mode)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[cublasLtMatmulMatrixScale_t](),
+        )
+    )
+    check_cublas_error(
+        cublasLtMatmulDescSetAttribute(
+            desc,
+            cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+            UnsafePointer(to=scale_mode)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[cublasLtMatmulMatrixScale_t](),
+        )
+    )
+
+    var a_sp = a_scale_ptr
+    check_cublas_error(
+        cublasLtMatmulDescSetAttribute(
+            desc,
+            cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            UnsafePointer(to=a_sp)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[ImmutKernelPtr[DType.uint8]](),
+        )
+    )
+    var b_sp = b_scale_ptr
+    check_cublas_error(
+        cublasLtMatmulDescSetAttribute(
+            desc,
+            cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            UnsafePointer(to=b_sp)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[ImmutKernelPtr[DType.uint8]](),
+        )
+    )
+
+    var a_l = cublasLtMatrixLayout_t()
+    check_cublas_error(
+        cublasLtMatrixLayoutCreate(
+            UnsafePointer(to=a_l).as_unsafe_any_origin(),
+            dt_ab,
+            UInt64(k),
+            UInt64(m),
+            Int64(k),
+        )
+    )
+    var b_l = cublasLtMatrixLayout_t()
+    check_cublas_error(
+        cublasLtMatrixLayoutCreate(
+            UnsafePointer(to=b_l).as_unsafe_any_origin(),
+            dt_ab,
+            UInt64(k),
+            UInt64(n),
+            Int64(k),
+        )
+    )
+    var c_l = cublasLtMatrixLayout_t()
+    check_cublas_error(
+        cublasLtMatrixLayoutCreate(
+            UnsafePointer(to=c_l).as_unsafe_any_origin(),
+            dt_out,
+            UInt64(m),
+            UInt64(n),
+            Int64(m),
+        )
+    )
+    var d_l = cublasLtMatrixLayout_t()
+    check_cublas_error(
+        cublasLtMatrixLayoutCreate(
+            UnsafePointer(to=d_l).as_unsafe_any_origin(),
+            dt_out,
+            UInt64(m),
+            UInt64(n),
+            Int64(m),
+        )
+    )
+
+    var pref = cublasLtMatmulPreference_t()
+    check_cublas_error(
+        cublasLtMatmulPreferenceCreate(
+            UnsafePointer(to=pref).as_unsafe_any_origin()
+        )
+    )
+    var ws_size = _CUBLASLT_WS_BYTES
+    check_cublas_error(
+        cublasLtMatmulPreferenceSetAttribute(
+            pref,
+            Preference.MAX_WORKSPACE_BYTES,
+            UnsafePointer(to=ws_size)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[Int](),
+        )
+    )
+
+    var heur = cublasLtMatmulHeuristicResult_t()
+    var cnt = 0
+    check_cublas_error(
+        cublasLtMatmulAlgoGetHeuristic(
+            lt,
+            desc,
+            a_l,
+            b_l,
+            c_l,
+            d_l,
+            pref,
+            1,
+            UnsafePointer(to=heur).as_unsafe_any_origin(),
+            UnsafePointer(to=cnt).as_unsafe_any_origin(),
+        )
+    )
+    if cnt == 0:
+        raise Error(
+            "no cuBLASLt algorithm for the NVFP4 TN GEMM (m="
+            + String(m)
+            + " n="
+            + String(n)
+            + " k="
+            + String(k)
+            + ") -- tests/probe_fp4/RESULTS.md's 512^3 probe found 4 viable"
+            " algorithms on this box, so a shape returning zero here is"
+            " likely too small/misaligned for the vs16 block-scaled kernel"
+            " (k must be a multiple of 16)"
+        )
+
+    var ws = _cublaslt_workspace(ctx)
+    var alpha = Float32(1.0)
+    var beta = Float32(1.0) if accumulate else Float32(0.0)
+    check_cublas_error(
+        cublasLtMatmul(
+            lt,
+            desc,
+            UnsafePointer(to=alpha)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            a_l,
+            b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            b_l,
+            UnsafePointer(to=beta)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            c_l,
+            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            d_l,
+            UnsafePointer(to=heur.algo).as_immutable().as_unsafe_any_origin(),
+            ws,
+            _CUBLASLT_WS_BYTES,
+            cuda_stream.value()[],
+        )
+    )
+
+    check_cublas_error(cublasLtMatmulPreferenceDestroy(pref))
+    check_cublas_error(cublasLtMatmulDescDestroy(desc))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(a_l))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(b_l))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(c_l))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(d_l))
+
+
+# ===----------------------------------------------------------------------=== #
+# Per-tensor-scale correction — the two-level-scaling gap `_matmul_cublaslt_fp4`
+# alone cannot close.
+#
+# `llmm/nvfp4_quant.mojo`'s NVFP4 scheme is TWO-level:
+# `original_value ~= e2m1_value * decode_e4m3(block_code) * tensor_scale`
+# (module docstring there: `block_scale_raw = (amax/6)/tensor_scale`, and the
+# data is divided by `decode_e4m3(block_code) * tensor_scale` at quantize
+# time). cuBLASLt's `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3` mode only
+# consumes the e4m3 CODE from the swizzled scale buffer and applies
+# `decode_e4m3(block_code)` internally per 16-element block — it has no
+# notion of a second, per-tensor fp32 multiplier layered on top (unlike
+# fp8's `A/B_SCALE_POINTER`, which IS the complete, single-level dequant
+# factor cuBLASLt applies). So `_matmul_cublaslt_fp4`'s raw output is
+# `D_true / (tensor_scale_A * tensor_scale_B)`, not `D_true` — confirmed
+# empirically (an earlier version of this file's `lowp_gemm_fp4` omitted
+# this correction and `tests/test_lowp_gemm_fp4.mojo`'s gaussian-512 case
+# came back with rel_l2 in the 1e5 range instead of ~0.15, while its
+# same-harness bf16-control arm was fine at ~0.0017 — isolating the bug to
+# exactly this missing factor, not the quantize kernels or GEMM dispatch).
+# `lowp_gemm_fp4` closes this gap with one small elementwise kernel after
+# the raw GEMM (both `tensor_scale` values stay device-resident throughout,
+# consistent with this codebase's "no host readback in the normal path"
+# design principle for scale state — see `llmm/amax.mojo`'s `AmaxState`
+# docstring for the fp8 analogue of that principle).
+# ===----------------------------------------------------------------------=== #
+
+
+def _nvfp4_post_scale_gpu[
+    out_dtype: DType,
+](
+    d_ptr: MutKernelPtr[out_dtype],
+    a_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
+    b_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
+    n: Int,
+) -> None:
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if idx < n:
+        var s = a_tensor_scale_ptr[0] * b_tensor_scale_ptr[0]
+        var v = d_ptr[idx].cast[DType.float32]() * s
+        d_ptr[idx] = v.cast[out_dtype]()
+
+
+def _nvfp4_post_scale[
+    out_dtype: DType,
+    target: StaticString,
+](
+    d_ptr: MutKernelPtr[out_dtype],
+    a_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
+    b_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
+    n: Int,
+    ctx: DeviceContext,
+) raises -> None:
+    comptime assert is_gpu[target](), "_nvfp4_post_scale is GPU-only"
+    comptime BLOCK_SIZE = 256
+    var num_blocks = ceildiv(n, BLOCK_SIZE)
+    comptime kernel = _nvfp4_post_scale_gpu[out_dtype]
+    var compiled = ctx.compile_function[kernel]()
+    ctx.enqueue_function(
+        compiled,
+        d_ptr,
+        a_tensor_scale_ptr,
+        b_tensor_scale_ptr,
+        n,
+        grid_dim=(num_blocks,),
+        block_dim=(BLOCK_SIZE,),
+    )
+
+
+def lowp_gemm_fp4[
+    in_dtype: DType,
+    out_dtype: DType,
+    target: StaticString,
+    a_block_rows: Int = 1,
+    b_block_rows: Int = 1,
+    round_mode: Int = ROUND_MODE_RNE,
+](
+    d_ptr: MutKernelPtr[out_dtype],
+    a_ptr: ImmutKernelPtr[in_dtype],  # [m, k] row-major, bf16 or fp32
+    b_ptr: ImmutKernelPtr[in_dtype],  # [n, k] row-major, bf16 or fp32
+    a_q_scratch: MutKernelPtr[DType.uint8],  # >= nvfp4_packed_size(m, k)
+    a_scale_scratch: MutKernelPtr[
+        DType.uint8
+    ],  # >= nvfp4_scale_buffer_size(m, k, a_block_rows)
+    a_tensor_scale_scratch: MutKernelPtr[DType.float32],  # 1 element
+    b_q_scratch: MutKernelPtr[DType.uint8],  # >= nvfp4_packed_size(n, k)
+    b_scale_scratch: MutKernelPtr[
+        DType.uint8
+    ],  # >= nvfp4_scale_buffer_size(n, k, b_block_rows)
+    b_tensor_scale_scratch: MutKernelPtr[DType.float32],  # 1 element
+    m: Int,
+    n: Int,
+    k: Int,
+    accumulate: Bool,
+    ctx: DeviceContext,
+    sr_seed: UInt64 = NVFP4_SR_SEED,
+    sr_step: Int = 0,
+) raises -> None:
+    """The dtype-generic NVFP4 GEMM entry point — the FP4 analogue of
+    `lowp_gemm` (fp8, above): quantizes `a_ptr`/`b_ptr` (bf16 or fp32, both
+    forward-orientation `[rows, k]` row-major — `a_ptr` is the `[m,k]`
+    "input"-role operand, `b_ptr` the `[n,k]` "weight"-role operand, e.g.
+    weight `[OC,C]`) into NVFP4 (packed e2m1 + swizzled e4m3 block scales +
+    fresh fp32 tensor scale) via `llmm/nvfp4_quant.mojo`'s `nvfp4_quantize`,
+    then runs `_matmul_cublaslt_fp4`, producing bf16 `d_ptr`.
+
+    `a_block_rows`/`b_block_rows` select `nvfp4_quantize`'s `BLOCK_ROWS`
+    granularity per operand independently (1 -> 1D 1x16, the recipe's
+    default for activations/gradients; 16 -> 2D 16x16, for weights) — pass
+    `b_block_rows=16` when `b_ptr` is a weight operand.
+
+    `round_mode` (default `ROUND_MODE_RNE`) selects RNE vs
+    `ROUND_MODE_STOCHASTIC` for BOTH operands' narrowing cast; per the
+    recipe SR belongs on gradient operands only, so a call site quantizing a
+    weight or activation should leave this at the default. `sr_seed`/
+    `sr_step` are forwarded to both `nvfp4_quantize` calls (module docstring
+    there); A and B are kept on separate RNG substreams internally
+    (`NVFP4_SR_STREAM`/`NVFP4_SR_STREAM + 1`) so their dither never collides
+    even when both operands happen to use SR.
+
+    Forward-orientation only (no `transpose_a`/`transpose_b`) — see the
+    module comment above `_matmul_cublaslt_fp4` for the scope rationale.
+    `m`/`n`/`k` follow this file's existing column-major-`D` convention,
+    identical to `lowp_gemm`'s.
+    """
+    comptime assert is_gpu[target](), (
+        "lowp_gemm_fp4 is GPU-only per docs/ai/fp8_training_design.md"
+        " landmine #1"
+    )
+    comptime assert HAS_CUBLAS, (
+        "lowp_gemm_fp4's only implemented vendor body is cuBLASLt NVFP4"
+        " (tests/probe_fp4/RESULTS.md)"
+    )
+
+    nvfp4_quantize[in_dtype, target, a_block_rows, round_mode](
+        a_q_scratch,
+        a_scale_scratch,
+        a_tensor_scale_scratch,
+        a_ptr,
+        m,
+        k,
+        ctx,
+        sr_seed,
+        NVFP4_SR_STREAM,
+        sr_step,
+    )
+    nvfp4_quantize[in_dtype, target, b_block_rows, round_mode](
+        b_q_scratch,
+        b_scale_scratch,
+        b_tensor_scale_scratch,
+        b_ptr,
+        n,
+        k,
+        ctx,
+        sr_seed,
+        NVFP4_SR_STREAM + 1,
+        sr_step,
+    )
+
+    if accumulate:
+        # See the module comment above `_nvfp4_post_scale_gpu`: the
+        # per-tensor-scale correction below must overwrite `d_ptr` (it
+        # multiplies whatever is already there by `tensor_scale_A *
+        # tensor_scale_B`), so a cuBLASLt-level beta=1 accumulate would
+        # silently rescale the PRE-EXISTING accumulated value too, not just
+        # this call's fresh contribution -- wrong. Correctly supporting
+        # accumulate needs an extra raw-output scratch buffer (post-scale
+        # INTO `d_ptr` via an add, not an overwrite) that no test/call site
+        # in this chunk needs yet (the Wgrad grad-accumulation use case is
+        # the training-integration chunk's job) — raise rather than
+        # silently produce a wrong accumulated value.
+        raise Error(
+            "lowp_gemm_fp4: accumulate=True is not yet supported (the"
+            " two-level-scale post-correction is only correct for a fresh"
+            " D buffer, beta=0) -- see the comment above"
+            " _nvfp4_post_scale_gpu in llmm/matmul.mojo"
+        )
+
+    _matmul_cublaslt_fp4[out_dtype](
+        d_ptr,
+        a_q_scratch.as_immutable(),
+        b_q_scratch.as_immutable(),
+        a_scale_scratch.as_immutable(),
+        b_scale_scratch.as_immutable(),
+        m,
+        n,
+        k,
+        False,
+        ctx,
+    )
+
+    _nvfp4_post_scale[out_dtype, target](
+        d_ptr,
+        a_tensor_scale_scratch.as_immutable(),
+        b_tensor_scale_scratch.as_immutable(),
+        m * n,
+        ctx,
+    )
+
+
+def bf16_control_gemm[
+    target: StaticString,
+](
+    d_ptr: MutKernelPtr[DType.bfloat16],
+    a_ptr: ImmutKernelPtr[DType.bfloat16],
+    b_ptr: ImmutKernelPtr[DType.bfloat16],
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> None:
+    """Plain bf16 TN GEMM (`transA=True`, `transB=False`, no bias/gelu/
+    accumulate) through the SAME `_matmul_cublaslt` vendor call and
+    TN/col-major-`D` layout convention `_matmul_cublaslt_fp4` uses. Exists
+    purely so `tests/test_lowp_gemm_fp4.mojo` can run a same-layout bf16
+    control arm through the identical cuBLASLt call path + `D` readback
+    convention: tests/probe_fp4/RESULTS.md's own methodology found (and
+    fixed) a comparison-harness bug this way — an initial version's D
+    readback bug produced a spurious ~1.4 rel-L2 on *both* the FP4 and a bf16
+    control run identically, which is what revealed it was a harness bug and
+    not a kernel/numerics bug. Running an equivalent bf16 GEMM through this
+    exact code path (not just a host fp32 reference) is that same check.
+    """
+    comptime assert is_gpu[target](), "bf16_control_gemm is GPU-only"
+    _matmul_cublaslt[DType.bfloat16, True, False](
+        d_ptr,
+        a_ptr,
+        b_ptr,
+        a_ptr,  # bias_ptr placeholder — unused (epilogue has no BIAS bit)
+        d_ptr,  # aux_ptr placeholder — unused (epilogue has no AUX bit)
+        m,
+        n,
+        k,
+        Int32(1),  # epilogue = DEFAULT
+        False,
         ctx,
     )
 

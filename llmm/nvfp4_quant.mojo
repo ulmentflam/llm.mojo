@@ -46,14 +46,34 @@ arithmetic and `bitcast` (a same-bit-width *reinterpret*, not a narrowing
 `encode_e2m1`/`encode_e4m3` implement round-to-nearest (ties-away-from-zero,
 matching `roundf()`/the probe's nearest-candidate search — see their
 docstrings for the exact tie-breaking rule). This is the `ROUND_MODE_RNE`
-path. `ROUND_MODE_STOCHASTIC` is a **declared seam, not implemented**: the
-recipe (`fp4_training_recipes_research.md` §1) requires stochastic rounding
-on *gradient* operands, which needs a counter-based device RNG that does not
-exist yet in this tree (`llmm/rand.mojo` is host-only MT19937). That RNG is
-explicitly the FP8 team's Chunk G
-(`../llmm-goal2-fp8/docs/ai/fp8_training_design.md` §6) — wiring stochastic
-rounding here is intentionally left as a `comptime assert`-guarded TODO
-rather than building a parallel/conflicting RNG.
+path.
+
+`ROUND_MODE_STOCHASTIC` (`encode_e2m1` only — `encode_e4m3` block scales stay
+RNE always, per the recipe) is wired on top of `llmm/rng_device.mojo`'s
+Squares device RNG (chunk G): given an already-drawn uniform `rand in [0,1)`,
+`encode_e2m1` finds the two e2m1 grid points bracketing `|x|` and rounds up
+to the higher one with probability exactly `(|x| - lo) / (hi - lo)` — the
+standard stochastic-rounding-on-a-nonlinear-ladder construction, unbiased in
+expectation (`E[decode(encode(x))] == x` exactly, by construction of the
+interpolation) unlike `sr_round_bits`' bit-dither trick (which only works for
+formats whose values are monotonic in raw bit pattern for a fixed exponent
+range — not applicable to e2m1's 3-bit magnitude-index encoding). Exact grid
+points (`p_up` is exactly 0 or the bracket is degenerate) round deterministically
+to themselves regardless of the drawn `rand`, matching RNE's behavior there.
+
+`_nvfp4_quantize_gpu`/`nvfp4_quantize` thread a `(seed, stream, step)` triple
+through to `rng_uniform01` per the same convention `llmm/adamw.mojo`'s
+`LLMM_SR_MASTER` seam uses: `counter = (step << 32) | flat_element_index`
+(unique per (step, element), so repeated runs with the same seed are
+bit-identical) and a `stream` id reserved for this module
+(`NVFP4_SR_STREAM`, distinct from `llmm/adamw.mojo`'s `SR_MASTER_STREAM=1`)
+so its random substream never collides with another SR call site sharing the
+same seed. `round_mode` defaults to `ROUND_MODE_RNE` everywhere (existing
+callers are unaffected); a caller opts into SR by passing
+`round_mode=ROUND_MODE_STOCHASTIC` as `nvfp4_quantize`'s 4th template
+parameter — selecting *which* operands (gradients only, per the recipe) is
+the training-integration chunk's call-site decision, not something this
+module enforces.
 
 ## Scope
 
@@ -66,12 +86,14 @@ FP8 team's design doc §3).
 from std.collections import InlineArray
 from std.math import ceildiv
 from std.memory import bitcast
+from std.sys import get_defined_int
 from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from std.gpu.primitives import block
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.memory import ImmutKernelPtr, MutKernelPtr, ImmutMemPtr, MutMemPtr
+from llmm.rng_device import rng_uniform01
 
 
 # ===----------------------------------------------------------------------=== #
@@ -83,14 +105,26 @@ comptime E2M1_MAX = Float32(6.0)  # largest representable e2m1 magnitude
 comptime E4M3_MAX = Float32(448.0)  # largest representable e4m3 magnitude
 
 
-# Rounding-mode seam for `encode_e2m1`. RNE is implemented; STOCHASTIC is
-# reserved for the FP8 team's device-RNG chunk (see module docstring). Plain
-# comptime Int constants (not a struct namespace) to avoid any question of
-# whether a field-less struct is instantiable — matches this file's/the
-# codebase's existing `comptime FOO = <literal>` convention (e.g.
+# Rounding-mode seam for `encode_e2m1`. Both modes are implemented (see module
+# docstring). Plain comptime Int constants (not a struct namespace) to avoid
+# any question of whether a field-less struct is instantiable — matches this
+# file's/the codebase's existing `comptime FOO = <literal>` convention (e.g.
 # llmm/gelu.mojo's UNROLL/GELU_CONSTANT).
 comptime ROUND_MODE_RNE = 0
 comptime ROUND_MODE_STOCHASTIC = 1
+
+# SR seed/stream defaults for `nvfp4_quantize`'s `ROUND_MODE_STOCHASTIC` path
+# (llmm/rng_device.mojo's `(seed, counter, stream)` contract). Same
+# `-D LLMM_SR_SEED=<int>` override and default literal as
+# `llmm/adamw.mojo`'s `SR_MASTER_SEED` (one build-wide SR seed, deterministic
+# by default) — the two call sites stay decorrelated via `stream`, not seed.
+comptime NVFP4_SR_SEED = UInt64(get_defined_int["LLMM_SR_SEED", 1746221221]())
+# `llmm/adamw.mojo` reserves stream=1 (`SR_MASTER_STREAM`). This module's
+# base stream is 2; `llmm/matmul.mojo`'s `lowp_gemm_fp4` (which quantizes two
+# operands, A and B, per GEMM call) uses `NVFP4_SR_STREAM` and
+# `NVFP4_SR_STREAM + 1` respectively so the two operands' dither never draws
+# from the same substream.
+comptime NVFP4_SR_STREAM = UInt64(2)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -107,34 +141,86 @@ comptime ROUND_MODE_STOCHASTIC = 1
 
 
 @always_inline
-def encode_e2m1[round_mode: Int = ROUND_MODE_RNE](x: Float32) -> UInt8:
+def encode_e2m1[
+    round_mode: Int = ROUND_MODE_RNE
+](x: Float32, rand: Float32 = 0.0) -> UInt8:
     """Encode a fp32 value to a 4-bit e2m1 code (0..15: bit3=sign,
     bits2:0=magnitude index). Values are implicitly saturated to +/-6.0.
+
+    `round_mode == ROUND_MODE_RNE` (default): round-to-nearest,
+    ties-away-from-zero (`rand` unused). `round_mode ==
+    ROUND_MODE_STOCHASTIC`: `rand` must be an already-drawn uniform value in
+    `[0, 1)` (e.g. from `llmm.rng_device.rng_uniform01`) — the value rounds
+    UP to the higher of the two bracketing grid points with probability
+    exactly proportional to how close it sits to that neighbor, and DOWN
+    otherwise; unbiased in expectation by construction (see module
+    docstring's Rounding section). This function is pure/RNG-agnostic (mirrors
+    `llmm/rng_device.mojo`'s `sr_round_bits` pattern) — callers own drawing
+    `rand`.
     """
-    comptime assert round_mode == ROUND_MODE_RNE, (
-        "ROUND_MODE_STOCHASTIC is a declared seam, not implemented here —"
-        " needs the FP8 team's counter-based device RNG"
-        " (see llmm/nvfp4_quant.mojo module docstring)."
-    )
     var sign: UInt8 = UInt8(8) if x < 0.0 else UInt8(0)
     var ax = x if x >= 0.0 else -x
     var idx: UInt8
-    if ax <= 0.25:
-        idx = 0
-    elif ax <= 0.75:
-        idx = 1
-    elif ax <= 1.25:
-        idx = 2
-    elif ax <= 1.75:
-        idx = 3
-    elif ax <= 2.5:
-        idx = 4
-    elif ax <= 3.5:
-        idx = 5
-    elif ax <= 5.0:
-        idx = 6
+    comptime if round_mode == ROUND_MODE_RNE:
+        if ax <= 0.25:
+            idx = 0
+        elif ax <= 0.75:
+            idx = 1
+        elif ax <= 1.25:
+            idx = 2
+        elif ax <= 1.75:
+            idx = 3
+        elif ax <= 2.5:
+            idx = 4
+        elif ax <= 3.5:
+            idx = 5
+        elif ax <= 5.0:
+            idx = 6
+        else:
+            idx = 7
+    elif round_mode == ROUND_MODE_STOCHASTIC:
+        if ax >= 6.0:
+            idx = 7
+        else:
+            var lo_idx: UInt8
+            var lo: Float32
+            var hi: Float32
+            if ax < 0.5:
+                lo_idx = 0
+                lo = 0.0
+                hi = 0.5
+            elif ax < 1.0:
+                lo_idx = 1
+                lo = 0.5
+                hi = 1.0
+            elif ax < 1.5:
+                lo_idx = 2
+                lo = 1.0
+                hi = 1.5
+            elif ax < 2.0:
+                lo_idx = 3
+                lo = 1.5
+                hi = 2.0
+            elif ax < 3.0:
+                lo_idx = 4
+                lo = 2.0
+                hi = 3.0
+            elif ax < 4.0:
+                lo_idx = 5
+                lo = 3.0
+                hi = 4.0
+            else:
+                lo_idx = 6
+                lo = 4.0
+                hi = 6.0
+            # p_up = (ax - lo) / (hi - lo); round up with that probability.
+            # At an exact grid point (ax == lo), p_up == 0.0 and
+            # `rand < 0.0` is never true (rand in [0,1)), so exact grid
+            # points are deterministic under SR too, same as RNE.
+            var p_up = (ax - lo) / (hi - lo)
+            idx = (lo_idx + 1) if rand < p_up else lo_idx
     else:
-        idx = 7
+        comptime assert False, "encode_e2m1: unknown round_mode"
     return sign | idx
 
 
@@ -319,17 +405,49 @@ def nvfp4_packed_size(rows: Int, k: Int) -> Int:
 
 @always_inline
 def nvfp4_scale_rows(rows: Int, BLOCK_ROWS: Int) -> Int:
+    """Number of `BLOCK_ROWS`-tall row-TILES spanning `rows` physical rows
+    (`ceildiv(rows, BLOCK_ROWS)`) — i.e. how many distinct scale VALUES get
+    computed, not the physical scale-BUFFER row count (see
+    `nvfp4_scale_buffer_size`'s docstring: the physical buffer always has
+    one entry per row, `BLOCK_ROWS > 1` only controls how many consecutive
+    physical rows share the same computed value). Used to size the
+    amax-computation thread grid in `_nvfp4_quantize_gpu`/`nvfp4_quantize`
+    and to iterate tiles in `nvfp4_dequant_reference`.
+    """
     return ceildiv(rows, BLOCK_ROWS)
 
 
 @always_inline
 def nvfp4_scale_buffer_size(rows: Int, k: Int, BLOCK_ROWS: Int) -> Int:
-    """Byte size of the swizzled scale buffer for a `[rows, k]` tensor
-    quantized with `BLOCK_ROWS` (1 for 1D 1x16, 16 for 2D 16x16).
+    """Byte size of the swizzled scale buffer for a `[rows, k]` tensor.
+
+    Always sized for `rows` physical scale-buffer entries along the row
+    axis, REGARDLESS of `BLOCK_ROWS` (kept as a parameter for call-site
+    symmetry with `nvfp4_quantize`/`nvfp4_dequant_reference`, not because it
+    changes this formula). cuBLASLt's `CUBLASLT_MATMUL_MATRIX_SCALE_
+    VEC16_UE4M3` scale mode is inherently a 1-row-per-16-K-element-block
+    physical layout ("the scaling factor is stored for each 16-element
+    block in the innermost dimension of the corresponding data tensor" —
+    `cublasLtMatmulMatrixScale_t` docstring, `_cublas/cublaslt.mojo`); there
+    is no native cuBLASLt notion of a physically-compressed `rows/16`-row
+    scale tensor. `BLOCK_ROWS=16` ("2D 16x16", weights) is achieved by
+    computing ONE shared e4m3 scale value per 16-row-by-16-column tile and
+    REPLICATING that value across all 16 physical scale-buffer rows the
+    tile covers (`_nvfp4_quantize_gpu`), not by shrinking the buffer.
+
+    An earlier version of this function returned a `rows/BLOCK_ROWS`-sized
+    buffer for the 2D case, which is wrong for cuBLASLt consumption (though
+    self-consistent with — and therefore undetected by — this file's own
+    `nvfp4_dequant_reference`, which merely mirrors whatever layout the
+    quantize kernel wrote): caught by
+    `tests/test_lowp_gemm_fp4.mojo`'s real-cuBLASLt MLP-shape GEMM tests
+    (`b_block_rows=16`), which produced NaN outputs — a pure-software
+    roundtrip test using the SAME (buggy) convention on both sides could
+    never have caught this; only feeding the buffer to the actual vendor
+    GEMM call could.
     """
-    var scale_rows = nvfp4_scale_rows(rows, BLOCK_ROWS)
     var k_blocks = k // NVFP4_BLOCK
-    return nvfp4_swizzled_scale_buffer_size(scale_rows, k_blocks)
+    return nvfp4_swizzled_scale_buffer_size(rows, k_blocks)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -449,12 +567,16 @@ def _nvfp4_quantize_gpu[
     tensor_scale_ptr: MutKernelPtr[DType.float32],
     rows: Int,
     k: Int,
-    scale_rows: Int,
+    tile_rows: Int,  # ceildiv(rows, BLOCK_ROWS) -- row-TILE count, not the
+    # physical scale-buffer row count (see nvfp4_scale_buffer_size).
     k_blocks: Int,
     n_col_tiles: Int,
+    sr_seed: UInt64,
+    sr_stream: UInt64,
+    sr_step: Int,
 ) -> None:
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
-    var total = scale_rows * k_blocks
+    var total = tile_rows * k_blocks
     if idx >= total:
         return
     var br = idx // k_blocks
@@ -489,8 +611,19 @@ def _nvfp4_quantize_gpu[
     if sc_val <= 0.0:
         sc_val = 1.0
 
-    var soff = nvfp4_scale_swizzle_offset(br, kb, n_col_tiles)
-    scale_ptr[soff] = sc_code
+    # Write the SAME e4m3 code to every physical row this tile covers.
+    # cuBLASLt's VEC16_UE4M3 scale mode is inherently a 1-scale-per-physical
+    # -row layout (nvfp4_scale_buffer_size's docstring); "2D 16x16"
+    # (BLOCK_ROWS=16) means BLOCK_ROWS consecutive physical rows share one
+    # computed value, not that the physical buffer shrinks to rows/16
+    # entries. For BLOCK_ROWS=1 this loop runs once (rr=0, r=br) and is a
+    # no-op change from the single-offset write it replaces.
+    for rr in range(BLOCK_ROWS):
+        var r = br * BLOCK_ROWS + rr
+        if r >= rows:
+            continue
+        var soff = nvfp4_scale_swizzle_offset(r, kb, n_col_tiles)
+        scale_ptr[soff] = sc_code
 
     # 3. quantize + pack elements. k is always a multiple of NVFP4_BLOCK
     # (enforced by the host wrapper), hence even, so r*k is always even and
@@ -505,15 +638,24 @@ def _nvfp4_quantize_gpu[
             var k0 = kb * NVFP4_BLOCK + kk
             if k0 >= k:
                 break
-            var c0 = encode_e2m1[round_mode](
-                x_ptr[r * k + k0].cast[DType.float32]() / sc_val
-            )
+            var v0 = x_ptr[r * k + k0].cast[DType.float32]() / sc_val
+            var c0: UInt8
+            comptime if round_mode == ROUND_MODE_STOCHASTIC:
+                var counter0 = (UInt64(sr_step) << 32) | UInt64(r * k + k0)
+                var rand0 = rng_uniform01(sr_seed, counter0, sr_stream)
+                c0 = encode_e2m1[round_mode](v0, rand0)
+            else:
+                c0 = encode_e2m1[round_mode](v0)
             var c1 = UInt8(0)
             var k1 = k0 + 1
             if k1 < k and kk + 1 < NVFP4_BLOCK:
-                c1 = encode_e2m1[round_mode](
-                    x_ptr[r * k + k1].cast[DType.float32]() / sc_val
-                )
+                var v1 = x_ptr[r * k + k1].cast[DType.float32]() / sc_val
+                comptime if round_mode == ROUND_MODE_STOCHASTIC:
+                    var counter1 = (UInt64(sr_step) << 32) | UInt64(r * k + k1)
+                    var rand1 = rng_uniform01(sr_seed, counter1, sr_stream)
+                    c1 = encode_e2m1[round_mode](v1, rand1)
+                else:
+                    c1 = encode_e2m1[round_mode](v1)
             q_ptr[(r * k + k0) // 2] = pack_e2m1x2(c0, c1)
             kk += 2
 
@@ -531,6 +673,9 @@ def nvfp4_quantize[
     rows: Int,
     k: Int,
     ctx: DeviceContext,
+    sr_seed: UInt64 = NVFP4_SR_SEED,
+    sr_stream: UInt64 = NVFP4_SR_STREAM,
+    sr_step: Int = 0,
 ) raises -> None:
     """Quantizes a `[rows, k]` bf16 (or fp32) tensor to NVFP4: packed e2m1
     `q_ptr` (size `nvfp4_packed_size(rows, k)`), swizzled e4m3 block scales
@@ -540,6 +685,18 @@ def nvfp4_quantize[
     `BLOCK_ROWS=1` -> 1D 1x16 blocks (activations & gradients per the
     recipe); `BLOCK_ROWS=16` -> 2D 16x16 blocks (weights). `k` must be a
     multiple of 16.
+
+    `sr_seed`/`sr_stream`/`sr_step` only matter when `round_mode ==
+    ROUND_MODE_STOCHASTIC` (module docstring's Rounding section); they are
+    plain no-op parameters at their default values otherwise. `sr_step`
+    should be the caller's training-step counter (or any per-call-site
+    monotonic counter) so repeated quantize calls on the same tensor draw
+    fresh dither each time instead of reusing the same bit pattern every
+    call under a fixed seed — pass a distinct `sr_stream` per logical
+    call-site (e.g. `llmm/matmul.mojo`'s `lowp_gemm_fp4` uses
+    `NVFP4_SR_STREAM`/`NVFP4_SR_STREAM + 1` for its A/B operands) so
+    unrelated tensors quantized under the same seed never share a dither
+    substream.
     """
     comptime assert (
         BLOCK_ROWS == 1 or BLOCK_ROWS == NVFP4_BLOCK
@@ -555,9 +712,9 @@ def nvfp4_quantize[
         )
 
         var k_blocks = k // NVFP4_BLOCK
-        var scale_rows = nvfp4_scale_rows(rows, BLOCK_ROWS)
+        var tile_rows = nvfp4_scale_rows(rows, BLOCK_ROWS)
         var n_col_tiles = ceildiv(k_blocks, 4)
-        var total = scale_rows * k_blocks
+        var total = tile_rows * k_blocks
         comptime BLOCK_SIZE = 256
         var num_blocks = ceildiv(total, BLOCK_SIZE) if total > 0 else 1
 
@@ -573,9 +730,12 @@ def nvfp4_quantize[
             tensor_scale_ptr,
             rows,
             k,
-            scale_rows,
+            tile_rows,
             k_blocks,
             n_col_tiles,
+            sr_seed,
+            sr_stream,
+            sr_step,
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )
@@ -615,12 +775,17 @@ def nvfp4_dequant_reference[
             + String(NVFP4_BLOCK)
         )
     var k_blocks = k // NVFP4_BLOCK
-    var scale_rows = nvfp4_scale_rows(rows, BLOCK_ROWS)
+    var tile_rows = nvfp4_scale_rows(rows, BLOCK_ROWS)
     var n_col_tiles = ceildiv(k_blocks, 4)
 
-    for br in range(scale_rows):
+    for br in range(tile_rows):
         for kb in range(k_blocks):
-            var soff = nvfp4_scale_swizzle_offset(br, kb, n_col_tiles)
+            # Every physical row in this tile carries the same replicated
+            # code (nvfp4_scale_buffer_size's docstring) -- read from the
+            # tile's first physical row, `br * BLOCK_ROWS`.
+            var soff = nvfp4_scale_swizzle_offset(
+                br * BLOCK_ROWS, kb, n_col_tiles
+            )
             var sc_val = decode_e4m3(scale_ptr[soff]) * tensor_scale
             for rr in range(BLOCK_ROWS):
                 var r = br * BLOCK_ROWS + rr
