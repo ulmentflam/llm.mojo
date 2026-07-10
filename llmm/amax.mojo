@@ -388,7 +388,7 @@ def _update_scale_gpu[
     history_ptr[step % history_len] = amax_current
 
 
-struct AmaxState[spec: PrecisionSpec]:
+struct AmaxState[spec: PrecisionSpec](Movable):
     """Per-GEMM-operand-site delayed-scaling state (design §1.3, §3).
 
     PerTensor (fp8): `history` is a length-`spec.amax_history_len` fp32 ring
@@ -442,6 +442,20 @@ struct AmaxState[spec: PrecisionSpec]:
     raise a clear comptime error rather than silently allocating/updating the
     wrong shape. The FP4 chunk fills these in with a `[rows/block,
     cols/block]` `spec.scale_dtype` tensor per site.
+
+    `(Movable)` (added by Chunk D): `List[AmaxState[spec]]` — the
+    per-layer/per-site storage `train_gpt2.mojo`'s `LowpState` container uses
+    (one instance per GEMM operand site per transformer layer) — requires the
+    element type to conform to Mojo's `Movable` trait
+    (`stdlib/collections/list.mojo`'s `struct List[T: Movable]`); Mojo does
+    not infer trait conformance implicitly, even when every field (here, three
+    `DeviceBuffer[DType.float32]`s and an `Int`) is itself movable, so the
+    trait must be declared. All fields are simple/movable and no custom
+    `__moveinit__`/`__del__` exists, so the compiler-synthesized move is
+    correct as-is (verified empirically: an un-annotated struct with the same
+    field shapes fails `List[Foo]()`'s constraint with "has 'Movable' type,
+    but value has type 'AnyStruct[Foo]'"; adding `(Movable)` alone, no
+    `__moveinit__`, fixes it). No behavior change to any existing call site.
     """
 
     var history: DeviceBuffer[DType.float32]
