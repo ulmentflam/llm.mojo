@@ -2051,3 +2051,102 @@ regression is clearly visible there.
   dgamma/dbeta shared accumulation or the atomic-flag finalize
   serializing more than expected) before this lands — per-kernel ms, not
   just launch count, needs to improve for this to ship.
+
+## 2026-07-10 — LN-backward fusion REDESIGN: regression fixed, family time beats baseline (2-kernel, register-accumulate)
+
+The first single-kernel LN-backward fusion (`edd2b67`, validated in the
+entry above) was correct and dropped launches 4->1 but REGRESSED family
+time to fp32 23.61 / bf16 15.38 ms (+7.4 both) vs the pre-fusion baseline
+(`a8f9f56`) 16.20 / 7.93 ms. This entry redesigns it and lands the win.
+
+### Diagnosis (1-step ncu, bf16, hot `HAS_RESID_IN=True` variant, T=1024)
+
+ncu on `_layernorm_bwd_fused_gpu` (the `edd2b67` single kernel), B=4 T=1024:
+
+| metric | value | reading |
+|---|---:|---|
+| Duration / launch | 596 us | ×24 ≈ 14.3 ms — matches the regression |
+| Memory throughput | 6.24% | not streaming — latency/serialization bound |
+| Compute (SM) throughput | 5.21% | idem |
+| SM active / elapsed cycles | 508K / 1281K = 40% | ~60% of wall time most SMs idle |
+| Registers / thread | 72 | -> Block Limit Registers = **3** |
+| Static SMEM / block | 16.45 KB | -> Block Limit Shared Mem = 5 |
+| Theoretical / achieved occupancy | 50% / 47.7% | register + SMEM capped |
+| top stalls | 67.8% L1TEX scoreboard (mem latency) + 40.4% CTA barrier | |
+
+Root cause = the three things the `edd2b67` design added on top of the
+(fast, 129 us) baseline `bwd_r` d_input kernel: (1) a **serial single-block
+finalize** — "last block" reduces 1536 block-partials × 768 ch × 2 while 47
+SMs idle (the 40%-SM-active tail); (2) a **16 KB/block dgamma/dbeta shared
+array** (2×2048 fp32) that, with 72 reg/thread, capped occupancy at 50%; (3)
+**per-element shared RMW** in the hot pass-2 loop.
+
+### Redesign
+
+Two kernels, register accumulation, no shared dgamma/dbeta array:
+
+1. **Main** (`_layernorm_bwd_fused_gpu`): unchanged block-per-row d_input +
+   folded resid seed, but dgamma/dbeta now accumulate into **per-thread
+   registers** across the block's grid-stride rows (thread `tid` owns a fixed
+   disjoint channel chunk on every row, so no sharing, no atomics), flushed
+   once at the end to a **channel-major** scratch (`scratch[c*blocks_cap+b]`).
+   Removes the 16 KB shared array (restores occupancy) and the per-element
+   shared traffic. `SM_OVERPROVISION` 32->3 (1536->144 blocks) — one wave at
+   the register-bound 3-blocks/SM residency, still SM-saturating, with the
+   fewest per-block partials to flush and finalize (see the tuning note below).
+2. **Finalize** (`_ln_bwd_fused_finalize_gpu`): **one block per channel**
+   (grid.x == channels), each block coalesced-reads its channel's contiguous
+   partials and block-reduces them into d_gamma/d_beta. All `channels` blocks
+   run concurrently across every SM — replaces the serial single-block tail.
+
+Numerically the register accumulation reproduces the shared-array values
+exactly (same per-row order); the finalize's block-reduction order differs
+from a strict 0..N sequential sum, so results are twin-run deterministic
+(fixed block dims) though no longer bit-identical to the sequential variant.
+
+### Gates
+
+- verify-gpu (strict IEEE, TF32 off): PASS — 16/16 TENSOR OK, 10/10 LOSS OK.
+- verify-gpu-tf32: PASS. verify-cpu: PASS.
+- bf16 twin-run: run A == run B bit-identical at all 10 steps (determinism
+  preserved).
+
+### Family time (1-step ncu, T=1024, L=12)
+
+| arm | edd2b67 (failed) | a8f9f56 baseline | **NEW** | vs baseline | acceptance |
+|---|---:|---:|---:|---:|---|
+| fp32 | 23.61 | 16.20 | **9.34** | **-6.86** | <= 10 ms: **PASS** |
+| bf16 | 15.38 | 7.93 | **4.82** | **-3.11** | <= 5 ms: **PASS** |
+
+(llm.c `layernorm_backward_kernel10` floor: fp32 5.55 / bf16 2.58.)
+
+NEW breakdown (bf16): main 4.26 (23×) + 0.16 (1×) + finalize 0.23 (24×) +
+ln_f dparam-accum/finalize 0.11 + plain bwd_g 0.07. The main d_input sweep
+(4.26) is now the whole cost; the finalize is 0.23 (down from the first
+attempt's ~2.4 ms single-block tail equivalent). `SM_OVERPROVISION=3`
+(144 blocks) beat 8 (384) by shrinking the strided channel-major scratch
+flush: bf16 main 4.78 -> 4.26, family 5.49 -> 4.82.
+
+Wall-clock corroboration (full step, L=12, T=1024, 25 steps/arm, WARMUP=5,
+two rounds with arm order reversed):
+
+| arm | round 1 | round 2 | vs baseline |
+|---|---:|---:|---|
+| NEW bf16 | 133.92 | 134.42 | ~-2 ms |
+| BASE bf16 (a8f9f56) | 135.45 | 137.04 | |
+| NEW fp32 | 277.48 | 281.46 | ~-7 ms |
+| BASE fp32 (a8f9f56) | 286.43 | 286.84 | |
+
+Both precisions the NEW build is faster than the pre-fusion baseline in
+wall-clock (and ~8 ms faster than the failed `edd2b67` bf16 142 ms).
+
+### Gotcha
+
+- The Makefile `PROFILE_T` defaults to **64**, not 1024 — pass
+  `PROFILE_T=1024` (or set `LLMM_PROFILE_T`) or ncu profiles the wrong shape.
+- Mangled Mojo kernel names truncate (`_ln_bwd_fused_finalize_gpu` ->
+  `..._ln_bwd_fused_f...`) — match on the truncated stem when parsing ncu CSVs.
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Opus agent), directed by Evan Owen.

@@ -6,6 +6,7 @@ from std.gpu import WARP_SIZE
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host import DeviceAttribute
+from std.collections import InlineArray
 from std.math import fma, ceildiv, rsqrt
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
@@ -1460,31 +1461,6 @@ def _ln_bwd_dparam_scratch(
     return rebind[MutKernelPtr[DType.float32]](hp[].unsafe_ptr())
 
 
-@always_inline
-def _ln_bwd_flag_scratch(
-    ctx: DeviceContext,
-) raises -> MutKernelPtr[DType.int32]:
-    # Persistent int32 "last block finalizes" counter for
-    # _layernorm_bwd_fused_gpu (llm.c layernorm_backward_kernel10's
-    # atomicInc-flag idiom). Allocated once, zeroed at creation; the kernel's
-    # last-arriving block resets it to 0 itself at the end of every launch
-    # (mirrors _ln_dparam_finalize_gpu's self-reset below), so no per-launch
-    # host-side memset is needed.
-    comptime BufType = type_of(ctx.enqueue_create_buffer[DType.int32](1))
-    var name = String(t"LLMM_LN_BWD_FLAG_SCRATCH_{ctx.id()}")
-    if gp := _get_global_or_null(name):
-        var p = gp.value().bitcast[BufType]()
-        return rebind[MutKernelPtr[DType.int32]](p[].unsafe_ptr())
-    var buf = ctx.enqueue_create_buffer[DType.int32](1)
-    ctx.enqueue_memset(buf, Int32(0))
-    var hp = alloc[BufType](1)
-    hp.init_pointee_move(buf^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), hp.bitcast[NoneType]()
-    )
-    return rebind[MutKernelPtr[DType.int32]](hp[].unsafe_ptr())
-
-
 def _layernorm_bwd_fused_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
@@ -1497,9 +1473,6 @@ def _layernorm_bwd_fused_gpu[
     # (resid_in_ptr never read) when False — used for the ln_f call site,
     # which has no incoming residual gradient to seed.
     HAS_RESID_IN: Bool = False,
-    # Parameter-gradient dtype: production keeps pdtype == dtype; the test
-    # harness (registered ops) accumulates d_gamma/d_beta in fp32.
-    pdtype: DType = dtype,
     # Per-block scratch stride / shared-memory bound for dgamma/dbeta.
     # 2048 covers every channel count this kernel is ever launched with
     # (GPT-2 configs top out at 1600; the equivalence suite tops out at 768)
@@ -1514,77 +1487,75 @@ def _layernorm_bwd_fused_gpu[
     resid_in_ptr: ImmutKernelPtr[dtype],
     d_inp1_ptr: MutKernelPtr[dtype],
     d_inp2_ptr: MutKernelPtr[dtype],
-    d_gamma_ptr: MutKernelPtr[pdtype],
-    d_beta_ptr: MutKernelPtr[pdtype],
     scratch_dgamma: MutKernelPtr[DType.float32],
     scratch_dbeta: MutKernelPtr[DType.float32],
-    scratch_flag: MutKernelPtr[DType.int32],
     num_rows: Int,
     channels: Int,
+    blocks_cap: Int,
 ) -> None:
-    # Single-kernel LN backward modeled on llm.c's layernorm_backward_
-    # kernel10 (third_party/llm.c/llmc/layernorm.cuh:233): d_input, the
-    # residual-grad seed, and dgamma/dbeta are all produced in ONE sweep over
-    # [B,T,C], replacing the 3-kernel sequence this replaces
-    # (_layernorm_bwd_residual_gpu + _ln_dparam_accum_gpu +
-    # _ln_dparam_finalize_gpu — the latter two re-read dout/input that this
-    # kernel already has in registers). dgamma/dbeta accumulate into
-    # block-local SHARED memory (no atomics: thread `tid` owns the same
-    # channel offsets on every row it processes in the grid-stride loop
-    # below, so no other thread ever touches its shared slot), then each
-    # block flushes its partial to a private scratch slot and the block that
-    # observes the last arrival (atomic counter, llm.c's flag idiom)
-    # performs the cross-block reduction and the += into d_gamma/d_beta.
+    # Fused LN-backward MAIN pass (the "big" launch of a 2-kernel design; the
+    # tiny deterministic finalize is _ln_bwd_fused_finalize_gpu below). In one
+    # sweep over [B,T,C] it produces d_input, folds the residual-grad seed
+    # (HAS_RESID_IN), and reduces dgamma/dbeta — replacing the 3-kernel
+    # sequence (_layernorm_bwd_residual_gpu + _ln_dparam_accum_gpu +
+    # _ln_dparam_finalize_gpu) plus the separate residual_grad_broadcast.
     #
-    # `aligned` / alignment proof: identical to _layernorm_bwd_residual_gpu
-    # (channels % width == 0 makes every row*channels+i offset provably
-    # width-aligned; the host dispatch only sets aligned=True when it has
-    # checked that).
+    # Redesign (2026-07-10) vs the first fused attempt (edd2b67): dgamma/dbeta
+    # accumulate into per-thread REGISTERS across every row this block
+    # processes, NOT into a 16 KB/block shared array with a per-element RMW in
+    # the hot loop. Thread `tid` owns a fixed, disjoint set of channel offsets
+    # on every row of its grid-stride loop (i = tile_base + tid*width for the
+    # aligned path; i = col_base + tid for the scalar path), so no other
+    # thread ever touches its accumulator — the reduction is deterministic and
+    # stays in registers until a single scratch flush at the end. The
+    # cross-block reduction that the previous attempt did inside this kernel
+    # with a "last block finalizes" serial tail (~60% of its wall time, one SM
+    # busy while 47 idle) is now a separate, fully parallel finalize launch.
+    # This removes the shared array (restores occupancy), the per-element
+    # shared traffic, and the serial tail — the three regressions the first
+    # attempt's ncu profile flagged.
+    #
+    # Numerically identical to edd2b67: same per-row accumulation order into
+    # the register partials, same block-order cross-block sum in the finalize,
+    # so dgamma/dbeta are bit-for-bit what the shared-array version produced
+    # (determinism preserved). `aligned` alignment proof unchanged: the host
+    # dispatch sets aligned=True only when channels % width == 0, which makes
+    # every row*channels+i offset provably width-aligned and the scalar tail
+    # (i < channels < i+width) provably unreachable.
     comptime BLOCK_SPAN = BLOCK_SIZE * width
     comptime align = align_of[SIMD[dtype, width]]()
+    # Number of comptime-unrolled work chunks a single thread can own. For the
+    # aligned (vector) path a chunk is `width` channels every BLOCK_SPAN; for
+    # the scalar path a chunk is one channel every BLOCK_SIZE. Both are sized
+    # to the CHANNELS_CAP bound so the register accumulators are a fixed,
+    # small, comptime-known count (2 and 8 respectively at the defaults).
+    comptime NUM_TILES = ceildiv(CHANNELS_CAP, BLOCK_SPAN)
+    comptime NUM_COLS = ceildiv(CHANNELS_CAP, BLOCK_SIZE)
 
     var tid = Int(thread_idx.x)
     var block_row = Int(block_idx.x)
     var num_blocks = Int(grid_dim.x)
+    var inv_c = 1.0 / Float32(channels)
 
-    var dgamma_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(CHANNELS_CAP),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var dbeta_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(CHANNELS_CAP),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var flag_shared = LayoutTensor[
-        DType.int32,
-        Layout.row_major(1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    comptime if aligned:
+        var dg_acc = InlineArray[SIMD[DType.float32, width], NUM_TILES](
+            fill=SIMD[DType.float32, width](0.0)
+        )
+        var db_acc = InlineArray[SIMD[DType.float32, width], NUM_TILES](
+            fill=SIMD[DType.float32, width](0.0)
+        )
 
-    for c in range(tid, channels, BLOCK_SIZE):
-        dgamma_shared.ptr[c] = 0.0
-        dbeta_shared.ptr[c] = 0.0
-    barrier()
+        for row in range(block_row, num_rows, num_blocks):
+            var mean = mean_ptr[row]
+            var rstd = rstd_ptr[row]
+            var mean_vec = SIMD[DType.float32, width](mean)
+            var rstd_vec = SIMD[DType.float32, width](rstd)
+            var sum_gdy_thread = SIMD[DType.float32, width](0.0)
+            var sum_gdy_xhat_thread = SIMD[DType.float32, width](0.0)
 
-    for row in range(block_row, num_rows, num_blocks):
-        var mean = mean_ptr[row]
-        var rstd = rstd_ptr[row]
-        var mean_vec = SIMD[DType.float32, width](mean)
-        var rstd_vec = SIMD[DType.float32, width](rstd)
-        var sum_gdy_thread = SIMD[DType.float32, width](0.0)
-        var sum_gdy_xhat_thread = SIMD[DType.float32, width](0.0)
-        var sum_gdy_tail = Scalar[DType.float32](0.0)
-        var sum_gdy_xhat_tail = Scalar[DType.float32](0.0)
-
-        # Pass 1: Row-statistic reduction (sum_gdy, sum_gdy_xhat) — same
-        # reduction as _layernorm_bwd_residual_gpu, unchanged.
-        comptime if aligned:
-            for tile_base in range(0, channels, BLOCK_SPAN):
+            # Pass 1: row-statistic reduction (sum_gdy, sum_gdy_xhat).
+            comptime for t in range(NUM_TILES):
+                comptime tile_base = t * BLOCK_SPAN
                 var i = tile_base + tid * width
                 if i + width <= channels:
                     var idx = row * channels + i
@@ -1604,45 +1575,21 @@ def _layernorm_bwd_fused_gpu[
                         .cast[DType.float32]()
                     )
                     var x_hat = (x - mean_vec) * rstd_vec
-
                     var gdy = g * dy
                     sum_gdy_thread += gdy
                     sum_gdy_xhat_thread += gdy * x_hat
-                elif i < channels:
-                    for j in range(i, channels):
-                        var idx = row * channels + j
-                        var dy = d_output_ptr[idx].cast[DType.float32]()
-                        var x = input_ptr[idx].cast[DType.float32]()
-                        var g = gamma_ptr[j].cast[DType.float32]()
-                        var x_hat = (x - mean) * rstd
 
-                        var gdy = g * dy
-                        sum_gdy_tail += gdy
-                        sum_gdy_xhat_tail += gdy * x_hat
-        else:
-            for i in range(tid, channels, BLOCK_SIZE):
-                var idx = row * channels + i
-                var dy = d_output_ptr[idx].cast[DType.float32]()
-                var x = input_ptr[idx].cast[DType.float32]()
-                var g = gamma_ptr[i].cast[DType.float32]()
-                var x_hat = (x - mean) * rstd
+            var sum_gdy = block.sum[block_size=BLOCK_SIZE](
+                sum_gdy_thread.reduce_add()
+            )
+            var sum_gdy_xhat = block.sum[block_size=BLOCK_SIZE](
+                sum_gdy_xhat_thread.reduce_add()
+            )
 
-                var gdy = g * dy
-                sum_gdy_tail += gdy
-                sum_gdy_xhat_tail += gdy * x_hat
-
-        var sum_gdy = block.sum[block_size=BLOCK_SIZE](
-            sum_gdy_thread.reduce_add() + sum_gdy_tail
-        )
-        var sum_gdy_xhat = block.sum[block_size=BLOCK_SIZE](
-            sum_gdy_xhat_thread.reduce_add() + sum_gdy_xhat_tail
-        )
-
-        # Pass 2: d_input, fused residual-grad seed (HAS_RESID_IN), and
-        # dgamma/dbeta shared accumulation — all in the same element sweep.
-        var inv_c = 1.0 / Float32(channels)
-        comptime if aligned:
-            for tile_base in range(0, channels, BLOCK_SPAN):
+            # Pass 2: d_input, fused residual-grad seed (HAS_RESID_IN), and
+            # dgamma/dbeta REGISTER accumulation — all in the same sweep.
+            comptime for t in range(NUM_TILES):
+                comptime tile_base = t * BLOCK_SPAN
                 var i = tile_base + tid * width
                 if i + width <= channels:
                     var idx = row * channels + i
@@ -1668,10 +1615,8 @@ def _layernorm_bwd_fused_gpu[
                         - (x_hat * sum_gdy_xhat * inv_c)
                     )
 
-                    var dg_old = (dgamma_shared.ptr + i).load[width=width]()
-                    var db_old = (dbeta_shared.ptr + i).load[width=width]()
-                    (dgamma_shared.ptr + i).store(dg_old + dy * x_hat)
-                    (dbeta_shared.ptr + i).store(db_old + dy)
+                    dg_acc[t] += dy * x_hat
+                    db_acc[t] += dy
 
                     var g1 = (
                         (d_inp1_ptr + idx)
@@ -1702,100 +1647,130 @@ def _layernorm_bwd_fused_gpu[
                         (d_inp2_ptr + idx).store[width=width, alignment=align](
                             (g2 + d_input).cast[dtype]()
                         )
-                elif i < channels:
-                    for j in range(i, channels):
-                        var idx = row * channels + j
-                        var dy = d_output_ptr[idx].cast[DType.float32]()
-                        var x = input_ptr[idx].cast[DType.float32]()
-                        var g = gamma_ptr[j].cast[DType.float32]()
-                        var x_hat = (x - mean) * rstd
-                        var d_input = rstd * (
-                            g * dy
-                            - (sum_gdy * inv_c)
-                            - (x_hat * sum_gdy_xhat * inv_c)
-                        )
 
-                        dgamma_shared.ptr[j] = dgamma_shared.ptr[j] + dy * x_hat
-                        dbeta_shared.ptr[j] = dbeta_shared.ptr[j] + dy
+        # Flush this thread's register partials to this block's slot in the
+        # CHANNEL-MAJOR scratch (scratch[c * blocks_cap + block_row]). Laying
+        # the partials out channel-major lets the finalize kernel reduce each
+        # channel's blocks_cap partials with a single coalesced block (one
+        # block per channel, saturating every SM) instead of the 3-block
+        # thread-per-channel finalize a block-major layout would force (only
+        # ceil(C/256)=3 blocks -> 45 idle SMs, which profiled at ~2.4 ms). The
+        # flush is `width` strided scalar writes per owned chunk, done once per
+        # block (not per row), so its cost is negligible.
+        comptime for t in range(NUM_TILES):
+            comptime tile_base = t * BLOCK_SPAN
+            var i = tile_base + tid * width
+            if i + width <= channels:
+                comptime for lane in range(width):
+                    var c = i + lane
+                    scratch_dgamma[c * blocks_cap + block_row] = dg_acc[t][lane]
+                    scratch_dbeta[c * blocks_cap + block_row] = db_acc[t][lane]
+    else:
+        var dg_acc = InlineArray[Scalar[DType.float32], NUM_COLS](
+            fill=Scalar[DType.float32](0.0)
+        )
+        var db_acc = InlineArray[Scalar[DType.float32], NUM_COLS](
+            fill=Scalar[DType.float32](0.0)
+        )
 
-                        var g1 = d_inp1_ptr[idx].cast[DType.float32]()
-                        var g2 = d_inp2_ptr[idx].cast[DType.float32]()
-                        comptime if HAS_RESID_IN:
-                            var resid = resid_in_ptr[idx].cast[DType.float32]()
-                            d_inp1_ptr[idx] = (g1 + resid + d_input).cast[
-                                dtype
-                            ]()
-                            d_inp2_ptr[idx] = (g2 + resid + d_input).cast[
-                                dtype
-                            ]()
-                        else:
-                            d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
-                            d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
-        else:
+        for row in range(block_row, num_rows, num_blocks):
+            var mean = mean_ptr[row]
+            var rstd = rstd_ptr[row]
+            var sum_gdy_tail = Scalar[DType.float32](0.0)
+            var sum_gdy_xhat_tail = Scalar[DType.float32](0.0)
+
             for i in range(tid, channels, BLOCK_SIZE):
                 var idx = row * channels + i
                 var dy = d_output_ptr[idx].cast[DType.float32]()
                 var x = input_ptr[idx].cast[DType.float32]()
                 var g = gamma_ptr[i].cast[DType.float32]()
                 var x_hat = (x - mean) * rstd
-                var d_input = rstd * (
-                    g * dy - (sum_gdy * inv_c) - (x_hat * sum_gdy_xhat * inv_c)
-                )
+                var gdy = g * dy
+                sum_gdy_tail += gdy
+                sum_gdy_xhat_tail += gdy * x_hat
 
-                dgamma_shared.ptr[i] = dgamma_shared.ptr[i] + dy * x_hat
-                dbeta_shared.ptr[i] = dbeta_shared.ptr[i] + dy
+            var sum_gdy = block.sum[block_size=BLOCK_SIZE](sum_gdy_tail)
+            var sum_gdy_xhat = block.sum[block_size=BLOCK_SIZE](
+                sum_gdy_xhat_tail
+            )
 
-                var g1 = d_inp1_ptr[idx].cast[DType.float32]()
-                var g2 = d_inp2_ptr[idx].cast[DType.float32]()
-                comptime if HAS_RESID_IN:
-                    var resid = resid_in_ptr[idx].cast[DType.float32]()
-                    d_inp1_ptr[idx] = (g1 + resid + d_input).cast[dtype]()
-                    d_inp2_ptr[idx] = (g2 + resid + d_input).cast[dtype]()
-                else:
-                    d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
-                    d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
+            comptime for s in range(NUM_COLS):
+                comptime col_base = s * BLOCK_SIZE
+                var i = col_base + tid
+                if i < channels:
+                    var idx = row * channels + i
+                    var dy = d_output_ptr[idx].cast[DType.float32]()
+                    var x = input_ptr[idx].cast[DType.float32]()
+                    var g = gamma_ptr[i].cast[DType.float32]()
+                    var x_hat = (x - mean) * rstd
+                    var d_input = rstd * (
+                        g * dy
+                        - (sum_gdy * inv_c)
+                        - (x_hat * sum_gdy_xhat * inv_c)
+                    )
 
-    barrier()
+                    dg_acc[s] += dy * x_hat
+                    db_acc[s] += dy
 
-    # Flush this block's dgamma/dbeta partials to its own scratch slot (no
-    # cross-block writes, no atomics needed here).
-    for c in range(tid, channels, BLOCK_SIZE):
-        scratch_dgamma[block_row * CHANNELS_CAP + c] = dgamma_shared.ptr[c]
-        scratch_dbeta[block_row * CHANNELS_CAP + c] = dbeta_shared.ptr[c]
-    barrier()
+                    var g1 = d_inp1_ptr[idx].cast[DType.float32]()
+                    var g2 = d_inp2_ptr[idx].cast[DType.float32]()
+                    comptime if HAS_RESID_IN:
+                        var resid = resid_in_ptr[idx].cast[DType.float32]()
+                        d_inp1_ptr[idx] = (g1 + resid + d_input).cast[dtype]()
+                        d_inp2_ptr[idx] = (g2 + resid + d_input).cast[dtype]()
+                    else:
+                        d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
+                        d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
 
-    # llm.c's "last block finalizes" idiom (layernorm_backward_kernel10):
-    # every block atomically increments the shared flag; fetch_add returns
-    # the PRE-increment value, so the block that observes num_blocks-1 is,
-    # by construction, the last to arrive — every other block's scratch
-    # write above happened-before its increment, which happened-before this
-    # block's read of the flag, so all partials are visible here without an
-    # extra fence.
+        comptime for s in range(NUM_COLS):
+            comptime col_base = s * BLOCK_SIZE
+            var i = col_base + tid
+            if i < channels:
+                scratch_dgamma[i * blocks_cap + block_row] = dg_acc[s]
+                scratch_dbeta[i * blocks_cap + block_row] = db_acc[s]
+
+
+def _ln_bwd_fused_finalize_gpu[
+    pdtype: DType,
+    BLOCK_SIZE: Int,
+](
+    d_gamma_ptr: MutKernelPtr[pdtype],
+    d_beta_ptr: MutKernelPtr[pdtype],
+    scratch_dgamma: MutKernelPtr[DType.float32],
+    scratch_dbeta: MutKernelPtr[DType.float32],
+    num_blocks: Int,
+    blocks_cap: Int,
+) -> None:
+    # Deterministic cross-block reduction of _layernorm_bwd_fused_gpu's
+    # per-block dgamma/dbeta partials. ONE BLOCK PER CHANNEL (block_idx.x ==
+    # channel), so all `channels` blocks run concurrently across every SM
+    # instead of the single "last block" the first fused attempt used (that
+    # serial tail was the dominant regression) and instead of a thread-per-
+    # channel grid (only ceil(C/256) blocks -> most SMs idle, ~2.4 ms). The
+    # channel's blocks_cap partials are contiguous in the channel-major
+    # scratch, so the block's threads read them fully coalesced, grid-stride
+    # over blocks_cap, then a block reduction sums them. Deterministic (fixed
+    # block dims -> fixed tree order -> bit-reproducible run to run).
+    # d_gamma/d_beta ALWAYS accumulate (grad accumulation across micro-steps),
+    # matching _ln_dparam_finalize_gpu. Scratch needs no re-zero: the main
+    # kernel overwrites every [0:num_blocks) slot in full each launch.
+    var col = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var base = col * blocks_cap
+    var dg_thread = Scalar[DType.float32](0.0)
+    var db_thread = Scalar[DType.float32](0.0)
+    for b in range(tid, num_blocks, BLOCK_SIZE):
+        dg_thread += scratch_dgamma[base + b]
+        db_thread += scratch_dbeta[base + b]
+    var dg = block.sum[block_size=BLOCK_SIZE](dg_thread)
+    var db = block.sum[block_size=BLOCK_SIZE](db_thread)
     if tid == 0:
-        flag_shared.ptr[0] = Atomic[DType.int32].fetch_add(scratch_flag, 1)
-    barrier()
-    var arrived = Int(flag_shared.ptr[0])
-
-    if arrived == num_blocks - 1:
-        for c in range(tid, channels, BLOCK_SIZE):
-            var acc_dg = Scalar[DType.float32](0.0)
-            var acc_db = Scalar[DType.float32](0.0)
-            for b in range(num_blocks):
-                acc_dg += scratch_dgamma[b * CHANNELS_CAP + c]
-                acc_db += scratch_dbeta[b * CHANNELS_CAP + c]
-            # d_gamma/d_beta ALWAYS accumulate (grad accumulation across
-            # micro-steps) — matches _ln_dparam_finalize_gpu.
-            d_gamma_ptr[c] = (
-                d_gamma_ptr[c].cast[DType.float32]() + acc_dg
-            ).cast[pdtype]()
-            d_beta_ptr[c] = (d_beta_ptr[c].cast[DType.float32]() + acc_db).cast[
-                pdtype
-            ]()
-        if tid == 0:
-            # Self-reset for the next launch — no host-side memset needed
-            # between calls (mirrors _ln_dparam_finalize_gpu's scratch
-            # re-zero).
-            scratch_flag[0] = 0
+        d_gamma_ptr[col] = (d_gamma_ptr[col].cast[DType.float32]() + dg).cast[
+            pdtype
+        ]()
+        d_beta_ptr[col] = (d_beta_ptr[col].cast[DType.float32]() + db).cast[
+            pdtype
+        ]()
 
 
 @always_inline
@@ -2366,18 +2341,32 @@ def layernorm_fused_residual_bwd[
             Int(batch_size * seq_len * channels),
         )
     elif is_gpu[target]():
-        # GPU: a single fused kernel (_layernorm_bwd_fused_gpu) computes
-        # d_input, the resid_in seed (HAS_RESID_IN), and dgamma/dbeta in one
-        # pass — see that kernel's docstring for the full design (modeled on
-        # llm.c's layernorm_backward_kernel10). This replaces what used to
-        # be up to 3 kernels here (the d_input+broadcast kernel plus the
-        # dparam accum/finalize pair) and, at each train_gpt2.mojo call
-        # site, a 4th kernel (the separate `residual_grad_broadcast` launch
-        # that used to seed d_inp1/d_inp2 before this function ran).
+        # GPU: a 2-kernel fused LN backward. The MAIN kernel
+        # (_layernorm_bwd_fused_gpu) computes d_input, folds the resid_in seed
+        # (HAS_RESID_IN), and reduces dgamma/dbeta into per-block scratch
+        # partials in one sweep; a tiny, fully parallel finalize kernel
+        # (_ln_bwd_fused_finalize_gpu) then sums those partials into
+        # d_gamma/d_beta. Together they replace what used to be up to 3 kernels
+        # here (the d_input+broadcast kernel plus the dparam accum/finalize
+        # pair) and, at each train_gpt2.mojo call site, a 4th kernel (the
+        # separate `residual_grad_broadcast` launch). The first single-kernel
+        # attempt (edd2b67) folded the finalize INTO the main kernel via a
+        # "last block finalizes" serial tail that ncu showed cost ~60% of its
+        # wall time (one SM busy, 47 idle) and, with a 16 KB/block dgamma/dbeta
+        # shared array, capped occupancy at 50% — both regressions this
+        # 2-kernel + register-accumulate design removes.
         comptime BLOCK_SIZE = 256
-        comptime SM_OVERPROVISION = 32
+        # One wave at the register-bound residency (ncu: 3 blocks/SM at 72
+        # reg/thread -> 3*num_sm fully saturates every SM in a single wave).
+        # Fewer blocks means fewer per-block dgamma/dbeta partials, which
+        # directly shrinks BOTH the main kernel's channel-major scratch flush
+        # (a strided write whose cost scales with the block count) and the
+        # finalize's per-channel reduction. The first attempt used 32 (1536
+        # blocks) — 5x the partials and a matching flush/finalize tax.
+        comptime SM_OVERPROVISION = 3
         comptime width = 4
         comptime CHANNELS_CAP = 2048
+        comptime FINALIZE_BLOCK = 256
         var device_ctx = ctx
         var num_rows = Int(batch_size * seq_len)
         var ch = Int(channels)
@@ -2401,10 +2390,10 @@ def layernorm_fused_residual_bwd[
         )
         var scratch_dgamma = dparam_scratch
         var scratch_dbeta = dparam_scratch + blocks_cap * CHANNELS_CAP
-        var flag_scratch = _ln_bwd_flag_scratch(device_ctx)
 
-        # Same aligned/scalar-fallback host dispatch as the kernels this
-        # replaces; see _layernorm_bwd_fused_gpu's docstring.
+        # Pass 1 (main): d_input + resid seed + per-block dgamma/dbeta partials.
+        # Same aligned/scalar-fallback dispatch as the kernels this replaces;
+        # see _layernorm_bwd_fused_gpu's docstring.
         if ch % width == 0:
             comptime fused_k = _layernorm_bwd_fused_gpu[
                 dtype,
@@ -2412,7 +2401,6 @@ def layernorm_fused_residual_bwd[
                 width,
                 aligned=True,
                 HAS_RESID_IN=HAS_RESID_IN,
-                pdtype=pdtype,
                 CHANNELS_CAP=CHANNELS_CAP,
             ]
             var compiled = device_ctx.compile_function[fused_k]()
@@ -2426,13 +2414,11 @@ def layernorm_fused_residual_bwd[
                 resid_in_ptr,
                 d_inp1_ptr,
                 d_inp2_ptr,
-                d_gamma_ptr,
-                d_beta_ptr,
                 scratch_dgamma,
                 scratch_dbeta,
-                flag_scratch,
                 num_rows,
                 ch,
+                blocks_cap,
                 grid_dim=(num_row_blocks,),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -2443,7 +2429,6 @@ def layernorm_fused_residual_bwd[
                 width,
                 aligned=False,
                 HAS_RESID_IN=HAS_RESID_IN,
-                pdtype=pdtype,
                 CHANNELS_CAP=CHANNELS_CAP,
             ]
             var compiled_u = device_ctx.compile_function[fused_k_u]()
@@ -2457,16 +2442,33 @@ def layernorm_fused_residual_bwd[
                 resid_in_ptr,
                 d_inp1_ptr,
                 d_inp2_ptr,
-                d_gamma_ptr,
-                d_beta_ptr,
                 scratch_dgamma,
                 scratch_dbeta,
-                flag_scratch,
                 num_rows,
                 ch,
+                blocks_cap,
                 grid_dim=(num_row_blocks,),
                 block_dim=(BLOCK_SIZE,),
             )
+
+        # Pass 2 (finalize): deterministic parallel reduction of the
+        # num_row_blocks per-block partials into d_gamma/d_beta — ONE BLOCK PER
+        # CHANNEL (grid.x == channels) so every SM stays busy, reading each
+        # channel's contiguous partials coalesced. Replaces the first attempt's
+        # serial single-block in-kernel finalize.
+        comptime finalize_k = _ln_bwd_fused_finalize_gpu[pdtype, FINALIZE_BLOCK]
+        var fcompiled = device_ctx.compile_function[finalize_k]()
+        device_ctx.enqueue_function(
+            fcompiled,
+            d_gamma_ptr,
+            d_beta_ptr,
+            scratch_dgamma,
+            scratch_dbeta,
+            num_row_blocks,
+            blocks_cap,
+            grid_dim=(max(ch, 1),),
+            block_dim=(FINALIZE_BLOCK,),
+        )
     else:
         raise Error("Invalid target")
 
