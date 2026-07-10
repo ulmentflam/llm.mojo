@@ -16,6 +16,7 @@ pass will consume. Properties beyond plain closeness:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -49,10 +50,16 @@ class Case:
     # anything (see _device_for_case below) — independent of the module's
     # shared pick_device()/MAX_USE_ACCELERATOR default, which stays CPU.
     prefer_accelerator: bool = False
+    # True for cases that must run on CPU specifically, e.g. to deliberately
+    # exercise attention_fwd_cpu rather than relying on it as an accidental
+    # fallback when no accelerator happens to be present. Takes precedence
+    # over prefer_accelerator if both are somehow set on the same case.
+    force_cpu: bool = False
 
 
 def _device_for_case(case: "Case"):
-    """Device override for cases that specifically need the accelerator.
+    """Device override for cases that specifically need the accelerator, or
+    specifically need to be pinned to CPU.
 
     Most cases pass `device=None` to run_custom_op, which falls back to the
     shared `pick_device()` default (CPU unless MAX_USE_ACCELERATOR=1 — see
@@ -68,11 +75,28 @@ def _device_for_case(case: "Case"):
     everywhere, but only the GPU run actually exercises (and proves the fix
     for) attention_fwd_gemm's _attention_softmax_causal_gpu. Don't mistake
     a green CPU-fallback run for regression coverage.
+
+    Two ways to deliberately exercise attention_fwd_cpu (not just as an
+    accidental byproduct of missing hardware) even on a machine that has an
+    accelerator available:
+      1. Set LLMM_TEST_FORCE_CPU=1 in the environment — pins EVERY case in
+         this module (including prefer_accelerator=True ones) to CPU,
+         regardless of what hardware is present. Matches this repo's
+         existing LLMM_-prefixed env var convention (see LLMM_USE_CPU,
+         LLMM_FORCE_PORTABLE_GPU, LLMM_DISABLE_METAL elsewhere).
+      2. Cases with force_cpu=True (e.g. the *_cpu_forced variants below)
+         always run on CPU, every invocation, with no env var needed — so
+         CI exercises attention_fwd_cpu on these shapes by default, not
+         only when a developer remembers to opt in.
     """
-    if not case.prefer_accelerator:
-        return None
     from max.driver import CPU, Accelerator, accelerator_count
 
+    if os.environ.get("LLMM_TEST_FORCE_CPU"):
+        return CPU()
+    if case.force_cpu:
+        return CPU()
+    if not case.prefer_accelerator:
+        return None
     return Accelerator() if accelerator_count() > 0 else CPU()
 
 
@@ -174,6 +198,34 @@ CASES: tuple[Case, ...] = (
         dtype="bfloat16",
         seed=8,
         prefer_accelerator=True,
+    ),
+    # Deliberate CPU-pinned counterparts of the two cases above (force_cpu=
+    # True — see _device_for_case): these always run attention_fwd_cpu on
+    # these exact shapes, every invocation, with no env var needed. This is
+    # the "on-demand, not just an accidental fallback" verification that the
+    # CPU path (which never had the alignment bug — it doesn't share
+    # attention_fwd_gemm's vectorized-load code) legitimately handles
+    # non-8-aligned seq_len correctly too. To force EVERY case in this file
+    # onto CPU instead (not just these two), run with LLMM_TEST_FORCE_CPU=1.
+    Case(
+        "bf16_seq_len_9_unaligned_cpu_forced",
+        batch_size=2,
+        num_heads=4,
+        seq_len=9,
+        head_dim=32,
+        dtype="bfloat16",
+        seed=7,
+        force_cpu=True,
+    ),
+    Case(
+        "bf16_seq_len_17_unaligned_cpu_forced",
+        batch_size=2,
+        num_heads=4,
+        seq_len=17,
+        head_dim=32,
+        dtype="bfloat16",
+        seed=8,
+        force_cpu=True,
     ),
 )
 
