@@ -216,6 +216,41 @@ bindings already in `llmm/matmul.mojo`.
 
 ---
 
+## 6. Empirical dispatch verdict (probe result, 2026-07-10)
+
+**§5's INFERRED sm_120→sm_121 dispatch hop is now CONFIRMED**, by direct
+execution — see `tests/probe_fp4/` for the probe and full writeup
+(`tests/probe_fp4/RESULTS.md`).
+
+A minimal `cublasLtMatmul` call — `CUDA_R_4F_E2M1` A/B operands,
+`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3` block scaling (NVFP4, block=16),
+`f32` accumulate, `bf16` output, 512×512×512 — returns
+`CUBLAS_STATUS_SUCCESS` end-to-end against this box's pixi-pinned
+`libcublasLt.so.12.9.2.10` on the GB10 (sm_121). `cublasLtMatmulAlgoGetHeuristic`
+returns 4 viable algorithms (not empty/degenerate). `nsys profile` confirms
+the GPU executed exactly the kernel identified by static analysis in §1d:
+
+```
+cutlass3x_sm120_bstensorop_s16864gemm_block_scaled_ue4m3xe2m1_ue4m3xe2m1_f32_bf16_bf16_128x128x256_1x1x1_0_tnn_align32_o_vs16_bias_bf16_relu
+```
+
+i.e. the **sm_120-named cubin runs, unmodified, on sm_121 hardware** — no
+`CUBLAS_STATUS_ARCH_MISMATCH`, no silent CPU/emulated fallback. Numeric
+correctness: the GEMM output matches an independent host-side
+software-dequant reference to 4 decimal places (rel L2 = 0.1445 both sides),
+and a same-layout bf16 control GEMM matches the fp32 reference to rel L2 =
+0.0029, confirming the harness itself (transpose/layout convention,
+block-scale swizzle) is correct, not just "it didn't crash."
+
+**Revised path ranking (§4b):** path (1), cuBLASLt FP4 GEMM interop via
+`llmm/matmul.mojo`'s existing bindings, is validated and is the move — add
+`CUDA_R_4F_E2M1` layouts + the `*_SCALE_MODE`/`*_SCALE_POINTER` descriptor
+attributes to `_matmul_cublaslt`. Path (2) (hand-written Mojo `mma.sync` FP4
+kernel) is not needed for dispatch; no driver/toolkit update is required
+either — the already-installed cuBLASLt 12.9.2.10 dispatches correctly today.
+
+---
+
 ## Key citations
 
 - Local: `.pixi/…/max/nn/kernels.py`, `max/nn/quant_ops.py`,
