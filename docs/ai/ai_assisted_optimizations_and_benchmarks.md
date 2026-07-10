@@ -2037,3 +2037,167 @@ root cause instead of re-deriving it.
 ### AI use statement
 
 Written with AI assistance (Claude Code / Sonnet agent), directed by Evan Owen.
+
+## 2026-07-10 — matmul dbias accum vectorization (perf-hunt candidate #2b): real win, still under target
+
+Branch `goal1/dbias-vectorize` (HEAD `e4eb4d5` → this commit), the flagged
+follow-up to the same-day dbias-fusion entry above. That session fused
+`_dbias_accum_gpu` + `_dbias_finalize_gpu` into one launch but found the
+real ~2 ms gap to llm.c's `matmul_backward_bias_kernel9` was the accum
+kernel's **scalar per-thread access pattern** (one column, one element per
+row, per thread), not the extra launch. This session vectorizes that.
+
+### The change
+
+`llmm/matmul.mojo`, `_dbias_fused_gpu` (NVIDIA/`HAS_CUBLAS` path only —
+Metal's `_dbias_accum_gpu`/`_dbias_finalize_gpu` two-launch fallback and the
+CPU path are both untouched): each thread now owns a contiguous
+`width`-wide run of output columns (`width` = one 128-bit transaction — 4
+fp32 lanes or 8 bf16 lanes, via `simd_width_of[dtype]()`, the same idiom
+every other vectorized GPU kernel in this file already uses) instead of a
+single scalar column, loading/accumulating/storing with `SIMD[DType.float32,
+width]` registers — matching llm.c kernel9's `x128 packed_dout =
+load128(dout + global_oc + idx*OC)`. The `[row_blocks, OC]` fp32 scratch
+layout, the threadfence + atomic-counter "last row-block finalizes"
+protocol, and the exact `+=`-vs-`=` accumulate semantics are all preserved
+byte-for-byte — only the accum/finalize loads and stores widen from scalar
+to `width`-wide.
+
+`out_channels % width == 0` is required (checked with a runtime `raise`,
+not a comptime assert, since `oc` is a runtime value) — every bias this
+model produces (768/2304/3072) is a multiple of 8, so this never trips; no
+scalar-tail path was added, to keep the hot loop branch-free (documented in
+both the caller and the kernel).
+
+**A naive 1:1 port (each thread just loads `width` columns, grid unchanged
+otherwise) was 2x SLOWER**, not faster — this took most of the session to
+run down and fix, and is worth recording since the next vectorization pass
+will hit the same trap:
+
+1. **First attempt** divided `block_dim.x` by `width` to hold the column
+   grid (`col_blocks`) fixed. This produced 32-thread (1-warp) blocks for
+   bf16 — occupancy-starved, measured ~10.3 ms vs. the 4.85 ms scalar
+   baseline (~2.1x slower).
+2. **Second attempt** kept `block_dim.x` fixed (the correct idiom, matching
+   `_launch_gelu_fwd_gpu` etc.) and let the column grid shrink by `width`x
+   instead. This under-filled the GPU's 48 SMs (`torch.cuda.get_device_properties`)
+   even worse for the two 768-wide biases (col_blocks shrinks to 1,
+   `16` total blocks) — still ~10.3 ms bf16, confirming the bottleneck was
+   total block count (occupancy), not warp size.
+3. **Third attempt** scaled row-blocks (`grid.y`) up by `width` to
+   compensate for the column-side shrink, restoring total block count.
+   This alone got bf16 back to ~4.9-5.7 ms depending on the exact
+   row-block multiplier tried (0.5x/1x/1.5x/2x of `ROW_BLOCKS * width`) —
+   roughly parity with the scalar baseline, no net win.
+4. **Fourth fix** (kept): the fixed-`BLOCK_SIZE`-threads-per-block column
+   split left the *last* column-block of a call ragged whenever
+   `num_groups = oc / width` didn't divide `BLOCK_SIZE` evenly — e.g.
+   oc=2304 bf16 has `num_groups=288`: one full 256-thread block + one only
+   32/256 (12.5%) active. Re-deriving threads/block as `num_groups` evenly
+   divided by the column-block count (chosen from `num_groups /
+   (BLOCK_SIZE // 2)`, empirically the best divisor of the ones tried —
+   `BLOCK_SIZE` and `BLOCK_SIZE // 4` both measured worse) eliminates that
+   waste — every column-block is now exactly, evenly packed. Combined with
+   the `width`x row-block scaling from step 3, this is the configuration
+   that actually landed a net win over the scalar baseline.
+
+`_dbias_scratch`'s CAP grew from 65536 to `1 << 20` fp32 elements to hold
+the larger `row_blocks * OC` footprint the row-block scaling needs (worst
+case 128 row-blocks × 3072 = 393,216 elements ≈ 1.5 MiB — trivial GPU
+memory, several MiB of headroom kept).
+
+### Correctness
+
+All four gates green on the final configuration:
+
+- **`make verify-gpu`** (strict IEEE, TF32 off): PASS — 16/16 gradient
+  tensors OK (all four dbias grads: `dqkvb`, `dattprojb`, `dfcb`,
+  `dfcprojb`), 10-step loss trajectory LOSS OK at every step.
+- **`make verify-gpu-tf32`**: PASS — same 16/16 + 10-step loss.
+- **`make verify-cpu`**: PASS (CPU dispatch untouched, as expected).
+- **bf16 twin-run** (`build/train_gpt2_bf16 -e d12 -i
+  data/.tinyshakespeare/tiny_shakespeare_train.bin -j
+  .../tiny_shakespeare_val.bin -b 4 -t 1024 -x 10 -a 1 -v 0`, 10-step
+  overfit, seed-42 init), run twice on this branch's build and once on a
+  fresh pre-change (`e4eb4d5`) build in the sibling `goal1/dbias-fusion`
+  worktree:
+
+  | step | post-change run 1 | post-change run 2 | pre-change (`e4eb4d5`) |
+  |---:|---:|---:|---:|
+  | 1 | 10.981078 | 10.981078 | 10.981078 |
+  | 2 | 9.642007 | 9.642064 | 9.642072 |
+  | 3 | 9.168800 | 9.168865 | 9.168860 |
+  | 4 | 9.002511 | 9.002278 | 9.002396 |
+  | 5 | 8.515047 | 8.515013 | 8.514988 |
+  | 6 | 8.215915 | 8.215817 | 8.215840 |
+  | 7 | 7.885343 | 7.885281 | 7.885309 |
+  | 8 | 7.534999 | 7.534940 | 7.534869 |
+  | 9 | 12.026655 | 12.027166 | 12.034834 |
+  | 10 | 7.114125 | 7.115279 | 7.117597 |
+
+  Step 1 identical across all three; steps 2+ show the same small
+  run-to-run wiggle documented in the dbias-fusion entry above (pre-existing
+  `layernorm.mojo` dgamma/dbeta atomics nondeterminism, unrelated to this
+  change — dbias's own reduction order is unchanged and still
+  deterministic: no atomics on the reduced float data, only on the
+  arrival counter). Same step-9 gradient-norm spike (~91-92) in all three
+  runs, no systematic drift.
+
+### Perf: real win on both precisions, short of the acceptance bar
+
+**ncu, same-session before/after (`e4eb4d5` vs this commit, built fresh in
+sibling worktrees), 1-step captures, `make profile-ncu PROFILE_T=1024` /
+`profile-fp32-ncu`, quiet box (0% util, 45-53°C across the session — the
+`/tmp/llmm-gpu.lock` was contended by other agents mid-session, per the
+task brief's warning):**
+
+| precision | metric | before (n=3) | after (n=4) | Δ (mean) |
+|---|---|---:|---:|---:|
+| bf16 | dbias family time | 4848.06 / 4946.75 / 4904.10 µs (mean 4899.6) | 4184.51 / 4226.91 / 4209.50 / 4282.40 µs (mean 4225.8) | **−673.8 µs (−0.67 ms)** |
+| fp32 | dbias family time | 7291.94 / 7258.72 / 7183.39 µs (mean 7244.7) | 5768.93 / 5827.55 / 6004.99 / 5840.00 µs (mean 5860.4) | **−1384.3 µs (−1.38 ms)** |
+
+Launch count unchanged at 48/step for both precisions (confirmed directly
+in the ncu per-kernel table — same as the pre-vectorization fused kernel;
+this pass only changed the kernel's internal access pattern and grid
+shape, not the call count).
+
+**Target NOT fully met** — the acceptance bar was ≥1.5 ms fp32 AND ≥1.0 ms
+bf16 saved. fp32 lands at 1.38 ms (92% of target); bf16 at 0.67 ms (67% of
+target). Both are genuine, reproducible reductions (13-19% off the fused
+scalar kernel's own family time) from a real access-pattern fix, not noise
+— the before/after gap is 5-10x larger than the largest single-precision
+sample spread observed (≤170 µs) — but neither clears the bar the task set
+(which was itself derived from llm.c kernel9's absolute time, 0.9/0.6 ms,
+not from this kernel's own architecture).
+
+**Why the gap to llm.c likely remains:** llm.c's kernel9 has a `grid_size_y
+== 1` fast path (used whenever one grid.y pass can cover all of `B*T`) that
+skips the aux-buffer/second-reduction machinery entirely — no scratch
+buffer, no cross-block reduction, no threadfence. Our kernel always pays
+for the `[row_blocks, OC]` scratch write + threadfence + atomic-counter
+last-block-finalizes protocol (a deliberate, explicit "preserve untouched"
+constraint for this task, since it's shared machinery with the
+dbias-fusion commit and the parallel LN-backward-fusion effort). That
+protocol's fixed per-block overhead is a plausible explanation for why
+pushing total block count up (needed for occupancy after vectorizing)
+didn't translate into savings proportional to the bytes-moved reduction:
+every additional block also pays another threadfence + atomic increment.
+Closing the remaining gap would likely mean revisiting whether the
+threadfence/scratch architecture itself (not just the accum loop) can
+collapse to something closer to kernel9's single-pass, no-aux-buffer case
+for this model's shapes — a larger, architecture-level change flagged here
+as a follow-up (`#2c`) rather than attempted in this task's scope.
+
+### Verdict
+
+Landing anyway, following the same standard as the dbias-fusion commit
+this builds on: a correct, gated (16/16 tensors + bf16 trajectory,
+`make lint` clean), strictly-positive win on both precisions, zero risk to
+Apple Metal (untouched fallback) or CPU (untouched), that measurably closes
+part of the gap to llm.c even though it doesn't clear the bar set at
+session start. Recorded honestly, including the four dead-end grid
+configurations tried en route, so the next dbias pass doesn't re-walk them.
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Sonnet agent), directed by Evan Owen.

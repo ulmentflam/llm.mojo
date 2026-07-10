@@ -891,7 +891,15 @@ def _dbias_scratch(ctx: DeviceContext) raises -> MutKernelPtr[DType.float32]:
     # heap-held via a process global keyed by device id; big enough for any
     # bias width). Zeroed on allocation; the finalize kernel re-zeros it after
     # each use so successive calls start clean.
-    comptime CAP = 65536
+    #
+    # CAP must hold `row_blocks * out_channels` fp32 elements. The
+    # vectorized HAS_CUBLAS fused kernel (`matmul_bias_bwd`) scales
+    # row_blocks up by the vector width (`ROW_BLOCKS * width`, up to 16*8
+    # = 128 for bf16) to keep grid occupancy up after `width`-ing the
+    # column dimension — worst case here is 128 row-blocks * 3072 (the 4C
+    # MLP fc bias) = 393,216 elements (1.5 MiB). 1<<20 leaves >2x headroom
+    # for that plus the portable (Metal) path's unvectorized 16 * 3072.
+    comptime CAP = 1 << 20
     comptime BufType = type_of(ctx.enqueue_create_buffer[DType.float32](1))
     var name = String(t"LLMM_DBIAS_SCRATCH_{ctx.id()}")
     if gp := _get_global_or_null(name):
@@ -914,8 +922,9 @@ def _dbias_counters(ctx: DeviceContext) raises -> MutKernelPtr[DType.int32]:
     # launch grid); zeroed on allocation, and the block that finalizes a
     # column-block resets its own slot back to 0 immediately after use, so no
     # per-call host-side memset is needed (mirrors `_dbias_scratch` below).
-    # CAP=4096 column-blocks is far beyond any OC/256 this model produces
-    # (largest bias is the 4C=3072-wide MLP fc, i.e. 12 column-blocks).
+    # CAP=4096 column-blocks is far beyond any OC/(BLOCK_SIZE*width) this
+    # model produces (largest bias is the 4C=3072-wide MLP fc, i.e. at most
+    # 12 column-blocks pre-vectorization / 3 post-vectorization).
     comptime CAP = 4096
     comptime BufType = type_of(ctx.enqueue_create_buffer[DType.int32](1))
     var name = String(t"LLMM_DBIAS_COUNTERS_{ctx.id()}")
@@ -985,6 +994,7 @@ def _dbias_finalize_gpu[
 def _dbias_fused_gpu[
     dtype: DType,
     accumulate: Bool,
+    width: Int,
 ](
     d_bias_ptr: MutKernelPtr[dtype],
     scratch: MutKernelPtr[DType.float32],
@@ -1008,25 +1018,59 @@ def _dbias_fused_gpu[
     # via shared memory whether it was the last of `row_blocks` arrivals; only
     # that block reads the full column back out of scratch and finalizes.
     #
+    # VECTORIZED (kernel9-style x128/f128 access): each thread now owns a
+    # contiguous `width`-wide run of output columns (width = one 128-bit
+    # transaction: 4 fp32 lanes or 8 bf16 lanes) instead of a single scalar
+    # column. Adjacent threads own adjacent runs, so a warp's row-load lands
+    # in one contiguous, fully-coalesced stretch of `d_output` — matching
+    # llm.c's `x128 packed_dout = load128(dout + global_oc + idx*OC)` in
+    # `matmul_backward_bias_kernel9` (llmc/matmul.cuh:41). The scratch
+    # writes/reads and final dbias write are vectorized the same way (still
+    # the same fp32 `[row_blocks, OC]` scratch layout — just written/read
+    # `width` columns at a time).
+    #
+    # Grid geometry (grid.x column-blocks, grid.y row-blocks, threads/block)
+    # is chosen by the caller (`matmul_bias_bwd`) to keep every column-block
+    # fully packed (no idle threads from `width`-ing the column dimension)
+    # and to keep total block count high enough to fill the GPU's SMs
+    # despite grid.x shrinking by ~`width`× — see the comment there. Launch
+    # count itself (one launch per `matmul_bias_bwd` call, 48/step) is
+    # unchanged from the scalar fused kernel this replaces.
+    #
+    # REQUIRES out_channels % width == 0 (checked by the caller before
+    # launch, not re-checked here — every bias this model produces, C/3C/4C
+    # at 768/2304/3072, is a multiple of 8, so this never trips in practice;
+    # since `col` only ever takes multiples of `width` and out_channels
+    # itself is a multiple of `width`, `col < out_channels` already implies
+    # `col + width <= out_channels`, so no separate ragged-edge/tail branch
+    # is needed here). A future irregular OC would need a scalar-tail path,
+    # deliberately not added here to keep the hot loop branch-free — see the
+    # 2026-07-10 dbias-vectorize writeup in
+    # docs/ai/ai_assisted_optimizations_and_benchmarks.md.
+    #
     # GOTCHA: this relies on `threadfence(Scope.GPU)`, which is NVIDIA-only
     # (comptime-asserts `is_nvidia_gpu()`) — never call this kernel outside a
     # `HAS_CUBLAS` branch (see `matmul_bias_bwd` below); Apple Metal keeps the
     # portable `_dbias_accum_gpu` + `_dbias_finalize_gpu` two-launch path.
     var bx = Int(block_idx.x)
     var by = Int(block_idx.y)
-    var col = bx * Int(block_dim.x) + Int(thread_idx.x)
+    var col = (bx * Int(block_dim.x) + Int(thread_idx.x)) * width
 
     if col < out_channels:
         var r0 = by * row_tile
         var r1 = min(r0 + row_tile, rows)
-        var acc = Scalar[DType.float32](0.0)
+        var acc = SIMD[DType.float32, width](0.0)
         for r in range(r0, r1):
-            acc += d_output_ptr[r * out_channels + col].cast[DType.float32]()
-        scratch[by * out_channels + col] = acc
+            acc += (
+                (d_output_ptr + r * out_channels + col)
+                .load[width=width]()
+                .cast[DType.float32]()
+            )
+        (scratch + by * out_channels + col).store(acc)
 
     # Every thread that may have written above must fence its own write —
     # __threadfence() only orders the calling thread's prior stores, so a
-    # single "leader" fence would not publish the other 255 threads' columns.
+    # single "leader" fence would not publish the other threads' columns.
     threadfence[Scope.GPU]()
 
     var flag = stack_allocation[
@@ -1041,15 +1085,16 @@ def _dbias_fused_gpu[
     if col >= out_channels:
         return
 
-    var total = Scalar[DType.float32](0.0)
+    var total = SIMD[DType.float32, width](0.0)
     for rb in range(row_blocks):
-        total += scratch[rb * out_channels + col]
+        total += (scratch + rb * out_channels + col).load[width=width]()
     comptime if accumulate:
-        d_bias_ptr[col] = (d_bias_ptr[col].cast[DType.float32]() + total).cast[
-            dtype
-        ]()
+        var previous = (
+            (d_bias_ptr + col).load[width=width]().cast[DType.float32]()
+        )
+        (d_bias_ptr + col).store((previous + total).cast[dtype]())
     else:
-        d_bias_ptr[col] = total.cast[dtype]()
+        (d_bias_ptr + col).store(total.cast[dtype]())
 
     # Self-reset: the next call reusing this column-block's counter slot
     # (next layer / next grad-accum micro-batch) must see 0 again. No
@@ -1144,9 +1189,59 @@ def matmul_bias_bwd[
             # matmul_backward_bias_kernel9-style single launch: last row-block
             # to finish a column-block finalizes in-kernel via a threadfence +
             # atomic-counter "last block" flag. NVIDIA-only (threadfence is
-            # CUDA-only) — see `_dbias_fused_gpu`.
+            # CUDA-only) — see `_dbias_fused_gpu`. Vectorized 128-bit-wide
+            # (kernel9's x128/f128 access pattern): `width` = 4 fp32 lanes /
+            # 8 bf16 lanes, same idiom as every other GPU elementwise kernel
+            # in this file (`_launch_gelu_fwd_gpu` etc). Two grid-shape
+            # adjustments beyond "each thread now loads `width` columns
+            # instead of 1", both load-bearing and both found empirically
+            # (see the 2026-07-10 dbias-vectorize writeup in
+            # docs/ai/ai_assisted_optimizations_and_benchmarks.md for the
+            # full sweep — a naive port that just widened per-thread loads
+            # 1:1 was 2x SLOWER, not faster):
+            #
+            # 1. Column-block granularity: widening the per-thread column
+            #    count shrinks the natural column-block count (grid.x) by
+            #    ~`width`×, and with a FIXED BLOCK_SIZE threads/block the
+            #    LAST column-block of a call is often ragged (e.g. oc=2304
+            #    bf16 has num_groups=288 width-8 vectors: one full 256-thread
+            #    block + one only 32/256 = 12.5% active). Re-deriving
+            #    threads/block as `num_groups` evenly divided by the chosen
+            #    column-block count keeps every block fully packed instead
+            #    (288 groups → 2 blocks of 144, zero idle threads). Halving
+            #    BLOCK_SIZE as the block-count divisor (rather than using it
+            #    directly) trades a bit more column parallelism for smaller,
+            #    still-fully-packed blocks — measured faster than both
+            #    BLOCK_SIZE and BLOCK_SIZE//4 on this GPU.
+            # 2. Row-block count: the column-side shrink alone starves
+            #    occupancy — as few as col_blocks=1 * ROW_BLOCKS=16 = 16
+            #    blocks for the 768-wide biases vs this GPU's 48 SMs
+            #    (`torch.cuda.get_device_properties`), which measured ~2x
+            #    SLOWER than the scalar kernel. Scaling row-blocks by
+            #    `width` (`FUSED_ROW_BLOCKS`) restores enough total blocks
+            #    to fill the GPU again — trading `width`× fewer, `width`×
+            #    shorter-row-tile blocks per column for `width`-wide
+            #    per-thread loads, on top of the vectorized-load win.
+            #    Over/under-shooting this factor (tried 0.5x, 1.5x, 2x) both
+            #    measured worse; 1x was the local optimum.
+            comptime width = simd_width_of[dtype]()
+            if oc % width != 0:
+                raise Error(
+                    "matmul_bias_bwd: out_channels ("
+                    + String(oc)
+                    + ") must be a multiple of the dbias vector width ("
+                    + String(width)
+                    + ") — the fused GPU kernel has no scalar-tail path"
+                )
+            # num_groups = number of width-wide column vectors (exact, since
+            # oc % width == 0 is checked above).
+            var num_groups = oc // width
+            var fused_col_blocks = max(ceildiv(num_groups, BLOCK_SIZE // 2), 1)
+            var fused_block_threads = ceildiv(num_groups, fused_col_blocks)
+            comptime FUSED_ROW_BLOCKS = ROW_BLOCKS * width
+            var fused_row_tile = ceildiv(rows, FUSED_ROW_BLOCKS)
             var counters = _dbias_counters(device_ctx)
-            comptime fused_k = _dbias_fused_gpu[dtype, accumulate]
+            comptime fused_k = _dbias_fused_gpu[dtype, accumulate, width]
             var fused_c = device_ctx.compile_function[fused_k]()
             device_ctx.enqueue_function(
                 fused_c,
@@ -1156,10 +1251,10 @@ def matmul_bias_bwd[
                 d_output_ptr,
                 rows,
                 oc,
-                row_tile,
-                ROW_BLOCKS,
-                grid_dim=(col_blocks, ROW_BLOCKS),
-                block_dim=(BLOCK_SIZE,),
+                fused_row_tile,
+                FUSED_ROW_BLOCKS,
+                grid_dim=(fused_col_blocks, FUSED_ROW_BLOCKS),
+                block_dim=(fused_block_threads,),
             )
         else:
             # Portable (Apple Metal) path: two launches — contention-free
