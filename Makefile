@@ -123,6 +123,7 @@ SHELL := /bin/bash
         build-profile build-profile-bf16 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
+        build-infer build-infer-bf16 data-hellaswag eval eval-cpu \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
@@ -168,6 +169,15 @@ help:
 	@echo "  profile-nsys-cpu  Capture a CPU nsys timeline showing all worker threads"
 	@echo "  NOTE: profile-ncu / profile-nsys / profile-llmc-* require NVIDIA Nsight tools"
 	@echo "        and are not available on Apple Silicon (darwin)."
+	@echo ""
+	@echo "Inference & eval:"
+	@echo "  build-infer      Compile infer_gpt2.mojo to build/infer_gpt2 (fp32/CPU-capable)"
+	@echo "  build-infer-bf16 Compile the bf16 (-D LLMM_BF16) inference binary, build/infer_gpt2_bf16"
+	@echo "  data-hellaswag   Download + tokenize the HellaSwag val split (data/hellaswag.py)"
+	@echo "  eval             Build (bf16) + score CHECKPOINT on HellaSwag (default"
+	@echo "                   CHECKPOINT=log124M/model_19552.bin; override on the command line,"
+	@echo "                   e.g. make eval CHECKPOINT=log124M/model_5000.bin EVAL_B=32)"
+	@echo "  eval-cpu         Same as eval, but the fp32/CPU inference binary"
 	@echo ""
 	@echo "Benchmark (vs llm.c submodule on NVIDIA; vs PyTorch MPS on Apple Silicon):"
 	@echo "  build-llmc    Build llm.c CPU (train_gpt2) + CUDA (train_gpt2cu, if nvcc)"
@@ -325,6 +335,25 @@ build-infer-bf16: $(INFER_BIN_BF16)
 $(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
+
+# HellaSwag eval: `make eval` builds the bf16 inference binary, ensures the
+# eval data is tokenized (see data/hellaswag.py), and scores a checkpoint.
+# Override on the command line, e.g. `make eval CHECKPOINT=log124M/model_5000.bin`.
+CHECKPOINT ?= log124M/model_19552.bin
+EVAL_BIN := data/.hellaswag/hellaswag_val.bin
+EVAL_B ?= 64
+EVAL_T ?= 512
+
+data-hellaswag: $(EVAL_BIN)
+
+$(EVAL_BIN):
+	pixi run python data/hellaswag.py
+
+eval: build-infer-bf16 $(EVAL_BIN)
+	./$(INFER_BIN_BF16) --eval $(CHECKPOINT) $(EVAL_BIN) $(EVAL_B) $(EVAL_T)
+
+eval-cpu: build-infer $(EVAL_BIN)
+	./$(INFER_BIN) --eval $(CHECKPOINT) $(EVAL_BIN) $(EVAL_B) $(EVAL_T)
 
 # Tracing build: same harness, with the per-thread kernel instrumentation
 # compiled in via -D LLMM_TRACE=1.
