@@ -22,7 +22,6 @@ from std.gpu.memory import AddressSpace
 from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.intrinsics import threadfence, Scope
 from std.atomic import Atomic
-from std.ffi import _get_global_or_null, external_call
 from std.sys import size_of
 from std.gpu.host._nvidia_cuda import CUDA
 from _cublas.dtype import DataType
@@ -52,7 +51,11 @@ from linalg.matmul.vendor.blas import _get_global_handle, Backend
 
 from llmm.gelu import gelu, gelu_grad, gelu_fwd_gpu, bias_gelu_fwd
 from llmm.profiler import traced_parallelize
-from llmm.memory import ImmutKernelPtr, MutKernelPtr
+from llmm.memory import (
+    ImmutKernelPtr,
+    MutKernelPtr,
+    persistent_device_buffer,
+)
 from llmm.vendor import HAS_CUBLAS, HAS_METAL, USE_TF32
 from llmm.hadamard import hadamard16_fwd_gpu
 from llmm.lowp import (
@@ -158,20 +161,13 @@ def _matmul_bias_act_gpu[
 def _cublaslt_workspace(
     ctx: DeviceContext,
 ) raises -> OpaquePointer[MutAnyOrigin]:
-    # Persistent 32 MB cuBLASLt workspace (allocate-once, heap-held via a
-    # device-keyed process global — mirrors llm.c's single global workspace).
-    comptime BufType = type_of(ctx.enqueue_create_buffer[DType.uint8](1))
-    var name = String(t"LLMM_CUBLASLT_WS_{ctx.id()}")
-    if gp := _get_global_or_null(name):
-        var p = gp.value().bitcast[BufType]()
-        return p[].unsafe_ptr().bitcast[NoneType]().as_unsafe_any_origin()
-    var buf = ctx.enqueue_create_buffer[DType.uint8](_CUBLASLT_WS_BYTES)
-    var hp = alloc[BufType](1)
-    hp.init_pointee_move(buf^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), hp.bitcast[NoneType]()
+    # Persistent 32 MB cuBLASLt workspace (mirrors llm.c's single global
+    # workspace) — allocate-once/process-global mechanics now live in
+    # llmm.memory.persistent_device_buffer (DRY pass F4).
+    var p = persistent_device_buffer[DType.uint8](
+        ctx, "CUBLASLT_WS", _CUBLASLT_WS_BYTES
     )
-    return hp[].unsafe_ptr().bitcast[NoneType]().as_unsafe_any_origin()
+    return p.bitcast[NoneType]().as_unsafe_any_origin()
 
 
 @always_inline
@@ -2293,19 +2289,9 @@ def _dbias_scratch(ctx: DeviceContext) raises -> MutKernelPtr[DType.float32]:
     # MLP fc bias) = 393,216 elements (1.5 MiB). 1<<20 leaves >2x headroom
     # for that plus the portable (Metal) path's unvectorized 16 * 3072.
     comptime CAP = 1 << 20
-    comptime BufType = type_of(ctx.enqueue_create_buffer[DType.float32](1))
-    var name = String(t"LLMM_DBIAS_SCRATCH_{ctx.id()}")
-    if gp := _get_global_or_null(name):
-        var p = gp.value().bitcast[BufType]()
-        return rebind[MutKernelPtr[DType.float32]](p[].unsafe_ptr())
-    var buf = ctx.enqueue_create_buffer[DType.float32](CAP)
-    ctx.enqueue_memset(buf, Float32(0))
-    var hp = alloc[BufType](1)
-    hp.init_pointee_move(buf^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), hp.bitcast[NoneType]()
+    return persistent_device_buffer[DType.float32](
+        ctx, "DBIAS_SCRATCH", CAP, zero=True
     )
-    return rebind[MutKernelPtr[DType.float32]](hp[].unsafe_ptr())
 
 
 def _dbias_counters(ctx: DeviceContext) raises -> MutKernelPtr[DType.int32]:
@@ -2319,19 +2305,9 @@ def _dbias_counters(ctx: DeviceContext) raises -> MutKernelPtr[DType.int32]:
     # model produces (largest bias is the 4C=3072-wide MLP fc, i.e. at most
     # 12 column-blocks pre-vectorization / 3 post-vectorization).
     comptime CAP = 4096
-    comptime BufType = type_of(ctx.enqueue_create_buffer[DType.int32](1))
-    var name = String(t"LLMM_DBIAS_COUNTERS_{ctx.id()}")
-    if gp := _get_global_or_null(name):
-        var p = gp.value().bitcast[BufType]()
-        return rebind[MutKernelPtr[DType.int32]](p[].unsafe_ptr())
-    var buf = ctx.enqueue_create_buffer[DType.int32](CAP)
-    ctx.enqueue_memset(buf, Int32(0))
-    var hp = alloc[BufType](1)
-    hp.init_pointee_move(buf^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), hp.bitcast[NoneType]()
+    return persistent_device_buffer[DType.int32](
+        ctx, "DBIAS_COUNTERS", CAP, zero=True
     )
-    return rebind[MutKernelPtr[DType.int32]](hp[].unsafe_ptr())
 
 
 def _dbias_accum_gpu[

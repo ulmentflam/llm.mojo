@@ -17,11 +17,14 @@ from std.algorithm import sync_parallelize, vectorize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx, barrier
 from std.gpu.memory import AddressSpace
 from std.atomic import Atomic
-from std.ffi import _get_global_or_null, external_call
 from layout import Layout, LayoutTensor
 
 from llmm.profiler import traced_parallelize
-from llmm.memory import ImmutKernelPtr, MutKernelPtr
+from llmm.memory import (
+    ImmutKernelPtr,
+    MutKernelPtr,
+    persistent_device_buffer,
+)
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
@@ -1447,18 +1450,9 @@ def _ln_bwd_dparam_scratch(
     # Never re-zeroed: each block writes its own [0:num_row_blocks) slot in
     # full every launch before the finalize reduction reads it, so stale
     # data outside the active grid (or from a prior launch) is never read.
-    comptime BufType = type_of(ctx.enqueue_create_buffer[DType.float32](1))
-    var name = String(t"LLMM_LN_BWD_DPARAM_SCRATCH_{ctx.id()}")
-    if gp := _get_global_or_null(name):
-        var p = gp.value().bitcast[BufType]()
-        return rebind[MutKernelPtr[DType.float32]](p[].unsafe_ptr())
-    var buf = ctx.enqueue_create_buffer[DType.float32](count)
-    var hp = alloc[BufType](1)
-    hp.init_pointee_move(buf^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), hp.bitcast[NoneType]()
+    return persistent_device_buffer[DType.float32](
+        ctx, "LN_BWD_DPARAM_SCRATCH", count
     )
-    return rebind[MutKernelPtr[DType.float32]](hp[].unsafe_ptr())
 
 
 def _layernorm_bwd_fused_gpu[
@@ -1780,19 +1774,9 @@ def _ln_dparam_scratch(
     # Persistent fp32 scratch holding dgamma partials in [0:cap] and dbeta
     # partials in [cap:2*cap]. Allocate-once (heap-held via a device-keyed
     # process global), zeroed; the finalize kernel re-zeros after each use.
-    comptime BufType = type_of(ctx.enqueue_create_buffer[DType.float32](1))
-    var name = String(t"LLMM_LN_DPARAM_SCRATCH_{ctx.id()}")
-    if gp := _get_global_or_null(name):
-        var p = gp.value().bitcast[BufType]()
-        return rebind[MutKernelPtr[DType.float32]](p[].unsafe_ptr())
-    var buf = ctx.enqueue_create_buffer[DType.float32](2 * cap)
-    ctx.enqueue_memset(buf, Float32(0))
-    var hp = alloc[BufType](1)
-    hp.init_pointee_move(buf^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), hp.bitcast[NoneType]()
+    return persistent_device_buffer[DType.float32](
+        ctx, "LN_DPARAM_SCRATCH", 2 * cap, zero=True
     )
-    return rebind[MutKernelPtr[DType.float32]](hp[].unsafe_ptr())
 
 
 def _ln_dparam_accum_gpu[
