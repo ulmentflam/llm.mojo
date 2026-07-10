@@ -37,14 +37,18 @@ long-running job on top of an already-validated kernel stack.
 - **Learning-rate schedule:** cosine, peak `6e-4` (`-l 0.0006`), 700-step warmup
   (`-u 700`), decayed to exactly `0.0` at step 19,552 (`-q 0.0`), weight decay
   `0.1` (`-c 0.1`).
-- **Launch script:** `scratch/train_fineweb_124M.sh`, supervised by autosentry
-  (a self-healing process supervisor) via `.autosentry/autosentry.yaml` in this
-  repo for crash-resilient checkpoint-resume on restart.
+- **Launch script:** `scratch/train_fineweb_124M.sh` (a one-off script at the
+  time; since generalized into `scripts/run_train_gpt2_bf16.sh` — see
+  [Replication instructions](#replication-instructions) — and `scratch/`
+  removed), supervised by [autosentry](https://github.com/ulmentflam/autosentry)
+  (a self-healing process supervisor) via `.autosentry/autosentry.yaml` in
+  this repo for crash-resilient
+  checkpoint-resume on restart.
 
-All of the flags above were re-checked against the current
-`scratch/train_fineweb_124M.sh` and `.autosentry/autosentry.yaml` (both still
-present and unchanged in content from what the run used) — see
-[Replication instructions](#replication-instructions).
+Every `scratch/*.sh` path named in the incident timeline below is a historical
+reference to a script that existed under that name *at the time these events
+happened*; see [Replication instructions](#replication-instructions) for the
+current, generalized equivalents.
 
 ## Final results
 
@@ -301,39 +305,39 @@ match what's actually in the Makefile/README/scripts today.
    `get_gpt2_encoding()` as of this writing — or tokenization takes days instead
    of under an hour.
 
-3. **Build the bf16 trainer.** As of this writing there is still no dedicated
-   Makefile target for a bf16 build of the full trainer (`build`/`build-train`
-   builds the fp32 `build/train_gpt2`; `build-profile-bf16` only builds the
-   *profiling harness*, `build/profile_gpt2_bf16`, not the trainer). The manual
-   command used for this run, confirmed against the Makefile's own
-   `MOJO_INCLUDES`/`MOJO_LINK_FLAGS`/`WORLD_SIZE` conventions, is:
+3. **Build the bf16 trainer:**
    ```sh
-   pixi run mojo build -D WORLD_SIZE=1 -D LLMM_BF16=1 -I . -Xlinker -lm \
-     -o build/train_gpt2_bf16 train_gpt2.mojo
+   make build-bf16
    ```
-   If a `make build-bf16`-style target has since been added, prefer it — check
-   `make help` / the Makefile's `train`/`build` section first.
+   (At the time this run happened there was no such target; the manual `pixi
+   run mojo build -D WORLD_SIZE=1 -D LLMM_BF16=1 ...` invocation used then has
+   since been folded into the Makefile.)
 
 4. **Launch the run**, ideally under autosentry for crash resilience:
    ```sh
-   scratch/train_fineweb_124M.sh
-   # or, per .autosentry/autosentry.yaml's process.command:
-   autosentry run   # from the repo root, using this repo's .autosentry/autosentry.yaml
+   scripts/run_train_gpt2_bf16.sh \
+     -i "data/.fineweb10B/fineweb_train_*.bin" \
+     -j "data/.fineweb10B/fineweb_val_*.bin" \
+     -e d12 -o log124M -n 1000 -y 1 -b 32 -t 1024 -d 524288 \
+     -l 0.0006 -q 0.0 -u 700 -c 0.1 -v 250 -s 20000 -x -1
+   # supervised, per .autosentry/autosentry.yaml's process.command:
+   scripts/ensure_supervisor.sh   # idempotent — launches `autosentry run` if not already up
    ```
-   Confirmed current contents of `scratch/train_fineweb_124M.sh` match what
-   this run used: `B=32` default (overridable via env), `-e d12`, checkpoints
-   every 1000 steps (`-n 1000`) to `-o log124M`, resume-enabled (`-y 1`),
-   `-t 1024 -d 524288 -l 0.0006 -q 0.0 -u 700 -c 0.1 -v 250`, and **sampling
-   now disabled by default (`-s 0`)** — a change made *because of* incident #3,
-   so a from-fresh-clone replication today will not by default reproduce that
-   crash.
+   This is the exact flag recipe this run used, run via `scratch/train_fineweb_124M.sh`
+   at the time — that script (and the other `scratch/*.sh` operational scripts
+   referenced throughout the incident timeline above) have since been
+   generalized into reusable, parameterized scripts under `scripts/` (no
+   run-specific hyperparameters baked in) and `scratch/` was removed. `-s 0`
+   (sampling disabled) was a temporary stopgap for incident #3, reverted back
+   to `-s 20000` once the underlying kernel bug was fixed — see
+   [`bf16_generation_misaligned_address_bug.md`](bf16_generation_misaligned_address_bug.md).
 
 5. **Budget time.** Expect **~88.8 hours (3.7 days)** of GPU-busy time on a
    single idle GB10 assuming zero interruptions. Budget more wall-clock margin:
    this box has an unexplained history of unclean reboots — `last -x` shows this
    pattern predates this run, back to at least June 22 — so plan for autosentry
-   plus the cron watchdog (`scratch/ensure_autosentry.sh`, now fixed to use an
-   absolute path per commit `cb331e4`) to actually be exercised, not just present.
+   plus a cron watchdog (`scripts/ensure_supervisor.sh` on a `@reboot` and
+   periodic crontab entry) to actually be exercised, not just present.
 
 ---
 

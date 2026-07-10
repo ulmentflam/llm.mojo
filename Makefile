@@ -119,7 +119,7 @@ SHELL := /bin/bash
 
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        typecheck check clean build         build-mojo build-train train train-cpu train-metal \
+        typecheck check clean build         build-mojo build-train build-bf16 train train-cpu train-metal train-bf16 \
         build-profile build-profile-bf16 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
@@ -153,6 +153,8 @@ help:
 	@echo "  train         Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
 	@echo "  train-cpu     Build and run build/train_gpt2 on CPU (LLMM_USE_CPU=1)"
 	@echo "  train-metal   Build (WORLD_SIZE=1) and run on Apple Metal GPU (experimental)"
+	@echo "  build-bf16    Compile train_gpt2.mojo (-D LLMM_BF16) to build/train_gpt2_bf16"
+	@echo "  train-bf16    Build and run build/train_gpt2_bf16 (ARGS=\"...\" for training flags)"
 	@echo ""
 	@echo "Profiling:"
 	@echo "  build-profile Compile profile_gpt2.mojo to build/profile_gpt2"
@@ -296,11 +298,27 @@ $(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
 
+# bf16 mixed-precision training binary (GPU-only — see the bf16-build-needs-
+# gpu-only-dispatch guard in train_gpt2.mojo). All training flags are passed
+# through scripts/run_train_gpt2_bf16.sh; there are no baked-in hyperparameters.
+TRAIN_BIN_BF16 := build/train_gpt2_bf16
+TRAIN_RUNNER_BF16 := scripts/run_train_gpt2_bf16.sh
+
+build-bf16: $(TRAIN_BIN_BF16)
+
+$(TRAIN_BIN_BF16): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_BF16) $(TRAIN_MOJO_SRC)
+
 train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@$(TRAIN_RUNNER)
 
 train-cpu: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@LLMM_USE_CPU=1 $(TRAIN_RUNNER)
+
+# Pass training flags via ARGS, e.g. `make train-bf16 ARGS="-i ... -j ... -e d12 ..."`
+train-bf16: $(TRAIN_BIN_BF16) $(TRAIN_RUNNER_BF16)
+	@$(TRAIN_RUNNER_BF16) $(ARGS)
 
 # Metal (Apple GPU) training: force WORLD_SIZE=1 because multi-GPU collectives
 # are NVIDIA-only. Metal is the default device on Apple Silicon (no extra flags

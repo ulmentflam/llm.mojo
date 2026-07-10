@@ -64,6 +64,15 @@ make train
 
 For additional help, see `make help`.
 
+For a long-running training run you want to survive crashes/reboots
+unattended, supervise it with [autosentry](https://github.com/ulmentflam/autosentry)
+(self-healing process supervisor — checkpoint-resume on restart, OOM
+batch-halving, Claude-agent escalation on unrecognized failures) via this
+repo's `.autosentry/autosentry.yaml`, `scripts/run_train_gpt2_bf16.sh`, and
+`scripts/ensure_supervisor.sh`. See
+[`docs/ai/gpt2_124m_fineweb_training_run.md`](docs/ai/gpt2_124m_fineweb_training_run.md)
+for a full worked example.
+
 ## Benchmarks
 
 Benchmark Results: (NVIDIA DGX Spark)
