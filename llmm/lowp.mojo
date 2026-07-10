@@ -18,8 +18,10 @@ from std.memory import UnsafePointer
 from std.math import ceildiv
 from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
-from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
+from std.gpu.memory import AddressSpace
 from std.sys import simd_width_of, size_of
+from layout import Layout, LayoutTensor
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
@@ -519,6 +521,30 @@ def quantize_devscale[
     )
 
 
+# ===----------------------------------------------------------------------=== #
+# quantize_transpose tiling constants (Optimization A, docs/ai/
+# ai_assisted_optimizations_and_benchmarks.md 2026-07-10 fp8-quant-opt entry).
+#
+# The original `_quantize_transpose_kernel` was one-thread-one-element:
+# `out_ptr[c * rows + r] = encode(...)` with `c = idx % cols` varying fastest
+# across a warp. Consecutive threads (consecutive `idx`, hence mostly
+# consecutive `c`) write to addresses `rows` elements apart — a
+# severely uncoalesced strided store (confirmed empirically: this kernel ran
+# ~4.3-4.9x slower than the byte-equivalent non-transposed `quantize` kernel
+# on the SAME tensors, an artifact fully attributable to the write pattern
+# since the per-element compute — `encode_fp8` — is identical). This tile
+# body fixes it with the same 32x32 shared-memory-tile transpose pattern
+# already proven in this file's `_gpu_transpose_add_into_kernel` (32x33
+# padded stride to dodge shared-memory bank conflicts on the transposed
+# read/write, coalesced global read AND write). See the diagnosis entry for
+# the measured before/after.
+# ===----------------------------------------------------------------------=== #
+
+comptime _QT_TILE = 32
+comptime _QT_STRIDE = _QT_TILE + 1  # +1 padding avoids shared-mem bank conflicts
+comptime _QT_BLOCK = 256  # ROW_STEP = _QT_BLOCK // _QT_TILE = 8
+
+
 def _quantize_transpose_kernel[
     in_dtype: DType, out_dtype: DType, mode: Int
 ](
@@ -528,12 +554,55 @@ def _quantize_transpose_kernel[
     rows: Int,
     cols: Int,
 ) -> None:
-    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
-    if idx < rows * cols:
-        var r = idx // cols
-        var c = idx % cols
-        var v = in_ptr[idx].cast[DType.float32]() * scale
-        out_ptr[c * rows + r] = encode_fp8[out_dtype, mode](v)
+    var tile = LayoutTensor[
+        in_dtype,
+        Layout.row_major(_QT_TILE, _QT_STRIDE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var tiles_rows = ceildiv(rows, _QT_TILE)
+    var tiles_cols = ceildiv(cols, _QT_TILE)
+    var total_tiles = tiles_rows * tiles_cols
+
+    var tx = Int(thread_idx.x) % _QT_TILE
+    var ty = Int(thread_idx.x) // _QT_TILE
+    comptime ROW_STEP = _QT_BLOCK // _QT_TILE
+
+    var bt = Int(block_idx.x)
+    while bt < total_tiles:
+        var tile_r = (bt // tiles_cols) * _QT_TILE
+        var tile_c = (bt % tiles_cols) * _QT_TILE
+
+        # Phase 1 — coalesced load from in_ptr [rows,cols] into shared tile.
+        # Thread tx reads column (tile_c+tx); consecutive tx -> consecutive
+        # in_ptr addresses -> coalesced. Guard is inside the loop (not around
+        # the whole body) so every thread still reaches the barrier below.
+        var r = ty
+        while r < _QT_TILE:
+            var gr = tile_r + r
+            var gc = tile_c + tx
+            if gr < rows and gc < cols:
+                tile.ptr[r * _QT_STRIDE + tx] = in_ptr[gr * cols + gc]
+            r += ROW_STEP
+        barrier()
+
+        # Phase 2 — transposed, coalesced write to out_ptr [cols,rows].
+        # Thread tx writes out row (tile_c+r) at column (tile_r+tx);
+        # consecutive tx -> consecutive out_ptr addresses -> coalesced.
+        r = ty
+        while r < _QT_TILE:
+            var goc = tile_c + r  # out row index == in col index
+            var gor = tile_r + tx  # out col index == in row index
+            if goc < cols and gor < rows:
+                var v = (
+                    tile.ptr[tx * _QT_STRIDE + r].cast[DType.float32]() * scale
+                )
+                out_ptr[goc * rows + gor] = encode_fp8[out_dtype, mode](v)
+            r += ROW_STEP
+        barrier()
+
+        bt += Int(grid_dim.x)
 
 
 def quantize_transpose[
@@ -566,12 +635,16 @@ def quantize_transpose[
     fp8 copy, which this fused kernel produces directly from the bf16 source
     (skipping a separate bf16-scratch transpose pass).
 
+    Uses a 32x32 shared-memory tile transpose (Optimization A) so both the
+    global read and the global write are coalesced — see the module comment
+    above `_quantize_transpose_kernel`.
+
     GPU-only, same reasoning as `quantize`.
     """
     comptime assert is_gpu[target](), "quantize_transpose is GPU-only"
-    comptime BLOCK_SIZE = 256
-    var total = rows * cols
-    var num_blocks = ceildiv(total, BLOCK_SIZE)
+    var tiles_rows = ceildiv(rows, _QT_TILE)
+    var tiles_cols = ceildiv(cols, _QT_TILE)
+    var num_blocks = tiles_rows * tiles_cols
     comptime kmode = RoundMode.SR if spec.stochastic_rounding else RoundMode.RNE
     comptime kernel = _quantize_transpose_kernel[in_dtype, out_dtype, kmode]
     var compiled = ctx.compile_function[kernel]()
@@ -583,7 +656,7 @@ def quantize_transpose[
         rows,
         cols,
         grid_dim=(num_blocks,),
-        block_dim=(BLOCK_SIZE,),
+        block_dim=(_QT_BLOCK,),
     )
 
 
@@ -596,12 +669,54 @@ def _quantize_transpose_kernel_devscale[
     rows: Int,
     cols: Int,
 ) -> None:
-    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
-    if idx < rows * cols:
-        var r = idx // cols
-        var c = idx % cols
-        var v = in_ptr[idx].cast[DType.float32]() * scale_ptr[0]
-        out_ptr[c * rows + r] = encode_fp8[out_dtype, mode](v)
+    # Same 32x32 shared-memory tile transpose as `_quantize_transpose_kernel`
+    # (Optimization A) — only the scale source differs (device pointer,
+    # dereferenced once per thread here rather than passed as a launch
+    # scalar; a broadcast read of one device fp32, negligible next to the
+    # tile's own global traffic).
+    var scale = scale_ptr[0]
+    var tile = LayoutTensor[
+        in_dtype,
+        Layout.row_major(_QT_TILE, _QT_STRIDE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var tiles_rows = ceildiv(rows, _QT_TILE)
+    var tiles_cols = ceildiv(cols, _QT_TILE)
+    var total_tiles = tiles_rows * tiles_cols
+
+    var tx = Int(thread_idx.x) % _QT_TILE
+    var ty = Int(thread_idx.x) // _QT_TILE
+    comptime ROW_STEP = _QT_BLOCK // _QT_TILE
+
+    var bt = Int(block_idx.x)
+    while bt < total_tiles:
+        var tile_r = (bt // tiles_cols) * _QT_TILE
+        var tile_c = (bt % tiles_cols) * _QT_TILE
+
+        var r = ty
+        while r < _QT_TILE:
+            var gr = tile_r + r
+            var gc = tile_c + tx
+            if gr < rows and gc < cols:
+                tile.ptr[r * _QT_STRIDE + tx] = in_ptr[gr * cols + gc]
+            r += ROW_STEP
+        barrier()
+
+        r = ty
+        while r < _QT_TILE:
+            var goc = tile_c + r
+            var gor = tile_r + tx
+            if goc < cols and gor < rows:
+                var v = (
+                    tile.ptr[tx * _QT_STRIDE + r].cast[DType.float32]() * scale
+                )
+                out_ptr[goc * rows + gor] = encode_fp8[out_dtype, mode](v)
+            r += ROW_STEP
+        barrier()
+
+        bt += Int(grid_dim.x)
 
 
 def quantize_transpose_devscale[
@@ -623,12 +738,13 @@ def quantize_transpose_devscale[
     `lowp_gemm`'s docstring in llmm/matmul.mojo), but Chunk E's dgrad/wgrad
     orientations need a transposed fp8 copy AND a device-resident scale, so
     this twin is provided here alongside `quantize_devscale` rather than
-    left for Chunk E to duplicate.
+    left for Chunk E to duplicate. Uses the same 32x32 shared-memory tile
+    transpose as `quantize_transpose` (Optimization A).
     """
     comptime assert is_gpu[target](), "quantize_transpose_devscale is GPU-only"
-    comptime BLOCK_SIZE = 256
-    var total = rows * cols
-    var num_blocks = ceildiv(total, BLOCK_SIZE)
+    var tiles_rows = ceildiv(rows, _QT_TILE)
+    var tiles_cols = ceildiv(cols, _QT_TILE)
+    var num_blocks = tiles_rows * tiles_cols
     comptime kmode = RoundMode.SR if spec.stochastic_rounding else RoundMode.RNE
     comptime kernel = _quantize_transpose_kernel_devscale[
         in_dtype, out_dtype, kmode
@@ -642,7 +758,7 @@ def quantize_transpose_devscale[
         rows,
         cols,
         grid_dim=(num_blocks,),
-        block_dim=(BLOCK_SIZE,),
+        block_dim=(_QT_BLOCK,),
     )
 
 

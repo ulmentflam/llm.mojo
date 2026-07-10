@@ -1852,3 +1852,175 @@ per-site quantize launches (12 sites/step × forward+backward), or quantize dire
 from the bf16 GEMM epilogue instead of as a separate kernel. Until then, fp8 is a
 **correct, gated, but not-yet-faster** milestone — same conclusion the design
 document flagged as the realistic worst case.
+
+---
+
+## 2026-07-10 (continued) — FP8 quantize-family optimization pass (goal2/fp8-quant-opt)
+
+Follow-on to Chunk F above: attacks the 32.8%-of-GPU-time quantize/amax/scale
+family, `quantize_transpose` above all. Method mirrors the LN-backward
+redesign entry (`goal1/ln-bwd-fusion`, same date): diagnose with `ncu`
+before coding, fix the cheapest/highest-confidence lever first, re-measure,
+commit each optimization separately. Worktree `llmm-goal2-qopt`, branch
+`goal2/fp8-quant-opt`, off Chunk F's `b98ce9f`.
+
+### Diagnosis
+
+**Environment constraint:** this box has no passwordless `sudo`, and ncu's
+hardware performance counters (occupancy, stall reasons, L1TEX/DRAM
+throughput — the metrics the LN-backward entry used) are gated to admin
+users on this driver config; `--sudo` is unavailable here (`ncu --metrics
+...` without it reports DRAM r/w and tensor% as blank, timing only — same
+"no perf-counter access" note Chunk F's own profile carried). The diagnosis
+below is therefore built from (a) the *code itself* — the write-address
+pattern is unambiguous — and (b) an ncu **timing** comparison between
+`quantize_transpose` and its non-transposed sibling `quantize` on the *same*
+tensors (weight, input) at the *same* total element count, which isolates
+the write pattern's cost since the per-element compute (`encode_fp8`) is
+byte-for-byte identical between the two kernels.
+
+**1. Code-level verdict: `quantize_transpose` is uncoalesced by construction.**
+The pre-optimization kernel (`llmm/lowp.mojo`, `_quantize_transpose_kernel`)
+was one-thread-one-element:
+```
+var idx = block_idx.x * block_dim.x + thread_idx.x
+var r = idx // cols
+var c = idx % cols
+out_ptr[c * rows + r] = encode_fp8(...)   # out is [cols, rows] row-major
+```
+Consecutive threads (consecutive `idx`, hence — within a row — consecutive
+`c`) write to addresses `rows` elements apart (`c*rows+r`, `c` varying,
+`r` fixed within a warp for `cols >= 32`). For this build's tensor shapes
+(`rows`/`cols` in the hundreds to low thousands), that is a maximally
+strided store: a 32-wide warp touches 32 different 128B-aligned cache lines
+instead of one, the textbook uncoalesced-write signature.
+
+**2. Timing confirms it — quantize_transpose ran 4.3-4.9x slower than
+byte-equivalent non-transposed quantize** (1-step `ncu`, `PROFILE_T=1024`,
+`make profile-ncu PROFILE_PROF_BIN=build/profile_gpt2_fp8 PROFILE_T=1024`
+— the same command Chunk F used, re-run here for a clean baseline
+measurement on this worktree's HEAD `b98ce9f`):
+
+| kernel (source tensor identity) | calls | total µs | µs/call |
+|---|---:|---:|---:|
+| `quantize_transpose`, E4M3 (weight-T dgrad + input-T wgrad) | 96 | 27,102.0 | 282.3 |
+| `quantize` (natural), E4M3 (weight fwd + input fwd) | 96 | 5,532.6 | 57.6 |
+| **ratio (same tensors, same element counts, same encode path)** | | | **4.90x** |
+| `quantize_transpose`, E5M2 (d_output-T wgrad) | 48 | 24,852.4 | 517.8 |
+| `quantize` (natural), E5M2 (d_output dgrad) | 48 | 5,766.2 | 120.1 |
+| **ratio** | | | **4.31x** |
+
+Since `quantize`/`quantize_transpose` process the exact same tensor
+identities at the exact same total byte count (only the output layout
+differs), and the per-element math is identical, this ~4.3-4.9x gap is
+attributable entirely to the write access pattern — direct, counter-free
+confirmation of the code-level diagnosis. Full pre-optimization kernel
+table (48 distinct kernels, 1,454 launches, 215,626.53 µs total GPU time
+this run — 0.3% run-to-run noise vs Chunk F's 214,964 µs):
+
+| kernel | calls | µs | % of total |
+|---|---:|---:|---:|
+| `quantize_transpose` (E4M3) | 96 | 27,102.0 | 12.6% |
+| `quantize_transpose` (E5M2) | 48 | 24,852.4 | 11.5% |
+| `quantize` (E4M3) | 96 | 5,532.6 | 2.6% |
+| `quantize` (E5M2) | 48 | 5,766.2 | 2.7% |
+| `amax_partial_gpu` | 144 | 5,919.2 | 2.7% |
+| `amax_aggregate_gpu` | 144 | 462.6 | 0.2% |
+| `update_scale_gpu` | 144 | 390.2 | 0.2% |
+| `amax_state_init_gpu` | 144 | 306.1 | 0.1% |
+| **quantize family total** | | **70,331.3** | **32.6%** |
+
+**3. Redundancy map** (derived from `llmm/matmul.mojo`'s `matmul_fwd_lowp`/
+`matmul_bwd_lowp`/`lowp_gemm_devscale` call graph, 4 GEMM sites/layer x 12
+layers = 48 sites): every step, per site, 6 quantize-family kernel launches
+run over only 3 distinct (tensor, scale) pairs:
+
+| tensor | natural quantize (site) | transposed quantize (site) | same scale? |
+|---|---|---|---|
+| weight | fwd (`matmul_fwd_lowp`, A-role) | dgrad (`matmul_d_input_bwd_lowp`, A-role) | yes — `weight_state`, not re-`update_scale`d between fwd and dgrad |
+| input | fwd (`matmul_fwd_lowp`, B-role) | wgrad (`matmul_d_weight_bwd_lowp`, A-role) | yes — `input_state`, ditto |
+| d_output | dgrad (`matmul_d_input_bwd_lowp`, B-role) | wgrad (`matmul_d_weight_bwd_lowp`, B-role) | yes — `doutput_state.update_scale` called exactly once in `matmul_bwd_lowp`, both sub-calls read it read-only |
+
+Each pair is read from its bf16 source **twice** (once by `quantize`, once
+by `quantize_transpose`) at the *same* scale — a fully redundant second
+global-memory pass per pair, exactly the "known suspects" the mission
+brief flagged. `weight`/`input`'s redundant pair crosses the forward/
+backward call boundary (would need a persistent per-layer fp8 cache to
+fuse — bigger surgery, deferred, see Optimization D discussion below);
+`d_output`'s pair is entirely local to one call of `matmul_bwd_lowp`
+(both `matmul_d_input_bwd_lowp` and `matmul_d_weight_bwd_lowp` are called
+from there) and needs no cross-call state.
+
+### Optimization A — coalesce `quantize_transpose` with a shared-memory tile transpose
+
+Rewrote `_quantize_transpose_kernel`/`_quantize_transpose_kernel_devscale`
+(`llmm/lowp.mojo`) from one-thread-one-element to the same 32x32
+shared-memory-tile transpose pattern already proven correct and fast
+elsewhere in this codebase (`llmm/matmul.mojo`'s
+`_gpu_transpose_add_into_kernel`, P14/P15 gotchas): 32x33-padded tile
+(the `+1` dodges shared-memory bank conflicts on the transposed read),
+phase 1 coalesced-reads a tile into shared memory, `barrier()`, phase 2
+coalesced-writes the transposed tile to global memory. Both the global
+READ and the global WRITE are now coalesced; the encode math
+(`encode_fp8`) and its call site are untouched — same manual
+integer/fp32 bit-twiddling GPU-safe encoder as before, same per-element
+values computed in the same order (each output element is still
+`encode(in[r,c] * scale)`), just reorganized across threads/tiles rather
+than one-thread-one-element. Purely a memory-access-pattern change: no
+scaling semantics, no rounding, no numerics touched. `quantize`/
+`quantize_devscale` (the non-transposed kernels, already coalesced by
+construction — consecutive threads already read/write consecutive
+addresses) are untouched. No call-site changes in `llmm/matmul.mojo` or
+`train_gpt2.mojo` — `quantize_transpose[_devscale]`'s signature is
+unchanged, only its internal kernel body and launch grid (now
+`ceildiv(rows,32) * ceildiv(cols,32)` tiles instead of
+`ceildiv(rows*cols,256)` elements) changed.
+
+**Gates:**
+
+| gate | result |
+|---|---|
+| `tests/test_lowp_gemm.mojo` (10 tests, incl. `test_quantize_transpose_matches_manual`) | PASS |
+| `tests/test_amax.mojo` (19 tests) | PASS |
+| `tests/test_lowp_bwd.mojo` (5 tests) | PASS |
+| `tests/test_matmul_fwd_lowp.mojo` (4 tests) | PASS |
+| `make verify-fp8-grads` | PASS — cosine min 0.9366 / median 0.9870 / max 0.9993; relL2 min 0.0412 / median 0.1742 / max 0.4616 (n=148) — **identical to pre-optimization Chunk F numbers to 4 decimal places**, confirming zero numerical impact |
+| fp8 10-step bit-identical twin run (same checkpoint/data/seed, `-b 4 -t 1024 -x 10 -v 5 -s 0`) | PASS — `diff` over both runs' `step N \| loss ... \| norm ...` lines: **zero differences** |
+| `make build` / `build-bf16` / `build-fp8` / `build-profile-fp8` | all 4 compile clean |
+
+**Measured deltas** (1-step `ncu`, `PROFILE_T=1024`, same command as the
+diagnosis run above, post-Optimization-A):
+
+| kernel | calls | µs (before) | µs (after) | Δ |
+|---|---:|---:|---:|---:|
+| `quantize_transpose` (E4M3) | 96 | 27,102.0 | 7,854.9 | **-71.0%** |
+| `quantize_transpose` (E5M2) | 48 | 24,852.4 | 7,741.5 | **-68.8%** |
+| `quantize` (E4M3, unchanged) | 96 | 5,532.6 | 5,553.4 | noise |
+| `quantize` (E5M2, unchanged) | 48 | 5,766.2 | 5,804.4 | noise |
+| `amax_*` family (unchanged) | 576 | 7,006.1 | 7,017.7 | noise |
+| **quantize family total** | | **70,331.3** | **33,972.0** | **-51.7%** |
+| **quantize family % of total GPU time** | | 32.6% | **19.0%** | |
+| **Total GPU time (1 step)** | | 215,626.5 | **178,547.2** | **-17.2%** |
+
+`quantize_transpose` alone dropped from 24.1% to 8.7% of total fp8 GPU
+time (E4M3+E5M2 combined: 51,954 -> 15,596 µs, a **3.33x** speedup) —
+matching the ~4.3-4.9x uncoalesced-write tax measured in the diagnosis
+(not quite the full ratio, since the tiled kernel has its own small fixed
+overhead — barriers, tile-boundary guards — that the naive kernel didn't
+pay, and a small fraction of `quantize_transpose`'s original cost was
+never write-bound to begin with).
+
+**Wall-clock** (interleaved rounds, arm order flipped each round, n=25
+measured steps/arm/round after excluding each round's step 1, same
+FineWeb checkpoint/shards/B/T as Chunk F, `-x 26 -v 0 -s 0`):
+
+| arm | round 1 median | round 2 median | combined median (n=50) |
+|---|---:|---:|---:|
+| fp8 (Optimization A) | 155.69 ms | 154.60 ms | **155.06 ms** |
+| bf16 (baseline, unchanged) | 135.24 ms | 135.83 ms | **135.47 ms** |
+| **fp8/bf16 ratio** | | | **1.145x** (was 1.363x pre-optimization) |
+
+**fp8 step time: 183.7 ms -> 155.06 ms, a 15.6% reduction from
+Optimization A alone** — right at the primary target (<=155 ms). The
+ambitious target (<=145 ms) is not yet reached; see Optimization B below
+for the next lever attempted.

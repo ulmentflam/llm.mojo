@@ -471,6 +471,33 @@ orientation that needs a transpose at all).
 
 ---
 
+## FP8 quantize-family optimization (goal2/fp8-quant-opt branch)
+
+### G1 — no passwordless sudo on this box means no ncu hardware counters; use timing-only comparisons instead
+
+**What:** `ncu --metrics dram__bytes_read.sum,...` (and `--sudo`) require elevated
+GPU performance-counter access; this box's driver gates that to admin users and
+there is no passwordless `sudo` available (`sudo -n true` fails). Without it, ncu's
+DRAM/tensor/occupancy/stall columns are blank ("n/a") — only per-kernel wall time
+and call counts are available (same limitation Chunk F's own profile silently hit).
+
+**Workaround:** for a memory-access-pattern diagnosis (e.g. "is this kernel's store
+uncoalesced?"), compare wall-clock time between two kernels that process the *same*
+tensor identities at the *same* element count with *identical* per-element compute,
+differing only in the access pattern under suspicion. `quantize_transpose` vs.
+`quantize` (same weight/input/d_output tensors, same `encode_fp8` per-element math,
+differing only in whether the store is transposed) gave a clean 4.3-4.9x gap
+attributable entirely to the write pattern — as diagnostic as an occupancy/stall
+table would have been for this specific question, just derived differently. Static
+code reading (the write address formula) is the other free source of truth this
+worktree relied on to reach a confident diagnosis without hardware counters — see
+the 2026-07-10 quant-opt entry in `ai_assisted_optimizations_and_benchmarks.md`.
+
+**Source:** FP8 quant-opt Optimization A diagnosis, 2026-07-10 (worktree
+`llmm-goal2-qopt`, branch `goal2/fp8-quant-opt`).
+
+---
+
 ## Section summary
 
 | Section | Items | Status |
@@ -481,6 +508,7 @@ orientation that needs a transpose at all).
 | ARCHITECTURE | A1–A3 | A1–A2: design doc confirmed; A3: agent-reported |
 | FP8 CHUNK D/E | E1–E5 | Verified (E5: root-cause investigation, coordinator-accepted recalibration) |
 | FP8 CHUNK F | F1–F4 | Verified (gate codified + PASS, bit-stability PASS, 50-step envelope PASS, perf measured) |
+| FP8 QUANT-OPT | G1 | Verified (ncu sudo-gated counters, timing-comparison workaround) |
 
 ---
 
