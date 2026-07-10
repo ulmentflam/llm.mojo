@@ -34,6 +34,8 @@ from llmm.amax import (
 )
 from llmm.lowp import PrecisionSpec, ScalingKind, FP8_SPEC
 
+from _lowp_test_common import make_bf16_tensor as _make_bf16_tensor
+
 
 # ===----------------------------------------------------------------------=== #
 # Small host<->device scalar/tensor helpers (mirrors tests/test_zero.mojo).
@@ -56,19 +58,6 @@ def _write_f32(
     host.unsafe_ptr()[0] = val
     buf.enqueue_copy_from(host)
     ctx.synchronize()
-
-
-def _make_bf16_tensor(
-    ctx: DeviceContext, values: List[Float32]
-) raises -> DeviceBuffer[DType.bfloat16]:
-    var n = len(values)
-    var host = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
-    for i in range(n):
-        host.unsafe_ptr()[i] = values[i].cast[DType.bfloat16]()
-    var dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
-    dev.enqueue_copy_from(host)
-    ctx.synchronize()
-    return dev
 
 
 def _make_fp32_tensor(
