@@ -44,7 +44,12 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
-from llmm.matmul import matmul_fwd, matmul_bwd, matmul_fwd_lowp
+from llmm.matmul import (
+    matmul_fwd,
+    matmul_bwd,
+    matmul_fwd_lowp,
+    matmul_bwd_lowp,
+)
 from llmm.softmax import softmax_fwd, softmax_bwd
 from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
 from llmm.global_norm import (
@@ -2711,41 +2716,83 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # matmul_d_input_bwd computes d_l_fch_gelu = gelu'(l_fch) ⊙
             # (d_fc_proj @ proj_weight) = d_fch (post-GELU-grad, still 4C-wide).
             var loop_t0 = global_perf_counter_ns()
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
-                as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
-                as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
-                as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
-                as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
-                as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
-                as_mut_kernel[GPT2_DTYPE](l_fch),
-                as_mut_kernel[GPT2_DTYPE](d_l_attn),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(4 * channels),
-                Int64(channels),
-                self.ctx,
-            )
+            # fp8 site (Chunk E): C=4*channels, OC=channels;
+            # input=l_fch_gelu, weight=l_proj_weight, d_output=d_l_fc_proj.
+            comptime if LOWP_ENABLED:
+                matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=True](
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
+                    as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](l_fch),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(4 * channels),
+                    Int64(channels),
+                    self.lowp_state.proj_input[layer],
+                    self.lowp_state.proj_weight[layer],
+                    self.lowp_state.proj_doutput[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
+                    as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](l_fch),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(4 * channels),
+                    Int64(channels),
+                    self.ctx,
+                )
 
             # MLP FC backward (no GELU — d_l_fch_gelu already carries d_fch, the
             # post-GELU-grad, from the fused projection backward above). This
             # matmul lives entirely below the GELU, so it just backprops the
             # linear FC: d_l_ln_2 = d_fch @ fc_weight.
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
-                as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
-                as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
-                as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
-                as_mut_kernel[GPT2_DTYPE](l_ln_2),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_mut_kernel[GPT2_DTYPE](d_l_fch),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(channels),
-                Int64(4 * channels),
-                self.ctx,
-            )
+            # fp8 site (Chunk E): C=channels, OC=4*channels; input=l_ln_2,
+            # weight=l_fc_weight, d_output=d_l_fch_gelu.
+            comptime if LOWP_ENABLED:
+                matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(4 * channels),
+                    self.lowp_state.fc_input[layer],
+                    self.lowp_state.fc_weight[layer],
+                    self.lowp_state.fc_doutput[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(4 * channels),
+                    self.ctx,
+                )
 
             # GOTCHA (gradient flow): the fused LN backward only adds LN_dinp to
             # its targets (`d_inp1 += LN_dinp; d_inp2 += LN_dinp`). The incoming
@@ -2794,21 +2841,43 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
 
             # Attention projection backward.
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
-                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
-                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_bias),
-                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
-                as_mut_kernel[GPT2_DTYPE](l_attn_merged),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_mut_kernel[GPT2_DTYPE](d_l_qkv),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(channels),
-                Int64(channels),
-                self.ctx,
-            )
+            # fp8 site (Chunk E): C=channels, OC=channels;
+            # input=l_attn_merged, weight=l_attn_proj_weight,
+            # d_output=d_l_attn_proj.
+            comptime if LOWP_ENABLED:
+                matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
+                    as_mut_kernel[GPT2_DTYPE](l_attn_merged),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(channels),
+                    self.lowp_state.attn_proj_input[layer],
+                    self.lowp_state.attn_proj_weight[layer],
+                    self.lowp_state.attn_proj_doutput[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
+                    as_mut_kernel[GPT2_DTYPE](l_attn_merged),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(channels),
+                    self.ctx,
+                )
 
             # Attention backward — read the forward-stored probs P from
             # acts.att_probs[layer] (see the forward store note; recompute is
@@ -2839,21 +2908,42 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
 
             # QKV matmul backward.
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
-                as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
-                as_mut_kernel[GPT2_DTYPE](d_l_qkv_bias),
-                as_mut_kernel[GPT2_DTYPE](d_l_qkv),
-                as_mut_kernel[GPT2_DTYPE](l_ln_1),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(channels),
-                Int64(3 * channels),
-                self.ctx,
-            )
+            # fp8 site (Chunk E): C=channels, OC=3*channels; input=l_ln_1,
+            # weight=l_qkv_weight, d_output=d_l_qkv.
+            comptime if LOWP_ENABLED:
+                matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(3 * channels),
+                    self.lowp_state.qkv_input[layer],
+                    self.lowp_state.qkv_weight[layer],
+                    self.lowp_state.qkv_doutput[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(3 * channels),
+                    self.ctx,
+                )
 
             # LayerNorm 1 backward.
             if layer == 0:
