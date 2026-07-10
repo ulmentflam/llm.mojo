@@ -50,6 +50,7 @@ from llmm.matmul import (
     matmul_fwd_lowp,
     matmul_bwd_lowp,
     matmul_fwd_fp4,
+    matmul_bwd_fp4,
 )
 from llmm.softmax import softmax_fwd, softmax_bwd
 from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
@@ -146,13 +147,15 @@ comptime LOWP_ENABLED = PRECISION == "fp8" or PRECISION == "fp4"
 #
 # fp8-only (NOT `LOWP_ENABLED`): the four `matmul_bwd_lowp` backward sites are
 # fp8-specific (E5M2 `d_output` operand via `LowpState`'s `*_doutput`
-# `AmaxState`s — see that struct's docstring). FP4 backward (SR on gradient
-# operands + RHT on Wgrad inputs, per
-# docs/ai/fp4_training_recipes_research.md §1) is chunk T2's scope, not yet
-# built; an fp4 build must fall through to the same bf16 `matmul_bwd`
-# else-branch fp32/bf16 use (this chunk's gate (d) is explicitly "fp4
-# fwd-only + bf16 bwd") rather than silently running fp8's backward
-# machinery on an fp4 forward pass.
+# `AmaxState`s — see that struct's docstring). FP4 backward (Chunk T2:
+# SR on gradient operands, RHT on Wgrad inputs lands in T2b, per
+# docs/ai/fp4_training_recipes_research.md §1) is a SEPARATE, THIRD branch
+# at the two FP4-eligible MLP backward sites (proj/fc) — `elif PRECISION ==
+# "fp4":`, gated per-layer by `_layer_in_fp4_range` exactly like the forward
+# pass's FC/Proj sites — not folded into `LOWP_BWD_ENABLED` (which stays
+# fp8-only) since fp4's backward machinery (`matmul_bwd_fp4`) has a
+# different signature (no `AmaxState`s, an `sr_step` counter instead) than
+# fp8's `matmul_bwd_lowp`.
 comptime LOWP_BWD_ENABLED = (PRECISION == "fp8") and not is_defined[
     "LLMM_FP8_FWD_ONLY"
 ]()
@@ -2618,7 +2621,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx.synchronize()
 
     def backward(
-        mut self, grad_accum_steps: Int = 1, micro_step: Int = 0
+        mut self,
+        grad_accum_steps: Int = 1,
+        micro_step: Int = 0,
+        step: Int = 0,
     ) raises:
         if self.mean_loss == -1.0:
             raise Error("GPT2 error: must call forward pass first")
@@ -2631,6 +2637,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
+
+        # FP4 backward SR counter (Chunk T2): unique per (outer training
+        # step, micro-step) so grad-accumulation micro-steps within one
+        # optimizer step draw distinct dither instead of reusing the same
+        # bit pattern every micro-step under the fixed default seed — same
+        # "unique per (step, element)" convention `llmm/adamw.mojo`'s
+        # `LLMM_SR_MASTER` seam and `llmm/nvfp4_quant.mojo`'s per-element
+        # counter both use, one level up (per call, not per element). Only
+        # consulted under `PRECISION == "fp4"` (inert elsewhere).
+        var fp4_sr_step = step * grad_accum_steps + micro_step
 
         var batch_size = self.batch_size
         var seq_len = self.seq_len
@@ -2855,6 +2871,46 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.lowp_state.proj_doutput[layer],
                     self.ctx,
                 )
+            elif PRECISION == "fp4":
+                # fp4 site (Chunk T2, MLP-eligible middle blocks only): same
+                # C=4*channels, OC=channels, input=l_fch_gelu,
+                # weight=l_proj_weight, d_output=d_l_fc_proj mapping as the
+                # fp8 branch above; outside `_layer_in_fp4_range` falls
+                # through to the same bf16 `matmul_bwd` the fp32/bf16/first-
+                # last-block-under-fp4 builds use (matches the forward pass's
+                # FC/Proj three-way dispatch).
+                if _layer_in_fp4_range(layer, num_layers):
+                    matmul_bwd_fp4[GPT2_DTYPE, Self.target, use_gelu=True](
+                        as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                        as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
+                        as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
+                        as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
+                        as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                        as_mut_kernel[GPT2_DTYPE](l_fch),
+                        Int64(batch_size),
+                        Int64(seq_len),
+                        Int64(4 * channels),
+                        Int64(channels),
+                        self.ctx,
+                        sr_step=fp4_sr_step,
+                    )
+                else:
+                    matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
+                        as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                        as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
+                        as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
+                        as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
+                        as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                        as_mut_kernel[GPT2_DTYPE](l_fch),
+                        as_mut_kernel[GPT2_DTYPE](d_l_attn),
+                        Int64(batch_size),
+                        Int64(seq_len),
+                        Int64(4 * channels),
+                        Int64(channels),
+                        self.ctx,
+                    )
             else:
                 matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
                     as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
@@ -2896,6 +2952,42 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.lowp_state.fc_doutput[layer],
                     self.ctx,
                 )
+            elif PRECISION == "fp4":
+                # fp4 site (Chunk T2, MLP-eligible middle blocks only): same
+                # C=channels, OC=4*channels, input=l_ln_2, weight=l_fc_weight,
+                # d_output=d_l_fch_gelu mapping as the fp8 branch above.
+                if _layer_in_fp4_range(layer, num_layers):
+                    matmul_bwd_fp4[GPT2_DTYPE, Self.target, use_gelu=False](
+                        as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
+                        as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
+                        as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
+                        as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                        as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                        as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                        Int64(batch_size),
+                        Int64(seq_len),
+                        Int64(channels),
+                        Int64(4 * channels),
+                        self.ctx,
+                        sr_step=fp4_sr_step,
+                    )
+                else:
+                    matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                        as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
+                        as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
+                        as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
+                        as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                        as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                        as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                        as_mut_kernel[GPT2_DTYPE](d_l_fch),
+                        Int64(batch_size),
+                        Int64(seq_len),
+                        Int64(channels),
+                        Int64(4 * channels),
+                        self.ctx,
+                    )
             else:
                 matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
@@ -4103,7 +4195,7 @@ def train[
                 grad_accum_steps,
             )
             accumulated_loss += model.mean_loss
-            model.backward(grad_accum_steps, micro_step)
+            model.backward(grad_accum_steps, micro_step, step)
         model.ctx.synchronize()
         accumulated_loss /= Float32(grad_accum_steps)
 

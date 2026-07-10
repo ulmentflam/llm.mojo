@@ -1784,3 +1784,119 @@ gate).
 All four builds (fp32/bf16/fp8/fp4) compile from one tree; bf16 build proven
 bit-identical pre/post (comptime-gating proof, gate b), fp8 suites 10/10 +
 8/8 (gates 0/a).
+
+## 2026-07-10 — NVFP4 backward-pass integration, SR only (goal3b chunk T2a)
+
+Chunk T2a adds the fp4 BACKWARD pass on top of T1's fp4-forward-only
+integration: `matmul_d_input_bwd_fp4` (Dgrad), `matmul_d_weight_bwd_fp4`
+(Wgrad), and the `matmul_bwd_fp4` bundle in `llmm/matmul.mojo`, wired into
+`train_gpt2.mojo`'s two FP4-eligible MLP backward sites (fc/proj) as a third
+`elif PRECISION == "fp4":` branch alongside fp8's existing
+`LOWP_BWD_ENABLED`, gated per-layer by the same `_layer_in_fp4_range` the
+forward pass uses. Per the recipe (`fp4_training_recipes_research.md` §1):
+**Dgrad = SR on the `d_output` gradient operand, RNE on the weight; Wgrad =
+RNE/SR (no RHT yet — T2b's scope)**. RHT (item 3, the last mandatory recipe
+ingredient) is deliberately deferred.
+
+**Orientation.** Both Dgrad's weight operand and Wgrad's input/d_output
+operands need a physically-transposed NVFP4 copy (cuBLASLt's block-scaled
+GEMM is TN-only, mirroring fp8's derivation). Rather than a two-pass
+bf16-transpose-then-quantize fallback, a fused `nvfp4_quantize_transpose`
+was added to `llmm/nvfp4_quant.mojo`: it shares `_nvfp4_quantize_gpu`'s
+kernel body with fp8's `quantize_transpose` counterpart, adding one comptime
+`TRANSPOSE` flag that swaps only the SOURCE READ address formula
+(`x_ptr[kidx*rows+r]` vs `x_ptr[r*k+kidx]`) — no separate transpose pass, no
+extra O(rows·k) memory round trip. `lowp_gemm_fp4` grew `transpose_a`/
+`transpose_b` comptime flags dispatching between `nvfp4_quantize`/
+`nvfp4_quantize_transpose` per operand, mirroring fp8's `lowp_gemm`.
+Weight re-quantization is NOT shared between Fprop and Dgrad in T2a (each
+call quantizes fresh from bf16, per fp4's existing "no `AmaxState`, no
+persistent scale state" design) — a documented performance opportunity left
+on the table, not a correctness issue (RNE is a pure function of the
+tensor).
+
+**Accumulate fix.** `lowp_gemm_fp4` (T1) raised on `accumulate=True` because
+NVFP4's two-level scale makes a cuBLASLt-level `beta=1` accumulate wrong
+(it would rescale the pre-existing accumulated value by this call's fresh
+`tensor_scale_A * tensor_scale_B` too). Fixed by threading a separate
+`d_raw_scratch` buffer through `lowp_gemm_fp4`/`_nvfp4_post_scale`: the raw
+GEMM result always lands fresh (`beta=0`) in `d_raw_scratch`, and the
+post-scale kernel now optionally ADDS the correctly-scaled result into the
+pre-existing `d_ptr` value (`accumulate` is now a comptime flag on
+`_nvfp4_post_scale_gpu`). Unit-tested (`tests/test_matmul_bwd_fp4.mojo::
+test_fp4_gemm_accumulate`): seeding an accumulator with a known constant and
+accumulating a fresh GEMM result matches `seed + fresh_result` to within
+bf16 rounding (max abs diff 0.03125 on values of order a few units).
+
+**SR seed/stream scheme.** Two new streams reserved in
+`llmm/nvfp4_quant.mojo` (`NVFP4_SR_STREAM_DGRAD_DOUTPUT = NVFP4_SR_STREAM+2`,
+`NVFP4_SR_STREAM_WGRAD_DOUTPUT = NVFP4_SR_STREAM+3`) keep Dgrad's and
+Wgrad's `d_output` SR draws disjoint from each other and from T1's forward
+reservation, even though both consume the same underlying tensor in
+different layouts. The per-call counter is `train_gpt2.mojo`'s new
+`fp4_sr_step = step * grad_accum_steps + micro_step`, threaded through a new
+`step: Int = 0` parameter on `GPT2.backward()` — unique per (training step,
+micro-step) so grad-accumulation micro-steps draw distinct dither.
+
+### Gate (c) — per-site backward accuracy (`tests/test_matmul_bwd_fp4.mojo`)
+
+`matmul_bwd_fp4` vs the production bf16 `matmul_bwd` at the same MLP shapes
+as T1 (rows=4096), 3 runs bit-identical:
+
+| site | d_input relL2 | d_input cosine | d_weight relL2 | d_weight cosine |
+|---|---:|---:|---:|---:|
+| fc-bwd | 0.1836 | 0.9845 | 0.1784 | 0.9849 |
+| proj-bwd | 0.1839 | 0.9850 | 0.1782 | 0.9849 |
+
+Both PASS the calibrated gate (relL2 < 0.22, cosine > 0.975 — derived from
+the measured floor via `cosine ≈ 1/√(1+relL2²)`, same F1-gotcha methodology
+as T1's forward gate). Somewhat worse than T1's single-GEMM ~0.151 floor, as
+expected: Dgrad/Wgrad each compose TWO fp4 quantizations (RNE weight/input +
+SR gradient) through one GEMM, plus SR's own dither variance on top of RNE's
+rounding error. `d_bias` is bit-identical between the fp4 and bf16 arms
+(both reuse the same bf16 `matmul_bias_bwd` kernel), confirming the
+bias-grad-reuse wiring is correct. NaN/Inf-free throughout.
+
+### Gate (d) — 10-step fp4 (fwd+bwd) vs bf16 training (tinyshakespeare,
+B4 T1024, GPT-2 124M checkpoint init): honest regression vs T1, as expected
+
+Twin bf16 runs (gate b) landed bit-identical (loss and val loss match to all
+printed digits through all 10 steps — a much tighter band than T1's
+from-scratch config, likely because checkpoint-init gradients are smaller/
+less atomic-order-sensitive than from-scratch ones). No NaN/Inf in the fp4
+arm; loss decreases in both arms:
+
+| step | fp4 loss | bf16 loss | Δ rel | T1 (fwd-only) Δ rel |
+|---:|---:|---:|---:|---:|
+| 1 | 4.408221 | 4.369226 | +0.89% | +0.89% |
+| 2 | 4.396538 | 4.418465 | −0.50% | −1.45% |
+| 3 | 4.567963 | 4.510433 | +1.28% | −0.05% |
+| 4 | 4.109174 | 4.026239 | +2.06% | +1.70% |
+| 5 | 3.641555 | 3.578290 | +1.77% | +1.80% |
+| 6 | 3.831708 | 3.767685 | +1.70% | +1.63% |
+| 7 | 3.562546 | 3.534359 | +0.80% | +0.83% |
+| 8 | 3.686466 | 3.655098 | +0.86% | +1.17% |
+| 9 | 3.288240 | 3.253812 | +1.06% | +1.02% |
+| 10 | 3.419512 | 3.390009 | +0.87% | +0.77% |
+| val (post-10) | 3.7649264 | 3.7094119 | +1.50% | +1.26% |
+
+Step 1 is bit-identical between T2a and T1 (4.408221 both), as it must be:
+step 1's loss depends only on the initial weights + fp4 forward, before any
+backward update has run — a strong sanity check that both runs share the
+same seed/data/init. From step 2 onward the two arms diverge as expected
+(T1's backward is bf16; T2a's is fp4 with SR).
+
+**Mean per-step delta: T2a +1.08% vs T1's +0.83%; final val +1.50% vs
++1.26%.** Worse than fwd-only, exactly as predicted ("expect worse before
+RHT — report honestly"): SR removes bias but adds variance, and Wgrad has no
+RHT yet to Gaussianize its outliers. T2b (RHT on Wgrad) is expected to close
+most of this gap per the recipe's own claim.
+
+**Gates summary: (a) all four builds compile — binaries verified fresh vs
+source mtimes; (b) bf16 trajectory unchanged (twin-run, bit-identical); (c)
+PASS (table above); (d) honest regression vs T1, no NaN/Inf, loss decreasing
+in both arms.** No STOP condition triggered (no NaN/Inf, loss decreasing,
+no gate failing by >2x its bound).
+
+Commit: this entry lands alongside the T2a implementation on
+`goal3b/fp4-training`.

@@ -510,6 +510,103 @@ envelope. Full tables in `ai_assisted_optimizations_and_benchmarks.md` (2026-07-
 
 ---
 
+## FP4 CHUNK T2a (backward pass — SR only, no RHT yet)
+
+### F2 — Comparing two independently-allocated swizzled scale buffers byte-for-byte requires zeroing padding first
+
+**What:** A dedicated correctness test for the new `nvfp4_quantize_transpose`
+(compare it against materializing the transpose in bf16 host-side and calling
+plain `nvfp4_quantize` on the result, expecting byte-identical output) FAILED
+on its first run: the packed e2m1 data buffer (768/768 bytes) matched
+perfectly, but the swizzled e4m3 scale buffer diverged at byte offset 2
+(201 vs 123) despite both calls using identical `rows`/`k`/`BLOCK_ROWS` and
+therefore identical swizzle geometry.
+
+**Root cause:** the swizzled scale buffer's cuBLAS 128-row/4-col tile layout
+has PADDING — for a `[48, 32]` logical scale tensor (96 real 1x16-block
+scale values), `nvfp4_swizzled_scale_buffer_size` allocates 512 bytes, of
+which only 96 are ever written by the quantize kernel (byte offset 2 solves
+to no valid `(row, col)` pair under the swizzle formula — it falls in an
+unused padding slot). `ctx.enqueue_create_buffer` does not zero-initialize,
+so two SEPARATELY allocated scale buffers have independently garbage
+padding bytes that predictably fail a byte-for-byte comparison — a test-
+harness bug, not a kernel bug (the actual quantize logic, including the new
+`TRANSPOSE`-flag source-read address swap, was correct all along).
+
+**Fix:** `ctx.enqueue_memset(scale_buf, Scalar[DType.uint8](0))` on BOTH
+scale buffers before running either quantize call, so never-written padding
+compares `0 == 0` instead of garbage vs garbage. After the fix, all 768
+packed bytes AND all 512 scale bytes (padding included) matched exactly,
+confirming `nvfp4_quantize_transpose` reproduces `nvfp4_quantize`-on-the-
+materialized-transpose bit-for-bit, as the shared-kernel-body design
+predicts.
+
+**Lesson (generalizes C5's swizzle-layout lesson):** any test that compares
+two independently-allocated buffers byte-for-byte, where the buffer's
+logical content doesn't fill 100% of its physical layout (swizzle/tile
+padding, alignment padding, etc.), must zero (or otherwise pin) the padding
+region first — a byte-identity assertion is only meaningful over the bytes
+BOTH sides' producers actually write.
+
+**Source:** `tests/test_nvfp4_quant.mojo::
+test_quantize_transpose_matches_materialized_transpose_gpu`, Chunk T2a,
+2026-07-10 (worktree goal3b/fp4-training).
+
+### F3 — Dgrad/Wgrad's fp4 accuracy floor is worse than Fprop's single-GEMM floor, and that's expected (not a new instance of E5's compounding, but a related composition effect)
+
+**What:** Chunk T2a's backward-GEMM gate (`tests/test_matmul_bwd_fp4.mojo`)
+measures relL2 ≈ 0.178–0.184 / cosine ≈ 0.985 for `d_input`/`d_weight` at
+both MLP sites — noticeably worse than T1's forward gate's ~0.151 relL2 /
+~0.989 cosine floor at the SAME shapes and comparable data distributions.
+
+**Why (not a bug):** each backward GEMM quantizes TWO operands through a
+transposed-quantize path (weight/input RNE, `d_output` SR) — RNE's rounding
+error and SR's dither variance both feed the same GEMM, whereas the forward
+GEMM's ~0.151 floor is from two RNE-only quantizations. SR is unbiased
+(`E[quantize(x)] == x`) but NOT lower-variance than RNE — trading bias for
+variance is the whole point of stochastic rounding for gradient
+accumulation, and it shows up here as a slightly higher single-GEMM relL2,
+exactly as `fp4_training_recipes_research.md`'s "FP4 All the Way" citation
+(the √3 gradient-noise-threshold paper) predicts.
+
+**Gate calibration:** relL2 < 0.22 / cosine > 0.975 (derived via `cosine ≈
+1/√(1+relL2²)` from the measured floor, same F1-gotcha methodology, NOT
+copy-pasted from T1's forward bound).
+
+**Source:** Chunk T2a gate (c) validation, 2026-07-10 (worktree
+goal3b/fp4-training).
+
+### F4 — T2a's 10-step training gate is a REGRESSION vs T1's fwd-only gate, as the recipe predicts pre-RHT
+
+**What:** fp4 (fwd+bwd, SR, no RHT) vs bf16 10-step training (tinyshakespeare,
+checkpoint init) shows mean per-step loss delta +1.08% (final val +1.50%),
+WORSE than T1's fwd-only +0.83% (final val +1.26%). Step 1's loss is
+bit-identical between the T1 and T2a runs (4.408221 both) — a strong sanity
+check that both runs share the same seed/data/init and that the divergence
+from step 2 onward is genuinely attributable to the backward-pass change,
+not a harness difference.
+
+**Why this is expected, not a regression to fix:** `fp4_training_recipes_
+research.md`'s mandatory recipe has THREE ingredients (SR on gradients, RHT
+on Wgrad, 2D/1D block scaling) and this chunk (T2a) ships only the first.
+NVIDIA's own ablations report RHT is essential for Wgrad accuracy — without
+it, outlier-heavy activation/gradient channels absorb more quantization
+error. The coordinator's task brief explicitly predicted this ("expect
+worse before RHT — report honestly"). T2b (RHT on Wgrad, per the recipe) is
+expected to close most of this gap.
+
+**STOP condition check:** NOT triggered — no NaN/Inf, loss decreases
+monotonically-ish in both arms (same noisy-but-decreasing shape as T1's
+run), and no individual gate failed by >2x its calibrated bound (T2a's own
++1.08%/+1.50% are the MEASUREMENT, not a bound being exceeded — there is no
+pre-declared numeric ceiling for gate (d), only "report honestly").
+
+**Source:** Chunk T2a gate (d), 2026-07-10 (worktree goal3b/fp4-training);
+full table in `ai_assisted_optimizations_and_benchmarks.md`'s 2026-07-10 T2a
+entry.
+
+---
+
 ## Section summary
 
 | Section | Items | Status |
@@ -520,6 +617,7 @@ envelope. Full tables in `ai_assisted_optimizations_and_benchmarks.md` (2026-07-
 | ARCHITECTURE | A1–A3 | A1–A2: design doc confirmed; A3: agent-reported |
 | FP8 CHUNK D/E | E1–E5 | Verified (E1–E4: goal2 integration; E5: four-line-of-evidence investigation) |
 | FP4 CHUNK T1 | F1 | Verified (gate c re-run 3x bit-identical; gate d 10-step A/B) |
+| FP4 CHUNK T2a | F2–F4 | Verified (F2: test fix + re-run 18/18 green; F3: gate c 3x bit-identical; F4: gate d 10-step A/B, checkpoint init) |
 
 ---
 

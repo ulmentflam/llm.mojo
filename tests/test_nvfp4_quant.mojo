@@ -26,6 +26,7 @@ from llmm.nvfp4_quant import (
     nvfp4_packed_size,
     nvfp4_scale_buffer_size,
     nvfp4_quantize,
+    nvfp4_quantize_transpose,
     nvfp4_dequant_reference,
 )
 
@@ -372,6 +373,143 @@ def test_quantize_2d_roundtrip_gaussian_gpu() raises:
     print("nvfp4 2D (16x16) roundtrip rel_l2 =", rel_l2)
     # Coarser granularity (256 elements/scale vs 16) -> looser bound.
     assert_true(rel_l2 < 0.35)
+
+
+def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
+    # Chunk T2 (backward): `nvfp4_quantize_transpose` must produce
+    # BYTE-IDENTICAL output to materializing the transpose in bf16 host-side
+    # and calling plain `nvfp4_quantize` on it -- both are the SAME
+    # deterministic RNE computation over the SAME set of logical values, just
+    # reached via a different physical memory-read pattern (module docstring
+    # in llmm/nvfp4_quant.mojo, "Transposed quantize" section). A bug in the
+    # `_nvfp4_src_addr` index-swap would show up here as a byte mismatch,
+    # not merely a "somewhat higher error" -- a much sharper signal than the
+    # end-to-end Dgrad/Wgrad GEMM tests (tests/test_matmul_bwd_fp4.mojo),
+    # which could not distinguish a subtly-wrong transpose from ordinary fp4
+    # quantization noise.
+    if not has_nvidia_gpu_accelerator():
+        return
+    var ctx = DeviceContext()
+    comptime BLOCK_ROWS = 1
+    # source [src_rows, src_k]; logical (transposed) output [src_k, src_rows]
+    # -- src_rows must be a multiple of 16 (nvfp4_quantize_transpose's
+    # docstring: it becomes the logical output's own block-16 axis).
+    var src_rows = 32
+    var src_k = 48
+    var n = src_rows * src_k
+
+    var rng = MT19937(UInt32(777))
+    var host_src_fp32 = ctx.enqueue_create_host_buffer[DType.float32](n)
+    for i in range(n):
+        var s = Float32(0.0)
+        for _ in range(12):
+            s += rng.randfloat32()
+        host_src_fp32.unsafe_ptr()[i] = (s - 6.0) * Float32(1.0)
+    var host_src_bf16 = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
+    for i in range(n):
+        host_src_bf16.unsafe_ptr()[i] = host_src_fp32.unsafe_ptr()[i].cast[
+            DType.bfloat16
+        ]()
+
+    # Materialize the transpose host-side: T[i,j] = src[j,i], T is
+    # [src_k, src_rows] row-major.
+    var host_t_bf16 = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
+    for i in range(src_k):
+        for j in range(src_rows):
+            host_t_bf16.unsafe_ptr()[
+                i * src_rows + j
+            ] = host_src_bf16.unsafe_ptr()[j * src_k + i]
+
+    var x_dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
+    x_dev.enqueue_copy_from(host_src_bf16)
+    var t_dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
+    t_dev.enqueue_copy_from(host_t_bf16)
+
+    var q_size = nvfp4_packed_size(src_k, src_rows)
+    var scale_size = nvfp4_scale_buffer_size(src_k, src_rows, BLOCK_ROWS)
+    var q_transpose = ctx.enqueue_create_buffer[DType.uint8](q_size)
+    var scale_transpose = ctx.enqueue_create_buffer[DType.uint8](scale_size)
+    var tscale_transpose = ctx.enqueue_create_buffer[DType.float32](1)
+    var q_ref = ctx.enqueue_create_buffer[DType.uint8](q_size)
+    var scale_ref = ctx.enqueue_create_buffer[DType.uint8](scale_size)
+    var tscale_ref = ctx.enqueue_create_buffer[DType.float32](1)
+    # The swizzled scale buffer has PADDING (128-row / 4-col tile geometry,
+    # 512 bytes total here vs 96 actually-written entries) -- zero both
+    # buffers first so never-written padding bytes compare equal (0 == 0)
+    # instead of comparing two independently-allocated buffers' leftover
+    # garbage, which would fail this test for a reason that has nothing to
+    # do with `nvfp4_quantize_transpose`'s correctness.
+    ctx.enqueue_memset(scale_transpose, Scalar[DType.uint8](0))
+    ctx.enqueue_memset(scale_ref, Scalar[DType.uint8](0))
+    ctx.synchronize()
+
+    nvfp4_quantize_transpose[DType.bfloat16, "gpu", BLOCK_ROWS](
+        rebind[MutKernelPtr[DType.uint8]](
+            q_transpose.unsafe_ptr().as_unsafe_any_origin()
+        ),
+        rebind[MutKernelPtr[DType.uint8]](
+            scale_transpose.unsafe_ptr().as_unsafe_any_origin()
+        ),
+        rebind[MutKernelPtr[DType.float32]](
+            tscale_transpose.unsafe_ptr().as_unsafe_any_origin()
+        ),
+        rebind[ImmutKernelPtr[DType.bfloat16]](
+            x_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+        ),
+        src_rows,
+        src_k,
+        ctx,
+    )
+    nvfp4_quantize[DType.bfloat16, "gpu", BLOCK_ROWS](
+        rebind[MutKernelPtr[DType.uint8]](
+            q_ref.unsafe_ptr().as_unsafe_any_origin()
+        ),
+        rebind[MutKernelPtr[DType.uint8]](
+            scale_ref.unsafe_ptr().as_unsafe_any_origin()
+        ),
+        rebind[MutKernelPtr[DType.float32]](
+            tscale_ref.unsafe_ptr().as_unsafe_any_origin()
+        ),
+        rebind[ImmutKernelPtr[DType.bfloat16]](
+            t_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+        ),
+        src_k,
+        src_rows,
+        ctx,
+    )
+    ctx.synchronize()
+
+    var host_q_transpose = ctx.enqueue_create_host_buffer[DType.uint8](q_size)
+    var host_q_ref = ctx.enqueue_create_host_buffer[DType.uint8](q_size)
+    var host_scale_transpose = ctx.enqueue_create_host_buffer[DType.uint8](
+        scale_size
+    )
+    var host_scale_ref = ctx.enqueue_create_host_buffer[DType.uint8](scale_size)
+    var host_tscale_transpose = ctx.enqueue_create_host_buffer[DType.float32](1)
+    var host_tscale_ref = ctx.enqueue_create_host_buffer[DType.float32](1)
+    q_transpose.enqueue_copy_to(host_q_transpose)
+    q_ref.enqueue_copy_to(host_q_ref)
+    scale_transpose.enqueue_copy_to(host_scale_transpose)
+    scale_ref.enqueue_copy_to(host_scale_ref)
+    tscale_transpose.enqueue_copy_to(host_tscale_transpose)
+    tscale_ref.enqueue_copy_to(host_tscale_ref)
+    ctx.synchronize()
+
+    assert_equal(
+        host_tscale_transpose.unsafe_ptr()[0], host_tscale_ref.unsafe_ptr()[0]
+    )
+    for i in range(q_size):
+        assert_equal(
+            host_q_transpose.unsafe_ptr()[i],
+            host_q_ref.unsafe_ptr()[i],
+            "packed e2m1 byte mismatch at " + String(i),
+        )
+    for i in range(scale_size):
+        assert_equal(
+            host_scale_transpose.unsafe_ptr()[i],
+            host_scale_ref.unsafe_ptr()[i],
+            "swizzled e4m3 scale byte mismatch at " + String(i),
+        )
 
 
 def test_quantize_all_zero_tensor_gpu() raises:

@@ -75,6 +75,44 @@ parameter — selecting *which* operands (gradients only, per the recipe) is
 the training-integration chunk's call-site decision, not something this
 module enforces.
 
+## Stream registry (chunk T2, backward)
+
+`llmm/matmul.mojo`'s `lowp_gemm_fp4` (forward, Chunk T1) reserves
+`NVFP4_SR_STREAM`/`NVFP4_SR_STREAM + 1` for its A/B operands. Chunk T2's
+backward call sites (`matmul_d_input_bwd_fp4`/`matmul_d_weight_bwd_fp4`) each
+quantize a `d_output` operand with SR (the recipe's "SR on the gradient
+operand"; the paired weight/input operand stays RNE, which never touches the
+RNG at all) — two MORE distinct streams so dgrad's and wgrad's `d_output`
+dither never collide with each other or with the forward reservation, even
+though both draw from the same tensor's values (different layouts: dgrad
+quantizes `d_output` in its NATIVE orientation, wgrad quantizes it
+TRANSPOSED — see `nvfp4_quantize_transpose` below):
+`NVFP4_SR_STREAM_DGRAD_DOUTPUT = NVFP4_SR_STREAM + 2`,
+`NVFP4_SR_STREAM_WGRAD_DOUTPUT = NVFP4_SR_STREAM + 3`.
+
+## Transposed quantize (chunk T2, backward)
+
+cuBLASLt's NVFP4 GEMM is TN-only (`_matmul_cublaslt_fp4`'s module comment,
+mirroring fp8's `_matmul_cublaslt_fp8`), so Dgrad's `weight` operand and
+Wgrad's `input`/`d_output` operands need a physically transposed NVFP4 copy
+(their contraction dimension is not the trailing axis of their natural
+row-major storage — see `llmm/matmul.mojo`'s dgrad/wgrad orientation
+derivation). `nvfp4_quantize_transpose` below is the FP4 analogue of
+`llmm/lowp.mojo`'s `quantize_transpose` (fp8): a single fused pass that reads
+the SOURCE tensor transposed and writes a normally-laid-out (packed e2m1 +
+swizzled e4m3 + fp32 tensor scale) NVFP4 quantization of that transpose — no
+separate bf16 transpose scratch buffer/pass. It shares `_nvfp4_quantize_gpu`'s
+kernel body via a comptime `TRANSPOSE` flag that only changes the SOURCE READ
+address formula (`x_ptr[kidx * rows + r]` instead of `x_ptr[r * k + kidx]` —
+i.e. read column `r` of the `[src_rows, src_k]` source instead of row `r` of
+a `[rows, k]` source); every other step (block-amax reduction, e4m3 encode,
+e2m1 encode/pack, swizzled scale write) is identical, since those operate on
+the LOGICAL (already-transposed) element identity, not the source's physical
+layout. The two-pass tensor-scale computation (`nvfp4_compute_tensor_scale`)
+needs NO transpose-aware variant: amax over all elements is transpose-
+invariant (it is a plain linear reduction over the flat buffer, independent
+of which axis is "rows" vs "k").
+
 ## Scope
 
 Standalone utility kernels only — no `llmm/matmul.mojo` / `train_gpt2.mojo`
@@ -125,6 +163,14 @@ comptime NVFP4_SR_SEED = UInt64(get_defined_int["LLMM_SR_SEED", 1746221221]())
 # `NVFP4_SR_STREAM + 1` respectively so the two operands' dither never draws
 # from the same substream.
 comptime NVFP4_SR_STREAM = UInt64(2)
+
+# Chunk T2 (backward) stream reservations — see the module docstring's
+# "Stream registry" section. `llmm/matmul.mojo`'s `matmul_d_input_bwd_fp4`
+# (dgrad) and `matmul_d_weight_bwd_fp4` (wgrad) each quantize a `d_output`
+# operand with SR; these two streams keep their dither substreams disjoint
+# from the forward reservation (2, 3) and from each other.
+comptime NVFP4_SR_STREAM_DGRAD_DOUTPUT = UInt64(4)
+comptime NVFP4_SR_STREAM_WGRAD_DOUTPUT = UInt64(5)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -556,10 +602,34 @@ def nvfp4_compute_tensor_scale[
 
 
 @always_inline
+def _nvfp4_src_addr[
+    TRANSPOSE: Bool
+](r: Int, kidx: Int, rows: Int, k: Int) -> Int:
+    """Source-buffer flat address for logical element `(r, kidx)` of a
+    `[rows, k]` tensor. `TRANSPOSE=False`: the source IS that `[rows, k]`
+    row-major tensor (`r * k + kidx`, the ordinary case). `TRANSPOSE=True`:
+    the source is instead a `[k, rows]` row-major tensor (physically `x_ptr`
+    has `rows` as its TRAILING/contiguous axis) and `(r, kidx)` addresses its
+    LOGICAL TRANSPOSE — i.e. `x_ptr[kidx, r]` in the source's own coordinates,
+    `kidx * rows + r` flat (see `nvfp4_quantize_transpose`'s docstring for the
+    full derivation). Every other part of `_nvfp4_quantize_gpu` (block-amax
+    reduction, e4m3/e2m1 encode, swizzled scale write, packed-byte write) is
+    unaffected by `TRANSPOSE` — only this address formula changes, since the
+    rest operates on the LOGICAL `(r, kidx)` element identity, not the
+    source's physical layout.
+    """
+    comptime if TRANSPOSE:
+        return kidx * rows + r
+    else:
+        return r * k + kidx
+
+
+@always_inline
 def _nvfp4_quantize_gpu[
     dtype: DType,
     BLOCK_ROWS: Int,
     round_mode: Int,
+    TRANSPOSE: Bool = False,
 ](
     q_ptr: MutKernelPtr[DType.uint8],
     scale_ptr: MutKernelPtr[DType.uint8],
@@ -593,7 +663,9 @@ def _nvfp4_quantize_gpu[
             var kidx = kb * NVFP4_BLOCK + kk
             if kidx >= k:
                 continue
-            var v = x_ptr[r * k + kidx].cast[DType.float32]()
+            var v = x_ptr[_nvfp4_src_addr[TRANSPOSE](r, kidx, rows, k)].cast[
+                DType.float32
+            ]()
             var av = v if v >= 0.0 else -v
             if av > amax:
                 amax = av
@@ -638,7 +710,12 @@ def _nvfp4_quantize_gpu[
             var k0 = kb * NVFP4_BLOCK + kk
             if k0 >= k:
                 break
-            var v0 = x_ptr[r * k + k0].cast[DType.float32]() / sc_val
+            var v0 = (
+                x_ptr[_nvfp4_src_addr[TRANSPOSE](r, k0, rows, k)].cast[
+                    DType.float32
+                ]()
+                / sc_val
+            )
             var c0: UInt8
             comptime if round_mode == ROUND_MODE_STOCHASTIC:
                 var counter0 = (UInt64(sr_step) << 32) | UInt64(r * k + k0)
@@ -649,7 +726,12 @@ def _nvfp4_quantize_gpu[
             var c1 = UInt8(0)
             var k1 = k0 + 1
             if k1 < k and kk + 1 < NVFP4_BLOCK:
-                var v1 = x_ptr[r * k + k1].cast[DType.float32]() / sc_val
+                var v1 = (
+                    x_ptr[_nvfp4_src_addr[TRANSPOSE](r, k1, rows, k)].cast[
+                        DType.float32
+                    ]()
+                    / sc_val
+                )
                 comptime if round_mode == ROUND_MODE_STOCHASTIC:
                     var counter1 = (UInt64(sr_step) << 32) | UInt64(r * k + k1)
                     var rand1 = rng_uniform01(sr_seed, counter1, sr_stream)
@@ -658,6 +740,75 @@ def _nvfp4_quantize_gpu[
                     c1 = encode_e2m1[round_mode](v1)
             q_ptr[(r * k + k0) // 2] = pack_e2m1x2(c0, c1)
             kk += 2
+
+
+def _nvfp4_quantize_impl[
+    dtype: DType,
+    target: StaticString,
+    BLOCK_ROWS: Int,
+    round_mode: Int,
+    TRANSPOSE: Bool,
+](
+    q_ptr: MutKernelPtr[DType.uint8],
+    scale_ptr: MutKernelPtr[DType.uint8],
+    tensor_scale_ptr: MutKernelPtr[DType.float32],
+    x_ptr: ImmutKernelPtr[dtype],
+    rows: Int,  # LOGICAL output rows (== src_k when TRANSPOSE)
+    k: Int,  # LOGICAL output k (== src_rows when TRANSPOSE)
+    ctx: DeviceContext,
+    sr_seed: UInt64,
+    sr_stream: UInt64,
+    sr_step: Int,
+) raises -> None:
+    """Shared body of `nvfp4_quantize`/`nvfp4_quantize_transpose` — see their
+    docstrings. `rows`/`k` are always the LOGICAL output tensor's shape (the
+    transpose, when `TRANSPOSE=True`); only `_nvfp4_quantize_gpu`'s SOURCE
+    READ address formula (`_nvfp4_src_addr`) differs between the two modes,
+    everything else (buffer sizing, grid, tensor-scale pass) is identical.
+    """
+    comptime assert (
+        BLOCK_ROWS == 1 or BLOCK_ROWS == NVFP4_BLOCK
+    ), "BLOCK_ROWS must be 1 (1D acts/grads) or 16 (2D weights)"
+    if k % NVFP4_BLOCK != 0:
+        raise Error(
+            "nvfp4_quantize: k must be a multiple of " + String(NVFP4_BLOCK)
+        )
+    comptime if is_gpu[target]():
+        var device_ctx = ctx
+        nvfp4_compute_tensor_scale[dtype, target](
+            tensor_scale_ptr, x_ptr, rows * k, device_ctx
+        )
+
+        var k_blocks = k // NVFP4_BLOCK
+        var tile_rows = nvfp4_scale_rows(rows, BLOCK_ROWS)
+        var n_col_tiles = ceildiv(k_blocks, 4)
+        var total = tile_rows * k_blocks
+        comptime BLOCK_SIZE = 256
+        var num_blocks = ceildiv(total, BLOCK_SIZE) if total > 0 else 1
+
+        comptime quant_kernel = _nvfp4_quantize_gpu[
+            dtype, BLOCK_ROWS, round_mode, TRANSPOSE
+        ]
+        var compiled = device_ctx.compile_function[quant_kernel]()
+        device_ctx.enqueue_function(
+            compiled,
+            q_ptr,
+            scale_ptr,
+            x_ptr,
+            tensor_scale_ptr,
+            rows,
+            k,
+            tile_rows,
+            k_blocks,
+            n_col_tiles,
+            sr_seed,
+            sr_stream,
+            sr_step,
+            grid_dim=(num_blocks,),
+            block_dim=(BLOCK_SIZE,),
+        )
+    else:
+        raise Error("nvfp4_quantize is GPU-only")
 
 
 def nvfp4_quantize[
@@ -698,49 +849,73 @@ def nvfp4_quantize[
     unrelated tensors quantized under the same seed never share a dither
     substream.
     """
-    comptime assert (
-        BLOCK_ROWS == 1 or BLOCK_ROWS == NVFP4_BLOCK
-    ), "BLOCK_ROWS must be 1 (1D acts/grads) or 16 (2D weights)"
-    if k % NVFP4_BLOCK != 0:
-        raise Error(
-            "nvfp4_quantize: k must be a multiple of " + String(NVFP4_BLOCK)
-        )
-    comptime if is_gpu[target]():
-        var device_ctx = ctx
-        nvfp4_compute_tensor_scale[dtype, target](
-            tensor_scale_ptr, x_ptr, rows * k, device_ctx
-        )
+    _nvfp4_quantize_impl[dtype, target, BLOCK_ROWS, round_mode, False](
+        q_ptr,
+        scale_ptr,
+        tensor_scale_ptr,
+        x_ptr,
+        rows,
+        k,
+        ctx,
+        sr_seed,
+        sr_stream,
+        sr_step,
+    )
 
-        var k_blocks = k // NVFP4_BLOCK
-        var tile_rows = nvfp4_scale_rows(rows, BLOCK_ROWS)
-        var n_col_tiles = ceildiv(k_blocks, 4)
-        var total = tile_rows * k_blocks
-        comptime BLOCK_SIZE = 256
-        var num_blocks = ceildiv(total, BLOCK_SIZE) if total > 0 else 1
 
-        comptime quant_kernel = _nvfp4_quantize_gpu[
-            dtype, BLOCK_ROWS, round_mode
-        ]
-        var compiled = device_ctx.compile_function[quant_kernel]()
-        device_ctx.enqueue_function(
-            compiled,
-            q_ptr,
-            scale_ptr,
-            x_ptr,
-            tensor_scale_ptr,
-            rows,
-            k,
-            tile_rows,
-            k_blocks,
-            n_col_tiles,
-            sr_seed,
-            sr_stream,
-            sr_step,
-            grid_dim=(num_blocks,),
-            block_dim=(BLOCK_SIZE,),
-        )
-    else:
-        raise Error("nvfp4_quantize is GPU-only")
+def nvfp4_quantize_transpose[
+    dtype: DType,
+    target: StaticString,
+    BLOCK_ROWS: Int,
+    round_mode: Int = ROUND_MODE_RNE,
+](
+    q_ptr: MutKernelPtr[DType.uint8],
+    scale_ptr: MutKernelPtr[DType.uint8],
+    tensor_scale_ptr: MutKernelPtr[DType.float32],
+    x_ptr: ImmutKernelPtr[dtype],  # [src_rows, src_k] row-major SOURCE layout
+    src_rows: Int,
+    src_k: Int,
+    ctx: DeviceContext,
+    sr_seed: UInt64 = NVFP4_SR_SEED,
+    sr_stream: UInt64 = NVFP4_SR_STREAM,
+    sr_step: Int = 0,
+) raises -> None:
+    """Fused transpose+quantize: quantizes the LOGICAL TRANSPOSE of a
+    `[src_rows, src_k]` row-major bf16/fp32 SOURCE tensor `x_ptr` to NVFP4 —
+    i.e. produces byte-identical output to calling `nvfp4_quantize` on a
+    materialized `[src_k, src_rows]` tensor `T` where `T[i, j] = x_ptr[j,
+    i]`, computed in one pass with no separate bf16 transpose scratch buffer
+    (the FP4 analogue of `llmm/lowp.mojo`'s `quantize_transpose` — see the
+    module docstring's "Transposed quantize" section for the full
+    derivation, and `llmm/matmul.mojo`'s dgrad/wgrad orientation comment for
+    which operands need this: Dgrad's `weight`, Wgrad's `input` and
+    `d_output`).
+
+    Output buffer shapes follow the LOGICAL (transposed) tensor `[src_k,
+    src_rows]`: `q_ptr` >= `nvfp4_packed_size(src_k, src_rows)`, `scale_ptr`
+    >= `nvfp4_scale_buffer_size(src_k, src_rows, BLOCK_ROWS)`. The LOGICAL
+    output's trailing/block-16 axis is `src_rows` (the SOURCE's row count),
+    NOT `src_k` — so `src_rows` must be a multiple of 16 here (the mirror
+    image of `nvfp4_quantize`'s "`k` must be a multiple of 16", since
+    transposition swaps which physical axis plays the block-16 role).
+
+    `sr_seed`/`sr_stream`/`sr_step`: same contract as `nvfp4_quantize`; pass
+    a stream distinct from any other call site sharing `sr_seed` (see the
+    module docstring's "Stream registry" section for the reserved fp4
+    backward stream ids).
+    """
+    _nvfp4_quantize_impl[dtype, target, BLOCK_ROWS, round_mode, True](
+        q_ptr,
+        scale_ptr,
+        tensor_scale_ptr,
+        x_ptr,
+        src_k,  # logical output rows
+        src_rows,  # logical output k -- must be a multiple of 16
+        ctx,
+        sr_seed,
+        sr_stream,
+        sr_step,
+    )
 
 
 # ===----------------------------------------------------------------------=== #

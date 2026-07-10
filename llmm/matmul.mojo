@@ -69,11 +69,15 @@ from llmm.amax import (
 )
 from llmm.nvfp4_quant import (
     nvfp4_quantize,
+    nvfp4_quantize_transpose,
     nvfp4_packed_size,
     nvfp4_scale_buffer_size,
     ROUND_MODE_RNE,
+    ROUND_MODE_STOCHASTIC,
     NVFP4_SR_SEED,
     NVFP4_SR_STREAM,
+    NVFP4_SR_STREAM_DGRAD_DOUTPUT,
+    NVFP4_SR_STREAM_WGRAD_DOUTPUT,
     NVFP4_BLOCK,
 )
 
@@ -1279,13 +1283,31 @@ def _matmul_cublaslt_fp4[
 # consistent with this codebase's "no host readback in the normal path"
 # design principle for scale state — see `llmm/amax.mojo`'s `AmaxState`
 # docstring for the fp8 analogue of that principle).
+#
+# Chunk T2 (backward) update — accumulate support: the post-scale kernel now
+# takes a comptime `accumulate` flag and a SEPARATE raw-GEMM-output pointer
+# (`raw_ptr`) distinct from the accumulator/output pointer (`d_ptr`):
+# `d_ptr[idx] = raw_ptr[idx] * scale (+ d_ptr[idx] if accumulate)`. This is
+# the fix the T1-era module comment above predicted would be needed
+# ("Correctly supporting accumulate needs an extra raw-output scratch
+# buffer"): a cuBLASLt-level beta=1 accumulate is still wrong for NVFP4 (it
+# would rescale the PRE-EXISTING accumulated value by this call's
+# `tensor_scale_A * tensor_scale_B` too), so `_matmul_cublaslt_fp4` always
+# runs with `beta=0` into a fresh `raw_ptr` buffer (which callers MAY alias
+# to `d_ptr` when `accumulate=False`, since the read-then-write per index is
+# safe in place — see `lowp_gemm_fp4`'s docstring), and the actual
+# accumulation happens here, in fp32, AFTER the correct tensor-scale is
+# applied to the fresh contribution only. Unit-tested in
+# `tests/test_lowp_gemm_fp4.mojo`'s `test_fp4_gemm_accumulate*` cases.
 # ===----------------------------------------------------------------------=== #
 
 
 def _nvfp4_post_scale_gpu[
     out_dtype: DType,
+    accumulate: Bool,
 ](
     d_ptr: MutKernelPtr[out_dtype],
+    raw_ptr: ImmutKernelPtr[out_dtype],
     a_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
     b_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
     n: Int,
@@ -1293,15 +1315,19 @@ def _nvfp4_post_scale_gpu[
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < n:
         var s = a_tensor_scale_ptr[0] * b_tensor_scale_ptr[0]
-        var v = d_ptr[idx].cast[DType.float32]() * s
+        var v = raw_ptr[idx].cast[DType.float32]() * s
+        comptime if accumulate:
+            v = v + d_ptr[idx].cast[DType.float32]()
         d_ptr[idx] = v.cast[out_dtype]()
 
 
 def _nvfp4_post_scale[
     out_dtype: DType,
     target: StaticString,
+    accumulate: Bool = False,
 ](
     d_ptr: MutKernelPtr[out_dtype],
+    raw_ptr: ImmutKernelPtr[out_dtype],
     a_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
     b_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
     n: Int,
@@ -1310,11 +1336,12 @@ def _nvfp4_post_scale[
     comptime assert is_gpu[target](), "_nvfp4_post_scale is GPU-only"
     comptime BLOCK_SIZE = 256
     var num_blocks = ceildiv(n, BLOCK_SIZE)
-    comptime kernel = _nvfp4_post_scale_gpu[out_dtype]
+    comptime kernel = _nvfp4_post_scale_gpu[out_dtype, accumulate]
     var compiled = ctx.compile_function[kernel]()
     ctx.enqueue_function(
         compiled,
         d_ptr,
+        raw_ptr,
         a_tensor_scale_ptr,
         b_tensor_scale_ptr,
         n,
@@ -1329,9 +1356,22 @@ def lowp_gemm_fp4[
     target: StaticString,
     a_block_rows: Int = 1,
     b_block_rows: Int = 1,
-    round_mode: Int = ROUND_MODE_RNE,
+    a_round_mode: Int = ROUND_MODE_RNE,
+    b_round_mode: Int = ROUND_MODE_RNE,
+    accumulate: Bool = False,
+    transpose_a: Bool = False,
+    transpose_b: Bool = False,
 ](
     d_ptr: MutKernelPtr[out_dtype],
+    d_raw_scratch: MutKernelPtr[
+        out_dtype
+    ],  # >= m*n; raw (pre-tensor-scale) GEMM output scratch. MAY alias
+    # `d_ptr` when `accumulate=False` (the post-scale kernel reads then
+    # writes each index in place, safe to alias); MUST be a buffer distinct
+    # from `d_ptr` when `accumulate=True` (post-scale reads `d_ptr`'s
+    # PRE-EXISTING value to add to, so it cannot also be where the fresh raw
+    # GEMM output landed -- see the module comment above
+    # `_nvfp4_post_scale_gpu`).
     a_ptr: ImmutKernelPtr[in_dtype],  # [m, k] row-major, bf16 or fp32
     b_ptr: ImmutKernelPtr[in_dtype],  # [n, k] row-major, bf16 or fp32
     a_q_scratch: MutKernelPtr[DType.uint8],  # >= nvfp4_packed_size(m, k)
@@ -1347,9 +1387,10 @@ def lowp_gemm_fp4[
     m: Int,
     n: Int,
     k: Int,
-    accumulate: Bool,
     ctx: DeviceContext,
     sr_seed: UInt64 = NVFP4_SR_SEED,
+    a_sr_stream: UInt64 = NVFP4_SR_STREAM,
+    b_sr_stream: UInt64 = NVFP4_SR_STREAM + 1,
     sr_step: Int = 0,
 ) raises -> None:
     """The dtype-generic NVFP4 GEMM entry point — the FP4 analogue of
@@ -1365,17 +1406,41 @@ def lowp_gemm_fp4[
     default for activations/gradients; 16 -> 2D 16x16, for weights) — pass
     `b_block_rows=16` when `b_ptr` is a weight operand.
 
-    `round_mode` (default `ROUND_MODE_RNE`) selects RNE vs
-    `ROUND_MODE_STOCHASTIC` for BOTH operands' narrowing cast; per the
-    recipe SR belongs on gradient operands only, so a call site quantizing a
-    weight or activation should leave this at the default. `sr_seed`/
-    `sr_step` are forwarded to both `nvfp4_quantize` calls (module docstring
-    there); A and B are kept on separate RNG substreams internally
-    (`NVFP4_SR_STREAM`/`NVFP4_SR_STREAM + 1`) so their dither never collides
-    even when both operands happen to use SR.
+    `a_round_mode`/`b_round_mode` (each default `ROUND_MODE_RNE`) select RNE
+    vs `ROUND_MODE_STOCHASTIC` INDEPENDENTLY per operand — Chunk T1's
+    forward call leaves both at the default (RNE per the recipe); Chunk T2's
+    dgrad/wgrad calls set `ROUND_MODE_STOCHASTIC` on just the `d_output`
+    operand's round mode (the recipe's "SR on the gradient operand only",
+    weight/input operands stay RNE). `sr_seed`/`sr_step` are forwarded to
+    both `nvfp4_quantize`/`nvfp4_quantize_transpose` calls (module docstring
+    there, only consulted when that operand's round mode is
+    `ROUND_MODE_STOCHASTIC`); A and B are kept on separate RNG substreams
+    (`a_sr_stream`/`b_sr_stream`, defaulting to `NVFP4_SR_STREAM`/
+    `NVFP4_SR_STREAM + 1`) so their dither never collides even when both
+    operands happen to use SR — a caller quantizing a DIFFERENT logical
+    tensor in each operand role (e.g. Chunk T2's dgrad/wgrad) should pass its
+    own reserved stream ids explicitly (see `llmm/nvfp4_quant.mojo`'s
+    "Stream registry" section) rather than rely on the forward-call default.
 
-    Forward-orientation only (no `transpose_a`/`transpose_b`) — see the
-    module comment above `_matmul_cublaslt_fp4` for the scope rationale.
+    `accumulate` (comptime, default False): when True, `d_ptr[idx] +=
+    raw_gemm[idx] * tensor_scale_A * tensor_scale_B` instead of overwriting
+    — see the module comment above `_nvfp4_post_scale_gpu` for why this
+    needs the separate `d_raw_scratch` buffer rather than a cuBLASLt-level
+    beta=1 accumulate (which NVFP4's two-level scale makes incorrect).
+
+    `transpose_a`/`transpose_b` (comptime, Chunk T2): when set, that operand
+    is quantized via `nvfp4_quantize_transpose` instead of `nvfp4_quantize`
+    — needed when the operand's natural `[rows, cols]` row-major storage
+    does NOT already have the contraction dimension `k` trailing (cuBLASLt's
+    NVFP4 GEMM is TN-only, mirroring fp8's `lowp_gemm`/`_matmul_cublaslt_fp8`
+    — see `llmm/matmul.mojo`'s dgrad/wgrad module comment below
+    `matmul_bwd_lowp` for the fp8 derivation and the fp4 sibling comment
+    above `matmul_d_input_bwd_fp4` for the fp4-specific wrinkle). When
+    `transpose_a`: `a_ptr` is logically `[k, m]` row-major (source shape,
+    e.g. weight `[OC,C]` for Dgrad, `k=OC, m=C`); `a_q_scratch`/
+    `a_scale_scratch` still size for the LOGICAL `[m,k]` a-role shape
+    (unchanged from the non-transposed case). Mirrored for `transpose_b`/
+    `b_ptr`/`[k,n]`.
     `m`/`n`/`k` follow this file's existing column-major-`D` convention,
     identical to `lowp_gemm`'s.
     """
@@ -1388,52 +1453,65 @@ def lowp_gemm_fp4[
         " (tests/probe_fp4/RESULTS.md)"
     )
 
-    nvfp4_quantize[in_dtype, target, a_block_rows, round_mode](
-        a_q_scratch,
-        a_scale_scratch,
-        a_tensor_scale_scratch,
-        a_ptr,
-        m,
-        k,
-        ctx,
-        sr_seed,
-        NVFP4_SR_STREAM,
-        sr_step,
-    )
-    nvfp4_quantize[in_dtype, target, b_block_rows, round_mode](
-        b_q_scratch,
-        b_scale_scratch,
-        b_tensor_scale_scratch,
-        b_ptr,
-        n,
-        k,
-        ctx,
-        sr_seed,
-        NVFP4_SR_STREAM + 1,
-        sr_step,
-    )
-
-    if accumulate:
-        # See the module comment above `_nvfp4_post_scale_gpu`: the
-        # per-tensor-scale correction below must overwrite `d_ptr` (it
-        # multiplies whatever is already there by `tensor_scale_A *
-        # tensor_scale_B`), so a cuBLASLt-level beta=1 accumulate would
-        # silently rescale the PRE-EXISTING accumulated value too, not just
-        # this call's fresh contribution -- wrong. Correctly supporting
-        # accumulate needs an extra raw-output scratch buffer (post-scale
-        # INTO `d_ptr` via an add, not an overwrite) that no test/call site
-        # in this chunk needs yet (the Wgrad grad-accumulation use case is
-        # the training-integration chunk's job) — raise rather than
-        # silently produce a wrong accumulated value.
-        raise Error(
-            "lowp_gemm_fp4: accumulate=True is not yet supported (the"
-            " two-level-scale post-correction is only correct for a fresh"
-            " D buffer, beta=0) -- see the comment above"
-            " _nvfp4_post_scale_gpu in llmm/matmul.mojo"
+    comptime if transpose_a:
+        nvfp4_quantize_transpose[in_dtype, target, a_block_rows, a_round_mode](
+            a_q_scratch,
+            a_scale_scratch,
+            a_tensor_scale_scratch,
+            a_ptr,
+            k,
+            m,
+            ctx,
+            sr_seed,
+            a_sr_stream,
+            sr_step,
+        )
+    else:
+        nvfp4_quantize[in_dtype, target, a_block_rows, a_round_mode](
+            a_q_scratch,
+            a_scale_scratch,
+            a_tensor_scale_scratch,
+            a_ptr,
+            m,
+            k,
+            ctx,
+            sr_seed,
+            a_sr_stream,
+            sr_step,
+        )
+    comptime if transpose_b:
+        nvfp4_quantize_transpose[in_dtype, target, b_block_rows, b_round_mode](
+            b_q_scratch,
+            b_scale_scratch,
+            b_tensor_scale_scratch,
+            b_ptr,
+            k,
+            n,
+            ctx,
+            sr_seed,
+            b_sr_stream,
+            sr_step,
+        )
+    else:
+        nvfp4_quantize[in_dtype, target, b_block_rows, b_round_mode](
+            b_q_scratch,
+            b_scale_scratch,
+            b_tensor_scale_scratch,
+            b_ptr,
+            n,
+            k,
+            ctx,
+            sr_seed,
+            b_sr_stream,
+            sr_step,
         )
 
+    # Always a fresh (beta=0) raw GEMM result into `d_raw_scratch` -- NVFP4's
+    # two-level scale means cuBLASLt-level accumulation is never correct
+    # here (module comment above `_nvfp4_post_scale_gpu`); any accumulation
+    # happens in the post-scale step below instead.
     _matmul_cublaslt_fp4[out_dtype](
-        d_ptr,
+        d_raw_scratch,
         a_q_scratch.as_immutable(),
         b_q_scratch.as_immutable(),
         a_scale_scratch.as_immutable(),
@@ -1445,8 +1523,9 @@ def lowp_gemm_fp4[
         ctx,
     )
 
-    _nvfp4_post_scale[out_dtype, target](
+    _nvfp4_post_scale[out_dtype, target, accumulate=accumulate](
         d_ptr,
+        d_raw_scratch.as_immutable(),
         a_tensor_scale_scratch.as_immutable(),
         b_tensor_scale_scratch.as_immutable(),
         m * n,
@@ -2037,6 +2116,8 @@ def matmul_fwd_fp4[
         b_block_rows=1,
     ](
         out_ptr,
+        out_ptr,  # d_raw_scratch aliases d_ptr -- accumulate=False (default),
+        # safe: the post-scale kernel reads then writes each index in place.
         weight_ptr,
         input_ptr,
         device_buf_mut_ptr(a_q_scratch),
@@ -2048,7 +2129,6 @@ def matmul_fwd_fp4[
         out_channels,
         rows,
         in_channels,
-        False,
         ctx,
     )
 
@@ -3267,6 +3347,316 @@ def matmul_bwd_lowp[
         input_state,
         doutput_state,
         ctx,
+    )
+
+
+# ===----------------------------------------------------------------------=== #
+# matmul_d_input_bwd_fp4 / matmul_d_weight_bwd_fp4 / matmul_bwd_fp4 — NVFP4
+# backward (Chunk T2), mirroring Chunk E's fp8 dgrad/wgrad/bundle split
+# immediately above (`matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_lowp`/
+# `matmul_bwd_lowp`) and Chunk T1's `matmul_fwd_fp4` (forward). Separate
+# sibling entry points, not a branch inside `matmul_d_input_bwd`/
+# `matmul_d_weight_bwd`/`matmul_bwd` themselves — same rationale as fp8's
+# split (those functions' signatures have no room for fp4's scratch
+# buffers, and bf16/fp32/fp8 callers must stay byte-for-byte unchanged).
+# `train_gpt2.mojo` wires these into a THIRD `elif PRECISION == "fp4":`
+# branch alongside fp8's `comptime if LOWP_BWD_ENABLED:`, gated per-layer by
+# `_layer_in_fp4_range` (the same middle-block policy the forward pass
+# uses) — outside that range it falls through to plain bf16 `matmul_bwd`.
+#
+# Per docs/ai/fp4_training_recipes_research.md §1 ("MANDATORY" list, items 2
+# and 3): **Dgrad = SR on the gradient operand, no RHT.** **Wgrad = RHT on
+# BOTH GEMM inputs + SR on the gradient operand** — but RHT is Chunk T2b's
+# scope (see `llmm/hadamard.mojo`'s module docstring); `matmul_d_weight_bwd_fp4`
+# here is deliberately RNE/SR WITHOUT RHT for now (T2a), so its accuracy
+# gate is expected to be worse than the eventual T2b number — report
+# honestly, do not compare it to the recipe's RHT-equipped claim.
+#
+# Operand orientations (same TN-only cuBLASLt constraint fp8's module
+# comment above `_matmul_cublaslt_fp8` derives, mirrored here for NVFP4's
+# `_matmul_cublaslt_fp4`):
+#   dgrad (matmul_d_input_bwd_fp4): A-role=weight (transpose_a=True, needs a
+#     transposed NVFP4 copy via `nvfp4_quantize_transpose`, 2D 16x16 block
+#     scale per the recipe's weight-scaling rule, RNE — weights are never
+#     SR'd), B-role=d_output (transpose_b=False, native orientation, 1D 1x16,
+#     **SR** — the recipe's gradient operand). `d_input` is always
+#     overwritten (accumulate=False, matching the fp8 sibling: activation
+#     grads never accumulate across micro-steps, only weight/bias grads do).
+#   wgrad (matmul_d_weight_bwd_fp4): A-role=input (transpose_a=True, needs a
+#     transposed NVFP4 copy, 1D 1x16, RNE — an activation, not a gradient),
+#     B-role=d_output (transpose_b=True, ALSO needs a transposed copy, 1D
+#     1x16, **SR**). `accumulate` is a comptime template parameter threaded
+#     straight from the caller (mirrors fp8's `matmul_d_weight_bwd_lowp`) —
+#     unlike fp8 (whose cuBLASLt beta=1 accumulate works natively for fp8
+#     operands), NVFP4's two-level scale means accumulation happens in the
+#     elementwise post-scale-add step (`_nvfp4_post_scale_gpu`'s
+#     `accumulate` branch), not cuBLASLt's `beta` — see that kernel's module
+#     comment. This function always allocates a FRESH `d_raw_scratch`
+#     buffer (distinct from `d_weight_ptr`) regardless of `accumulate`'s
+#     value, avoiding a conditional-aliasing footgun, consistent with this
+#     function's existing "no persistent state, fresh scratch every call"
+#     design (fp4 does not use `AmaxState` at all — Chunk T1's
+#     `matmul_fwd_fp4` docstring).
+#
+# DGELU is NOT fused into the fp4 GEMM epilogue, same reasoning as fp8's
+# `matmul_d_input_bwd_lowp`: it runs as the existing separate bf16
+# `_launch_matmul_gelu_backward_scaling_gpu` kernel afterward.
+#
+# No `AmaxState`: every quantize call here (like `matmul_fwd_fp4`) computes
+# both NVFP4 scale levels fresh from the current bf16 tensor, every call —
+# there is no delayed-scaling history to maintain and no "once per step"
+# update-ownership contract to reason about (contrast fp8's `AmaxState`
+# module comment above `matmul_d_input_bwd_lowp`). This also means Dgrad's
+# weight-operand quantization does NOT reuse Fprop's already-quantized 2D
+# 16x16 weight buffer — the recipe's "same buffer serves Fprop row-major and
+# Dgrad column-major without requantizing" is a PERFORMANCE optimization
+# `matmul_fwd_fp4`'s module comment flags as explicitly deferred ("that
+# reuse is a genuine per-role integration decision... not machinery this
+# GEMM-layer chunk should pre-build"); freshly re-quantizing here is
+# functionally equivalent (RNE is a deterministic pure function of the
+# weight tensor) at the cost of redundant compute, left on the table for a
+# later performance pass.
+#
+# SR seed/stream/step scheme: `sr_step` should be the caller's training-step
+# counter (thread from `train_gpt2.mojo`'s outer loop through `backward()`,
+# NOT always 0 — see the `train_gpt2.mojo` call-site comment for the exact
+# `step`/`micro_step` combination used) so repeated backward calls across
+# training steps draw fresh dither rather than reusing the same bit pattern
+# every step under the fixed default seed. `NVFP4_SR_STREAM_DGRAD_DOUTPUT`/
+# `NVFP4_SR_STREAM_WGRAD_DOUTPUT` (llmm/nvfp4_quant.mojo) keep dgrad's and
+# wgrad's `d_output` SR draws on disjoint substreams from each other and from
+# Chunk T1's forward reservation, even though both consume the same
+# underlying `d_output` tensor values in different layouts.
+# ===----------------------------------------------------------------------=== #
+
+
+def matmul_d_input_bwd_fp4[
+    dtype: DType,
+    target: StaticString,
+    use_gelu: Bool,
+](
+    d_input_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    weight_ptr: ImmutKernelPtr[dtype],
+    pre_gelu_ptr: ImmutKernelPtr[dtype],
+    batch_size: Int64,
+    seq_len: Int64,
+    channels: Int64,
+    output_channels: Int64,
+    ctx: DeviceContext,
+    sr_seed: UInt64 = NVFP4_SR_SEED,
+    sr_step: Int = 0,
+) raises -> None:
+    """NVFP4 dgrad: `d_input = d_output @ weight` via `lowp_gemm_fp4`. See
+    the module comment above for the orientation/rounding derivation.
+    """
+    comptime assert is_gpu[target](), (
+        "matmul_d_input_bwd_fp4 is GPU-only per"
+        " docs/ai/fp8_training_design.md landmine #1"
+    )
+    var rows = Int(batch_size * seq_len)
+    var in_channels = Int(channels)
+    var out_channels = Int(output_channels)
+
+    # a = weight [out_channels, in_channels] (transposed read), 2D 16x16, RNE.
+    var a_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_packed_size(in_channels, out_channels)
+    )
+    var a_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_scale_buffer_size(in_channels, out_channels, NVFP4_BLOCK)
+    )
+    var a_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+    # b = d_output [rows, out_channels] (native), 1D 1x16, SR.
+    var b_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_packed_size(rows, out_channels)
+    )
+    var b_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_scale_buffer_size(rows, out_channels, 1)
+    )
+    var b_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+
+    lowp_gemm_fp4[
+        dtype,
+        dtype,
+        target,
+        a_block_rows=NVFP4_BLOCK,
+        b_block_rows=1,
+        a_round_mode=ROUND_MODE_RNE,
+        b_round_mode=ROUND_MODE_STOCHASTIC,
+        accumulate=False,  # d_input is always overwritten, never accumulated
+        transpose_a=True,
+        transpose_b=False,
+    ](
+        d_input_ptr,
+        d_input_ptr,  # d_raw_scratch aliases d_ptr (accumulate=False, safe)
+        weight_ptr,
+        d_output_ptr,
+        device_buf_mut_ptr(a_q_scratch),
+        device_buf_mut_ptr(a_scale_scratch),
+        device_buf_mut_ptr(a_tensor_scale_scratch),
+        device_buf_mut_ptr(b_q_scratch),
+        device_buf_mut_ptr(b_scale_scratch),
+        device_buf_mut_ptr(b_tensor_scale_scratch),
+        in_channels,
+        rows,
+        out_channels,
+        ctx,
+        sr_seed,
+        NVFP4_SR_STREAM,  # a_sr_stream: unused (a_round_mode is RNE)
+        NVFP4_SR_STREAM_DGRAD_DOUTPUT,
+        sr_step,
+    )
+    comptime if use_gelu:
+        _launch_matmul_gelu_backward_scaling_gpu[dtype](
+            d_input_ptr, pre_gelu_ptr, rows * in_channels, ctx
+        )
+
+
+def matmul_d_weight_bwd_fp4[
+    dtype: DType,
+    target: StaticString,
+    accumulate: Bool,
+](
+    d_weight_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    input_ptr: ImmutKernelPtr[dtype],
+    batch_size: Int64,
+    seq_len: Int64,
+    channels: Int64,
+    output_channels: Int64,
+    ctx: DeviceContext,
+    sr_seed: UInt64 = NVFP4_SR_SEED,
+    sr_step: Int = 0,
+) raises -> None:
+    """NVFP4 wgrad (Chunk T2a — RNE/SR, no RHT yet; T2b adds RHT):
+    `d_weight = d_output^T @ input` via `lowp_gemm_fp4`. See the module
+    comment above for the orientation/rounding/accumulate derivation.
+    """
+    comptime assert is_gpu[target](), (
+        "matmul_d_weight_bwd_fp4 is GPU-only per"
+        " docs/ai/fp8_training_design.md landmine #1"
+    )
+    var rows = Int(batch_size * seq_len)
+    var in_channels = Int(channels)
+    var out_channels = Int(output_channels)
+
+    # a = input [rows, in_channels] (transposed read), 1D 1x16, RNE.
+    var a_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_packed_size(in_channels, rows)
+    )
+    var a_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_scale_buffer_size(in_channels, rows, 1)
+    )
+    var a_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+    # b = d_output [rows, out_channels] (transposed read), 1D 1x16, SR.
+    var b_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_packed_size(out_channels, rows)
+    )
+    var b_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_scale_buffer_size(out_channels, rows, 1)
+    )
+    var b_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+    # Always a FRESH raw-GEMM scratch buffer -- see the module comment above
+    # for why this avoids a conditional-aliasing footgun.
+    var d_raw_scratch = ctx.enqueue_create_buffer[dtype](
+        in_channels * out_channels
+    )
+
+    lowp_gemm_fp4[
+        dtype,
+        dtype,
+        target,
+        a_block_rows=1,
+        b_block_rows=1,
+        a_round_mode=ROUND_MODE_RNE,
+        b_round_mode=ROUND_MODE_STOCHASTIC,
+        accumulate=accumulate,
+        transpose_a=True,
+        transpose_b=True,
+    ](
+        d_weight_ptr,
+        device_buf_mut_ptr(d_raw_scratch),
+        input_ptr,
+        d_output_ptr,
+        device_buf_mut_ptr(a_q_scratch),
+        device_buf_mut_ptr(a_scale_scratch),
+        device_buf_mut_ptr(a_tensor_scale_scratch),
+        device_buf_mut_ptr(b_q_scratch),
+        device_buf_mut_ptr(b_scale_scratch),
+        device_buf_mut_ptr(b_tensor_scale_scratch),
+        in_channels,
+        out_channels,
+        rows,
+        ctx,
+        sr_seed,
+        NVFP4_SR_STREAM,  # a_sr_stream: unused (a_round_mode is RNE)
+        NVFP4_SR_STREAM_WGRAD_DOUTPUT,
+        sr_step,
+    )
+
+
+def matmul_bwd_fp4[
+    dtype: DType,
+    target: StaticString,
+    use_gelu: Bool = False,
+    accumulate: Bool = True,
+    has_bias: Bool = True,
+](
+    d_input_ptr: MutKernelPtr[dtype],
+    d_weight_ptr: MutKernelPtr[dtype],
+    d_bias_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    input_ptr: ImmutKernelPtr[dtype],
+    weight_ptr: ImmutKernelPtr[dtype],
+    pre_gelu_ptr: ImmutKernelPtr[dtype],
+    batch_size: Int64,
+    seq_len: Int64,
+    channels: Int64,
+    output_channels: Int64,
+    ctx: DeviceContext,
+    sr_seed: UInt64 = NVFP4_SR_SEED,
+    sr_step: Int = 0,
+) raises -> None:
+    """NVFP4 backward for one block-linear site (Chunk T2): bias grad (bf16,
+    unchanged `matmul_bias_bwd` — reused exactly like fp8's
+    `matmul_bwd_lowp`) + dgrad + wgrad (both NVFP4). Sibling of `matmul_bwd`/
+    `matmul_bwd_lowp`, mirroring `matmul_fwd`/`matmul_fwd_lowp`/
+    `matmul_fwd_fp4`'s three-way split.
+    """
+    comptime if has_bias:
+        matmul_bias_bwd[dtype, target, accumulate](
+            d_bias_ptr,
+            d_output_ptr,
+            batch_size,
+            seq_len,
+            output_channels,
+            ctx,
+        )
+
+    matmul_d_input_bwd_fp4[dtype, target, use_gelu](
+        d_input_ptr,
+        d_output_ptr,
+        weight_ptr,
+        pre_gelu_ptr,
+        batch_size,
+        seq_len,
+        channels,
+        output_channels,
+        ctx,
+        sr_seed,
+        sr_step,
+    )
+    matmul_d_weight_bwd_fp4[dtype, target, accumulate](
+        d_weight_ptr,
+        d_output_ptr,
+        input_ptr,
+        batch_size,
+        seq_len,
+        channels,
+        output_channels,
+        ctx,
+        sr_seed,
+        sr_step,
     )
 
 

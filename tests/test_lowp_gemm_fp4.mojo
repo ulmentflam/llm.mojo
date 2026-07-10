@@ -189,6 +189,7 @@ def _run_fp4_gemm_case[
 
     lowp_gemm_fp4[IN_DT, IN_DT, "gpu", a_block_rows, b_block_rows](
         rebind[MutKernelPtr[IN_DT]](dev_d.unsafe_ptr().as_unsafe_any_origin()),
+        rebind[MutKernelPtr[IN_DT]](dev_d.unsafe_ptr().as_unsafe_any_origin()),
         rebind[ImmutKernelPtr[IN_DT]](
             dev_a.unsafe_ptr().as_immutable().as_unsafe_any_origin()
         ),
@@ -216,7 +217,6 @@ def _run_fp4_gemm_case[
         m,
         n,
         k,
-        False,
         ctx,
     )
 
@@ -461,6 +461,7 @@ def test_fp4_rht_quantize_gemm_contract() raises:
 
     lowp_gemm_fp4[IN_DT, IN_DT, "gpu", 1, 1](
         rebind[MutKernelPtr[IN_DT]](dev_d.unsafe_ptr().as_unsafe_any_origin()),
+        rebind[MutKernelPtr[IN_DT]](dev_d.unsafe_ptr().as_unsafe_any_origin()),
         rebind[ImmutKernelPtr[IN_DT]](
             dev_a_rht.unsafe_ptr().as_immutable().as_unsafe_any_origin()
         ),
@@ -488,7 +489,6 @@ def test_fp4_rht_quantize_gemm_contract() raises:
         m,
         n,
         k,
-        False,
         ctx,
     )
     ctx.synchronize()
