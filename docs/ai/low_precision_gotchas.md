@@ -6,8 +6,9 @@ regimes on NVIDIA GB10 (Grace-Blackwell, sm_121, aarch64). This document capture
 out-of-the-ordinary implementation changes, and non-obvious updates that future engineers
 or agents extending low-precision support must not rediscover the hard way.
 
-**Note at the top:** This is a LIVING first draft (2026-07-10, campaigns in flight); FP8
-chunks B/C/D/E/F/G and the FP4 build will append their gotchas before the final merge.
+**Note at the top:** Complete audit of TF32/FP8/FP4 campaigns (2026-07-10, campaigns consolidated).
+All three precision paths are integrated and gated. This document captures gotchas across the full campaign
+lifecycle for future reference and extension.
 
 **Related documentation:**
 - The FP8 design document (`fp8_training_design.md` on this branch) covers the scheme,
@@ -306,6 +307,33 @@ and **interleaving A/B comparison arms in one quiet window**.
 
 **Source:** Memory footprint contention notes (MEMORY.md, worktree-agents-must-commit context).
 
+### TF4 — Wall-clock A/B benchmarks cannot resolve sub-millisecond thermal-drift effects; alternate arm order across rounds
+
+**Gotcha:** Naive fixed-order A/B benchmarking (always run A then B in every round) produces
+false **apparent wins/losses** of ±3–4 ms when the true effect is <0.5 ms, because thermal state
+drifts predictably over minutes — an A-first warm B-second-cold pair will always make B look
+slower even if they are identical. A 60-sample interleaved benchmark (3 rounds × 20 steps/round)
+with fixed order showed +4.17 ms false win; a second run alternating which arm went first
+(A-first then B-first each round) showed −1.10 ms / +0.17 ms — opposite sign and noise-amplitude.
+
+**Fix:** Alternate arm order across rounds (e.g., round 1: A then B, round 2: B then A, round 3:
+A then B). Per-arm standard error is ~0.2–0.3 ms, so effects smaller than that cannot be
+resolved reliably; use per-kernel ncu profiles (`make profile-ncu PROFILE_T=1024`) for
+sub-millisecond targeting instead.
+
+**Source:** 2026-07-10 dbias-fusion wall-clock interleaving study
+(`docs/ai/ai_assisted_optimizations_and_benchmarks.md`).
+
+### TF5 — `make benchmark-gpu` silently drops PyTorch arms if the default pixi env has no CUDA torch
+
+**Gotcha:** `scripts/benchmark_train.py` in the default pixi environment fails PyTorch CUDA arms
+with "Torch not compiled with CUDA enabled", then silently **drops those samples from the output
+table** rather than erroring — a 6-arm table becomes a 4-arm table invisibly. The fix: invoke
+`pixi run -e cuda python scripts/benchmark_train.py ...` to use the CUDA-enabled torch environment.
+
+**Source:** 2026-07-10 GPU 6-arm official benchmark (`docs/ai/ai_assisted_optimizations_and_benchmarks.md`,
+Harness gotcha section).
+
 ---
 
 ## ARCHITECTURE DECISIONS
@@ -481,7 +509,7 @@ knob in `train_gpt2.mojo` (default off = full fp8, comptime-inert).
 
 ## FP8 CHUNK F (end-to-end verification, determinism, perf)
 
-### F1 — The recalibrated gradient gate is now codified; local-trend window choice matters
+### FF1 — The recalibrated gradient gate is now codified; local-trend window choice matters
 
 **What:** `tests/compare_grad_dumps.py` implements the E5 recalibration proposal as an
 executable gate (`make verify-fp8-grads`): (a) per-tensor cosine floor >0.93, (b) relL2
@@ -504,7 +532,7 @@ point is 1.90×, under threshold. Future agents changing this gate should keep r
 small (1) rather than widen it — a wider window trades bug sensitivity for false
 positives on the naturally-noisy compounding curve.
 
-### F2 — Bit-stability confirmed: fp8's new kernels are deterministic
+### FF2 — Bit-stability confirmed: fp8's new kernels are deterministic
 
 **What:** Two identical fp8 10-step runs (same seed/checkpoint/data invocation)
 produce bitwise-identical `step N | loss ... | norm ...` sequences (`diff` empty).
@@ -515,7 +543,7 @@ mutable state across threads that would introduce atomics-order nondeterminism �
 contrast to the known bf16 atomics-in-non-lowp-kernels wiggle source (MEMORY.md
 territory), which fp8 does not add to.
 
-### F3 — 50-step envelope: no drift as amax history fills
+### FF3 — 50-step envelope: no drift as amax history fills
 
 **What:** A 10-step horizon (E5) cannot distinguish "tracks bf16" from "slowly
 drifts as the 16-step amax history transitions out of warmup." A 50-step fp8-vs-bf16
@@ -527,7 +555,7 @@ being pre-trained — the warmup-to-delayed-scaling transition (`amax_history_le
 §1.3) falls around step 16-17 of this 50-step window, and the flat first-half vs
 second-half median confirms it does not destabilize the loss trajectory.
 
-### F4 — FP8 is currently slower than bf16 at real scale; overhead is almost entirely `quantize_transpose`
+### FF4 — FP8 is currently slower than bf16 at real scale; overhead is almost entirely `quantize_transpose`
 
 **What:** At B=4, T=1024 (the shipped training config), fp8 is **~36% slower** than
 bf16 (183.7 vs 134.7 ms/step median, two independent measurement protocols agreeing
@@ -1000,13 +1028,11 @@ implemented then reverted, git-clean at commit time).
 |---------|-------|--------|
 | TOOLCHAIN | T1–T5 | Verified (T1–T2: Probes 1–5; T3–T5: observed) |
 | cuBLASLt | C1–C5 | Verified (C1: Probe 4; C2–C3: Probe FP4; C4–C5: FP4-GEMM chunk, tests/test_lowp_gemm_fp4.mojo) |
-| TF32/fp32 | TF1–TF3 | Verified (TF1–TF2: goal1 branch; TF3: GB10 incidents) |
+| TF32/fp32 | TF1–TF5 | Verified (TF1–TF2: goal1 branch; TF3: GB10 incidents; TF4–TF5: benchmarking methodology from 2026-07-10 optimizations) |
 | ARCHITECTURE | A1–A3 | A1–A2: design doc confirmed; A3: agent-reported |
 | FP8 CHUNK D/E | E1–E5 | Verified (E5: root-cause investigation, coordinator-accepted recalibration) |
-| FP8 CHUNK F | F1–F4 | Verified (gate codified + PASS, bit-stability PASS, 50-step envelope PASS, perf measured) |
+| FP8 CHUNK F | FF1–FF4 | Verified (gate codified + PASS, bit-stability PASS, 50-step envelope PASS, perf measured) |
 | FP8 QUANT-OPT | G1-G2 | Verified (G1: ncu sudo-gated counters workaround; G2: race found + fixed, 3x twin-run confirmed) |
-
-| FP8 CHUNK D/E | E1–E5 | Verified (E1–E4: goal2 integration; E5: four-line-of-evidence investigation) |
 | FP4 CHUNK T1 | F1 | Verified (gate c re-run 3x bit-identical; gate d 10-step A/B) |
 | FP4 CHUNK T2a | F2–F4 | Verified (F2: test fix + re-run 18/18 green; F3: gate c 3x bit-identical; F4: gate d 10-step A/B, checkpoint init) |
 | FP4 CHUNK T2b | F5–F6 | Verified (F5: dedicated gaussian/outlier unit tests, reproducible; F6: gate d 10-step A/B + ablation bit-identity to T2a) |
@@ -1026,4 +1052,5 @@ implemented then reverted, git-clean at commit time).
 
 ## Footer
 
-Written with AI assistance (Claude Code / Haiku agent), directed by Evan Owen.
+Written with AI assistance (Claude Code / Haiku agent), directed by Evan Owen. Final editorial sweep
+(numbering consolidation, cross-reference verification, gotchas from daily entries) on 2026-07-10.
