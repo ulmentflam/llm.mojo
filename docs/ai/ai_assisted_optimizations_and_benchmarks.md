@@ -1900,3 +1900,172 @@ no gate failing by >2x its bound).
 
 Commit: this entry lands alongside the T2a implementation on
 `goal3b/fp4-training`.
+
+## 2026-07-10 — NVFP4 Wgrad Random Hadamard Transform (goal3b chunk T2b)
+
+Chunk T2b completes the recipe's three-item mandatory Wgrad stabilization
+list (`fp4_training_recipes_research.md` §1: 2D 16x16 weight scaling — T1;
+SR on gradients — T2a; **RHT on Wgrad — T2b**) by wiring
+`llmm/hadamard.mojo`'s fixed 16-wide Random Hadamard Transform into
+`matmul_d_weight_bwd_fp4` (`llmm/matmul.mojo`). Both Wgrad operands
+(`input`, `d_output`) are transformed along the contraction (K = batch*seq)
+dimension before NVFP4 quantization, per the recipe.
+
+**RHT integration design: a separate transpose+RHT materialization pass, not
+a fused quantize-kernel prologue.** A fused prologue was considered — with
+`BLOCK_ROWS=1` (1D 1x16, Wgrad's granularity), each `_nvfp4_quantize_gpu`
+thread already owns exactly one 16-element block, a tempting match for
+`HADAMARD_BLOCK=16` — but rejected: `_nvfp4_quantize_impl` computes the
+per-TENSOR fp32 scale (`nvfp4_compute_tensor_scale`, a separate flat-amax
+reduction pass) BEFORE the per-block quantize kernel runs, reading `x_ptr`
+directly. If RHT were applied only inside the quantize kernel's per-block
+prologue, the tensor scale would be computed from the PRE-RHT data while
+block scales are encoded against POST-RHT block amaxes — for Gaussian-ish
+data RHT scales per-block amax by roughly `sqrt(16)=4` (variance-additive
+sum of 16 signed terms), so `block_scale_raw` would run ~4x too high,
+overflowing e4m3's block-scale encoding range and silently misscaling every
+block. A new helper, `_rht_transpose_prep` (`llmm/matmul.mojo`), instead (1)
+transposes `input`/`d_output` from their natural `[rows, channels]` storage
+into `[channels, rows]` scratch via the existing `_gpu_transpose_kernel`
+(previously Metal-only, now also used from the CUDA Wgrad path — plain
+vendor-neutral GPU code, no new kernel needed), then (2) applies
+`hadamard16_fwd_gpu` IN PLACE along the now-trailing/contiguous `rows` axis
+(safe: each thread reads its full 16-element block before writing any of
+it). The ordinary, UNMODIFIED `nvfp4_quantize` then runs on this materialized
+buffer, so `nvfp4_compute_tensor_scale` naturally sees the same RHT'd data
+the block-quantize step does — zero risk to the shared quantize kernel every
+other fp4 call site (Fprop, Dgrad) also uses. Cost: two extra kernel
+launches per operand (naive transpose + in-place Hadamard) and one extra
+`rows*channels`-sized bf16 scratch buffer per operand, not benchmarked for
+throughput this chunk (correctness/accuracy was the gate, not performance —
+a documented opportunity for a later pass, e.g. fusing the transpose into
+the Hadamard kernel's read address the way `nvfp4_quantize_transpose`
+already fuses transpose into quantize).
+
+**16x scale factor.** The RHT-composition contract
+(`(H@a)^T@(H@b) == 16*a^T@b`, `tests/test_lowp_gemm_fp4.mojo::
+test_fp4_rht_quantize_gemm_contract`, unaffected by this chunk and still
+passing) means the resulting GEMM is 16x the desired Wgrad value. Per the
+coordinator's instruction, this is folded into `lowp_gemm_fp4`'s new
+`extra_scale` runtime parameter (`extra_scale=1/16`, multiplied into the
+existing per-tensor-scale post-scale kernel, `_nvfp4_post_scale_gpu`) rather
+than an extra `O(m*n)` elementwise divide-by-16 pass over the (potentially
+large) weight-gradient output — effectively free.
+
+**Ablation flag.** `-D LLMM_FP4_NO_RHT=1` (default 0, i.e. RHT ON) falls
+`matmul_d_weight_bwd_fp4` back to EXACTLY T2a's code path (plain
+`nvfp4_quantize_transpose` on `input_ptr`/`d_output_ptr`, no RHT, no extra
+scratch) — same streams, same `sr_step` usage. Both `build-fp4` (RHT-on) and
+a `-D LLMM_FP4_NO_RHT=1` build compile cleanly; the ablation's 10-step
+training run reproduces T2a's original per-step losses **bit-for-bit** (see
+gate (d) below), confirming the flag plumbing.
+
+### Gate (c) — GEMM-level RHT-on vs RHT-off (`tests/test_matmul_bwd_fp4.mojo`)
+
+Two new tests, `test_wgrad_rht_gaussian`/`test_wgrad_rht_outlier`, compare
+`matmul_d_weight_bwd_fp4` (RHT-on, production default) against a
+hand-composed RHT-off arm (T2a's exact `nvfp4_quantize_transpose`
+composition) on synthetic data, both vs a bf16 `matmul_d_weight_bwd`
+reference (`rows=1024, in_channels=out_channels=384`):
+
+| case | RHT-off rel_l2 | RHT-off cosine | RHT-on rel_l2 | RHT-on cosine | verdict |
+|---|---:|---:|---:|---:|---|
+| gaussian | 0.16745 | 0.98600 | 0.16642 | 0.98619 | roughly neutral (tiny improvement) |
+| outlier-heavy (0.1% @ 100x) | 0.08441 | 0.99644 | 0.09688 | 0.99610 | **RHT-on WORSE** |
+
+Both bit-identical across repeat runs (no SR randomness in play beyond what
+both T2a and T2b already share). The outlier-heavy result is
+counterintuitive — see `low_precision_gotchas.md` F5 for the mechanism (an
+isolated 100x spike gets SPREAD across all 16 block positions by the
+unnormalized Hadamard, not shrunk; e2m1's 8-level ladder then can't resolve
+the resulting near-uniform-but-still-large values, echoing the Metis paper
+critique already cited in `fp4_training_recipes_research.md`: RHT "only
+smooths a few outliers without reducing overall spread"). The real MLP-site
+gates below tell a more favorable (if modest) story on realistic data.
+
+The existing site gates (`test_fc_bwd_site`/`test_proj_bwd_site`,
+uniform-random data at real GPT-2 124M shapes, rows=4096) now exercise
+T2b's RHT-on default for `d_weight` (Dgrad/`d_input` is unaffected — RHT is
+Wgrad-only per the recipe) and show a real, if modest, improvement over
+T2a's floor:
+
+| site | d_input relL2/cosine (T2a, unaffected) | d_weight relL2/cosine T2a (RHT-off) | d_weight relL2/cosine T2b (RHT-on) |
+|---|---|---|---|
+| fc-bwd | 0.1836 / 0.9845 | 0.1784 / 0.9849 | **0.1664 / 0.9865** |
+| proj-bwd | 0.1839 / 0.9850 | 0.1782 / 0.9849 | **0.1665 / 0.9864** |
+
+`d_weight` relL2 drops ~7-10% relative (0.178-0.184 -> 0.166) and cosine
+improves (0.985 -> 0.986) — a genuine single-GEMM accuracy win, gate bounds
+tightened accordingly (relL2 < 0.20, cosine > 0.980, from 0.22/0.975 —
+derivation in the test file). `d_bias` remains bit-identical (bias-grad
+reuse unaffected, as expected). All new/existing fp4 test suites pass:
+`test_matmul_bwd_fp4.mojo` (5/5), `test_lowp_gemm_fp4.mojo` (8/8, RHT
+contract test unaffected/still passing), `test_matmul_fwd_fp4.mojo` (2/2),
+`test_nvfp4_quant.mojo` (18/18) — no regressions from touching the shared
+`lowp_gemm_fp4`/`_nvfp4_post_scale` machinery.
+
+### Gate (d) — 10-step fp4 (RHT-on) vs bf16 training (tinyshakespeare, B4
+T1024, GPT-2 124M checkpoint init): same invocation as T1/T2a
+(`-e gpt2_124M_bf16.bin -x 10`)
+
+No NaN/Inf; loss decreases in both arms. bf16 arm reproduced T2a's exact
+bf16 trajectory bit-for-bit (checkpoint-init determinism, per T2a's finding)
+— val loss 4.513306 -> 3.709412 identically:
+
+| step | fp4 (T2b, RHT-on) loss | bf16 loss | Δ rel | T2a (RHT-off) Δ rel | T1 (fwd-only) Δ rel |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4.408221 | 4.369226 | +0.89% | +0.89% | +0.89% |
+| 2 | 4.398898 | 4.418465 | −0.44% | −0.50% | −1.45% |
+| 3 | 4.579138 | 4.510433 | +1.52% | +1.28% | −0.05% |
+| 4 | 4.111033 | 4.026239 | +2.11% | +2.06% | +1.70% |
+| 5 | 3.643768 | 3.578290 | +1.83% | +1.77% | +1.80% |
+| 6 | 3.823251 | 3.767685 | +1.47% | +1.70% | +1.63% |
+| 7 | 3.559469 | 3.534359 | +0.71% | +0.80% | +0.83% |
+| 8 | 3.678583 | 3.655098 | +0.64% | +0.86% | +1.17% |
+| 9 | 3.287668 | 3.253812 | +1.04% | +1.06% | +1.02% |
+| 10 | 3.417234 | 3.390009 | +0.80% | +0.87% | +0.77% |
+| val (post-10) | 3.764894 | 3.709412 | +1.50% | +1.50% | +1.26% |
+
+**Mean per-step delta: T2b (RHT-on) +1.06% vs T2a's (RHT-off) +1.08%; final
+val +1.50% vs +1.50% (identical to two decimal places).** RHT provides a
+negligible, arguably noise-level improvement in this gate — NOT the
+recipe's "closes most of the gap" claim. This is not a wiring failure: see
+`low_precision_gotchas.md` F6 for why (three independent checks confirm the
+RHT machinery is doing exactly what it should — the contract test still
+passes, the ablation reproduces T2a bit-for-bit, and the GEMM-level unit
+tests DO show a real ~7-10% accuracy improvement on realistic data — the
+effect is just too small at 10 steps from a converged checkpoint to move
+the aggregate training-loss needle, and F5's outlier-construction finding
+suggests RHT's benefit is genuinely data-distribution-dependent rather than
+a blanket win).
+
+**Throughput cost (measured, not gated this chunk):** RHT-on averaged
+~183 ms/step (steps 2-10, ~14.4% fp4 MFU, ~22.4k tok/s) vs the ablation's
+~164.5 ms/step (~16.0% fp4 MFU, ~25.0k tok/s) — RHT-on is ~11% slower,
+consistent with `_rht_transpose_prep`'s two extra kernel launches (naive
+transpose + in-place Hadamard) and extra scratch traffic per Wgrad operand,
+predicted in the design section above. bf16 remains fastest at ~134.9 ms/step
+(~19.6% bf16 MFU, ~30.4k tok/s) — fp4 (either RHT arm) is still slower than
+bf16 at these shapes, same "quantize-kernel overhead outweighs the e2m1 GEMM
+gain" finding as T1's forward-only gate.
+
+### Gate (e) — ablation consistency (`-D LLMM_FP4_NO_RHT=1`)
+
+The `-D LLMM_FP4_NO_RHT=1` build's 10-step training run reproduces T2a's
+ORIGINAL per-step losses bit-for-bit — every one of the 10 steps and the
+val loss (3.7649264) match T2a's committed table to every printed digit.
+**Ablation flag plumbing verdict: PASS, bit-identical, exactly as expected**
+(same streams, same `sr_step` usage, the ablation branch is a byte-for-byte
+copy of T2a's original code).
+
+**Gates summary: (a) all builds (fp32/bf16/fp8/fp4, plus the
+`-D LLMM_FP4_NO_RHT=1` fp4 ablation variant) compile, binaries verified
+fresh vs source mtimes; (b) bf16 trajectory unchanged (matches T2a
+bit-for-bit); (c) PASS (tables above, with one honestly-reported
+counterintuitive sub-result, F5); (d) honest near-null result vs T2a (not a
+regression, not the hoped-for recovery either), no NaN/Inf, loss decreasing
+in both arms; (e) ablation reproduces T2a bit-for-bit.** No STOP condition
+triggered.
+
+Commit: this entry lands alongside the T2b implementation on
+`goal3b/fp4-training`.

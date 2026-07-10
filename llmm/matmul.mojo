@@ -4,7 +4,7 @@ from std.math import ceildiv
 from layout import Layout, TileTensor
 from layout.layout_tensor import LayoutTensor
 from linalg.matmul import matmul
-from std.sys import simd_width_of
+from std.sys import simd_width_of, get_defined_int
 from std.gpu.primitives import block
 from linalg.matmul.vendor import blas
 from std.utils.index import IndexList
@@ -53,6 +53,7 @@ from llmm.gelu import gelu, gelu_grad, gelu_fwd_gpu, bias_gelu_fwd
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 from llmm.vendor import HAS_CUBLAS, HAS_METAL
+from llmm.hadamard import hadamard16_fwd_gpu
 from llmm.lowp import (
     PrecisionSpec,
     FP8_SPEC,
@@ -1311,10 +1312,11 @@ def _nvfp4_post_scale_gpu[
     a_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
     b_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
     n: Int,
+    extra_scale: Float32,
 ) -> None:
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < n:
-        var s = a_tensor_scale_ptr[0] * b_tensor_scale_ptr[0]
+        var s = a_tensor_scale_ptr[0] * b_tensor_scale_ptr[0] * extra_scale
         var v = raw_ptr[idx].cast[DType.float32]() * s
         comptime if accumulate:
             v = v + d_ptr[idx].cast[DType.float32]()
@@ -1332,6 +1334,7 @@ def _nvfp4_post_scale[
     b_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
     n: Int,
     ctx: DeviceContext,
+    extra_scale: Float32 = Float32(1.0),
 ) raises -> None:
     comptime assert is_gpu[target](), "_nvfp4_post_scale is GPU-only"
     comptime BLOCK_SIZE = 256
@@ -1345,6 +1348,7 @@ def _nvfp4_post_scale[
         a_tensor_scale_ptr,
         b_tensor_scale_ptr,
         n,
+        extra_scale,
         grid_dim=(num_blocks,),
         block_dim=(BLOCK_SIZE,),
     )
@@ -1392,6 +1396,7 @@ def lowp_gemm_fp4[
     a_sr_stream: UInt64 = NVFP4_SR_STREAM,
     b_sr_stream: UInt64 = NVFP4_SR_STREAM + 1,
     sr_step: Int = 0,
+    extra_scale: Float32 = Float32(1.0),
 ) raises -> None:
     """The dtype-generic NVFP4 GEMM entry point — the FP4 analogue of
     `lowp_gemm` (fp8, above): quantizes `a_ptr`/`b_ptr` (bf16 or fp32, both
@@ -1443,6 +1448,16 @@ def lowp_gemm_fp4[
     `b_ptr`/`[k,n]`.
     `m`/`n`/`k` follow this file's existing column-major-`D` convention,
     identical to `lowp_gemm`'s.
+
+    `extra_scale` (runtime, default 1.0, Chunk T2b): an extra scalar folded
+    into the post-scale multiply (`d = raw * tensor_scale_A * tensor_scale_B
+    * extra_scale`). Exists so a caller that pre-transformed BOTH GEMM
+    operands with `llmm/hadamard.mojo`'s 16-wide RHT (`(H@a)^T @ (H@b) ==
+    16 * a^T @ b`, verified in `tests/test_lowp_gemm_fp4.mojo::
+    test_fp4_rht_quantize_gemm_contract`) can pass `extra_scale=1/16` to
+    recover the UN-transformed GEMM result directly from the post-scale step,
+    instead of a separate O(m*n) elementwise divide-by-16 pass over the
+    output — see `matmul_d_weight_bwd_fp4`'s Chunk T2b RHT integration.
     """
     comptime assert is_gpu[target](), (
         "lowp_gemm_fp4 is GPU-only per docs/ai/fp8_training_design.md"
@@ -1530,6 +1545,7 @@ def lowp_gemm_fp4[
         b_tensor_scale_scratch.as_immutable(),
         m * n,
         ctx,
+        extra_scale,
     )
 
 
@@ -3366,11 +3382,57 @@ def matmul_bwd_lowp[
 #
 # Per docs/ai/fp4_training_recipes_research.md §1 ("MANDATORY" list, items 2
 # and 3): **Dgrad = SR on the gradient operand, no RHT.** **Wgrad = RHT on
-# BOTH GEMM inputs + SR on the gradient operand** — but RHT is Chunk T2b's
-# scope (see `llmm/hadamard.mojo`'s module docstring); `matmul_d_weight_bwd_fp4`
-# here is deliberately RNE/SR WITHOUT RHT for now (T2a), so its accuracy
-# gate is expected to be worse than the eventual T2b number — report
-# honestly, do not compare it to the recipe's RHT-equipped claim.
+# BOTH GEMM inputs + SR on the gradient operand.**
+#
+# ## RHT integration (Chunk T2b)
+#
+# `matmul_d_weight_bwd_fp4` applies `llmm/hadamard.mojo`'s fixed 16-wide RHT
+# to BOTH Wgrad operands (`input`, `d_output`) along the contraction (K =
+# `rows` = batch*seq_len) dimension, BEFORE NVFP4 quantization, per the
+# recipe. **Design: a separate transpose+RHT materialization pass, not a
+# fused prologue inside `_nvfp4_quantize_gpu`.** A fused prologue was
+# considered (BLOCK_ROWS=1 means each quantize-kernel thread already owns
+# exactly one 16-element block — a tempting match for HADAMARD_BLOCK=16) but
+# rejected: `_nvfp4_quantize_impl` computes the per-TENSOR fp32 scale
+# (`nvfp4_compute_tensor_scale`, a separate flat-amax reduction pass) BEFORE
+# the per-block quantize kernel runs, reading `x_ptr` directly. If RHT were
+# applied only inside the quantize kernel's per-block prologue, the tensor
+# scale would be computed from the PRE-RHT data while the block scales are
+# encoded against POST-RHT block amaxes — for Gaussian-ish data RHT scales
+# per-block amax by roughly `sqrt(16)=4` (variance-additive sum of 16 signed
+# terms), so `block_scale_raw = (rht_block_amax/6)/tensor_scale` would run
+# ~4x too high, overflowing e4m3's block-scale encoding range and silently
+# clipping/misscaling every block — a real correctness bug, not a rounding
+# nuance. Materializing the RHT'd (and transposed, since the contraction
+# dimension is the OUTER/non-contiguous axis of `input`/`d_output`'s natural
+# `[rows, channels]` storage) tensor into a fresh bf16 scratch buffer BEFORE
+# calling the ordinary (unmodified) `nvfp4_quantize` sidesteps this entirely
+# — `nvfp4_compute_tensor_scale` then naturally sees the same RHT'd data the
+# block-quantize step does. Cost: two extra kernel launches per operand
+# (`_gpu_transpose_kernel` + `hadamard16_fwd_gpu`, the latter run in-place)
+# and one extra `rows*channels`-sized bf16 scratch buffer per operand, on top
+# of the quantize scratch `lowp_gemm_fp4` already needs — see
+# `_rht_transpose_prep`'s docstring and the T2b docs entry for measured cost.
+#
+# The RHT-composition contract (`(H@a)^T @ (H@b) == 16 * a^T @ b`, verified
+# in `tests/test_lowp_gemm_fp4.mojo::test_fp4_rht_quantize_gemm_contract`)
+# means the resulting GEMM is 16x the desired Wgrad value; rather than an
+# extra O(m*n) elementwise divide-by-16 pass over the (potentially large)
+# weight-gradient output, the 1/16 is folded into `lowp_gemm_fp4`'s
+# `extra_scale` parameter (multiplied into the existing per-tensor-scale
+# post-scale step, `_nvfp4_post_scale_gpu` — effectively free). Both RHT'd
+# scratch buffers are already in the `[channels, rows]` orientation
+# `lowp_gemm_fp4` wants for a non-transposed read, so `transpose_a`/
+# `transpose_b` are both `False` on the RHT path (unlike T2a's fused
+# `nvfp4_quantize_transpose` reads directly off `input_ptr`/`d_output_ptr`).
+#
+# `-D LLMM_FP4_NO_RHT=1` (default 0, i.e. RHT ON) is an ablation flag: when
+# set, `matmul_d_weight_bwd_fp4` falls back to EXACTLY T2a's code path
+# (`nvfp4_quantize_transpose` directly on `input_ptr`/`d_output_ptr`, no RHT,
+# no extra scratch) — same streams, same `sr_step` usage, nothing else
+# touched, so the ablation is expected to reproduce T2a's numbers bit-for-bit
+# (a cheap consistency check of the flag plumbing, not a new code path to
+# validate independently). See the T2b docs entry for the measured verdict.
 #
 # Operand orientations (same TN-only cuBLASLt constraint fp8's module
 # comment above `_matmul_cublaslt_fp8` derives, mirrored here for NVFP4's
@@ -3428,6 +3490,55 @@ def matmul_bwd_lowp[
 # Chunk T1's forward reservation, even though both consume the same
 # underlying `d_output` tensor values in different layouts.
 # ===----------------------------------------------------------------------=== #
+
+# Ablation flag (Chunk T2b) — see the RHT-integration section above.
+comptime LLMM_FP4_NO_RHT = get_defined_int["LLMM_FP4_NO_RHT", 0]() != 0
+comptime LLMM_FP4_WGRAD_RHT = not LLMM_FP4_NO_RHT
+
+
+def _rht_transpose_prep[
+    dtype: DType,
+](
+    scratch_ptr: MutKernelPtr[dtype],  # >= rows*cols; becomes [cols, rows]
+    src_ptr: ImmutKernelPtr[dtype],  # [rows, cols] row-major source
+    rows: Int,
+    cols: Int,
+    ctx: DeviceContext,
+) raises -> None:
+    """Materializes `RHT(src^T)` into `scratch_ptr` for Chunk T2b's Wgrad RHT
+    path (see the module comment above `matmul_d_input_bwd_fp4` for why this
+    is a separate pass rather than a fused quantize-kernel prologue).
+
+    Two steps: (1) transpose `src[rows, cols]` (row-major) into
+    `scratch[cols, rows]` (row-major) via `_gpu_transpose_kernel` — the same
+    kernel the Apple-Metal Wgrad fallback above already uses, vendor-neutral
+    GPU code (`block_idx`/`thread_idx` only, no vendor calls), just not
+    previously invoked from a CUDA call site; (2) apply
+    `llmm/hadamard.mojo`'s `hadamard16_fwd_gpu` IN PLACE on `scratch`, along
+    its now-trailing/contiguous `rows` axis (16-wide blocks) — this is
+    exactly the Wgrad contraction dimension (batch*seq_len), which must be a
+    multiple of 16 (`hadamard16_fwd_gpu`'s own requirement; true at every
+    supported training shape). In-place aliasing (`out_ptr == x_ptr`) is
+    safe: `llmm/hadamard.mojo`'s kernel reads all 16 elements of a thread's
+    block into registers before writing any of them back, and distinct
+    threads own disjoint 16-element blocks.
+    """
+    comptime BLOCK_SIZE = 256
+    var total = rows * cols
+    comptime t_kernel = _gpu_transpose_kernel[dtype]
+    var t_compiled = ctx.compile_function[t_kernel]()
+    ctx.enqueue_function(
+        t_compiled,
+        scratch_ptr,
+        src_ptr,
+        rows,
+        cols,
+        grid_dim=(ceildiv(total, BLOCK_SIZE),),
+        block_dim=(BLOCK_SIZE,),
+    )
+    hadamard16_fwd_gpu[dtype, "gpu"](
+        scratch_ptr, kernel_ptr_as_immut(scratch_ptr), cols, rows, ctx
+    )
 
 
 def matmul_d_input_bwd_fp4[
@@ -3528,9 +3639,11 @@ def matmul_d_weight_bwd_fp4[
     sr_seed: UInt64 = NVFP4_SR_SEED,
     sr_step: Int = 0,
 ) raises -> None:
-    """NVFP4 wgrad (Chunk T2a — RNE/SR, no RHT yet; T2b adds RHT):
-    `d_weight = d_output^T @ input` via `lowp_gemm_fp4`. See the module
-    comment above for the orientation/rounding/accumulate derivation.
+    """NVFP4 wgrad: `d_weight = d_output^T @ input` via `lowp_gemm_fp4`. See
+    the module comment above for the orientation/rounding/accumulate
+    derivation and the Chunk T2b RHT-integration design (both operands RHT'd
+    along the contraction dimension before quantization, `-D
+    LLMM_FP4_NO_RHT=1` ablates back to Chunk T2a's plain RNE/SR path).
     """
     comptime assert is_gpu[target](), (
         "matmul_d_weight_bwd_fp4 is GPU-only per"
@@ -3540,59 +3653,146 @@ def matmul_d_weight_bwd_fp4[
     var in_channels = Int(channels)
     var out_channels = Int(output_channels)
 
-    # a = input [rows, in_channels] (transposed read), 1D 1x16, RNE.
-    var a_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
-        nvfp4_packed_size(in_channels, rows)
-    )
-    var a_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
-        nvfp4_scale_buffer_size(in_channels, rows, 1)
-    )
-    var a_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
-    # b = d_output [rows, out_channels] (transposed read), 1D 1x16, SR.
-    var b_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
-        nvfp4_packed_size(out_channels, rows)
-    )
-    var b_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
-        nvfp4_scale_buffer_size(out_channels, rows, 1)
-    )
-    var b_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
-    # Always a FRESH raw-GEMM scratch buffer -- see the module comment above
-    # for why this avoids a conditional-aliasing footgun.
-    var d_raw_scratch = ctx.enqueue_create_buffer[dtype](
-        in_channels * out_channels
-    )
+    comptime if LLMM_FP4_WGRAD_RHT:
+        # Chunk T2b: RHT both operands (along the K=rows contraction
+        # dimension) into scratch BEFORE quantizing, then run a
+        # NON-transposed NVFP4 GEMM (the RHT scratch is already in
+        # `[channels, rows]` orientation) with the `(H@a)^T@(H@b) == 16*a^T@b`
+        # factor folded into `extra_scale` — see the module comment above
+        # `matmul_d_input_bwd_fp4` for the full design rationale.
+        var a_rht_scratch = ctx.enqueue_create_buffer[dtype](in_channels * rows)
+        var b_rht_scratch = ctx.enqueue_create_buffer[dtype](
+            out_channels * rows
+        )
+        _rht_transpose_prep[dtype](
+            device_buf_mut_ptr(a_rht_scratch),
+            input_ptr,
+            rows,
+            in_channels,
+            ctx,
+        )
+        _rht_transpose_prep[dtype](
+            device_buf_mut_ptr(b_rht_scratch),
+            d_output_ptr,
+            rows,
+            out_channels,
+            ctx,
+        )
 
-    lowp_gemm_fp4[
-        dtype,
-        dtype,
-        target,
-        a_block_rows=1,
-        b_block_rows=1,
-        a_round_mode=ROUND_MODE_RNE,
-        b_round_mode=ROUND_MODE_STOCHASTIC,
-        accumulate=accumulate,
-        transpose_a=True,
-        transpose_b=True,
-    ](
-        d_weight_ptr,
-        device_buf_mut_ptr(d_raw_scratch),
-        input_ptr,
-        d_output_ptr,
-        device_buf_mut_ptr(a_q_scratch),
-        device_buf_mut_ptr(a_scale_scratch),
-        device_buf_mut_ptr(a_tensor_scale_scratch),
-        device_buf_mut_ptr(b_q_scratch),
-        device_buf_mut_ptr(b_scale_scratch),
-        device_buf_mut_ptr(b_tensor_scale_scratch),
-        in_channels,
-        out_channels,
-        rows,
-        ctx,
-        sr_seed,
-        NVFP4_SR_STREAM,  # a_sr_stream: unused (a_round_mode is RNE)
-        NVFP4_SR_STREAM_WGRAD_DOUTPUT,
-        sr_step,
-    )
+        # a = RHT(input)^T [in_channels, rows], already correctly oriented
+        # (k=rows trailing), 1D 1x16, RNE.
+        var a_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+            nvfp4_packed_size(in_channels, rows)
+        )
+        var a_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+            nvfp4_scale_buffer_size(in_channels, rows, 1)
+        )
+        var a_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+        # b = RHT(d_output)^T [out_channels, rows], already correctly
+        # oriented, 1D 1x16, SR.
+        var b_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+            nvfp4_packed_size(out_channels, rows)
+        )
+        var b_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+            nvfp4_scale_buffer_size(out_channels, rows, 1)
+        )
+        var b_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+        # Always a FRESH raw-GEMM scratch buffer -- see the module comment
+        # above for why this avoids a conditional-aliasing footgun.
+        var d_raw_scratch = ctx.enqueue_create_buffer[dtype](
+            in_channels * out_channels
+        )
+
+        lowp_gemm_fp4[
+            dtype,
+            dtype,
+            target,
+            a_block_rows=1,
+            b_block_rows=1,
+            a_round_mode=ROUND_MODE_RNE,
+            b_round_mode=ROUND_MODE_STOCHASTIC,
+            accumulate=accumulate,
+            transpose_a=False,
+            transpose_b=False,
+        ](
+            d_weight_ptr,
+            device_buf_mut_ptr(d_raw_scratch),
+            kernel_ptr_as_immut(device_buf_mut_ptr(a_rht_scratch)),
+            kernel_ptr_as_immut(device_buf_mut_ptr(b_rht_scratch)),
+            device_buf_mut_ptr(a_q_scratch),
+            device_buf_mut_ptr(a_scale_scratch),
+            device_buf_mut_ptr(a_tensor_scale_scratch),
+            device_buf_mut_ptr(b_q_scratch),
+            device_buf_mut_ptr(b_scale_scratch),
+            device_buf_mut_ptr(b_tensor_scale_scratch),
+            in_channels,
+            out_channels,
+            rows,
+            ctx,
+            sr_seed,
+            NVFP4_SR_STREAM,  # a_sr_stream: unused (a_round_mode is RNE)
+            NVFP4_SR_STREAM_WGRAD_DOUTPUT,
+            sr_step,
+            extra_scale=Float32(1.0) / Float32(16.0),
+        )
+    else:
+        # Chunk T2a ablation path (`-D LLMM_FP4_NO_RHT=1`): plain RNE/SR,
+        # UNCHANGED from the T2a implementation -- same streams, same
+        # `sr_step` usage, no RHT scratch -- so this reproduces T2a's numbers
+        # bit-for-bit (a consistency check of the ablation flag plumbing).
+        # a = input [rows, in_channels] (transposed read), 1D 1x16, RNE.
+        var a_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+            nvfp4_packed_size(in_channels, rows)
+        )
+        var a_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+            nvfp4_scale_buffer_size(in_channels, rows, 1)
+        )
+        var a_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+        # b = d_output [rows, out_channels] (transposed read), 1D 1x16, SR.
+        var b_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+            nvfp4_packed_size(out_channels, rows)
+        )
+        var b_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+            nvfp4_scale_buffer_size(out_channels, rows, 1)
+        )
+        var b_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+        # Always a FRESH raw-GEMM scratch buffer -- see the module comment
+        # above for why this avoids a conditional-aliasing footgun.
+        var d_raw_scratch = ctx.enqueue_create_buffer[dtype](
+            in_channels * out_channels
+        )
+
+        lowp_gemm_fp4[
+            dtype,
+            dtype,
+            target,
+            a_block_rows=1,
+            b_block_rows=1,
+            a_round_mode=ROUND_MODE_RNE,
+            b_round_mode=ROUND_MODE_STOCHASTIC,
+            accumulate=accumulate,
+            transpose_a=True,
+            transpose_b=True,
+        ](
+            d_weight_ptr,
+            device_buf_mut_ptr(d_raw_scratch),
+            input_ptr,
+            d_output_ptr,
+            device_buf_mut_ptr(a_q_scratch),
+            device_buf_mut_ptr(a_scale_scratch),
+            device_buf_mut_ptr(a_tensor_scale_scratch),
+            device_buf_mut_ptr(b_q_scratch),
+            device_buf_mut_ptr(b_scale_scratch),
+            device_buf_mut_ptr(b_tensor_scale_scratch),
+            in_channels,
+            out_channels,
+            rows,
+            ctx,
+            sr_seed,
+            NVFP4_SR_STREAM,  # a_sr_stream: unused (a_round_mode is RNE)
+            NVFP4_SR_STREAM_WGRAD_DOUTPUT,
+            sr_step,
+        )
 
 
 def matmul_bwd_fp4[

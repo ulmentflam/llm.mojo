@@ -607,6 +607,103 @@ entry.
 
 ---
 
+## FP4 CHUNK T2b (Wgrad Random Hadamard Transform)
+
+### F5 — A single dominant outlier in an RHT block gets SPREAD, not shrunk — e2m1's coarse ladder can lose more from that than it gains
+
+**What:** A dedicated unit test (`tests/test_matmul_bwd_fp4.mojo::
+test_wgrad_rht_outlier`) constructs a 16-block containing 15 ordinary
+(`~N(0,1)`) values and one isolated 100x-scaled "outlier" value (0.1% of all
+entries, matching the coordinator's literal spec), then compares
+`matmul_d_weight_bwd_fp4` RHT-on vs a hand-composed RHT-off arm against a
+bf16 reference. Naive expectation (and the module docstrings' framing,
+"Gaussianizes outliers so a block quantizes with less error"): RHT-on should
+be strictly better here — this is supposedly RHT's motivating case.
+Measured (bit-identical across repeat runs): RHT-on is actually WORSE
+(rel_l2 0.0969 vs RHT-off's 0.0844).
+
+**Why (not a bug):** the unnormalized 16x16 Hadamard has every entry `+/-1`,
+so mixing one dominant value `V` into an otherwise-small block produces
+`y_i = +/-V + O(sqrt(15))` for EVERY output position `i` — the block's PEAK
+magnitude does not shrink (still `~V`), it gets SPREAD from 1-of-16 slots to
+all 16. Pre-RHT, e2m1's 8-level ladder crushes the 15 small values to
+exactly 0 (a real information loss) but encodes the 1 large value with good
+relative precision. Post-RHT, all 16 values are comparable in magnitude to
+`V` but only differ from each other by the `O(sqrt(15))` mixing noise — a
+small RELATIVE spread that e2m1's coarse ladder (top two nonzero levels are
+4 and 6, a 50% gap) cannot resolve, so most of the 16 transformed values
+collapse to the SAME quantized code, losing the very differentiation the
+GEMM needs to reconstruct each element's true contribution.
+`docs/ai/fp4_training_recipes_research.md`'s own citation of the Metis paper
+(arXiv:2509.00404) makes exactly this point: RHT "only smooths a few
+outliers without reducing overall spread" — this test reproduces that
+critique empirically, in-repo, at the single-GEMM level.
+
+**Scope of the finding:** this is a property of an ISOLATED single-spike
+outlier construction, not necessarily of realistic multi-outlier/correlated
+gradient structure (the recipe's actual target, and what NVIDIA's
+large-scale ablations were run against). A companion test on plain gaussian
+data (`test_wgrad_rht_gaussian`) shows RHT-on roughly neutral-to-slightly-
+better (rel_l2 0.1674 -> 0.1664), and the real MLP-shaped site gates
+(`test_fc_bwd_site`/`test_proj_bwd_site`, uniform random data) show a real
+~7-10% relL2 improvement (0.178-0.184 -> 0.166 for `d_weight`) — so RHT is
+not uniformly harmful, just not uniformly helpful either. See F6 below for
+what this means for the end-to-end training gate.
+
+**Source:** Chunk T2b gate (c)/ablation unit tests, 2026-07-10 (worktree
+goal3b/fp4-training).
+
+### F6 — T2b's RHT integration is verifiably correct but provides negligible end-to-end benefit at this scale/setup — report honestly, do not force the recipe's narrative
+
+**What:** Per the recipe (`fp4_training_recipes_research.md` §1), RHT on
+Wgrad is supposed to "close most of the gap" T2a's SR-only regression opened
+(+1.08%/step, +1.50% final val vs bf16). Measured 10-step training
+(tinyshakespeare, B4 T1024, GPT-2 124M checkpoint init, same invocation as
+T1/T2a): **T2b (RHT-on) mean per-step delta +1.06%, final val +1.50%** —
+essentially IDENTICAL to T2a's +1.08%/+1.50%, not a meaningful recovery.
+
+**This is not a wiring bug — three independent checks confirm the RHT path
+is doing exactly what it's supposed to:**
+1. The RHT-composition contract test
+   (`tests/test_lowp_gemm_fp4.mojo::test_fp4_rht_quantize_gemm_contract`,
+   unaffected by this chunk's changes, still PASSES) confirms
+   `(H@a)^T@(H@b) == 16*a^T@b` holds through quantize+GEMM.
+2. `-D LLMM_FP4_NO_RHT=1` (the ablation build) reproduces T2a's ORIGINAL
+   10-step per-step losses BIT-FOR-BIT (all 10 steps + val loss match to
+   every printed digit) — proof the ablation flag correctly falls back to
+   T2a's exact code path with nothing else disturbed.
+3. The dedicated GEMM-level unit tests (F5 above) show RHT DOES measurably
+   improve `d_weight` accuracy on realistic MLP-shaped data (~7-10% relL2
+   reduction) — the mechanism works, it's just a small effect at the
+   single-GEMM level that doesn't compound into a visible training-loss
+   difference over only 10 steps.
+
+**Why the recipe's claim doesn't clearly materialize here (informed
+speculation, not verified against NVIDIA's own ablation setup):** NVIDIA's
+"RHT closes most of the gap" claim comes from LARGE-SCALE (billions of
+tokens, larger models) from-scratch pretraining ablations, where (a) small
+per-step accuracy deltas compound over far more steps than this gate's 10,
+and (b) gradient outlier/heavy-tail structure is a from-scratch-training
+phenomenon that may not be well-represented by only 10 steps starting from
+an already-converged checkpoint (this gate's `-e gpt2_124M_bf16.bin` init,
+chosen for determinism/speed, not gradient realism) — see F5's finding that
+RHT's benefit is genuinely data-distribution-dependent (helps on realistic
+random data, roughly neutral on gaussian, can even hurt on an isolated
+single-spike outlier).
+
+**STOP condition check:** NOT triggered — no NaN/Inf in either arm, loss
+decreases in both, ablation reproduces T2a bit-for-bit (proving nothing else
+broke), and no gate failed by >2x its calibrated bound. This is a "measure
+honestly, don't force the hoped-for narrative" finding, same category as
+F3/F4/E5 — the coordinator's brief explicitly anticipated this possibility
+("report the measured mean delta honestly, whatever it is").
+
+**Source:** Chunk T2b gate (d) + ablation consistency check, 2026-07-10
+(worktree goal3b/fp4-training); full table in
+`ai_assisted_optimizations_and_benchmarks.md`'s 2026-07-10 T2b entry.
+
+---
+
 ## Section summary
 
 | Section | Items | Status |
@@ -618,6 +715,7 @@ entry.
 | FP8 CHUNK D/E | E1–E5 | Verified (E1–E4: goal2 integration; E5: four-line-of-evidence investigation) |
 | FP4 CHUNK T1 | F1 | Verified (gate c re-run 3x bit-identical; gate d 10-step A/B) |
 | FP4 CHUNK T2a | F2–F4 | Verified (F2: test fix + re-run 18/18 green; F3: gate c 3x bit-identical; F4: gate d 10-step A/B, checkpoint init) |
+| FP4 CHUNK T2b | F5–F6 | Verified (F5: dedicated gaussian/outlier unit tests, reproducible; F6: gate d 10-step A/B + ablation bit-identity to T2a) |
 
 ---
 
