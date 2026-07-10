@@ -52,7 +52,20 @@ from llmm.gelu import gelu, gelu_grad, gelu_fwd_gpu, bias_gelu_fwd
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 from llmm.vendor import HAS_CUBLAS, HAS_METAL
-from llmm.lowp import PrecisionSpec, FP8_SPEC, quantize, quantize_transpose
+from llmm.lowp import (
+    PrecisionSpec,
+    FP8_SPEC,
+    quantize,
+    quantize_transpose,
+    quantize_devscale,
+    quantize_transpose_devscale,
+)
+from llmm.amax import (
+    AmaxState,
+    compute_amax,
+    kernel_ptr_as_immut,
+    device_buf_mut_ptr,
+)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -865,6 +878,87 @@ def lowp_gemm[
     )
 
 
+def lowp_gemm_devscale[
+    a_out_dtype: DType,
+    b_out_dtype: DType,
+    in_dtype: DType,
+    out_dtype: DType,
+    target: StaticString,
+    transpose_a: Bool = False,
+    transpose_b: Bool = False,
+](
+    d_ptr: MutKernelPtr[out_dtype],
+    a_ptr: ImmutKernelPtr[in_dtype],
+    b_ptr: ImmutKernelPtr[in_dtype],
+    a_fp8_scratch: MutKernelPtr[DType.uint8],
+    b_fp8_scratch: MutKernelPtr[DType.uint8],
+    a_scale_ptr: ImmutKernelPtr[DType.float32],
+    a_scale_inv_ptr: ImmutKernelPtr[DType.float32],
+    b_scale_ptr: ImmutKernelPtr[DType.float32],
+    b_scale_inv_ptr: ImmutKernelPtr[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    accumulate: Bool,
+    ctx: DeviceContext,
+) raises -> None:
+    """Device-pointer-scale twin of `lowp_gemm` (Chunk D): identical
+    quantize-then-GEMM structure, but both the quantize-time multiplier
+    (`a_scale_ptr`/`b_scale_ptr`) AND the GEMM's descale reciprocal
+    (`a_scale_inv_ptr`/`b_scale_inv_ptr`) are DEVICE fp32 scalars — the
+    `AmaxState.scale`/`scale_inv` device buffers Chunk C's `AmaxState`
+    (llmm/amax.mojo) already maintains, read with no host sync on the
+    training step's critical path (design §1.3/§4: "Host readback? no").
+    `lowp_gemm` itself keeps taking a host `a_scale`/`b_scale` Float32
+    because `tests/test_lowp_gemm.mojo` (Chunk B's gate) exercises it with a
+    host-computed scale; this twin is the one production forward/backward
+    call sites (Chunk D/E) use once an `AmaxState` is in the loop. See
+    `quantize_devscale`'s docstring in llmm/lowp.mojo for why a host-scale
+    call site would force a host readback here.
+    """
+    comptime assert is_gpu[target](), (
+        "lowp_gemm_devscale is GPU-only per docs/ai/fp8_training_design.md"
+        " landmine #1"
+    )
+    comptime assert HAS_CUBLAS, (
+        "lowp_gemm_devscale's only implemented vendor body is cuBLASLt fp8"
+        " (tests/probe_fp8/RESULTS.md probe3/probe4) -- no MAX-linalg or"
+        " emulated fallback exists on this toolchain (see the module comment"
+        " above _matmul_cublaslt_fp8)"
+    )
+
+    comptime if transpose_a:
+        quantize_transpose_devscale[FP8_SPEC, a_out_dtype, in_dtype, target](
+            a_fp8_scratch, a_ptr, a_scale_ptr, k, m, ctx
+        )
+    else:
+        quantize_devscale[FP8_SPEC, a_out_dtype, in_dtype, target](
+            a_fp8_scratch, a_ptr, a_scale_ptr, m * k, ctx
+        )
+
+    comptime if transpose_b:
+        quantize_transpose_devscale[FP8_SPEC, b_out_dtype, in_dtype, target](
+            b_fp8_scratch, b_ptr, b_scale_ptr, k, n, ctx
+        )
+    else:
+        quantize_devscale[FP8_SPEC, b_out_dtype, in_dtype, target](
+            b_fp8_scratch, b_ptr, b_scale_ptr, n * k, ctx
+        )
+
+    _matmul_cublaslt_fp8[a_out_dtype, b_out_dtype, out_dtype](
+        d_ptr,
+        a_fp8_scratch.as_immutable(),
+        b_fp8_scratch.as_immutable(),
+        a_scale_inv_ptr,
+        b_scale_inv_ptr,
+        m,
+        n,
+        k,
+        accumulate,
+        ctx,
+    )
+
+
 def _launch_gelu_fwd_gpu[
     dtype: DType,
 ](
@@ -1175,6 +1269,155 @@ struct MatmulFwd:
             channels,
             output_channels,
             ctx,
+        )
+
+
+# ===----------------------------------------------------------------------=== #
+# matmul_fwd_lowp — fp8 forward linear (Chunk D).
+#
+# A separate entry point rather than a branch inside `matmul_fwd` itself:
+# `matmul_fwd`'s existing signature has no room for the per-layer/per-site
+# `AmaxState`s a delayed-scaling fp8 GEMM needs (weight and input activation
+# each carry their own amax history + scale — design §1.3), and every other
+# caller of `matmul_fwd` (bf16/fp32 builds, and the LM-head call which design
+# §1.2 excludes from fp8) must stay byte-for-byte what it is today. The four
+# per-block train_gpt2.mojo call sites wrap the CURRENT (unmodified)
+# `matmul_fwd[...]` call in `else:` and add this function in a sibling
+# `comptime if LOWP_ENABLED:` branch — so under bf16/fp32 the `else:` branch
+# is the ONLY branch ever elaborated, textually identical to what ran before
+# this chunk (gate (b), the comptime-gating proof).
+#
+# Design §5 point 1: fp8 GEMM (E4M3 x E4M3 -> bf16), THEN bias/GELU as the
+# existing separate bf16 kernel (`bias_gelu_fwd`) — cuBLASLt fp8 has
+# restricted epilogue support, so the fused-epilogue path `matmul_fwd` uses
+# for bf16/fp32 does not apply here; this mirrors matmul_fwd's own
+# "vendor-neutral GPU" branch (plain GEMM + standalone bias_gelu_fwd), just
+# with `lowp_gemm_devscale` standing in for the plain bf16 GEMM.
+#
+# Off-critical-path amax (design §1.3's "a caller free to compute
+# amax_current off the critical path ... can call update_scale without
+# gating this step's GEMM"): NOT exploited here — `compute_amax` for both
+# operands runs, and is awaited (via the ctx stream ordering) by
+# `update_scale`, before this call's own `lowp_gemm_devscale`. This is the
+# simplest, provably-correct ordering (matches `AmaxState`'s documented
+# calling contract in both the warmup and steady-state regimes, no
+# raced/second-guessed scale) rather than the design's optional
+# steady-state-only deferral; it is call-site-local (does not change
+# `AmaxState`'s contract), and left as a documented future optimization
+# (see this chunk's final report) rather than a correctness requirement of
+# Gate D.
+# ===----------------------------------------------------------------------=== #
+
+
+def matmul_fwd_lowp[
+    dtype: DType,
+    target: StaticString,
+    use_gelu: Bool = False,
+    has_bias: Bool = True,
+](
+    out_ptr: MutKernelPtr[dtype],
+    pre_gelu_ptr: MutKernelPtr[dtype],
+    input_ptr: ImmutKernelPtr[dtype],
+    weight_ptr: ImmutKernelPtr[dtype],
+    bias_ptr: ImmutKernelPtr[dtype],
+    batch_size: Int64,
+    seq_len: Int64,
+    channels: Int64,
+    output_channels: Int64,
+    mut input_state: AmaxState[FP8_SPEC],
+    mut weight_state: AmaxState[FP8_SPEC],
+    ctx: DeviceContext,
+) raises -> None:
+    """fp8 forward linear: `out = gelu?(bias? + input @ weightᵀ)`, the same
+    geometry as `matmul_fwd`, but the GEMM itself runs E4M3 x E4M3 -> bf16
+    via `lowp_gemm_devscale` (forward orientation: `transpose_a=False,
+    transpose_b=False` — both `weight` `[out_channels,channels]` and `input`
+    `[rows,channels]` are already TN-native, no transposed quantize needed —
+    see `lowp_gemm`'s docstring for the per-GEMM orientation derivation).
+
+    `input_state`/`weight_state` are this call site's `AmaxState[FP8_SPEC]`
+    (one instance per transformer layer per site, from `train_gpt2.mojo`'s
+    `LowpState` container) — updated in place (`update_scale`) every call, so
+    repeated calls (one per training step) build the delayed-scaling history
+    design §1.3 describes. The weight is re-quantized from its bf16 storage
+    on every call (no persistent fp8 weight cache) because the optimizer
+    updates it every step (design §5 Chunk D file comment: "weight: quantize
+    from its bf16 storage ... re-quantize each step").
+
+    GPU-only (comptime-asserted, landmine #1): fp8 is never instantiated for
+    the `cpu` target.
+    """
+    comptime assert is_gpu[target](), (
+        "matmul_fwd_lowp is GPU-only per docs/ai/fp8_training_design.md"
+        " landmine #1 (low-precision kernels must never be instantiated for"
+        " the cpu target)"
+    )
+    var rows = Int(batch_size * seq_len)
+    var in_channels = Int(channels)
+    var out_channels = Int(output_channels)
+
+    # 1. Per-operand amax -> delayed-scaling update (Chunk C contract: call
+    #    update_scale once per step BEFORE consuming state.scale below).
+    var amax_input = ctx.enqueue_create_buffer[DType.float32](1)
+    var amax_weight = ctx.enqueue_create_buffer[DType.float32](1)
+    compute_amax[FP8_SPEC, dtype](
+        device_buf_mut_ptr(amax_input), input_ptr, rows * in_channels, ctx
+    )
+    compute_amax[FP8_SPEC, dtype](
+        device_buf_mut_ptr(amax_weight),
+        weight_ptr,
+        out_channels * in_channels,
+        ctx,
+    )
+    input_state.update_scale[FP8_SPEC.fwd_dtype](
+        kernel_ptr_as_immut(device_buf_mut_ptr(amax_input)), ctx
+    )
+    weight_state.update_scale[FP8_SPEC.fwd_dtype](
+        kernel_ptr_as_immut(device_buf_mut_ptr(amax_weight)), ctx
+    )
+
+    # 2. Quantize (inside lowp_gemm_devscale, reading input_state.scale /
+    #    weight_state.scale device-side) + fp8 GEMM -> raw (bias-free) bf16
+    #    output in out_ptr. `a`=weight (m=out_channels,k=in_channels),
+    #    `b`=input (n=rows,k=in_channels) — matches matmul_fwd's own
+    #    weight-as-A/input-as-B convention (`_matmul_cublaslt[transA=True]`
+    #    called with `weight_ptr` first, `input_ptr` second).
+    var a_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        out_channels * in_channels
+    )
+    var b_scratch = ctx.enqueue_create_buffer[DType.uint8](rows * in_channels)
+
+    lowp_gemm_devscale[
+        FP8_SPEC.fwd_dtype,
+        FP8_SPEC.fwd_dtype,
+        dtype,
+        dtype,
+        target,
+        transpose_a=False,
+        transpose_b=False,
+    ](
+        out_ptr,
+        weight_ptr,
+        input_ptr,
+        device_buf_mut_ptr(a_scratch),
+        device_buf_mut_ptr(b_scratch),
+        kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
+        kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale_inv)),
+        kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
+        kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale_inv)),
+        out_channels,
+        rows,
+        in_channels,
+        False,
+        ctx,
+    )
+
+    # 3. Bias (+GELU) epilogue in bf16, same standalone kernel matmul_fwd's
+    #    vendor-neutral GPU branch uses (cuBLASLt fp8 has restricted
+    #    epilogue support — design §5 point 1).
+    comptime if has_bias or use_gelu:
+        bias_gelu_fwd[dtype, target, has_bias=has_bias, use_gelu=use_gelu](
+            out_ptr, pre_gelu_ptr, bias_ptr, rows, out_channels, ctx
         )
 
 
