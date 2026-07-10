@@ -128,7 +128,8 @@ comptime FP8_SPEC = PrecisionSpec(
 #
 # `stochastic_rounding=True`/`hadamard=True`: precision-level markers ("this
 # regime uses these techniques"), not a blanket per-operand switch the way
-# fp8's `quantize`/`quantize_transpose` read `spec.stochastic_rounding`
+# fp8's `quantize_devscale`/`quantize_transpose_devscale` read
+# `spec.stochastic_rounding`
 # uniformly for every operand. The recipe requires SR only on *gradient*
 # operands (weights/activations stay RNE) and RHT only on *Wgrad* operands
 # (`llmm/hadamard.mojo`) — that per-operand-role selection is a call-site
@@ -283,7 +284,7 @@ def _fp8_encode_rne[
         # Normal mantissa carry-out bumps the exponent (input is pre-clamped
         # to max_normal, which is exactly representable, so this can only
         # promote within the format's valid exponent range, never overflow
-        # it — see module docstring / lowp_gemm design notes).
+        # it — see module docstring / lowp_gemm_devscale design notes).
         #
         # Why this can't produce the "rounds up into the NaN/inf pattern"
         # bug: `ax` was already clamped to `max_normal` (exactly
@@ -395,8 +396,9 @@ def encode_fp8[
     out_dtype: DType, mode: Int = RoundMode.RNE
 ](x: Float32, rand: UInt32 = 0) -> UInt8:
     """Dtype-generic wrapper over `encode_e4m3`/`encode_e5m2` — the form
-    `quantize` (below) uses so a call site is parameterized by `out_dtype`
-    (`spec.fwd_dtype` or `spec.bwd_dtype`), not a hardcoded format."""
+    the quantize kernels (below) use so a call site is parameterized by
+    `out_dtype` (`spec.fwd_dtype` or `spec.bwd_dtype`), not a hardcoded
+    format."""
     comptime if out_dtype == DType.float8_e4m3fn:
         return encode_e4m3[mode](x, rand)
     elif out_dtype == DType.float8_e5m2:
@@ -435,88 +437,28 @@ def decode_fp8[out_dtype: DType](b: UInt8) -> Float32:
 # ===----------------------------------------------------------------------=== #
 
 
-def _quantize_kernel[
-    in_dtype: DType, out_dtype: DType, mode: Int
-](
-    out_ptr: MutKernelPtr[DType.uint8],
-    in_ptr: ImmutKernelPtr[in_dtype],
-    scale: Float32,
-    n: Int,
-) -> None:
-    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
-    if idx < n:
-        var v = in_ptr[idx].cast[DType.float32]() * scale
-        out_ptr[idx] = encode_fp8[out_dtype, mode](v)
-
-
-def quantize[
-    spec: PrecisionSpec,
-    out_dtype: DType,
-    in_dtype: DType,
-    target: StaticString,
-](
-    out_ptr: MutKernelPtr[DType.uint8],
-    in_ptr: ImmutKernelPtr[in_dtype],
-    scale: Float32,
-    n: Int,
-    ctx: DeviceContext,
-) raises -> None:
-    """Bf16/fp32 -> fp8 quantize: `out[i] = encode(in[i] * scale)`.
-
-    GPU-only (comptime-asserted): fp8 is a device-only GEMM transient
-    (docs/ai/fp8_training_design.md §1.1), and the manual `encode_fp8` above
-    is deliberately written to be GPU-safe (integer/fp32 arithmetic only, no
-    fp8-typed intermediate — see the module docstring; plain `pop.cast
-    f8eXmY -> {f32,bf16}` is broken on this toolchain's GPU target once the
-    upcast feeds arithmetic, per `tests/probe_fp8/RESULTS.md` probes 2/2c/3).
-
-    `scale` is a single fp32 value the *caller* supplies — this function does
-    not compute amax or a delayed-scaling schedule; that is Chunk C's
-    `AmaxState`/`compute_amax`/`update_scale` (§3), deliberately kept out of
-    this file's Chunk-B surface so the two chunks don't collide on the same
-    functions while landing in parallel. A caller wires
-    `quantize[...](..., scale=a_state.scale, ...)` once Chunk C lands.
-    """
-    comptime assert is_gpu[target](), (
-        "quantize is GPU-only per docs/ai/fp8_training_design.md landmine #1"
-        " (low-precision kernels must never be instantiated for the cpu"
-        " target)"
-    )
-    comptime BLOCK_SIZE = 256
-    var num_blocks = ceildiv(n, BLOCK_SIZE)
-    comptime kmode = RoundMode.SR if spec.stochastic_rounding else RoundMode.RNE
-    comptime kernel = _quantize_kernel[in_dtype, out_dtype, kmode]
-    var compiled = ctx.compile_function[kernel]()
-    ctx.enqueue_function(
-        compiled,
-        out_ptr,
-        in_ptr,
-        scale,
-        n,
-        grid_dim=(num_blocks,),
-        block_dim=(BLOCK_SIZE,),
-    )
-
-
 # ===----------------------------------------------------------------------=== #
-# Device-pointer-scale variants (Chunk D).
+# Device-pointer-scale quantize kernels (Chunk D).
 #
-# `quantize`/`quantize_transpose` above take `scale: Float32` — a HOST value.
-# That is exactly right for Chunk B's own gate (a host-computed amax/scale in
-# a unit test), but Chunk C's `AmaxState.scale`/`scale_inv` (llmm/amax.mojo)
-# are DEVICE-resident fp32 scalars, deliberately never read back to host on
+# Chunk C's `AmaxState.scale`/`scale_inv` (llmm/amax.mojo) are
+# DEVICE-resident fp32 scalars, deliberately never read back to host on
 # the training step path (design §4's landmine-2 audit: "Host readback? no").
 # A GPU kernel launch's scalar arguments are copied host->device at launch
-# time regardless of whether the source is a host variable or (as here) a
-# device pointer being dereferenced — so passing `scale: Float32` to
-# `quantize` would force a host readback of `AmaxState.scale` right before
-# every single quantize call, once per fp8 GEMM operand per step. These
-# `_devscale` twins take `scale_ptr: ImmutKernelPtr[DType.float32]` instead
-# and dereference it *inside* the kernel (`scale_ptr[0]`), so the scale
-# value never leaves the device — the call site passes
-# `AmaxState.scale`'s own device pointer straight through. Otherwise
-# identical to `quantize`/`quantize_transpose` (same encode path, same
-# stochastic-rounding seam, same GPU-only guard).
+# time regardless of whether the source is a host variable or a device
+# pointer being dereferenced — so a `scale: Float32` parameter here would
+# force a host readback of `AmaxState.scale` right before every single
+# quantize call, once per fp8 GEMM operand per step. These `_devscale`
+# kernels instead take `scale_ptr: ImmutKernelPtr[DType.float32]` and
+# dereference it *inside* the kernel (`scale_ptr[0]`), so the scale value
+# never leaves the device — the call site passes `AmaxState.scale`'s own
+# device pointer straight through.
+#
+# History (DRY pass F3, docs/ai/dry_consolidation_audit_2026-07-10.md):
+# Chunk B originally also shipped host-`Float32`-scale twins
+# (`quantize`/`quantize_transpose`), which existed only for its unit-test
+# gate — every production call site used the `_devscale` forms. The twins
+# were deleted and `tests/test_lowp_gemm.mojo` now uploads its host-computed
+# scale into a 1-element device buffer and calls the `_devscale` forms.
 # ===----------------------------------------------------------------------=== #
 
 
@@ -546,9 +488,22 @@ def quantize_devscale[
     n: Int,
     ctx: DeviceContext,
 ) raises -> None:
-    """Device-pointer-scale twin of `quantize` — see the module comment
-    above. `scale_ptr` is a device fp32 scalar (e.g. `AmaxState.scale`'s
-    `unsafe_ptr()`); the kernel reads it directly, no host readback.
+    """Bf16/fp32 -> fp8 quantize: `out[i] = encode(in[i] * scale_ptr[0])`.
+
+    `scale_ptr` is a device fp32 scalar (e.g. `AmaxState.scale`'s
+    `unsafe_ptr()`); the kernel reads it directly, no host readback — see
+    the module comment above.
+
+    GPU-only (comptime-asserted): fp8 is a device-only GEMM transient
+    (docs/ai/fp8_training_design.md §1.1), and the manual `encode_fp8` above
+    is deliberately written to be GPU-safe (integer/fp32 arithmetic only, no
+    fp8-typed intermediate — see the module docstring; plain `pop.cast
+    f8eXmY -> {f32,bf16}` is broken on this toolchain's GPU target once the
+    upcast feeds arithmetic, per `tests/probe_fp8/RESULTS.md` probes 2/2c/3).
+
+    The scale is a value the *caller* supplies — this function does not
+    compute amax or a delayed-scaling schedule; that is Chunk C's
+    `AmaxState`/`compute_amax`/`update_scale` (§3).
     """
     comptime assert is_gpu[target](), (
         "quantize_devscale is GPU-only per"
@@ -595,121 +550,6 @@ comptime _QT_STRIDE = _QT_TILE + 1  # +1 padding avoids shared-mem bank conflict
 comptime _QT_BLOCK = 256  # ROW_STEP = _QT_BLOCK // _QT_TILE = 8
 
 
-def _quantize_transpose_kernel[
-    in_dtype: DType, out_dtype: DType, mode: Int
-](
-    out_ptr: MutKernelPtr[DType.uint8],  # [cols, rows] row-major (transposed)
-    in_ptr: ImmutKernelPtr[in_dtype],  # [rows, cols] row-major
-    scale: Float32,
-    rows: Int,
-    cols: Int,
-) -> None:
-    var tile = LayoutTensor[
-        in_dtype,
-        Layout.row_major(_QT_TILE, _QT_STRIDE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-
-    var tiles_rows = ceildiv(rows, _QT_TILE)
-    var tiles_cols = ceildiv(cols, _QT_TILE)
-    var total_tiles = tiles_rows * tiles_cols
-
-    var tx = Int(thread_idx.x) % _QT_TILE
-    var ty = Int(thread_idx.x) // _QT_TILE
-    comptime ROW_STEP = _QT_BLOCK // _QT_TILE
-
-    var bt = Int(block_idx.x)
-    while bt < total_tiles:
-        var tile_r = (bt // tiles_cols) * _QT_TILE
-        var tile_c = (bt % tiles_cols) * _QT_TILE
-
-        # Phase 1 — coalesced load from in_ptr [rows,cols] into shared tile.
-        # Thread tx reads column (tile_c+tx); consecutive tx -> consecutive
-        # in_ptr addresses -> coalesced. Guard is inside the loop (not around
-        # the whole body) so every thread still reaches the barrier below.
-        var r = ty
-        while r < _QT_TILE:
-            var gr = tile_r + r
-            var gc = tile_c + tx
-            if gr < rows and gc < cols:
-                tile.ptr[r * _QT_STRIDE + tx] = in_ptr[gr * cols + gc]
-            r += ROW_STEP
-        barrier()
-
-        # Phase 2 — transposed, coalesced write to out_ptr [cols,rows].
-        # Thread tx writes out row (tile_c+r) at column (tile_r+tx);
-        # consecutive tx -> consecutive out_ptr addresses -> coalesced.
-        r = ty
-        while r < _QT_TILE:
-            var goc = tile_c + r  # out row index == in col index
-            var gor = tile_r + tx  # out col index == in row index
-            if goc < cols and gor < rows:
-                var v = (
-                    tile.ptr[tx * _QT_STRIDE + r].cast[DType.float32]() * scale
-                )
-                out_ptr[goc * rows + gor] = encode_fp8[out_dtype, mode](v)
-            r += ROW_STEP
-        barrier()
-
-        bt += Int(grid_dim.x)
-
-
-def quantize_transpose[
-    spec: PrecisionSpec,
-    out_dtype: DType,
-    in_dtype: DType,
-    target: StaticString,
-](
-    out_ptr: MutKernelPtr[DType.uint8],
-    in_ptr: ImmutKernelPtr[in_dtype],
-    scale: Float32,
-    rows: Int,
-    cols: Int,
-    ctx: DeviceContext,
-) raises -> None:
-    """Fused transpose+quantize: `out[c,r] = encode(in[r,c] * scale)` — i.e.
-    `out` ([cols,rows] row-major) is the fp8-quantized TRANSPOSE of `in`
-    ([rows,cols] row-major), computed in one pass (no separate transpose
-    kernel, no extra O(rows*cols) round trip through a bf16 scratch buffer).
-
-    Needed because cuBLASLt's fp8 GEMM is TN-only (`transA=True,
-    transB=False`) — see `lowp_gemm`'s docstring in `llmm/matmul.mojo` for the
-    full derivation, summarized here: TN's "free" (zero-copy, pure
-    relabeling) duality requires the GEMM's contraction dimension to be the
-    *trailing* axis of both operands' natural row-major storage. That holds
-    for the forward GEMM's `input`/`weight` (both trailing-dim = channels),
-    but not for dgrad's `weight` operand (trailing dim is `C`, contraction is
-    `OC`) or for wgrad's `input`/`d_output` operands (trailing dims are
-    `C`/`OC`, contraction is `rows`) — those need a physically transposed
-    fp8 copy, which this fused kernel produces directly from the bf16 source
-    (skipping a separate bf16-scratch transpose pass).
-
-    Uses a 32x32 shared-memory tile transpose (Optimization A) so both the
-    global read and the global write are coalesced — see the module comment
-    above `_quantize_transpose_kernel`.
-
-    GPU-only, same reasoning as `quantize`.
-    """
-    comptime assert is_gpu[target](), "quantize_transpose is GPU-only"
-    var tiles_rows = ceildiv(rows, _QT_TILE)
-    var tiles_cols = ceildiv(cols, _QT_TILE)
-    var num_blocks = tiles_rows * tiles_cols
-    comptime kmode = RoundMode.SR if spec.stochastic_rounding else RoundMode.RNE
-    comptime kernel = _quantize_transpose_kernel[in_dtype, out_dtype, kmode]
-    var compiled = ctx.compile_function[kernel]()
-    ctx.enqueue_function(
-        compiled,
-        out_ptr,
-        in_ptr,
-        scale,
-        rows,
-        cols,
-        grid_dim=(num_blocks,),
-        block_dim=(_QT_BLOCK,),
-    )
-
-
 def _quantize_transpose_kernel_devscale[
     in_dtype: DType, out_dtype: DType, mode: Int
 ](
@@ -719,11 +559,10 @@ def _quantize_transpose_kernel_devscale[
     rows: Int,
     cols: Int,
 ) -> None:
-    # Same 32x32 shared-memory tile transpose as `_quantize_transpose_kernel`
-    # (Optimization A) — only the scale source differs (device pointer,
-    # dereferenced once per thread here rather than passed as a launch
-    # scalar; a broadcast read of one device fp32, negligible next to the
-    # tile's own global traffic).
+    # 32x32 shared-memory tile transpose (Optimization A — see the module
+    # comment above). The scale is a device pointer, dereferenced once per
+    # thread here rather than passed as a launch scalar; a broadcast read of
+    # one device fp32, negligible next to the tile's own global traffic.
     var scale = scale_ptr[0]
     var tile = LayoutTensor[
         in_dtype,
@@ -782,14 +621,32 @@ def quantize_transpose_devscale[
     cols: Int,
     ctx: DeviceContext,
 ) raises -> None:
-    """Device-pointer-scale twin of `quantize_transpose` — see the module
-    comment above `quantize_devscale`. Not needed by Chunk D (the forward
-    GEMM is TN-native — `transpose_a=False, transpose_b=False`, see
-    `lowp_gemm`'s docstring in llmm/matmul.mojo), but Chunk E's dgrad/wgrad
-    orientations need a transposed fp8 copy AND a device-resident scale, so
-    this twin is provided here alongside `quantize_devscale` rather than
-    left for Chunk E to duplicate. Uses the same 32x32 shared-memory tile
-    transpose as `quantize_transpose` (Optimization A).
+    """Fused transpose+quantize: `out[c,r] = encode(in[r,c] * scale_ptr[0])`
+    — i.e. `out` ([cols,rows] row-major) is the fp8-quantized TRANSPOSE of
+    `in` ([rows,cols] row-major), computed in one pass (no separate transpose
+    kernel, no extra O(rows*cols) round trip through a bf16 scratch buffer).
+    `scale_ptr` is a device fp32 scalar, read with no host readback — see
+    the module comment above `quantize_devscale`.
+
+    Needed because cuBLASLt's fp8 GEMM is TN-only (`transA=True,
+    transB=False`) — see `lowp_gemm_devscale`'s docstring in
+    `llmm/matmul.mojo` for the full derivation, summarized here: TN's "free"
+    (zero-copy, pure relabeling) duality requires the GEMM's contraction
+    dimension to be the *trailing* axis of both operands' natural row-major
+    storage. That holds for the forward GEMM's `input`/`weight` (both
+    trailing-dim = channels), but not for dgrad's `weight` operand (trailing
+    dim is `C`, contraction is `OC`) or for wgrad's `input`/`d_output`
+    operands (trailing dims are `C`/`OC`, contraction is `rows`) — those
+    (Chunk E's orientations) need a physically transposed fp8 copy, which
+    this fused kernel produces directly from the bf16 source (skipping a
+    separate bf16-scratch transpose pass). The forward GEMM itself is
+    TN-native and never calls this.
+
+    Uses a 32x32 shared-memory tile transpose (Optimization A) so both the
+    global read and the global write are coalesced — see the module comment
+    above.
+
+    GPU-only, same reasoning as `quantize_devscale`.
     """
     comptime assert is_gpu[target](), "quantize_transpose_devscale is GPU-only"
     var tiles_rows = ceildiv(rows, _QT_TILE)
@@ -931,7 +788,7 @@ def quantize_dual_devscale[
     `encode_fp8` call per output element, same rounding) — purely a memory-
     traffic optimization, not a numerics change.
 
-    GPU-only, same reasoning as `quantize`.
+    GPU-only, same reasoning as `quantize_devscale`.
     """
     comptime assert is_gpu[target](), "quantize_dual_devscale is GPU-only"
     var tiles_rows = ceildiv(rows, _QT_TILE)

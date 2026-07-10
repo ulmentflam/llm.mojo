@@ -34,10 +34,11 @@ from std.testing import assert_true
 # ===----------------------------------------------------------------------=== #
 # Host fp32 GEMM reference (tests/test_lowp_gemm.mojo lines 63-90, verbatim).
 #
-# Matches lowp_gemm's operand-orientation convention (matmul.mojo's
+# Matches lowp_gemm_devscale's operand-orientation convention (matmul.mojo's
 # `_matmul_cublaslt_fp8` module comment): `d[j*m+i] = sum_p a_role(i,p) *
 # b_role(p,j)`, where a_role/b_role read `a_host`/`b_host` according to
-# `transpose_a`/`transpose_b` exactly as `lowp_gemm` does (transpose_a=False:
+# `transpose_a`/`transpose_b` exactly as `lowp_gemm_devscale` does
+# (transpose_a=False:
 # a_host is `[m,k]` row-major; True: `[k,m]` row-major. transpose_b=False:
 # b_host is `[n,k]` row-major; True: `[k,n]` row-major).
 # ===----------------------------------------------------------------------=== #

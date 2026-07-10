@@ -4,10 +4,14 @@
 #   1. Manual fp8 encode/decode round-trips bit-exact against Mojo's native
 #      host-target fp8 casts (the correctness oracle — probe1 in
 #      tests/probe_fp8/RESULTS.md confirms those casts work on CPU/host).
-#   2. The GPU `quantize`/`quantize_transpose` kernels (llmm/lowp.mojo) match
-#      the manual encoder, including saturation / zero / (fp8-)denormal /
-#      amax=0 edge cases.
-#   3. `lowp_gemm` (llmm/matmul.mojo) vs a plain fp32 reference GEMM on the
+#   2. The GPU `quantize_devscale`/`quantize_transpose_devscale` kernels
+#      (llmm/lowp.mojo) match the manual encoder, including saturation /
+#      zero / (fp8-)denormal / amax=0 edge cases. (The host-Float32-scale
+#      twins these tests originally gated were deleted by the DRY pass F3 —
+#      docs/ai/dry_consolidation_audit_2026-07-10.md; the tests now upload
+#      their host-computed scale into a 1-element device buffer.)
+#   3. `lowp_gemm_devscale` (llmm/matmul.mojo) vs a plain fp32 reference GEMM
+#      on the
 #      pre-quantization bf16 data: per-element relative error < 2^-3 (E4M3's
 #      ~3 mantissa bits), across all three block-GEMM operand orientations
 #      (forward / dgrad / wgrad — see matmul.mojo's `_matmul_cublaslt_fp8`
@@ -32,14 +36,14 @@ from llmm.lowp import (
     encode_e5m2,
     decode_e4m3,
     decode_e5m2,
-    quantize,
-    quantize_transpose,
+    quantize_devscale,
+    quantize_transpose_devscale,
     RoundMode,
     FP8_SPEC,
     E4M3_MAX,
     E5M2_MAX,
 )
-from llmm.matmul import lowp_gemm
+from llmm.matmul import lowp_gemm_devscale
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
 from _lowp_test_common import _host_gemm_ref
@@ -240,10 +244,17 @@ def test_quantize_kernel_matches_manual_encode() raises:
     ctx.synchronize()
 
     comptime SCALE = Float32(2.5)
-    quantize[FP8_SPEC, DType.float8_e4m3fn, IN_DT, "gpu"](
+    # Host-computed scale uploaded into a 1-element device buffer (the
+    # devscale contract — the host-scale twin was deleted in DRY pass F3).
+    var host_scale = ctx.enqueue_create_host_buffer[DType.float32](1)
+    host_scale.unsafe_ptr()[0] = SCALE
+    var dev_scale = ctx.enqueue_create_buffer[DType.float32](1)
+    dev_scale.enqueue_copy_from(host_scale)
+    ctx.synchronize()
+    quantize_devscale[FP8_SPEC, DType.float8_e4m3fn, IN_DT, "gpu"](
         dev_out.unsafe_ptr().as_unsafe_any_origin(),
         dev_in.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        SCALE,
+        dev_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
         N,
         ctx,
     )
@@ -287,10 +298,15 @@ def test_quantize_kernel_amax_zero() raises:
     var dev_out = ctx.enqueue_create_buffer[DType.uint8](N)
     ctx.synchronize()
 
-    quantize[FP8_SPEC, DType.float8_e4m3fn, IN_DT, "gpu"](
+    var host_scale = ctx.enqueue_create_host_buffer[DType.float32](1)
+    host_scale.unsafe_ptr()[0] = Float32(1.0)
+    var dev_scale = ctx.enqueue_create_buffer[DType.float32](1)
+    dev_scale.enqueue_copy_from(host_scale)
+    ctx.synchronize()
+    quantize_devscale[FP8_SPEC, DType.float8_e4m3fn, IN_DT, "gpu"](
         dev_out.unsafe_ptr().as_unsafe_any_origin(),
         dev_in.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        Float32(1.0),
+        dev_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
         N,
         ctx,
     )
@@ -326,10 +342,15 @@ def test_quantize_transpose_matches_manual() raises:
     ctx.synchronize()
 
     comptime SCALE = Float32(10.0)
-    quantize_transpose[FP8_SPEC, DType.float8_e4m3fn, IN_DT, "gpu"](
+    var host_scale = ctx.enqueue_create_host_buffer[DType.float32](1)
+    host_scale.unsafe_ptr()[0] = SCALE
+    var dev_scale = ctx.enqueue_create_buffer[DType.float32](1)
+    dev_scale.enqueue_copy_from(host_scale)
+    ctx.synchronize()
+    quantize_transpose_devscale[FP8_SPEC, DType.float8_e4m3fn, IN_DT, "gpu"](
         dev_out.unsafe_ptr().as_unsafe_any_origin(),
         dev_in.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        SCALE,
+        dev_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
         ROWS,
         COLS,
         ctx,
@@ -422,6 +443,18 @@ def _run_lowp_gemm_case[
     var scale_inv_a = Float32(1.0) / scale_a
     var scale_inv_b = Float32(1.0) / scale_b
 
+    # Host-computed scales uploaded into 1-element device buffers (the
+    # devscale contract — the host-scale `lowp_gemm` twin was deleted in DRY
+    # pass F3): quantize-time multipliers AND their reciprocals, kept in
+    # sync as `lowp_gemm_devscale`'s docstring requires.
+    var host_s_a = ctx.enqueue_create_host_buffer[DType.float32](1)
+    var host_s_b = ctx.enqueue_create_host_buffer[DType.float32](1)
+    host_s_a.unsafe_ptr()[0] = scale_a
+    host_s_b.unsafe_ptr()[0] = scale_b
+    var dev_s_a = ctx.enqueue_create_buffer[DType.float32](1)
+    var dev_s_b = ctx.enqueue_create_buffer[DType.float32](1)
+    dev_s_a.enqueue_copy_from(host_s_a)
+    dev_s_b.enqueue_copy_from(host_s_b)
     var host_sinv_a = ctx.enqueue_create_host_buffer[DType.float32](1)
     var host_sinv_b = ctx.enqueue_create_host_buffer[DType.float32](1)
     host_sinv_a.unsafe_ptr()[0] = scale_inv_a
@@ -432,7 +465,7 @@ def _run_lowp_gemm_case[
     dev_sinv_b.enqueue_copy_from(host_sinv_b)
     ctx.synchronize()
 
-    lowp_gemm[
+    lowp_gemm_devscale[
         FP8_DT,
         FP8_DT,
         IN_DT,
@@ -446,9 +479,9 @@ def _run_lowp_gemm_case[
         dev_b.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
         dev_a_scratch.unsafe_ptr().as_unsafe_any_origin(),
         dev_b_scratch.unsafe_ptr().as_unsafe_any_origin(),
-        scale_a,
+        dev_s_a.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
         dev_sinv_a.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        scale_b,
+        dev_s_b.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
         dev_sinv_b.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
         m,
         n,
@@ -494,11 +527,14 @@ def _run_lowp_gemm_case[
     for i in range(m * n):
         var got = host_d.unsafe_ptr()[i].cast[DType.float32]()
         assert_true(
-            got == got, label + ": NaN in lowp_gemm output at " + String(i)
+            got == got,
+            label + ": NaN in lowp_gemm_devscale output at " + String(i),
         )
         assert_true(
             got > Float32(-1e30) and got < Float32(1e30),
-            label + ": Inf/overflow in lowp_gemm output at " + String(i),
+            label
+            + ": Inf/overflow in lowp_gemm_devscale output at "
+            + String(i),
         )
         var want = host_ref.unsafe_ptr()[i]
         var err = got - want

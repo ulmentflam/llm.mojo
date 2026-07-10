@@ -61,8 +61,6 @@ from llmm.hadamard import hadamard16_fwd_gpu
 from llmm.lowp import (
     PrecisionSpec,
     FP8_SPEC,
-    quantize,
-    quantize_transpose,
     quantize_devscale,
     quantize_transpose_devscale,
     quantize_dual_devscale,
@@ -541,9 +539,9 @@ def _matmul_cublaslt[
 # not a viable fallback on this toolchain either, and the "emulated" body
 # would itself need the same broken GPU fp8 arithmetic (probe2/2c) — so on
 # THIS box/toolchain there is exactly one working body, not three, and
-# `lowp_gemm` below has no comptime branch to select between them. A future
-# toolchain where MAX's fp8 path lowers on sm_121 (or emulation becomes
-# viable) would add that branch here.
+# `lowp_gemm_devscale` below has no comptime branch to select between them.
+# A future toolchain where MAX's fp8 path lowers on sm_121 (or emulation
+# becomes viable) would add that branch here.
 #
 # Two additional open items from docs/ai/fp8_training_design.md §7, resolved
 # empirically in this worktree (probe script + RESULTS below; the probe
@@ -570,11 +568,12 @@ def _matmul_cublaslt[
 #           input[rows,C] has `rows` as its trailing axis — BOTH need a
 #           transposed fp8 copy (input -> [C,rows] for the A role,
 #           d_output -> [OC,rows] for the B role). This is the expensive
-#           case; `quantize_transpose` (llmm/lowp.mojo) fuses the
+#           case; `quantize_transpose_devscale` (llmm/lowp.mojo) fuses the
 #           transpose into the quantize pass (one kernel, not a separate
 #           transpose + quantize) to amortize it.
-#       `lowp_gemm` below exposes `transpose_a`/`transpose_b` comptime bools
-#       so Chunk D (transpose_a=False, transpose_b=False for fwd) and
+#       `lowp_gemm_devscale` below exposes `transpose_a`/`transpose_b`
+#       comptime bools so Chunk D (transpose_a=False, transpose_b=False
+#       for fwd) and
 #       Chunk E (dgrad: transpose_a=True, transpose_b=False; wgrad:
 #       transpose_a=True, transpose_b=True) select the right quantize body
 #       per operand without re-deriving this.
@@ -596,7 +595,7 @@ def _matmul_cublaslt[
 #   toolchain — setting a_scale=2.0, b_scale=3.0 multiplied the bf16 output
 #   by 6.0x relative to the unscaled run, matching cuBLASLt's documented
 #   semantics ("scaling factor value that converts data in matrix A to the
-#   compute data type range"). `lowp_gemm` passes each operand's
+#   compute data type range"). `lowp_gemm_devscale` passes each operand's
 #   **scale_inv** (not scale) through these pointers — cuBLASLt multiplies
 #   fp8_A * a_scale_inv and fp8_B * b_scale_inv inside the fp32-compute GEMM,
 #   so `d_bf16 = (x * scale_x) @ (w * scale_w) * scale_inv_x * scale_inv_w ≈
@@ -632,8 +631,8 @@ def _matmul_cublaslt_fp8[
     TN-only (`transA=CUBLAS_OP_T`, `transB=CUBLAS_OP_N` — cuBLASLt's fp8
     requirement; not caller-selectable, unlike `_matmul_cublaslt`'s bf16/fp32
     path). `a_ptr`/`b_ptr` must already be the correctly-oriented fp8 bytes —
-    this function does no quantization or transpose; see `lowp_gemm` (which
-    calls this) for that, and the module-level comment above for which
+    this function does no quantization or transpose; see `lowp_gemm_devscale`
+    (which calls this) for that, and the module-level comment above for which
     operands of which GEMM need a transposed quantize. `k` must be a multiple
     of 16 (fp8 tensor-core alignment; unchecked here — caller's
     responsibility, same as `_matmul_cublaslt`'s implicit assumptions).
@@ -812,108 +811,6 @@ def _matmul_cublaslt_fp8[
     check_cublas_error(cublasLtMatrixLayoutDestroy(d_l))
 
 
-def lowp_gemm[
-    a_out_dtype: DType,
-    b_out_dtype: DType,
-    in_dtype: DType,
-    out_dtype: DType,
-    target: StaticString,
-    transpose_a: Bool = False,
-    transpose_b: Bool = False,
-](
-    d_ptr: MutKernelPtr[out_dtype],
-    a_ptr: ImmutKernelPtr[in_dtype],
-    b_ptr: ImmutKernelPtr[in_dtype],
-    a_fp8_scratch: MutKernelPtr[DType.uint8],
-    b_fp8_scratch: MutKernelPtr[DType.uint8],
-    a_scale: Float32,
-    a_scale_inv_ptr: ImmutKernelPtr[DType.float32],
-    b_scale: Float32,
-    b_scale_inv_ptr: ImmutKernelPtr[DType.float32],
-    m: Int,
-    n: Int,
-    k: Int,
-    accumulate: Bool,
-    ctx: DeviceContext,
-) raises -> None:
-    """The dtype-generic fp8 GEMM entry point (docs/ai/fp8_training_design.md
-    §3/§5): quantizes `a_ptr`/`b_ptr` (bf16 or fp32) into fp8 scratch buffers
-    at the caller-chosen scale, then runs `_matmul_cublaslt_fp8` (the only
-    vendor body available on this toolchain — see the comment block above),
-    producing bf16 `d_ptr` already correctly descaled (no separate dequantize
-    pass needed, per the scale-pointer probe result above).
-
-    `m`, `n`, `k` follow this file's existing column-major convention: `m` is
-    D's trailing (fastest-varying, "column") dimension in row-major terms,
-    `n` its leading dimension, `k` the contraction dimension — identical to
-    `_matmul_cublaslt`'s `m`/`n`/`k` at each of its three call sites
-    (`matmul_fwd`, `matmul_d_input_bwd`, `matmul_d_weight_bwd`).
-
-    `transpose_a`/`transpose_b` select `quantize` (operand's natural
-    row-major layout already fits the TN "A-role"/"B-role" free pattern) vs
-    `quantize_transpose` (needs a physically transposed fp8 copy) per
-    operand — see the module comment above for the derivation per GEMM:
-      - forward:       transpose_a=False, transpose_b=False
-      - dgrad (d_input): transpose_a=True,  transpose_b=False
-      - wgrad (d_weight): transpose_a=True,  transpose_b=True
-
-    When `transpose_a`: `a_ptr` is logically `[k, m]` row-major (source
-    shape), `a_fp8_scratch` becomes `[m, k]` row-major (transposed) fp8
-    bytes. When not: `a_ptr` is `[m, k]` row-major already, copied through
-    `quantize` unchanged (mirrored for `b_ptr`/`[k, n]`/`[n, k]`).
-
-    `a_fp8_scratch`/`b_fp8_scratch` must be at least `m*k`/`k*n` bytes.
-    `a_scale`/`b_scale` are the quantize-time multipliers (`fp8_max / amax`,
-    per docs/ai/fp8_training_design.md §1.3 — computed by Chunk C's
-    `AmaxState`/`update_scale`, out of this chunk's scope);
-    `a_scale_inv_ptr`/`b_scale_inv_ptr` are DEVICE fp32 scalars holding their
-    reciprocals (cuBLASLt's `A_SCALE_POINTER`/`B_SCALE_POINTER` require a
-    device pointer, not a host value — keep them in sync with `a_scale`/
-    `b_scale` at the call site; `tests/test_lowp_gemm.mojo` shows the
-    single-scalar-buffer pattern).
-    """
-    comptime assert is_gpu[
-        target
-    ](), "lowp_gemm is GPU-only per docs/ai/fp8_training_design.md landmine #1"
-    comptime assert HAS_CUBLAS, (
-        "lowp_gemm's only implemented vendor body is cuBLASLt fp8"
-        " (tests/probe_fp8/RESULTS.md probe3/probe4) -- no MAX-linalg or"
-        " emulated fallback exists on this toolchain (see the module comment"
-        " above _matmul_cublaslt_fp8)"
-    )
-
-    comptime if transpose_a:
-        quantize_transpose[FP8_SPEC, a_out_dtype, in_dtype, target](
-            a_fp8_scratch, a_ptr, a_scale, k, m, ctx
-        )
-    else:
-        quantize[FP8_SPEC, a_out_dtype, in_dtype, target](
-            a_fp8_scratch, a_ptr, a_scale, m * k, ctx
-        )
-
-    comptime if transpose_b:
-        quantize_transpose[FP8_SPEC, b_out_dtype, in_dtype, target](
-            b_fp8_scratch, b_ptr, b_scale, k, n, ctx
-        )
-    else:
-        quantize[FP8_SPEC, b_out_dtype, in_dtype, target](
-            b_fp8_scratch, b_ptr, b_scale, n * k, ctx
-        )
-
-    _matmul_cublaslt_fp8[a_out_dtype, b_out_dtype, out_dtype](
-        d_ptr,
-        a_fp8_scratch.as_immutable(),
-        b_fp8_scratch.as_immutable(),
-        a_scale_inv_ptr,
-        b_scale_inv_ptr,
-        m,
-        n,
-        k,
-        accumulate,
-        ctx,
-    )
-
-
 def lowp_gemm_devscale[
     a_out_dtype: DType,
     b_out_dtype: DType,
@@ -939,19 +836,52 @@ def lowp_gemm_devscale[
     accumulate: Bool,
     ctx: DeviceContext,
 ) raises -> None:
-    """Device-pointer-scale twin of `lowp_gemm` (Chunk D): identical
-    quantize-then-GEMM structure, but both the quantize-time multiplier
-    (`a_scale_ptr`/`b_scale_ptr`) AND the GEMM's descale reciprocal
-    (`a_scale_inv_ptr`/`b_scale_inv_ptr`) are DEVICE fp32 scalars — the
-    `AmaxState.scale`/`scale_inv` device buffers Chunk C's `AmaxState`
-    (llmm/amax.mojo) already maintains, read with no host sync on the
-    training step's critical path (design §1.3/§4: "Host readback? no").
-    `lowp_gemm` itself keeps taking a host `a_scale`/`b_scale` Float32
-    because `tests/test_lowp_gemm.mojo` (Chunk B's gate) exercises it with a
-    host-computed scale; this twin is the one production forward/backward
-    call sites (Chunk D/E) use once an `AmaxState` is in the loop. See
-    `quantize_devscale`'s docstring in llmm/lowp.mojo for why a host-scale
-    call site would force a host readback here.
+    """The dtype-generic fp8 GEMM entry point (docs/ai/fp8_training_design.md
+    §3/§5): quantizes `a_ptr`/`b_ptr` (bf16 or fp32) into fp8 scratch buffers
+    at the caller-chosen scale, then runs `_matmul_cublaslt_fp8` (the only
+    vendor body available on this toolchain — see the comment block above),
+    producing bf16 `d_ptr` already correctly descaled (no separate dequantize
+    pass needed, per the scale-pointer probe result above).
+
+    Both the quantize-time multiplier (`a_scale_ptr`/`b_scale_ptr`) AND the
+    GEMM's descale reciprocal (`a_scale_inv_ptr`/`b_scale_inv_ptr`) are
+    DEVICE fp32 scalars — the `AmaxState.scale`/`scale_inv` device buffers
+    Chunk C's `AmaxState` (llmm/amax.mojo) already maintains, read with no
+    host sync on the training step's critical path (design §1.3/§4: "Host
+    readback? no"). See `quantize_devscale`'s docstring in llmm/lowp.mojo
+    for why a host-scale parameter would force a host readback here. (Chunk
+    B originally also shipped a host-`Float32`-scale twin, `lowp_gemm`, for
+    its unit-test gate; the DRY pass F3 deleted it — the tests now upload
+    their host-computed scale into 1-element device buffers and call this
+    form. Keep the scale and scale-inv buffers in sync at the call site;
+    `tests/test_lowp_gemm.mojo` shows the single-scalar-buffer pattern.)
+
+    `m`, `n`, `k` follow this file's existing column-major convention: `m` is
+    D's trailing (fastest-varying, "column") dimension in row-major terms,
+    `n` its leading dimension, `k` the contraction dimension — identical to
+    `_matmul_cublaslt`'s `m`/`n`/`k` at each of its three call sites
+    (`matmul_fwd`, `matmul_d_input_bwd`, `matmul_d_weight_bwd`).
+
+    `transpose_a`/`transpose_b` select `quantize_devscale` (operand's
+    natural row-major layout already fits the TN "A-role"/"B-role" free
+    pattern) vs `quantize_transpose_devscale` (needs a physically transposed
+    fp8 copy) per operand — see the module comment above for the derivation
+    per GEMM:
+      - forward:       transpose_a=False, transpose_b=False
+      - dgrad (d_input): transpose_a=True,  transpose_b=False
+      - wgrad (d_weight): transpose_a=True,  transpose_b=True
+
+    When `transpose_a`: `a_ptr` is logically `[k, m]` row-major (source
+    shape), `a_fp8_scratch` becomes `[m, k]` row-major (transposed) fp8
+    bytes. When not: `a_ptr` is `[m, k]` row-major already, copied through
+    `quantize_devscale` unchanged (mirrored for `b_ptr`/`[k, n]`/`[n, k]`).
+
+    `a_fp8_scratch`/`b_fp8_scratch` must be at least `m*k`/`k*n` bytes.
+    The scales are the quantize-time multipliers (`fp8_max / amax`, per
+    docs/ai/fp8_training_design.md §1.3 — computed by Chunk C's
+    `AmaxState`/`update_scale`); `a_scale_inv_ptr`/`b_scale_inv_ptr` hold
+    their reciprocals (cuBLASLt's `A_SCALE_POINTER`/`B_SCALE_POINTER`
+    require a device pointer, not a host value).
 
     `quantize_b` (Optimization B, docs/ai/ai_assisted_optimizations_and_
     benchmarks.md 2026-07-10 fp8-quant-opt entry): when False, `b_ptr` is
@@ -1034,13 +964,15 @@ def lowp_gemm_devscale[
 # Scope note: unlike `_matmul_cublaslt_fp8`, this raw GEMM (and
 # `lowp_gemm_fp4` below) does not expose `transpose_a`/`transpose_b` —
 # `llmm/nvfp4_quant.mojo`'s `nvfp4_quantize` has no fused transpose+quantize
-# counterpart to `llmm/lowp.mojo`'s `quantize_transpose` (out of this
-# chunk's file-ownership scope), and the forward orientation (both operands'
+# counterpart to `llmm/lowp.mojo`'s `quantize_transpose_devscale` (out of
+# this chunk's file-ownership scope), and the forward orientation (both
+# operands'
 # natural row-major storage already has the contraction dim `C` trailing —
 # weight`[OC,C]`, input`[rows,C]`) is TN-native with no transpose needed
 # anyway, exactly like fp8's forward case. Dgrad/Wgrad orientations (which
-# fp8 handles via `quantize_transpose`) are deferred to the training-
-# integration chunk: per the recipe, weights use 2D 16x16 block scaling
+# fp8 handles via `quantize_transpose_devscale`) are deferred to the
+# training-integration chunk: per the recipe, weights use 2D 16x16 block
+# scaling
 # specifically so the *same* quantized buffer can serve both Fprop
 # (row-major read) and Dgrad (column-major read) without requantizing —
 # that reuse is a genuine per-role integration decision belonging to
@@ -1423,8 +1355,8 @@ def lowp_gemm_fp4[
     extra_scale: Float32 = Float32(1.0),
 ) raises -> None:
     """The dtype-generic NVFP4 GEMM entry point — the FP4 analogue of
-    `lowp_gemm` (fp8, above): quantizes `a_ptr`/`b_ptr` (bf16 or fp32, both
-    forward-orientation `[rows, k]` row-major — `a_ptr` is the `[m,k]`
+    `lowp_gemm_devscale` (fp8, above): quantizes `a_ptr`/`b_ptr` (bf16 or
+    fp32, both forward-orientation `[rows, k]` row-major — `a_ptr` is the `[m,k]`
     "input"-role operand, `b_ptr` the `[n,k]` "weight"-role operand, e.g.
     weight `[OC,C]`) into NVFP4 (packed e2m1 + swizzled e4m3 block scales +
     fresh fp32 tensor scale) via `llmm/nvfp4_quant.mojo`'s `nvfp4_quantize`,
@@ -1461,7 +1393,8 @@ def lowp_gemm_fp4[
     is quantized via `nvfp4_quantize_transpose` instead of `nvfp4_quantize`
     — needed when the operand's natural `[rows, cols]` row-major storage
     does NOT already have the contraction dimension `k` trailing (cuBLASLt's
-    NVFP4 GEMM is TN-only, mirroring fp8's `lowp_gemm`/`_matmul_cublaslt_fp8`
+    NVFP4 GEMM is TN-only, mirroring fp8's
+    `lowp_gemm_devscale`/`_matmul_cublaslt_fp8`
     — see `llmm/matmul.mojo`'s dgrad/wgrad module comment below
     `matmul_bwd_lowp` for the fp8 derivation and the fp4 sibling comment
     above `matmul_d_input_bwd_fp4` for the fp4-specific wrinkle). When
@@ -1471,7 +1404,7 @@ def lowp_gemm_fp4[
     (unchanged from the non-transposed case). Mirrored for `transpose_b`/
     `b_ptr`/`[k,n]`.
     `m`/`n`/`k` follow this file's existing column-major-`D` convention,
-    identical to `lowp_gemm`'s.
+    identical to `lowp_gemm_devscale`'s.
 
     `extra_scale` (runtime, default 1.0, Chunk T2b): an extra scalar folded
     into the post-scale multiply (`d = raw * tensor_scale_A * tensor_scale_B
@@ -1986,7 +1919,8 @@ def matmul_fwd_lowp[
     via `lowp_gemm_devscale` (forward orientation: `transpose_a=False,
     transpose_b=False` — both `weight` `[out_channels,channels]` and `input`
     `[rows,channels]` are already TN-native, no transposed quantize needed —
-    see `lowp_gemm`'s docstring for the per-GEMM orientation derivation).
+    see `lowp_gemm_devscale`'s docstring for the per-GEMM orientation
+    derivation).
 
     `input_state`/`weight_state` are this call site's `AmaxState[FP8_SPEC]`
     (one instance per transformer layer per site, from `train_gpt2.mojo`'s
@@ -2099,7 +2033,7 @@ def matmul_fwd_fp4[
     `[out_channels,channels]` -> `m`=`out_channels`, `b`=`input_ptr`
     `[rows,channels]` -> `n`=`rows`, so the column-major `D` cuBLASLt
     writes lands as the `[rows,out_channels]` row-major buffer `out_ptr`
-    expects — see `lowp_gemm`'s docstring for the derivation).
+    expects — see `lowp_gemm_devscale`'s docstring for the derivation).
 
     Per `docs/ai/fp4_training_recipes_research.md` §1 ("2D vs 1D
     scaling"): the weight operand uses 2D 16x16 block scaling

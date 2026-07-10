@@ -3,7 +3,7 @@
 #
 # Chunk C of docs/ai/fp8_training_design.md (§1.3 "Scaling strategy", §3 "the
 # dtype-generic low-precision layer"). The design places this machinery
-# inside llmm/lowp.mojo alongside `PrecisionSpec`/`quantize`/`lowp_gemm`
+# inside llmm/lowp.mojo alongside `PrecisionSpec`/`quantize_devscale`
 # (Chunks A/B/G, developed in parallel worktrees touching that same file).
 # DELIBERATE DEVIATION: to keep parallel agents from editing the same file,
 # this chunk lives in its own `llmm/amax.mojo` for now. Folding this file's
