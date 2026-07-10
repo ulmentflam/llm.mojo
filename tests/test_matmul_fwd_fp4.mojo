@@ -209,9 +209,17 @@ def _run_site_case(
         + String(out_channels)
         + ")",
     )
+    # Cosine floor is DERIVED from the relL2 floor, not independent: for
+    # quantization error ~orthogonal to the signal, cosine ~= 1/sqrt(1 +
+    # rel_l2^2), so fp4's ~0.151 relL2 floor implies cosine ~0.9886 (measured
+    # 0.9894/0.9903 at both MLP sites, bit-identical across runs). The fp8
+    # test's 0.999 bound is self-consistent only at fp8's ~0.036 floor —
+    # reusing it here demands sub-physics error (gate C failure, 2026-07-10).
+    # 0.985 sits below the measured floor with margin while still failing
+    # loudly on real bugs (wrong operand/scale/layout land <<0.98).
     assert_true(
-        cosine > Float32(0.999),
-        label + ": cosine similarity " + String(cosine) + " <= 0.999",
+        cosine > Float32(0.985),
+        label + ": cosine similarity " + String(cosine) + " <= 0.985",
     )
 
 
