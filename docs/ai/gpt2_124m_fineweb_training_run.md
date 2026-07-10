@@ -51,6 +51,11 @@ present and unchanged in content from what the run used) — see
 - **Final checkpoint:** `log124M/model_19552.bin` (248,952,832 bytes ≈ 249 MB,
   bf16 params) + `log124M/state_19552_0.bin` (995,808,256 bytes ≈ 996 MB, fp32
   AdamW moments — only needed to resume further training, not for inference).
+  Published on HuggingFace: [ulmentflam/gpt2-124m-fineweb-mojo](https://huggingface.co/ulmentflam/gpt2-124m-fineweb-mojo)
+  (safetensors export + the original raw checkpoint; see `scripts/export_to_hf.py`).
+- **HellaSwag: 2965/10042 = 29.53%** (acc_norm), Wilson 95% CI [28.6%, 30.4%] —
+  see the README's Evaluation section for the full comparison against Karpathy's
+  own llm.c reproduction of this exact setup.
 - **Final train loss** (step 19552, the last logged step): **3.345018**. **Final
   val loss: 3.2806964** — essentially flat vs. step 19000's val loss of
   **3.2820423** (and the checkpoints in between: 3.2808414, 3.2808414, 3.2806778,
