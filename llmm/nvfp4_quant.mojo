@@ -98,7 +98,7 @@ Wgrad's `input`/`d_output` operands need a physically transposed NVFP4 copy
 (their contraction dimension is not the trailing axis of their natural
 row-major storage — see `llmm/matmul.mojo`'s dgrad/wgrad orientation
 derivation). `nvfp4_quantize_transpose` below is the FP4 analogue of
-`llmm/lowp.mojo`'s `quantize_transpose` (fp8): a single fused pass that reads
+`llmm/lowp.mojo`'s `quantize_transpose_devscale` (fp8): a fused pass reading
 the SOURCE tensor transposed and writes a normally-laid-out (packed e2m1 +
 swizzled e4m3 + fp32 tensor scale) NVFP4 quantization of that transpose — no
 separate bf16 transpose scratch buffer/pass. It shares `_nvfp4_quantize_gpu`'s
@@ -123,7 +123,6 @@ FP8 team's design doc §3).
 
 from std.collections import InlineArray
 from std.math import ceildiv
-from std.memory import bitcast
 from std.sys import get_defined_int
 from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
@@ -131,6 +130,13 @@ from std.gpu.primitives import block
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.memory import ImmutKernelPtr, MutKernelPtr, ImmutMemPtr, MutMemPtr
+from llmm.lowp import (
+    E4M3_MAX,
+    NanPolicy,
+    TieMode,
+    _fp8_decode,
+    _fp8_encode,
+)
 from llmm.rng_device import rng_uniform01
 
 
@@ -140,7 +146,8 @@ from llmm.rng_device import rng_uniform01
 
 comptime NVFP4_BLOCK = 16  # elements per scale, along K (both 1D and 2D)
 comptime E2M1_MAX = Float32(6.0)  # largest representable e2m1 magnitude
-comptime E4M3_MAX = Float32(448.0)  # largest representable e4m3 magnitude
+# E4M3_MAX (448.0, largest representable e4m3 magnitude) is imported from
+# llmm/lowp.mojo — one definition since the DRY pass F1.
 
 
 # Rounding-mode seam for `encode_e2m1`. Both modes are implemented (see module
@@ -318,89 +325,49 @@ def unpack_e2m1x2_hi(byte: UInt8) -> UInt8:
 # e4m3 (block scale) encode / decode
 #
 # Standard fp8 e4m3 (1 sign / 4 exponent / 3 mantissa, bias 7, no infinities,
-# 0x7F/0xFF reserved for NaN) — manual bit manipulation, ported from
-# tests/probe_fp4/probe_fp4.cu::encode_e4m3/decode_e4m3 (which uses
-# frexpf/powf; this version decomposes the fp32 bit pattern directly via
-# `bitcast`, which is mathematically identical — same e_unbiased / mantissa
-# decomposition — and avoids any pop.cast to an actual float8 dtype).
+# 0x7F/0xFF reserved for NaN). Since the DRY pass F1
+# (docs/ai/dry_consolidation_audit_2026-07-10.md) these are thin wrappers
+# over the shared codec core in `llmm/lowp.mojo`:
+#
+# - decode is bit-for-bit the same math both modules independently carried
+#   (subnormal `m/512`, normal `(1 + m/8)*2^(e-7)` by direct exponent-field
+#   construction) — unified outright into `_fp8_decode[4, 3, 7]`.
+# - encode DELIBERATELY diverges from `llmm/lowp.mojo`'s own `encode_e4m3`:
+#   this one is round-to-nearest ties-AWAY-from-zero with NaN -> 0x7F
+#   (matching tests/probe_fp4/probe_fp4.cu's `roundf` reference and the
+#   cuBLAS/PyTorch NVFP4 block-scale convention), while lowp's is
+#   ties-to-EVEN with NaN saturating (matching Mojo's host fp8 cast). The
+#   full divergence contract — including the probe-lineage -0.0 and
+#   subnormal behaviors — is documented at the `TieMode` definition in
+#   llmm/lowp.mojo; do NOT collapse the two rule sets.
+#
 # Block scales in this module are always >= 0, but sign is handled for
-# generality.
+# generality. The pre-F1 local implementation's fix of the probe's
+# `e_biased >= 15 -> m3 = 7` saturation bug (which decodes to 240, not 448)
+# is preserved structurally by the shared core: it clamps the input
+# magnitude to max_normal (448, exactly representable) BEFORE rounding, so
+# no post-round exponent-clamp branch exists to get wrong — see
+# `_fp8_encode`'s carry-out comment and
+# tests/test_nvfp4_quant.mojo::test_e4m3_saturation.
 # ===----------------------------------------------------------------------=== #
 
 
 @always_inline
 def encode_e4m3(x: Float32) -> UInt8:
     """Encode a fp32 value to an e4m3 byte, round-to-nearest
-    (ties-away-from-zero), saturating to +/-448.
+    (ties-away-from-zero), saturating to +/-448, NaN -> 0x7F — the
+    probe/cuBLAS NVFP4 block-scale convention (see the module comment above
+    and the TieMode contract in llmm/lowp.mojo).
     """
-    if x != x:  # NaN
-        return UInt8(0x7F)
-    var sign: UInt8 = UInt8(0x80) if x < 0.0 else UInt8(0x00)
-    var ax = x if x >= 0.0 else -x
-    if ax == 0.0:
-        return sign
-    if ax > 448.0:
-        ax = 448.0
-    var bits = bitcast[DType.uint32, 1](ax)
-    var exp32 = Int((bits >> UInt32(23)) & UInt32(0xFF))
-    if exp32 == 0:
-        # fp32-subnormal input (< ~1.18e-38) is far below e4m3's smallest
-        # subnormal (2^-9 ~= 0.00195) -- flush to (signed) zero.
-        return sign
-    var mant32 = Int(bits & UInt32(0x7FFFFF))
-    var mant2 = Float32(1.0) + Float32(mant32) / Float32(1 << 23)  # [1, 2)
-    var e_unbiased = exp32 - 127
-    if e_unbiased < -6:
-        # subnormal e4m3: value = m * 2^-9, m in [0, 7]
-        var m = Int(ax * 512.0 + 0.5)
-        if m > 7:
-            m = 7
-        return sign | UInt8(m)
-    var e_biased = e_unbiased + 7
-    var m3 = Int((mant2 - 1.0) * 8.0 + 0.5)
-    if m3 == 8:
-        m3 = 0
-        e_biased += 1
-    # DEVIATION FROM THE PROBE: tests/probe_fp4/probe_fp4.cu::encode_e4m3
-    # has `if (e_biased >= 15) { e_biased = 14; m3 = 7; }` here, commented
-    # "saturate to 448" -- but (e_biased=14, m3=7) decodes to 240, not 448
-    # (verified: e4m3's true max finite is e_biased=15, m3=6 == 1.75*2^8 ==
-    # 448; e_biased=15 with m3=7 is the reserved NaN pattern). Since `ax` is
-    # already clamped to <=448.0 above, e_biased organically never exceeds
-    # 15 and m3 never reaches 7 at e_biased=15 (mant2 tops out at 1.75) --
-    # so the probe's check is both unreachable-as-a-no-op in the common
-    # case *and* actively wrong (silently corrupts any value that lands
-    # exactly on e_biased==15, e.g. ax in roughly [256, 448]) if it ever
-    # does fire. Caught by this file's own
-    # test_e4m3_saturation/test_e4m3_roundtrip_relative_error_bounded
-    # (447.0 -> the buggy branch produced 240.0). Fixed here to saturate to
-    # the true max finite (448) only when the encoding would otherwise
-    # genuinely overflow 4 exponent bits or collide with the NaN pattern.
-    if e_biased > 15:
-        e_biased = 15
-        m3 = 6
-    elif e_biased == 15 and m3 == 7:
-        m3 = 6
-    return sign | (UInt8(e_biased) << 3) | UInt8(m3)
+    return _fp8_encode[
+        4, 3, 7, E4M3_MAX, tie_mode=TieMode.AWAY, nan_policy=NanPolicy.EMIT
+    ](x)
 
 
 @always_inline
 def decode_e4m3(code: UInt8) -> Float32:
-    """Decode an e4m3 byte back to fp32."""
-    var sign = (code >> 7) & UInt8(1)
-    var e = Int((code >> 3) & UInt8(0xF))
-    var m = Int(code & UInt8(0x7))
-    var mag: Float32
-    if e == 0:
-        mag = Float32(m) / 512.0
-    else:
-        var mant2 = Float32(1.0) + Float32(m) / 8.0
-        # Construct 2^(e-7) by writing the fp32 exponent field directly
-        # (bias 127) instead of calling a transcendental pow()/exp2().
-        var scale_bits = UInt32((e - 7 + 127) << 23)
-        var pow2 = bitcast[DType.float32, 1](scale_bits)
-        mag = mant2 * pow2
-    return -mag if sign == UInt8(1) else mag
+    """Decode an e4m3 byte back to fp32 (shared core — llmm/lowp.mojo)."""
+    return _fp8_decode[4, 3, 7](code)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -885,8 +852,8 @@ def nvfp4_quantize_transpose[
     i.e. produces byte-identical output to calling `nvfp4_quantize` on a
     materialized `[src_k, src_rows]` tensor `T` where `T[i, j] = x_ptr[j,
     i]`, computed in one pass with no separate bf16 transpose scratch buffer
-    (the FP4 analogue of `llmm/lowp.mojo`'s `quantize_transpose` — see the
-    module docstring's "Transposed quantize" section for the full
+    (the FP4 analogue of `llmm/lowp.mojo`'s `quantize_transpose_devscale` —
+    see the module docstring's "Transposed quantize" section for the full
     derivation, and `llmm/matmul.mojo`'s dgrad/wgrad orientation comment for
     which operands need this: Dgrad's `weight`, Wgrad's `input` and
     `d_output`).

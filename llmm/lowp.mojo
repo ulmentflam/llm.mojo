@@ -195,6 +195,57 @@ struct RoundMode:
     """Stochastic rounding — Chunk G seam (see `encode_e4m3`/`encode_e5m2`)."""
 
 
+# ===----------------------------------------------------------------------=== #
+# TieMode / NanPolicy — the two-oracle divergence (DRY pass F1).
+#
+# This repo carries TWO e4m3 encoders under one shared core (`_fp8_encode`
+# below), because they answer to two DIFFERENT external oracles and the
+# difference is LOAD-BEARING — do NOT force them to one rule (that is a
+# correctness regression against one of the two oracles; see
+# docs/ai/dry_consolidation_audit_2026-07-10.md finding F1):
+#
+# - `encode_e4m3` (this file, TieMode.EVEN + NanPolicy.SATURATE): round-to-
+#   nearest, ties-to-EVEN, NaN saturates to ±448 — chosen to match Mojo's
+#   *host* `.cast[float8_e4m3fn]()` bit-for-bit, so the GPU fp8 quantizer
+#   agrees with the host-cast oracle in tests/test_lowp_gemm.mojo.
+# - `llmm/nvfp4_quant.mojo`'s `encode_e4m3` (TieMode.AWAY + NanPolicy.EMIT):
+#   round-to-nearest, ties-AWAY-from-zero, NaN emits the 0x7F NaN byte —
+#   chosen to match tests/probe_fp4/probe_fp4.cu's `roundf`-based reference
+#   and the cuBLAS/PyTorch NVFP4 block-scale convention, gated by
+#   tests/test_nvfp4_quant.mojo.
+#
+# TieMode.AWAY additionally preserves two more probe-lineage behaviors the
+# audit's tie/NaN framing did not capture (both verified bit-level against
+# the pre-consolidation nvfp4 encoder, and both kept for bit-compatibility
+# with the shipped FP4 training trajectories):
+# - sign comes from a `x < 0` compare (so -0.0 collapses to +0x00), not from
+#   fp32 bit 31 (EVEN keeps bit 31: host cast encodes -0.0 as 0x80);
+# - the subnormal branch reproduces the probe's float arithmetic
+#   (`Int(ax * 2^(bias-1+mant_bits) + 0.5)`, clamped at the largest
+#   subnormal rather than promoted to the smallest normal on overflow) —
+#   including its `+ 0.5` fp32-addition rounding, which on inputs within
+#   ~2^-25 of a subnormal tie differs from exact integer ties-away.
+# ===----------------------------------------------------------------------=== #
+
+
+struct TieMode:
+    """Comptime enum selecting the tie-breaking rule of `_fp8_encode`."""
+
+    comptime EVEN = 0
+    """Ties-to-even — the Mojo host-cast oracle (fp8 training path)."""
+    comptime AWAY = 1
+    """Ties-away-from-zero — the probe/cuBLAS NVFP4 block-scale oracle."""
+
+
+struct NanPolicy:
+    """Comptime enum selecting `_fp8_encode`'s NaN handling."""
+
+    comptime SATURATE = 0
+    """NaN clamps to ±max_normal (matches Mojo's host fp8 cast)."""
+    comptime EMIT = 1
+    """NaN encodes as the format's NaN byte (0x7F for e4m3fn)."""
+
+
 # Saturation ceilings (Mojo's *host*-target `.cast[float8_*]()` saturates to
 # these — confirmed empirically, not IEEE-754 default (e5m2 has an encodable
 # infinity but the cast never produces it): e.g. `1.0e5 -> e5m2 -> f32 ==
@@ -225,21 +276,44 @@ def _pow2_f32(e: Int) -> Float32:
 
 
 @always_inline
-def _fp8_encode_rne[
-    exp_bits: Int, mant_bits: Int, bias: Int, max_normal: Float32
+def _fp8_encode[
+    exp_bits: Int,
+    mant_bits: Int,
+    bias: Int,
+    max_normal: Float32,
+    tie_mode: Int = TieMode.EVEN,
+    nan_policy: Int = NanPolicy.SATURATE,
 ](x: Float32) -> UInt8:
-    """Round-to-nearest-even encode of `x` into an `(exp_bits, mant_bits,
-    bias)` fp8 format's bit pattern, saturating (never inf/nan) at
-    `max_normal`. Generic core shared by `encode_e4m3`/`encode_e5m2` — see
-    module docstring for why this must stay pure integer/fp32 arithmetic
-    (no fp8-typed intermediate) to be GPU-safe.
+    """Round-to-nearest encode of `x` into an `(exp_bits, mant_bits, bias)`
+    fp8 format's bit pattern, saturating (never inf) at `max_normal`.
+    Generic core shared by `encode_e4m3`/`encode_e5m2` (TieMode.EVEN — the
+    host-cast oracle) and `llmm/nvfp4_quant.mojo`'s `encode_e4m3`
+    (TieMode.AWAY + NanPolicy.EMIT — the probe/cuBLAS NVFP4 oracle). The two
+    rule sets deliberately diverge and must both be kept — see the TieMode
+    module comment above for the full divergence contract, and the module
+    docstring for why this must stay pure integer/fp32 arithmetic (no
+    fp8-typed intermediate) to be GPU-safe.
     """
+    comptime if nan_policy == NanPolicy.EMIT:
+        if x != x:
+            # The format's (sign-0) NaN byte: exp field all-ones + mantissa
+            # all-ones — 0x7F for e4m3fn (e5m2 never uses EMIT here).
+            comptime nan_byte = (1 << (exp_bits + mant_bits)) - 1
+            return UInt8(nan_byte)
+
     var xbits = _f32_bits(x)
-    var sign_bit = UInt8((xbits >> 31) & 1) << 7
+    var sign_bit: UInt8
+    comptime if tie_mode == TieMode.AWAY:
+        # Probe-lineage sign: a `< 0` compare, so -0.0 collapses to +0x00
+        # (the host-cast/EVEN rule below keeps bit 31: -0.0 -> 0x80).
+        sign_bit = UInt8(0x80) if x < Float32(0.0) else UInt8(0x00)
+    else:
+        sign_bit = UInt8((xbits >> 31) & 1) << 7
     var ax = abs(x)
     # `not (ax <= max_normal)` catches ax > max_normal AND NaN (NaN compares
     # false against everything under IEEE rules) — both saturate rather than
-    # propagate, matching the native host cast's observed behavior.
+    # propagate, matching the native host cast's observed behavior. (Under
+    # NanPolicy.EMIT, NaN already returned above, so this is a plain clamp.)
     if not (ax <= max_normal):
         ax = max_normal
     if ax == Float32(0.0):
@@ -247,11 +321,29 @@ def _fp8_encode_rne[
 
     var bits = _f32_bits(ax)
     var f32_exp = Int((bits >> 23) & 0xFF) - 127
+    comptime min_normal_exp = 1 - bias
+
+    comptime if tie_mode == TieMode.AWAY:
+        # Probe-lineage subnormal branch, kept bit-for-bit (see the TieMode
+        # module comment): fp32-subnormal input flushes to (signed) zero;
+        # an fp8-subnormal result comes from the probe's float arithmetic —
+        # `roundf`-style `+ 0.5` (whose fp32-addition rounding is part of
+        # the preserved behavior) and a clamp at the largest subnormal
+        # (`m > max` -> max, NOT a promote to the smallest normal).
+        if f32_exp == -127:
+            return sign_bit
+        if f32_exp < min_normal_exp:
+            # 1/min_subnormal = 2^(bias - 1 + mant_bits) (512 for e4m3).
+            var m = Int(ax * _pow2_f32(bias - 1 + mant_bits) + Float32(0.5))
+            comptime max_sub = (1 << mant_bits) - 1
+            if m > max_sub:
+                m = max_sub
+            return sign_bit | UInt8(m)
+
     var full_mant: UInt32 = (bits & 0x7FFFFF) | (
         UInt32(1) << 23
     )  # 24-bit, implicit 1
 
-    comptime min_normal_exp = 1 - bias
     var shift: Int
     var exp_field: Int
     if f32_exp >= min_normal_exp:
@@ -271,8 +363,17 @@ def _fp8_encode_rne[
     var mask: UInt32 = (UInt32(1) << ushift) - 1
     var rem = full_mant & mask
     var mant_shifted = full_mant >> ushift
-    if rem > half or (rem == half and (mant_shifted & 1) == 1):
-        mant_shifted += 1
+    comptime if tie_mode == TieMode.AWAY:
+        # Ties-away-from-zero. On the normal path this is provably identical
+        # to the probe's `Int((mant2 - 1) * 8 + 0.5)`: `(mant2-1)*8` is a
+        # multiple of 2^-20 below 8, so `+ 0.5` needs at most 24 significand
+        # bits and is exact in fp32 — no double rounding, unlike the
+        # subnormal branch above.
+        if rem >= half:
+            mant_shifted += 1
+    else:
+        if rem > half or (rem == half and (mant_shifted & 1) == 1):
+            mant_shifted += 1
 
     comptime umant_bits = UInt32(mant_bits)
     if exp_field == 0:
@@ -357,7 +458,7 @@ def encode_e4m3[
     manually (no fp8-typed cast — see module docstring). `mode` selects RNE
     (implemented) or SR (Chunk G seam, comptime error until wired)."""
     comptime if mode == RoundMode.RNE:
-        return _fp8_encode_rne[4, 3, 7, E4M3_MAX](x)
+        return _fp8_encode[4, 3, 7, E4M3_MAX](x)
     elif mode == RoundMode.SR:
         comptime assert False, _SR_SEAM_MSG
     else:
@@ -372,7 +473,7 @@ def encode_e5m2[
     manually (no fp8-typed cast — see module docstring). `mode` selects RNE
     (implemented) or SR (Chunk G seam, comptime error until wired)."""
     comptime if mode == RoundMode.RNE:
-        return _fp8_encode_rne[5, 2, 15, E5M2_MAX](x)
+        return _fp8_encode[5, 2, 15, E5M2_MAX](x)
     elif mode == RoundMode.SR:
         comptime assert False, _SR_SEAM_MSG
     else:
