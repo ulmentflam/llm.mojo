@@ -1819,3 +1819,65 @@ classifier once, alignment hints, LN fusion, selective zeroing) carries
 over to fp32, where llm.c's fp32 harness lacks some of its bf16-side
 optimizations (e.g. its fp32 attention still materializes preatt/att fully
 in fp32 and runs a separate backward classifier pass).
+
+### Post-merge regression sweep (2026-07-10, merged HEAD `9382ee1`)
+
+Full sweep to prove the TF32 change regressed no other precision. Pre-run
+state: `free -g` 121/75 used/46 available; nvidia-smi 0% util, 42-43 °C,
+quiet box. All binaries rebuilt this session (mtimes checked newer than
+sources, including llm.c's `train_gpt2cu`/`train_gpt2fp32cu`). Every
+GPU-touching command ran under the `/tmp/llmm-gpu.lock` flock.
+
+**Verdict per precision — NO REGRESSIONS:**
+
+- **bf16 (GPU)**: harness losses (B=4 T=1024 L=12, 8 steps) — steps 0-1
+  digit-for-digit the 07-03 reference (8.791564 / 7.937944) in every run;
+  steps 2-7 show small run-to-run variation. Controlled by rebuilding the
+  bf16 harness at pre-TF32 `7c3dad0` in a scratch worktree: the pre-change
+  binary shows the SAME variation, one pre-change run matches the 07-03
+  reference digit-for-digit at all 8 steps, and another pre-change run is
+  digit-for-digit identical to a post-change run at all 8 steps. So the
+  bf16 numeric path is empirically unchanged (exact cross-build trajectory
+  match) and the wiggle is pre-existing atomics nondeterminism — the
+  earlier "bf16 is bit-deterministic" note (㉚/㉜ era) evidently no longer
+  holds unconditionally, but bit-identity *across builds per realization*
+  does. Benchmark: 134.77 ms vs 135.97 on 07-03 (within noise).
+- **fp32 (GPU)**: `make verify-gpu` (strict IEEE, TF32 off, tight
+  LOSS_STEP_TOL=0.01) PASS — 16/16 TENSOR OK + 10-step loss.
+  `make verify-gpu-tf32` (default TF32 path, calibrated 0.02) PASS.
+  Benchmark 282.23 ms — matches the merge-time 282.77 result.
+- **fp32 (CPU)**: `make verify-cpu` PASS (16/16 TENSOR OK, 10-step loss
+  trajectory exact vs debug state). Timed sanity run (profile harness,
+  B=4 T=64 L=12, 8 steps, CPU dispatch): losses collapse sanely,
+  steady-state ~470 ms/step (fwd ~120 + bwd ~315 + upd ~35) vs the 07-03
+  official 457.9 — within ~3% on a box with a resident ~75 GB tenant. No
+  full CPU benchmark rerun (llm.c CPU arms take hours; nothing in this
+  change touches CPU dispatch — comptime-guarded).
+
+**Official 6-arm GPU benchmark** (`scripts/benchmark_train.py --device gpu`,
+B=4 T=1024, 40 steps, WARMUP=5 → n=35/arm, all arms interleaved in one
+session 13:34, figure
+`figures/benchmark_gpu_b4_t1024_2026-07-10_1334_NVIDIA-GB10_DGX-Spark.png`):
+
+| arm | n | mean ms | median | std | tok/s | 07-03 official |
+|---|---:|---:|---:|---:|---:|---:|
+| llm.mojo fp32 (TF32) | 35 | **282.23** | 282.60 | 1.20 | 14,513 | 417.72 |
+| llm.mojo bf16 | 35 | **134.77** | 134.83 | 0.72 | 30,392 | 135.97 |
+| llm.c CUDA fp32 | 3 | 292.94 | 293.36 | 1.49 | 13,983 | 298.53 |
+| llm.c CUDA bf16 | 35 | 133.68 | 133.60 | 0.84 | 30,639 | 135.77 |
+| PyTorch fp32 | 35 | 579.20 | 578.81 | 2.26 | 7,072 | 587.57 |
+| PyTorch bf16 | 35 | 502.92 | 502.89 | 2.33 | 8,144 | 514.51 |
+
+tok/s = B·T/ms sanity-checked on every row. Every non-fp32-mojo arm matches
+its 07-03 reference within noise; the only mover is the intended one
+(llm.mojo fp32, 417.72 → 282.23).
+
+Harness gotcha found en route: `make benchmark-gpu` runs
+`scripts/benchmark_train.py` in the **default** pixi env, whose torch has
+no CUDA — the PyTorch arms fail with "Torch not compiled with CUDA
+enabled" inside `_run()`'s captured output and are then *silently dropped*
+from the table (empty sample list → `summarize()` returns None). The
+official run above was invoked as `pixi run -e cuda python
+scripts/benchmark_train.py ...` to get all six arms; a first invocation via
+the make target produced a 4-arm table (its incomplete figure was deleted).
+README updated with the new GPU table + TF32 note and the 07-03 CPU table.

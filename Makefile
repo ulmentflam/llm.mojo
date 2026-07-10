@@ -526,8 +526,12 @@ benchmark-cpu: $(PROFILE_BIN) build-llmc-cpu $(BENCH_SCRIPT)
 	pixi run python $(BENCH_SCRIPT) --device cpu $(BENCH_ARGS) \
 		--cpu-steps $(BENCH_CPU_STEPS)
 
+# Runs in the cuda pixi env: the default env's torch has no CUDA, and the
+# harness *silently drops* arms whose subprocess fails ("Torch not compiled
+# with CUDA enabled" → empty sample list → row omitted), so the default env
+# yields a 4-arm table with no error. Found in the 2026-07-10 regression sweep.
 benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
-	pixi run python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
+	pixi run -e cuda python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
 		--gpu-steps $(BENCH_GPU_STEPS)
 
 # Apple Silicon Metal GPU benchmark: llm.mojo fp32+bf16 vs PyTorch MPS fp32+bf16.
