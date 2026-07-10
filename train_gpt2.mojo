@@ -21,7 +21,8 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.memory import alloc, UnsafePointer, memcpy, memset_zero
 
 from llmm.io import read_and_copy
-from llmm.lowp import precision_spec
+from llmm.lowp import precision_spec, FP8_SPEC
+from llmm.amax import AmaxState
 from llmm.dataloader import DataLoader
 from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
 from llmm.checkpointing import (
@@ -586,6 +587,118 @@ struct GPT2Config:
     var padded_vocab_size: Int  # Padded vocab size (%128 == 0, e.g. 50304).
 
 
+# ===----------------------------------------------------------------------=== #
+# LowpState — shared per-tensor fp8 delayed-scaling state container.
+#
+# docs/ai/fp8_training_design.md restricts fp8 to the four per-block linear
+# GEMMs (QKV projection, attention-output projection, MLP fc, MLP proj — §1.2
+# "FP8 GEMMs = the four per-block linear layers only"; the LM head and every
+# other op stay bf16). Each of those four sites needs its own delayed-scaling
+# `AmaxState[FP8_SPEC]` (Chunk C, llmm/amax.mojo) PER TRANSFORMER LAYER — not
+# one shared across layers — because delayed scaling's whole premise (§1.3:
+# "the scale used this step is derived from *prior* steps' amax") only holds
+# if the amax history a site's scale is built from actually comes from
+# repeated observations of *that same tensor*; layer 0's QKV weight and layer
+# 11's QKV weight have unrelated magnitude statistics, so collapsing them onto
+# one shared `AmaxState` would let one layer's outlier amax silently mis-scale
+# every other layer's GEMM.
+#
+# This container is Chunk D's first commit (coordinator instruction): it is
+# the single source of truth for every fp8 GEMM operand's scaling state, so
+# Chunk E (backward, running in parallel) can extend it without renaming or
+# reshaping anything Chunk D already committed. Three role-groups per site,
+# each a `List[AmaxState[FP8_SPEC]]` of length `num_layer`:
+#   - `*_input`  — the site's forward input activation (E4M3), Chunk D.
+#   - `*_weight` — the site's weight (E4M3, requantized every step from its
+#     bf16 storage — weights change every step post-optimizer), Chunk D.
+#   - `*_doutput` — the site's backward `d_output` gradient (E5M2). Defined
+#     HERE (not by Chunk E) so the container's shape is stable the moment
+#     Chunk D commits it; Chunk D allocates but never reads/writes these
+#     (`update_scale`/`compute_amax` on them is exclusively Chunk E's
+#     forward-declared-but-not-yet-wired territory) — see docs/ai/
+#     fp8_training_design.md §5 point 2/3 (dgrad's E5M2 `d_output` operand,
+#     wgrad's E5M2 `d_output` operand; QKV/attn-proj/fc/proj backward
+#     counterparts at :2465/:2485/:2548/:2593 in the design's line numbering).
+#
+# Forward's weight/input E4M3 `AmaxState`s are also what backward's "same
+# tensors as forward" E4M3 operand (design §1.2 row 3) reuses — Chunk E reads
+# `*_input`/`*_weight` (not new states) for dgrad's weight operand and wgrad's
+# input operand, per the design's explicit "same tensors as forward"
+# instruction; only the gradient operand (`*_doutput`, E5M2) is new state.
+#
+# Comptime-gated to `LOWP_ENABLED` builds: the field type (`List[AmaxState[
+# FP8_SPEC]]`) is always well-formed (FP8_SPEC is a fixed constant regardless
+# of PRECISION — see llmm/lowp.mojo), so the `GPT2` struct declares this field
+# unconditionally (mirrors the existing `master_buf`/`USE_BF16` convention:
+# "always declare the field; make it an inert placeholder — empty lists here,
+# a size-1 buffer there — under the regimes that don't need it" — see that
+# field's docstring a few hundred lines below). It is `__init__`'s BODY that
+# is comptime-gated (`comptime if LOWP_ENABLED:` below), not the field's
+# existence: under bf16/fp32, that branch is never elaborated, so no
+# `AmaxState` (and therefore no GPU kernel launch — `AmaxState.__init__`
+# compiles and enqueues an init kernel) is ever instantiated for those builds,
+# preserving landmine #1 (no low-precision/GPU-only code may be instantiated
+# for the `cpu` target) exactly the way `_dispatch_cpu`'s `comptime if
+# USE_BF16:` already does for the whole GPU dispatch path.
+# ===----------------------------------------------------------------------=== #
+
+
+struct LowpState(Movable):
+    """Per-layer, per-site `AmaxState[FP8_SPEC]` container for every fp8 GEMM
+    operand in the model (the four per-block linears' input/weight/d_output).
+    See the module comment above for the shape rationale and the Chunk D/E
+    ownership split. Empty lists under bf16/fp32 (`LOWP_ENABLED == False`).
+    """
+
+    var qkv_input: List[AmaxState[FP8_SPEC]]
+    var qkv_weight: List[AmaxState[FP8_SPEC]]
+    var qkv_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+
+    var attn_proj_input: List[AmaxState[FP8_SPEC]]
+    var attn_proj_weight: List[AmaxState[FP8_SPEC]]
+    var attn_proj_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+
+    var fc_input: List[AmaxState[FP8_SPEC]]
+    var fc_weight: List[AmaxState[FP8_SPEC]]
+    var fc_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+
+    var proj_input: List[AmaxState[FP8_SPEC]]
+    var proj_weight: List[AmaxState[FP8_SPEC]]
+    var proj_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+
+    def __init__(out self, num_layer: Int, ctx: DeviceContext) raises:
+        self.qkv_input = List[AmaxState[FP8_SPEC]]()
+        self.qkv_weight = List[AmaxState[FP8_SPEC]]()
+        self.qkv_doutput = List[AmaxState[FP8_SPEC]]()
+        self.attn_proj_input = List[AmaxState[FP8_SPEC]]()
+        self.attn_proj_weight = List[AmaxState[FP8_SPEC]]()
+        self.attn_proj_doutput = List[AmaxState[FP8_SPEC]]()
+        self.fc_input = List[AmaxState[FP8_SPEC]]()
+        self.fc_weight = List[AmaxState[FP8_SPEC]]()
+        self.fc_doutput = List[AmaxState[FP8_SPEC]]()
+        self.proj_input = List[AmaxState[FP8_SPEC]]()
+        self.proj_weight = List[AmaxState[FP8_SPEC]]()
+        self.proj_doutput = List[AmaxState[FP8_SPEC]]()
+
+        # See the module comment above: only elaborated for LOWP_ENABLED
+        # (fp8/fp4) GPU builds — bf16/fp32 leave every list empty and launch
+        # no GPU kernels here (landmine #1).
+        comptime if LOWP_ENABLED:
+            for _ in range(num_layer):
+                self.qkv_input.append(AmaxState[FP8_SPEC](ctx))
+                self.qkv_weight.append(AmaxState[FP8_SPEC](ctx))
+                self.qkv_doutput.append(AmaxState[FP8_SPEC](ctx))
+                self.attn_proj_input.append(AmaxState[FP8_SPEC](ctx))
+                self.attn_proj_weight.append(AmaxState[FP8_SPEC](ctx))
+                self.attn_proj_doutput.append(AmaxState[FP8_SPEC](ctx))
+                self.fc_input.append(AmaxState[FP8_SPEC](ctx))
+                self.fc_weight.append(AmaxState[FP8_SPEC](ctx))
+                self.fc_doutput.append(AmaxState[FP8_SPEC](ctx))
+                self.proj_input.append(AmaxState[FP8_SPEC](ctx))
+                self.proj_weight.append(AmaxState[FP8_SPEC](ctx))
+                self.proj_doutput.append(AmaxState[FP8_SPEC](ctx))
+
+
 def _gpt2_hyperparameters(depth: Int) raises -> Tuple[Int, Int]:
     """GPT-2 (channels, num_heads) for a given depth. Mirrors llm.c."""
     if depth == 6:
@@ -763,6 +876,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var grad_acts_stats_memory: MutMemPtr[StatsDType]
     var num_grads: Int
 
+    # Chunk D: shared per-tensor fp8 delayed-scaling state (see `LowpState`'s
+    # docstring above). Always declared (mirrors `master_buf`'s USE_BF16
+    # convention); populated only under LOWP_ENABLED (empty lists otherwise).
+    var lowp_state: LowpState
+
     # Runstate Configurations
     var batch_size: Int  # The batch size of the current forward pass (Our B).
     var seq_len: Int  # The sequence length of the current forward pass (Our T).
@@ -831,6 +949,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             channels=0,
             padded_vocab_size=0,
         )
+        # Trivial placeholder (num_layer=0 -> no AmaxState instances, no GPU
+        # kernel launches even under LOWP_ENABLED): definite-initialization
+        # requires every field set before the first `self.<method>()` call
+        # below (`self.allocate_parameters`/etc.), mirroring `self.config`'s
+        # own placeholder-then-real-value pattern immediately above. Replaced
+        # with the real, per-layer-populated container once `self.config` is
+        # finalized (see below, after the checkpoint/safetensors/from-scratch
+        # branches and `self.allocate_gradients()`).
+        self.lowp_state = LowpState(0, ctx)
 
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
@@ -980,6 +1107,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         # Allocate weight gradients.
         self.allocate_gradients()
+
+        # fp8 delayed-scaling state (Chunk D): one AmaxState per GEMM operand
+        # site per layer. Config is finalized by all three branches above, so
+        # config.num_layer is valid here. See `LowpState`'s module comment
+        # for why this is unconditional (empty lists, no GPU work, under
+        # bf16/fp32 — the ctor's body is itself `comptime if LOWP_ENABLED:`
+        # gated).
+        self.lowp_state = LowpState(self.config.num_layer, ctx)
 
         # Allocate optimizer moments.
         self.allocate_optimizer_moments()
