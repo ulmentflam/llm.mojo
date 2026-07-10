@@ -1881,3 +1881,173 @@ official run above was invoked as `pixi run -e cuda python
 scripts/benchmark_train.py ...` to get all six arms; a first invocation via
 the make target produced a 4-arm table (its incomplete figure was deleted).
 README updated with the new GPU table + TF32 note and the 07-03 CPU table.
+
+---
+
+## 2026-07-10 — LN-backward single-kernel fusion: correctness holds, performance REGRESSES (not merged)
+
+`docs/ai/perf_hunt_analysis_2026-07-10.md` identified LN backward as the
+single biggest non-GEMM gap (4 launches/invocation vs llm.c's 1 fused
+`layernorm_backward_kernel10`, ~13 element-passes vs ~5) and projected
+**savings** of fp32 −7.4 ms (best −9.0) / bf16 −4.0 ms (best −5.0) from
+fusing it. `_layernorm_bwd_fused_gpu` (`llmm/layernorm.mojo:1488`,
+branch `goal1/ln-bwd-fusion`, HEAD `edd2b67`, parent `a8f9f56`) implements
+that fusion: block-per-row grid-stride kernel, dgamma/dbeta via
+single-writer shared-memory partials (no atomics — deterministic) plus an
+atomic block-counter flag-finalize (llm.c kernel10's idiom) with in-kernel
+flag self-reset, and the residual-broadcast seed folded in via a
+`HAS_RESID_IN` comptime flag. Call sites: `ln_2` (all 12 layers) and
+`ln_1`-else (layers 1–11); layer-0's `ln_1` and the plain (non-residual)
+`ln_f` backward are intentionally untouched. This entry is the successor
+validation pass: gates 1/2/4 (verify-gpu, verify-gpu-tf32, verify-cpu) had
+already passed pre-format; this pass re-checks verify-cpu on the committed
+(post-`mojo format`) tree, runs the bf16 twin-run determinism gate, and
+runs the interleaved A/B perf gate + ncu kernel-count proof.
+
+**Bottom line: correctness is intact and the kernel-launch count really
+did drop, but the fused kernel is measurably *slower* in aggregate than
+the four launches it replaces — the opposite of the projected win.** Not
+merged; flagged back to the implementer.
+
+### Cheap re-check: `make verify-cpu` on the committed tree
+
+PASS — 16/16 TENSOR OK + all 10 loss steps LOSS OK against
+`gpt2_124M_debug_state.bin`, confirming the post-`mojo format` reformat
+was whitespace-only (matches the pre-format gate result already recorded
+for this branch).
+
+### Gate 3 — bf16 twin-run determinism protocol
+
+Ran `build/train_gpt2_bf16` at HEAD (`edd2b67`) twice with the identical
+invocation (`-e gpt2_124M_bf16.bin -x 10 -v 0 -s 0`; defaults already pin
+B=4, T=1024, tinyshakespeare data, the pretrained checkpoint — no
+overfit-single-batch flag, so this is a real-data, non-collapsing
+trajectory), then built and ran the `a8f9f56` parent once from a scratch
+`git worktree add --detach a8f9f56` (binaries confirmed fresh via
+`stat` mtime vs source mtime before every run).
+
+| step | loss (HEAD run A) | loss (HEAD run B) | loss (`a8f9f56` baseline) | norm (all 3 runs) |
+|---:|---:|---:|---:|---:|
+| 1  | 4.369226 | 4.369226 | 4.369226 | 17.1131 |
+| 2  | 4.418465 | 4.418465 | 4.418465 | 17.8014 |
+| 3  | 4.510433 | 4.510433 | 4.510433 | 23.8323 |
+| 4  | 4.026239 | 4.026239 | 4.026239 | 15.4808 |
+| 5  | 3.578290 | 3.578290 | 3.578290 | 11.3918 |
+| 6  | 3.767685 | 3.767685 | 3.767685 |  8.9980 |
+| 7  | 3.534359 | 3.534359 | 3.534359 |  4.6588 |
+| 8  | 3.655098 | 3.655098 | 3.655098 |  7.2158 |
+| 9  | 3.253812 | 3.253812 | 3.253812 |  4.7633 |
+| 10 | 3.390009 | 3.390009 | 3.390009 |  4.2824 |
+
+**Determinism verdict: same-build twin-run is identical to printed
+float32 precision (7 significant digits) at all 10 steps — an
+improvement** (the new kernel's single-writer shared-memory dgamma/dbeta
+accumulation, replacing the old atomics-based cross-block accumulate, is
+evidently the reason: no atomic-ordering nondeterminism left in this
+path). **Cross-build (HEAD vs `a8f9f56`) also matches to the same printed
+precision at every step** — stronger than the "steps 0-1 exact, steps 2+
+within the usual wiggle band" expectation set going in; here there is no
+visible wiggle at all in this config. Loss doesn't collapse (real
+tinyshakespeare batches, not an overfit single batch), so "collapse"
+doesn't apply, but the trajectories are exact matches, which is the
+stronger statement anyway.
+
+### Gate 5 — perf: interleaved A/B wall-clock + ncu kernel-count proof
+
+**Setup.** `profile_gpt2` / `profile_gpt2_bf16` harness (B=4, T=1024,
+L=12 — `LLMM_PROFILE_LAYERS=12`, matching the shipped config), 25 steps
+per arm-rep (`WARMUP=5` trimmed → n=20/rep). Two interleaved reps per
+session, arm order reversed between reps (`HEAD-fp32, BASE-fp32,
+HEAD-bf16, BASE-bf16` then reversed) to cancel drift; the whole session
+run under one `flock /tmp/llmm-gpu.lock` hold. `a8f9f56` binaries built
+fresh in the scratch worktree (`git worktree add --detach a8f9f56`,
+symlinked data/weights/`.pixi` from the main repo). Pre-run state: `free
+-g` 121 total / 75 used / ~45 available; `nvidia-smi` 0% util, 44-52 °C,
+quiet box. Every binary's mtime checked newer than its source tree
+immediately before use. Two independent sessions run back-to-back to
+check reproducibility.
+
+| arm | session A mean ms (n=40) | std | session B mean ms (n=40) | std |
+|---|---:|---:|---:|---:|
+| HEAD fp32 | 287.67 | 1.79 | 287.32 | 2.59 |
+| `a8f9f56` fp32 | 285.75 | 2.05 | 287.31 | 1.71 |
+| **HEAD bf16** | **142.41** | 1.16 | **143.18** | 0.86 |
+| **`a8f9f56` bf16** | **135.18** | 0.94 | **136.22** | 1.36 |
+
+tok/s sanity: 4096/143.18 ms = 28,608 ✓ (checked on every row).
+
+**fp32: ~parity in wall-clock** (Δ +1.92 ms session A, +0.02 ms session
+B — both within the fp32 arm's own ~1.7-2.6 ms std, i.e. not
+statistically distinguishable from noise at this n). **bf16: HEAD is
+robustly ~7 ms *slower*** (Δ +7.23 ms session A, +6.96 ms session B — well
+outside the ~1 ms bf16 std, reproduced independently twice). This is the
+opposite sign of the ≥3.5 ms bf16 / ≥6 ms fp32 *savings* acceptance
+targets.
+
+**ncu, 1-step capture, same B=4/T=1024/L=12 config, same session** (the
+`profile-ncu`/`profile-fp32-ncu` Make targets default `PROFILE_T` to
+**64**, not 1024 — a harness gotcha hit while building this table;
+`PROFILE_T=1024` must be passed explicitly to match the shipped config,
+otherwise the whole-step total comes out ~8x too small and isn't
+comparable to wall-clock). Baseline reproduced the analysis doc's
+previously-published fp32/bf16 LN-backward totals within ~5%/~1%,
+confirming methodology:
+
+| LN-backward kernel | `a8f9f56` fp32 (calls, ms) | HEAD fp32 (calls, ms) | `a8f9f56` bf16 (calls, ms) | HEAD bf16 (calls, ms) |
+|---|---|---|---|---|
+| `residual_grad_broadcast` (grid 3072) | 24, 5.34 | — (folded in) | 24, 2.17 | — (folded in) |
+| `layernorm_bwd_residual_gpu` (bwd_r, d_input) | 24, 7.13 | — (folded in) | 24, 3.09 | — (folded in) |
+| `_layernorm_bwd_fused_gpu` (new, `HAS_RESID_IN=True`) | — | 23, **22.53** | — | 23, **14.68** |
+| `_layernorm_bwd_fused_gpu` (new, layer-0 `ln_1`, `HAS_RESID_IN=False`) | — | 1, 0.79 | — | 1, 0.54 |
+| `_ln_dparam_accum_gpu` (atomics) | 25, 3.49 | 1 (ln_f only), 0.15 | 25, 2.51 | 1 (ln_f only), 0.10 |
+| `_ln_dparam_finalize_gpu` | 25, 0.094 | 1 (ln_f only), 0.004 | 25, 0.090 | 1 (ln_f only), 0.004 |
+| plain `layernorm_bwd_gpu` (ln_f, ×1, unchanged) | 1, 0.145 | 1, 0.131 | 1, 0.064 | 1, 0.060 |
+| **LN-backward family total** | **16.20** | **23.61** | **7.93** | **15.38** |
+| **launch count (whole step)** | **99** | **27** | **99** | **27** |
+
+(`a8f9f56` fp32 16.20 ms / bf16 7.93 ms track the analysis doc's 15.43 /
+7.98 ms closely — different session, same order of magnitude and
+breakdown shape, confirming this measurement is apples-to-apples with the
+doc's baseline.)
+
+**Kernel-count proof: confirmed 4→1 per invocation** (`residual_grad_broadcast`
++ `bwd_r` + `_ln_dparam_accum_gpu` + `_ln_dparam_finalize_gpu` → one
+`_layernorm_bwd_fused_gpu` launch), and whole-step LN-backward launch
+count drops **99 → 27** (3.7×), exactly as designed. **But the family's
+total *time* went the wrong way: fp32 16.20 → 23.61 ms (Δ +7.41 ms),
+bf16 7.93 → 15.38 ms (Δ +7.45 ms) — both precisions regress by almost
+exactly the same absolute amount**, which is suspiciously close in
+magnitude (opposite sign) to the analysis doc's predicted savings. The
+fused kernel and the old `bwd_r` kernel launch with the *identical* grid/
+block config (`(1536,1,1)` / `(256,1,1)`) in both builds, so this isn't a
+fewer-blocks occupancy story — the extra cost is *inside* each of the
+1536 blocks (the shared-memory dgamma/dbeta reduction plus the
+atomic-flag cross-block finalize apparently cost more per block than the
+three small/cheap kernels they replaced saved). Root-causing that is out
+of scope for this validation pass.
+
+The fp32 wall-clock arm not showing this regression clearly is explained
+by the ncu total: `a8f9f56` fp32 whole-step ncu total 292.62 ms vs HEAD
+300.42 ms (Δ +7.80 ms) — consistent with the LN-family delta — but fp32's
+TF32 GEMMs (63% of the step) carry enough run-to-run variance
+(session A vs B fp32 deltas swung from +1.9 ms to +0.02 ms) to bury a
+~7-8 ms shift at this n. bf16's GEMMs are more stable, so the same-sized
+regression is clearly visible there.
+
+### Verdict
+
+- **Correctness:** intact. `verify-cpu` PASS, bf16 loss trajectory
+  bit-reproducible (an improvement — no more atomics wiggle) and matches
+  the pre-change parent exactly.
+- **Kernel fusion:** did what it says — 4 launches → 1 per invocation,
+  99 → 27 total LN-backward launches per step.
+- **Performance:** **regression, not the projected win.** Acceptance
+  targets were ≥6 ms fp32 / ≥3.5 ms bf16 *savings*; measured result is
+  **≈+7.4 ms *slower*** in both precisions (ncu, same-session, apples-to-
+  apples vs the parent commit), reproduced in bf16 wall-clock across two
+  independent interleaved sessions. **Not merged to `main`.** Flagging
+  back to the implementer: the fused kernel's per-block cost needs
+  profiling at the warp/shared-memory level (likely the single-writer
+  dgamma/dbeta shared accumulation or the atomic-flag finalize
+  serializing more than expected) before this lands — per-kernel ms, not
+  just launch count, needs to improve for this to ship.
