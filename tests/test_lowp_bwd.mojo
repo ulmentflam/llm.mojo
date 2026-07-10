@@ -29,11 +29,10 @@
 # `flock -w 10800 /tmp/llmm-gpu.lock -c 'pixi run -e cuda mojo run -I . tests/test_lowp_bwd.mojo'`.
 # ===----------------------------------------------------------------------=== #
 
-from std.math import sqrt
-from std.random import random_float64, seed
+from std.random import seed
 from std.sys import has_nvidia_gpu_accelerator
 from std.gpu.host import DeviceContext, DeviceBuffer
-from std.testing import TestSuite, assert_true
+from std.testing import TestSuite
 
 from llmm.lowp import FP8_SPEC
 from llmm.amax import (
@@ -52,47 +51,12 @@ from llmm.matmul import (
 )
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
-
-# ===----------------------------------------------------------------------=== #
-# Small host<->device helpers (mirrors tests/test_amax.mojo / test_lowp_gemm.mojo).
-# ===----------------------------------------------------------------------=== #
-
-
-def _random_bf16(
-    ctx: DeviceContext, n: Int, scale: Float32
-) raises -> DeviceBuffer[DType.bfloat16]:
-    var host = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
-    for i in range(n):
-        var v = Float32((random_float64() * 2.0 - 1.0)) * scale
-        host.unsafe_ptr()[i] = v.cast[DType.bfloat16]()
-    var dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
-    dev.enqueue_copy_from(host)
-    ctx.synchronize()
-    return dev
-
-
-def _zeros_bf16(
-    ctx: DeviceContext, n: Int
-) raises -> DeviceBuffer[DType.bfloat16]:
-    var host = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
-    for i in range(n):
-        host.unsafe_ptr()[i] = Float32(0.0).cast[DType.bfloat16]()
-    var dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
-    dev.enqueue_copy_from(host)
-    ctx.synchronize()
-    return dev
-
-
-def _clone_bf16(
-    ctx: DeviceContext, src: DeviceBuffer[DType.bfloat16], n: Int
-) raises -> DeviceBuffer[DType.bfloat16]:
-    var host = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
-    src.enqueue_copy_to(host)
-    ctx.synchronize()
-    var dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
-    dev.enqueue_copy_from(host)
-    ctx.synchronize()
-    return dev
+from _lowp_test_common import (
+    random_bf16 as _random_bf16,
+    zeros_bf16 as _zeros_bf16,
+    clone_bf16 as _clone_bf16,
+    cosine_and_rel_l2 as _cosine_and_rel_l2,
+)
 
 
 def _prime_state[
@@ -117,48 +81,6 @@ def _prime_state[
     ctx.synchronize()
     state.update_scale[fmt_dtype](
         kernel_ptr_as_immut(device_buf_mut_ptr(amax_buf)), ctx
-    )
-
-
-def _cosine_and_rel_l2(
-    ctx: DeviceContext,
-    got: DeviceBuffer[DType.bfloat16],
-    want: DeviceBuffer[DType.bfloat16],
-    n: Int,
-    label: String,
-) raises -> None:
-    var host_got = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
-    var host_want = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
-    got.enqueue_copy_to(host_got)
-    want.enqueue_copy_to(host_want)
-    ctx.synchronize()
-
-    var l2_err = Float32(0.0)
-    var dot = Float32(0.0)
-    var norm_got = Float32(0.0)
-    var norm_want = Float32(0.0)
-    for i in range(n):
-        var g = host_got.unsafe_ptr()[i].cast[DType.float32]()
-        var w = host_want.unsafe_ptr()[i].cast[DType.float32]()
-        assert_true(g == g, label + ": NaN in fp8 output at " + String(i))
-        assert_true(
-            g > Float32(-1e30) and g < Float32(1e30),
-            label + ": Inf/overflow in fp8 output at " + String(i),
-        )
-        var err = g - w
-        l2_err += err * err
-        dot += g * w
-        norm_got += g * g
-        norm_want += w * w
-    var rel_l2 = sqrt(l2_err / (norm_want + Float32(1e-12)))
-    var cosine = dot / (sqrt(norm_got) * sqrt(norm_want) + Float32(1e-12))
-    assert_true(
-        rel_l2 < Float32(0.1),
-        label + ": relative L2 " + String(rel_l2) + " >= 0.1",
-    )
-    assert_true(
-        cosine > Float32(0.99),
-        label + ": cosine similarity " + String(cosine) + " <= 0.99",
     )
 
 

@@ -42,6 +42,8 @@ from llmm.lowp import (
 from llmm.matmul import lowp_gemm
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
+from _lowp_test_common import _host_gemm_ref
+
 
 # ===----------------------------------------------------------------------=== #
 # Helpers
@@ -51,41 +53,6 @@ from llmm.memory import MutKernelPtr, ImmutKernelPtr
 def _bits_of_fp8[dtype: DType](x: Scalar[dtype]) -> UInt8:
     var v = x
     return UnsafePointer(to=v).bitcast[UInt8]()[]
-
-
-# Host fp32 GEMM reference matching lowp_gemm's operand-orientation
-# convention (matmul.mojo's `_matmul_cublaslt_fp8` module comment): `d[j*m+i]
-# = sum_p a_role(i,p) * b_role(p,j)`, where a_role/b_role read `a_host`/
-# `b_host` according to `transpose_a`/`transpose_b` exactly as `lowp_gemm`
-# does (transpose_a=False: a_host is `[m,k]` row-major; True: `[k,m]`
-# row-major. transpose_b=False: b_host is `[n,k]` row-major; True: `[k,n]`
-# row-major).
-def _host_gemm_ref[
-    transpose_a: Bool, transpose_b: Bool
-](
-    a_host: UnsafePointer[Float32, MutUntrackedOrigin],
-    b_host: UnsafePointer[Float32, MutUntrackedOrigin],
-    out_host: UnsafePointer[Float32, MutUntrackedOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-) -> None:
-    for i in range(m):
-        for j in range(n):
-            var acc = Float32(0.0)
-            for p in range(k):
-                var av: Float32
-                comptime if transpose_a:
-                    av = a_host[p * m + i]
-                else:
-                    av = a_host[i * k + p]
-                var bv: Float32
-                comptime if transpose_b:
-                    bv = b_host[p * n + j]
-                else:
-                    bv = b_host[j * k + p]
-                acc += av * bv
-            out_host[j * m + i] = acc
 
 
 # ===----------------------------------------------------------------------=== #
