@@ -6,26 +6,40 @@ from std.memory import alloc
 from llmm.memory import MutMemPtr, ImmutMemPtr
 from llmm.sampler import random_f32, sample_softmax
 from llmm.tokenizer import Tokenizer, safe_print
+from llmm.eval_dataloader import EvalDataLoader, eval_stat_correct
 
 from train_gpt2 import GPT2, GPT2_DTYPE
 
-# Lean inference-only harness: load a checkpoint, run autoregressive B=1
-# generation, print the decoded text. No backward pass, no optimizer step, no
-# training-shard dataloading — just the forward-pass + sampling code path that
-# train_gpt2.mojo's end-of-run generation block exercises, isolated so it can
-# be iterated on without spinning up the full training harness.
+# Lean inference-only harness: load a checkpoint, and either (a) run
+# autoregressive B=1 generation and print the decoded text, or (b) run a
+# multiple-choice completion eval (HellaSwag-style) and print the accuracy.
+# No backward pass, no optimizer step, no training-shard dataloading — just
+# the forward-pass code paths, isolated so they can be iterated on without
+# spinning up the full training harness.
 #
 # Build (see the Makefile `build-infer` / `build-infer-bf16` targets):
 #
 #     make build-infer-bf16
 #
-# Run:
+# Run (generation mode):
 #
 #     MOJO_PYTHON_LIBRARY=... ./build/infer_gpt2_bf16 log124M/model_19552.bin 64
 #
 #   arg1: checkpoint path (model_*.bin)
 #   arg2: number of tokens to generate (default 64)
 #   arg3: RNG seed (default 1337)
+#
+# Run (eval mode — e.g. HellaSwag; see data/hellaswag.py to produce the .bin):
+#
+#     MOJO_PYTHON_LIBRARY=... ./build/infer_gpt2_bf16 --eval log124M/model_19552.bin data/.hellaswag/hellaswag_val.bin
+#
+#   arg1: --eval
+#   arg2: checkpoint path (model_*.bin)
+#   arg3: eval file path (hellaswag_val.bin, from data/hellaswag.py)
+#   arg4: micro batch size B, must be a multiple of 4 (default 64)
+#   arg5: sequence length T (default 512 — comfortably above any single
+#         HellaSwag row's context+completion length, well under the model's
+#         max_seq_len=1024, to avoid needlessly forwarding padding)
 
 
 def run_infer[
@@ -119,8 +133,83 @@ def run_infer[
     logits_fp32.free()
 
 
+def run_eval[
+    target: StaticString,
+](checkpoint_path: String, eval_path: String, batch_size: Int, seq_len: Int) raises -> None:
+    var ctx = DeviceContext()
+
+    var model = GPT2[target, 1](
+        checkpoint_path,
+        rank=0,
+        zero_stage=0,
+        ctx=ctx,
+    )
+    print("[eval] target:", target)
+    print("[eval] checkpoint:", checkpoint_path)
+    print("[eval] eval file:", eval_path)
+    print("[eval] batch_size:", batch_size, "seq_len:", seq_len)
+
+    var loader = EvalDataLoader(eval_path, batch_size, seq_len)
+    print("[eval] num_examples:", loader.num_examples)
+    print("[eval] num_batches:", loader.num_batches)
+
+    var num_correct = 0
+    for i in range(loader.num_batches):
+        loader.next_batch()
+        model.forward(loader.inputs, loader.targets, batch_size, seq_len)
+        num_correct += eval_stat_correct(
+            loader,
+            rebind[UnsafePointer[Scalar[DType.float32], MutAnyOrigin]](
+                model.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()
+            ),
+        )
+        if i % 10 == 0 or i == loader.num_batches - 1:
+            print(
+                "evaluating:",
+                i + 1,
+                "/",
+                loader.num_batches,
+                "| running correct:",
+                num_correct,
+            )
+
+    var acc = Float32(num_correct) / Float32(loader.num_examples)
+    print("HellaSwag:", num_correct, "/", loader.num_examples, "=", acc)
+
+
 def main() raises -> None:
     var args = argv()
+
+    if len(args) > 1 and args[1] == "--eval":
+        var checkpoint_path = String("log124M/model_19552.bin")
+        if len(args) > 2:
+            checkpoint_path = args[2]
+        var eval_path = String("data/.hellaswag/hellaswag_val.bin")
+        if len(args) > 3:
+            eval_path = args[3]
+        var batch_size = 64
+        if len(args) > 4:
+            batch_size = atol(args[4])
+        var seq_len = 512
+        if len(args) > 5:
+            seq_len = atol(args[5])
+
+        comptime if GPT2_DTYPE == DType.bfloat16:
+            if not has_accelerator():
+                print(
+                    "bf16 build supports only the GPU target (CPU stays"
+                    " fp32)."
+                )
+                exit(1)
+            comptime if has_accelerator():
+                run_eval["gpu"](checkpoint_path, eval_path, batch_size, seq_len)
+        else:
+            comptime if has_accelerator():
+                run_eval["gpu"](checkpoint_path, eval_path, batch_size, seq_len)
+            else:
+                run_eval["cpu"](checkpoint_path, eval_path, batch_size, seq_len)
+        return
+
     var checkpoint_path = String("log124M/model_19552.bin")
     if len(args) > 1:
         checkpoint_path = args[1]

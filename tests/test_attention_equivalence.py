@@ -45,6 +45,35 @@ class Case:
     head_dim: int
     dtype: str
     seed: int
+    # True only for cases that must run on the GPU accelerator to mean
+    # anything (see _device_for_case below) — independent of the module's
+    # shared pick_device()/MAX_USE_ACCELERATOR default, which stays CPU.
+    prefer_accelerator: bool = False
+
+
+def _device_for_case(case: "Case"):
+    """Device override for cases that specifically need the accelerator.
+
+    Most cases pass `device=None` to run_custom_op, which falls back to the
+    shared `pick_device()` default (CPU unless MAX_USE_ACCELERATOR=1 — see
+    tests/_max_bridge.py). Cases with `prefer_accelerator=True` bypass that
+    default entirely: they pick the accelerator directly if one is present,
+    with no env var required, and fall back to CPU (not skip/fail) so the
+    suite stays green on machines with no accelerator (e.g. a Metal dev
+    box, or CPU-only CI).
+
+    IMPORTANT: on CPU, attention dispatches to attention_fwd_cpu — a
+    different function that never had the f0da883 alignment bug. A CPU
+    fallback run of a prefer_accelerator case keeps the test passing
+    everywhere, but only the GPU run actually exercises (and proves the fix
+    for) attention_fwd_gemm's _attention_softmax_causal_gpu. Don't mistake
+    a green CPU-fallback run for regression coverage.
+    """
+    if not case.prefer_accelerator:
+        return None
+    from max.driver import CPU, Accelerator, accelerator_count
+
+    return Accelerator() if accelerator_count() > 0 else CPU()
 
 
 CASES: tuple[Case, ...] = (
@@ -113,6 +142,38 @@ CASES: tuple[Case, ...] = (
         head_dim=32,
         dtype="bfloat16",
         seed=6,
+    ),
+    # Regression cases for the GEMM-attention softmax alignment bug (fixed in
+    # f0da883, see docs/ai/bf16_generation_misaligned_address_bug.md).
+    # attention_fwd_gemm's vectorized bf16 softmax kernel loads/stores 8-wide
+    # (bf16's SIMD width) at per-row offset row*seq_len; that offset is only
+    # a multiple of 8 when seq_len itself is. Training's fixed seq_len=1024
+    # always satisfied this; token-by-token generation's seq_len=1,2,3,...
+    # does not, and the first failure is at seq_len=9 (CUDA_ERROR_MISALIGNED_
+    # ADDRESS on real hardware). prefer_accelerator=True routes these to the
+    # GPU whenever one's present (see _device_for_case) — no env var needed —
+    # since that's the only device that actually reaches the fixed kernel;
+    # on a CPU-only machine these still pass, but via the unrelated
+    # attention_fwd_cpu path, which never had this bug.
+    Case(
+        "bf16_seq_len_9_unaligned",
+        batch_size=2,
+        num_heads=4,
+        seq_len=9,
+        head_dim=32,
+        dtype="bfloat16",
+        seed=7,
+        prefer_accelerator=True,
+    ),
+    Case(
+        "bf16_seq_len_17_unaligned",
+        batch_size=2,
+        num_heads=4,
+        seq_len=17,
+        head_dim=32,
+        dtype="bfloat16",
+        seed=8,
+        prefer_accelerator=True,
     ),
 )
 
@@ -354,6 +415,7 @@ def _run_kernel(
         l_vec=l_vec,
         use_soft_exp=use_soft_exp,
         use_conditional_rescale=use_conditional_rescale,
+        device=_device_for_case(case),
     )
 
 
@@ -716,6 +778,7 @@ def _run_kernel_bwd(
         head_dim=case.head_dim,
         dtype_name=case.dtype,
         use_soft_exp=use_soft_exp,
+        device=_device_for_case(case),
     )
 
 
