@@ -2165,3 +2165,46 @@ proportional return than Optimization B delivered. **Not attempted this
 pass** — flagged as the clearest remaining lever for a future session,
 with the buffer-lifetime gotcha below as required reading before
 attempting it.
+
+### Session summary
+
+| stage | fp8 ms/step | bf16 ms/step | fp8/bf16 | quantize family % of GPU time |
+|---|---:|---:|---:|---:|
+| Chunk F baseline (pre-optimization) | 183.7 | 134.7 | 1.363x | 32.6% |
+| + Optimization A (coalesced `quantize_transpose`) | 155.06 | 135.47 | 1.145x | 19.0% |
+| + Optimization B (dual-output `d_output` quantize) | **152.48** | 135.85 | **1.122x** | **16.8%** |
+
+Both wall-clock deltas were measured with the same protocol (interleaved
+rounds, arm order flipped each round, n=25 measured steps/arm/round after
+excluding step 1, `-b 4 -t 1024`, FineWeb checkpoint/shards) so the three
+rows are directly comparable; bf16's small round-to-round drift (134.7 to
+135.9 ms across the whole session) is measurement noise, not a real
+regression — nothing in this pass touches the bf16 build's code paths.
+
+**Result: fp8 step time dropped from 183.7 ms to 152.48 ms, a 17.0%
+reduction, comfortably past the primary <=155 ms target.** The ambitious
+<=145 ms target was not reached; per the Optimization D discussion above,
+the remaining ~7 ms gap is attributable to weight/input's redundant pair
+(deferred, higher risk/lower proportional return than what's already
+landed) plus the residual, now-coalesced but still real cost of the
+quantize family's necessary work (fp8 fundamentally requires quantizing
+every GEMM operand every step; the floor is not zero).
+
+**Gates, cumulative:** `verify-fp8-grads` PASS after every commit with
+numbers identical to the pre-optimization Chunk F baseline (both
+optimizations are provably bit-preserving — same `encode_fp8` value per
+output element, same order, purely reorganized across threads/tiles or
+deduplicated reads); fp8 10-step wall-clock twin runs bit-identical
+(3x for Optimization B, after fixing the buffer-lifetime race); all four
+builds (`build`, `build-bf16`, `build-fp8`, `build-profile-fp8`) compile
+clean after every commit; `make lint` clean.
+
+**For a future session:** Optimization D (weight/input fwd/bwd-spanning
+fusion) is the clearest remaining lever, with a concrete implementation
+sketch and risk assessment above; Optimization C (batching the amax/
+update_scale family) was evaluated and found not worth its surgery cost
+at ~4% of GPU time. Both are documented rather than spuriously attempted
+under time pressure — see MEMORY.md `weak-gates-overrule-nothing` and
+this session's own G2 gotcha for why a change in this territory needs a
+multi-step, full-scale twin-run gate, not just the single-step
+`verify-fp8-grads` gate, before being trusted.
