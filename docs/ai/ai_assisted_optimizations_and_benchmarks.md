@@ -2470,3 +2470,113 @@ wall-clock (and ~8 ms faster than the failed `edd2b67` bf16 142 ms).
 ### AI use statement
 
 Written with AI assistance (Claude Code / Opus agent), directed by Evan Owen.
+
+## 2026-07-10 — perf-hunt closeout: assembly verification + official benchmark (fp32 clear win, bf16 parity with a nominal edge)
+
+Closeout of the day's perf-hunt campaign on the assembled tree,
+`goal1/fp32-parity` HEAD `4806f64` = TF32 (`c27a1f9` lineage) + dbias
+fusion+vectorization (`69d7a15` lineage) + LN-backward redesign
+(`b559009`/merge `4806f64`). Each optimization was gated individually on
+its own branch; this entry independently re-verifies the ASSEMBLY and
+produces the official combined benchmark.
+
+### Fresh builds (all mtimes verified newer than sources)
+
+Rebuilt this session, freshness confirmed via `find ... -newer <bin>`
+(empty result = no source newer than its binary):
+
+- `build/train_gpt2`, `build/train_gpt2_bf16`, `build/profile_gpt2`,
+  `build/profile_gpt2_bf16` (15:55-15:56).
+- llm.c: `train_gpt2cu` (NO_MULTI_GPU=1), `train_gpt2fp32cu`, `train_gpt2`
+  (15:56-15:57; `train_gpt2cu` rebuilt again by the benchmark target's
+  dependency at 16:03). Gotcha: `make -C third_party/llm.c train_gpt2fp32cu`
+  needs `NO_MULTI_GPU=1` explicitly — the repo Makefile's `build-llmc-gpu`
+  only passes it for `train_gpt2cu`, and without it the fp32 target detects
+  NCCL headers, adds `-lnccl`, and fails at link (no NCCL library on this
+  box).
+
+### Assembly gate battery
+
+| gate | result |
+|---|---|
+| `make verify-gpu` (strict IEEE, TF32 off) | **PASS** — 16/16 TENSOR OK, 10/10 LOSS OK |
+| `make verify-gpu-tf32` (default TF32 path, LOSS_STEP_TOL=0.02) | **PASS** — 16/16 + 10/10 |
+| `make verify-cpu` | **PASS** (but see flake note below) |
+| bf16 twin-run determinism | steps 2-10 wiggle remains (characterized below) |
+
+**verify-cpu flake (1 in 11 runs):** the FIRST verify-cpu invocation of the
+session failed hard — 12/16 backward tensors NOT OK with a consistent
+`our_l2/ref_l2 ≈ 0.65` signature and the 10-step loss diverging from step 1
+(3.9165 vs 3.8650) — then 10 consecutive re-runs all passed cleanly,
+loss trajectories exact. The failing run came immediately after 6
+back-to-back Mojo/nvcc builds had saturated all 20 cores. The 0.65-ish
+uniform L2 ratio across many tensors smells like a lost/duplicated worker
+partition in a `traced_parallelize` reduction (CPU LN-backward and matmul
+both use private per-worker partials joined after `sync_parallelize`), i.e.
+a scheduling/races-under-load issue in the CPU path or its runtime, NOT a
+numeric bug in this branch's changes (which are GPU-only kernels; the CPU
+LN-backward code is untouched by the redesign). Not reproduced in 10
+attempts on a quiet box. Flagged for follow-up rather than shipped-blocking:
+the CPU path's correctness under a loaded box deserves its own
+investigation (memory: weak-gates-overrule-nothing — recording, not
+shading).
+
+**bf16 twin-run (10 steps, real tinyshakespeare data, same binary, same
+invocation):** step 1 identical (4.369226 / norm 17.1131 both runs); steps
+2-10 differ slightly (max loss delta 0.0042 at step 3, max norm delta 0.34
+at step 5). So full-step bf16 is NOT bit-stable run-to-run on the assembled
+tree: the LN-backward redesign made ITS path deterministic (proven on the
+branch), but the assembly retains a residual wiggle — consistent with the
+dbias fused kernel's cross-block atomic-flag accumulation ordering and/or
+the other remaining atomics-based reductions. Acceptable per the campaign
+protocol; characterized as: deterministic at step 1 (single fwd/bwd before
+optimizer state diverges the trajectory), ~1e-3-scale loss wiggle
+thereafter, no drift or collapse.
+
+### Official 6-arm benchmark (2026-07-10 16:04)
+
+Pre-run state: `free -g` 121 total / 75 used / 46 available (matches the
+morning's 74-75 GB baseline — same resident tenant, not newly contended);
+nvidia-smi 0-1% util, 51 °C, only Xorg/gnome-shell resident. One
+uninterrupted `/tmp/llmm-gpu.lock` hold for the whole 6-arm interleaved
+harness (`make benchmark-gpu BENCH_B=4 BENCH_T=1024`, 40 steps, WARMUP=5 →
+n=35/arm; llm.c fp32 fixed 8-step epoch → n=3 runs, same harness limitation
+as every prior session). Figure:
+`figures/benchmark_gpu_b4_t1024_2026-07-10_1604_NVIDIA-GB10_DGX-Spark.png`.
+
+| arm | n | mean ms | median | std | tok/s | morning official | Δ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| llm.mojo fp32 (TF32) | 35 | **276.93** | 276.85 | 1.46 | 14,791 | 282.23 | **−5.30** |
+| llm.mojo bf16 | 35 | **133.99** | 134.28 | 1.15 | 30,570 | 134.77 | **−0.78** |
+| llm.c CUDA fp32 | 3 | 294.10 | 293.68 | 0.61 | 13,927 | 292.94 | +1.16 |
+| llm.c CUDA bf16 | 35 | 134.53 | 134.69 | 0.78 | 30,447 | 133.68 | +0.85 |
+| PyTorch fp32 | 35 | 579.52 | 579.42 | 2.17 | 7,068 | 579.20 | +0.32 |
+| PyTorch bf16 | 35 | 504.26 | 503.96 | 1.96 | 8,123 | 502.92 | +1.34 |
+
+tok/s = 4096/ms sanity-checked on every row (all exact). The three
+non-llm.mojo movers all drifted +0.3-1.3 ms — a session-level shift, which
+bounds how much of the llm.mojo deltas is real; the llm.mojo arms moved
+*against* that drift.
+
+### Verdict
+
+- **fp32: llm.mojo BEATS llm.c CUDA, 276.93 vs 294.10 ms — 1.062× (~6%)
+  faster, 17.2 ms/step.** Morning gap was 10.7 ms (1.038×); the two new
+  optimizations added ~5.3 ms. Close to the ~274 ms projection.
+- **bf16: parity with a nominal edge — 133.99 vs 134.53 ms (1.004×,
+  0.54 ms).** Nominally faster (t≈2.3 on within-session std), but the llm.c
+  bf16 arm itself moved +0.85 ms between the morning and afternoon sessions,
+  so the honest claim is *parity, llm.mojo no longer behind* (morning had
+  llm.mojo 1.09 ms BEHIND). The ~131 ms projection did not materialize in
+  wall-clock — the −4.1 ms of kernel-family savings compress to −0.78 ms
+  end-to-end, consistent with the redesign entry's own wall-clock
+  corroboration (~−2 ms) and partial overlap of the saved time with other
+  step components.
+- Combined claim, supported: **llm.mojo now matches-or-beats llm.c CUDA at
+  both precisions — clear ~6% win at fp32 (TF32-vs-TF32), statistical
+  parity with a nominal 0.4% edge at bf16.** README updated accordingly
+  (headline + GPU table + figure + backward-kernel note).
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
