@@ -27,6 +27,24 @@ below so the post-merge pass is mechanical.
 
 ---
 
+## Status (consolidation pass executed 2026-07-10, branch `integrate/all-goals`)
+
+Executed post-merge in the recommended order F4 -> F3 -> F1 -> F2, one commit
+each, gates re-run after each; full gate results and the trajectory verdict
+are in `ai_assisted_optimizations_and_benchmarks.md`'s "DRY consolidation
+pass" entry.
+
+| finding | status | note |
+|---|---|---|
+| F1 e4m3 codec | **DONE** (`8d7626f`) | Decode unified; `_fp8_encode[tie_mode, nan_policy]` core; both public names kept. Staleness correction: the divergence is four-fold, not two — the AWAY mode also preserves the probe-lineage -0.0 sign and float-arithmetic subnormal branch bit-for-bit (documented at `TieMode`). Brute-force 0-mismatch sweep vs the old body. |
+| F2 cuBLASLt dance | **DONE, partial per this audit's own verdict** (`5bca47e`) | Only `_lt_make_layout`/`_lt_make_pref`/`_lt_pick_algo`/`_lt_destroy` extracted; the three orchestrators stay distinct, with the deliberately-not-consolidated rationale in a comment block at the helper section. |
+| F3 host-scale twins | **DONE** (`2d3038c`) | All three host-scale functions deleted (~172 net LOC); tests ported to `_devscale` + 1-element device scale buffers. Post-audit re-check: still zero production callers; `quantize_dual_devscale` (added by fp8-quant-opt after this audit) has no host twin. |
+| F4 persistent-buffer global | **DONE** (`b12691e`) | `persistent_device_buffer` in `llmm/memory.mojo`; **five** sites collapsed (the three inventoried here plus post-audit `_dbias_counters` and `_ln_bwd_dparam_scratch`). |
+| F5 test helpers | **DONE (previous pass)** | `tests/_lowp_test_common.mojo` landed with the F5 safe-now spec; composition with quant-opt re-proven as GATE 0 of this pass (10/10, 5/5, 19/19). `test_lowp_gemm_fp4.mojo`'s adoption of `_host_gemm_ref` remains an open one-liner follow-up. |
+| F6 Makefile clones | **SKIPPED (as recommended)** | Leave-as-is verdict stands; repetition is make-idiomatic. |
+| F7 accum+finalize idiom | **NOT CONSOLIDATED (note stands)** | Post-LN-redesign the dbias and ln-dparam bodies remain substantively different (contention-free partials vs block-sum + different finalize); no shared shape emerged. |
+| D1-D4 docs overlap | **OUT OF SCOPE for this pass** | Belongs to the separate docs pass (task 6). D3's fix (orphan `26b45a4`) already landed on this branch. |
+
 ## Ranked findings
 
 Ranked by (duplication severity × consolidation safety). "Severity" = how much

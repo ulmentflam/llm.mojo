@@ -3754,3 +3754,76 @@ surviving the merge.
 prior sightings). No numerical or performance regression attributable to
 the merge was found. Commit: see the integration-verification entry
 commit immediately following this one on `integrate/all-goals`.
+
+## 2026-07-10 — DRY consolidation pass (F4→F3→F1→F2) on the verified assembly
+
+Post-merge cleanup pass prescribed by
+`docs/ai/dry_consolidation_audit_2026-07-10.md`, executed on
+`integrate/all-goals` at the verified assembly HEAD (`052c0bf`), one commit
+per finding in the audit's recommended order, gates re-run after each.
+Every fix is a behavior-neutral refactor; the standard applied was
+bit-identity at every point where the assembled tree is itself bit-stable
+(see the trajectory verdict below for the one documented exception).
+
+GATE 0 first: the three F5-refactored suites re-run on the merged tree —
+`test_lowp_gemm` 10/10, `test_lowp_bwd` 5/5, `test_amax` 19/19 — proving
+the F5 helper extraction composed cleanly with quant-opt's signature
+changes (the merge had combined them without conflict markers but the
+semantic composition was unproven). No fixes needed.
+
+### Per-fix summary
+
+| fix | commit | diff | what moved | gates |
+|---|---|---|---|---|
+| F4 | `b12691e` | +72/−65 | one `persistent_device_buffer[dtype](ctx, name_suffix, count, *, zero)` helper in `llmm/memory.mojo`; **five** lazy-global-alloc sites collapsed (audit's three — `_cublaslt_workspace`, `_dbias_scratch`, `_ln_dparam_scratch` — plus post-audit `_dbias_counters` and `_ln_bwd_dparam_scratch`). fp8/fp4 per-call `enqueue_create_buffer` scratches deliberately out of scope (different idiom, per the audit's F4 note). | all 17 GPU suites (130 tests, 0 fail); 4/4 builds |
+| F3 | `2d3038c` | +181/−353 | deleted the fp8 host-`Float32`-scale twins — `quantize`, `quantize_transpose` (incl. their kernels) and `lowp_gemm` — after grep-verifying zero production callers; `tests/test_lowp_gemm.mojo` ported to the `_devscale` forms via 1-element device scale buffers. Load-bearing docstrings (TN orientation derivation) transplanted to the survivors. | lowp_gemm 10/10, lowp_bwd 5/5, matmul_fwd_lowp 4/4; 4/4 builds |
+| F1 | `8d7626f` | +158/−90 | single e4m3 codec core in `llmm/lowp.mojo`: `decode_e4m3` unified outright (0/256 byte mismatches); `_fp8_encode_rne` generalized to `_fp8_encode[..., tie_mode, nan_policy]` (EVEN+SATURATE = host-cast oracle, fp8; AWAY+EMIT = probe/cuBLAS oracle, nvfp4). Both public `encode_e4m3` names kept as wrappers; divergence contract documented at the `TieMode` definition. **Audit-staleness correction:** the real divergence is four-fold, not two-fold — the audit's tie/NaN framing missed the probe-lineage −0.0 sign handling and the subnormal branch's float `+0.5` arithmetic (clamp-at-largest-subnormal; double-rounds near subnormal ties), both preserved bit-for-bit inside the AWAY mode for trajectory compatibility. Brute-force evidence: 0 encode mismatches vs the verbatim pre-F1 body over every fp32 bit pattern with magnitude in [2^-16, 2^10) both signs (~437M values) plus sampled tiny/saturation/inf/NaN space. | nvfp4_quant 18/18, lowp_gemm 10/10, lowp_gemm_fp4 8/8; 4/4 builds |
+| F2 | `5bca47e` | +181/−286 | per the audit's own verdict, the three `_matmul_cublaslt*` orchestrators stay distinct (a 6-switch mega-generic would make unsafe vendor code harder to audit — rationale comment now at the helper section). Extracted only the mechanical sub-steps: `_lt_make_layout` (was 14 inline copies), `_lt_make_pref` (3), `_lt_pick_algo` (3, per-caller error strings), `_lt_destroy` (3, original order). | verify-gpu PASS, lowp_gemm 10/10, lowp_gemm_fp4 8/8, matmul_bwd_fp4 5/5; 4/4 builds |
+
+Net: **+592/−794 lines (−202)** across `llmm/memory.mojo`, `llmm/lowp.mojo`,
+`llmm/matmul.mojo`, `llmm/layernorm.mojo`, `llmm/nvfp4_quant.mojo`,
+`llmm/amax.mojo`, and the two test files. F6 (Makefile clones) and the F2
+full merge remain deliberately unconsolidated per the audit; F7 remains a
+note (the dbias vs ln-dparam accumulate/finalize bodies are still
+substantively different post-LN-redesign).
+
+### Final gates (after the last commit, one GPU-lock window)
+
+- `make verify-gpu` (strict IEEE): **PASS** — same tree as the F2 gate run.
+- `make verify-fp8-grads`: **PASS**, and the 148-tensor summary matches the
+  branch-era/integration numbers **digit-for-digit** (cosine min 0.9366 /
+  median 0.9870 / max 0.9993; relL2 min 0.0412 / median 0.1742 / max
+  0.4616) — a fully deterministic single fwd+bwd gate, the strongest
+  bit-level trajectory-adjacent evidence available on this tree.
+- 10-step training runs, twin runs per precision (`-e gpt2_124M_bf16.bin
+  -x 10 -v 0 -s 0`, tinyshakespeare, same invocation as the integration
+  entry's Gate 6):
+
+**Trajectory verdict — bit-identical wherever the tree itself is
+bit-stable; steps 2–10 inside the pre-existing wiggle band.** Step 1
+(the documented deterministic point: single fwd/bwd before optimizer
+state diverges) matches the integration-verification logs **bit-for-bit
+in all three precisions, both runs** (bf16 4.369226/17.1131, fp8
+4.390939/16.5327, fp4 4.408221/17.2049). Steps 2–10 are subject to the
+**pre-existing** assembled-tree atomics wiggle documented in the
+perf-hunt closeout entry ("full-step bf16 is NOT bit-stable run-to-run
+on the assembled tree", ~1e-3-scale) — re-examining the integration
+entry's own Gate 6 logs confirms its twin runs also differed run-to-run
+(bf16 from step 2, fp8 from step 3, fp4 from step 5), so strict 10-step
+bit-identity was never a property of the verified tree either. Against
+that band:
+
+| precision | ref twins' own max Δloss (steps 2–10) | new twins' max Δ | new-run2 vs ref-run2 max Δ |
+|---|---:|---:|---:|
+| bf16 | 0.007992 | 0.006906 | 0.006906 |
+| fp8  | 0.008822 | 0.009130 | 0.007559 |
+| fp4  | 0.008849 | 0.006412 | 0.008101 |
+
+The consolidated tree deviates from the verified tree by **less than the
+verified tree's own run-to-run spread** in every precision. Gate-6
+envelope stats reproduce: median |rel loss delta| vs same-window bf16 —
+fp4 **1.03% vs the reference window's own 1.03%** (identical), fp8 0.71%
+vs 0.64% (both consistent with the branch-era 0.57% at n=10). No NaN/Inf
+in any of the six runs; all losses decrease.
+
+_Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen._
