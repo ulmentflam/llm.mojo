@@ -14,7 +14,35 @@ def get_dtype_size(dtype: DType) -> Int:
         return 2
     elif dtype == DType.int8 or dtype == DType.uint8:
         return 1
+    elif (
+        dtype == DType.float8_e4m3fn
+        or dtype == DType.float8_e5m2
+        or dtype == DType.float8_e4m3fnuz
+        or dtype == DType.float8_e5m2fnuz
+    ):
+        # 1 byte. Defensive: no host buffer is fp8-typed on the normal path
+        # (fp8 is a transient GEMM-operand dtype only — see
+        # docs/ai/fp8_training_design.md §1.1/§4), but the original silent
+        # `else: return 4` fallback is exactly the landmine that caused the
+        # bf16 host-buffer element-size mismatch this function's other
+        # branches were added to fix; fp8 gets its own explicit case rather
+        # than falling through to the wrong 4-byte default.
+        return 1
     else:
+        # Sub-byte dtypes (e.g. fp4/e2m1, 2 values/byte) have no whole-byte
+        # element size and are not expected to reach a byte-count call site;
+        # rather than silently returning a wrong size (the landmine this
+        # function guards against), fail loudly so a future fp4 checkpoint/
+        # dump path is forced to special-case its packed layout explicitly
+        # (docs/ai/fp8_training_design.md §3, extension seam 6) instead of
+        # inheriting a wrong default.
+        debug_assert(
+            False,
+            (
+                "get_dtype_size: unrecognized dtype (sub-byte/fp4 packed dtypes"
+                " need dedicated packed handling, not a per-element byte size)"
+            ),
+        )
         return 4
 
 
