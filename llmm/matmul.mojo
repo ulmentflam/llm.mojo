@@ -1493,6 +1493,7 @@ def matmul_d_input_bwd[
     dtype: DType,
     target: StaticString,
     use_gelu: Bool,
+    use_lowp: Bool = False,
 ](
     d_input_ptr: MutKernelPtr[dtype],
     d_output_ptr: ImmutKernelPtr[dtype],
@@ -1503,9 +1504,35 @@ def matmul_d_input_bwd[
     channels: Int64,
     output_channels: Int64,
     ctx: DeviceContext,
+    weight_t_fp8_scratch: Optional[MutKernelPtr[DType.uint8]] = None,
+    d_output_fp8_scratch: Optional[MutKernelPtr[DType.uint8]] = None,
+    weight_scale: Float32 = Float32(1.0),
+    weight_scale_inv: Optional[ImmutKernelPtr[DType.float32]] = None,
+    d_output_scale: Float32 = Float32(1.0),
+    d_output_scale_inv: Optional[ImmutKernelPtr[DType.float32]] = None,
 ) raises -> None:
     """Computes d_input = d_output @ weight. Overwrites d_input: llm.c overwrites
-    activation grads; only weight/bias grads accumulate across micro-steps."""
+    activation grads; only weight/bias grads accumulate across micro-steps.
+
+    `use_lowp` (docs/ai/fp8_training_design.md Chunk E, §5.2): fp8 dgrad via
+    `lowp_gemm`. dgrad's TN-orientation (see the module comment above
+    `_matmul_cublaslt_fp8`/`lowp_gemm`): A-role = `weight` (needs a
+    transposed fp8 copy, [C,OC] — `weight_t_fp8_scratch`, >= C*OC bytes,
+    quantized E4M3 same as the forward weight operand, just a different
+    physical layout so it **reuses the forward weight site's `AmaxState`/
+    scale**), B-role = `d_output` (native orientation, no transpose needed —
+    `d_output_fp8_scratch`, >= rows*OC bytes, quantized **E5M2**, the
+    gradient-format operand per design §1.2). `weight_scale`/
+    `d_output_scale` are the host-value quantize-time multipliers
+    (`fp8_max / amax`); `*_scale_inv` are DEVICE fp32 scalars for cuBLASLt's
+    scale pointers (`lowp_gemm`'s own contract — see its docstring). GELU
+    backward is **not** fused into the fp8 GEMM epilogue (cuBLASLt fp8 has
+    restricted epilogue support, design §5 item 2): it runs as the existing
+    separate bf16 `_launch_matmul_gelu_backward_scaling_gpu` kernel
+    afterward, identical to the `USE_GELU_FUSION=False` bf16 path below.
+    `use_lowp=True` requires `is_gpu[target]()` and `HAS_CUBLAS` (comptime-
+    asserted) — mirrors `lowp_gemm`'s own GPU-only/cuBLASLt-only contract.
+    """
     var rows = Int(batch_size * seq_len)
     var in_channels = Int(channels)
     var out_channels = Int(output_channels)
@@ -1565,7 +1592,56 @@ def matmul_d_input_bwd[
         ctx.synchronize()
 
     comptime if is_gpu[target]():
-        comptime if HAS_CUBLAS:
+        comptime if use_lowp:
+            comptime assert HAS_CUBLAS, (
+                "fp8 dgrad (use_lowp=True) requires cuBLASLt -- lowp_gemm's"
+                " only implemented vendor body on this toolchain (see the"
+                " module comment above _matmul_cublaslt_fp8)"
+            )
+            # dgrad: d_input[rows,C] = d_output[rows,OC] @ weight[OC,C].
+            # A-role=weight (transpose_a=True: needs weight's transpose
+            # [C,OC], quantized E4M3), B-role=d_output (transpose_b=False:
+            # native orientation, quantized E5M2) -- see the module comment
+            # above _matmul_cublaslt_fp8 / lowp_gemm's docstring for the
+            # per-GEMM orientation derivation. m=C, n=rows, k=OC, matching
+            # the bf16 cuBLASLt call below (weight as "A" arg, d_output as
+            # "B" arg, same m/n/k).
+            lowp_gemm[
+                FP8_SPEC.fwd_dtype,
+                FP8_SPEC.bwd_dtype,
+                dtype,
+                dtype,
+                target,
+                transpose_a=True,
+                transpose_b=False,
+            ](
+                d_input_ptr,
+                weight_ptr,
+                d_output_ptr,
+                weight_t_fp8_scratch.value(),
+                d_output_fp8_scratch.value(),
+                weight_scale,
+                weight_scale_inv.value(),
+                d_output_scale,
+                d_output_scale_inv.value(),
+                in_channels,
+                rows,
+                out_channels,
+                False,  # d_input is always overwritten, never accumulated
+                ctx,
+            )
+            comptime if use_gelu:
+                # DGELU not fused into the fp8 GEMM epilogue (design §5 item
+                # 2: cuBLASLt fp8 has restricted epilogue support) -- apply
+                # it as the existing standalone bf16 kernel, same as the
+                # USE_GELU_FUSION=False bf16 path below.
+                _launch_matmul_gelu_backward_scaling_gpu[dtype](
+                    d_input_ptr,
+                    pre_gelu_ptr,
+                    rows * in_channels,
+                    ctx,
+                )
+        elif HAS_CUBLAS:
             comptime if use_gelu and not USE_GELU_FUSION:
                 # llm.c's default (gelu_fusion<2): plain (DEFAULT-epilogue)
                 # d_input GEMM, then a separate standalone in-place
@@ -1791,6 +1867,7 @@ def matmul_d_weight_bwd[
     dtype: DType,
     target: StaticString,
     accumulate: Bool,
+    use_lowp: Bool = False,
 ](
     d_weight_ptr: MutKernelPtr[dtype],
     d_output_ptr: ImmutKernelPtr[dtype],
@@ -1801,11 +1878,32 @@ def matmul_d_weight_bwd[
     channels: Int64,  # C
     output_channels: Int64,  # OC
     ctx: DeviceContext,
+    input_t_fp8_scratch: Optional[MutKernelPtr[DType.uint8]] = None,
+    d_output_t_fp8_scratch: Optional[MutKernelPtr[DType.uint8]] = None,
+    input_scale: Float32 = Float32(1.0),
+    input_scale_inv: Optional[ImmutKernelPtr[DType.float32]] = None,
+    d_output_scale: Float32 = Float32(1.0),
+    d_output_scale_inv: Optional[ImmutKernelPtr[DType.float32]] = None,
 ) raises -> None:
     """Computes d_weight = d_output^T @ input. linalg.matmul rejects transpose_a (#6626), so
     GPU goes through the vendor BLAS (transposed A is native and beta folds
     in accumulation) and CPU materializes d_output^T once into scratch
-    (O(rows * OC) traffic next to the GEMM's O(2 * rows * OC * C) flops)."""
+    (O(rows * OC) traffic next to the GEMM's O(2 * rows * OC * C) flops).
+
+    `use_lowp` (docs/ai/fp8_training_design.md Chunk E, §5.3): fp8 wgrad via
+    `lowp_gemm`. wgrad's TN-orientation needs a transposed fp8 copy of
+    **both** operands (module comment above `_matmul_cublaslt_fp8`): A-role
+    = `input` (-> `[C,rows]`, `input_t_fp8_scratch`, >= C*rows bytes,
+    quantized **E4M3** — reuses the forward input site's `AmaxState`/scale),
+    B-role = `d_output` (-> `[OC,rows]`, `d_output_t_fp8_scratch`, >=
+    OC*rows bytes, quantized **E5M2**, same site/scale as the dgrad call's
+    `d_output` operand). `accumulate` (grad-accum across micro-steps) passes
+    straight through to `lowp_gemm`'s `accumulate` -> cuBLASLt `beta` — probed
+    and confirmed working for fp8-operand GEMMs (module comment above
+    `_matmul_cublaslt_fp8`, item (b): no bf16-scratch-and-add fallback
+    needed, unlike the design doc's speculative worst case). `use_lowp=True`
+    requires `is_gpu[target]()` and `HAS_CUBLAS` (comptime-asserted).
+    """
     var rows = Int(batch_size * seq_len)
     var in_channels = Int(channels)
     var out_channels = Int(output_channels)
@@ -1830,7 +1928,47 @@ def matmul_d_weight_bwd[
     )
 
     comptime if is_gpu[target]():
-        comptime if HAS_CUBLAS:
+        comptime if use_lowp:
+            comptime assert HAS_CUBLAS, (
+                "fp8 wgrad (use_lowp=True) requires cuBLASLt -- lowp_gemm's"
+                " only implemented vendor body on this toolchain (see the"
+                " module comment above _matmul_cublaslt_fp8)"
+            )
+            # wgrad: d_weight[OC,C] = d_outputᵀ[OC,rows] @ input[rows,C].
+            # Neither operand's natural row-major storage has `rows` as its
+            # trailing axis, so BOTH need a transposed fp8 copy (module
+            # comment above _matmul_cublaslt_fp8): A-role=input
+            # (transpose_a=True -> [C,rows], E4M3), B-role=d_output
+            # (transpose_b=True -> [OC,rows], E5M2). m=C, n=OC, k=rows,
+            # matching the bf16 cuBLASLt call below (input as "A" arg,
+            # d_output as "B" arg, same m/n/k). `accumulate` passes straight
+            # through to lowp_gemm's beta (confirmed working, see this
+            # function's docstring).
+            lowp_gemm[
+                FP8_SPEC.fwd_dtype,
+                FP8_SPEC.bwd_dtype,
+                dtype,
+                dtype,
+                target,
+                transpose_a=True,
+                transpose_b=True,
+            ](
+                d_weight_ptr,
+                input_ptr,
+                d_output_ptr,
+                input_t_fp8_scratch.value(),
+                d_output_t_fp8_scratch.value(),
+                input_scale,
+                input_scale_inv.value(),
+                d_output_scale,
+                d_output_scale_inv.value(),
+                in_channels,
+                out_channels,
+                rows,
+                accumulate,
+                ctx,
+            )
+        elif HAS_CUBLAS:
             # cuBLASLt d_weight[OC,C] = d_outputᵀ·input, all heads via col-major
             # m=C, n=OC, k=rows with a=input(transA=false), b=d_output(transB=true);
             # beta folds gradient accumulation. Same-stream, no host fence.
@@ -2068,6 +2206,7 @@ def matmul_bwd[
     use_gelu: Bool = False,
     accumulate: Bool = True,
     has_bias: Bool = True,
+    use_lowp: Bool = False,
 ](
     d_input_ptr: MutKernelPtr[dtype],
     d_weight_ptr: MutKernelPtr[dtype],
@@ -2082,6 +2221,26 @@ def matmul_bwd[
     channels: Int64,
     output_channels: Int64,
     ctx: DeviceContext,
+    # fp8 scratch/scale plumbing (docs/ai/fp8_training_design.md Chunk E) —
+    # only consumed when use_lowp=True; every arg has a harmless default so
+    # existing (non-fp8) call sites need no change. weight_t_fp8_scratch/
+    # weight_scale(_inv) come from the site's forward-weight AmaxState
+    # (reused, per Chunk E's coordination note: "dgrad re-uses each site's
+    # weight scale state -- same AmaxState as fwd's weight, different layout
+    # buffer"); input_t_fp8_scratch/input_scale(_inv) likewise reuse the
+    # forward-input AmaxState; d_output_*_fp8_scratch/d_output_scale(_inv)
+    # are this site's E5M2 gradient-operand state, shared between the dgrad
+    # and wgrad calls below (same d_output tensor, same scale).
+    weight_t_fp8_scratch: Optional[MutKernelPtr[DType.uint8]] = None,
+    d_output_fp8_scratch: Optional[MutKernelPtr[DType.uint8]] = None,
+    input_t_fp8_scratch: Optional[MutKernelPtr[DType.uint8]] = None,
+    d_output_t_fp8_scratch: Optional[MutKernelPtr[DType.uint8]] = None,
+    weight_scale: Float32 = Float32(1.0),
+    weight_scale_inv: Optional[ImmutKernelPtr[DType.float32]] = None,
+    input_scale: Float32 = Float32(1.0),
+    input_scale_inv: Optional[ImmutKernelPtr[DType.float32]] = None,
+    d_output_scale: Float32 = Float32(1.0),
+    d_output_scale_inv: Optional[ImmutKernelPtr[DType.float32]] = None,
 ) raises -> None:
     comptime if has_bias:
         matmul_bias_bwd[dtype, target, accumulate](
@@ -2092,7 +2251,7 @@ def matmul_bwd[
             output_channels,
             ctx,
         )
-    matmul_d_input_bwd[dtype, target, use_gelu](
+    matmul_d_input_bwd[dtype, target, use_gelu, use_lowp=use_lowp](
         d_input_ptr,
         d_output_ptr,
         weight_ptr,
@@ -2102,8 +2261,14 @@ def matmul_bwd[
         channels,
         output_channels,
         ctx,
+        weight_t_fp8_scratch,
+        d_output_fp8_scratch,
+        weight_scale,
+        weight_scale_inv,
+        d_output_scale,
+        d_output_scale_inv,
     )
-    matmul_d_weight_bwd[dtype, target, accumulate](
+    matmul_d_weight_bwd[dtype, target, accumulate, use_lowp=use_lowp](
         d_weight_ptr,
         d_output_ptr,
         input_ptr,
@@ -2113,6 +2278,12 @@ def matmul_bwd[
         channels,
         output_channels,
         ctx,
+        input_t_fp8_scratch,
+        d_output_t_fp8_scratch,
+        input_scale,
+        input_scale_inv,
+        d_output_scale,
+        d_output_scale_inv,
     )
 
 
