@@ -1432,53 +1432,146 @@ def layernorm_bwd_gpu[
 
 
 @always_inline
-def _layernorm_bwd_residual_gpu[
+def _ln_bwd_dparam_scratch(
+    count: Int, ctx: DeviceContext
+) raises -> MutKernelPtr[DType.float32]:
+    # Persistent fp32 scratch for the fused LN-backward kernel's block-partial
+    # dgamma/dbeta (see _layernorm_bwd_fused_gpu): dgamma partials live in
+    # [0 : blocks_cap*CHANNELS_CAP), dbeta partials in
+    # [blocks_cap*CHANNELS_CAP : 2*blocks_cap*CHANNELS_CAP). `count` is fixed
+    # per process (SM_OVERPROVISION*num_sm is a per-device constant and
+    # CHANNELS_CAP is a hardcoded bound — see the GPU dispatch in
+    # layernorm_fused_residual_bwd), so — exactly like _ln_dparam_scratch
+    # below — one allocation safely serves every call regardless of shape.
+    # Never re-zeroed: each block writes its own [0:num_row_blocks) slot in
+    # full every launch before the finalize reduction reads it, so stale
+    # data outside the active grid (or from a prior launch) is never read.
+    comptime BufType = type_of(ctx.enqueue_create_buffer[DType.float32](1))
+    var name = String(t"LLMM_LN_BWD_DPARAM_SCRATCH_{ctx.id()}")
+    if gp := _get_global_or_null(name):
+        var p = gp.value().bitcast[BufType]()
+        return rebind[MutKernelPtr[DType.float32]](p[].unsafe_ptr())
+    var buf = ctx.enqueue_create_buffer[DType.float32](count)
+    var hp = alloc[BufType](1)
+    hp.init_pointee_move(buf^)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), hp.bitcast[NoneType]()
+    )
+    return rebind[MutKernelPtr[DType.float32]](hp[].unsafe_ptr())
+
+
+@always_inline
+def _ln_bwd_flag_scratch(
+    ctx: DeviceContext,
+) raises -> MutKernelPtr[DType.int32]:
+    # Persistent int32 "last block finalizes" counter for
+    # _layernorm_bwd_fused_gpu (llm.c layernorm_backward_kernel10's
+    # atomicInc-flag idiom). Allocated once, zeroed at creation; the kernel's
+    # last-arriving block resets it to 0 itself at the end of every launch
+    # (mirrors _ln_dparam_finalize_gpu's self-reset below), so no per-launch
+    # host-side memset is needed.
+    comptime BufType = type_of(ctx.enqueue_create_buffer[DType.int32](1))
+    var name = String(t"LLMM_LN_BWD_FLAG_SCRATCH_{ctx.id()}")
+    if gp := _get_global_or_null(name):
+        var p = gp.value().bitcast[BufType]()
+        return rebind[MutKernelPtr[DType.int32]](p[].unsafe_ptr())
+    var buf = ctx.enqueue_create_buffer[DType.int32](1)
+    ctx.enqueue_memset(buf, Int32(0))
+    var hp = alloc[BufType](1)
+    hp.init_pointee_move(buf^)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), hp.bitcast[NoneType]()
+    )
+    return rebind[MutKernelPtr[DType.int32]](hp[].unsafe_ptr())
+
+
+def _layernorm_bwd_fused_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
     width: Int = 4,
-    store_scratch: Bool = True,
     aligned: Bool = True,
+    # When True, pass 2 additionally seeds the incoming residual-stream
+    # gradient (resid_in_ptr) into d_inp1/d_inp2 in the SAME store as the LN
+    # input-gradient accumulate, replacing the separate `residual_grad_
+    # broadcast` kernel launch that used to run before this one. Ignored
+    # (resid_in_ptr never read) when False — used for the ln_f call site,
+    # which has no incoming residual gradient to seed.
+    HAS_RESID_IN: Bool = False,
+    # Parameter-gradient dtype: production keeps pdtype == dtype; the test
+    # harness (registered ops) accumulates d_gamma/d_beta in fp32.
+    pdtype: DType = dtype,
+    # Per-block scratch stride / shared-memory bound for dgamma/dbeta.
+    # 2048 covers every channel count this kernel is ever launched with
+    # (GPT-2 configs top out at 1600; the equivalence suite tops out at 768)
+    # — same bound already assumed by the forward fused kernel's LN_CAP.
+    CHANNELS_CAP: Int = 2048,
 ](
-    num_rows: Int,
-    tid: Int,
-    stride: Int,
-    block_row: Int,
     d_output_ptr: ImmutKernelPtr[dtype],
     input_ptr: ImmutKernelPtr[dtype],
     gamma_ptr: ImmutKernelPtr[dtype],
     mean_ptr: ImmutKernelPtr[DType.float32],
     rstd_ptr: ImmutKernelPtr[DType.float32],
-    d_input_ptr: MutKernelPtr[dtype],
+    resid_in_ptr: ImmutKernelPtr[dtype],
     d_inp1_ptr: MutKernelPtr[dtype],
     d_inp2_ptr: MutKernelPtr[dtype],
+    d_gamma_ptr: MutKernelPtr[pdtype],
+    d_beta_ptr: MutKernelPtr[pdtype],
+    scratch_dgamma: MutKernelPtr[DType.float32],
+    scratch_dbeta: MutKernelPtr[DType.float32],
+    scratch_flag: MutKernelPtr[DType.int32],
+    num_rows: Int,
     channels: Int,
 ) -> None:
-    # Fused variant of _layernorm_bwd_gpu for layernorm_fused_residual_bwd:
-    # pass 2 computes dval in registers exactly as the plain kernel does, and
-    # additionally does the broadcast accumulate inline
-    # (d_inp1[idx] += dval; d_inp2[idx] += dval), replacing the separate
-    # layernorm_fused_residual_bwd_broadcast_gpu launch + its d_residual
-    # read. This is bit-identical to the two-kernel sequence: dval is
-    # unchanged arithmetic, and the RMW matches
-    # _layernorm_fused_residual_bwd_broadcast_tile's aligned=True path.
+    # Single-kernel LN backward modeled on llm.c's layernorm_backward_
+    # kernel10 (third_party/llm.c/llmc/layernorm.cuh:233): d_input, the
+    # residual-grad seed, and dgamma/dbeta are all produced in ONE sweep over
+    # [B,T,C], replacing the 3-kernel sequence this replaces
+    # (_layernorm_bwd_residual_gpu + _ln_dparam_accum_gpu +
+    # _ln_dparam_finalize_gpu — the latter two re-read dout/input that this
+    # kernel already has in registers). dgamma/dbeta accumulate into
+    # block-local SHARED memory (no atomics: thread `tid` owns the same
+    # channel offsets on every row it processes in the grid-stride loop
+    # below, so no other thread ever touches its shared slot), then each
+    # block flushes its partial to a private scratch slot and the block that
+    # observes the last arrival (atomic counter, llm.c's flag idiom)
+    # performs the cross-block reduction and the += into d_gamma/d_beta.
     #
-    # store_scratch (comptime) additionally writes dval to d_input_ptr
-    # (the scratch plane), matching the original kernel's store. Stage 1
-    # keeps this (bit-identical by construction, since the fused broadcast
-    # no longer reads it back). Stage 2 drops it: the scratch plane's
-    # post-broadcast value is dead within this step (every access after the
-    # broadcast read is a write) and is re-zeroed before next step's use, so
-    # skipping the store changes no observable value, only saves the write.
-    #
-    # `aligned` (comptime): True keeps the vectorized fast path below,
-    # byte-identical to before, for the production invariant
-    # channels % width == 0 (so row*channels is always width-aligned). False
-    # (odd channel counts) falls back to a fully scalar sweep — see
-    # _layernorm_bwd_gpu for the same proof/pattern.
+    # `aligned` / alignment proof: identical to _layernorm_bwd_residual_gpu
+    # (channels % width == 0 makes every row*channels+i offset provably
+    # width-aligned; the host dispatch only sets aligned=True when it has
+    # checked that).
     comptime BLOCK_SPAN = BLOCK_SIZE * width
     comptime align = align_of[SIMD[dtype, width]]()
 
-    for row in range(block_row, num_rows, stride):
+    var tid = Int(thread_idx.x)
+    var block_row = Int(block_idx.x)
+    var num_blocks = Int(grid_dim.x)
+
+    var dgamma_shared = LayoutTensor[
+        DType.float32,
+        Layout.row_major(CHANNELS_CAP),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var dbeta_shared = LayoutTensor[
+        DType.float32,
+        Layout.row_major(CHANNELS_CAP),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var flag_shared = LayoutTensor[
+        DType.int32,
+        Layout.row_major(1),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    for c in range(tid, channels, BLOCK_SIZE):
+        dgamma_shared.ptr[c] = 0.0
+        dbeta_shared.ptr[c] = 0.0
+    barrier()
+
+    for row in range(block_row, num_rows, num_blocks):
         var mean = mean_ptr[row]
         var rstd = rstd_ptr[row]
         var mean_vec = SIMD[DType.float32, width](mean)
@@ -1488,7 +1581,8 @@ def _layernorm_bwd_residual_gpu[
         var sum_gdy_tail = Scalar[DType.float32](0.0)
         var sum_gdy_xhat_tail = Scalar[DType.float32](0.0)
 
-        # Pass 1: Row-statistic reduction (sum_gdy, sum_gdy_xhat).
+        # Pass 1: Row-statistic reduction (sum_gdy, sum_gdy_xhat) — same
+        # reduction as _layernorm_bwd_residual_gpu, unchanged.
         comptime if aligned:
             for tile_base in range(0, channels, BLOCK_SPAN):
                 var i = tile_base + tid * width
@@ -1544,7 +1638,8 @@ def _layernorm_bwd_residual_gpu[
             sum_gdy_xhat_thread.reduce_add() + sum_gdy_xhat_tail
         )
 
-        # Pass 2: Compute input gradient, then fuse the broadcast accumulate.
+        # Pass 2: d_input, fused residual-grad seed (HAS_RESID_IN), and
+        # dgamma/dbeta shared accumulation — all in the same element sweep.
         var inv_c = 1.0 / Float32(channels)
         comptime if aligned:
             for tile_base in range(0, channels, BLOCK_SPAN):
@@ -1572,10 +1667,12 @@ def _layernorm_bwd_residual_gpu[
                         - (sum_gdy * inv_c)
                         - (x_hat * sum_gdy_xhat * inv_c)
                     )
-                    comptime if store_scratch:
-                        (d_input_ptr + idx).store[width=width, alignment=align](
-                            d_input.cast[dtype]()
-                        )
+
+                    var dg_old = (dgamma_shared.ptr + i).load[width=width]()
+                    var db_old = (dbeta_shared.ptr + i).load[width=width]()
+                    (dgamma_shared.ptr + i).store(dg_old + dy * x_hat)
+                    (dbeta_shared.ptr + i).store(db_old + dy)
+
                     var g1 = (
                         (d_inp1_ptr + idx)
                         .load[width=width, alignment=align]()
@@ -1586,12 +1683,25 @@ def _layernorm_bwd_residual_gpu[
                         .load[width=width, alignment=align]()
                         .cast[DType.float32]()
                     )
-                    (d_inp1_ptr + idx).store[width=width, alignment=align](
-                        (g1 + d_input).cast[dtype]()
-                    )
-                    (d_inp2_ptr + idx).store[width=width, alignment=align](
-                        (g2 + d_input).cast[dtype]()
-                    )
+                    comptime if HAS_RESID_IN:
+                        var resid = (
+                            (resid_in_ptr + idx)
+                            .load[width=width, alignment=align]()
+                            .cast[DType.float32]()
+                        )
+                        (d_inp1_ptr + idx).store[width=width, alignment=align](
+                            (g1 + resid + d_input).cast[dtype]()
+                        )
+                        (d_inp2_ptr + idx).store[width=width, alignment=align](
+                            (g2 + resid + d_input).cast[dtype]()
+                        )
+                    else:
+                        (d_inp1_ptr + idx).store[width=width, alignment=align](
+                            (g1 + d_input).cast[dtype]()
+                        )
+                        (d_inp2_ptr + idx).store[width=width, alignment=align](
+                            (g2 + d_input).cast[dtype]()
+                        )
                 elif i < channels:
                     for j in range(i, channels):
                         var idx = row * channels + j
@@ -1604,12 +1714,23 @@ def _layernorm_bwd_residual_gpu[
                             - (sum_gdy * inv_c)
                             - (x_hat * sum_gdy_xhat * inv_c)
                         )
-                        comptime if store_scratch:
-                            d_input_ptr[idx] = d_input.cast[dtype]()
+
+                        dgamma_shared.ptr[j] = dgamma_shared.ptr[j] + dy * x_hat
+                        dbeta_shared.ptr[j] = dbeta_shared.ptr[j] + dy
+
                         var g1 = d_inp1_ptr[idx].cast[DType.float32]()
                         var g2 = d_inp2_ptr[idx].cast[DType.float32]()
-                        d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
-                        d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
+                        comptime if HAS_RESID_IN:
+                            var resid = resid_in_ptr[idx].cast[DType.float32]()
+                            d_inp1_ptr[idx] = (g1 + resid + d_input).cast[
+                                dtype
+                            ]()
+                            d_inp2_ptr[idx] = (g2 + resid + d_input).cast[
+                                dtype
+                            ]()
+                        else:
+                            d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
+                            d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
         else:
             for i in range(tid, channels, BLOCK_SIZE):
                 var idx = row * channels + i
@@ -1620,50 +1741,61 @@ def _layernorm_bwd_residual_gpu[
                 var d_input = rstd * (
                     g * dy - (sum_gdy * inv_c) - (x_hat * sum_gdy_xhat * inv_c)
                 )
-                comptime if store_scratch:
-                    d_input_ptr[idx] = d_input.cast[dtype]()
+
+                dgamma_shared.ptr[i] = dgamma_shared.ptr[i] + dy * x_hat
+                dbeta_shared.ptr[i] = dbeta_shared.ptr[i] + dy
+
                 var g1 = d_inp1_ptr[idx].cast[DType.float32]()
                 var g2 = d_inp2_ptr[idx].cast[DType.float32]()
-                d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
-                d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
+                comptime if HAS_RESID_IN:
+                    var resid = resid_in_ptr[idx].cast[DType.float32]()
+                    d_inp1_ptr[idx] = (g1 + resid + d_input).cast[dtype]()
+                    d_inp2_ptr[idx] = (g2 + resid + d_input).cast[dtype]()
+                else:
+                    d_inp1_ptr[idx] = (g1 + d_input).cast[dtype]()
+                    d_inp2_ptr[idx] = (g2 + d_input).cast[dtype]()
 
+    barrier()
 
-def layernorm_bwd_residual_gpu[
-    dtype: DType,
-    BLOCK_SIZE: Int,
-    width: Int = 4,
-    store_scratch: Bool = True,
-    aligned: Bool = True,
-](
-    d_output_ptr: MutKernelPtr[dtype],
-    input_ptr: ImmutKernelPtr[dtype],
-    gamma_ptr: ImmutKernelPtr[dtype],
-    mean_ptr: ImmutKernelPtr[DType.float32],
-    rstd_ptr: ImmutKernelPtr[DType.float32],
-    d_input_ptr: MutKernelPtr[dtype],
-    d_inp1_ptr: MutKernelPtr[dtype],
-    d_inp2_ptr: MutKernelPtr[dtype],
-    batch_size: Int64,
-    seq_len: Int64,
-    channels: Int64,
-) -> None:
-    _layernorm_bwd_residual_gpu[
-        dtype, BLOCK_SIZE, width, store_scratch, aligned=aligned
-    ](
-        Int(batch_size * seq_len),
-        Int(thread_idx.x),
-        Int(grid_dim.x),
-        Int(block_idx.x),
-        d_output_ptr,
-        input_ptr,
-        gamma_ptr,
-        mean_ptr,
-        rstd_ptr,
-        d_input_ptr,
-        d_inp1_ptr,
-        d_inp2_ptr,
-        Int(channels),
-    )
+    # Flush this block's dgamma/dbeta partials to its own scratch slot (no
+    # cross-block writes, no atomics needed here).
+    for c in range(tid, channels, BLOCK_SIZE):
+        scratch_dgamma[block_row * CHANNELS_CAP + c] = dgamma_shared.ptr[c]
+        scratch_dbeta[block_row * CHANNELS_CAP + c] = dbeta_shared.ptr[c]
+    barrier()
+
+    # llm.c's "last block finalizes" idiom (layernorm_backward_kernel10):
+    # every block atomically increments the shared flag; fetch_add returns
+    # the PRE-increment value, so the block that observes num_blocks-1 is,
+    # by construction, the last to arrive — every other block's scratch
+    # write above happened-before its increment, which happened-before this
+    # block's read of the flag, so all partials are visible here without an
+    # extra fence.
+    if tid == 0:
+        flag_shared.ptr[0] = Atomic[DType.int32].fetch_add(scratch_flag, 1)
+    barrier()
+    var arrived = Int(flag_shared.ptr[0])
+
+    if arrived == num_blocks - 1:
+        for c in range(tid, channels, BLOCK_SIZE):
+            var acc_dg = Scalar[DType.float32](0.0)
+            var acc_db = Scalar[DType.float32](0.0)
+            for b in range(num_blocks):
+                acc_dg += scratch_dgamma[b * CHANNELS_CAP + c]
+                acc_db += scratch_dbeta[b * CHANNELS_CAP + c]
+            # d_gamma/d_beta ALWAYS accumulate (grad accumulation across
+            # micro-steps) — matches _ln_dparam_finalize_gpu.
+            d_gamma_ptr[c] = (
+                d_gamma_ptr[c].cast[DType.float32]() + acc_dg
+            ).cast[pdtype]()
+            d_beta_ptr[c] = (d_beta_ptr[c].cast[DType.float32]() + acc_db).cast[
+                pdtype
+            ]()
+        if tid == 0:
+            # Self-reset for the next launch — no host-side memset needed
+            # between calls (mirrors _ln_dparam_finalize_gpu's scratch
+            # re-zero).
+            scratch_flag[0] = 0
 
 
 @always_inline
@@ -2173,6 +2305,15 @@ def layernorm_fused_residual_bwd[
     # Parameter-gradient dtype: production keeps pdtype == dtype; the test
     # harness (registered ops) accumulates d_gamma/d_beta in fp32.
     pdtype: DType = dtype,
+    # When True, the incoming residual-stream gradient at resid_in_ptr is
+    # fused into the same d_inp1/d_inp2 accumulate that the LN input-
+    # gradient uses (GPU: inside the single fused kernel; CPU: a broadcast
+    # pass before layernorm_bwd, matching the old call-site order), instead
+    # of the caller running a separate `residual_grad_broadcast` launch
+    # first. False (the default, used by e.g. the ln_f call site and the
+    # registered custom op) means there is no incoming residual gradient to
+    # seed and resid_in_ptr is ignored.
+    HAS_RESID_IN: Bool = False,
 ](
     d_inp1_ptr: MutKernelPtr[dtype],
     d_inp2_ptr: MutKernelPtr[dtype],
@@ -2184,6 +2325,7 @@ def layernorm_fused_residual_bwd[
     d_gamma_ptr: MutKernelPtr[pdtype],
     d_beta_ptr: MutKernelPtr[pdtype],
     d_residual_ptr: MutKernelPtr[dtype],
+    resid_in_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
     channels: Int64,
@@ -2191,6 +2333,18 @@ def layernorm_fused_residual_bwd[
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
+        # CPU path is untouched: still the old two-launch-equivalent
+        # sequence (seed broadcast, if any + LN backward + broadcast), just
+        # with the seed call relocated from the train_gpt2.mojo call site
+        # into this function so both targets share one call signature. Same
+        # kernels, same order, same arithmetic as before this change.
+        comptime if HAS_RESID_IN:
+            _layernorm_fused_residual_bwd_broadcast_cpu[dtype, width](
+                d_inp1_ptr,
+                d_inp2_ptr,
+                resid_in_ptr,
+                Int(batch_size * seq_len * channels),
+            )
         layernorm_bwd[dtype, target, pdtype](
             d_output_ptr,
             residual_ptr,
@@ -2212,89 +2366,107 @@ def layernorm_fused_residual_bwd[
             Int(batch_size * seq_len * channels),
         )
     elif is_gpu[target]():
-        # GPU: fuse the broadcast accumulate into the d_input kernel itself
-        # (layernorm_bwd_residual_gpu) instead of running layernorm_bwd's
-        # plain d_input kernel followed by a separate broadcast sweep. This
-        # is the ㉛-style fusion from the parity analysis: same dval
-        # arithmetic, same RMW as the broadcast kernel's aligned=True path,
-        # just done in the same pass so d_inp1/d_inp2 never round-trip
-        # through the d_residual scratch plane.
-        #
-        # STORE_SCRATCH (stage 1 = True, stage 2 = False): stage 1 keeps
-        # writing dval to d_residual_ptr (bit-identical to today, since the
-        # value is never read back — the broadcast that used to read it is
-        # now fused away). Stage 2 drops that store; see
-        # _layernorm_bwd_residual_gpu's docstring for why that's safe.
-        comptime STORE_SCRATCH = False
+        # GPU: a single fused kernel (_layernorm_bwd_fused_gpu) computes
+        # d_input, the resid_in seed (HAS_RESID_IN), and dgamma/dbeta in one
+        # pass — see that kernel's docstring for the full design (modeled on
+        # llm.c's layernorm_backward_kernel10). This replaces what used to
+        # be up to 3 kernels here (the d_input+broadcast kernel plus the
+        # dparam accum/finalize pair) and, at each train_gpt2.mojo call
+        # site, a 4th kernel (the separate `residual_grad_broadcast` launch
+        # that used to seed d_inp1/d_inp2 before this function ran).
         comptime BLOCK_SIZE = 256
         comptime SM_OVERPROVISION = 32
         comptime width = 4
+        comptime CHANNELS_CAP = 2048
         var device_ctx = ctx
         var num_rows = Int(batch_size * seq_len)
+        var ch = Int(channels)
+        if ch > CHANNELS_CAP:
+            raise Error(
+                "layernorm_fused_residual_bwd: channels exceeds the fused"
+                " backward kernel's CHANNELS_CAP"
+            )
         var num_sm = device_ctx.get_attribute(
             DeviceAttribute.MULTIPROCESSOR_COUNT
         )
-        var num_row_blocks = max(min(num_rows, SM_OVERPROVISION * num_sm), 1)
+        # SM_OVERPROVISION*num_sm is a per-device constant (num_sm never
+        # changes within a process), so it upper-bounds num_row_blocks for
+        # every shape this process ever launches with — the scratch buffer
+        # below is sized once from this bound and is safe to reuse forever.
+        var blocks_cap = SM_OVERPROVISION * num_sm
+        var num_row_blocks = max(min(num_rows, blocks_cap), 1)
 
-        # Same aligned/scalar-fallback host dispatch as layernorm_bwd's
-        # Kernel 1 above; see the comment there.
-        if Int(channels) % width == 0:
-            comptime dinput_kernel = layernorm_bwd_residual_gpu[
-                dtype, BLOCK_SIZE, width, STORE_SCRATCH, aligned=True
+        var dparam_scratch = _ln_bwd_dparam_scratch(
+            2 * blocks_cap * CHANNELS_CAP, device_ctx
+        )
+        var scratch_dgamma = dparam_scratch
+        var scratch_dbeta = dparam_scratch + blocks_cap * CHANNELS_CAP
+        var flag_scratch = _ln_bwd_flag_scratch(device_ctx)
+
+        # Same aligned/scalar-fallback host dispatch as the kernels this
+        # replaces; see _layernorm_bwd_fused_gpu's docstring.
+        if ch % width == 0:
+            comptime fused_k = _layernorm_bwd_fused_gpu[
+                dtype,
+                BLOCK_SIZE,
+                width,
+                aligned=True,
+                HAS_RESID_IN=HAS_RESID_IN,
+                pdtype=pdtype,
+                CHANNELS_CAP=CHANNELS_CAP,
             ]
-            var dinput_compiled = device_ctx.compile_function[dinput_kernel]()
+            var compiled = device_ctx.compile_function[fused_k]()
             device_ctx.enqueue_function(
-                dinput_compiled,
+                compiled,
                 d_output_ptr,
                 residual_ptr,
                 gamma_ptr,
                 mean_ptr,
                 rstd_ptr,
-                d_residual_ptr,
+                resid_in_ptr,
                 d_inp1_ptr,
                 d_inp2_ptr,
-                batch_size,
-                seq_len,
-                channels,
+                d_gamma_ptr,
+                d_beta_ptr,
+                scratch_dgamma,
+                scratch_dbeta,
+                flag_scratch,
+                num_rows,
+                ch,
                 grid_dim=(num_row_blocks,),
                 block_dim=(BLOCK_SIZE,),
             )
         else:
-            comptime dinput_kernel_u = layernorm_bwd_residual_gpu[
-                dtype, BLOCK_SIZE, width, STORE_SCRATCH, aligned=False
+            comptime fused_k_u = _layernorm_bwd_fused_gpu[
+                dtype,
+                BLOCK_SIZE,
+                width,
+                aligned=False,
+                HAS_RESID_IN=HAS_RESID_IN,
+                pdtype=pdtype,
+                CHANNELS_CAP=CHANNELS_CAP,
             ]
-            var dinput_compiled_u = device_ctx.compile_function[
-                dinput_kernel_u
-            ]()
+            var compiled_u = device_ctx.compile_function[fused_k_u]()
             device_ctx.enqueue_function(
-                dinput_compiled_u,
+                compiled_u,
                 d_output_ptr,
                 residual_ptr,
                 gamma_ptr,
                 mean_ptr,
                 rstd_ptr,
-                d_residual_ptr,
+                resid_in_ptr,
                 d_inp1_ptr,
                 d_inp2_ptr,
-                batch_size,
-                seq_len,
-                channels,
+                d_gamma_ptr,
+                d_beta_ptr,
+                scratch_dgamma,
+                scratch_dbeta,
+                flag_scratch,
+                num_rows,
+                ch,
                 grid_dim=(num_row_blocks,),
                 block_dim=(BLOCK_SIZE,),
             )
-
-        _layernorm_dparam_gpu[dtype, pdtype](
-            d_output_ptr,
-            residual_ptr,
-            mean_ptr,
-            rstd_ptr,
-            d_gamma_ptr,
-            d_beta_ptr,
-            batch_size,
-            seq_len,
-            channels,
-            device_ctx,
-        )
     else:
         raise Error("Invalid target")
 
@@ -2419,6 +2591,11 @@ struct LayerNormFusedResidualBwd:
             rstd.unsafe_ptr(),
             d_gamma.unsafe_ptr(),
             d_beta.unsafe_ptr(),
+            d_residual.unsafe_ptr(),
+            # resid_in_ptr: unused placeholder — HAS_RESID_IN defaults False
+            # for this registered op, so the fused kernel never reads it
+            # (matches the pre-fusion tested "+=" accumulate contract; see
+            # tests/test_layernorm_equivalence.py's *_accumulates tests).
             d_residual.unsafe_ptr(),
             batch_size,
             seq_len,
