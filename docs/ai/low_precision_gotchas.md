@@ -496,6 +496,64 @@ the 2026-07-10 quant-opt entry in `ai_assisted_optimizations_and_benchmarks.md`.
 **Source:** FP8 quant-opt Optimization A diagnosis, 2026-07-10 (worktree
 `llmm-goal2-qopt`, branch `goal2/fp8-quant-opt`).
 
+### G2 — sharing a `DeviceBuffer` across nested function calls needs an explicit keep-alive; a single-step gate won't catch the race, only a multi-step wall-clock twin-run will
+
+**What:** Optimization B (fusing `d_output`'s natural+transposed fp8
+quantize into one dual-output kernel) created the two output `DeviceBuffer`s
+in `matmul_bwd_lowp` and handed raw pointers 3 call-levels deep
+(`matmul_bwd_lowp` -> `matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_lowp`
+-> `lowp_gemm_devscale` -> `_matmul_cublaslt_fp8`). This is a DIFFERENT
+shape than every existing scratch-buffer pattern in `llmm/matmul.mojo`,
+which all create-and-consume a `DeviceBuffer` within a SINGLE function.
+`DeviceBuffer.__del__`'s docstring claims release is stream-ordered ("the
+actual deallocation may occur asynchronously after all operations using
+this buffer have completed"), and Mojo's ASAP/destroy-at-last-use means a
+buffer whose only remaining reference is inside the FIRST of two sibling
+nested calls gets destroyed before the SECOND call — which itself
+allocates its own scratch buffers — even runs. In practice this produced
+a real, reproducible race: a first implementation passed every unit test
+and the single-step `verify-fp8-grads` gate (which uses a small T=64
+fixed-batch single fwd+bwd step) but a full-scale (T=1024, 12 layers,
+B=4) 10-step wall-clock twin-run was NOT bit-identical — two back-to-back
+runs of the identical binary diverged starting at step 4, and a third run
+diverged differently again, i.e. run-to-run NONDETERMINISTIC (not merely
+"a new but consistent numerics path", which would rule out a race and
+just mean a legitimate behavior change). A single-step gradient dump run
+twice back-to-back stayed bit-identical throughout — the race needed the
+full multi-step, full-scale (larger buffers, more allocator churn from
+concurrent per-layer/per-step scratch creation) training loop to surface,
+not just more launches of the same shapes.
+
+**Fix:** two trivial keep-alive reads (`_ = buf.unsafe_ptr()`) at the end
+of the OUTER function, after both nested consumers have been called, so
+Mojo's liveness analysis keeps the buffer referenced through the whole
+function body rather than trusting the (real, but apparently
+insufficient at this call depth) stream-ordering guarantee alone. Three
+consecutive 10-step twin runs were bit-identical after the fix, and
+matched the pre-optimization baseline exactly.
+
+**Lesson for future cross-call buffer sharing in this codebase** (relevant
+to the deferred Optimization D — fusing weight/input's redundant pair
+across the forward/backward call boundary, a much deeper and longer-lived
+version of the same pattern): (1) any `DeviceBuffer` created in one
+function and consumed by a DIFFERENT (nested or sibling) function is a
+signal to add an explicit keep-alive at the creating function's end,
+covering every consumer, rather than relying on stream-ordered `__del__`
+alone; (2) a single-step, fixed-batch gate (`verify-fp8-grads`) is
+NECESSARY but not SUFFICIENT for this class of bug — always additionally
+run a multi-step, full-scale (matching the real training config, not the
+profiler's small default shapes) wall-clock twin-run before considering
+a memory-layout/lifetime-touching optimization done; (3) if a twin-run
+ever diverges, run a THIRD time before concluding anything — two runs
+alone cannot distinguish "consistently different because of a real (buggy
+or intentional) code-path change" from "randomly different because of a
+race", but three runs where none agree pairwise consistently (or where
+repeated re-runs keep landing on different trajectories) is strong
+evidence of the latter.
+
+**Source:** FP8 quant-opt Optimization B, 2026-07-10 (worktree
+`llmm-goal2-qopt`, branch `goal2/fp8-quant-opt`).
+
 ---
 
 ## Section summary
@@ -508,7 +566,7 @@ the 2026-07-10 quant-opt entry in `ai_assisted_optimizations_and_benchmarks.md`.
 | ARCHITECTURE | A1–A3 | A1–A2: design doc confirmed; A3: agent-reported |
 | FP8 CHUNK D/E | E1–E5 | Verified (E5: root-cause investigation, coordinator-accepted recalibration) |
 | FP8 CHUNK F | F1–F4 | Verified (gate codified + PASS, bit-stability PASS, 50-step envelope PASS, perf measured) |
-| FP8 QUANT-OPT | G1 | Verified (ncu sudo-gated counters, timing-comparison workaround) |
+| FP8 QUANT-OPT | G1-G2 | Verified (G1: ncu sudo-gated counters workaround; G2: race found + fixed, 3x twin-run confirmed) |
 
 ---
 

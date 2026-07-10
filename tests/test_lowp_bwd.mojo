@@ -35,7 +35,7 @@ from std.sys import has_nvidia_gpu_accelerator
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.testing import TestSuite, assert_true
 
-from llmm.lowp import FP8_SPEC
+from llmm.lowp import FP8_SPEC, quantize_devscale, quantize_transpose_devscale
 from llmm.amax import (
     AmaxState,
     compute_amax,
@@ -210,6 +210,24 @@ def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
         ctx,
     )
 
+    # Optimization B (docs/ai/ai_assisted_optimizations_and_benchmarks.md
+    # 2026-07-10 fp8-quant-opt entry): `matmul_d_input_bwd_lowp` now takes
+    # the natural-layout fp8 quantization of `d_output` as an input (it used
+    # to quantize it internally) -- `matmul_bwd_lowp` produces this via a
+    # single `quantize_dual_devscale` call shared with the wgrad sub-GEMM;
+    # this standalone test (which calls the dgrad sibling directly, not
+    # through `matmul_bwd_lowp`) reproduces just the natural-layout half
+    # with the plain `quantize_devscale`, which is bit-identical to
+    # `quantize_dual_devscale`'s natural output on the same input/scale.
+    var doutput_fp8_nat = ctx.enqueue_create_buffer[DType.uint8](ROWS * OC)
+    quantize_devscale[FP8_SPEC, FP8_SPEC.bwd_dtype, DType.bfloat16, "gpu"](
+        device_buf_mut_ptr(doutput_fp8_nat),
+        kernel_ptr_as_immut_bf16(d_output),
+        kernel_ptr_as_immut(device_buf_mut_ptr(doutput_state.scale)),
+        ROWS * OC,
+        ctx,
+    )
+
     # bf16 reference: the existing, already-validated matmul_d_input_bwd.
     if use_gelu_case:
         matmul_d_input_bwd[DType.bfloat16, "gpu", use_gelu=True](
@@ -242,6 +260,7 @@ def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
         matmul_d_input_bwd_lowp[DType.bfloat16, "gpu", use_gelu=True](
             device_buf_mut_ptr(d_input_lowp),
             kernel_ptr_as_immut_bf16(d_output),
+            device_buf_mut_ptr(doutput_fp8_nat),
             kernel_ptr_as_immut_bf16(weight),
             kernel_ptr_as_immut_bf16(pre_gelu),
             Int64(ROWS),
@@ -256,6 +275,7 @@ def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
         matmul_d_input_bwd_lowp[DType.bfloat16, "gpu", use_gelu=False](
             device_buf_mut_ptr(d_input_lowp),
             kernel_ptr_as_immut_bf16(d_output),
+            device_buf_mut_ptr(doutput_fp8_nat),
             kernel_ptr_as_immut_bf16(weight),
             kernel_ptr_as_immut_bf16(pre_gelu),
             Int64(ROWS),
@@ -321,6 +341,23 @@ def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
         ctx,
     )
 
+    # Optimization B (see the dgrad test above for the full rationale):
+    # `matmul_d_weight_bwd_lowp` now takes the TRANSPOSED-layout fp8
+    # quantization of `d_output` as an input; reproduce it here with the
+    # plain `quantize_transpose_devscale` (bit-identical to
+    # `quantize_dual_devscale`'s transposed output on the same input/scale).
+    var doutput_fp8_t = ctx.enqueue_create_buffer[DType.uint8](ROWS * OC)
+    quantize_transpose_devscale[
+        FP8_SPEC, FP8_SPEC.bwd_dtype, DType.bfloat16, "gpu"
+    ](
+        device_buf_mut_ptr(doutput_fp8_t),
+        kernel_ptr_as_immut_bf16(d_output),
+        kernel_ptr_as_immut(device_buf_mut_ptr(doutput_state.scale)),
+        ROWS,
+        OC,
+        ctx,
+    )
+
     var scratch = _zeros_bf16(ctx, ROWS * OC)  # unused by the cuBLASLt path
     if accumulate_case:
         matmul_d_weight_bwd[DType.bfloat16, "gpu", accumulate=True](
@@ -352,6 +389,7 @@ def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
         matmul_d_weight_bwd_lowp[DType.bfloat16, "gpu", accumulate=True](
             device_buf_mut_ptr(d_weight_lowp),
             kernel_ptr_as_immut_bf16(d_output),
+            device_buf_mut_ptr(doutput_fp8_t),
             kernel_ptr_as_immut_bf16(input),
             Int64(ROWS),
             Int64(1),
@@ -365,6 +403,7 @@ def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
         matmul_d_weight_bwd_lowp[DType.bfloat16, "gpu", accumulate=False](
             device_buf_mut_ptr(d_weight_lowp),
             kernel_ptr_as_immut_bf16(d_output),
+            device_buf_mut_ptr(doutput_fp8_t),
             kernel_ptr_as_immut_bf16(input),
             Int64(ROWS),
             Int64(1),

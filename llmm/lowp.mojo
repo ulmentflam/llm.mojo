@@ -762,6 +762,147 @@ def quantize_transpose_devscale[
     )
 
 
+# ===----------------------------------------------------------------------=== #
+# quantize_dual_devscale — Optimization B (docs/ai/
+# ai_assisted_optimizations_and_benchmarks.md 2026-07-10 fp8-quant-opt entry).
+#
+# The Optimization-A diagnosis's redundancy map found three (tensor, scale)
+# pairs each read from their bf16 source TWICE per step at the SAME scale —
+# once by `quantize` (natural layout), once by `quantize_transpose`
+# (transposed layout): weight (fwd natural + dgrad transposed), input (fwd
+# natural + wgrad transposed), d_output (dgrad natural + wgrad transposed).
+# `d_output`'s pair is the only one entirely local to a single call
+# (`matmul_bwd_lowp` in llmm/matmul.mojo calls both `matmul_d_input_bwd_lowp`
+# and `matmul_d_weight_bwd_lowp`, which are where its natural/transposed
+# copies were each separately re-quantized) — weight/input's redundant
+# pair crosses the forward/backward call boundary and would need a
+# persistent per-layer fp8 cache to fuse (bigger surgery, not attempted in
+# this pass; see the doc entry's Optimization D discussion).
+#
+# This kernel reads its bf16/fp32 source ONCE per tile and emits BOTH the
+# natural-layout AND the transposed-layout fp8 copy from that single read:
+# the natural output is written during phase 1 (same address it was just
+# read from — trivially coalesced, no shared-memory round trip needed for
+# it), and the transposed output is written during phase 2 exactly as
+# `_quantize_transpose_kernel_devscale` does (Optimization A's coalesced
+# tile transpose, reading back from the same shared-memory tile). Halves
+# the redundant global-memory traffic for the d_output pair versus calling
+# `quantize_devscale` + `quantize_transpose_devscale` separately.
+# ===----------------------------------------------------------------------=== #
+
+
+def _quantize_dual_kernel_devscale[
+    in_dtype: DType, out_dtype: DType, mode: Int
+](
+    nat_out_ptr: MutKernelPtr[DType.uint8],  # [rows, cols] row-major (natural)
+    trans_out_ptr: MutKernelPtr[DType.uint8],  # [cols, rows] row-major (T)
+    in_ptr: ImmutKernelPtr[in_dtype],  # [rows, cols] row-major
+    scale_ptr: ImmutKernelPtr[DType.float32],
+    rows: Int,
+    cols: Int,
+) -> None:
+    var scale = scale_ptr[0]
+    var tile = LayoutTensor[
+        in_dtype,
+        Layout.row_major(_QT_TILE, _QT_STRIDE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var tiles_rows = ceildiv(rows, _QT_TILE)
+    var tiles_cols = ceildiv(cols, _QT_TILE)
+    var total_tiles = tiles_rows * tiles_cols
+
+    var tx = Int(thread_idx.x) % _QT_TILE
+    var ty = Int(thread_idx.x) // _QT_TILE
+    comptime ROW_STEP = _QT_BLOCK // _QT_TILE
+
+    var bt = Int(block_idx.x)
+    while bt < total_tiles:
+        var tile_r = (bt // tiles_cols) * _QT_TILE
+        var tile_c = (bt % tiles_cols) * _QT_TILE
+
+        # Phase 1 — coalesced load from in_ptr into shared memory, AND
+        # (fused, free) a coalesced write of the NATURAL-layout output at
+        # the exact same address just read — no separate pass needed for
+        # the natural copy.
+        var r = ty
+        while r < _QT_TILE:
+            var gr = tile_r + r
+            var gc = tile_c + tx
+            if gr < rows and gc < cols:
+                var raw = in_ptr[gr * cols + gc]
+                tile.ptr[r * _QT_STRIDE + tx] = raw
+                var v = raw.cast[DType.float32]() * scale
+                nat_out_ptr[gr * cols + gc] = encode_fp8[out_dtype, mode](v)
+            r += ROW_STEP
+        barrier()
+
+        # Phase 2 — transposed, coalesced write to trans_out_ptr
+        # [cols,rows], identical to `_quantize_transpose_kernel_devscale`.
+        r = ty
+        while r < _QT_TILE:
+            var goc = tile_c + r
+            var gor = tile_r + tx
+            if goc < cols and gor < rows:
+                var v = (
+                    tile.ptr[tx * _QT_STRIDE + r].cast[DType.float32]() * scale
+                )
+                trans_out_ptr[goc * rows + gor] = encode_fp8[out_dtype, mode](v)
+            r += ROW_STEP
+        barrier()
+
+        bt += Int(grid_dim.x)
+
+
+def quantize_dual_devscale[
+    spec: PrecisionSpec,
+    out_dtype: DType,
+    in_dtype: DType,
+    target: StaticString,
+](
+    nat_out_ptr: MutKernelPtr[DType.uint8],
+    trans_out_ptr: MutKernelPtr[DType.uint8],
+    in_ptr: ImmutKernelPtr[in_dtype],
+    scale_ptr: ImmutKernelPtr[DType.float32],
+    rows: Int,
+    cols: Int,
+    ctx: DeviceContext,
+) raises -> None:
+    """Dual-output quantize (Optimization B): reads `in_ptr` ([rows,cols]
+    row-major) exactly ONCE and writes BOTH `nat_out_ptr` ([rows,cols],
+    `out[i] = encode(in[i] * scale)`) and `trans_out_ptr` ([cols,rows],
+    the fp8-quantized transpose) — see the module comment above for why
+    this is safe/profitable (same tensor, same scale, two orientations
+    needed by two different GEMM call sites in the same training step).
+
+    Bit-identical to calling `quantize_devscale` then
+    `quantize_transpose_devscale` separately on the same inputs (same
+    `encode_fp8` call per output element, same rounding) — purely a memory-
+    traffic optimization, not a numerics change.
+
+    GPU-only, same reasoning as `quantize`.
+    """
+    comptime assert is_gpu[target](), "quantize_dual_devscale is GPU-only"
+    var tiles_rows = ceildiv(rows, _QT_TILE)
+    var tiles_cols = ceildiv(cols, _QT_TILE)
+    var num_blocks = tiles_rows * tiles_cols
+    comptime kmode = RoundMode.SR if spec.stochastic_rounding else RoundMode.RNE
+    comptime kernel = _quantize_dual_kernel_devscale[in_dtype, out_dtype, kmode]
+    var compiled = ctx.compile_function[kernel]()
+    ctx.enqueue_function(
+        compiled,
+        nat_out_ptr,
+        trans_out_ptr,
+        in_ptr,
+        scale_ptr,
+        rows,
+        cols,
+        grid_dim=(num_blocks,),
+        block_dim=(_QT_BLOCK,),
+    )
+
+
 def precision_spec[name: StaticString]() -> PrecisionSpec:
     """Resolve a `LLMM_PRECISION` name ("fp32" | "bf16" | "fp8" | "fp4") to its
     `PrecisionSpec`. "fp8" -> `FP8_SPEC`; "fp32"/"bf16" -> an inert placeholder

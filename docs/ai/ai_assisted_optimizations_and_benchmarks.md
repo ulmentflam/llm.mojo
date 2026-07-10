@@ -2024,3 +2024,144 @@ FineWeb checkpoint/shards/B/T as Chunk F, `-x 26 -v 0 -s 0`):
 Optimization A alone** — right at the primary target (<=155 ms). The
 ambitious target (<=145 ms) is not yet reached; see Optimization B below
 for the next lever attempted.
+
+### Optimization B — dual-output quantize for the `d_output` redundant pair
+
+Per the diagnosis's redundancy map, `d_output` is quantized twice per site
+per step at the same scale: once naturally (dgrad, `matmul_d_input_bwd_lowp`)
+and once transposed (wgrad, `matmul_d_weight_bwd_lowp`) — both calls live
+inside `matmul_bwd_lowp`, so this pair (unlike weight/input's, which cross
+the forward/backward call boundary — see "Optimizations not attempted"
+below) needs no persistent cross-call state to fuse.
+
+Added `quantize_dual_devscale`/`_quantize_dual_kernel_devscale`
+(`llmm/lowp.mojo`): reads `d_output` from its bf16 source exactly once per
+tile and writes BOTH the natural-layout fp8 copy (fused into phase 1's
+read — same address, no extra pass) and the transposed-layout copy (phase
+2, same coalesced tile-transpose as Optimization A). `matmul_bwd_lowp`
+calls it once, right after `doutput_state.update_scale`, then passes the
+two resulting buffers into `matmul_d_input_bwd_lowp`/
+`matmul_d_weight_bwd_lowp` (both gained a `doutput_fp8_{nat,t}_ptr`
+parameter; they no longer quantize `d_output` themselves). `lowp_gemm_
+devscale` gained a `quantize_b: Bool = True` comptime flag so its two
+callers can skip the (now redundant) internal quantize of `b` — default
+`True` keeps every other call site byte-for-byte unchanged.
+
+**A real bug found and fixed during this optimization — buffer lifetime
+across the new cross-call boundary:** the first implementation created
+`doutput_fp8_nat`/`doutput_fp8_t` as local `DeviceBuffer`s in
+`matmul_bwd_lowp` and passed raw pointers into the two nested calls. This
+passed every unit test and the single-step `verify-fp8-grads` gate, but a
+10-step **wall-clock training twin-run was NOT bit-identical** — two
+back-to-back runs of the identical binary/checkpoint/data diverged
+starting at step 4 (`loss 3.515555` vs the correct `3.515840`), while a
+THIRD run matched neither exactly deterministically (each run was
+internally deterministic once fixed, but which trajectory a given run
+landed on was not, ruling out a legitimate new-but-consistent numerics
+path and confirming a genuine race). A single-step gradient dump
+(`make verify-fp8-grads`, T=64, `gpt2_124M_debug_state.bin`) run twice
+back-to-back was bit-identical — the race did not reproduce at that
+small scale/single-step depth, only across the full T=1024 x 12-layer x
+10-step training loop, which is why the codified single-step gate did not
+catch it (see the new gotcha below). Root-caused to
+`doutput_fp8_nat`/`doutput_fp8_t`'s Mojo destroy-at-last-use: `doutput_
+fp8_nat`'s last textual use in `matmul_bwd_lowp` is inside the
+`matmul_d_input_bwd_lowp(...)` call, before `matmul_d_weight_bwd_lowp`
+(which allocates its own scratch buffers) even runs — `DeviceBuffer.
+__del__`'s release is documented as stream-ordered ("the actual
+deallocation may occur asynchronously after all operations using this
+buffer have completed"), but nothing in this call chain's 3-levels-deep
+pointer hand-off (`matmul_bwd_lowp` -> `matmul_d_input_bwd_lowp` ->
+`lowp_gemm_devscale` -> `_matmul_cublaslt_fp8`) depended on or verified
+that guarantee held at this depth. **Fix:** two explicit keep-alive reads
+(`_ = doutput_fp8_nat.unsafe_ptr()`, same for `doutput_fp8_t`) at the very
+end of `matmul_bwd_lowp`, after both consumers, so Mojo's liveness
+analysis keeps both buffers referenced through the whole function body
+regardless of the nested calls' internal pointer usage. After the fix:
+three consecutive 10-step twin runs were bit-identical to each other AND
+to the pre-Optimization-B baseline.
+
+**Gates** (after the fix):
+
+| gate | result |
+|---|---|
+| `tests/test_lowp_gemm.mojo`/`test_amax.mojo`/`test_lowp_bwd.mojo`/`test_matmul_fwd_lowp.mojo` (updated for the new `matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_lowp` signatures) | all PASS |
+| `make verify-fp8-grads` | PASS — identical numbers to Chunk F/Optimization A (cosine min 0.9366/median 0.9870/max 0.9993; relL2 min 0.0412/median 0.1742/max 0.4616) |
+| fp8 10-step twin run x3 | bit-identical across all 3 runs, and identical to the pre-Optimization-B baseline |
+| `make build` / `build-bf16` / `build-fp8` / `build-profile-fp8` | all 4 compile clean |
+
+**Measured deltas** (1-step `ncu`, `PROFILE_T=1024`):
+
+| kernel | calls (before) | calls (after) | µs (before) | µs (after) |
+|---|---:|---:|---:|---:|
+| `quantize_dual_kernel_devscale` (new, d_output E5M2) | 0 | 48 | 0 | 8,762.9 |
+| `quantize_transpose` (E5M2, d_output-T, now wgrad-only via dual) | 48 | 0 | 7,741.5 | 0 |
+| `quantize` (E5M2, d_output natural, now dgrad-only via dual) | 48 | 0 | 5,804.4 | 0 |
+| `quantize_transpose` (E4M3, weight-T + input-T, unchanged) | 96 | 96 | 7,854.9 | 7,718.2 (noise) |
+| `quantize` (E4M3, weight + input natural, unchanged) | 96 | 96 | 5,553.4 | 5,514.7 (noise) |
+| `amax_*` family (unchanged) | 576 | 576 | 7,017.7 | 7,085.2 (noise) |
+| **quantize family total** | | | **33,972.0** | **29,081.0** |
+| **quantize family % of total GPU time** | | | 19.0% | **16.8%** |
+| **Total GPU time (1 step)** | | | 178,547.2 | **173,571.3** |
+| **Total kernel launches (1 step)** | 1,454 | **1,406** | | |
+
+The d_output pair's combined cost dropped from 13,545.9 us (separate
+natural + transpose) to 8,762.9 us (dual) — a 35.3% reduction for that
+pair, and 48 fewer kernel launches/step (one dual launch replaces two).
+
+**Wall-clock** (interleaved rounds, arm order flipped, n=25/arm/round,
+step 1 excluded, same protocol as Optimization A):
+
+| arm | round 1 median | round 2 median | combined median (n=50) |
+|---|---:|---:|---:|
+| fp8 (Optimization A+B) | 153.28 ms | 151.64 ms | **152.48 ms** |
+| bf16 (baseline, unchanged) | 135.22 ms | 136.70 ms | **135.85 ms** |
+| **fp8/bf16 ratio** | | | **1.122x** (was 1.145x after A alone, 1.363x pre-optimization) |
+
+**fp8 step time: 155.06 ms -> 152.48 ms**, a further 1.7% reduction from
+Optimization B (cumulative: 183.7 -> 152.48 ms, **17.0% total reduction**).
+Comfortably past the primary <=155 ms target; the ambitious <=145 ms
+target is not reached.
+
+### Optimizations not attempted this pass — C and D, with numbers
+
+**Optimization C (batch the tiny amax/update_scale kernels):** re-measured
+post-A/B, the `amax_partial`/`amax_aggregate`/`update_scale`/`amax_state_
+init` family is 7,085.2 us — **4.1% of total GPU time**, essentially
+unchanged from Chunk F's original 3.3% estimate (noise-level drift, not a
+real regression). Batching all sites' `update_scale`/`amax_state_init`
+into one launch each would need to hoist those calls out of their current
+positions (interspersed per-layer, per-site inside `matmul_fwd_lowp`/
+`matmul_bwd_lowp`) into a deferred end-of-pass batch, touching `LowpState`
+and every forward/backward call site in `train_gpt2.mojo` — a real
+restructuring for, at best, shaving a few percent off an already-cheap
+4.1%. Per Chunk F's own roadmap note ("cheap and not worth touching") and
+this re-measurement confirming it, **not attempted this pass** — the
+expected value is low relative to the surgery required.
+
+**Optimization D (fuse weight/input's redundant pair across the fwd/bwd
+boundary):** the diagnosis's redundancy map has THREE pairs, not one —
+Optimization B only fused `d_output`'s (the one entirely local to
+`matmul_bwd_lowp`). `weight` (fwd natural + dgrad transposed) and `input`
+(fwd natural + wgrad transposed) are each still quantized twice, but
+fusing them would mean caching a forward-computed fp8 copy in a
+per-layer, per-site buffer that survives from the forward pass into
+backward (weight/input's scale doesn't change between fwd and bwd within
+one step — `weight_state`/`input_state` are not re-`update_scale`d
+between them, per the existing "once per step" contract) — a `LowpState`
+change (new persistent device buffers, ~333 MB total at this model
+size: `weight` ~81 MB + `input` ~252 MB transposed-fp8 across 12 layers x
+4 sites, trivial against this box's 121 GB unified memory) plus signature
+changes to `matmul_fwd_lowp`/`matmul_d_input_bwd_lowp`/`matmul_d_weight_
+bwd_lowp` and their `train_gpt2.mojo` call sites (8 sites, not the 4 this
+pass touched). Expected additional saving is comparable to Optimization
+B's per-pair result (roughly another ~9,000-10,000 us/step, maybe another
+4-5% off total GPU time) — real, but Optimization B's local, single-
+function version of the SAME kind of cross-buffer fusion already
+surfaced a genuine race (see above); a fwd-to-bwd-spanning version is
+materially higher risk (persistent state across ~24 intervening GEMM
+calls across 12 layers, not 2 calls in one function) for a smaller
+proportional return than Optimization B delivered. **Not attempted this
+pass** — flagged as the clearest remaining lever for a future session,
+with the buffer-lifetime gotcha below as required reading before
+attempting it.

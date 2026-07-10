@@ -59,6 +59,7 @@ from llmm.lowp import (
     quantize_transpose,
     quantize_devscale,
     quantize_transpose_devscale,
+    quantize_dual_devscale,
 )
 from llmm.amax import (
     AmaxState,
@@ -886,6 +887,7 @@ def lowp_gemm_devscale[
     target: StaticString,
     transpose_a: Bool = False,
     transpose_b: Bool = False,
+    quantize_b: Bool = True,
 ](
     d_ptr: MutKernelPtr[out_dtype],
     a_ptr: ImmutKernelPtr[in_dtype],
@@ -915,6 +917,18 @@ def lowp_gemm_devscale[
     call sites (Chunk D/E) use once an `AmaxState` is in the loop. See
     `quantize_devscale`'s docstring in llmm/lowp.mojo for why a host-scale
     call site would force a host readback here.
+
+    `quantize_b` (Optimization B, docs/ai/ai_assisted_optimizations_and_
+    benchmarks.md 2026-07-10 fp8-quant-opt entry): when False, `b_ptr` is
+    NOT read/quantized here — the caller must have already filled
+    `b_fp8_scratch` (in the layout `transpose_b` implies) via
+    `quantize_dual_devscale` (llmm/lowp.mojo), e.g. because the same bf16
+    tensor at the same scale also needs the OTHER (non-`b`) orientation at
+    another call site this step, and a fused dual-output kernel already
+    produced both from a single read. `b_ptr` is still accepted (unused in
+    this branch) to keep the signature — and every `transpose_b=True/False`
+    instantiation of this generic function — uniform. Default True keeps
+    every existing call site's behavior byte-for-byte unchanged.
     """
     comptime assert is_gpu[target](), (
         "lowp_gemm_devscale is GPU-only per docs/ai/fp8_training_design.md"
@@ -936,14 +950,15 @@ def lowp_gemm_devscale[
             a_fp8_scratch, a_ptr, a_scale_ptr, m * k, ctx
         )
 
-    comptime if transpose_b:
-        quantize_transpose_devscale[FP8_SPEC, b_out_dtype, in_dtype, target](
-            b_fp8_scratch, b_ptr, b_scale_ptr, k, n, ctx
-        )
-    else:
-        quantize_devscale[FP8_SPEC, b_out_dtype, in_dtype, target](
-            b_fp8_scratch, b_ptr, b_scale_ptr, n * k, ctx
-        )
+    comptime if quantize_b:
+        comptime if transpose_b:
+            quantize_transpose_devscale[
+                FP8_SPEC, b_out_dtype, in_dtype, target
+            ](b_fp8_scratch, b_ptr, b_scale_ptr, k, n, ctx)
+        else:
+            quantize_devscale[FP8_SPEC, b_out_dtype, in_dtype, target](
+                b_fp8_scratch, b_ptr, b_scale_ptr, n * k, ctx
+            )
 
     _matmul_cublaslt_fp8[a_out_dtype, b_out_dtype, out_dtype](
         d_ptr,
@@ -2419,6 +2434,7 @@ def matmul_d_input_bwd_lowp[
 ](
     d_input_ptr: MutKernelPtr[dtype],
     d_output_ptr: ImmutKernelPtr[dtype],
+    doutput_fp8_nat_ptr: MutKernelPtr[DType.uint8],
     weight_ptr: ImmutKernelPtr[dtype],
     pre_gelu_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,
@@ -2432,6 +2448,15 @@ def matmul_d_input_bwd_lowp[
     """fp8 dgrad: `d_input = d_output @ weight` via `lowp_gemm_devscale`.
     `weight_state`/`doutput_state` are read-only here (not `mut`) — see the
     module comment above for why neither is updated in this function.
+
+    `doutput_fp8_nat_ptr` (Optimization B, docs/ai/ai_assisted_
+    optimizations_and_benchmarks.md 2026-07-10 fp8-quant-opt entry): the
+    natural-layout fp8 quantization of `d_output`, already produced by
+    `matmul_bwd_lowp`'s single `quantize_dual_devscale` call (shared with
+    `matmul_d_weight_bwd_lowp`'s transposed copy — same tensor, same scale,
+    one read instead of two). `d_output_ptr` (bf16) is still accepted only
+    to satisfy `lowp_gemm_devscale`'s uniform signature under
+    `quantize_b=False` — it is not read.
     """
     comptime assert is_gpu[target](), (
         "matmul_d_input_bwd_lowp is GPU-only per"
@@ -2444,9 +2469,6 @@ def matmul_d_input_bwd_lowp[
     var weight_t_scratch = ctx.enqueue_create_buffer[DType.uint8](
         in_channels * out_channels
     )
-    var doutput_scratch = ctx.enqueue_create_buffer[DType.uint8](
-        rows * out_channels
-    )
 
     lowp_gemm_devscale[
         FP8_SPEC.fwd_dtype,
@@ -2456,12 +2478,13 @@ def matmul_d_input_bwd_lowp[
         target,
         transpose_a=True,
         transpose_b=False,
+        quantize_b=False,
     ](
         d_input_ptr,
         weight_ptr,
         d_output_ptr,
         device_buf_mut_ptr(weight_t_scratch),
-        device_buf_mut_ptr(doutput_scratch),
+        doutput_fp8_nat_ptr,
         kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
         kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale_inv)),
         kernel_ptr_as_immut(device_buf_mut_ptr(doutput_state.scale)),
@@ -2485,6 +2508,7 @@ def matmul_d_weight_bwd_lowp[
 ](
     d_weight_ptr: MutKernelPtr[dtype],
     d_output_ptr: ImmutKernelPtr[dtype],
+    doutput_fp8_t_ptr: MutKernelPtr[DType.uint8],
     input_ptr: ImmutKernelPtr[dtype],
     batch_size: Int64,
     seq_len: Int64,
@@ -2497,6 +2521,13 @@ def matmul_d_weight_bwd_lowp[
     """fp8 wgrad: `d_weight = d_output^T @ input` via `lowp_gemm_devscale`.
     `input_state`/`doutput_state` are read-only here (not `mut`) — see the
     module comment above for why neither is updated in this function.
+
+    `doutput_fp8_t_ptr` (Optimization B — see `matmul_d_input_bwd_lowp`'s
+    docstring): the transposed-layout fp8 quantization of `d_output`,
+    already produced by `matmul_bwd_lowp`'s single `quantize_dual_devscale`
+    call. `d_output_ptr` (bf16) is still accepted only to satisfy
+    `lowp_gemm_devscale`'s uniform signature under `quantize_b=False` — it
+    is not read.
     """
     comptime assert is_gpu[target](), (
         "matmul_d_weight_bwd_lowp is GPU-only per"
@@ -2509,9 +2540,6 @@ def matmul_d_weight_bwd_lowp[
     var input_t_scratch = ctx.enqueue_create_buffer[DType.uint8](
         in_channels * rows
     )
-    var doutput_t_scratch = ctx.enqueue_create_buffer[DType.uint8](
-        out_channels * rows
-    )
 
     lowp_gemm_devscale[
         FP8_SPEC.fwd_dtype,
@@ -2521,12 +2549,13 @@ def matmul_d_weight_bwd_lowp[
         target,
         transpose_a=True,
         transpose_b=True,
+        quantize_b=False,
     ](
         d_weight_ptr,
         input_ptr,
         d_output_ptr,
         device_buf_mut_ptr(input_t_scratch),
-        device_buf_mut_ptr(doutput_t_scratch),
+        doutput_fp8_t_ptr,
         kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
         kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale_inv)),
         kernel_ptr_as_immut(device_buf_mut_ptr(doutput_state.scale)),
@@ -2580,6 +2609,17 @@ def matmul_bwd_lowp[
     updated them during this same step's forward pass, before backward ever
     runs (see `matmul_d_input_bwd_lowp`'s docstring / the module comment
     above).
+
+    Optimization B (docs/ai/ai_assisted_optimizations_and_benchmarks.md
+    2026-07-10 fp8-quant-opt entry): `d_output` is quantized exactly ONCE
+    here — natural AND transposed fp8 copies from a single read, via
+    `quantize_dual_devscale` — rather than `matmul_d_input_bwd_lowp` and
+    `matmul_d_weight_bwd_lowp` each separately re-reading/re-encoding it
+    from bf16 (they used to call `quantize_devscale`/
+    `quantize_transpose_devscale` on `d_output_ptr` internally; now they
+    take the pre-quantized buffers this function fills). Bit-identical to
+    the old two-separate-calls behavior (same `encode_fp8` per output
+    element at the same scale) — purely a memory-traffic optimization.
     """
     comptime if has_bias:
         matmul_bias_bwd[dtype, target, accumulate](
@@ -2604,9 +2644,26 @@ def matmul_bwd_lowp[
         kernel_ptr_as_immut(device_buf_mut_ptr(amax_doutput)), ctx
     )
 
+    var doutput_fp8_nat = ctx.enqueue_create_buffer[DType.uint8](
+        rows * out_channels
+    )
+    var doutput_fp8_t = ctx.enqueue_create_buffer[DType.uint8](
+        out_channels * rows
+    )
+    quantize_dual_devscale[FP8_SPEC, FP8_SPEC.bwd_dtype, dtype, target](
+        device_buf_mut_ptr(doutput_fp8_nat),
+        device_buf_mut_ptr(doutput_fp8_t),
+        d_output_ptr,
+        kernel_ptr_as_immut(device_buf_mut_ptr(doutput_state.scale)),
+        rows,
+        out_channels,
+        ctx,
+    )
+
     matmul_d_input_bwd_lowp[dtype, target, use_gelu](
         d_input_ptr,
         d_output_ptr,
+        device_buf_mut_ptr(doutput_fp8_nat),
         weight_ptr,
         pre_gelu_ptr,
         batch_size,
@@ -2620,6 +2677,7 @@ def matmul_bwd_lowp[
     matmul_d_weight_bwd_lowp[dtype, target, accumulate](
         d_weight_ptr,
         d_output_ptr,
+        device_buf_mut_ptr(doutput_fp8_t),
         input_ptr,
         batch_size,
         seq_len,
@@ -2629,6 +2687,20 @@ def matmul_bwd_lowp[
         doutput_state,
         ctx,
     )
+
+    # Explicit keep-alive: `doutput_fp8_nat`'s last textual use above is
+    # inside the `matmul_d_input_bwd_lowp` call (before `matmul_d_weight_bwd_
+    # lowp` even runs). Without this, Mojo's destroy-at-last-use could drop
+    # `doutput_fp8_nat`'s `DeviceBuffer` — and, transitively, let its
+    # backing allocation be reclaimed/reused by a scratch buffer one of the
+    # nested calls below allocates — before the dgrad GEMM that reads it
+    # has actually been issued to completion. `DeviceBuffer.__del__`'s
+    # release is itself stream-ordered (per its docstring), but keeping
+    # both buffers referenced through the end of this function removes any
+    # dependency on that guarantee reaching this deep a call chain
+    # correctly. Cheap (a pointer read), not a kernel launch.
+    _ = doutput_fp8_nat.unsafe_ptr()
+    _ = doutput_fp8_t.unsafe_ptr()
 
 
 # ===----------------------------------------------------------------------=== #
