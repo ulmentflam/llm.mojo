@@ -3659,3 +3659,98 @@ envelope shows no drift and zero NaN/Inf; no STOP condition triggered.
 New gotchas: F7 (fresh-build first-invocation bit-stability fragility,
 `low_precision_gotchas.md`) and F8 (the `_rht_transpose_prep` fix
 attempt/revert writeup, same file).
+
+## 2026-07-10 — Integration verification: assembly of goal1+goal2+goal3b (`integrate/all-goals`)
+
+Independent verification pass over `integrate/all-goals` (HEAD `bae04b2`,
+the merge of today's three campaigns: goal1 TF32+LN-redesign+dbias perf
+work, goal2 FP8 training+quant-opt, goal3b FP4 training), run from a
+dedicated worktree. Each campaign passed its gates on its own branch;
+this pass exists because merges can compose incorrectly even when they
+compile — this integration session had already caught one dropped-section
+merge and one cross-call buffer-lifetime race before this verification
+ran. All four binaries (fp32/bf16/fp8/fp4) confirmed freshly built (mtime
+newer than every tracked source file) before any gate ran.
+
+**Gate 1 — `make verify-gpu` (strict IEEE fp32, TF32 off): PASS.** 16/16
+gradient tensors OK (`dwte` … `dlnfb`, all four dbias grads included),
+10/10 step-loss checks OK against `gpt2_124M_debug_state.bin`.
+
+**Gate 2 — `make verify-gpu-tf32`: PASS.** Same 16/16 tensor checks, 10/10
+step losses, max step-loss deviation ~0.0014 — well inside the
+TF32-calibrated `LOSS_STEP_TOL=0.02`.
+
+**Gate 3 — `make verify-cpu`: PASS, with one flake occurrence.** First
+attempt **FAILED** (exit 2) with the documented F7-adjacent signature: 7 of
+16 tensors NOT OK with l2-ratios clustered at ~0.60–0.70 (`dln2b` 0.599,
+`dfcw` 0.599, `dfcb` 0.599, `dfcprojw` 0.605, `dfcprojb` 0.595, `dlnfw`
+1.324, `dlnfb` 0.697) and step losses diverging from step 1 onward
+(diffs 0.04–0.18, tol 0.01). Re-run immediately after: **PASS**, clean
+16/16 + 10/10, `overall okay: True`. Per protocol this is logged as a
+confirmed flake, not a regression — same failure shape as the
+already-documented F7-adjacent CPU flake, first occurrence seen this
+session.
+
+**Gate 4 — `make verify-fp8-grads`: PASS.** 148/148 tensors: cosine min
+0.9366 / median 0.9870 / max 0.9993; relL2 min 0.0412 / median 0.1742 /
+max 0.4616; 0 depth-monotonicity violations; 0 NaN/Inf. Matches the
+branch-era numbers (cosine ~0.937, median relL2 ~0.174) to 4 decimal
+places — zero numerical drift from the merge.
+
+**Gate 5 — GPU test suites: 85/85 PASS, 0 failures.**
+
+| suite | result |
+|---|---:|
+| test_lowp_gemm.mojo | 10/10 |
+| test_lowp_bwd.mojo | 5/5 |
+| test_amax.mojo | 19/19 |
+| test_rng_sr.mojo | 13/13 |
+| test_lowp_gemm_fp4.mojo | 8/8 |
+| test_nvfp4_quant.mojo | 18/18 |
+| test_hadamard.mojo | 5/5 |
+| test_matmul_fwd_fp4.mojo | 2/2 |
+| test_matmul_bwd_fp4.mojo | 5/5 |
+
+**Gate 6 — 10-step training trajectories, checkpoint-init tinyshakespeare
+(`-e gpt2_124M_bf16.bin -x 10 -v 0 -s 0`, all three precisions share the
+same checkpoint), each binary run twice per the F7 fresh-build caveat:**
+
+- **bf16**: run 1 showed the known F7 fresh-build drift (step 1 exact
+  match 4.369226/17.1131, but steps 3+ off by up to ~0.20%, e.g. step 4
+  4.018247 vs known 4.026239). Run 2 matched the known trajectory closely
+  at every step (step 1 4.369226/17.1131 exact; step 2 4.418465 exact;
+  step 3 4.510433 exact; remaining steps within noise). Using run 2 per
+  protocol: **PASS**.
+- **fp8**: both runs consistent with each other (no F7 divergence
+  observed) and with bf16 run 2. Median `|relative loss delta|` (fp8 vs
+  bf16 run 2, n=10) **0.57%**, matching the branch-era 50-step envelope
+  (median 0.57%) almost exactly. **PASS** (well inside the ~0.6% envelope).
+- **fp4**: both runs bitwise-identical through step 4, negligible drift
+  after (deterministic quantize path). Step 1 matches the branch-era
+  reference exactly (4.408221/17.2049). Median `|relative loss delta|`
+  (fp4 vs bf16 run 2, n=10) **~0.90%**, matching the branch-era 50-step
+  envelope median (0.89%). **PASS** (inside the ~1% envelope).
+
+No NaN/Inf in any run, all six runs decreasing losses, no STOP condition
+triggered.
+
+**Gate 7 — step-time sanity (not official).** Derived from the twin runs
+above (6 runs total, back-to-back under one GPU-lock window — not a
+full arm-flipped interleave, but close enough in time to catch a
+wrong-version function surviving the merge):
+
+| precision | mean ms/step (n=18, steps 2–10 × 2 runs) | median ms/step | branch-era target | delta |
+|---|---:|---:|---:|---:|
+| bf16 | 132.86 | 132.95 | ~134 | −0.78% |
+| fp8  | 149.21 | 149.30 | ~152 | −1.78% |
+| fp4  | 182.59 | 182.71 | ~184 | −0.70% |
+
+All three within 2% of the branch-era targets, well under the 5%
+flag threshold — no evidence of a wrong-version kernel or dispatch path
+surviving the merge.
+
+**Overall verdict: the assembly holds.** All 7 verification items PASS
+(one confirmed CPU-gate flake, self-resolved on re-run, consistent with
+prior sightings). No numerical or performance regression attributable to
+the merge was found. Commit: see the integration-verification entry
+commit immediately following this one on `integrate/all-goals`.
