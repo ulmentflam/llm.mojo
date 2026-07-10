@@ -69,9 +69,12 @@ from llmm.amax import (
 )
 from llmm.nvfp4_quant import (
     nvfp4_quantize,
+    nvfp4_packed_size,
+    nvfp4_scale_buffer_size,
     ROUND_MODE_RNE,
     NVFP4_SR_SEED,
     NVFP4_SR_STREAM,
+    NVFP4_BLOCK,
 )
 
 
@@ -1946,6 +1949,111 @@ def matmul_fwd_lowp[
     # 3. Bias (+GELU) epilogue in bf16, same standalone kernel matmul_fwd's
     #    vendor-neutral GPU branch uses (cuBLASLt fp8 has restricted
     #    epilogue support — design §5 point 1).
+    comptime if has_bias or use_gelu:
+        bias_gelu_fwd[dtype, target, has_bias=has_bias, use_gelu=use_gelu](
+            out_ptr, pre_gelu_ptr, bias_ptr, rows, out_channels, ctx
+        )
+
+
+def matmul_fwd_fp4[
+    dtype: DType,
+    target: StaticString,
+    use_gelu: Bool = False,
+    has_bias: Bool = True,
+](
+    out_ptr: MutKernelPtr[dtype],
+    pre_gelu_ptr: MutKernelPtr[dtype],
+    input_ptr: ImmutKernelPtr[dtype],
+    weight_ptr: ImmutKernelPtr[dtype],
+    bias_ptr: ImmutKernelPtr[dtype],
+    batch_size: Int64,
+    seq_len: Int64,
+    channels: Int64,
+    output_channels: Int64,
+    ctx: DeviceContext,
+) raises -> None:
+    """NVFP4 forward linear: `out = gelu?(bias? + input @ weightᵀ)`, the
+    fp4 sibling of `matmul_fwd_lowp` (fp8, above) — same geometry as
+    `matmul_fwd`, but the GEMM runs NVFP4 x NVFP4 -> bf16 via
+    `lowp_gemm_fp4` (forward orientation, matching `matmul_fwd_lowp`'s
+    weight-as-A/input-as-B convention: `a`=`weight_ptr`
+    `[out_channels,channels]` -> `m`=`out_channels`, `b`=`input_ptr`
+    `[rows,channels]` -> `n`=`rows`, so the column-major `D` cuBLASLt
+    writes lands as the `[rows,out_channels]` row-major buffer `out_ptr`
+    expects — see `lowp_gemm`'s docstring for the derivation).
+
+    Per `docs/ai/fp4_training_recipes_research.md` §1 ("2D vs 1D
+    scaling"): the weight operand uses 2D 16x16 block scaling
+    (`a_block_rows=NVFP4_BLOCK`, so the same quantized weight buffer can
+    serve both Fprop row-major and a future Dgrad column-major read
+    without requantizing — not exercised here, T2's scope), the
+    activation operand uses 1D 1x16 (`b_block_rows=1`). Fprop is always
+    RNE (`round_mode` left at its `ROUND_MODE_RNE` default) — stochastic
+    rounding is reserved for gradient operands (T2, Dgrad/Wgrad).
+
+    Unlike `matmul_fwd_lowp`, there is no `AmaxState`/delayed-scaling
+    argument: `nvfp4_quantize` (inside `lowp_gemm_fp4`) computes both
+    scale levels (fp32 per-tensor + e4m3 per-block) fresh, fully
+    device-resident, every call — see `llmm/lowp.mojo`'s `FP4_SPEC`
+    comment ("decision: FP4 does not use `AmaxState` at all"). Scratch
+    buffers (packed e2m1 + swizzled scale buffers + 1-elem tensor scales)
+    are freshly enqueued each call, mirroring `matmul_fwd_lowp`'s
+    `ctx.enqueue_create_buffer` scratch pattern above.
+
+    GPU-only (comptime-asserted, landmine #1): fp4 is never instantiated
+    for the `cpu` target.
+    """
+    comptime assert is_gpu[target](), (
+        "matmul_fwd_fp4 is GPU-only per docs/ai/fp8_training_design.md"
+        " landmine #1 (low-precision kernels must never be instantiated for"
+        " the cpu target)"
+    )
+    var rows = Int(batch_size * seq_len)
+    var in_channels = Int(channels)
+    var out_channels = Int(output_channels)
+
+    # a = weight [out_channels, in_channels], 2D 16x16 block scale.
+    # b = input  [rows, in_channels], 1D 1x16 block scale.
+    var a_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_packed_size(out_channels, in_channels)
+    )
+    var a_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_scale_buffer_size(out_channels, in_channels, NVFP4_BLOCK)
+    )
+    var a_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+    var b_q_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_packed_size(rows, in_channels)
+    )
+    var b_scale_scratch = ctx.enqueue_create_buffer[DType.uint8](
+        nvfp4_scale_buffer_size(rows, in_channels, 1)
+    )
+    var b_tensor_scale_scratch = ctx.enqueue_create_buffer[DType.float32](1)
+
+    lowp_gemm_fp4[
+        dtype,
+        dtype,
+        target,
+        a_block_rows=NVFP4_BLOCK,
+        b_block_rows=1,
+    ](
+        out_ptr,
+        weight_ptr,
+        input_ptr,
+        device_buf_mut_ptr(a_q_scratch),
+        device_buf_mut_ptr(a_scale_scratch),
+        device_buf_mut_ptr(a_tensor_scale_scratch),
+        device_buf_mut_ptr(b_q_scratch),
+        device_buf_mut_ptr(b_scale_scratch),
+        device_buf_mut_ptr(b_tensor_scale_scratch),
+        out_channels,
+        rows,
+        in_channels,
+        False,
+        ctx,
+    )
+
+    # Bias (+GELU) epilogue in bf16 — same standalone kernel matmul_fwd_lowp
+    # uses (lowp_gemm_fp4 has no fused epilogue of its own).
     comptime if has_bias or use_gelu:
         bias_gelu_fwd[dtype, target, has_bias=has_bias, use_gelu=use_gelu](
             out_ptr, pre_gelu_ptr, bias_ptr, rows, out_channels, ctx

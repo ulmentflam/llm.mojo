@@ -49,6 +49,7 @@ from llmm.matmul import (
     matmul_bwd,
     matmul_fwd_lowp,
     matmul_bwd_lowp,
+    matmul_fwd_fp4,
 )
 from llmm.softmax import softmax_fwd, softmax_bwd
 from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
@@ -142,7 +143,17 @@ comptime LOWP_ENABLED = PRECISION == "fp8" or PRECISION == "fp4"
 # per-block backward sites onto their bf16 `matmul_bwd` else-branch, so a grad
 # dump splits the fp8 error budget into forward-only vs forward+backward. Default
 # (flag unset) is full fp8 backward, byte-identical to before this knob existed.
-comptime LOWP_BWD_ENABLED = LOWP_ENABLED and not is_defined[
+#
+# fp8-only (NOT `LOWP_ENABLED`): the four `matmul_bwd_lowp` backward sites are
+# fp8-specific (E5M2 `d_output` operand via `LowpState`'s `*_doutput`
+# `AmaxState`s — see that struct's docstring). FP4 backward (SR on gradient
+# operands + RHT on Wgrad inputs, per
+# docs/ai/fp4_training_recipes_research.md §1) is chunk T2's scope, not yet
+# built; an fp4 build must fall through to the same bf16 `matmul_bwd`
+# else-branch fp32/bf16 use (this chunk's gate (d) is explicitly "fp4
+# fwd-only + bf16 bwd") rather than silently running fp8's backward
+# machinery on an fp4 forward pass.
+comptime LOWP_BWD_ENABLED = (PRECISION == "fp8") and not is_defined[
     "LLMM_FP8_FWD_ONLY"
 ]()
 comptime STORAGE_DTYPE = (
@@ -157,6 +168,24 @@ comptime MASTER_DTYPE = DType.float32
 # change and automatically also gate fp8/fp4 off the CPU target (landmine #1).
 comptime USE_BF16 = STORAGE_DTYPE == DType.bfloat16
 comptime SPEC = precision_spec[PRECISION]()
+
+# FP4 layer-range policy (docs/ai/fp4_training_recipes_research.md §1
+# "Selective high-precision layers"): NVFP4 applies ONLY to the MLP linears
+# (fc/fc_proj) of MIDDLE transformer blocks; qkv/attn_proj/attention/LN/
+# embeddings/LM-head stay bf16 EVERYWHERE regardless of PRECISION (see the
+# four call sites below — only two of the four Matmul sites even consult
+# these bounds). `LLMM_FP4_FIRST` defaults to 2 (first 2 blocks stay bf16).
+# `LLMM_FP4_LAST` defaults to `num_layer - 2` (final 2 blocks stay bf16) —
+# resolved at runtime (`-1` sentinel below) since `num_layer` is a runtime
+# value (the model descriptor, e.g. `-e d12`, is not known at comptime), not
+# a comptime constant; override either bound with
+# `-D LLMM_FP4_FIRST=<int>`/`-D LLMM_FP4_LAST=<int>` (e.g. for the 12-layer
+# d12 default this is layers [2, 10), i.e. layers 2..9 in fp4, matching the
+# recipe's "first ~2 and final several blocks stay bf16" for a small model).
+# Only elaborated/consulted under `PRECISION == "fp4"` — inert (unread) for
+# every other PRECISION value.
+comptime LLMM_FP4_FIRST = get_defined_int["LLMM_FP4_FIRST", 2]()
+comptime LLMM_FP4_LAST_OVERRIDE = get_defined_int["LLMM_FP4_LAST", -1]()
 comptime GPT2_MAGIC = 20240520
 # llm.c's model-file magic (the HF starter-pack gpt2_124M*.bin that `make data`
 # downloads); same header layout and version convention as ours.
@@ -172,6 +201,23 @@ comptime INIT_WEIGHT_STD = Float32(0.02)
 # GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
 comptime SCRATCH_VOCAB_SIZE = 50257
 comptime SCRATCH_PADDED_VOCAB_SIZE = 50304
+
+
+@always_inline
+def _layer_in_fp4_range(layer: Int, num_layers: Int) -> Bool:
+    """True if `layer` falls in the FP4-eligible middle-block range (the
+    `LLMM_FP4_FIRST`/`LLMM_FP4_LAST` comptime constants above) — the recipe's
+    "first ~2 and final several blocks stay bf16" policy. `LLMM_FP4_LAST`'s
+    `-1` sentinel resolves to `num_layers - 2` here (runtime, since
+    `num_layers` is not a comptime value). Only meaningful under
+    `PRECISION == "fp4"`; call sites comptime-gate on that before consulting
+    this (see the FC/Proj matmul sites in the forward pass).
+    """
+    var fp4_last = (
+        LLMM_FP4_LAST_OVERRIDE if LLMM_FP4_LAST_OVERRIDE
+        >= 0 else num_layers - 2
+    )
+    return layer >= LLMM_FP4_FIRST and layer < fp4_last
 
 
 # ===----------------------------------------------------------------------=== #
@@ -2130,8 +2176,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
 
-            # Matmul QKV.
-            comptime if LOWP_ENABLED:
+            # Matmul QKV. Always bf16, even under LLMM_PRECISION=fp4 (the
+            # recipe keeps attention's QKV/out proj + softmax out of FP4 —
+            # docs/ai/fp4_training_recipes_research.md §1 "Selective
+            # high-precision layers"); only PRECISION=="fp8" takes the
+            # matmul_fwd_lowp path here.
+            comptime if PRECISION == "fp8":
                 matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](l_qkv),
                     as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
@@ -2203,8 +2253,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 cache=rebind[KVCachePtr](UnsafePointer(to=self.kv_cache)),
             )
 
-            # Matmul Attn Proj
-            comptime if LOWP_ENABLED:
+            # Matmul Attn Proj. Always bf16 under fp4 (same rationale as the
+            # QKV site above — attention stays out of FP4 per the recipe).
+            comptime if PRECISION == "fp8":
                 matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](l_attn_proj),
                     as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
@@ -2249,8 +2300,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx,
             )
 
-            # Matmul FC (fused GELU).
-            comptime if LOWP_ENABLED:
+            # Matmul FC (fused GELU). One of the two FP4-eligible MLP
+            # linears (docs/ai/fp4_training_recipes_research.md §1): under
+            # PRECISION=="fp4", middle blocks (_layer_in_fp4_range) take
+            # matmul_fwd_fp4; first/last blocks fall through to the same
+            # bf16 matmul_fwd the fp32/bf16 builds use. fp8 is unchanged
+            # (matmul_fwd_lowp on every layer, byte-identical to before).
+            comptime if PRECISION == "fp8":
                 matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=True](
                     as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
                     as_mut_kernel[GPT2_DTYPE](l_fch),
@@ -2265,6 +2321,33 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.lowp_state.fc_weight[layer],
                     self.ctx,
                 )
+            elif PRECISION == "fp4":
+                if _layer_in_fp4_range(layer, num_layers):
+                    matmul_fwd_fp4[GPT2_DTYPE, Self.target, use_gelu=True](
+                        as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                        as_mut_kernel[GPT2_DTYPE](l_fch),
+                        as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
+                        Int64(batch_size),
+                        Int64(seq_len),
+                        Int64(channels),
+                        Int64(4 * channels),
+                        self.ctx,
+                    )
+                else:
+                    matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=True](
+                        as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                        as_mut_kernel[GPT2_DTYPE](l_fch),
+                        as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
+                        Int64(batch_size),
+                        Int64(seq_len),
+                        Int64(channels),
+                        Int64(4 * channels),
+                        self.ctx,
+                    )
             else:
                 matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=True](
                     as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
@@ -2279,8 +2362,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
 
-            # Matmul Proj.
-            comptime if LOWP_ENABLED:
+            # Matmul Proj. The other FP4-eligible MLP linear — same
+            # three-way dispatch as the FC site above.
+            comptime if PRECISION == "fp8":
                 matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](l_fc_proj),
                     as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
@@ -2295,6 +2379,33 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.lowp_state.proj_weight[layer],
                     self.ctx,
                 )
+            elif PRECISION == "fp4":
+                if _layer_in_fp4_range(layer, num_layers):
+                    matmul_fwd_fp4[GPT2_DTYPE, Self.target, use_gelu=False](
+                        as_mut_kernel[GPT2_DTYPE](l_fc_proj),
+                        as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                        as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
+                        Int64(batch_size),
+                        Int64(seq_len),
+                        Int64(4 * channels),
+                        Int64(channels),
+                        self.ctx,
+                    )
+                else:
+                    matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                        as_mut_kernel[GPT2_DTYPE](l_fc_proj),
+                        as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                        as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                        as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
+                        Int64(batch_size),
+                        Int64(seq_len),
+                        Int64(4 * channels),
+                        Int64(channels),
+                        self.ctx,
+                    )
             else:
                 matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](l_fc_proj),
