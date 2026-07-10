@@ -372,6 +372,113 @@ Coordinator merges to goal2/fp8-training when chunks complete.
 
 ---
 
+## FP8 CHUNK D/E (forward + backward integration)
+
+### E1 — fp8/bf16 builds MUST load the bf16 checkpoint, not the fp32 one
+
+**What:** Storage stays bf16 under `LLMM_PRECISION=fp8` (A1), so any fp8 or bf16 build reads
+`gpt2_124M_bf16.bin` (EXPECTED_VERSION=5), never `gpt2_124M.bin` (fp32). Tools select via
+`comptime checkpoint = "gpt2_124M_bf16.bin" if GPT2_DTYPE == DType.bfloat16 else "gpt2_124M.bin"`.
+Loading the fp32 checkpoint into a bf16-storage model mismatches element sizes on readback
+(cf. MEMORY.md `bf16-loss-buffer-dtype-mismatch`). The `dump_grads_gpt2.mojo` gate tool and any
+new fp8 harness must follow this.
+
+### E2 — `List[AmaxState]` requires an explicit `(Movable)` declaration
+
+**What:** `train_gpt2.mojo`'s `LowpState` holds a `List[AmaxState[FP8_SPEC]]` per site per layer.
+Mojo does not infer `Movable` conformance even when every field is movable, so `AmaxState` must
+declare `struct AmaxState[spec](Movable)`. Symptom without it: `List[AmaxState]()` fails with
+"has 'Movable' type, but value has type 'AnyStruct[AmaxState]'". No `__moveinit__` needed — the
+compiler-synthesized move is correct.
+
+### E3 — Sibling-function convention for the fp8 GEMM path (Chunk D/E)
+
+**What:** fp8 GEMMs are separate entry points (`matmul_fwd_lowp`, `matmul_bwd_lowp`,
+`matmul_d_input_bwd_lowp`, `matmul_d_weight_bwd_lowp`) called from a `comptime if LOWP_ENABLED:`
+branch, with the unmodified bf16 `matmul_fwd`/`matmul_bwd` in the `else:`. Rationale: the bf16
+signatures have no room for the per-site `AmaxState`s, and under bf16/fp32 the `else:` branch is
+the ONLY branch elaborated (byte-identical to pre-chunk code — the comptime-gating proof, gate b).
+Do not add fp8 parameters to the shared functions.
+
+### E4 — AmaxState single-update ownership (the "once per step" contract)
+
+**What:** Each `AmaxState.update_scale` call pushes this step's amax into the ring buffer;
+calling it twice for the same operand in one step double-pushes and poisons the delayed-scaling
+history. Ownership: **forward** (`matmul_fwd_lowp`) updates the input/weight (E4M3) states exactly
+once; **backward** reads those same states read-only (dgrad/wgrad only re-quantize the same bf16
+tensors at the already-current scale). The backward-only `d_output` (E5M2) state has no forward
+counterpart, so `matmul_bwd_lowp` updates it exactly once, before either sub-GEMM, and both dgrad
+and wgrad read the result. Warmup (`step < amax_history_len=16`) uses the current step's own amax;
+a never-updated state falls back to `scale=1.0` (only legitimately hit by an all-zero/NaN tensor).
+
+### E5 — INVESTIGATION (2026-07-10): the failing per-tensor gradient gate is EXPECTED error compounding, not a bug
+
+**Question:** Chunk E's per-tensor gradient gate (`dump_grads_gpt2.mojo` + `tests/compare_grad_dumps.py`,
+cos>0.99 && relL2<0.1 over all 148 param-grad tensors, fp8 fwd+bwd vs bf16 reference, one step on
+`gpt2_124M_debug_state.bin`) passes only 9/148 (median cosine 0.987, median relL2 0.174). Real bug or
+expected quantization compounding?
+
+**Verdict: COMPOUNDING (expected).** Four independent lines of evidence:
+
+1. **State-ordering audit (static): clean.** Forward updates input/weight states once before backward
+   reads them; `d_output` state updated exactly once in `matmul_bwd_lowp`; no double-update; margin=0,
+   16-step history; at step 0 every site is in warmup so it quantizes at its OWN current-tensor amax
+   (best case, no stale scale, no `scale=1.0` fallback). A state bug would have surfaced as one
+   catastrophically-wrong site class — none observed.
+
+2. **Forward/backward error split** (added a temporary `-D LLMM_FP8_FWD_ONLY=1` comptime knob that
+   forces the bf16 backward else-branch): forward-fp8-only vs bf16 already gives **median relL2 0.156**
+   (15/148 pass) — ~90% of the total error. Backward's incremental contribution (full vs fwd-only) is
+   **median relL2 0.061** (125/148 pass on its own). The two combine in quadrature:
+   `sqrt(0.156² + 0.061²) = 0.167 ≈` observed 0.174. Chunk E's backward code is NOT the culprit; the
+   error is dominated by the forward fp8 GEMMs that Chunk D already shipped and gated.
+
+3. **Depth scaling: the backprop-compounding fingerprint.** All 12 per-layer tensor classes show a
+   strong negative correlation between layer index and relL2 (corr −0.68 to −0.97): error is worst at
+   EARLY layers (near input) and smoothly decreases toward the output. Gradients accrue quantization
+   error multiplicatively as they flow output→input — the exact expected signature. A bug would spike
+   one layer/site; instead the curve is monotonic and coherent across every class. (Worst tensors:
+   `ln_1_gamma`, `wpe` — small, spiky, reduction-heavy grads sensitive to relative error; note
+   `ln_1_gamma` grads come from the bf16 LN-backward kernel, so their error is purely propagated
+   upstream fp8 contamination, not a kernel defect.)
+
+4. **e5m2/e4m3 per-tensor quantization is well-behaved at step 0** (numpy characterization on the
+   reference grads): per-tensor e4m3 relL2 median 0.026, e5m2 median 0.052 (2 vs 3 mantissa bits, as
+   expected); saturation fraction ~0 (max 0.13%) — per-tensor amax scaling maps the largest element to
+   exactly fmt_max so nothing overflows; not outlier-dominated in any harmful way (even `wte` with
+   amax/p99.9≈5744 quantizes to relL2 0.044). The per-GEMM floors (~0.026 E4M3 / ~0.052 E5M2) compound
+   across ~12 layers to the observed ~0.17.
+
+**Functional gate (d): PASS.** fp8 vs bf16 10-step training (fineweb shard, b=4 t=1024, identical
+invocation) tracks within noise — no NaN/Inf (the "(nanz)" token is a warmup z-score, not a NaN):
+
+| step | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | val |
+|------|---|---|---|---|---|---|---|---|---|----|-----|
+| fp8  | 3.755 | 4.339 | 4.236 | 3.578 | 3.574 | 3.591 | 3.220 | 3.683 | 3.563 | 3.436 | 3.534 |
+| bf16 | 3.739 | 4.230 | 4.223 | 3.545 | 3.569 | 3.594 | 3.204 | 3.654 | 3.545 | 3.423 | 3.525 |
+
+**Recalibration proposal (for the coordinator — NOT unilaterally applied to the design gate):**
+The flat per-tensor `relL2<0.1 && cos>0.99` demands per-tensor error below the single-GEMM floor while
+gradients traverse up to ~12 fp8 GEMMs — it is structurally unsatisfiable for a real fp8 training step
+and buries no signal (cf. MEMORY.md `weak-gates-overrule-nothing`: a gate must be able to catch the
+failure it guards). Propose replacing it with a depth-aware envelope + a functional primary:
+  - **(a) cosine floor per tensor** (≈ >0.93): catches gradient-direction reversal, the true
+    optimizer-health failure a real bug would cause.
+  - **(b) relL2 envelope** (not per-tensor pass/fail): median <0.20, max <0.50, calibrated to the
+    per-GEMM-verified floors (0.036 E4M3 / 0.052 E5M2) × depth.
+  - **(c) depth-monotonicity check**: flag any single layer whose relL2 exceeds ~2× the local depth
+    trend — this is what actually catches a per-site quantization/state bug.
+  - **(d) the 10-step fp8-tracks-bf16 loss gate as the primary acceptance criterion** (functional,
+    robust, already passing).
+
+**Tooling added:** `tests/compare_grad_dumps.py` (the comparison script referenced by
+`dump_grads_gpt2.mojo`, cosine + relL2 per tensor), and the `-D LLMM_FP8_FWD_ONLY=1` fwd/bwd isolation
+knob in `train_gpt2.mojo` (default off = full fp8, comptime-inert).
+
+**Source:** Chunk E gradient-gate root-cause investigation, 2026-07-10 (worktree goal2/fp8-chunkE).
+
+---
+
 ## Section summary
 
 | Section | Items | Status |
