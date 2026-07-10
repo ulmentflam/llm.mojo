@@ -25,12 +25,16 @@ if [ -z "${MOJO_PYTHON_LIBRARY:-}" ]; then
     done
 fi
 
-# Sampling disabled (-s 0): the end-of-run generation step hit
-# CUDA_ERROR_MISALIGNED_ADDRESS on 2026-07-09 (train_gpt2.mojo:1905, a B=1
-# inference-shape bug never exercised before last_step) and crashed BEFORE
-# the checkpoint write, losing the final model_19552.bin. -s 0 disables
-# sampling unconditionally (last_step normally forces it regardless of
-# sample_every) so the checkpoint write is reached this time.
+# -s 20000 (sample_every): the end-of-run generation step used to hit
+# CUDA_ERROR_MISALIGNED_ADDRESS (2026-07-09) — root-caused to a genuine
+# alignment bug in the attention softmax kernel's vectorized load/store
+# (llmm/attention.mojo's _attention_softmax_causal_gpu): its per-row base
+# offset row*T is only guaranteed width-aligned when T itself is a multiple
+# of the SIMD width (8 for bf16). Training's T=1024 always satisfied this;
+# token-by-token generation's varying T does not (first breaks at T=9).
+# Fixed by falling back to the scalar kernel whenever T isn't width-aligned
+# (training's fast path is untouched). Verified with 40+ crash-free
+# generation trials (build/infer_gpt2_bf16) before re-enabling here.
 exec "$BIN" \
     -i "data/.fineweb10B/fineweb_train_*.bin" \
     -j "data/.fineweb10B/fineweb_val_*.bin" \
@@ -46,6 +50,6 @@ exec "$BIN" \
     -u 700 \
     -c 0.1 \
     -v 250 \
-    -s 0 \
+    -s 20000 \
     -x -1 \
     "$@"

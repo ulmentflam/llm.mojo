@@ -1646,21 +1646,52 @@ def attention_fwd_gemm[
     comptime softmax_width = simd_width_of[
         dtype
     ]() if USE_SOFTMAX_VEC_LOADS else 1
-    comptime softmax_kernel = _attention_softmax_causal_gpu[
-        dtype, BLOCK_SIZE, softmax_width
-    ]
-    var compiled = device_ctx.compile_function[softmax_kernel]()
-    device_ctx.enqueue_function(
-        compiled,
-        num_rows,
-        T,
-        attention_scale,
-        scores_immut,
-        att_base,
-        log_sum_exp_ptr,
-        grid_dim=(num_blocks,),
-        block_dim=(BLOCK_SIZE,),
-    )
+    # The vectorized kernel's per-row base offset is `row * T` elements; its
+    # `width`-wide loads/stores are only guaranteed aligned when that offset is
+    # always a multiple of `width`, i.e. when T itself is a multiple of
+    # `width`. Training always calls with T=max_seq_len (1024, a multiple of
+    # 8) so this held for the whole 19,552-step run — but single-token-at-a-
+    # time generation walks T through every value 1..genT-1, and the first
+    # non-multiple-of-8 T (e.g. T=9) drifts `row * T` out of the required
+    # 16-byte alignment for most rows, faulting the hardware vector load with
+    # CUDA_ERROR_MISALIGNED_ADDRESS. Compile both kernel variants and pick at
+    # runtime: this leaves training's fast path byte-for-byte unchanged (T is
+    # always width-aligned there) while generation's non-aligned T falls back
+    # to the scalar (width=1) kernel, which has no such alignment assumption.
+    if T % softmax_width == 0:
+        comptime softmax_kernel = _attention_softmax_causal_gpu[
+            dtype, BLOCK_SIZE, softmax_width
+        ]
+        var compiled = device_ctx.compile_function[softmax_kernel]()
+        device_ctx.enqueue_function(
+            compiled,
+            num_rows,
+            T,
+            attention_scale,
+            scores_immut,
+            att_base,
+            log_sum_exp_ptr,
+            grid_dim=(num_blocks,),
+            block_dim=(BLOCK_SIZE,),
+        )
+    else:
+        comptime softmax_kernel_scalar = _attention_softmax_causal_gpu[
+            dtype, BLOCK_SIZE, 1
+        ]
+        var compiled_scalar = device_ctx.compile_function[
+            softmax_kernel_scalar
+        ]()
+        device_ctx.enqueue_function(
+            compiled_scalar,
+            num_rows,
+            T,
+            attention_scale,
+            scores_immut,
+            att_base,
+            log_sum_exp_ptr,
+            grid_dim=(num_blocks,),
+            block_dim=(BLOCK_SIZE,),
+        )
 
     # Step 3: A·V for all heads in one batched call. bf16 probabilities × bf16 V
     # -> bf16 attention output. Same-stream: no fence before it (A·V's read of the

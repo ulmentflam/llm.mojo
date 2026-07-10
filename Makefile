@@ -20,6 +20,14 @@ MOJO_LINK_FLAGS := -Xlinker -lm
 LLMM_SOURCES := $(shell find llmm -name '*.mojo' 2>/dev/null)
 WORLD_SIZE ?= 1
 
+# Inference-only: load a checkpoint and run autoregressive B=1 generation.
+# No backward/optimizer/training-dataloader — a fast iteration loop for the
+# generation code path alone (encoder/attention/matmul/sampling), separate
+# from the training binary.
+INFER_MOJO_SRC := infer_gpt2.mojo
+INFER_BIN := build/infer_gpt2
+INFER_BIN_BF16 := build/infer_gpt2_bf16
+
 # Profiling: a single forward/backward/update step on synthetic data, built as
 # its own binary so external profilers (ncu/nsys) and the Perfetto tracer can
 # target it without the full training loop.
@@ -305,6 +313,18 @@ build-profile-bf16: $(PROFILE_BIN_BF16)
 $(PROFILE_BIN_BF16): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_BF16) $(PROFILE_MOJO_SRC)
+
+build-infer: $(INFER_BIN)
+
+$(INFER_BIN): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN) $(INFER_MOJO_SRC)
+
+build-infer-bf16: $(INFER_BIN_BF16)
+
+$(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
 
 # Tracing build: same harness, with the per-thread kernel instrumentation
 # compiled in via -D LLMM_TRACE=1.
