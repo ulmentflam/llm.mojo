@@ -10,7 +10,7 @@ from std.sys import (
 from std.time import global_perf_counter_ns
 from std.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
-from std.sys import get_defined_int, is_defined
+from std.sys import get_defined_int, get_defined_string, is_defined
 from std.gpu.host import (
     DeviceContext,
     HostBuffer,
@@ -21,6 +21,8 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.memory import alloc, UnsafePointer, memcpy, memset_zero
 
 from llmm.io import read_and_copy
+from llmm.lowp import precision_spec, FP8_SPEC
+from llmm.amax import AmaxState
 from llmm.dataloader import DataLoader
 from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
 from llmm.checkpointing import (
@@ -42,7 +44,12 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
-from llmm.matmul import matmul_fwd, matmul_bwd
+from llmm.matmul import (
+    matmul_fwd,
+    matmul_bwd,
+    matmul_fwd_lowp,
+    matmul_bwd_lowp,
+)
 from llmm.softmax import softmax_fwd, softmax_bwd
 from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
 from llmm.global_norm import (
@@ -85,14 +92,71 @@ comptime WORLD_SIZE_DEF = get_defined_int["WORLD_SIZE", 1]()
 
 comptime NUM_PARAMETER_TENSORS = 16
 comptime NUM_ACTIVATION_TENSORS = 26
+
+
 # Parameter/activation/gradient precision. Defaults to fp32; build with
-# -D LLMM_BF16=1 for bf16 mixed-precision training. The layernorm/attention
-# statistics stay fp32 (StatsDType) and the optimizer keeps fp32 moments + an
-# fp32 master copy of the weights (MASTER_DTYPE) — matching llm.c — so the low-
-# precision params are only ever a rounded view of the fp32 math.
-comptime USE_BF16 = is_defined["LLMM_BF16"]()
-comptime GPT2_DTYPE = DType.bfloat16 if USE_BF16 else DType.float32
+# -D LLMM_PRECISION=bf16|fp8|fp4, or the -D LLMM_BF16=1 back-compat alias for
+# bf16, for mixed-precision training. The layernorm/attention statistics stay
+# fp32 (StatsDType) and the optimizer keeps fp32 moments + an fp32 master copy
+# of the weights (MASTER_DTYPE) — matching llm.c — so the low-precision params
+# are only ever a rounded view of the fp32 math.
+#
+# Storage stays bf16 under fp8/fp4 too (docs/ai/fp8_training_design.md §1.1):
+# fp8/fp4 are transient dtypes inside the GEMM only (Chunk B/D/E), never the
+# parameter/activation/gradient storage dtype. That's why `STORAGE_DTYPE`
+# collapses fp8/fp4 onto bfloat16 below, and why `USE_BF16` (kept for the
+# adamw/zero fp32-master plumbing, unchanged meaning: "keep an fp32 master +
+# bf16 storage") is true for fp8/fp4 builds too.
+def _resolve_precision() -> StaticString:
+    """Resolve the `LLMM_PRECISION` axis, honoring the `LLMM_BF16=1` back-
+    compat alias (== `LLMM_PRECISION=bf16`). Comptime-errors if both are set
+    inconsistently, or if `LLMM_PRECISION` is set to something other than
+    fp32 | bf16 | fp8 | fp4.
+    """
+    comptime bf16_alias = is_defined["LLMM_BF16"]()
+    comptime has_precision = is_defined["LLMM_PRECISION"]()
+    comptime precision_str = get_defined_string["LLMM_PRECISION", "fp32"]()
+
+    comptime if bf16_alias and has_precision:
+        comptime assert precision_str == "bf16", (
+            "LLMM_BF16=1 and LLMM_PRECISION set to something other than bf16"
+            " are inconsistent — set only one"
+        )
+        return "bf16"
+    elif bf16_alias:
+        return "bf16"
+    else:
+        comptime assert (
+            precision_str == "fp32"
+            or precision_str == "bf16"
+            or precision_str == "fp8"
+            or precision_str == "fp4"
+        ), "unknown LLMM_PRECISION value (expected fp32 | bf16 | fp8 | fp4)"
+        return precision_str
+
+
+comptime PRECISION = _resolve_precision()
+comptime LOWP_ENABLED = PRECISION == "fp8" or PRECISION == "fp4"
+# Investigation knob (fp8 fwd/bwd error isolation, Chunk E gate probe): building
+# with `-D LLMM_FP8_FWD_ONLY=1` keeps the fp8 forward linears but forces the four
+# per-block backward sites onto their bf16 `matmul_bwd` else-branch, so a grad
+# dump splits the fp8 error budget into forward-only vs forward+backward. Default
+# (flag unset) is full fp8 backward, byte-identical to before this knob existed.
+comptime LOWP_BWD_ENABLED = LOWP_ENABLED and not is_defined[
+    "LLMM_FP8_FWD_ONLY"
+]()
+comptime STORAGE_DTYPE = (
+    DType.float32 if PRECISION == "fp32" else DType.bfloat16
+)
+comptime GPT2_DTYPE = STORAGE_DTYPE  # keep the existing name/usage
 comptime MASTER_DTYPE = DType.float32
+# `USE_BF16` keeps its exact current meaning ("keep an fp32 master + bf16
+# storage"); fp8/fp4 storage is also bf16 (see above), so they inherit the
+# same fp32-master path — llmm/adamw.mojo, llmm/zero.mojo, and the
+# `_dispatch_cpu` GPU-only guard (which raises whenever `USE_BF16`) need no
+# change and automatically also gate fp8/fp4 off the CPU target (landmine #1).
+comptime USE_BF16 = STORAGE_DTYPE == DType.bfloat16
+comptime SPEC = precision_spec[PRECISION]()
 comptime GPT2_MAGIC = 20240520
 # llm.c's model-file magic (the HF starter-pack gpt2_124M*.bin that `make data`
 # downloads); same header layout and version convention as ours.
@@ -536,6 +600,118 @@ struct GPT2Config:
     var padded_vocab_size: Int  # Padded vocab size (%128 == 0, e.g. 50304).
 
 
+# ===----------------------------------------------------------------------=== #
+# LowpState — shared per-tensor fp8 delayed-scaling state container.
+#
+# docs/ai/fp8_training_design.md restricts fp8 to the four per-block linear
+# GEMMs (QKV projection, attention-output projection, MLP fc, MLP proj — §1.2
+# "FP8 GEMMs = the four per-block linear layers only"; the LM head and every
+# other op stay bf16). Each of those four sites needs its own delayed-scaling
+# `AmaxState[FP8_SPEC]` (Chunk C, llmm/amax.mojo) PER TRANSFORMER LAYER — not
+# one shared across layers — because delayed scaling's whole premise (§1.3:
+# "the scale used this step is derived from *prior* steps' amax") only holds
+# if the amax history a site's scale is built from actually comes from
+# repeated observations of *that same tensor*; layer 0's QKV weight and layer
+# 11's QKV weight have unrelated magnitude statistics, so collapsing them onto
+# one shared `AmaxState` would let one layer's outlier amax silently mis-scale
+# every other layer's GEMM.
+#
+# This container is Chunk D's first commit (coordinator instruction): it is
+# the single source of truth for every fp8 GEMM operand's scaling state, so
+# Chunk E (backward, running in parallel) can extend it without renaming or
+# reshaping anything Chunk D already committed. Three role-groups per site,
+# each a `List[AmaxState[FP8_SPEC]]` of length `num_layer`:
+#   - `*_input`  — the site's forward input activation (E4M3), Chunk D.
+#   - `*_weight` — the site's weight (E4M3, requantized every step from its
+#     bf16 storage — weights change every step post-optimizer), Chunk D.
+#   - `*_doutput` — the site's backward `d_output` gradient (E5M2). Defined
+#     HERE (not by Chunk E) so the container's shape is stable the moment
+#     Chunk D commits it; Chunk D allocates but never reads/writes these
+#     (`update_scale`/`compute_amax` on them is exclusively Chunk E's
+#     forward-declared-but-not-yet-wired territory) — see docs/ai/
+#     fp8_training_design.md §5 point 2/3 (dgrad's E5M2 `d_output` operand,
+#     wgrad's E5M2 `d_output` operand; QKV/attn-proj/fc/proj backward
+#     counterparts at :2465/:2485/:2548/:2593 in the design's line numbering).
+#
+# Forward's weight/input E4M3 `AmaxState`s are also what backward's "same
+# tensors as forward" E4M3 operand (design §1.2 row 3) reuses — Chunk E reads
+# `*_input`/`*_weight` (not new states) for dgrad's weight operand and wgrad's
+# input operand, per the design's explicit "same tensors as forward"
+# instruction; only the gradient operand (`*_doutput`, E5M2) is new state.
+#
+# Comptime-gated to `LOWP_ENABLED` builds: the field type (`List[AmaxState[
+# FP8_SPEC]]`) is always well-formed (FP8_SPEC is a fixed constant regardless
+# of PRECISION — see llmm/lowp.mojo), so the `GPT2` struct declares this field
+# unconditionally (mirrors the existing `master_buf`/`USE_BF16` convention:
+# "always declare the field; make it an inert placeholder — empty lists here,
+# a size-1 buffer there — under the regimes that don't need it" — see that
+# field's docstring a few hundred lines below). It is `__init__`'s BODY that
+# is comptime-gated (`comptime if LOWP_ENABLED:` below), not the field's
+# existence: under bf16/fp32, that branch is never elaborated, so no
+# `AmaxState` (and therefore no GPU kernel launch — `AmaxState.__init__`
+# compiles and enqueues an init kernel) is ever instantiated for those builds,
+# preserving landmine #1 (no low-precision/GPU-only code may be instantiated
+# for the `cpu` target) exactly the way `_dispatch_cpu`'s `comptime if
+# USE_BF16:` already does for the whole GPU dispatch path.
+# ===----------------------------------------------------------------------=== #
+
+
+struct LowpState(Movable):
+    """Per-layer, per-site `AmaxState[FP8_SPEC]` container for every fp8 GEMM
+    operand in the model (the four per-block linears' input/weight/d_output).
+    See the module comment above for the shape rationale and the Chunk D/E
+    ownership split. Empty lists under bf16/fp32 (`LOWP_ENABLED == False`).
+    """
+
+    var qkv_input: List[AmaxState[FP8_SPEC]]
+    var qkv_weight: List[AmaxState[FP8_SPEC]]
+    var qkv_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+
+    var attn_proj_input: List[AmaxState[FP8_SPEC]]
+    var attn_proj_weight: List[AmaxState[FP8_SPEC]]
+    var attn_proj_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+
+    var fc_input: List[AmaxState[FP8_SPEC]]
+    var fc_weight: List[AmaxState[FP8_SPEC]]
+    var fc_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+
+    var proj_input: List[AmaxState[FP8_SPEC]]
+    var proj_weight: List[AmaxState[FP8_SPEC]]
+    var proj_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+
+    def __init__(out self, num_layer: Int, ctx: DeviceContext) raises:
+        self.qkv_input = List[AmaxState[FP8_SPEC]]()
+        self.qkv_weight = List[AmaxState[FP8_SPEC]]()
+        self.qkv_doutput = List[AmaxState[FP8_SPEC]]()
+        self.attn_proj_input = List[AmaxState[FP8_SPEC]]()
+        self.attn_proj_weight = List[AmaxState[FP8_SPEC]]()
+        self.attn_proj_doutput = List[AmaxState[FP8_SPEC]]()
+        self.fc_input = List[AmaxState[FP8_SPEC]]()
+        self.fc_weight = List[AmaxState[FP8_SPEC]]()
+        self.fc_doutput = List[AmaxState[FP8_SPEC]]()
+        self.proj_input = List[AmaxState[FP8_SPEC]]()
+        self.proj_weight = List[AmaxState[FP8_SPEC]]()
+        self.proj_doutput = List[AmaxState[FP8_SPEC]]()
+
+        # See the module comment above: only elaborated for LOWP_ENABLED
+        # (fp8/fp4) GPU builds — bf16/fp32 leave every list empty and launch
+        # no GPU kernels here (landmine #1).
+        comptime if LOWP_ENABLED:
+            for _ in range(num_layer):
+                self.qkv_input.append(AmaxState[FP8_SPEC](ctx))
+                self.qkv_weight.append(AmaxState[FP8_SPEC](ctx))
+                self.qkv_doutput.append(AmaxState[FP8_SPEC](ctx))
+                self.attn_proj_input.append(AmaxState[FP8_SPEC](ctx))
+                self.attn_proj_weight.append(AmaxState[FP8_SPEC](ctx))
+                self.attn_proj_doutput.append(AmaxState[FP8_SPEC](ctx))
+                self.fc_input.append(AmaxState[FP8_SPEC](ctx))
+                self.fc_weight.append(AmaxState[FP8_SPEC](ctx))
+                self.fc_doutput.append(AmaxState[FP8_SPEC](ctx))
+                self.proj_input.append(AmaxState[FP8_SPEC](ctx))
+                self.proj_weight.append(AmaxState[FP8_SPEC](ctx))
+                self.proj_doutput.append(AmaxState[FP8_SPEC](ctx))
+
+
 def _gpt2_hyperparameters(depth: Int) raises -> Tuple[Int, Int]:
     """GPT-2 (channels, num_heads) for a given depth. Mirrors llm.c."""
     if depth == 6:
@@ -713,6 +889,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var grad_acts_stats_memory: MutMemPtr[StatsDType]
     var num_grads: Int
 
+    # Chunk D: shared per-tensor fp8 delayed-scaling state (see `LowpState`'s
+    # docstring above). Always declared (mirrors `master_buf`'s USE_BF16
+    # convention); populated only under LOWP_ENABLED (empty lists otherwise).
+    var lowp_state: LowpState
+
     # Runstate Configurations
     var batch_size: Int  # The batch size of the current forward pass (Our B).
     var seq_len: Int  # The sequence length of the current forward pass (Our T).
@@ -781,6 +962,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             channels=0,
             padded_vocab_size=0,
         )
+        # Trivial placeholder (num_layer=0 -> no AmaxState instances, no GPU
+        # kernel launches even under LOWP_ENABLED): definite-initialization
+        # requires every field set before the first `self.<method>()` call
+        # below (`self.allocate_parameters`/etc.), mirroring `self.config`'s
+        # own placeholder-then-real-value pattern immediately above. Replaced
+        # with the real, per-layer-populated container once `self.config` is
+        # finalized (see below, after the checkpoint/safetensors/from-scratch
+        # branches and `self.allocate_gradients()`).
+        self.lowp_state = LowpState(0, ctx)
 
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
@@ -930,6 +1120,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         # Allocate weight gradients.
         self.allocate_gradients()
+
+        # fp8 delayed-scaling state (Chunk D): one AmaxState per GEMM operand
+        # site per layer. Config is finalized by all three branches above, so
+        # config.num_layer is valid here. See `LowpState`'s module comment
+        # for why this is unconditional (empty lists, no GPU work, under
+        # bf16/fp32 — the ctor's body is itself `comptime if LOWP_ENABLED:`
+        # gated).
+        self.lowp_state = LowpState(self.config.num_layer, ctx)
 
         # Allocate optimizer moments.
         self.allocate_optimizer_moments()
@@ -1933,18 +2131,34 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
 
             # Matmul QKV.
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                as_mut_kernel[GPT2_DTYPE](l_qkv),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_mut_kernel[GPT2_DTYPE](l_ln_1),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_bias),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(channels),
-                Int64(3 * channels),
-                self.ctx,
-            )
+            comptime if LOWP_ENABLED:
+                matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](l_qkv),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_bias),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(3 * channels),
+                    self.lowp_state.qkv_input[layer],
+                    self.lowp_state.qkv_weight[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](l_qkv),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_bias),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(3 * channels),
+                    self.ctx,
+                )
 
             # Attention Forward (handles QKV Split/Transpose and Merge Heads internally).
             var head_dim = channels // num_heads
@@ -1990,18 +2204,34 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
 
             # Matmul Attn Proj
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                as_mut_kernel[GPT2_DTYPE](l_attn_proj),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_mut_kernel[GPT2_DTYPE](l_attn_merged),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_bias),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(channels),
-                Int64(channels),
-                self.ctx,
-            )
+            comptime if LOWP_ENABLED:
+                matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](l_attn_proj),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](l_attn_merged),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_bias),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(channels),
+                    self.lowp_state.attn_proj_input[layer],
+                    self.lowp_state.attn_proj_weight[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](l_attn_proj),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](l_attn_merged),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_bias),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(channels),
+                    self.ctx,
+                )
             # LayerNorm 2 & Residual.
             layernorm_fused_residual_fwd[GPT2_DTYPE, Self.target](
                 as_mut_kernel[GPT2_DTYPE](l_residual_2),
@@ -2020,32 +2250,64 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
 
             # Matmul FC (fused GELU).
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=True](
-                as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
-                as_mut_kernel[GPT2_DTYPE](l_fch),
-                as_mut_kernel[GPT2_DTYPE](l_ln_2),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(channels),
-                Int64(4 * channels),
-                self.ctx,
-            )
+            comptime if LOWP_ENABLED:
+                matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=True](
+                    as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](l_fch),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(4 * channels),
+                    self.lowp_state.fc_input[layer],
+                    self.lowp_state.fc_weight[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=True](
+                    as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](l_fch),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_bias),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(4 * channels),
+                    self.ctx,
+                )
 
             # Matmul Proj.
-            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                as_mut_kernel[GPT2_DTYPE](l_fc_proj),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(4 * channels),
-                Int64(channels),
-                self.ctx,
-            )
+            comptime if LOWP_ENABLED:
+                matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](l_fc_proj),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(4 * channels),
+                    Int64(channels),
+                    self.lowp_state.proj_input[layer],
+                    self.lowp_state.proj_weight[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](l_fc_proj),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_bias),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(4 * channels),
+                    Int64(channels),
+                    self.ctx,
+                )
 
         # Final LayerNorm
         var last_residual_3 = (
@@ -2466,41 +2728,83 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # matmul_d_input_bwd computes d_l_fch_gelu = gelu'(l_fch) ⊙
             # (d_fc_proj @ proj_weight) = d_fch (post-GELU-grad, still 4C-wide).
             var loop_t0 = global_perf_counter_ns()
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
-                as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
-                as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
-                as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
-                as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
-                as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
-                as_mut_kernel[GPT2_DTYPE](l_fch),
-                as_mut_kernel[GPT2_DTYPE](d_l_attn),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(4 * channels),
-                Int64(channels),
-                self.ctx,
-            )
+            # fp8 site (Chunk E): C=4*channels, OC=channels;
+            # input=l_fch_gelu, weight=l_proj_weight, d_output=d_l_fc_proj.
+            comptime if LOWP_BWD_ENABLED:
+                matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=True](
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
+                    as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](l_fch),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(4 * channels),
+                    Int64(channels),
+                    self.lowp_state.proj_input[layer],
+                    self.lowp_state.proj_weight[layer],
+                    self.lowp_state.proj_doutput[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=True](
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_proj_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_proj),
+                    as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](l_fch),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(4 * channels),
+                    Int64(channels),
+                    self.ctx,
+                )
 
             # MLP FC backward (no GELU — d_l_fch_gelu already carries d_fch, the
             # post-GELU-grad, from the fused projection backward above). This
             # matmul lives entirely below the GELU, so it just backprops the
             # linear FC: d_l_ln_2 = d_fch @ fc_weight.
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
-                as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
-                as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
-                as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
-                as_mut_kernel[GPT2_DTYPE](l_ln_2),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_mut_kernel[GPT2_DTYPE](d_l_fch),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(channels),
-                Int64(4 * channels),
-                self.ctx,
-            )
+            # fp8 site (Chunk E): C=channels, OC=4*channels; input=l_ln_2,
+            # weight=l_fc_weight, d_output=d_l_fch_gelu.
+            comptime if LOWP_BWD_ENABLED:
+                matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(4 * channels),
+                    self.lowp_state.fc_input[layer],
+                    self.lowp_state.fc_weight[layer],
+                    self.lowp_state.fc_doutput[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fc_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_2),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_fc_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(4 * channels),
+                    self.ctx,
+                )
 
             # GOTCHA (gradient flow): the fused LN backward only adds LN_dinp to
             # its targets (`d_inp1 += LN_dinp; d_inp2 += LN_dinp`). The incoming
@@ -2545,21 +2849,43 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
 
             # Attention projection backward.
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
-                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
-                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_bias),
-                as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
-                as_mut_kernel[GPT2_DTYPE](l_attn_merged),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_mut_kernel[GPT2_DTYPE](d_l_qkv),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(channels),
-                Int64(channels),
-                self.ctx,
-            )
+            # fp8 site (Chunk E): C=channels, OC=channels;
+            # input=l_attn_merged, weight=l_attn_proj_weight,
+            # d_output=d_l_attn_proj.
+            comptime if LOWP_BWD_ENABLED:
+                matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
+                    as_mut_kernel[GPT2_DTYPE](l_attn_merged),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(channels),
+                    self.lowp_state.attn_proj_input[layer],
+                    self.lowp_state.attn_proj_weight[layer],
+                    self.lowp_state.attn_proj_doutput[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_attn_proj),
+                    as_mut_kernel[GPT2_DTYPE](l_attn_merged),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_attn_proj_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(channels),
+                    self.ctx,
+                )
 
             # Attention backward — read the forward-stored probs P from
             # acts.att_probs[layer] (see the forward store note; recompute is
@@ -2590,21 +2916,42 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
 
             # QKV matmul backward.
-            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
-                as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
-                as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
-                as_mut_kernel[GPT2_DTYPE](d_l_qkv_bias),
-                as_mut_kernel[GPT2_DTYPE](d_l_qkv),
-                as_mut_kernel[GPT2_DTYPE](l_ln_1),
-                as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
-                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-                as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(channels),
-                Int64(3 * channels),
-                self.ctx,
-            )
+            # fp8 site (Chunk E): C=channels, OC=3*channels; input=l_ln_1,
+            # weight=l_qkv_weight, d_output=d_l_qkv.
+            comptime if LOWP_BWD_ENABLED:
+                matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(3 * channels),
+                    self.lowp_state.qkv_input[layer],
+                    self.lowp_state.qkv_weight[layer],
+                    self.lowp_state.qkv_doutput[layer],
+                    self.ctx,
+                )
+            else:
+                matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False](
+                    as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv_bias),
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                    as_mut_kernel[GPT2_DTYPE](l_ln_1),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv_weight),
+                    as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                    as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
+                    Int64(3 * channels),
+                    self.ctx,
+                )
 
             # LayerNorm 1 backward.
             if layer == 0:
@@ -3689,7 +4036,7 @@ def train[
             device_name,
             USE_BF16,
         )
-        var prec_label = String("bf16") if USE_BF16 else String("fp32")
+        var prec_label = String(PRECISION)
         var mfu_str = (
             String("n/a") if mfu < 0.0 else _ffmt(mfu * 100.0, 1) + "%"
         )
@@ -3890,13 +4237,17 @@ def _parse_train_args(
 
 
 def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
-    # CPU training is fp32 by policy (matching profile_gpt2.mojo): a bf16
-    # build must not instantiate the "cpu" dispatch — the CPU bf16 GEMM
-    # packing path crashes AArch64 instruction selection at compile time.
+    # CPU training is fp32 by policy (matching profile_gpt2.mojo): a bf16 (or
+    # fp8/fp4, which also store bf16 — see USE_BF16 above) build must not
+    # instantiate the "cpu" dispatch — the CPU low-precision GEMM packing path
+    # crashes AArch64 instruction selection at compile time.
     comptime if USE_BF16:
         raise Error(
-            "bf16 build supports only the GPU target (CPU stays fp32)."
-            " Rebuild without -D LLMM_BF16=1 to train on CPU."
+            "'"
+            + String(PRECISION)
+            + "' builds support only the GPU target (CPU stays fp32)."
+            " Rebuild with -D LLMM_PRECISION=fp32 (or without -D LLMM_BF16=1)"
+            " to train on CPU."
         )
     else:
         print("Training on CPU.")

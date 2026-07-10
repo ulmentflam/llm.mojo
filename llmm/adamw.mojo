@@ -3,7 +3,7 @@ from std.algorithm import vectorize
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.math import fma, sqrt, ceildiv
-from std.sys import simd_width_of, align_of
+from std.sys import simd_width_of, align_of, is_defined, get_defined_int
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -12,6 +12,7 @@ from std.gpu import block_dim, block_idx, thread_idx
 
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
+from llmm.rng_device import sr_cast_bf16
 
 
 # ===----------------------------------------------------------------------=== #
@@ -20,6 +21,30 @@ from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 comptime CHUNK_SIZE = 4096
 comptime UNROLL = 4
+
+# Stochastic-rounding master->low-precision store (docs/ai/fp8_training_design.md
+# §3/§6 Chunk G; closes the TODO in `_adamw_update` below). Default OFF: every
+# existing build/verify gate (fp32, bf16) stays on the untouched
+# `param.cast[dtype]()` RNE code path with zero behavioral change — that
+# unchanged-code-path property, not a runtime check, is the bit-identity
+# proof. Build with `-D LLMM_SR_MASTER=1` to opt in; currently only valid for
+# a bf16 low-precision param store (`llmm/rng_device.mojo`'s `sr_cast_bf16`).
+# fp8/fp4 stochastic-rounding encoders are a separate seam owned by Chunk B
+# (docs/ai/fp8_training_design.md §3) and are not wired here.
+comptime SR_MASTER_ENABLED = is_defined["LLMM_SR_MASTER"]()
+
+# Fixed by default (not wall-clock-derived) so `-D LLMM_SR_MASTER=1` runs are
+# reproducible out of the box; override with `-D LLMM_SR_SEED=<int>` for a
+# different (still deterministic) random stream. This is a 64-bit RNG seed,
+# not a training hyperparameter — it has no relationship to `INIT_RNG_SEED`
+# (train_gpt2.mojo's from-scratch weight-init seed).
+comptime SR_MASTER_SEED = UInt64(get_defined_int["LLMM_SR_SEED", 1746221221]())
+
+# `llmm/rng_device.mojo`'s `stream` id reserved for this call site, so its
+# random substream stays independent of any future SR call site sharing the
+# same seed (e.g. Chunk B/E's fp8/fp4 gradient-quantize SR, which should pick
+# a different stream constant).
+comptime SR_MASTER_STREAM = UInt64(1)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -90,6 +115,12 @@ def _adamw_update[
     config: AdamWConfig,
     beta1_correction: Scalar[DType.float32],
     beta2_correction: Scalar[DType.float32],
+    # AdamW step, only consumed when `SR_MASTER_ENABLED` (folded into the SR
+    # counter below so repeated master->bf16 stores don't reuse the same
+    # random bit for a given element across steps). Otherwise unused — kept
+    # as a plain arg (not Optional) to match the rest of this kernel's
+    # "no null pointers / no Optionals in the hot path" style.
+    t: UInt32,
 ) -> None:
     # This mirrors llm.c's `adamw_update`: read the grad as fp32, keep both Adam
     # moments in fp32, and do the weight update in fp32 against the master copy.
@@ -138,10 +169,42 @@ def _adamw_update[
 
     # Round the fp32 result down into the low-precision params, and keep the fp32
     # master in sync when we have one.
-    # TODO: Karpathy adds a stochastic rounding function here for low-precision params.
-    (params_ptr + idx).store[width=width, alignment=align_d](
-        param.cast[dtype]()
-    )
+    #
+    # Karpathy's llm.c leaves a plain round-to-nearest-even (RNE) cast here
+    # ("TODO: stochastic rounding for low-precision params"); RNE
+    # systematically truncates small updates toward zero over many steps.
+    # `-D LLMM_SR_MASTER=1` swaps in stochastic rounding (llmm/rng_device.mojo)
+    # instead: each element gets a fresh, deterministic pseudo-random draw
+    # keyed by (SR_MASTER_SEED, element index, step `t`), and rounds to the
+    # nearer of the two representable bf16 neighbors with probability
+    # proportional to proximity — unbiased in expectation instead of
+    # systematically-truncating. Default OFF; the `else` branch below is the
+    # original, untouched `param.cast[dtype]()` RNE line.
+    comptime if SR_MASTER_ENABLED:
+        comptime assert dtype == DType.bfloat16, (
+            "LLMM_SR_MASTER=1 requires a bf16 low-precision param store"
+            " (dtype == DType.bfloat16); fp8/fp4 stochastic-rounding"
+            " encoders are a separate seam"
+            " (docs/ai/fp8_training_design.md §3, owned by Chunk B) not"
+            " wired into llmm/adamw.mojo"
+        )
+        var sr_param = SIMD[DType.bfloat16, width]()
+        comptime for lane in range(width):
+            # Counter = (t << 32) | element_index: unique per (step, element)
+            # pair under a fixed seed, so repeated runs with the same seed
+            # are bit-identical (same t, same idx -> same counter -> same
+            # draw) while different steps/elements never collide.
+            var counter = (UInt64(t) << 32) | UInt64(idx + lane)
+            sr_param[lane] = sr_cast_bf16(
+                param[lane], SR_MASTER_SEED, counter, SR_MASTER_STREAM
+            )
+        (params_ptr + idx).store[width=width, alignment=align_d](
+            sr_param.cast[dtype]()
+        )
+    else:
+        (params_ptr + idx).store[width=width, alignment=align_d](
+            param.cast[dtype]()
+        )
     if has_master:
         (master_ptr + idx).store[width=width, alignment=align_f](param)
 
@@ -160,6 +223,7 @@ def adamw_update_cpu[
     config: AdamWConfig,
     beta1_correction: Scalar[DType.float32],
     beta2_correction: Scalar[DType.float32],
+    t: UInt32,
 ) raises -> None:
     var num_chunks = (num_params + CHUNK_SIZE - 1) // CHUNK_SIZE
 
@@ -182,6 +246,7 @@ def adamw_update_cpu[
             beta1_correction,
             beta2_correction,
             base,
+            t,
         }:
             var idx = base + local
             _adamw_update[dtype, w](
@@ -195,6 +260,7 @@ def adamw_update_cpu[
                 config,
                 beta1_correction,
                 beta2_correction,
+                t,
             )
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
@@ -216,6 +282,7 @@ def adamw_update_cpu_seq[
     config: AdamWConfig,
     beta1_correction: Scalar[DType.float32],
     beta2_correction: Scalar[DType.float32],
+    t: UInt32,
 ) -> None:
     var i = 0
     while i + width <= num_params:
@@ -230,6 +297,7 @@ def adamw_update_cpu_seq[
             config,
             beta1_correction,
             beta2_correction,
+            t,
         )
         i += width
     while i < num_params:
@@ -244,6 +312,7 @@ def adamw_update_cpu_seq[
             config,
             beta1_correction,
             beta2_correction,
+            t,
         )
         i += 1
 
@@ -269,6 +338,7 @@ def adamw_update_gpu[
     grad_scale: Scalar[DType.float32],
     beta1_correction: Scalar[DType.float32],
     beta2_correction: Scalar[DType.float32],
+    t: UInt32,
 ) -> None:
     var config = AdamWConfig(
         learning_rate=learning_rate,
@@ -292,6 +362,7 @@ def adamw_update_gpu[
             config,
             beta1_correction,
             beta2_correction,
+            t,
         )
     elif idx < num_params:
         # Last vector straddles num_params so handle the remainder one element at a time.
@@ -307,6 +378,7 @@ def adamw_update_gpu[
                 config,
                 beta1_correction,
                 beta2_correction,
+                t,
             )
 
 
@@ -349,6 +421,7 @@ def adamw_update[
                 config,
                 beta1_correction,
                 beta2_correction,
+                t,
             )
         else:
             adamw_update_cpu_seq[dtype, simd_width](
@@ -362,6 +435,7 @@ def adamw_update[
                 config,
                 beta1_correction,
                 beta2_correction,
+                t,
             )
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
@@ -390,6 +464,7 @@ def adamw_update[
             config.grad_scale,
             beta1_correction,
             beta2_correction,
+            t,
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )
