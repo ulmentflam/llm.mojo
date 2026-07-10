@@ -128,7 +128,7 @@ SHELL := /bin/bash
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures \
-        verify verify-cpu verify-gpu \
+        verify verify-cpu verify-gpu verify-gpu-tf32 \
         docs docs-clean
 
 .DEFAULT_GOAL := help
@@ -223,7 +223,8 @@ help:
 	@echo "  test-fixtures Regenerate tests/fixtures/*.npz from PyTorch reference"
 	@echo "  verify        Verify both CPU and GPU versions against reference state"
 	@echo "  verify-cpu    Verify CPU version against reference state"
-	@echo "  verify-gpu    Verify GPU version against reference state"
+	@echo "  verify-gpu    Verify GPU version against reference state (true fp32, TF32 off)"
+	@echo "  verify-gpu-tf32  Same, but with default TF32-on fp32 GEMMs (non-gating)"
 	@echo ""
 	@echo "Documents:"
 	@echo "  docs          Build docs/backprop.pdf with latexmk"
@@ -808,7 +809,27 @@ verify: verify-cpu verify-gpu
 verify-cpu:
 	pixi run mojo test_gpt2.mojo cpu
 
+# fp32 GEMMs default to TF32 tensor cores (llmm/vendor.mojo's USE_TF32), which
+# is the right choice for training but too loose for this test's tight
+# mixed-tolerance gradient checks (GRAD_ATOL=0.01/RTOL=0.05) and per-step loss
+# trajectory (LOSS_STEP_TOL=0.01) — TF32's 10-bit mantissa can drift a single
+# step's loss a few hundredths past that bar over a 10-step overfit run. llm.c
+# hits the same issue and resolves it the same way: its fp32 correctness test
+# (test_gpt2_fp32.cu) explicitly forces `enable_tf32 = 0` ("disable TF32 for
+# testing!!!") even though its training binary auto-enables TF32 on cc>=8.0.
+# Mirror that here with -D LLMM_NO_TF32=1 so this gate keeps checking true
+# IEEE fp32 math; see verify-gpu-tf32 below to validate the TF32 path itself.
 verify-gpu:
+	pixi run -e cuda mojo -D LLMM_NO_TF32=1 test_gpt2.mojo gpu
+
+# Non-gating: validates the default (TF32-on) fp32 training path against the
+# same reference. Expect the per-tensor gradient checks to stay green (TF32
+# rounding is well within GRAD_ATOL/RTOL/L2 margins) but the tight per-step
+# LOSS_STEP_TOL=0.01 trajectory check may trip on one or two of the 10 steps
+# — that is expected TF32 numerical drift, not a regression; see
+# docs/ai/ai_assisted_optimizations_and_benchmarks.md for the reference
+# TF32-vs-fp32 delta table. Not part of `make verify`/`make check`.
+verify-gpu-tf32:
 	pixi run -e cuda mojo test_gpt2.mojo gpu
 
 docs:

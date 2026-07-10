@@ -1716,3 +1716,99 @@ correctness changes** (correct backward included). Still ~4.0× faster than
 llm.c OpenMP and ~1.2× faster than PyTorch (medians). All cross-arm references
 match July 1 within noise, confirming the earlier 732 ms reading was pure
 run-stacking contention.
+
+---
+
+## 2026-07-10 — fp32 parity via TF32: llm.mojo fp32 now *beats* llm.c fp32 (282.8 vs 294.7 ms)
+
+The 2026-07-03 official benchmark left one open gap: llm.mojo fp32 was
+**1.40× behind llm.c fp32** (417.72 vs 298.53 ms/step, B=4 T=1024). A static
+analysis ([`fp32_gap_analysis_static_2026-07-10.md`](fp32_gap_analysis_static_2026-07-10.md))
+and an independent same-day ncu profile (`fp32_parity_profile_2026-07-10.md`,
+`goal1/fp32-parity` branch) both converged on a single cause: **llm.mojo's
+fp32 GEMMs never enabled TF32 tensor cores** — `_matmul_cublaslt`
+(`llmm/matmul.mojo`) and `_attn_gemm_batched`'s cuBLAS tail
+(`llmm/attention.mojo`) hardcoded `ComputeType.COMPUTE_32F` (plain FP32 CUDA
+cores; the profile showed 74.7% of the fp32 step in `simt_sgemm`/`magma`
+non-tensor-core kernels), while llm.c's fp32 arm auto-enables
+`CUBLAS_COMPUTE_32F_FAST_TF32` + `CUBLAS_TF32_TENSOR_OP_MATH` on any
+compute-capability-8.0+ GPU (`train_gpt2_fp32.cu:1614-1618`) — i.e. llm.c's
+"fp32" benchmark was always TF32-vs-TF32 on GB10.
+
+### The change (commit `c27a1f9`)
+
+One new comptime flag + two call sites:
+
+- `llmm/vendor.mojo`: `USE_TF32` (default **on**; disable with
+  `-D LLMM_NO_TF32=1` for true IEEE fp32 debugging).
+- `llmm/matmul.mojo` (`_matmul_cublaslt`): compute type is now
+  `COMPUTE_32F_FAST_TF32` iff `dtype == DType.float32 and USE_TF32`, else
+  `COMPUTE_32F` — covers every FC-layer fwd/bwd GEMM (qkv, attproj, fc,
+  fcproj, lm_head), ~93% of model FLOPs.
+- `llmm/attention.mojo` (`_attn_gemm_batched` `cublasGemmStridedBatchedEx`
+  tail): same gate keyed on `a_dt`, covering QKᵀ/A·V forward and dQ/dK/dV
+  backward batched GEMMs.
+
+bf16/fp16 builds are untouched (input dtype alone already selects tensor
+cores there; both keep `COMPUTE_32F` accumulate). The two `-D LLMM_NO_TF32=1`
+/ default binaries were confirmed to differ (flag reaches codegen), and both
+build cleanly.
+
+### Correctness gate (test_gpt2.mojo, gpt2_124M_debug_state.bin, B=4 T=64)
+
+Three runs, all GPU, same reference:
+
+| run | result | note |
+|---|---|---|
+| baseline (pre-change `7c3dad0`) | **PASS** (all 16 tensors + 10-step loss) | reference point |
+| TF32-**off** (`-D LLMM_NO_TF32=1`, post-change) | **PASS** | losses match baseline to ≤5e-7/step — within the run-to-run noise of the atomics-based reductions (two identical TF32-off runs differ by ~1e-6), proving the flag plumbing is inert |
+| TF32-**on** (default, post-change) | 16/16 gradient tensors **PASS**; loss trajectory trips once | step-3 loss diff 0.0102 vs `LOSS_STEP_TOL=0.01` — TF32-scale drift, see below |
+
+TF32-on loss trajectory vs the fp32 reference (Δ per step, 10-step overfit):
++0.0014, +0.0079, −0.0094, **+0.0102**, −0.0005, +0.0019, +0.0040, −0.0008,
++0.0011, +0.0008 — max |Δ| 0.0102, no growth trend, loss collapses
+identically (5.356 → 0.356). Every per-tensor gradient check stays green
+under the existing mixed tolerance (atol 0.01 / rtol 0.05 / L2 3.0) with
+huge margin (typical maxdiff 30–100× below threshold).
+
+**Tolerance approach:** llm.c hit exactly this and chose to test with TF32
+off — `test_gpt2_fp32.cu:41` reads `enable_tf32 = 0; // NOTE: disable TF32
+for testing!!!` even though its training binary enables TF32. We mirror
+that rather than loosening any tolerance (a past flat atol=2.0 gate buried
+three real bugs): **`make verify-gpu` now runs with `-D LLMM_NO_TF32=1`**
+(gating, tight fp32 tolerances intact) and a new non-gating
+**`make verify-gpu-tf32`** validates the default TF32 path (gradient checks
+must pass; the one-step 0.0002-over-tolerance loss blip is documented as
+expected TF32 drift, not a regression).
+
+### Benchmark (interleaved A/B, B=4 T=1024, GPU flock held, quiet box)
+
+Pre-run state: `free -g` 121 total / 76 used / 45 available; nvidia-smi 0%
+util, 43 °C, only Xorg/gnome-shell resident. Binaries rebuilt this session
+(mtime checked newer than sources). 3 interleaved reps; llm.mojo 25 steps/rep
+(WARMUP=5 trim → n=20/rep, pooled n=60); llm.c fp32 runs a fixed 8-step epoch
+(same harness limitation as every prior run), 3 runs/rep → pooled n=27.
+
+| arm | n | mean ms | median | std | tok/s |
+|---|---:|---:|---:|---:|---:|
+| **llm.mojo fp32 (TF32, this change)** | 60 | **282.77** | 283.02 | 1.85 | **14,485** |
+| llm.c CUDA fp32 (TF32) | 27 | 294.67 | 294.21 | 3.19 | 13,901 |
+| llm.mojo fp32 pre-fix (same day, `goal1/fp32-parity` profile) | 40 | 416.66 | — | — | 9,831 |
+| llm.c fp32 (same-day pooled reference) | 6 | 294.01 | — | — | 13,931 |
+
+tok/s sanity: 4096/282.77 ms = 14,485 ✓; 4096/294.67 = 13,901 ✓.
+
+**Result: 416.66 → 282.77 ms/step (1.47× speedup) — llm.mojo fp32 is now
+0.96× of llm.c fp32, i.e. ~4% FASTER.** The static analysis predicted
+270–300 ms; measured 282.8. Combined with the 2026-07-03 bf16 parity
+(135.97 vs 135.77 ms), llm.mojo now matches or beats llm.c CUDA at **both**
+precisions of the shipped training config. Per-rep means were 281.1 / 283.4
+/ 283.7 ms (llm.mojo) vs 290.7–298.7 ms (llm.c) — the arms never overlap,
+so the win is outside noise.
+
+Why llm.mojo lands slightly ahead: with the GEMM backends now identical
+(cuBLASLt + TF32 both sides), the earlier non-GEMM kernel work (fused
+classifier once, alignment hints, LN fusion, selective zeroing) carries
+over to fp32, where llm.c's fp32 harness lacks some of its bf16-side
+optimizations (e.g. its fp32 attention still materializes preatt/att fully
+in fp32 and runs a separate backward classifier pass).
