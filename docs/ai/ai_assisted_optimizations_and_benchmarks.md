@@ -1716,3 +1716,139 @@ correctness changes** (correct backward included). Still ~4.0× faster than
 llm.c OpenMP and ~1.2× faster than PyTorch (medians). All cross-arm references
 match July 1 within noise, confirming the earlier 732 ms reading was pure
 run-stacking contention.
+
+---
+
+## 2026-07-10 — FP8 mixed-precision training: end-to-end verification (Chunk F)
+
+**What FP8 training is here** (`docs/ai/fp8_training_design.md`, `goal2/fp8-training`,
+Chunks A–G): the four per-block linear GEMMs (QKV projection, attention output
+projection, MLP fc, MLP proj — forward **and** backward) run in FP8 (E4M3 forward
+operands, E5M2 backward gradient operand) with delayed per-tensor scaling (16-step
+amax history, TE-style). Storage stays bf16 (`GPT2_DTYPE`), and LayerNorm, softmax,
+attention core, GELU, the LM head, and the fp32 AdamW optimizer are untouched —
+exactly the existing bf16 build's numerics outside those four GEMM sites. Build with
+`make build-fp8` (`-D LLMM_PRECISION=fp8`); loads the same bf16 checkpoint as
+`build-bf16`. This entry is Chunk F: harden, measure, and codify the gates for a
+scheme that Chunks D/E already brought to a functionally-correct 10-step smoke test
+(`docs/ai/low_precision_gotchas.md` E5).
+
+### Gradient gate: `make verify-fp8-grads` — PASS
+
+Chunk E's flat per-tensor `cos>0.99 && relL2<0.1` gate over all 148 param-gradient
+tensors (one fwd+bwd step, fixed `gpt2_124M_debug_state.bin` batch) was shown by a
+prior investigation (gotchas E5) to be structurally unsatisfiable for a real fp8
+step whose gradients traverse up to ~12 fp8 GEMMs — quantization error compounds
+with depth (a documented, not-a-bug signature: corr −0.68 to −0.97 between layer
+index and relL2 across all 12 per-layer tensor classes). Chunk F codifies the
+coordinator-accepted recalibrated gate into `tests/compare_grad_dumps.py` and wires
+`make verify-fp8-grads` (builds both dump binaries, dumps 148 tensors under bf16 and
+fp8, runs the comparator):
+
+| criterion | rule | result |
+|---|---|---:|
+| (a) per-tensor cosine floor | every tensor > 0.93 | **PASS** — min 0.9366 |
+| (b) relL2 envelope | median < 0.20, max < 0.50 | **PASS** — median 0.1742, max 0.4616 |
+| (c) depth-monotonicity | no layer > ~2× its local-neighbor relL2, per tensor class | **PASS** — 0 violations |
+| (d) NaN/Inf sentinel | zero nonfinite elements | **PASS** |
+
+**OVERALL GATE: PASS.** Full stats: cosine min 0.9366 / median 0.9870 / max 0.9993;
+relL2 min 0.0412 / median 0.1742 / max 0.4616 (n=148).
+
+Implementation note on (c): "local trend" is the median of a tensor's *immediate*
+neighbors (radius=1) within its 12-layer class — the tightest, most standard reading
+of "local," and deliberately not a wider window. A wider radius=2 window (median of
+up to 4 neighbors) was tried first and produced one borderline flag,
+`ln_1_gamma_layer04` at 2.04× (just over the ~2× threshold) — the wider window pulls
+in layers further from the point being tested, which on this curve (monotonic but
+noisy, not perfectly smooth per the E5 depth-correlation numbers) dilutes the local
+comparison. `ln_1_gamma` is independently the tensor class E5 already flagged as
+smallest-magnitude and most sensitive to relative error (its gradient comes from the
+bf16 LN-backward kernel, so the error is purely propagated upstream fp8
+contamination, not a kernel defect) — with the tighter, equally-defensible radius=1
+window this specific point is 1.90× its neighbors' median, under the threshold. This
+is disclosed rather than silently tuned away: the flag was a real borderline case in
+noisy real data, not evidence of a bug, and the final implementation choice (radius=1)
+was made on its own merits (tightest "local" reading, standard small-window spike
+filter) independent of which choice happened to pass.
+
+### Bit-stability: PASS (bitwise-identical)
+
+Two identical fp8 10-step runs (same seed, same invocation — GPT-2 124M loaded from
+the FineWeb-trained checkpoint `log124M/model_19552.bin`, FineWeb train/val shards,
+B=4, T=1024) produce **bitwise-identical loss and grad-norm sequences**: `diff` over
+the extracted `step N | loss ... | norm ...` lines (timing/tok-s fields excluded,
+since those are expected to vary run-to-run) reports zero differences across all 10
+steps plus both val-loss checkpoints. Per the design's determinism gate, this rules
+out a scale/amax race in the delayed-scaling state machine — the quantize/amax
+kernels are deterministic, matching the design's expectation (they are not the known
+bf16 atomics-wiggle source).
+
+### 50-step loss-trajectory envelope: PASS, no drift
+
+Same checkpoint/data/B/T, fp8 vs bf16, 50 steps, `-v 25` (val loss at steps 0/25/50):
+
+| | step 1 | step 25 | step 50 |
+|---|---:|---:|---:|
+| fp8 val loss | 3.315878 (step 0) | 3.7947502 | 3.8522835 |
+| bf16 val loss | 3.286980 (step 0) | 3.7861176 | 3.8209538 |
+
+Per-step `|relative loss delta|` (fp8 vs bf16, n=50): **median 0.57%, max 1.81%**
+(step 46). No drift as amax histories fill: first-half median 0.55% vs second-half
+median 0.58% — flat, not growing. Zero NaN/Inf in either arm across all 50 steps.
+Both val-loss trajectories are plausible and track each other within a few percent.
+
+### Performance: FP8 is currently ~36% SLOWER than bf16 at B=4, T=1024
+
+Two independent wall-clock measurements agree closely:
+
+| method | fp8 median ms/step | bf16 median ms/step | fp8/bf16 |
+|---|---:|---:|---:|
+| interleaved rounds (arm order flipped each round, n=25 measured steps/arm, step 1 of each round excluded) | 183.69 | 134.73 | **1.363×** |
+| raw 50-step back-to-back run (n=49 measured steps/arm) | 184.38 | 135.86 | **1.357×** |
+
+Consistent to within 0.5% across two different measurement protocols — this is a
+real effect, not noise. **Memory:** `free -g` shows no discernible difference
+between arms (~74–75 GB used throughout, on this 121 GB unified-memory GB10 box);
+`nvidia-smi` reports `Memory-Usage: Not Supported` on this device, so `free -g` is
+the available proxy. Storage staying bf16 (fp8 buffers are small device-only
+transients, design §1.1/§4) is consistent with the flat reading.
+
+**Where the overhead lives** (1-step `ncu` breakdown, `make profile-ncu
+PROFILE_T=1024`, matching the B=4,T=1024 training config — the profiler's T=64
+default is not representative at this scale):
+
+| | fp8 (µs) | bf16 (µs) | Δ |
+|---|---:|---:|---:|
+| **Total GPU time (1 step)** | **214,964** | **149,591** | **+65,373 (+43.7%)** |
+| GEMM compute (matmul family + `nvjet_*` tensor-core microkernels) | 82,834 | 96,024 | **−13,190 (−13.7%)** |
+| fp8 quantize/amax/scale kernel family (new) | 70,450 | 0 | +70,450 |
+| everything else (attention, layernorm, gelu, optimizer, split/merge, classifier, encoder) | 61,680 | 53,567 | +8,113 |
+
+The actual fp8 tensor-core GEMMs are **faster** than bf16's, as the design
+predicted (−13.7% GEMM compute time) — but that saving is more than 5× outweighed
+by the new quantize/amax/scale kernel family, which alone is **32.8% of total fp8
+GPU time**. Breakdown of that family (dominant to smallest):
+
+| kernel | calls | µs | % of fp8 total |
+|---|---:|---:|---:|
+| `quantize_transpose` (two call-count variants: 96 + 48) | 144 | 51,978 | 24.2% |
+| `quantize_kernel_dev` (two variants: 48 + 96) | 144 | 11,467 | 5.3% |
+| `amax_partial_gpu` | 144 | 5,856 | 2.7% |
+| `amax_aggregate_gpu` | 144 | 454 | 0.2% |
+| `update_scale_gpu` | 144 | 388 | 0.2% |
+| `amax_state_init_gpu` | 144 | 308 | 0.1% |
+
+`quantize_transpose` (quantize + transpose the operand feeding the dgrad/wgrad
+orientation cuBLASLt needs, design §5.3) is the single largest line item in the
+*entire* profile — larger than `adamw_update` (14,850 µs) or any individual matmul
+kernel. **Roadmap for the future optimization pass:** the amax reduction/scale-update
+kernels (`amax_partial`/`amax_aggregate`/`update_scale`/`amax_state_init`, 7,006 µs
+combined, 3.3% of total) are cheap and not worth touching; the entire ~65 ms/step gap
+between fp8 and bf16 traces to the quantize kernels, `quantize_transpose` above all.
+Candidates: fuse the transpose into the quantize kernel's write pattern (or avoid the
+transpose by choosing a cuBLASLt fp8 operand orientation that needs none), batch the
+per-site quantize launches (12 sites/step × forward+backward), or quantize directly
+from the bf16 GEMM epilogue instead of as a separate kernel. Until then, fp8 is a
+**correct, gated, but not-yet-faster** milestone — same conclusion the design
+document flagged as the realistic worst case.

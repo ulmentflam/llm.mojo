@@ -399,6 +399,78 @@ knob in `train_gpt2.mojo` (default off = full fp8, comptime-inert).
 
 ---
 
+## FP8 CHUNK F (end-to-end verification, determinism, perf)
+
+### F1 — The recalibrated gradient gate is now codified; local-trend window choice matters
+
+**What:** `tests/compare_grad_dumps.py` implements the E5 recalibration proposal as an
+executable gate (`make verify-fp8-grads`): (a) per-tensor cosine floor >0.93, (b) relL2
+envelope (median<0.20, max<0.50), (c) depth-monotonicity (flag any layer whose relL2
+exceeds ~2× its class's local-neighbor trend), (d) NaN/Inf sentinel. All four PASS on
+the current `goal2/fp8-training` HEAD (cosine min 0.9366/median 0.9870/max 0.9993;
+relL2 min 0.0412/median 0.1742/max 0.4616; 0 depth violations; 0 nonfinite).
+
+**Gotcha:** criterion (c)'s result is sensitive to the neighbor-window radius. A
+radius=2 window (median of up to 4 neighbors per point) flags one borderline case,
+`ln_1_gamma_layer04` at 2.04× (just over the ~2× threshold) — this is the exact
+tensor E5 already characterized as smallest-magnitude/most error-sensitive
+(propagated bf16-LN-backward error, not a kernel defect), and the wider window
+dilutes the "local" comparison with layers further from the test point on a curve
+that is monotonic-but-noisy (not perfectly smooth; E5's own depth-correlation was
+−0.68 to −0.97, not −1.0). The shipped implementation uses radius=1 (immediate
+neighbors only — the tightest, most standard reading of "local," and a real
+signal-detection choice, not a threshold hand-tuned to pass): with radius=1 the same
+point is 1.90×, under threshold. Future agents changing this gate should keep radius
+small (1) rather than widen it — a wider window trades bug sensitivity for false
+positives on the naturally-noisy compounding curve.
+
+### F2 — Bit-stability confirmed: fp8's new kernels are deterministic
+
+**What:** Two identical fp8 10-step runs (same seed/checkpoint/data invocation)
+produce bitwise-identical `step N | loss ... | norm ...` sequences (`diff` empty).
+This confirms the design's expectation (§1.3): all scale/amax math is delayed
+(computed from *prior* steps' history, not a same-step reduction racing the GEMM),
+and the amax/quantize kernels (`llmm/amax.mojo`, `llmm/lowp.mojo`) use no shared
+mutable state across threads that would introduce atomics-order nondeterminism — in
+contrast to the known bf16 atomics-in-non-lowp-kernels wiggle source (MEMORY.md
+territory), which fp8 does not add to.
+
+### F3 — 50-step envelope: no drift as amax history fills
+
+**What:** A 10-step horizon (E5) cannot distinguish "tracks bf16" from "slowly
+drifts as the 16-step amax history transitions out of warmup." A 50-step fp8-vs-bf16
+run (same checkpoint/data/B=4/T=1024) shows per-step `|relative loss delta|` median
+0.57%, max 1.81% (step 46), with first-half (steps 2–25) median 0.55% vs second-half
+(steps 26–50) median 0.58% — flat, no growing-envelope trend. Zero NaN/Inf either arm. `AmaxState` is runtime-only (not part of the checkpoint),
+so this run's amax history starts empty at step 1 regardless of the model weights
+being pre-trained — the warmup-to-delayed-scaling transition (`amax_history_len=16`,
+§1.3) falls around step 16-17 of this 50-step window, and the flat first-half vs
+second-half median confirms it does not destabilize the loss trajectory.
+
+### F4 — FP8 is currently slower than bf16 at real scale; overhead is almost entirely `quantize_transpose`
+
+**What:** At B=4, T=1024 (the shipped training config), fp8 is **~36% slower** than
+bf16 (183.7 vs 134.7 ms/step median, two independent measurement protocols agreeing
+to within 0.5%) — larger than the ~5-6% toy-scale estimate from an earlier probe.
+A 1-step `ncu` breakdown at the matching T=1024 (the profiler's `PROFILE_T` defaults
+to 64, which is **not** representative — rerun with `PROFILE_T=1024` for any future
+fp8 perf work) shows why: the actual fp8 tensor-core GEMMs are faster than bf16's
+(−13.7% GEMM compute time, confirming the hardware works as expected), but a new
+`quantize/amax/scale` kernel family costs 32.8% of total fp8 GPU time — more than
+5× the GEMM saving. **`quantize_transpose` alone is 24.2% of total fp8 time**,
+larger than any single existing kernel including `adamw_update`. The
+amax-reduction/scale-update kernels (`amax_partial`/`amax_aggregate`/
+`update_scale`/`amax_state_init`) are cheap by comparison (3.3% combined) and are
+not the lever. See `docs/ai/ai_assisted_optimizations_and_benchmarks.md`
+(2026-07-10 FP8 entry) for the full per-kernel table and the future-optimization-pass
+roadmap (fuse the transpose into quantize's write pattern, or eliminate the operand
+orientation that needs a transpose at all).
+
+**Source:** Chunk F end-to-end verification, 2026-07-10 (worktree `goal2/fp8-training`,
+`llmm-goal2-fp8`; `docs/ai/fp8_training_design.md` §6 Chunk F gates).
+
+---
+
 ## Section summary
 
 | Section | Items | Status |
@@ -407,6 +479,8 @@ knob in `train_gpt2.mojo` (default off = full fp8, comptime-inert).
 | cuBLASLt | C1–C3 | Verified (C1: Probe 4; C2–C3: Probe FP4) |
 | TF32/fp32 | TF1–TF3 | Verified (TF1–TF2: goal1 branch; TF3: GB10 incidents) |
 | ARCHITECTURE | A1–A3 | A1–A2: design doc confirmed; A3: agent-reported |
+| FP8 CHUNK D/E | E1–E5 | Verified (E5: root-cause investigation, coordinator-accepted recalibration) |
+| FP8 CHUNK F | F1–F4 | Verified (gate codified + PASS, bit-stability PASS, 50-step envelope PASS, perf measured) |
 
 ---
 

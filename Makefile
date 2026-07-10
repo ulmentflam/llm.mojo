@@ -129,6 +129,7 @@ SHELL := /bin/bash
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
         build-infer build-infer-bf16 build-infer-fp8 data-hellaswag eval eval-cpu benchmark-eval \
+        verify-fp8-grads \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
@@ -185,6 +186,9 @@ help:
 	@echo "  build-infer      Compile infer_gpt2.mojo to build/infer_gpt2 (fp32/CPU-capable)"
 	@echo "  build-infer-bf16 Compile the bf16 (-D LLMM_BF16) inference binary, build/infer_gpt2_bf16"
 	@echo "  build-infer-fp8  Compile the fp8 (-D LLMM_PRECISION=fp8) inference binary, build/infer_gpt2_fp8"
+	@echo "  verify-fp8-grads Build both grad-dump binaries, dump 148 param-grad tensors fp8 vs"
+	@echo "                   bf16 on the fixed debug-state batch, and run the recalibrated"
+	@echo "                   gradient gate (tests/compare_grad_dumps.py). GPU-only."
 	@echo "  data-hellaswag   Download + tokenize the HellaSwag val split (data/hellaswag.py)"
 	@echo "  eval             Build (bf16) + score CHECKPOINT on HellaSwag (default"
 	@echo "                   CHECKPOINT=log124M/model_19552.bin; override on the command line,"
@@ -401,6 +405,36 @@ build-infer-fp8: $(INFER_BIN_FP8)
 $(INFER_BIN_FP8): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_FP8) $(INFER_MOJO_SRC)
+
+# Chunk F gradient gate (docs/ai/fp8_training_design.md Chunk F / gotchas E5):
+# dump all 148 param-gradient tensors after one fwd+bwd step on the fixed
+# gpt2_124M_debug_state.bin reference batch, once under the bf16 build and
+# once under the fp8 build, then compare with tests/compare_grad_dumps.py's
+# coordinator-ACCEPTED recalibrated gate (per-tensor cosine floor, relL2
+# envelope, depth-monotonicity, NaN/Inf sentinel — NOT the flat atol that hid
+# bugs before; see MEMORY.md weak-gates-overrule-nothing).
+DUMP_MOJO_SRC := dump_grads_gpt2.mojo
+DUMP_BIN_BF16 := build/dump_grads_gpt2_bf16
+DUMP_BIN_FP8 := build/dump_grads_gpt2_fp8
+GRAD_DUMP_DIR_BF16 := build/grad_dump_bf16
+GRAD_DUMP_DIR_FP8 := build/grad_dump_fp8
+
+$(DUMP_BIN_BF16): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_BF16) $(DUMP_MOJO_SRC)
+
+$(DUMP_BIN_FP8): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_FP8) $(DUMP_MOJO_SRC)
+
+# GPU-only (both dump binaries require an accelerator); run under the shared
+# GPU lock in contended environments: `flock -w 10800 /tmp/llmm-gpu.lock -c
+# 'make verify-fp8-grads'`.
+verify-fp8-grads: $(DUMP_BIN_BF16) $(DUMP_BIN_FP8)
+	@mkdir -p $(GRAD_DUMP_DIR_BF16) $(GRAD_DUMP_DIR_FP8)
+	./$(DUMP_BIN_BF16) $(GRAD_DUMP_DIR_BF16)
+	./$(DUMP_BIN_FP8) $(GRAD_DUMP_DIR_FP8)
+	pixi run -e cuda python3 tests/compare_grad_dumps.py $(GRAD_DUMP_DIR_FP8) $(GRAD_DUMP_DIR_BF16)
 
 # HellaSwag eval: `make eval` builds the bf16 inference binary, ensures the
 # eval data is tokenized (see data/hellaswag.py), and scores a checkpoint.

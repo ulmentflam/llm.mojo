@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-07-10
+
+### Added
+
+- **FP8 mixed-precision training (Chunks A-G, `goal2/fp8-training`)** — GPT-2 124M now
+  trains end-to-end with the four per-block linear GEMMs (QKV/attn-proj/MLP fc/MLP
+  proj, forward + backward) in FP8 (E4M3 forward operands, E5M2 backward gradient
+  operand, delayed per-tensor scaling with a 16-step amax history), while storage,
+  LayerNorm, softmax, attention core, GELU, the LM head, and the AdamW optimizer stay
+  bf16/fp32 exactly as in the existing mixed-precision build (`make build-fp8`).
+  End-to-end verification (`docs/ai/fp8_training_design.md` Chunk F): the recalibrated
+  148-tensor gradient gate (`make verify-fp8-grads`) passes (per-tensor cosine floor
+  >0.93, relL2 envelope median 0.174/max 0.462 within the calibrated compounding
+  bounds, zero depth-monotonicity violations, no NaN/Inf); two identical fp8 runs are
+  bitwise-identical step-for-step (no scale/amax race); a 50-step fp8-vs-bf16 loss
+  trajectory tracks within 0.6% median / 1.8% max relative delta with no drift. FP8 is
+  currently **~36% slower** than bf16 at B=4,T=1024 on NVIDIA GB10 (quantize/amax
+  kernel-launch overhead outweighs the small-batch GEMM saving at this scale) — a
+  correct, gated, but not-yet-faster milestone; see
+  `docs/ai/ai_assisted_optimizations_and_benchmarks.md` for the full gate results and
+  perf breakdown, and `docs/ai/low_precision_gotchas.md` for implementation gotchas.
+
 ## [Unreleased] - 2026-07-03
 
 ### Fixed
@@ -145,7 +167,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GPU kernel implementations: matmul, attention (flash algorithm), softmax, cross-entropy, layer normalization, GELU, embeddings.
 - CPU equivalence tests for all major operations.
 - Distributed data loading with sharding support.
-- Mixed-precision training (fp32, bf16, fp16, fp8).
+- Mixed-precision training scaffolding (fp32/bf16 storage dtypes; bf16 mixed
+  precision reached full parity 2026-07-01, see the `[Unreleased] - 2026-07-01`
+  entry below — fp8 was not yet functional at this 0.1.0 tag, and fp16 was never
+  implemented as a distinct dtype; see the `[Unreleased] - 2026-07-10` entry above
+  for FP8's actual functional/gated debut).
 - Model checkpointing and weight export.
 - Benchmark harness for profiling against llm.c and PyTorch.
 - Support for both CUDA and portable GPU execution paths.
