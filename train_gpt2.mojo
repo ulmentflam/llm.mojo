@@ -22,6 +22,7 @@ from std.memory import alloc, UnsafePointer, memcpy, memset_zero
 
 from llmm.io import read_and_copy
 from llmm.dataloader import DataLoader
+from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
 from llmm.checkpointing import (
     CheckpointConfig,
     TrainingState,
@@ -901,6 +902,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
             # Allocate parameters and read them from the checkpoint.
             self.allocate_parameters(model_file)
+        elif self.checkpoint_path.endswith(".safetensors"):
+            # HuggingFace-exported checkpoint (see scripts/export_to_hf.py).
+            # Config lives in a sibling config.json, not in the safetensors
+            # header itself.
+            var safetensors_path = self.checkpoint_path
+            var slash_idx = safetensors_path.rfind("/")
+            var config_dir = String(
+                safetensors_path[byte=0:slash_idx]
+            ) if slash_idx >= 0 else String(".")
+            var checkpoint_config = read_hf_gpt2_config(
+                config_dir + "/config.json"
+            )
+            self.config = GPT2Config(
+                max_seq_len=checkpoint_config.max_seq_len,
+                vocab_size=checkpoint_config.vocab_size,
+                num_layer=checkpoint_config.num_layer,
+                num_heads=checkpoint_config.num_heads,
+                channels=checkpoint_config.channels,
+                padded_vocab_size=checkpoint_config.padded_vocab_size,
+            )
+            self.allocate_parameters_from_safetensors(safetensors_path)
         else:
             # Build config from the descriptor and random-init the weights.
             self.config = parse_model_descriptor(self.checkpoint_path)
@@ -1134,6 +1156,174 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         fp32_scratch.free()
 
         # Copy the host params to the device, zero-padding the sharded tail.
+        self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+            self.padded_num_parameters
+        )
+        self.params_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        self.ctx.enqueue_copy(
+            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                self.params_buf.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                hp.as_unsafe_any_origin()
+            ),
+            size=self.num_parameters,
+        )
+        self.ctx.synchronize()
+        self.params_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.params_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.params.point_parameters(self.param_sizes, self.params_memory)
+
+        self.has_allocated_params = True
+
+    def allocate_parameters_from_safetensors(
+        mut self, safetensors_path: String
+    ) raises:
+        """Allocate parameters and populate them from a HuggingFace-exported
+        `.safetensors` checkpoint (see `scripts/export_to_hf.py`, which
+        produces these from our own `.bin` format).
+
+        Reuses the exact same downstream layout as `allocate_parameters`
+        (flat `temp_host_buf` in canonical parameter order -> device copy ->
+        `ParameterTensors.point_parameters`) — only how the host buffer gets
+        populated differs. `self.config` must already be set (from the
+        sibling `config.json`) before calling this.
+        """
+        self._compute_param_sizes()
+
+        var L = self.config.num_layer
+        var C = self.config.channels
+        var V = self.config.vocab_size
+        var V_p = self.config.padded_vocab_size
+        var max_T = self.config.max_seq_len
+
+        self.params = ParameterTensors[GPT2_DTYPE]()
+        var temp_host_buf = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+            self.num_parameters
+        )
+        self.ctx.synchronize()
+        var hp = rebind_mut_mem[GPT2_DTYPE](
+            temp_host_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        for i in range(self.num_parameters):
+            hp[i] = Scalar[GPT2_DTYPE](0.0)
+
+        var st = SafetensorsFile(safetensors_path)
+
+        # wte: HF export drops the (V_p - V) padding rows entirely (see
+        # export_to_hf.py's `w[key][:(V-Vp), :]` slice) — read the real V
+        # rows into the front of our (V_p, C)-sized block; the trailing
+        # padding rows stay zero, exactly as fused_classifier already
+        # ignores them (it masks dlogits/loss to the real V columns, see
+        # llmm/fused_classifier.mojo).
+        var base = 0
+        st.read_tensor[GPT2_DTYPE]("transformer.wte.weight", hp + base)
+        base += V_p * C
+
+        st.read_tensor[GPT2_DTYPE]("transformer.wpe.weight", hp + base)
+        base += max_T * C
+
+        # ln_1_gamma / ln_1_beta: each layer's C values are concatenated
+        # back-to-back across the whole L*C block (llm.c/our own layout
+        # groups by tensor TYPE across all layers, not by layer).
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".ln_1.weight",
+                hp + base + l * C,
+            )
+        base += L * C
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".ln_1.bias",
+                hp + base + l * C,
+            )
+        base += L * C
+
+        # qkv_weight: HF stores Conv1D-style (C, 3C) — the transpose of our
+        # (3C, C) — per export_to_hf.py's `mk_tensor(..., transpose=True)`.
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".attn.c_attn.weight",
+                hp + base + l * (3 * C * C),
+                transpose_rows=3 * C,
+                transpose_cols=C,
+            )
+        base += L * (3 * C) * C
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".attn.c_attn.bias",
+                hp + base + l * (3 * C),
+            )
+        base += L * (3 * C)
+
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".attn.c_proj.weight",
+                hp + base + l * (C * C),
+                transpose_rows=C,
+                transpose_cols=C,
+            )
+        base += L * C * C
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".attn.c_proj.bias",
+                hp + base + l * C,
+            )
+        base += L * C
+
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".ln_2.weight",
+                hp + base + l * C,
+            )
+        base += L * C
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".ln_2.bias",
+                hp + base + l * C,
+            )
+        base += L * C
+
+        # fc_weight (mlp.c_fc): HF stores (C, 4C), the transpose of our
+        # (4C, C).
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".mlp.c_fc.weight",
+                hp + base + l * (4 * C * C),
+                transpose_rows=4 * C,
+                transpose_cols=C,
+            )
+        base += L * (4 * C) * C
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".mlp.c_fc.bias",
+                hp + base + l * (4 * C),
+            )
+        base += L * (4 * C)
+
+        # proj_weight (mlp.c_proj): HF stores (4C, C), the transpose of our
+        # (C, 4C).
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".mlp.c_proj.weight",
+                hp + base + l * (C * 4 * C),
+                transpose_rows=C,
+                transpose_cols=4 * C,
+            )
+        base += L * C * (4 * C)
+        for l in range(L):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.h." + String(l) + ".mlp.c_proj.bias",
+                hp + base + l * C,
+            )
+        base += L * C
+
+        st.read_tensor[GPT2_DTYPE]("transformer.ln_f.weight", hp + base)
+        base += C
+        st.read_tensor[GPT2_DTYPE]("transformer.ln_f.bias", hp + base)
+        base += C
+
         self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             self.padded_num_parameters
         )

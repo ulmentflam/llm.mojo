@@ -7,6 +7,7 @@ from llmm.memory import MutMemPtr, ImmutMemPtr
 from llmm.sampler import random_f32, sample_softmax
 from llmm.tokenizer import Tokenizer, safe_print
 from llmm.eval_dataloader import EvalDataLoader, eval_stat_correct
+from llmm.hf_download import fetch_hf_checkpoint
 
 from train_gpt2 import GPT2, GPT2_DTYPE
 
@@ -25,9 +26,20 @@ from train_gpt2 import GPT2, GPT2_DTYPE
 #
 #     MOJO_PYTHON_LIBRARY=... ./build/infer_gpt2_bf16 log124M/model_19552.bin 64
 #
-#   arg1: checkpoint path (model_*.bin)
+#   arg1: checkpoint path — accepts our own model_*.bin, OR a HuggingFace
+#         export's model.safetensors (config.json must sit alongside it —
+#         see scripts/export_to_hf.py). Format is auto-detected by extension.
 #   arg2: number of tokens to generate (default 64)
 #   arg3: RNG seed (default 1337)
+#
+# Run (generation mode, fetching straight from a HuggingFace repo):
+#
+#     MOJO_PYTHON_LIBRARY=... ./build/infer_gpt2_bf16 --hf ulmentflam/gpt2-124m-fineweb-mojo 64
+#
+#   arg1: --hf
+#   arg2: HuggingFace repo id (downloads config.json + model.safetensors)
+#   arg3: number of tokens to generate (default 64)
+#   arg4: RNG seed (default 1337)
 #
 # Run (eval mode — e.g. HellaSwag; see data/hellaswag.py to produce the .bin):
 #
@@ -135,7 +147,9 @@ def run_infer[
 
 def run_eval[
     target: StaticString,
-](checkpoint_path: String, eval_path: String, batch_size: Int, seq_len: Int) raises -> None:
+](
+    checkpoint_path: String, eval_path: String, batch_size: Int, seq_len: Int
+) raises -> None:
     var ctx = DeviceContext()
 
     var model = GPT2[target, 1](
@@ -180,6 +194,39 @@ def run_eval[
 def main() raises -> None:
     var args = argv()
 
+    # --hf <repo_id>: fetch config.json + model.safetensors from a public
+    # HuggingFace model repo (e.g. ulmentflam/gpt2-124m-fineweb-mojo), then
+    # generate from it exactly like a local checkpoint path. The fetch is the
+    # one Python-bridged step (llmm/hf_download.mojo); loading the fetched
+    # .safetensors into GPT2's parameter buffers is pure Mojo either way (see
+    # GPT2.__init__'s .safetensors branch, train_gpt2.mojo).
+    if len(args) > 1 and args[1] == "--hf":
+        if len(args) <= 2:
+            print("Usage: --hf <repo_id> [gen_max_length] [seed]")
+            exit(1)
+        var checkpoint_path = fetch_hf_checkpoint(args[2])
+        var gen_max_length = 64
+        if len(args) > 3:
+            gen_max_length = atol(args[3])
+        var seed: UInt64 = 1337
+        if len(args) > 4:
+            seed = UInt64(atol(args[4]))
+
+        comptime if GPT2_DTYPE == DType.bfloat16:
+            if not has_accelerator():
+                print(
+                    "bf16 build supports only the GPU target (CPU stays fp32)."
+                )
+                exit(1)
+            comptime if has_accelerator():
+                run_infer["gpu"](checkpoint_path, gen_max_length, seed)
+        else:
+            comptime if has_accelerator():
+                run_infer["gpu"](checkpoint_path, gen_max_length, seed)
+            else:
+                run_infer["cpu"](checkpoint_path, gen_max_length, seed)
+        return
+
     if len(args) > 1 and args[1] == "--eval":
         var checkpoint_path = String("log124M/model_19552.bin")
         if len(args) > 2:
@@ -197,8 +244,7 @@ def main() raises -> None:
         comptime if GPT2_DTYPE == DType.bfloat16:
             if not has_accelerator():
                 print(
-                    "bf16 build supports only the GPU target (CPU stays"
-                    " fp32)."
+                    "bf16 build supports only the GPU target (CPU stays fp32)."
                 )
                 exit(1)
             comptime if has_accelerator():
