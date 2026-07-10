@@ -25,7 +25,7 @@ When unsure, write it down.
 
 ## AI use statement
 
-Written with AI assistance (Claude Code), directed by Evan Owen.
+Written with AI assistance ([Agent/Harness]), directed by [Author].
 
 ## Issue and PR Guidelines
 
