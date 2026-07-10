@@ -9,10 +9,12 @@ from std.gpu.host.info import is_cpu, is_gpu
 from std.math import sqrt
 
 from llmm.memory import MutMemPtr
+from llmm.vendor import HAS_CUBLAS, USE_TF32
 from llmm.zero import ZeroContext
 
 from train_gpt2 import (
     GPT2,
+    GPT2_DTYPE,
     ParameterTensors,
 )
 
@@ -93,7 +95,9 @@ def check_tensor[
     # Dead-gradient signature: our_l2 << ref_l2 (fails lower bound).
     var l2_ok: Bool
     if ref_l2 > Float32(1e-6):
-        l2_ok = (our_l2 <= l2_factor * ref_l2) and (our_l2 * l2_factor >= ref_l2)
+        l2_ok = (our_l2 <= l2_factor * ref_l2) and (
+            our_l2 * l2_factor >= ref_l2
+        )
     else:
         # Reference is essentially zero — accept ours only if also near-zero.
         l2_ok = our_l2 <= Float32(1e-3)
@@ -112,27 +116,49 @@ def check_tensor[
             print("  OK  ", end="")
         else:
             print("  FAIL", end="")
-        print(" actual=" + String(actual) + " ref=" + String(expected_ptr[i]) + " diff=" + String(diff))
+        print(
+            " actual="
+            + String(actual)
+            + " ref="
+            + String(expected_ptr[i])
+            + " diff="
+            + String(diff)
+        )
 
     # --- Per-tensor diagnostic summary ---
     print(
-        "  maxdiff=" + String(maxdiff)
-        + "  threshold=" + String(threshold)
-        + "  (atol=" + String(atol)
-        + " rtol=" + String(rtol)
-        + " ref_maxabs=" + String(ref_maxabs) + ")"
+        "  maxdiff="
+        + String(maxdiff)
+        + "  threshold="
+        + String(threshold)
+        + "  (atol="
+        + String(atol)
+        + " rtol="
+        + String(rtol)
+        + " ref_maxabs="
+        + String(ref_maxabs)
+        + ")"
     )
     if ref_l2 > Float32(1e-6):
         print(
-            "  our_l2=" + String(our_l2)
-            + "  ref_l2=" + String(ref_l2)
-            + "  ratio=" + String(our_l2 / ref_l2)
-            + "  [must be in (1/" + String(l2_factor) + ", " + String(l2_factor) + ")]"
+            "  our_l2="
+            + String(our_l2)
+            + "  ref_l2="
+            + String(ref_l2)
+            + "  ratio="
+            + String(our_l2 / ref_l2)
+            + "  [must be in (1/"
+            + String(l2_factor)
+            + ", "
+            + String(l2_factor)
+            + ")]"
         )
     else:
         print(
-            "  our_l2=" + String(our_l2)
-            + "  ref_l2=" + String(ref_l2)
+            "  our_l2="
+            + String(our_l2)
+            + "  ref_l2="
+            + String(ref_l2)
             + "  (ref≈0; our must be <1e-3)"
         )
 
@@ -144,15 +170,22 @@ def check_tensor[
         if not maxdiff_ok:
             reasons = (
                 reasons
-                + " MAXDIFF(" + String(maxdiff)
-                + ">" + String(threshold) + ")"
+                + " MAXDIFF("
+                + String(maxdiff)
+                + ">"
+                + String(threshold)
+                + ")"
             )
         if not l2_ok:
             reasons = (
                 reasons
-                + " L2_RATIO(ours=" + String(our_l2)
-                + " ref=" + String(ref_l2)
-                + " limit=" + String(l2_factor) + "x)"
+                + " L2_RATIO(ours="
+                + String(our_l2)
+                + " ref="
+                + String(ref_l2)
+                + " limit="
+                + String(l2_factor)
+                + "x)"
             )
         print("TENSOR NOT OK:" + reasons)
 
@@ -201,10 +234,36 @@ def run_test[
     #
     # Loss-trajectory tolerance (LOSS_STEP_TOL):
     #   llm.c uses 1e-2 absolute for per-step loss checks against the PyTorch reference.
+    #
+    # TF32 exception: when the build's fp32 GEMMs run on TF32 tensor cores
+    # (default on NVIDIA — llmm/vendor.mojo's USE_TF32; `make verify-gpu`
+    # disables it with -D LLMM_NO_TF32=1 to keep this gate strict-IEEE), the
+    # 10-bit-mantissa GEMM inputs drift the per-step loss slightly: measured
+    # max |delta| over the 10-step overfit run is 0.0102 with no growth trend
+    # (see docs/ai/ai_assisted_optimizations_and_benchmarks.md, 2026-07-10
+    # entry). 0.02 = ~2x that measured drift — loose enough that healthy TF32
+    # rounding passes, tight enough that a real regression (which shows up as
+    # a large per-step deviation or a growing trend, e.g. the dead-gradient
+    # trajectories this check exists to catch deviate by O(0.1+) within a few
+    # steps) still fails. The gradient tolerances are NOT loosened: TF32
+    # passes them with 30-100x margin, so they stay at full strength.
     var GRAD_ATOL: Float32 = 0.01
     var GRAD_RTOL: Float32 = 0.05
     var GRAD_L2_FACTOR: Float32 = 3.0
     var LOSS_STEP_TOL: Float32 = 0.01
+    comptime tf32_active = (
+        USE_TF32
+        and HAS_CUBLAS
+        and is_gpu[target]()
+        and GPT2_DTYPE == DType.float32
+    )
+    comptime if tf32_active:
+        LOSS_STEP_TOL = 0.02
+        print(
+            "TF32 fp32 GEMMs active (USE_TF32=1): LOSS_STEP_TOL=0.02"
+            " (calibrated for TF32 drift; build with -D LLMM_NO_TF32=1 for"
+            " the strict-IEEE 0.01 gate)"
+        )
     # build the GPT-2 model from a checkpoint
     var ctx: DeviceContext
     comptime if is_cpu[target]():
@@ -674,7 +733,9 @@ def main() raises:
             if not gpu_ok:
                 exit(1)
         else:
-            print("No accelerator detected on this host; GPU tests unavailable.")
+            print(
+                "No accelerator detected on this host; GPU tests unavailable."
+            )
             exit(1)
     else:
         print("=== Running CPU Tests ===")

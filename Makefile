@@ -128,7 +128,7 @@ SHELL := /bin/bash
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures \
-        verify verify-cpu verify-gpu \
+        verify verify-cpu verify-gpu verify-gpu-tf32 \
         docs docs-clean
 
 .DEFAULT_GOAL := help
@@ -223,7 +223,8 @@ help:
 	@echo "  test-fixtures Regenerate tests/fixtures/*.npz from PyTorch reference"
 	@echo "  verify        Verify both CPU and GPU versions against reference state"
 	@echo "  verify-cpu    Verify CPU version against reference state"
-	@echo "  verify-gpu    Verify GPU version against reference state"
+	@echo "  verify-gpu    Verify GPU version against reference state (true fp32, TF32 off)"
+	@echo "  verify-gpu-tf32  Same gate for the default TF32-on fp32 path (TF32-calibrated loss tol)"
 	@echo ""
 	@echo "Documents:"
 	@echo "  docs          Build docs/backprop.pdf with latexmk"
@@ -808,7 +809,28 @@ verify: verify-cpu verify-gpu
 verify-cpu:
 	pixi run mojo test_gpt2.mojo cpu
 
+# fp32 GEMMs default to TF32 tensor cores (llmm/vendor.mojo's USE_TF32), which
+# is the right choice for training but wrong for a strict-IEEE reference
+# check — TF32's 10-bit mantissa drifts the per-step loss up to ~0.01 over
+# the 10-step overfit run. llm.c hits the same issue and resolves it the same
+# way: its fp32 correctness test (test_gpt2_fp32.cu) explicitly forces
+# `enable_tf32 = 0` ("disable TF32 for testing!!!") even though its training
+# binary auto-enables TF32 on cc>=8.0. Mirror that here with
+# -D LLMM_NO_TF32=1 so this gate keeps checking true IEEE fp32 math at the
+# tight LOSS_STEP_TOL=0.01; see verify-gpu-tf32 below for the TF32 path.
 verify-gpu:
+	pixi run -e cuda mojo -D LLMM_NO_TF32=1 test_gpt2.mojo gpu
+
+# Gates the default (TF32-on) fp32 training path against the same reference.
+# The gradient checks run at full strength (TF32 passes them with 30-100x
+# margin); only the per-step loss-trajectory tolerance is TF32-calibrated —
+# test_gpt2.mojo detects USE_TF32 at comptime and uses LOSS_STEP_TOL=0.02
+# (~2x the measured max TF32 drift of 0.0102, no growth trend — see the
+# 2026-07-10 entry in docs/ai/ai_assisted_optimizations_and_benchmarks.md).
+# A real regression (large deviation or growing trend, e.g. dead gradients
+# deviate by O(0.1+) within a few steps) still fails. Not part of
+# `make verify`/`make check`, which keep gating on strict IEEE fp32.
+verify-gpu-tf32:
 	pixi run -e cuda mojo test_gpt2.mojo gpu
 
 docs:
