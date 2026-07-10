@@ -123,7 +123,7 @@ SHELL := /bin/bash
         build-profile build-profile-bf16 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
-        build-infer build-infer-bf16 data-hellaswag eval eval-cpu \
+        build-infer build-infer-bf16 data-hellaswag eval eval-cpu benchmark-eval \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
@@ -178,6 +178,8 @@ help:
 	@echo "                   CHECKPOINT=log124M/model_19552.bin; override on the command line,"
 	@echo "                   e.g. make eval CHECKPOINT=log124M/model_5000.bin EVAL_B=32)"
 	@echo "  eval-cpu         Same as eval, but the fp32/CPU inference binary"
+	@echo "  benchmark-eval   Score + render the llm.mojo-vs-llm.c HellaSwag comparison"
+	@echo "                   chart into figures/ (make eval + Wilson CI + plot)"
 	@echo ""
 	@echo "Benchmark (vs llm.c submodule on NVIDIA; vs PyTorch MPS on Apple Silicon):"
 	@echo "  build-llmc    Build llm.c CPU (train_gpt2) + CUDA (train_gpt2cu, if nvcc)"
@@ -354,6 +356,11 @@ eval: build-infer-bf16 $(EVAL_BIN)
 
 eval-cpu: build-infer $(EVAL_BIN)
 	./$(INFER_BIN) --eval $(CHECKPOINT) $(EVAL_BIN) $(EVAL_B) $(EVAL_T)
+
+# Runs `make eval`, computes a Wilson CI, and renders the llm.mojo-vs-llm.c
+# comparison chart into figures/ (see scripts/benchmark_eval.py's docstring).
+benchmark-eval:
+	pixi run python scripts/benchmark_eval.py
 
 # Tracing build: same harness, with the per-thread kernel instrumentation
 # compiled in via -D LLMM_TRACE=1.

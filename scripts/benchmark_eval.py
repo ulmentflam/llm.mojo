@@ -35,8 +35,8 @@ normalized computation, and discussion #481's plot is generated from exactly
 that training loop.
 
 Usage:
-    python scripts/benchmark_eval.py                   # runs `make eval` fresh
-    python scripts/benchmark_eval.py --k 2965 --n 10042 # skip the run, use given counts
+    make benchmark-eval                                          # runs `make eval` fresh
+    pixi run python scripts/benchmark_eval.py --k 2965 --n 10042 # skip the run, use given counts
 """
 
 import argparse
@@ -153,11 +153,57 @@ def run_make_eval():
     return int(m.group(1)), int(m.group(2))
 
 
+# Reference bars aren't a code "family" like llm.mojo/llm.c/PyTorch — they're
+# cited external data points (different models/training regimes). Muted,
+# neutral fills (not a new arbitrary hue) keep that distinction legible: color
+# still follows identity (llm.mojo blue is always llm.mojo; llm.c aqua is
+# always llm.c, matching benchmark_train.py's chart family), but a reference
+# with no raw (k, n) behind it is visually "quieter" than a measured bar.
+REF_COMPARABLE_COLOR = "#9a9890"  # muted neutral — same methodology, cited
+REF_CONTEXT_COLOR = "#c9c7bd"  # lighter still — different budget/methodology
+
+
 def render(k, n, outpath, info):
     phat, lo, hi = wilson_ci(k, n)
     phat_pct, lo_pct, hi_pct = phat * 100, lo * 100, hi * 100
+    sig_z, sig_p = two_proportion_p_value(k, n, REFERENCES[0].pct)
 
-    fig, ax = plt.subplots(figsize=(8.4, 5.2), constrained_layout=True)
+    # All four data points as bars on one shared categorical axis — a
+    # magnitude comparison across named categories reads as a comparison when
+    # every entry is the same mark type. The earlier draft drew llm.c and the
+    # other references as thin axhlines crossing a single bar; two of those
+    # lines (29.9 vs 29.55) were only 0.35pp apart and unreadable, and — more
+    # importantly — a line doesn't read as "a thing being compared" the way a
+    # bar does. llm.c gets its established color from benchmark_train.py's
+    # FAMILY_COLORS (same aqua everywhere llm.c appears in this repo's
+    # figures); the other two references are muted neutral fills, since
+    # they're cited external numbers, not our own (k, n) measurements.
+    entries = [
+        ("llm.mojo\n(ours)", phat_pct, FAMILY_COLORS["llm.mojo"], (lo_pct, hi_pct)),
+        (
+            "llm.c (Karpathy)\nsame setup: 10B FineWeb",
+            REFERENCES[0].pct,
+            FAMILY_COLORS["llm.c"],
+            None,
+        ),
+        (
+            "GPT-2 124M original\nOpenAI WebText ckpt",
+            REFERENCES[1].pct,
+            REF_COMPARABLE_COLOR,
+            None,
+        ),
+        (
+            "GPT-3 Small 124M\n300B tokens, 30x budget",
+            REFERENCES[2].pct,
+            REF_CONTEXT_COLOR,
+            None,
+        ),
+    ]
+    x = list(range(len(entries)))
+    heights = [e[1] for e in entries]
+    colors = [e[2] for e in entries]
+
+    fig, ax = plt.subplots(figsize=(8.4, 5.4), constrained_layout=True)
 
     ax.set_ylim(0, max(38, hi_pct + 4))
     ax.set_ylabel("HellaSwag accuracy (acc_norm, %)", color=TEXT_GRAY, fontsize=9.5)
@@ -167,92 +213,73 @@ def render(k, n, outpath, info):
         ax.spines[spine].set_visible(False)
     ax.spines["bottom"].set_color(GRID_COLOR)
 
-    # Our measured result: one bar with a real 95% Wilson CI as error bars —
-    # this is the only value on the chart with sampling uncertainty drawn,
-    # because it's the only one we have raw (k, n) for.
-    bar_color = FAMILY_COLORS["llm.mojo"]
     ax.bar(
+        x, heights, width=0.6, color=colors, zorder=3, edgecolor="white", linewidth=0.5
+    )
+
+    # Real 95% Wilson CI error bar — only llm.mojo has raw (k, n) behind it;
+    # the other three are point estimates cited from external sources, so
+    # drawing an error bar on them would fabricate a precision we don't have.
+    ax.errorbar(
         [0],
         [phat_pct],
-        width=0.5,
-        color=bar_color,
-        zorder=3,
         yerr=[[phat_pct - lo_pct], [hi_pct - phat_pct]],
-        error_kw=dict(ecolor=TEXT_INK, elinewidth=1.6, capsize=6, zorder=4),
+        fmt="none",
+        ecolor=TEXT_INK,
+        elinewidth=1.6,
+        capsize=6,
+        zorder=4,
     )
-    ax.text(
-        0,
-        hi_pct + 0.5,
-        f"{phat_pct:.2f}%  (95% CI {lo_pct:.1f}–{hi_pct:.1f})",
-        ha="center",
-        va="bottom",
-        fontsize=9,
-        color=TEXT_INK,
-        zorder=5,
-    )
-    ax.set_xticks([0])
-    ax.set_xticklabels(
-        ["llm.mojo (ours)\nfrom-scratch, 10B FineWeb"], fontsize=9.5, color=TEXT_INK
-    )
-    ax.set_xlim(-1.0, 1.0)
 
-    # Reference points: dashed/dotted horizontal lines, not bars — these are
-    # cited percentages, not our own measurements, and drawing them as bars
-    # would visually imply the same evidentiary weight as the CI'd bar above.
-    # Karpathy's 29.9 and the GPT-2-original 29.55 are only 0.35pp apart, far
-    # too close to label inline at the line without the text colliding — so
-    # labels live in a fixed-position legend box (axes-fraction coordinates,
-    # decoupled from data values) instead; linestyle order ties a legend line
-    # back to its axhline (both iterate REFERENCES in the same fixed order).
-    LINESTYLES = ["--", "-.", ":"]
-    for ref, ls in zip(REFERENCES, LINESTYLES):
-        color = TEXT_INK if ref.comparable else TEXT_GRAY
-        alpha = 0.85 if ref.comparable else 0.55
-        ax.axhline(
-            ref.pct, color=color, linestyle=ls, linewidth=1.3, alpha=alpha, zorder=2
+    # Direct value label on every bar (≤4 categories — labeling all of them is
+    # clearer than a legend here, and the CI only needs to sit next to the one
+    # bar that has one).
+    for xi, h, ref_comparable in zip(
+        x,
+        heights,
+        [True, True, True, False],  # llm.mojo counts as "comparable" to itself
+    ):
+        label = f"{h:.2f}%"
+        if xi == 0:
+            label += f"\n95% CI [{lo_pct:.1f}, {hi_pct:.1f}]"
+        ax.text(
+            xi,
+            h + (hi_pct - phat_pct if xi == 0 else 0) + 0.6,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=8.5,
+            color=TEXT_INK if ref_comparable else TEXT_GRAY,
+            zorder=5,
         )
 
-    legend_lines = [
-        f"{ref.label.splitlines()[0]}: {ref.pct:.2f}%" for ref in REFERENCES
-    ]
-    legend_text = "\n".join(legend_lines)
-    ax.text(
-        0.985,
-        0.985,
-        legend_text,
-        transform=ax.transAxes,
-        ha="right",
-        va="top",
-        fontsize=8,
-        color=TEXT_GRAY,
-        linespacing=1.9,
-        bbox=dict(facecolor="white", edgecolor=GRID_COLOR, boxstyle="round,pad=0.5"),
-        zorder=6,
-    )
+    ax.set_xticks(x)
+    ax.set_xticklabels([e[0] for e in entries], fontsize=8.8, color=TEXT_INK)
+    ax.set_xlim(-0.7, len(entries) - 0.3)
 
     fig.suptitle(
-        "HellaSwag accuracy — llm.mojo vs published references",
+        "HellaSwag accuracy — llm.mojo vs llm.c and published references",
         fontsize=13,
         color=TEXT_INK,
         x=0.02,
         ha="left",
     )
-    sig_z, sig_p = two_proportion_p_value(k, n, REFERENCES[0].pct)
     subtitle = (
-        f"n={n:,} val examples  |  Karpathy's {REFERENCES[0].pct:.1f}% falls inside our "
+        f"n={n:,} val examples  |  llm.c's {REFERENCES[0].pct:.1f}% falls inside our "
         f"95% CI (not significantly different, illustrative p={sig_p:.2f})"
     )
     ax.set_title(subtitle, fontsize=9.5, color=TEXT_GRAY, pad=10)
 
     footer = (
         f"llm.mojo: {k}/{n} correct, log124M/model_19552.bin (GPT-2 124M, d12, from-scratch, "
-        f"FineWeb classic 10B tokens, bf16). Reproduce: make eval. "
-        f"{info['platform']}, {info['date'][:10]}."
+        f"FineWeb classic 10B tokens, bf16). GPT-3 Small (grey, right) is scale context only — "
+        f"different token budget and likely eval methodology, not a statistical comparison. "
+        f"Reproduce: make eval. {info['platform']}, {info['date'][:10]}."
     )
     import textwrap
 
     fig.supxlabel(
-        textwrap.fill(footer, width=100), fontsize=7.5, color=TEXT_GRAY, style="italic"
+        textwrap.fill(footer, width=105), fontsize=7.5, color=TEXT_GRAY, style="italic"
     )
 
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
