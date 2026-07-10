@@ -137,6 +137,14 @@ def _resolve_precision() -> StaticString:
 
 comptime PRECISION = _resolve_precision()
 comptime LOWP_ENABLED = PRECISION == "fp8" or PRECISION == "fp4"
+# Investigation knob (fp8 fwd/bwd error isolation, Chunk E gate probe): building
+# with `-D LLMM_FP8_FWD_ONLY=1` keeps the fp8 forward linears but forces the four
+# per-block backward sites onto their bf16 `matmul_bwd` else-branch, so a grad
+# dump splits the fp8 error budget into forward-only vs forward+backward. Default
+# (flag unset) is full fp8 backward, byte-identical to before this knob existed.
+comptime LOWP_BWD_ENABLED = LOWP_ENABLED and not is_defined[
+    "LLMM_FP8_FWD_ONLY"
+]()
 comptime STORAGE_DTYPE = (
     DType.float32 if PRECISION == "fp32" else DType.bfloat16
 )
@@ -2718,7 +2726,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var loop_t0 = global_perf_counter_ns()
             # fp8 site (Chunk E): C=4*channels, OC=channels;
             # input=l_fch_gelu, weight=l_proj_weight, d_output=d_l_fc_proj.
-            comptime if LOWP_ENABLED:
+            comptime if LOWP_BWD_ENABLED:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=True](
                     as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
                     as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
@@ -2759,7 +2767,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # linear FC: d_l_ln_2 = d_fch @ fc_weight.
             # fp8 site (Chunk E): C=channels, OC=4*channels; input=l_ln_2,
             # weight=l_fc_weight, d_output=d_l_fch_gelu.
-            comptime if LOWP_ENABLED:
+            comptime if LOWP_BWD_ENABLED:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
                     as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
@@ -2844,7 +2852,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # fp8 site (Chunk E): C=channels, OC=channels;
             # input=l_attn_merged, weight=l_attn_proj_weight,
             # d_output=d_l_attn_proj.
-            comptime if LOWP_ENABLED:
+            comptime if LOWP_BWD_ENABLED:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
                     as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
@@ -2910,7 +2918,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # QKV matmul backward.
             # fp8 site (Chunk E): C=channels, OC=3*channels; input=l_ln_1,
             # weight=l_qkv_weight, d_output=d_l_qkv.
-            comptime if LOWP_ENABLED:
+            comptime if LOWP_BWD_ENABLED:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
                     as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
