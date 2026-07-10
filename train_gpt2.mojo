@@ -10,7 +10,7 @@ from std.sys import (
 from std.time import global_perf_counter_ns
 from std.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
-from std.sys import get_defined_int, is_defined
+from std.sys import get_defined_int, get_defined_string, is_defined
 from std.gpu.host import (
     DeviceContext,
     HostBuffer,
@@ -21,6 +21,7 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.memory import alloc, UnsafePointer, memcpy, memset_zero
 
 from llmm.io import read_and_copy
+from llmm.lowp import precision_spec
 from llmm.dataloader import DataLoader
 from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
 from llmm.checkpointing import (
@@ -85,14 +86,63 @@ comptime WORLD_SIZE_DEF = get_defined_int["WORLD_SIZE", 1]()
 
 comptime NUM_PARAMETER_TENSORS = 16
 comptime NUM_ACTIVATION_TENSORS = 26
+
+
 # Parameter/activation/gradient precision. Defaults to fp32; build with
-# -D LLMM_BF16=1 for bf16 mixed-precision training. The layernorm/attention
-# statistics stay fp32 (StatsDType) and the optimizer keeps fp32 moments + an
-# fp32 master copy of the weights (MASTER_DTYPE) — matching llm.c — so the low-
-# precision params are only ever a rounded view of the fp32 math.
-comptime USE_BF16 = is_defined["LLMM_BF16"]()
-comptime GPT2_DTYPE = DType.bfloat16 if USE_BF16 else DType.float32
+# -D LLMM_PRECISION=bf16|fp8|fp4, or the -D LLMM_BF16=1 back-compat alias for
+# bf16, for mixed-precision training. The layernorm/attention statistics stay
+# fp32 (StatsDType) and the optimizer keeps fp32 moments + an fp32 master copy
+# of the weights (MASTER_DTYPE) — matching llm.c — so the low-precision params
+# are only ever a rounded view of the fp32 math.
+#
+# Storage stays bf16 under fp8/fp4 too (docs/ai/fp8_training_design.md §1.1):
+# fp8/fp4 are transient dtypes inside the GEMM only (Chunk B/D/E), never the
+# parameter/activation/gradient storage dtype. That's why `STORAGE_DTYPE`
+# collapses fp8/fp4 onto bfloat16 below, and why `USE_BF16` (kept for the
+# adamw/zero fp32-master plumbing, unchanged meaning: "keep an fp32 master +
+# bf16 storage") is true for fp8/fp4 builds too.
+def _resolve_precision() -> StaticString:
+    """Resolve the `LLMM_PRECISION` axis, honoring the `LLMM_BF16=1` back-
+    compat alias (== `LLMM_PRECISION=bf16`). Comptime-errors if both are set
+    inconsistently, or if `LLMM_PRECISION` is set to something other than
+    fp32 | bf16 | fp8 | fp4.
+    """
+    comptime bf16_alias = is_defined["LLMM_BF16"]()
+    comptime has_precision = is_defined["LLMM_PRECISION"]()
+    comptime precision_str = get_defined_string["LLMM_PRECISION", "fp32"]()
+
+    comptime if bf16_alias and has_precision:
+        comptime assert precision_str == "bf16", (
+            "LLMM_BF16=1 and LLMM_PRECISION set to something other than bf16"
+            " are inconsistent — set only one"
+        )
+        return "bf16"
+    elif bf16_alias:
+        return "bf16"
+    else:
+        comptime assert (
+            precision_str == "fp32"
+            or precision_str == "bf16"
+            or precision_str == "fp8"
+            or precision_str == "fp4"
+        ), "unknown LLMM_PRECISION value (expected fp32 | bf16 | fp8 | fp4)"
+        return precision_str
+
+
+comptime PRECISION = _resolve_precision()
+comptime LOWP_ENABLED = PRECISION == "fp8" or PRECISION == "fp4"
+comptime STORAGE_DTYPE = (
+    DType.float32 if PRECISION == "fp32" else DType.bfloat16
+)
+comptime GPT2_DTYPE = STORAGE_DTYPE  # keep the existing name/usage
 comptime MASTER_DTYPE = DType.float32
+# `USE_BF16` keeps its exact current meaning ("keep an fp32 master + bf16
+# storage"); fp8/fp4 storage is also bf16 (see above), so they inherit the
+# same fp32-master path — llmm/adamw.mojo, llmm/zero.mojo, and the
+# `_dispatch_cpu` GPU-only guard (which raises whenever `USE_BF16`) need no
+# change and automatically also gate fp8/fp4 off the CPU target (landmine #1).
+comptime USE_BF16 = STORAGE_DTYPE == DType.bfloat16
+comptime SPEC = precision_spec[PRECISION]()
 comptime GPT2_MAGIC = 20240520
 # llm.c's model-file magic (the HF starter-pack gpt2_124M*.bin that `make data`
 # downloads); same header layout and version convention as ours.
@@ -3694,7 +3744,7 @@ def train[
             device_name,
             USE_BF16,
         )
-        var prec_label = String("bf16") if USE_BF16 else String("fp32")
+        var prec_label = String(PRECISION)
         var mfu_str = (
             String("n/a") if mfu < 0.0 else _ffmt(mfu * 100.0, 1) + "%"
         )
@@ -3895,13 +3945,17 @@ def _parse_train_args(
 
 
 def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
-    # CPU training is fp32 by policy (matching profile_gpt2.mojo): a bf16
-    # build must not instantiate the "cpu" dispatch — the CPU bf16 GEMM
-    # packing path crashes AArch64 instruction selection at compile time.
+    # CPU training is fp32 by policy (matching profile_gpt2.mojo): a bf16 (or
+    # fp8/fp4, which also store bf16 — see USE_BF16 above) build must not
+    # instantiate the "cpu" dispatch — the CPU low-precision GEMM packing path
+    # crashes AArch64 instruction selection at compile time.
     comptime if USE_BF16:
         raise Error(
-            "bf16 build supports only the GPU target (CPU stays fp32)."
-            " Rebuild without -D LLMM_BF16=1 to train on CPU."
+            "'"
+            + String(PRECISION)
+            + "' builds support only the GPU target (CPU stays fp32)."
+            " Rebuild with -D LLMM_PRECISION=fp32 (or without -D LLMM_BF16=1)"
+            " to train on CPU."
         )
     else:
         print("Training on CPU.")
