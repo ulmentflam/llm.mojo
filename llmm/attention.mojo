@@ -44,7 +44,7 @@ from llmm.merge import merge_fwd, merge_bwd
 from llmm.matmul import _matmul_cublaslt
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
-from llmm.vendor import HAS_CUBLAS, HAS_METAL
+from llmm.vendor import HAS_CUBLAS, HAS_METAL, USE_TF32
 
 
 # ===----------------------------------------------------------------------=== #
@@ -4264,6 +4264,16 @@ def _attn_gemm_batched[
     # never referenced (they don't link on a Metal build). The Metal branch above
     # returns before here.
     comptime if not HAS_METAL:
+        # Same TF32 gate as _matmul_cublaslt (llmm/matmul.mojo): fp32 attention
+        # GEMMs (QKᵀ/A·V fwd, dQ/dK/dV bwd) route through TF32 tensor cores by
+        # default, matching llm.c's fp32 arm (cublasSgemmStridedBatched honors
+        # the handle's CUBLAS_TF32_TENSOR_OP_MATH math mode on cc>=8.0). bf16
+        # is unaffected. Disable with -D LLMM_NO_TF32=1.
+        comptime compute_type = (
+            ComputeType.COMPUTE_32F_FAST_TF32 if (
+                a_dt == DType.float32 and USE_TF32
+            ) else ComputeType.COMPUTE_32F
+        )
         var handle = _get_global_handle[a_dt](ctx)
         var alpha = Float32(1.0)
         var beta = Float32(0.0)
@@ -4300,7 +4310,7 @@ def _attn_gemm_batched[
                 Int64(N),
                 Int64(c_stride),
                 Int64(BH),
-                ComputeType.COMPUTE_32F,
+                compute_type,
                 Algorithm.DEFAULT,
             )
         )

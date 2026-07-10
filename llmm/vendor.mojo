@@ -34,3 +34,21 @@ comptime HAS_CUBLAS = has_nvidia_gpu_accelerator() and not _FORCE_PORTABLE_GPU
 #
 comptime _DISABLE_METAL = is_defined["LLMM_DISABLE_METAL"]()
 comptime HAS_METAL = has_apple_gpu_accelerator() and not _DISABLE_METAL
+
+# USE_TF32 — True by default: fp32 cuBLAS(Lt) GEMMs (matmul.mojo's
+#   _matmul_cublaslt and attention.mojo's _attn_gemm_batched cuBLAS tail) route
+#   through TF32 tensor cores (ComputeType.COMPUTE_32F_FAST_TF32) instead of
+#   plain FP32 CUDA cores (ComputeType.COMPUTE_32F). This mirrors llm.c's fp32
+#   arm (train_gpt2_fp32.cu:1614-1618), which auto-enables
+#   CUBLAS_COMPUTE_32F_FAST_TF32 on any compute-capability-8.0+ GPU — i.e.
+#   llm.c's "fp32" is already TF32-vs-TF32 by definition on Ampere+/Blackwell.
+#   bf16/fp16 builds are unaffected either way (input dtype alone already
+#   selects tensor cores for those).
+#
+#   Disable to fall back to true IEEE fp32 math (no tensor cores) for
+#   numerical debugging, e.g. to isolate TF32 rounding from a suspected
+#   correctness bug:
+#     mojo build -D LLMM_NO_TF32=1 ...
+#
+comptime _DISABLE_TF32 = is_defined["LLMM_NO_TF32"]()
+comptime USE_TF32 = not _DISABLE_TF32

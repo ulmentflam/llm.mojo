@@ -51,7 +51,7 @@ from linalg.matmul.vendor.blas import _get_global_handle, Backend
 from llmm.gelu import gelu, gelu_grad, gelu_fwd_gpu, bias_gelu_fwd
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
-from llmm.vendor import HAS_CUBLAS, HAS_METAL
+from llmm.vendor import HAS_CUBLAS, HAS_METAL, USE_TF32
 
 
 # ===----------------------------------------------------------------------=== #
@@ -207,11 +207,23 @@ def _matmul_cublaslt[
     var cuda_stream = CUDA(ctx.stream())
     comptime dt = _lt_dt[dtype]()
 
+    # fp32 GEMMs route through TF32 tensor cores by default (matches llm.c's
+    # fp32 arm, which is TF32-accelerated on any compute-capability-8.0+ GPU —
+    # see llmm/vendor.mojo's USE_TF32 doc comment); bf16/fp16 keep the
+    # existing COMPUTE_32F (mixed-precision GEMMs are already tensor-core
+    # eligible by input dtype alone). Disable with -D LLMM_NO_TF32=1 for true
+    # IEEE fp32 math.
+    comptime compute_type = (
+        ComputeType.COMPUTE_32F_FAST_TF32 if (
+            dtype == DType.float32 and USE_TF32
+        ) else ComputeType.COMPUTE_32F
+    )
+
     var desc = cublasLtMatmulDesc_t()
     check_cublas_error(
         cublasLtMatmulDescCreate(
             UnsafePointer(to=desc).as_unsafe_any_origin(),
-            ComputeType.COMPUTE_32F,
+            compute_type,
             DataType.R_32F,
         )
     )
