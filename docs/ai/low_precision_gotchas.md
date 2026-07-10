@@ -1,0 +1,318 @@
+# Low-precision training (TF32/FP8/FP4) campaigns: gotchas and changes
+
+A consolidated technical log of the TF32 (goal1/fp32-parity), FP8 (goal2/fp8-training),
+and FP4 (goal3/fp4-research) campaigns to extend `llm.mojo`'s training path to mixed-precision
+regimes on NVIDIA GB10 (Grace-Blackwell, sm_121, aarch64). This document captures gotchas,
+out-of-the-ordinary implementation changes, and non-obvious updates that future engineers
+or agents extending low-precision support must not rediscover the hard way.
+
+**Note at the top:** This is a LIVING first draft (2026-07-10, campaigns in flight); FP8
+chunks B/C/D/E/F/G and the FP4 build will append their gotchas before the final merge.
+
+**Related documentation:**
+- The FP8 design document (`fp8_training_design.md` on this branch) covers the scheme,
+  the dtype-generic layer (`llmm/lowp.mojo`), precision axis, and integration points.
+- The FP4 research documents (`fp4_modular_support_research.md`, `fp4_training_recipes_research.md`
+  on goal3/fp4-research branch) cover hardware/toolchain feasibility and recipe design.
+- The NVIDIA optimization campaign (`ai_assisted_optimizations_and_benchmarks.md` on goal1/fp32-parity)
+  documents the TF32 correctness and performance story.
+
+**Validation gate:** "test passes" throughout this document means `make test` (`test_gpt2 gpu` path)
+runs green. That is the ground-truth correctness gate for all GPU precision changes.
+
+---
+
+## TOOLCHAIN (Mojo 1.0.0b3.dev2026062706 / MAX 26.5 nightly)
+
+### T1 — Mojo pop.cast for fp8 dtypes is BROKEN on GPU targets
+
+**What breaks:** Mojo's generic fp8 dtype support (e4m3fn, e5m2, their unsigned variants)
+compiles on the host (CPU target) with full SIMD arithmetic working correctly. On GPU targets,
+any `pop.cast` from fp8 to higher precision (fp32, bf16) that feeds arithmetic fails lowering:
+the operation is not implemented in the GPU-target backend.
+
+**Exact error:** When GPU code calls `.cast[float32]()` on an fp8 value and uses the result
+in arithmetic (not as a bare passthrough):
+```
+error: conversion from 'f8e4m3fn' to 'f32' is not implemented
+note: see current operation: %24 = "pop.cast"(%23) : (!kgen.scalar<f8e4m3fn>) -> !kgen.scalar<f32>
+```
+
+**Effect:** Elementwise fp8 quantize/dequantize kernels (the standard pattern `load fp8 ->
+cast to bf16 -> compute -> cast to fp8 -> store`) do not compile on GPU. MAX's own generic
+`linalg.matmul` dispatcher, which internally performs fp8→f32 upcasts, also fails with the
+same error when targeting GPU. Host-side fp8 casts and arithmetic work perfectly (Probe 1).
+
+**Workaround shipped:** Mojo's `pop.cast` for fp8→higher-precision on GPU is unimplemented
+in this toolchain (1.0.0b3.dev2026062706). **The working FP8 GEMM path consumes raw fp8
+register bit patterns directly via vendor libraries** (cuBLASLt) or manual bit-manipulation
+encoders on uint8-viewed buffers, **never** through Mojo's generic `pop.cast`. Host-side fp8
+casts do work and are used for test references and host-side quantization. For any fp8
+computation that requires the missing GPU-target cast, use host-side casts (validated with
+fp32 references) as the fallback.
+
+**Source:** `tests/probe_fp8/RESULTS.md` (this branch), Probes 1–3; verified on Mojo 1.0.0b3.dev2026062706.
+
+### T2 — fp8 has NO AArch64 cpu-target codegen hazard
+
+**Finding:** bf16 on this toolchain crashes AArch64 codegen if any `"cpu"`-target dtype
+instantiation happens (landmine #1 in fp8_training_design.md). fp8 does **not** have this
+hazard — fp8 CPU-target code (plain `vectorize()` loops, comptime `target="cpu"` dispatch)
+builds clean on AArch64.
+
+**Why:** The fp8→fp32 cast (Probe 1) *is* implemented for the CPU target; only the GPU
+target lowering lacks it (T1). The bf16 crash is a separate, bf16-specific AArch64 backend bug.
+
+**Implication:** fp8 CPU-side code does not need a comptime gpu-only guard purely to avoid
+a codegen crash, **but** CPU-side fp8 kernels are moot for training anyway (Probe 2 shows GPU
+elementwise compute is broken), so the guard for "no low-precision on CPU" remains for
+architectural consistency.
+
+**Source:** `tests/probe_fp8/RESULTS.md` (Probe 5); verified on GB10/AArch64.
+
+### T3 — This toolchain rejects `fn` for public functions (use `def`)
+
+**Gotcha:** Mojo 1.0.0b3 deprecated `fn` (the old keyword) in favor of `def` for public
+function declarations. The `build-fp8` target and test harnesses expect `def`. Any new
+low-precision helper functions must use `def`.
+
+### T4 — This toolchain has no `constrained` keyword (use `comptime assert`)
+
+**Gotcha:** Old-style Mojo `fn` parameter constraints (`fn foo[T: DType]` where `T` is constrained
+to a specific set) are no longer supported; use `comptime assert` inside the function body to
+validate type parameters at comptime.
+
+### T5 — Parallel `make` invocations backgrounded with & in one shell are flaky
+
+**Gotcha:** Running `make target1 & make target2 & wait` in a single shell invocation produces
+spurious "No rule to make target" errors due to make's parallel jobserver interfering across
+invocations. **Build sequentially:** `make target1 && make target2`.
+
+---
+
+## cuBLASLt (12.9.2.10)
+
+### C1 — FP8 GEMM: e4m3×e4m3→bf16 WORKS; e4m3 output NOT SUPPORTED
+
+**Working path:** e4m3 (fp8) A operand × e4m3 B operand → bf16 (or fp32) accumulate/output,
+TN layout (transA=True, transB=False), K a multiple of 16. This is the standard Transformer-Engine
+HYBRID pattern: low-precision GEMM operands, high-precision output.
+
+**Not working:** e4m3×e4m3→e4m3 (fp8 output) returns `CUBLAS_STATUS_NOT_SUPPORTED` at runtime.
+Likely requires an explicit `CUBLASLT_MATMUL_DESC_D_SCALE_POINTER` attribute (not explored
+further as it falls outside the lowest-risk FP8 path).
+
+**Design implication:** Storage stays bf16, fp8 is transient GEMM-operand only. The GEMM
+writes bf16 output back into the bf16 activation/gradient pipeline. This choice sidesteps
+the fp8-output scaling complexity and keeps the host↔device buffer element sizes unchanged
+(avoiding landmine #2: the host-buffer element-size mismatch that caused the bf16 NaN bug).
+
+**Source:** `tests/probe_fp8/RESULTS.md` (Probes 4a–4b); verified on GB10/sm_121 with
+cuBLASLt 12.9.2.10.
+
+### C2 — NVFP4: sm_120 block-scaled kernels dispatch unmodified on sm_121
+
+**Finding:** cuBLASLt 12.9.2.10 (the one pinned in `.pixi`) ships sm_120 NVFP4 block-scaled
+GEMM kernels (`cutlass3x_sm120_bstensorop_…_ue4m3xe2m1_…_vs16`, block=16, e2m1 data, e4m3 scales).
+These are *named* sm_120 cubins. Yet the **sm_120-named cubin executes unmodified on this box's
+sm_121 hardware** — no `CUBLAS_STATUS_ARCH_MISMATCH`, no silent CPU fallback, no driver update
+required.
+
+**Probe result:** Direct execution of FP4 `cublasLtMatmul` with block-scale descriptors returns
+`CUBLAS_STATUS_SUCCESS`, nsys confirms the sm_120 kernel ran, and numerics match (rel L2 = 0.1445,
+matching the software dequant reference to 4 decimal places).
+
+**Implication:** cuBLASLt FP4 interop is viable on GB10 via the `_matmul_cublaslt` FFI bindings
+(which llm.mojo already uses for bf16). No hand-written Mojo FP4 kernel is needed for dispatch;
+the installed vendor library is sufficient.
+
+**Source:** `tests/probe_fp4/RESULTS.md` (goal3/fp4-research branch); verified on GB10/sm_121
+with cuBLASLt 12.9.2.10.
+
+### C3 — NVFP4 conventions: e2m1 packing and block-scale swizzle must match PyTorch exactly
+
+**Gotcha:** NVFP4 e2m1 nibble packing (2 values per byte) and block-scale swizzle (the
+128×4-tile / 32×4×4-internal cuBLAS layout) have specific bit-for-bit conventions. The fp4
+probe's quantization code uses:
+- **e2m1 data:** OCP MX 4-bit table `{0, 0.5, 1, 1.5, 2, 3, 4, 6}` × sign; nearest-value encode;
+  2 values/byte, even index → low nibble, odd → high nibble (convention cross-checked against
+  PyTorch's `pack_uint4`).
+- **e4m3 block scale:** standard FP8 E4M3, 1 scale per 16-element block along K, derived per
+  the cuBLAS doc §3.1.4.3.2 formula (and against PyTorch's `to_blocked()`/`from_blocked()`).
+
+**Comparison bug:** The fp4 probe's first-pass comparison code had a column-major-vs-row-major
+output indexing bug (cuBLASLt writes D column-major) that produced a spurious ~1.4 rel-L2 error
+on *both* FP4 and bf16 control arms identically — making it look like a kernel bug when the
+fault was in the readback indexing. **Always run a known-good control arm through new comparison
+harnesses.** A correct bf16 control matched the reference to rel L2 = 0.0029, confirming the
+layout scheme itself was right.
+
+**Source:** `tests/probe_fp4/RESULTS.md` (goal3/fp4-research branch), "Numeric check" and
+first-pass-version note.
+
+---
+
+## TF32 / fp32 (goal1/fp32-parity branch)
+
+### TF1 — "fp32 parity with llm.c" means TF32-vs-TF32, not IEEE-vs-IEEE
+
+**Baseline:** llm.c enables TF32 on NVIDIA sm≥80 via `CUBLAS_COMPUTE_32F_FAST_TF32` by default
+(llm.c `train_gpt2.cu:1614–18`). Its "fp32" parity is actually **TF32 computation**, trading
+IEEE-754 precision for tensor-core dispatch on Tensor Cores.
+
+**The bug:** llm.mojo's `_matmul_cublaslt` in `llmm/matmul.mojo` hardcoded `ComputeType.COMPUTE_32F`
+(IEEE fp32 GEMM), not `COMPUTE_32F_FAST_TF32`. This silently disabled tensor cores for fp32,
+causing a **1.47× step-time regression** (measured 416.7→282.8 ms/step after fix) vs llm.c.
+
+**Non-obvious:** The same hardcoded compute type was harmless in bf16 and invisible in review
+because bf16 input dtype alone triggers tensor cores; TF32 is purely a compute-precision flag
+that only matters for fp32 inputs.
+
+**Fix:** Goal1 implements a comptime `USE_TF32` flag (default True, disable with `-D LLMM_NO_TF32=1`).
+For `dtype == float32 and USE_TF32`, use `COMPUTE_32F_FAST_TF32`; otherwise `COMPUTE_32F`. Same
+pattern applied to `llmm/attention.mojo`'s batched GEMM.
+
+**Code sites:**
+- `llmm/matmul.mojo:_matmul_cublaslt` — compute type selection (goal1/fp32-parity branch;
+  may not be merged to goal2/fp8-training yet).
+- `llmm/attention.mojo:_attn_gemm_batched` — same pattern.
+
+**Test gating:** Goal1 introduced `make verify-gpu-tf32` (TF32 ON) with a calibrated tolerance
+(0.02, ~2× measured max drift of 0.0102) and `make verify-gpu` (TF32 OFF via `-D LLMM_NO_TF32=1`,
+true IEEE fp32). Both gates run; the TF32 gate accepts larger loss/gradient differences because
+TF32 arithmetic is inherently less precise than IEEE. A flat blanket tolerance would have buried
+three real backward bugs (see the training-correctness campaign in metal_port_gotchas.md).
+
+**Status in goal2/fp8-training branch:** Not yet merged. This branch still has hardcoded
+`COMPUTE_32F`. The FP8 campaign should not re-merge the TF32 fix opportunistically; goal1 is
+on the merge queue independently.
+
+**Source:** Goal1/fp32-parity branch commit c27a1f9 and descendants; cited in goal1 merge
+message at commit 9382ee1.
+
+### TF2 — Loss-gating pattern for numerics-changing optimizations: strict gate OFF, real gate calibrated
+
+**Pattern:** For any optimization that changes numerics (tensor cores, TF32, later FP8 scaling
+tuning), use **two** gates:
+1. **Strict gate (TF32/optimization OFF):** Verify against llm.c behavior or prior-known-good
+   baseline with atol/rtol calibrated to catch real errors. Goal1 uses `-D LLMM_NO_TF32=1`.
+2. **Real gate (TF32/optimization ON):** Run with the optimization enabled, using a tolerance
+   calibrated to ~2× measured drift in controlled conditions (not a cranked blanket tolerance).
+
+Goal1 measured TF32 impact in isolation: max gradient drift = 0.0102, loss drift = 0.0121.
+The real gate uses atol=0.02 (≈2×), and a strict gate using atol=0.002 (≈0.2×) catches bugs
+the real gate misses.
+
+**Anti-pattern:** A flat `atol=2.0` (the old `test_gpt2` default) is a footgun. It passes
+correct values and incorrect ones alike. Goal1's test hardening (metal_port_gotchas.md C1–C3)
+found three backward bugs the old tolerance completely missed.
+
+**Source:** Goal1/fp32-parity, commit 8604a9d and descendants.
+
+### TF3 — Benchmark hygiene on GB10 (unified memory): interleave A/B arms in one quiet window
+
+**Gotcha:** GB10's unified memory and the concurrent vLLM tenant can produce phantom regressions.
+A stacked train + vLLM run produced a false 732 ms CPU regression (2026-07-03 before lockfile
+discipline). The fix: **flock discipline** (`flock /tmp/llmm-gpu.lock` wrapping all GPU commands)
+and **interleaving A/B comparison arms in one quiet window**.
+
+**Hygiene checklist:**
+- GPU lockfile: every GPU-touching command uses `flock -w 10800 /tmp/llmm-gpu.lock -c '...'`.
+- Baseline check: `free -g` and `nvidia-smi` before any timing run; confirm idle GB memory.
+- Interleave: A/B arms run back-to-back in one locked session, no restarts between.
+- Sanity check: `tok/s = B*T/ms` in every timing table (catches obvious measurement bugs).
+- Thermal: GB10 throttles less severely than M4 Max (no jetsam), but allow ~30 sec idle between
+  unrelated measurement sessions.
+
+**Source:** Memory footprint contention notes (MEMORY.md, worktree-agents-must-commit context).
+
+---
+
+## ARCHITECTURE DECISIONS
+
+### A1 — FP8 is transient GEMM-operand-only; storage stays bf16 + fp32 master
+
+**Decision:** Under FP8 (and FP4), **model storage is unchanged** — parameters, activations,
+gradients stay bf16 (`GPT2_DTYPE = bfloat16`); optimizer master weights stay fp32.
+**fp8 exists only as short-lived device quantized copies of the two operands feeding a linear
+GEMM**, plus their scale/amax scalars. The GEMM consumes fp8 and writes bf16 output.
+
+**Why this layout (and why it is also the right FP4 layout):**
+- **Neutralizes landmine #2 (host↔device element-size mismatch).** No host buffer changes element
+  size. The fp8/fp4 buffers are device-only transients never read back to a typed host buffer
+  in the normal path.
+- **Keeps LayerNorm, softmax, attention core (QKᵀ / softmax·V), GELU, residual adds, embeddings,
+  the LM head, cross-entropy, and AdamW bit-for-bit identical to bf16** — matching Transformer-Engine's
+  HYBRID recipe, which keeps exactly these ops in high precision.
+- **No forked forward/backward.** `GPT2.forward` / `GPT2.backward` / `GPT2.update` are unchanged.
+- **FP4 reuses it verbatim** — storage still bf16, only the transient operand dtype + scaling
+  granularity change.
+
+**Source:** `docs/ai/fp8_training_design.md` (this branch), §1.1.
+
+### A2 — One LLMM_PRECISION axis (fp32|bf16|fp8|fp4) with LLMM_BF16 back-compat alias
+
+**Decision:** Introduce a single ordered axis `LLMM_PRECISION` in `train_gpt2.mojo` replacing
+the `USE_BF16` / `GPT2_DTYPE` block. Values: `"fp32"`, `"bf16"`, `"fp8"`, `"fp4"` (future).
+`-D LLMM_BF16=1` is a back-compat alias for `LLMM_PRECISION=bf16`.
+
+**Rationale:** fp8 and fp4 are mutually exclusive; a growing set of independent booleans is
+error-prone and violates DRY. One axis is extensible.
+
+**Comptime structure:**
+```mojo
+comptime PRECISION = _resolve_precision()  # reads LLMM_PRECISION / LLMM_BF16
+comptime LOWP_ENABLED = PRECISION == "fp8" or PRECISION == "fp4"
+comptime STORAGE_DTYPE = DType.float32 if PRECISION == "fp32" else DType.bfloat16
+comptime GPT2_DTYPE = STORAGE_DTYPE
+comptime USE_BF16 = STORAGE_DTYPE == DType.bfloat16   # master iff bf16
+```
+
+**Implication:** `USE_BF16` keeps its exact current meaning, so `llmm/adamw.mojo`, `zero.mojo`
+need **no change**. fp8/fp4 get the fp32 master path for free.
+
+**Gotcha:** Inconsistent combinations (e.g., both `LLMM_BF16=1` and `LLMM_PRECISION=fp8`) and
+unknown precision values are **comptime errors**, not silent fallbacks.
+
+**Source:** `docs/ai/fp8_training_design.md` (this branch), §2; reported by campaign agent
+(chunk A, commit 804b10d), not yet fully deployed/tested on all targets. Mark as "agent-reported,
+awaiting Chunk B integration."
+
+### A3 — Worktree/agent process conventions for safe parallel campaigns
+
+**Convention:** One worktree per agent (shared tree = commit races), sub-branch per implementation
+chunk with disjoint file ownership, coordinator does all merges, GPU flock for every GPU-touching
+command.
+
+**Example:** goal2/fp8-training has sub-branches for each chunk (goal2/fp8-chunk-a, goal2/fp8-chunkB,
+etc.), each pair-independent so multiple agents can work in parallel without merge conflicts.
+Coordinator merges to goal2/fp8-training when chunks complete.
+
+**Source:** Worktree-agents-must-commit (MEMORY.md context); goal2 branch structure.
+
+---
+
+## Section summary
+
+| Section | Items | Status |
+|---------|-------|--------|
+| TOOLCHAIN | T1–T5 | Verified (T1–T2: Probes 1–5; T3–T5: observed) |
+| cuBLASLt | C1–C3 | Verified (C1: Probe 4; C2–C3: Probe FP4) |
+| TF32/fp32 | TF1–TF3 | Verified (TF1–TF2: goal1 branch; TF3: GB10 incidents) |
+| ARCHITECTURE | A1–A3 | A1–A2: design doc confirmed; A3: agent-reported |
+
+---
+
+## Unverified seed items (reported by campaign agent, not yet committed)
+
+- **A2, comptime-error enforcement:** The `_resolve_precision` function and the exact
+  comptime error behavior for inconsistent precision flags are described in fp8_training_design.md
+  but not visible in the current goal2/fp8-training HEAD (they are in Chunk A, commit 804b10d,
+  which may not yet be merged into this branch for full integration testing). Pending Chunk B
+  completion and merge verification.
+
+---
+
+## Footer
+
+Written with AI assistance (Claude Code / Haiku agent), directed by Evan Owen.
