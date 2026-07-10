@@ -27,6 +27,7 @@ from std.gpu.host._nvidia_cuda import CUDA
 from _cublas.dtype import DataType
 from _cublas.cublas import cublasOperation_t, ComputeType, check_cublas_error
 from _cublas.cublaslt import (
+    cublasLtHandle_t,
     cublasLtMatmul,
     cublasLtMatmulDesc_t,
     cublasLtMatmulDescCreate,
@@ -222,6 +223,116 @@ def _lt_set_op(
     )
 
 
+# ===----------------------------------------------------------------------=== #
+# Shared cuBLASLt sub-helpers (DRY pass F2, docs/ai/
+# dry_consolidation_audit_2026-07-10.md).
+#
+# The three `_matmul_cublaslt*` orchestrators below (bf16/fp32, fp8, fp4)
+# are DELIBERATELY NOT merged into one generic wrapper: per the audit's own
+# verdict, a single mega-generic body with half a dozen comptime switches
+# would make security-adjacent unsafe-pointer vendor code *harder* to audit
+# than three explicit descriptor dances whose per-precision attributes
+# (epilogue/bias vs per-tensor scale pointers vs block-scale mode+pointers,
+# caller-selectable vs TN-fixed transposes) stay visible at their use site.
+# Only the four genuinely mechanical, byte-identical sub-steps are factored
+# here (same calls, same order — behavior-identical to the inline copies
+# they replace): layout creation (was 14 inline copies), preference setup,
+# heuristic selection + empty-result raise, and the destroy tail.
+# ===----------------------------------------------------------------------=== #
+
+
+def _lt_make_layout(
+    dt: DataType, rows: Int, cols: Int, ld: Int
+) raises -> cublasLtMatrixLayout_t:
+    """Create one col-major cuBLASLt matrix layout (rows x cols, leading
+    dimension ld — element units, even for sub-byte dtypes like e2m1)."""
+    var lay = cublasLtMatrixLayout_t()
+    check_cublas_error(
+        cublasLtMatrixLayoutCreate(
+            UnsafePointer(to=lay).as_unsafe_any_origin(),
+            dt,
+            UInt64(rows),
+            UInt64(cols),
+            Int64(ld),
+        )
+    )
+    return lay
+
+
+def _lt_make_pref() raises -> cublasLtMatmulPreference_t:
+    """Create the matmul preference, capped at the shared persistent
+    workspace size (`_CUBLASLT_WS_BYTES`)."""
+    var pref = cublasLtMatmulPreference_t()
+    check_cublas_error(
+        cublasLtMatmulPreferenceCreate(
+            UnsafePointer(to=pref).as_unsafe_any_origin()
+        )
+    )
+    var ws_size = _CUBLASLT_WS_BYTES
+    check_cublas_error(
+        cublasLtMatmulPreferenceSetAttribute(
+            pref,
+            Preference.MAX_WORKSPACE_BYTES,
+            UnsafePointer(to=ws_size)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[Int](),
+        )
+    )
+    return pref
+
+
+def _lt_pick_algo(
+    lt: cublasLtHandle_t,
+    desc: cublasLtMatmulDesc_t,
+    a_l: cublasLtMatrixLayout_t,
+    b_l: cublasLtMatrixLayout_t,
+    c_l: cublasLtMatrixLayout_t,
+    d_l: cublasLtMatrixLayout_t,
+    pref: cublasLtMatmulPreference_t,
+    err_msg: String,
+) raises -> cublasLtMatmulHeuristicResult_t:
+    """Run the heuristic for one algorithm; raise `err_msg` if none found."""
+    var heur = cublasLtMatmulHeuristicResult_t()
+    var cnt = 0
+    check_cublas_error(
+        cublasLtMatmulAlgoGetHeuristic(
+            lt,
+            desc,
+            a_l,
+            b_l,
+            c_l,
+            d_l,
+            pref,
+            1,
+            UnsafePointer(to=heur).as_unsafe_any_origin(),
+            UnsafePointer(to=cnt).as_unsafe_any_origin(),
+        )
+    )
+    if cnt == 0:
+        raise Error(err_msg)
+    return heur
+
+
+def _lt_destroy(
+    desc: cublasLtMatmulDesc_t,
+    a_l: cublasLtMatrixLayout_t,
+    b_l: cublasLtMatrixLayout_t,
+    c_l: cublasLtMatrixLayout_t,
+    d_l: cublasLtMatrixLayout_t,
+    pref: cublasLtMatmulPreference_t,
+) raises:
+    """Destroy the six per-call cuBLASLt handles (same order as the inline
+    tails this replaces: pref, desc, then the four layouts)."""
+    check_cublas_error(cublasLtMatmulPreferenceDestroy(pref))
+    check_cublas_error(cublasLtMatmulDescDestroy(desc))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(a_l))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(b_l))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(c_l))
+    check_cublas_error(cublasLtMatrixLayoutDestroy(d_l))
+
+
 def _matmul_cublaslt[
     dtype: DType,
     transA: Bool,
@@ -283,68 +394,18 @@ def _matmul_cublaslt[
 
     # Layouts (llm.c): transA→A(dt,k,m,k) else A(dt,m,k,m); transB→B(dt,n,k,n)
     # else B(dt,k,n,k); C/D(dt,m,n,m).
-    var a_l = cublasLtMatrixLayout_t()
+    var a_l: cublasLtMatrixLayout_t
     comptime if transA:
-        check_cublas_error(
-            cublasLtMatrixLayoutCreate(
-                UnsafePointer(to=a_l).as_unsafe_any_origin(),
-                dt,
-                UInt64(k),
-                UInt64(m),
-                Int64(k),
-            )
-        )
+        a_l = _lt_make_layout(dt, k, m, k)
     else:
-        check_cublas_error(
-            cublasLtMatrixLayoutCreate(
-                UnsafePointer(to=a_l).as_unsafe_any_origin(),
-                dt,
-                UInt64(m),
-                UInt64(k),
-                Int64(m),
-            )
-        )
-    var b_l = cublasLtMatrixLayout_t()
+        a_l = _lt_make_layout(dt, m, k, m)
+    var b_l: cublasLtMatrixLayout_t
     comptime if transB:
-        check_cublas_error(
-            cublasLtMatrixLayoutCreate(
-                UnsafePointer(to=b_l).as_unsafe_any_origin(),
-                dt,
-                UInt64(n),
-                UInt64(k),
-                Int64(n),
-            )
-        )
+        b_l = _lt_make_layout(dt, n, k, n)
     else:
-        check_cublas_error(
-            cublasLtMatrixLayoutCreate(
-                UnsafePointer(to=b_l).as_unsafe_any_origin(),
-                dt,
-                UInt64(k),
-                UInt64(n),
-                Int64(k),
-            )
-        )
-    var c_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=c_l).as_unsafe_any_origin(),
-            dt,
-            UInt64(m),
-            UInt64(n),
-            Int64(m),
-        )
-    )
-    var d_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=d_l).as_unsafe_any_origin(),
-            dt,
-            UInt64(m),
-            UInt64(n),
-            Int64(m),
-        )
-    )
+        b_l = _lt_make_layout(dt, k, n, k)
+    var c_l = _lt_make_layout(dt, m, n, m)
+    var d_l = _lt_make_layout(dt, m, n, m)
 
     # Strided-batched (llm.c's attention path): set BATCH_COUNT + per-matrix
     # STRIDED_BATCH_OFFSET on every layout. cuBLASLt's heuristic picks the kernel
@@ -383,24 +444,7 @@ def _matmul_cublaslt[
         _set_batch(c_l, stride_d)
         _set_batch(d_l, stride_d)
 
-    var pref = cublasLtMatmulPreference_t()
-    check_cublas_error(
-        cublasLtMatmulPreferenceCreate(
-            UnsafePointer(to=pref).as_unsafe_any_origin()
-        )
-    )
-    var ws_size = _CUBLASLT_WS_BYTES
-    check_cublas_error(
-        cublasLtMatmulPreferenceSetAttribute(
-            pref,
-            Preference.MAX_WORKSPACE_BYTES,
-            UnsafePointer(to=ws_size)
-            .bitcast[NoneType]()
-            .as_immutable()
-            .as_unsafe_any_origin(),
-            size_of[Int](),
-        )
-    )
+    var pref = _lt_make_pref()
 
     # aux (gelu/dgelu) — epilogue bit 128.
     if (Int(epilogue) & 128) != 0:
@@ -467,24 +511,16 @@ def _matmul_cublaslt[
             )
         )
 
-    var heur = cublasLtMatmulHeuristicResult_t()
-    var cnt = 0
-    check_cublas_error(
-        cublasLtMatmulAlgoGetHeuristic(
-            lt,
-            desc,
-            a_l,
-            b_l,
-            c_l,
-            d_l,
-            pref,
-            1,
-            UnsafePointer(to=heur).as_unsafe_any_origin(),
-            UnsafePointer(to=cnt).as_unsafe_any_origin(),
-        )
+    var heur = _lt_pick_algo(
+        lt,
+        desc,
+        a_l,
+        b_l,
+        c_l,
+        d_l,
+        pref,
+        "no cuBLASLt algorithm for the fused matmul",
     )
-    if cnt == 0:
-        raise Error("no cuBLASLt algorithm for the fused matmul")
 
     var ws = _cublaslt_workspace(ctx)
     var alpha = Float32(1.0)
@@ -516,12 +552,7 @@ def _matmul_cublaslt[
         )
     )
 
-    check_cublas_error(cublasLtMatmulPreferenceDestroy(pref))
-    check_cublas_error(cublasLtMatmulDescDestroy(desc))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(a_l))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(b_l))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(c_l))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(d_l))
+    _lt_destroy(desc, a_l, b_l, c_l, d_l, pref)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -684,94 +715,31 @@ def _matmul_cublaslt_fp8[
         )
     )
 
-    var a_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=a_l).as_unsafe_any_origin(),
-            dt_a,
-            UInt64(k),
-            UInt64(m),
-            Int64(k),
-        )
-    )
-    var b_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=b_l).as_unsafe_any_origin(),
-            dt_b,
-            UInt64(k),
-            UInt64(n),
-            Int64(k),
-        )
-    )
-    var c_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=c_l).as_unsafe_any_origin(),
-            dt_out,
-            UInt64(m),
-            UInt64(n),
-            Int64(m),
-        )
-    )
-    var d_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=d_l).as_unsafe_any_origin(),
-            dt_out,
-            UInt64(m),
-            UInt64(n),
-            Int64(m),
-        )
-    )
+    var a_l = _lt_make_layout(dt_a, k, m, k)
+    var b_l = _lt_make_layout(dt_b, k, n, k)
+    var c_l = _lt_make_layout(dt_out, m, n, m)
+    var d_l = _lt_make_layout(dt_out, m, n, m)
 
-    var pref = cublasLtMatmulPreference_t()
-    check_cublas_error(
-        cublasLtMatmulPreferenceCreate(
-            UnsafePointer(to=pref).as_unsafe_any_origin()
-        )
-    )
-    var ws_size = _CUBLASLT_WS_BYTES
-    check_cublas_error(
-        cublasLtMatmulPreferenceSetAttribute(
-            pref,
-            Preference.MAX_WORKSPACE_BYTES,
-            UnsafePointer(to=ws_size)
-            .bitcast[NoneType]()
-            .as_immutable()
-            .as_unsafe_any_origin(),
-            size_of[Int](),
-        )
-    )
+    var pref = _lt_make_pref()
 
-    var heur = cublasLtMatmulHeuristicResult_t()
-    var cnt = 0
-    check_cublas_error(
-        cublasLtMatmulAlgoGetHeuristic(
-            lt,
-            desc,
-            a_l,
-            b_l,
-            c_l,
-            d_l,
-            pref,
-            1,
-            UnsafePointer(to=heur).as_unsafe_any_origin(),
-            UnsafePointer(to=cnt).as_unsafe_any_origin(),
-        )
+    var heur = _lt_pick_algo(
+        lt,
+        desc,
+        a_l,
+        b_l,
+        c_l,
+        d_l,
+        pref,
+        "no cuBLASLt algorithm for the fp8 TN GEMM (a_dtype="
+        + String(a_dtype)
+        + " b_dtype="
+        + String(b_dtype)
+        + " out_dtype="
+        + String(out_dtype)
+        + ") -- mixed e4m3/e5m2 operand pairs are not universally"
+        " supported; e4m3 x e4m3 is the confirmed-working combination"
+        " on this toolchain (tests/probe_fp8/RESULTS.md probe4)",
     )
-    if cnt == 0:
-        raise Error(
-            "no cuBLASLt algorithm for the fp8 TN GEMM (a_dtype="
-            + String(a_dtype)
-            + " b_dtype="
-            + String(b_dtype)
-            + " out_dtype="
-            + String(out_dtype)
-            + ") -- mixed e4m3/e5m2 operand pairs are not universally"
-            " supported; e4m3 x e4m3 is the confirmed-working combination"
-            " on this toolchain (tests/probe_fp8/RESULTS.md probe4)"
-        )
 
     var ws = _cublaslt_workspace(ctx)
     var alpha = Float32(1.0)
@@ -803,12 +771,7 @@ def _matmul_cublaslt_fp8[
         )
     )
 
-    check_cublas_error(cublasLtMatmulPreferenceDestroy(pref))
-    check_cublas_error(cublasLtMatmulDescDestroy(desc))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(a_l))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(b_l))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(c_l))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(d_l))
+    _lt_destroy(desc, a_l, b_l, c_l, d_l, pref)
 
 
 def lowp_gemm_devscale[
@@ -1087,95 +1050,32 @@ def _matmul_cublaslt_fp4[
         )
     )
 
-    var a_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=a_l).as_unsafe_any_origin(),
-            dt_ab,
-            UInt64(k),
-            UInt64(m),
-            Int64(k),
-        )
-    )
-    var b_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=b_l).as_unsafe_any_origin(),
-            dt_ab,
-            UInt64(k),
-            UInt64(n),
-            Int64(k),
-        )
-    )
-    var c_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=c_l).as_unsafe_any_origin(),
-            dt_out,
-            UInt64(m),
-            UInt64(n),
-            Int64(m),
-        )
-    )
-    var d_l = cublasLtMatrixLayout_t()
-    check_cublas_error(
-        cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=d_l).as_unsafe_any_origin(),
-            dt_out,
-            UInt64(m),
-            UInt64(n),
-            Int64(m),
-        )
-    )
+    var a_l = _lt_make_layout(dt_ab, k, m, k)
+    var b_l = _lt_make_layout(dt_ab, k, n, k)
+    var c_l = _lt_make_layout(dt_out, m, n, m)
+    var d_l = _lt_make_layout(dt_out, m, n, m)
 
-    var pref = cublasLtMatmulPreference_t()
-    check_cublas_error(
-        cublasLtMatmulPreferenceCreate(
-            UnsafePointer(to=pref).as_unsafe_any_origin()
-        )
-    )
-    var ws_size = _CUBLASLT_WS_BYTES
-    check_cublas_error(
-        cublasLtMatmulPreferenceSetAttribute(
-            pref,
-            Preference.MAX_WORKSPACE_BYTES,
-            UnsafePointer(to=ws_size)
-            .bitcast[NoneType]()
-            .as_immutable()
-            .as_unsafe_any_origin(),
-            size_of[Int](),
-        )
-    )
+    var pref = _lt_make_pref()
 
-    var heur = cublasLtMatmulHeuristicResult_t()
-    var cnt = 0
-    check_cublas_error(
-        cublasLtMatmulAlgoGetHeuristic(
-            lt,
-            desc,
-            a_l,
-            b_l,
-            c_l,
-            d_l,
-            pref,
-            1,
-            UnsafePointer(to=heur).as_unsafe_any_origin(),
-            UnsafePointer(to=cnt).as_unsafe_any_origin(),
-        )
+    var heur = _lt_pick_algo(
+        lt,
+        desc,
+        a_l,
+        b_l,
+        c_l,
+        d_l,
+        pref,
+        "no cuBLASLt algorithm for the NVFP4 TN GEMM (m="
+        + String(m)
+        + " n="
+        + String(n)
+        + " k="
+        + String(k)
+        + ") -- tests/probe_fp4/RESULTS.md's 512^3 probe found 4 viable"
+        " algorithms on this box, so a shape returning zero here is"
+        " likely too small/misaligned for the vs16 block-scaled kernel"
+        " (k must be a multiple of 16)",
     )
-    if cnt == 0:
-        raise Error(
-            "no cuBLASLt algorithm for the NVFP4 TN GEMM (m="
-            + String(m)
-            + " n="
-            + String(n)
-            + " k="
-            + String(k)
-            + ") -- tests/probe_fp4/RESULTS.md's 512^3 probe found 4 viable"
-            " algorithms on this box, so a shape returning zero here is"
-            " likely too small/misaligned for the vs16 block-scaled kernel"
-            " (k must be a multiple of 16)"
-        )
 
     var ws = _cublaslt_workspace(ctx)
     var alpha = Float32(1.0)
@@ -1207,12 +1107,7 @@ def _matmul_cublaslt_fp4[
         )
     )
 
-    check_cublas_error(cublasLtMatmulPreferenceDestroy(pref))
-    check_cublas_error(cublasLtMatmulDescDestroy(desc))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(a_l))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(b_l))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(c_l))
-    check_cublas_error(cublasLtMatrixLayoutDestroy(d_l))
+    _lt_destroy(desc, a_l, b_l, c_l, d_l, pref)
 
 
 # ===----------------------------------------------------------------------=== #
