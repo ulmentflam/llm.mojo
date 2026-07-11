@@ -4077,6 +4077,147 @@ the two RHT wgrad scratch tensors (7,564 us — a candidate for folding into
 the fused transpose kernel's epilogue in a future pass, since the tensor
 scale only needs the post-RHT amax).
 
+## 2026-07-11 — EXPERIMENT: FP4 layer-coverage stability screen (opt/fp4-kernels, 200-step, 124M)
+
+**Question:** the NVFP4 recipe (`>=1B`-scale literature) keeps the first ~2
+and last ~2 blocks' MLPs in bf16; our default (`LLMM_FP4_FIRST=2`,
+`LLMM_FP4_LAST=num_layer-2`) inherits that exclusion unmeasured at 124M.
+Does widening fp4 coverage to *every* block's MLP destabilize training at
+this scale over a short horizon? Zero `llmm/`/`train_gpt2.mojo` code
+changes — flags-and-measurement only, four fresh binaries built off HEAD
+`e9a75ad` (the just-landed 7.5x RHT-prep + coalesced quantize-transpose
+kernels).
+
+**Arms** (all: `gpt2_124M_bf16.bin` checkpoint init, tinyshakespeare,
+B=4/T=1024, `-x 200 -v 100 -s 0`, one GPU-lock window, binaries mtime-
+verified fresh before every run):
+
+| arm | build flags | layers in fp4 (d12) |
+|---|---|---|
+| 0 (reference) | `-D LLMM_BF16=1` | none (bf16) |
+| 1 (default coverage) | `-D LLMM_PRECISION=fp4` | 2..9 (8/12 blocks) |
+| 2 (all-layers) | `-D LLMM_PRECISION=fp4 -D LLMM_FP4_FIRST=0 -D LLMM_FP4_LAST=12` | 0..11 (12/12 blocks) |
+| 3 (all-layers, RHT off) | arm 2 flags `+ -D LLMM_FP4_NO_RHT=1` | 0..11, plain RNE/SR wgrad path |
+
+Arm 3 was run because arms 1–2 both came back stable (see below), per the
+mission's own gating condition.
+
+### Results
+
+**Per-step relative loss delta vs ARM0 (bf16), n=200 steps each:**
+
+| arm | mean Δ | median Δ | max \|Δ\| | first-100 mean \|Δ\| | second-100 mean \|Δ\| |
+|---|---:|---:|---:|---:|---:|
+| 1 fp4 default | +1.61% | +1.26% | 7.65% | 0.99% | 2.40% |
+| 2 fp4 all-layers | +2.57% | +2.08% | 9.15% | 1.66% | 3.53% |
+| 3 fp4 all-layers, no RHT | +2.67% | +2.07% | 10.38% | 1.68% | 3.71% |
+
+**Loss-spike count** (step-over-step jump >5% where bf16's own same-step
+jump is <2%; denominator: 38/199 transitions qualify as "bf16 calm enough
+to test against"):
+
+| arm | spikes | worst jump |
+|---|---:|---:|
+| 1 fp4 default | 2/38 | 5.15% |
+| 2 fp4 all-layers | 2/38 | 7.66% |
+| 3 fp4 all-layers, no RHT | 1/38 | 7.80% |
+
+**NaN/Inf:** none in any of the 4 arms (grepped all four full logs).
+
+**Val loss** (step 0 / 100 / 200):
+
+| arm | step 0 | step 100 | step 200 |
+|---|---:|---:|---:|
+| 0 bf16 | 4.5133057 | 3.636153 | 3.7216253 |
+| 1 fp4 default | 4.546688 | 3.6433403 | 3.703814 |
+| 2 fp4 all-layers | 4.5574856 | 3.640629 | 3.6777856 |
+| 3 fp4 all-layers, no RHT | 4.5574856 | 3.651947 | 3.7099519 |
+
+(Arms 2/3 share an identical step-0 val loss — expected, `LLMM_FP4_NO_RHT`
+only changes the weight-gradient path, not the forward pass.) All four
+arms land within **1.2% of each other** at step 200 — arm 2 (all-layers,
+RHT on) actually posts the *lowest* val loss of the four, arm 0 (bf16) the
+highest. At this short horizon none of the fp4 configurations show
+degraded generalization vs bf16.
+
+**Step time** (mean of steps 5–200, ms; arm 2 was expected to be *faster*
+than arm 1 per the mission brief's own assumption — more layers moved off
+bf16 GEMM onto the fp4 path):
+
+| arm | mean ms/step | vs bf16 | vs arm 1 |
+|---|---:|---:|---:|
+| 0 bf16 | 134.77 | 1.000x | — |
+| 1 fp4 default | 155.45 | 1.153x | — |
+| 2 fp4 all-layers | 166.75 | 1.237x | **1.073x slower** |
+| 3 fp4 all-layers, no RHT | 169.85 | 1.260x | 1.260x (1.019x slower than arm 2) |
+
+**Surprise, contradicting the mission brief's assumption:** arm 2 is
+*slower* than arm 1, not faster. At 124M the fp4 GEMM path is still net
+slower than bf16 per-layer (this branch's own closeout number: fp4 stock
+155.8 ms vs bf16 134.9 ms/step) because the quantize/amax/RHT-prep
+overhead per fp4-converted layer isn't yet amortized by the narrower GEMM
+at this width — so converting *more* layers to fp4 adds more of that
+per-layer overhead rather than removing bf16-GEMM cost, and total step
+time goes up, not down. Widening coverage is a **speed regression** at
+124M, independent of any stability question.
+
+**RHT-off (arm 3) is also slower than RHT-on (arm 2)**, which looks
+backwards until you note this branch (`opt/fp4-kernels`, `e9a75ad`)
+specifically fused/coalesced the RHT-prep transpose (commits `979d06c`,
+`f6a1492`); `-D LLMM_FP4_NO_RHT=1` reverts to the *old*, unoptimized plain
+RNE/SR quantization path (Chunk T2a's ablation branch in `matmul.mojo`),
+which never received this pass's speedups. The "RHT costs extra prep work"
+intuition no longer holds on this tree — RHT-on is now the fast path.
+
+### Verdicts
+
+1. **Is all-layers-MLP fp4 stable at 200 steps? Yes.** No NaN/Inf in any
+   arm; spike rates are low and comparable across arms (1–2 flagged
+   spikes out of 38 qualifying transitions, all in the 5–10% range, none
+   catastrophic); val loss at step 200 is within 1.2% across all four
+   arms, with the all-layers arm actually best. Widening coverage does
+   not visibly destabilize training over this horizon.
+2. **Is the recipe's first/last-block bf16 exclusion load-bearing at
+   124M/200 steps, or conservatism? On this evidence, conservatism — not
+   load-bearing.** Nothing in the 200-step screen distinguishes arm 2 from
+   arm 1 on stability grounds (comparable spike counts, no drift blowup,
+   comparable or better val loss). But widening coverage buys nothing at
+   124M either: it is strictly slower (arm2 1.073x slower than arm1) with
+   no measurable quality benefit, so there's no practical reason to widen
+   it in production regardless of the stability verdict.
+3. **Is RHT load-bearing at widened coverage? Not for stability, but yes
+   for quality/speed on this tree.** Arm 3 (no RHT) shows no NaN/Inf and
+   a similar loss-delta/spike profile to arm 2 (RHT on) — ablating RHT at
+   widened coverage does not destabilize the widened config either. It
+   does cost measurably: worse val loss at both step 100 (+0.31%) and step
+   200 (+0.87%) than arm 2, and (on this branch specifically) is *also*
+   slower, since RHT-on is the newly-optimized path.
+
+**Both fp4-vs-bf16 loss deltas grow from first-100 to second-100 steps in
+all three fp4 arms (roughly 2.4x, consistent across arms 1/2/3)** — this
+is trajectory divergence from differing per-step gradients (chaotic
+sensitivity, expected for any two independently-evolving optimizers on
+real, non-overfit data), not a coverage-specific instability signal, since
+the growth rate is essentially the same magnitude regardless of coverage
+width.
+
+**Caveat — 200 steps is a SHORT horizon.** This screen can only catch
+*fast* destabilization: NaN/Inf, large per-step spikes uncorrelated with
+bf16's own noise, or an early, sharply accelerating divergence trend. It
+cannot rule out slow-onset instability (e.g. a widened-coverage run that
+looks fine for 200 steps but diverges at step 5,000, or a quality gap that
+only appears after the LR schedule's decay phase). A definitive answer
+needs the project's standard reproduction target: a full GPT-2 124M /
+FineWeb-10B run (`docs/ai/gpt2_124m_fineweb_training_run.md`'s protocol) to
+completion, comparing final validation loss and HellaSwag accuracy between
+default-coverage and all-layers fp4, not just a 200-step screen.
+
+**Artifacts:** four fresh binaries (`build/train_gpt2_{bf16,fp4,fp4_all,
+fp4_all_norht}`, sequential `mojo build`, mtime-verified), full per-step
+logs and the parsing/analysis script kept in the experiment's scratch
+directory (not checked into the repo — this entry's tables are the
+durable record).
+
 ### AI use statement
 
 Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
