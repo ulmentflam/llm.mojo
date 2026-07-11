@@ -58,7 +58,9 @@ from llmm.memory import (
     persistent_device_buffer,
 )
 from llmm.vendor import HAS_CUBLAS, HAS_METAL, USE_TF32
-from llmm.hadamard import hadamard16_fwd_gpu
+from std.gpu.primitives.warp import shuffle_xor
+
+from llmm.hadamard import hadamard_sign
 from llmm.lowp import (
     PrecisionSpec,
     FP8_SPEC,
@@ -2727,6 +2729,125 @@ def _gpu_transpose_kernel[
         dst[c * rows + r] = src[idx]  # src[idx] == src[r*cols + c]
 
 
+def _rht_transpose_tiled_kernel[
+    dtype: DType,
+    BLOCK_SIZE: Int,
+](
+    dst: MutKernelPtr[dtype],
+    src: ImmutKernelPtr[dtype],
+    rows: Int,
+    cols: Int,
+) -> None:
+    """Coalesced 32x32-shared-memory-tile transpose of `src[rows, cols]`
+    (row-major) into `dst[cols, rows]` (row-major) with `llmm/hadamard.mojo`'s
+    forward 16-wide RHT (`y = H16 @ (s (*) x)`, unnormalized Sylvester
+    butterfly) FUSED into the write phase along dst's trailing `rows` axis —
+    one kernel replacing `_rht_transpose_prep`'s previous two-pass
+    `_gpu_transpose_kernel` + `hadamard16_fwd_gpu` pipeline (FP4 closeout
+    gotcha F8: the naive one-thread-one-element transpose has a maximally-
+    strided WRITE, `dst[c*rows+r] = src[idx]`, structurally identical to
+    fp8's original `_quantize_transpose_kernel` before its proven
+    32x32-tile rewrite — see `llmm/lowp.mojo`'s `_quantize_transpose_kernel`
+    and this file's own `_gpu_transpose_add_into_kernel`, P14/P15; the
+    separate in-place hadamard pass additionally cost a full extra
+    read+write of the whole tensor).
+
+    Tile shape: each 32x32 tile of `src` is loaded coalesced into shared
+    memory (padded to 32x33 to dodge bank conflicts on the transposed read),
+    then written transposed to `dst` with coalesced stores — mirrors
+    `_gpu_transpose_add_into_kernel`'s two-phase load/barrier/store shape.
+
+    RHT fusion: in phase 2, the 16 elements of a Hadamard block are 16
+    consecutive dst-column (`gr = tile_r + tx`) positions = 16 consecutive
+    LANES of the writing warp (`tx = thread_idx.x % 32` is the lane id, so
+    lanes 0-15 / 16-31 hold the tile's two Hadamard blocks along the
+    contraction axis). The butterfly therefore runs as 4 `warp.shuffle_xor`
+    stages (offsets 1/2/4/8 — confined within each 16-lane half by
+    construction) on the fp32-cast value, after the sign multiply
+    `hadamard_sign(tx % 16)`, before the single bf16 store. Stage h computes
+    exactly `_fwht16`'s `buf[j] = a + b; buf[j+h] = a - b` pair (bit-h-clear
+    lane: `v + partner`; bit-h-set lane: `partner - v`), on the same
+    fp32-cast inputs, with one final cast to `dtype` at the store — the same
+    op sequence per output element as the unfused
+    `_gpu_transpose_kernel`-then-`_hadamard16_kernel[forward=True]` pipeline
+    (which also round-trips the UNTRANSFORMED bf16 value through global
+    memory unrounded, casts to fp32 once, butterflies in registers, and
+    casts back once), so the fused result is bit-identical.
+
+    REQUIRES `rows % 16 == 0` (raised by `_rht_transpose_prep`, and already
+    `hadamard16_fwd_gpu`'s own contract): guarantees a 16-lane Hadamard
+    half-warp never straddles the `rows` boundary, so out-of-bounds lanes
+    only ever exchange values with other out-of-bounds lanes (which never
+    store). Out-of-tile SMEM slots are zero-filled in phase 1 so the
+    shuffles stay NaN-free regardless.
+    """
+    comptime TILE = 32
+    comptime STRIDE = TILE + 1  # 33 — avoids shared-memory bank conflicts
+    var tile = LayoutTensor[
+        dtype,
+        Layout.row_major(TILE, STRIDE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var tiles_r = ceildiv(rows, TILE)  # tiles along src's row dimension
+    var tiles_c = ceildiv(cols, TILE)  # tiles along src's col dimension
+    var total_tiles = tiles_r * tiles_c
+
+    var tx = Int(thread_idx.x) % TILE
+    var ty = Int(thread_idx.x) // TILE
+    comptime ROW_STEP = BLOCK_SIZE // TILE
+
+    var bt = Int(block_idx.x)
+    while bt < total_tiles:
+        var tile_r = (bt // tiles_c) * TILE  # row offset in src
+        var tile_c = (bt % tiles_c) * TILE  # col offset in src
+
+        # Phase 1 — coalesced load: thread tx reads src column (tile_c+tx);
+        # consecutive tx -> consecutive src columns -> coalesced read.
+        # Out-of-bounds slots are zero-filled (see docstring: keeps the
+        # phase-2 shuffles NaN-free; OOB lanes never store).
+        var r = ty
+        while r < TILE:
+            var gr = tile_r + r
+            var gc = tile_c + tx
+            var lv: Scalar[dtype]
+            if gr < rows and gc < cols:
+                lv = src[gr * cols + gc]
+            else:
+                lv = Scalar[dtype](0)
+            tile.ptr[r * STRIDE + tx] = lv
+            r += ROW_STEP
+        barrier()
+
+        # Phase 2 — coalesced transposed write with the fused RHT butterfly:
+        # thread tx writes dst column (tile_r+tx); consecutive tx ->
+        # consecutive dst columns -> coalesced write. The shuffle stages run
+        # UNGUARDED (every lane participates uniformly — the loop bound is
+        # uniform and only the store is bounds-guarded).
+        r = ty
+        while r < TILE:
+            var gc = tile_c + r  # dst row index (src col)
+            var gr = tile_r + tx  # dst col index (src row)
+            var v = tile.ptr[tx * STRIDE + r].cast[
+                DType.float32
+            ]() * hadamard_sign(tx & 15)
+            var p = shuffle_xor(v, UInt32(1))
+            v = (p - v) if (tx & 1) != 0 else (v + p)
+            p = shuffle_xor(v, UInt32(2))
+            v = (p - v) if (tx & 2) != 0 else (v + p)
+            p = shuffle_xor(v, UInt32(4))
+            v = (p - v) if (tx & 4) != 0 else (v + p)
+            p = shuffle_xor(v, UInt32(8))
+            v = (p - v) if (tx & 8) != 0 else (v + p)
+            if gc < cols and gr < rows:
+                dst[gc * rows + gr] = v.cast[dtype]()
+            r += ROW_STEP
+        barrier()
+
+        bt += Int(grid_dim.x)
+
+
 def _gpu_add_into_kernel[
     dtype: DType
 ](dst: MutKernelPtr[dtype], src: MutKernelPtr[dtype], total: Int,) -> None:
@@ -3621,23 +3742,25 @@ def _rht_transpose_prep[
     path (see the module comment above `matmul_d_input_bwd_fp4` for why this
     is a separate pass rather than a fused quantize-kernel prologue).
 
-    Two steps: (1) transpose `src[rows, cols]` (row-major) into
-    `scratch[cols, rows]` (row-major) via `_gpu_transpose_kernel` — the same
-    kernel the Apple-Metal Wgrad fallback above already uses, vendor-neutral
-    GPU code (`block_idx`/`thread_idx` only, no vendor calls), just not
-    previously invoked from a CUDA call site; (2) apply
-    `llmm/hadamard.mojo`'s `hadamard16_fwd_gpu` IN PLACE on `scratch`, along
-    its now-trailing/contiguous `rows` axis (16-wide blocks) — this is
-    exactly the Wgrad contraction dimension (batch*seq_len), which must be a
-    multiple of 16 (`hadamard16_fwd_gpu`'s own requirement; true at every
-    supported training shape). In-place aliasing (`out_ptr == x_ptr`) is
-    safe: `llmm/hadamard.mojo`'s kernel reads all 16 elements of a thread's
-    block into registers before writing any of them back, and distinct
-    threads own disjoint 16-element blocks.
+    ONE kernel launch: `_rht_transpose_tiled_kernel` transposes
+    `src[rows, cols]` (row-major) into `scratch[cols, rows]` (row-major)
+    through a coalesced 32x32 shared-memory tile AND applies
+    `llmm/hadamard.mojo`'s forward 16-wide RHT along the now-trailing
+    `rows` axis inside the write phase via warp shuffles (FP4-closeout
+    gotcha F8, re-shipped 2026-07-11 after `compute-sanitizer racecheck`
+    cleared F7 as environmental, plus the Hadamard fusion — replacing the
+    previous `_gpu_transpose_kernel` + in-place `hadamard16_fwd_gpu`
+    two-pass pipeline and its full extra read+write of the tensor). The
+    `rows` axis is the Wgrad contraction dimension (batch*seq_len), which
+    must be a multiple of 16 — previously `hadamard16_fwd_gpu`'s own
+    contract, now checked here (true at every supported training shape).
     """
+    if rows % 16 != 0:
+        raise Error("_rht_transpose_prep: rows must be a multiple of 16")
     comptime BLOCK_SIZE = 256
-    var total = rows * cols
-    comptime t_kernel = _gpu_transpose_kernel[dtype]
+    comptime TILE = 32
+    var tiles = ceildiv(rows, TILE) * ceildiv(cols, TILE)
+    comptime t_kernel = _rht_transpose_tiled_kernel[dtype, BLOCK_SIZE]
     var t_compiled = ctx.compile_function[t_kernel]()
     ctx.enqueue_function(
         t_compiled,
@@ -3645,11 +3768,8 @@ def _rht_transpose_prep[
         src_ptr,
         rows,
         cols,
-        grid_dim=(ceildiv(total, BLOCK_SIZE),),
+        grid_dim=(tiles,),
         block_dim=(BLOCK_SIZE,),
-    )
-    hadamard16_fwd_gpu[dtype, "gpu"](
-        scratch_ptr, kernel_ptr_as_immut(scratch_ptr), cols, rows, ctx
     )
 
 
