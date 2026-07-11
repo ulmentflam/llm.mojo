@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-07-11
+
+### Performance
+
+- **Apple Silicon (Metal): bf16 training step −29%, now beats MLX bf16.** A
+  profiling campaign on an M4 found the causal-attention QKᵀ path
+  (`_attention_bmm_scoreout`) was issuing **BH=48 serial `linalg.matmul` launches
+  per call** (one per head) on Metal — pure kernel-dispatch overhead that, at the
+  benchmark's short T=64, made attention **53% of per-layer forward / 41% of
+  per-layer backward**. A single-launch batched Metal kernel for this GEMM
+  (`_attn_batched_scoreout_gpu`/`_launch_batched_scoreout`) already existed in
+  `llmm/attention.mojo` but was dead code; wiring it into `_attention_bmm_scoreout`
+  (gated `HAS_METAL and dtype == out_dtype`, with an `hd == 64 and T % 32 == 0`
+  fast-path guard falling back to the per-head path for other shapes) cuts
+  attention forward/backward ~−58%/−54% and the full bf16 step **~269 → ~190 ms**
+  (same-window A/B). This moves llm.mojo bf16 from behind MLX bf16 (215.6 ms) to
+  ahead of it; fp32 improves too (the batched path is not bf16-gated). The CUDA
+  path is unchanged. Gated by the full `make test` battery (233 pytest + `test_gpt2`
+  end-to-end equivalence, exercising the batched path at bf16 and fp32). See
+  `docs/ai/metal_beat_mlx_campaign_2026-07-11.md`.
+- **Metal: per-step allocation removed from grad-norm.** `calculate_grad_norm()`
+  called `enqueue_create_buffer` + `enqueue_create_host_buffer` fresh every
+  training step even though the reduction grid size is a runtime constant;
+  persistent `grad_norm_out_buf`/`grad_norm_host_buf` fields (sized once in
+  `allocate_optimizer_moments`) trim the update phase ~−3 ms. Optimizer math is
+  bit-for-bit unchanged.
+- **Metal bf16 GEMM lever documented as closed (no code change).** Confirmed via
+  micro-benchmark + empirical `TensorCore` probes that a faster bf16 Metal GEMM is
+  not expressible through Mojo's current Metal surface (`mma`/`store_d`
+  unsupported; hand-tiled SIMD is 3–6× slower; bf16 `linalg.matmul` already ≈ its
+  own fp32 via an internal simdgroup path inside MAX). Artifact: `bench_gemm.mojo`.
+
 ## [Unreleased] - 2026-07-10
 
 ### Added

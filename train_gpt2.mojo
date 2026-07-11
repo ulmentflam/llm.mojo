@@ -1018,6 +1018,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var workload_indices_dev_buf: DeviceBuffer[DType.int32]
     var losses_host_buf: HostBuffer[StatsDType]
     var logits_host_buf: HostBuffer[GPT2_DTYPE]
+    # Persistent scratch for calculate_grad_norm's GPU reduction (per-block
+    # partial sums + the 1-element host readback). Sized once in
+    # allocate_optimizer_moments (grid_x is fixed by num_sm/BLOCK_SIZE, not by
+    # anything that changes step to step) and reused every step instead of
+    # calling enqueue_create_buffer/enqueue_create_host_buffer per call.
+    var grad_norm_out_buf: DeviceBuffer[DType.float32]
+    var grad_norm_host_buf: HostBuffer[DType.float32]
+    # grad_norm_out_buf's element count (grid_x), cached alongside it so
+    # calculate_grad_norm doesn't re-query the GPU's SM count every step.
+    var grad_norm_grid_x: Int
 
     # Model weights and their sizes
     var params: ParameterTensors[GPT2_DTYPE]
@@ -1203,6 +1213,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.workload_indices_buf = self.ctx.enqueue_create_host_buffer[
             DType.int32
         ](1)
+        self.grad_norm_out_buf = self.ctx.enqueue_create_buffer[DType.float32](
+            1
+        )
+        self.grad_norm_host_buf = self.ctx.enqueue_create_host_buffer[
+            DType.float32
+        ](1)
+        self.grad_norm_grid_x = 1
         self.losses_host_buf = self.ctx.enqueue_create_host_buffer[StatsDType](
             1
         )
@@ -1798,6 +1815,28 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 size=n,
             )
             self.ctx.synchronize()
+
+        # Persistent scratch for calculate_grad_norm's GPU reduction (see the
+        # field comment): sized once here to grid_x, the same
+        # num_sm/BLOCK_SIZE/RESIDENT_THREADS formula calculate_grad_norm uses
+        # to launch global_norm_squared_gpu, so it never needs to reallocate
+        # per step. CPU targets don't reduce through this buffer, so a size-1
+        # placeholder (matching the __init__ placeholder above) is enough.
+        comptime if is_gpu[Self.target]():
+            comptime BLOCK_SIZE = 512
+            comptime RESIDENT_THREADS = 2048
+            var num_sm = self.ctx.get_attribute(
+                DeviceAttribute.MULTIPROCESSOR_COUNT
+            )
+            self.grad_norm_grid_x = ceildiv(
+                num_sm * RESIDENT_THREADS, BLOCK_SIZE
+            )
+            self.grad_norm_out_buf = self.ctx.enqueue_create_buffer[
+                DType.float32
+            ](self.grad_norm_grid_x)
+            self.grad_norm_host_buf = self.ctx.enqueue_create_host_buffer[
+                DType.float32
+            ](1)
 
         self.has_allocated_optimizer_moments = True
 
@@ -3618,22 +3657,22 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             return sqrt(sumsq)
         else:
             comptime BLOCK_SIZE = 512
-            comptime RESIDENT_THREADS = 2048
-            var num_sm = self.ctx.get_attribute(
-                DeviceAttribute.MULTIPROCESSOR_COUNT
-            )
-            var grid_x = ceildiv(num_sm * RESIDENT_THREADS, BLOCK_SIZE)
+            var grid_x = self.grad_norm_grid_x
             # Per-block partial sums land in out_buf[0:grid_x]; the aggregate
-            # kernel reduces them into out_buf[0].
-            var out_buf = self.ctx.enqueue_create_buffer[DType.float32](grid_x)
-            out_buf.enqueue_fill(Scalar[DType.float32](0.0))
+            # kernel reduces them into out_buf[0]. out_buf/host_out are
+            # persistent (grad_norm_out_buf/grad_norm_host_buf, sized once in
+            # allocate_optimizer_moments) rather than reallocated every call —
+            # this runs once per training step, so a fresh
+            # enqueue_create_buffer/enqueue_create_host_buffer here would
+            # otherwise reallocate device/host memory on every step.
+            self.grad_norm_out_buf.enqueue_fill(Scalar[DType.float32](0.0))
             # Metal: unsafe_ptr() is a CPU-side query (pointer value, not
             # content); the fill and subsequent norm kernel are sequenced by
             # the in-order queue — no sync needed here.
             comptime if not HAS_METAL:
                 self.ctx.synchronize()
             var out_ptr = rebind_mut_mem[DType.float32](
-                out_buf.unsafe_ptr().as_unsafe_any_origin()
+                self.grad_norm_out_buf.unsafe_ptr().as_unsafe_any_origin()
             )
 
             comptime norm_kernel = global_norm_squared_gpu[
@@ -3664,22 +3703,19 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             comptime if not HAS_METAL:
                 self.ctx.synchronize()
 
-            var host_out = self.ctx.enqueue_create_host_buffer[DType.float32](1)
-            # Metal: HostBuffer pointer is valid immediately after creation;
-            # the subsequent enqueue_copy is sequenced after the agg kernel.
             comptime if not HAS_METAL:
                 self.ctx.synchronize()
             self.ctx.enqueue_copy(
                 dst_ptr=rebind[
                     UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-                ](host_out.unsafe_ptr().as_unsafe_any_origin()),
+                ](self.grad_norm_host_buf.unsafe_ptr().as_unsafe_any_origin()),
                 src_ptr=rebind[
                     UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
                 ](out_ptr.as_unsafe_any_origin()),
                 size=1,
             )
             self.ctx.synchronize()
-            return sqrt(host_out[0])
+            return sqrt(self.grad_norm_host_buf[0])
 
     def _checkpoint_config(self) -> CheckpointConfig:
         return CheckpointConfig(

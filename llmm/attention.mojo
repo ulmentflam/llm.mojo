@@ -4363,6 +4363,31 @@ def _attention_bmm_scoreout[
     # written-out precision: bf16 for QKᵀ (feeds only exp in the P recompute) and
     # (optionally) fp32 for dO·Vᵀ. cuBLAS writes the fp32 accumulator straight
     # into c; the scale is deferred to the softmax/dS.
+    #
+    # Metal: dispatch all BH heads in a single custom tiled kernel
+    # (_launch_batched_scoreout) instead of BH serial linalg.matmul calls — the
+    # same "all heads in one launch" treatment _attention_bmm_headout and
+    # _attention_bmm_kvgrad already get. At small T (e.g. T=64) the BH-loop's
+    # per-call dispatch overhead dominates: measured ~48 serial matmul launches
+    # costing ~5 ms/layer here vs a few kernel launches at a few hundred µs once
+    # batched. _attn_batched_scoreout_gpu is comptime-pinned to HD=64 (GPT-2
+    # 124M) and has no load-side bounds check (matches _attn_headout4_gpu's
+    # documented aligned-T-only contract — see its comment above), so it's only
+    # safe for hd==64 and T a multiple of 32; training's fixed shapes (T=64,
+    # T=1024) both qualify. Anything else (odd T from generation/tests) falls
+    # back to the generic per-head path below.
+    comptime if HAS_METAL and dtype == out_dtype:
+        if hd == 64 and T % 32 == 0:
+            _launch_batched_scoreout[dtype](
+                a_ptr,
+                b_ptr,
+                rebind[MutKernelPtr[dtype]](out_ptr),
+                BH,
+                T,
+                hd,
+                ctx,
+            )
+            return
     _attn_gemm_batched[dtype, dtype, out_dtype](
         a_ptr,
         b_ptr,
