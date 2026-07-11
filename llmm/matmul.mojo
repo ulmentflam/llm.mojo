@@ -4,7 +4,7 @@ from std.math import ceildiv
 from layout import Layout, TileTensor
 from layout.layout_tensor import LayoutTensor
 from linalg.matmul import matmul
-from std.sys import simd_width_of, get_defined_int
+from std.sys import simd_width_of, get_defined_int, is_defined
 from std.gpu.primitives import block
 from linalg.matmul.vendor import blas
 from std.utils.index import IndexList
@@ -67,6 +67,17 @@ from llmm.lowp import (
     quantize_transpose_devscale,
     quantize_dual_devscale,
 )
+
+# A6 (docs/ai/speedrun_techniques_research.md): `-D LLMM_FP8_FAST_ACCUM=1`
+# (default OFF) enables cuBLASLt fast-accumulation mode on the FORWARD fp8
+# GEMM only (`matmul_fwd_lowp`'s single `lowp_gemm_devscale` call below) —
+# dgrad/wgrad (`matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_lowp`) always
+# pass `fast_accum=False` (precise accumulation), matching modded-nanogpt's
+# own fwd-fast/bwd-precise split. Independent of `FP8_STATIC_SCALES` — either
+# can be on/off in any combination (both flags only ever change what
+# `matmul_fwd_lowp`/`matmul_bwd_lowp` do internally, never each other's
+# comptime branches).
+comptime FP8_FAST_ACCUM = is_defined["LLMM_FP8_FAST_ACCUM"]()
 from llmm.amax import (
     AmaxState,
     compute_amax,
@@ -221,6 +232,33 @@ def _lt_set_op(
             .as_immutable()
             .as_unsafe_any_origin(),
             size_of[cublasOperation_t](),
+        )
+    )
+
+
+# A6 (docs/ai/speedrun_techniques_research.md): fp8 fast-accumulation mode.
+# `CUBLASLT_MATMUL_DESC_FAST_ACCUM` is confirmed present in this toolchain's
+# vendored `_cublas.cublaslt` bindings (probed directly: a standalone
+# `mojo run` referencing `cublasLtMatmulDescAttributes_t.
+# CUBLASLT_MATMUL_DESC_FAST_ACCUM` resolves cleanly) -- no new enum value
+# needed (unlike, e.g., `_lt_dt`'s dtype additions, which DID need new
+# comptime mappings on our own side for dtypes the vendored `DataType` enum
+# didn't have named constants for). Attribute is `int8_t` (cuBLASLt's own
+# docstring: "0 - fast accumulation mode is disabled", default), unlike the
+# `int32_t` `cublasOperation_t` `_lt_set_op` sets above -- a separate
+# one-byte setter, not a variant of `_lt_set_op`.
+@always_inline
+def _lt_set_fast_accum(desc: cublasLtMatmulDesc_t, enable: Bool) raises:
+    var flag = Int8(1) if enable else Int8(0)
+    check_cublas_error(
+        cublasLtMatmulDescSetAttribute(
+            desc,
+            cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_FAST_ACCUM,
+            UnsafePointer(to=flag)
+            .bitcast[NoneType]()
+            .as_immutable()
+            .as_unsafe_any_origin(),
+            size_of[Int8](),
         )
     )
 
@@ -644,6 +682,7 @@ def _matmul_cublaslt_fp8[
     a_dtype: DType,
     b_dtype: DType,
     out_dtype: DType,
+    fast_accum: Bool = False,
 ](
     d_ptr: MutKernelPtr[out_dtype],
     a_ptr: ImmutKernelPtr[
@@ -669,6 +708,15 @@ def _matmul_cublaslt_fp8[
     operands of which GEMM need a transposed quantize. `k` must be a multiple
     of 16 (fp8 tensor-core alignment; unchecked here — caller's
     responsibility, same as `_matmul_cublaslt`'s implicit assumptions).
+
+    `fast_accum` (A6, docs/ai/speedrun_techniques_research.md, default
+    False = unchanged behavior): sets `CUBLASLT_MATMUL_DESC_FAST_ACCUM`,
+    cuBLASLt's lower-precision (periodically-promoted, not every-term)
+    tensor-core accumulation mode for fp8 GEMMs. modded-nanogpt's recipe
+    (train_gpt.py) enables this on the FORWARD fp8 GEMM only and keeps
+    dgrad/wgrad precise — `lowp_gemm_devscale` exposes this as a comptime
+    parameter so callers make that choice explicitly per call site rather
+    than this function defaulting it on.
     """
     var handle = _get_global_handle[a_dtype, Backend.CUBLASLT](ctx)
     var lt = handle._get_cublas()
@@ -691,6 +739,8 @@ def _matmul_cublaslt_fp8[
     _lt_set_op(
         desc, cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_TRANSB, False
     )
+    comptime if fast_accum:
+        _lt_set_fast_accum(desc, True)
 
     var a_sp = a_scale_inv_ptr
     check_cublas_error(
@@ -786,6 +836,7 @@ def lowp_gemm_devscale[
     transpose_b: Bool = False,
     quantize_a: Bool = True,
     quantize_b: Bool = True,
+    fast_accum: Bool = False,
 ](
     d_ptr: MutKernelPtr[out_dtype],
     a_ptr: ImmutKernelPtr[in_dtype],
@@ -899,7 +950,9 @@ def lowp_gemm_devscale[
                 b_fp8_scratch, b_ptr, b_scale_ptr, n * k, ctx
             )
 
-    _matmul_cublaslt_fp8[a_out_dtype, b_out_dtype, out_dtype](
+    _matmul_cublaslt_fp8[
+        a_out_dtype, b_out_dtype, out_dtype, fast_accum=fast_accum
+    ](
         d_ptr,
         a_fp8_scratch.as_immutable(),
         b_fp8_scratch.as_immutable(),
@@ -2045,6 +2098,7 @@ def matmul_fwd_lowp[
         transpose_b=False,
         quantize_a=False,
         quantize_b=False,
+        fast_accum=FP8_FAST_ACCUM,
     ](
         out_ptr,
         weight_ptr,
