@@ -1,37 +1,32 @@
 # ===----------------------------------------------------------------------=== #
-# tests/test_matmul_bwd_fp4.mojo — Chunk T2a/T2b gate (c) + accumulate + RHT
-# ablation unit tests:
+# tests/test_matmul_bwd_fp4.mojo — fp4 backward unit tests:
 #
-#   1. `matmul_bwd_fp4` (llmm/matmul.mojo, Chunk T2a: Dgrad = SR on d_output,
-#      RNE on weight, no RHT; Wgrad = RNE/SR + RHT by default since Chunk T2b,
-#      `-D LLMM_FP4_NO_RHT=1` ablates back to plain RNE/SR) vs the production
+#   1. `matmul_bwd_fp4` (llmm/matmul.mojo: Dgrad = SR on d_output, RNE on
+#      weight, no RHT; Wgrad = RNE/SR + RHT by default, `-D
+#      LLMM_FP4_NO_RHT=1` ablates back to plain RNE/SR) vs the production
 #      bf16 `matmul_bwd` at the two FP4-eligible MLP linear shapes (fc, proj),
 #      real GPT-2 124M (d12, channels=768) dimensions and the real B=4/T=1024
-#      row count (rows=4096) — mirrors tests/test_matmul_fwd_fp4.mojo's gate
-#      (c) methodology for the backward pass. Compares `d_input`/`d_weight`
-#      (relL2 + cosine, NaN/Inf-free) and asserts `d_bias` is BIT-IDENTICAL
-#      between the two arms (both paths reuse the same bf16 `matmul_bias_bwd`
-#      kernel — the "bias-grad reuse" design decision — so any divergence
-#      there would flag a wiring bug, not ordinary fp4 quantization noise).
+#      row count (rows=4096). Compares `d_input`/`d_weight` (relL2 + cosine,
+#      NaN/Inf-free) and asserts `d_bias` is BIT-IDENTICAL between the two
+#      arms (both paths reuse the same bf16 `matmul_bias_bwd` kernel — the
+#      "bias-grad reuse" design decision — so any divergence there would
+#      flag a wiring bug, not ordinary fp4 quantization noise).
 #   2. `test_fp4_gemm_accumulate*` — unit tests for the `lowp_gemm_fp4`
-#      accumulate fix (Chunk T2a, mechanics item 2): a fresh (accumulate=
-#      False) GEMM result added to a known seed value via a SEPARATE
-#      accumulate=True call must match seeding the accumulator directly and
-#      adding, to within bf16 rounding — mirrors the fp8 beta=1 probe cited
-#      in docs/ai/low_precision_gotchas.md C4.
-#   3. `test_wgrad_rht_gaussian`/`test_wgrad_rht_outlier` (Chunk T2b) — RHT-on
-#      (the production `matmul_d_weight_bwd_fp4` default) vs a hand-composed
-#      RHT-off arm (T2a's exact composition), on gaussian vs outlier-heavy
-#      (0.1% of entries scaled 100x) synthetic data, both vs a bf16
-#      `matmul_d_weight_bwd` reference — see the module comment above those
-#      tests for the (non-obvious, measured) verdict.
+#      accumulate path: a fresh (accumulate=False) GEMM result added to a
+#      known seed value via a SEPARATE accumulate=True call must match
+#      seeding the accumulator directly and adding, to within bf16 rounding.
+#   3. `test_wgrad_rht_gaussian`/`test_wgrad_rht_outlier` — RHT-on (the
+#      production `matmul_d_weight_bwd_fp4` default) vs a hand-composed
+#      RHT-off arm, on gaussian vs outlier-heavy (0.1% of entries scaled
+#      100x) synthetic data, both vs a bf16 `matmul_d_weight_bwd` reference —
+#      see the module comment above those tests for the (non-obvious,
+#      measured) verdict.
 #
 # GPU-only tests are guarded by `has_nvidia_gpu_accelerator()` and expected to
 # run under `flock -w 10800 /tmp/llmm-gpu.lock -c '...'` (shared GPU).
 # ===----------------------------------------------------------------------=== #
 
 from std.memory import UnsafePointer
-from std.math import sqrt
 from std.random import random_float64, seed
 from std.sys import has_nvidia_gpu_accelerator
 from std.gpu.host import DeviceContext
@@ -56,6 +51,8 @@ from llmm.nvfp4_quant import (
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 from llmm.rand import MT19937
 
+from _lowp_test_common import pseudo_gaussian_fill, cosine_and_rel_l2
+
 
 # ===----------------------------------------------------------------------=== #
 # 1. matmul_bwd_fp4 vs matmul_bwd (bf16) at MLP shapes.
@@ -70,35 +67,6 @@ def _fill_random(
     for i in range(numel):
         var v = Float32((random_float64() * 2.0 - 1.0)) * scale
         ptr[i] = v.cast[DType.bfloat16]()
-
-
-def _rel_l2_cosine(
-    got: UnsafePointer[Scalar[DType.bfloat16], MutUntrackedOrigin],
-    want: UnsafePointer[Scalar[DType.bfloat16], MutUntrackedOrigin],
-    n: Int,
-    label: String,
-    mut rel_l2_out: Float32,
-    mut cosine_out: Float32,
-) raises -> None:
-    var l2_err = Float32(0.0)
-    var dot = Float32(0.0)
-    var norm_got = Float32(0.0)
-    var norm_want = Float32(0.0)
-    for i in range(n):
-        var g = got[i].cast[DType.float32]()
-        var w = want[i].cast[DType.float32]()
-        assert_true(g == g, label + ": NaN at " + String(i))
-        assert_true(
-            g > Float32(-1e30) and g < Float32(1e30),
-            label + ": Inf/overflow at " + String(i),
-        )
-        var e = g - w
-        l2_err += e * e
-        dot += g * w
-        norm_got += g * g
-        norm_want += w * w
-    rel_l2_out = sqrt(l2_err / (norm_want + Float32(1e-12)))
-    cosine_out = dot / (sqrt(norm_got) * sqrt(norm_want) + Float32(1e-12))
 
 
 def _run_bwd_site_case(
@@ -183,7 +151,7 @@ def _run_bwd_site_case(
         )
     ctx.synchronize()
 
-    # fp4 arm (matmul_bwd_fp4, Chunk T2a).
+    # fp4 arm (matmul_bwd_fp4).
     var d_input_fp4 = ctx.enqueue_create_buffer[DT](n_in)
     var d_weight_fp4 = ctx.enqueue_create_buffer[DT](n_w)
     var d_bias_fp4 = ctx.enqueue_create_buffer[DT](out_channels)
@@ -252,7 +220,7 @@ def _run_bwd_site_case(
 
     var rel_l2_input = Float32(0.0)
     var cosine_input = Float32(0.0)
-    _rel_l2_cosine(
+    cosine_and_rel_l2(
         host_d_input_fp4.unsafe_ptr(),
         host_d_input_ref.unsafe_ptr(),
         n_in,
@@ -262,7 +230,7 @@ def _run_bwd_site_case(
     )
     var rel_l2_weight = Float32(0.0)
     var cosine_weight = Float32(0.0)
-    _rel_l2_cosine(
+    cosine_and_rel_l2(
         host_d_weight_fp4.unsafe_ptr(),
         host_d_weight_ref.unsafe_ptr(),
         n_w,
@@ -270,38 +238,25 @@ def _run_bwd_site_case(
         rel_l2_weight,
         cosine_weight,
     )
-    print(
-        label
-        + ": d_input rel_l2="
-        + String(rel_l2_input)
-        + " cosine="
-        + String(cosine_input)
-        + " | d_weight rel_l2="
-        + String(rel_l2_weight)
-        + " cosine="
-        + String(cosine_weight)
-    )
-
-    # Bounds per the F1 gotcha (docs/ai/low_precision_gotchas.md): the
-    # cosine floor is DERIVED from the calibrated relL2 floor via
+    # Bounds: the cosine floor is DERIVED from the calibrated relL2 floor via
     # cosine ~= 1/sqrt(1+relL2^2), not copy-pasted from a higher-precision
-    # sibling. `d_input` (Dgrad) is unaffected by Chunk T2b (RHT is Wgrad-
-    # only per the recipe) -- measured (three runs, bit-identical, same as
-    # Chunk T2a): fc/proj d_input relL2 0.1836/0.1839, cosine 0.9845/0.9850.
+    # sibling. `d_input` (Dgrad) is unaffected by the RHT (Wgrad-only) --
+    # measured (three runs, bit-identical): fc/proj d_input relL2
+    # 0.1836/0.1839, cosine 0.9845/0.9850.
     # relL2 < 0.22 leaves ~20% headroom above the measured floor; the cosine
     # floor derives from that bound (1/sqrt(1+0.22^2) ~= 0.977), with a
-    # small margin (0.975) matching cac1968's precedent of sitting just
-    # below the geometric value rather than exactly on it.
+    # small margin (0.975) below the geometric value rather than exactly on
+    # it.
     #
-    # `d_weight` (Wgrad) DOES change under T2b: RHT is on by default, and at
-    # these real MLP shapes/data it measures a bit BETTER than T2a's plain
+    # `d_weight` (Wgrad) DOES change under RHT: it is on by default, and at
+    # these real MLP shapes/data it measures a bit BETTER than the plain
     # RNE/SR floor (0.1784/0.1782) -- fc/proj d_weight relL2 0.1664/0.1665,
     # cosine 0.9865/0.9864. Tightened relL2 < 0.20 (~20% headroom above the
     # measured ~0.166 floor) / cosine > 0.980 (1/sqrt(1+0.20^2) ~= 0.980,
-    # same F1 derivation) accordingly -- see the T2b docs entry for the
-    # dedicated gaussian/outlier RHT-on-vs-off ablation (`test_wgrad_rht_
-    # gaussian`/`test_wgrad_rht_outlier` below), which is a more nuanced
-    # picture than "RHT always helps."
+    # same derivation) accordingly -- see the dedicated gaussian/outlier
+    # RHT-on-vs-off ablation (`test_wgrad_rht_gaussian`/
+    # `test_wgrad_rht_outlier` below), which is a more nuanced picture than
+    # "RHT always helps."
     assert_true(
         rel_l2_input < Float32(0.22),
         label + ": d_input rel_l2 " + String(rel_l2_input) + " >= 0.22",
@@ -333,7 +288,7 @@ def test_proj_bwd_site() raises:
 
 
 # ===----------------------------------------------------------------------=== #
-# 2. lowp_gemm_fp4 accumulate=True unit test (Chunk T2a, mechanics item 2).
+# 2. lowp_gemm_fp4 accumulate=True unit test.
 # ===----------------------------------------------------------------------=== #
 
 
@@ -476,7 +431,6 @@ def test_fp4_gemm_accumulate() raises:
             diff = -diff
         if diff > max_abs_diff:
             max_abs_diff = diff
-    print("fp4-gemm-accumulate: max_abs_diff vs (seed + fresh) =", max_abs_diff)
     # bf16 rounding of the seed (2.0, exact) + fresh (up to a few units) is
     # small; a broken accumulate (e.g. double-counting, or reading the
     # post-overwrite raw buffer instead of the pre-existing d_ptr value)
@@ -492,11 +446,11 @@ def test_fp4_gemm_accumulate() raises:
 
 
 # ===----------------------------------------------------------------------=== #
-# 3. Chunk T2b — RHT ablation: `matmul_d_weight_bwd_fp4` (RHT-on, the default
-#    build's actual production behavior) vs a hand-composed RHT-off arm (T2a's
-#    exact quantize_transpose composition), on (a) gaussian inputs and (b) an
-#    outlier-heavy case (0.1% of entries scaled 100x -- gradient-like), both
-#    vs a bf16 `matmul_d_weight_bwd` reference.
+# 3. RHT ablation: `matmul_d_weight_bwd_fp4` (RHT-on, the default build's
+#    actual production behavior) vs a hand-composed RHT-off arm (the exact
+#    quantize_transpose composition without RHT), on (a) gaussian inputs and
+#    (b) an outlier-heavy case (0.1% of entries scaled 100x -- gradient-like),
+#    both vs a bf16 `matmul_d_weight_bwd` reference.
 #
 #    `-D LLMM_FP4_NO_RHT` is a comptime (build-time) flag (module comment
 #    above `matmul_d_input_bwd_fp4`, llmm/matmul.mojo) -- a single test
@@ -508,34 +462,17 @@ def test_fp4_gemm_accumulate() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-@always_inline
-def _pseudo_gaussian_fill_bf16(
-    mut rng: MT19937,
-    ptr: UnsafePointer[Scalar[DType.bfloat16], MutUntrackedOrigin],
-    numel: Int,
-    std: Float32,
-) -> None:
-    """Irwin-Hall approximate-normal fill (see tests/test_lowp_gemm_fp4.mojo's
-    identical-purpose helper: avoids `llmm.rand.normal_`'s Box-Muller, which
-    needs `-lm`, not passed by the generic `make test-mojo` loop)."""
-    for i in range(numel):
-        var s = Float32(0.0)
-        for _ in range(12):
-            s += rng.randfloat32()
-        ptr[i] = ((s - 6.0) * std).cast[DType.bfloat16]()
-
-
 def _make_outlier_bf16(
     mut rng: MT19937,
     ptr: UnsafePointer[Scalar[DType.bfloat16], MutUntrackedOrigin],
     numel: Int,
     std: Float32,
 ) -> None:
-    """Gaussian base (see `_pseudo_gaussian_fill_bf16`) with exactly 0.1% of
+    """Gaussian base (see `pseudo_gaussian_fill`) with exactly 0.1% of
     entries (every 1000th) scaled 100x -- a deterministic, reproducible
     outlier-heavy tensor standing in for a gradient tensor's heavy-tailed
     channels (the recipe's motivating case for RHT)."""
-    _pseudo_gaussian_fill_bf16(rng, ptr, numel, std)
+    pseudo_gaussian_fill[DType.bfloat16](rng, ptr, numel, std)
     var i = 0
     while i < numel:
         var v = ptr[i].cast[DType.float32]() * Float32(100.0)
@@ -570,10 +507,10 @@ def _run_wgrad_rht_case(
         _make_outlier_bf16(rng, host_input.unsafe_ptr(), n_in, Float32(1.0))
         _make_outlier_bf16(rng, host_doutput.unsafe_ptr(), n_out, Float32(0.05))
     else:
-        _pseudo_gaussian_fill_bf16(
+        pseudo_gaussian_fill[DType.bfloat16](
             rng, host_input.unsafe_ptr(), n_in, Float32(1.0)
         )
-        _pseudo_gaussian_fill_bf16(
+        pseudo_gaussian_fill[DType.bfloat16](
             rng, host_doutput.unsafe_ptr(), n_out, Float32(0.05)
         )
 
@@ -712,7 +649,7 @@ def _run_wgrad_rht_case(
     d_weight_norht.enqueue_copy_to(host_norht)
     ctx.synchronize()
 
-    _rel_l2_cosine(
+    cosine_and_rel_l2(
         host_rht.unsafe_ptr(),
         host_ref.unsafe_ptr(),
         n_w,
@@ -720,7 +657,7 @@ def _run_wgrad_rht_case(
         rel_l2_rht,
         cosine_rht,
     )
-    _rel_l2_cosine(
+    cosine_and_rel_l2(
         host_norht.unsafe_ptr(),
         host_ref.unsafe_ptr(),
         n_w,
@@ -760,10 +697,11 @@ def test_wgrad_rht_gaussian() raises:
     ):
         return
     # Gaussian data has no outlier structure for RHT to fix -- RHT-on is
-    # expected to be roughly NEUTRAL, bounded per the same F1-gotcha
-    # geometric methodology as the site gates above. Measured (bit-
-    # identical across repeat runs): rel_l2 0.1674 (off) -> 0.1664 (on), a
-    # tiny improvement, well within "roughly neutral."
+    # expected to be roughly NEUTRAL, bounded per the same cosine ~=
+    # 1/sqrt(1+relL2^2) geometric methodology as the site gates above.
+    # Measured (bit-identical across repeat runs): rel_l2 0.1674 (off) ->
+    # 0.1664 (on), a tiny improvement, well within "roughly neutral" -- both
+    # arms of the ablation are asserted with the same bound.
     assert_true(
         rel_l2_rht < Float32(0.22),
         "wgrad-gaussian RHT-on rel_l2 " + String(rel_l2_rht) + " >= 0.22",
@@ -771,6 +709,14 @@ def test_wgrad_rht_gaussian() raises:
     assert_true(
         cosine_rht > Float32(0.975),
         "wgrad-gaussian RHT-on cosine " + String(cosine_rht) + " <= 0.975",
+    )
+    assert_true(
+        rel_l2_norht < Float32(0.22),
+        "wgrad-gaussian RHT-off rel_l2 " + String(rel_l2_norht) + " >= 0.22",
+    )
+    assert_true(
+        cosine_norht > Float32(0.975),
+        "wgrad-gaussian RHT-off cosine " + String(cosine_norht) + " <= 0.975",
     )
 
 
@@ -794,9 +740,9 @@ def test_wgrad_rht_outlier() raises:
     # MEASURED (bit-identical across repeat runs): RHT-on is actually
     # slightly WORSE here (rel_l2 0.0969 vs RHT-off's 0.0844) -- the OPPOSITE
     # of the naive "RHT always helps outliers" expectation. This is a real,
-    # reproducible finding, not test noise -- report honestly rather than
-    # asserting the hoped-for direction (project convention, see docs/ai/
-    # low_precision_gotchas.md F3/F4/E5).
+    # reproducible finding, not test noise -- both arms are asserted below
+    # (measured+margin, same cosine ~= 1/sqrt(1+relL2^2) derivation as the
+    # other gates in this file), not just the hoped-for direction.
     #
     # Why: this test's outlier is a SINGLE isolated 100x spike among 15
     # otherwise-normal values in a 16-block. `llmm/hadamard.mojo`'s
@@ -817,11 +763,29 @@ def test_wgrad_rht_outlier() raises:
     # the Metis paper (arXiv:2509.00404) makes exactly this point: RHT
     # "only smooths a few outliers without reducing overall spread." This
     # single-isolated-spike construction is a harder regime than realistic
-    # gradient outlier structure (correlated/multi-outlier), which is what
-    # the item-3 end-to-end training run (the recipe's actual claim) tests.
+    # gradient outlier structure (correlated/multi-outlier), which the
+    # end-to-end training run exercises instead.
+    #
+    # RHT-on: measured rel_l2 0.0969, cosine ~0.9953. Bound rel_l2 < 0.20
+    # (~2x measured headroom) / cosine > 0.980 (1/sqrt(1+0.20^2) ~= 0.980).
     assert_true(
-        rel_l2_rht < Float32(0.40),
-        "wgrad-outlier RHT-on rel_l2 " + String(rel_l2_rht) + " >= 0.40",
+        rel_l2_rht < Float32(0.20),
+        "wgrad-outlier RHT-on rel_l2 " + String(rel_l2_rht) + " >= 0.20",
+    )
+    assert_true(
+        cosine_rht > Float32(0.980),
+        "wgrad-outlier RHT-on cosine " + String(cosine_rht) + " <= 0.980",
+    )
+    # RHT-off arm (the ablation's other half): measured rel_l2 0.0844,
+    # cosine ~0.9965. Bound rel_l2 < 0.18 (~2x measured headroom) /
+    # cosine > 0.982 (1/sqrt(1+0.18^2) ~= 0.984, small margin below).
+    assert_true(
+        rel_l2_norht < Float32(0.18),
+        "wgrad-outlier RHT-off rel_l2 " + String(rel_l2_norht) + " >= 0.18",
+    )
+    assert_true(
+        cosine_norht > Float32(0.982),
+        "wgrad-outlier RHT-off cosine " + String(cosine_norht) + " <= 0.982",
     )
 
 

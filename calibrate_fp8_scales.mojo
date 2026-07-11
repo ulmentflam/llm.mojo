@@ -1,6 +1,6 @@
 # ===----------------------------------------------------------------------=== #
-# calibrate_fp8_scales.mojo — A1 calibration tool (speedrun A1: static/
-# calibrated FP8 scales, docs/ai/speedrun_techniques_research.md).
+# calibrate_fp8_scales.mojo — computes the static/calibrated FP8 scale table
+# consumed by `-D LLMM_FP8_STATIC_SCALES=1` (llmm/lowp.mojo).
 #
 # Runs N steps (default 20) of ordinary fp8 training with the EXISTING
 # delayed-scaling (`AmaxState`) path, reading back every per-(site,role,layer)
@@ -11,30 +11,25 @@
 # tool, not the trainer, pays them) — fine for a one-shot offline
 # calibration utility.
 #
-# Why every-step running-min, not "read once at the end" (first version of
-# this tool did the latter and produced an UNSAFE table — see docs/ai/
-# ai_assisted_optimizations_and_benchmarks.md's A1 calibration entry for the
-# full incident): `AmaxState`'s delayed-scaling ring buffer only remembers
-# the last `amax_history_len=16` steps by construction (`llmm/amax.mojo`) —
-# reading `.scale` only after step 20 sees the max amax over steps ~4-19
-# and has ALREADY FORGOTTEN steps 0-3. The single most extreme amax in a
-# short run is very often the FIRST step or two off a fresh checkpoint
-# (loss/gradients have not yet settled onto the tiny fine-tuning dataset),
-# so an end-of-run-only readback can silently miss exactly the outlier a
-# safety margin is supposed to cover. Reading every step and keeping a
-# running min-over-time (in addition to the min-over-layers the design
-# always wanted) fixes this: the reported constant is now the smallest
-# scale ANY layer needed at ANY point during the whole calibration run,
-# which is the correct "worst case observed" input to the safety-factor
-# margin.
+# Why every-step running-min, not "read once at the end": `AmaxState`'s
+# delayed-scaling ring buffer only remembers the last `amax_history_len=16`
+# steps by construction (`llmm/amax.mojo`) — reading `.scale` only after
+# step 20 sees the max amax over steps ~4-19 and has ALREADY FORGOTTEN steps
+# 0-3. The single most extreme amax in a short run is very often the FIRST
+# step or two off a fresh checkpoint (loss/gradients have not yet settled
+# onto the tiny fine-tuning dataset), so an end-of-run-only readback can
+# silently miss exactly the outlier a safety margin is supposed to cover.
+# Reading every step and keeping a running min-over-time (in addition to the
+# min-over-layers the design always wanted) fixes this: the reported
+# constant is now the smallest scale ANY layer needed at ANY point during
+# the whole calibration run, which is the correct "worst case observed"
+# input to the safety-factor margin.
 #
 # For each of the 12 (site, role) pairs — site in {qkv, attn_proj, fc, proj},
 # role in {input, weight, doutput} — this tool has `num_layer` independent
-# `AmaxState`s (one per transformer layer). The static-scale design (A1)
-# wants ONE constant per (site, role), shared across all layers (mirroring
-# modded-nanogpt's per-tensor-role constants, not per-layer-instance
-# constants — see the research doc's "hardcoded constant per-tensor scales"
-# finding). This tool picks the MIN scale across (layers x steps) for each
+# `AmaxState`s (one per transformer layer). The static-scale design wants
+# ONE constant per (site, role), shared across all layers (not per-layer
+# constants). This tool picks the MIN scale across (layers x steps) for each
 # (site, role) — i.e. the scale belonging to whichever (layer, step) saw
 # the LARGEST amax — so that using this one constant everywhere is safe
 # for every layer at every point in training, not just the "typical" one.
@@ -46,14 +41,13 @@
 #   pixi run -e cuda mojo run -I . calibrate_fp8_scales.mojo \
 #       [checkpoint_or_descriptor] [steps] [batch_size] [seq_len] [safety_factor]
 #
-#   checkpoint_or_descriptor  default "gpt2_124M_bf16.bin" (checkpoint-init,
-#                             the campaign's standard invocation). Pass a
-#                             model descriptor like "d36" for a from-scratch
-#                             (random-init) calibration run at another width
-#                             — scales only need the right order of
-#                             magnitude, per the mission's own allowance.
+#   checkpoint_or_descriptor  default "gpt2_124M_bf16.bin" (checkpoint-init).
+#                             Pass a model descriptor like "d36" for a
+#                             from-scratch (random-init) calibration run at
+#                             another width — scales only need the right
+#                             order of magnitude.
 #   steps                     default 20.
-#   batch_size / seq_len      default 4 / 1024 (the campaign's B=4 T=1024).
+#   batch_size / seq_len      default 4 / 1024.
 #   safety_factor             default 2.0 (scale_static = min_scale / factor,
 #                             i.e. treats amax as if it were `factor`x larger).
 #
@@ -70,7 +64,7 @@ from llmm.memory import MutMemPtr
 from llmm.lowp import FP8_SPEC
 from llmm.amax import AmaxState
 
-from train_gpt2 import GPT2, GPT2_DTYPE, LOWP_ENABLED
+from train_gpt2 import GPT2, GPT2_DTYPE, PRECISION
 from llmm.dataloader import DataLoader
 
 
@@ -160,9 +154,10 @@ def main() raises:
     if len(args) > 5:
         safety_factor = Float32(atof(String(args[5])))
 
-    comptime assert LOWP_ENABLED, (
-        "calibrate_fp8_scales must be built with -D LLMM_PRECISION=fp8 (or"
-        " fp4, though this tool's AmaxState reads are fp8-specific)"
+    comptime assert PRECISION == "fp8", (
+        "calibrate_fp8_scales must be built with -D LLMM_PRECISION=fp8 —"
+        " its AmaxState reads are fp8-specific (GPT2.fp8_state is only"
+        ' populated under PRECISION == "fp8")'
     )
 
     var ctx = DeviceContext()
@@ -215,26 +210,24 @@ def main() raises:
 
         # Running-min readback (see the module comment above for why this
         # must happen every step, not just once at the end).
-        _update_running_min(ctx, model.lowp_state.qkv_input, qkv_input_min)
-        _update_running_min(ctx, model.lowp_state.qkv_weight, qkv_weight_min)
-        _update_running_min(ctx, model.lowp_state.qkv_doutput, qkv_doutput_min)
+        _update_running_min(ctx, model.fp8_state.qkv_input, qkv_input_min)
+        _update_running_min(ctx, model.fp8_state.qkv_weight, qkv_weight_min)
+        _update_running_min(ctx, model.fp8_state.qkv_doutput, qkv_doutput_min)
         _update_running_min(
-            ctx, model.lowp_state.attn_proj_input, attn_proj_input_min
+            ctx, model.fp8_state.attn_proj_input, attn_proj_input_min
         )
         _update_running_min(
-            ctx, model.lowp_state.attn_proj_weight, attn_proj_weight_min
+            ctx, model.fp8_state.attn_proj_weight, attn_proj_weight_min
         )
         _update_running_min(
-            ctx, model.lowp_state.attn_proj_doutput, attn_proj_doutput_min
+            ctx, model.fp8_state.attn_proj_doutput, attn_proj_doutput_min
         )
-        _update_running_min(ctx, model.lowp_state.fc_input, fc_input_min)
-        _update_running_min(ctx, model.lowp_state.fc_weight, fc_weight_min)
-        _update_running_min(ctx, model.lowp_state.fc_doutput, fc_doutput_min)
-        _update_running_min(ctx, model.lowp_state.proj_input, proj_input_min)
-        _update_running_min(ctx, model.lowp_state.proj_weight, proj_weight_min)
-        _update_running_min(
-            ctx, model.lowp_state.proj_doutput, proj_doutput_min
-        )
+        _update_running_min(ctx, model.fp8_state.fc_input, fc_input_min)
+        _update_running_min(ctx, model.fp8_state.fc_weight, fc_weight_min)
+        _update_running_min(ctx, model.fp8_state.fc_doutput, fc_doutput_min)
+        _update_running_min(ctx, model.fp8_state.proj_input, proj_input_min)
+        _update_running_min(ctx, model.fp8_state.proj_weight, proj_weight_min)
+        _update_running_min(ctx, model.fp8_state.proj_doutput, proj_doutput_min)
     ctx.synchronize()
     print("done training; loss=" + String(model.mean_loss))
 

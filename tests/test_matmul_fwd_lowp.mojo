@@ -1,6 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# tests/test_matmul_fwd_lowp.mojo — Chunk D gate (docs/ai/fp8_training_design.md
-# §6, "Gate D"):
+# tests/test_matmul_fwd_lowp.mojo — fp8 forward linear gate:
 #
 #   Run 1 forward step under fp8 (`matmul_fwd_lowp`) vs bf16 (`matmul_fwd`) on
 #   the same input/weight/bias data, for each of the four per-block linear
@@ -8,8 +7,7 @@
 #   linear's activation output (post-GEMM+bias, PRE-nonlinearity — i.e. the
 #   final `out_ptr` for the three non-GELU sites, `pre_gelu_ptr` for fc):
 #     - per-tensor cosine similarity > 0.999
-#     - relative L2 norm < 0.125 (see DEVIATION note below re: the design
-#       doc's literal "< 0.02")
+#     - relative L2 norm < 0.125 (see DEVIATION note below)
 #     - no NaN/Inf
 #
 # This exercises the real `llmm.matmul.matmul_fwd_lowp` entry point (compute_amax
@@ -20,32 +18,22 @@
 # binary regardless of the global LLMM_PRECISION define (mirrors
 # tests/test_lowp_gemm.mojo's direct-call style for the same reason).
 #
-# DEVIATION from docs/ai/fp8_training_design.md §6 Gate D's literal
-# "relative L2 < 0.02": measured relative L2 on all four real block-linear
-# shapes (d12: rows=256, channels=768) is consistently ~0.036 (cosine
-# ~0.9991-0.9992), comfortably inside Chunk B's OWN empirically-calibrated
-# gate (tests/test_lowp_gemm.mojo: `max_rel_l2=0.125`, matching E4M3's
-# ~3-mantissa-bit precision, 2^-3) but outside the design doc's 0.02 figure.
-# Chunk B's test file documents measuring this exact ~0.036 relL2 (with
-# cosine 0.9993) for a WELL-SCALED random fp8 GEMM and explicitly adopting
-# 0.125 as the correct threshold for that reason (see that file's comment on
-# `_run_lowp_gemm_case`: a tighter per-element metric there gave false
-# positives on ordinary GEMM cancellation, and 0.125 is what E4M3's mantissa
-# budget actually supports). The 0.02 figure in Gate D appears to predate
-# that calibration (written before any real fp8 GEMM had been measured) and
-# is not achievable for E4M3 per-tensor quantization at these dimensions —
-# this test uses Chunk B's own 0.125 bound instead, per the coordinator's
-# "(or the design's exact thresholds)" allowance, and flags the discrepancy
-# for design-doc reconciliation rather than silently loosening a bug-hiding
-# metric (the cosine-similarity gate, which IS a sensitive correctness check,
-# still holds at the design's original >0.999).
+# DEVIATION: this test uses `relative L2 < 0.125` rather than a naive `<
+# 0.02`. Measured relative L2 on all four real block-linear shapes (d12:
+# rows=256, channels=768) is consistently ~0.036 (cosine ~0.9991-0.9992),
+# comfortably inside tests/test_lowp_gemm.mojo's own empirically-calibrated
+# gate (`max_rel_l2=0.125`, matching E4M3's ~3-mantissa-bit precision, 2^-3)
+# but outside a naive 0.02 figure that is not achievable for E4M3
+# per-tensor quantization at these dimensions (a tighter per-element metric
+# gives false positives on ordinary GEMM cancellation — see that file's
+# comment on `_run_lowp_gemm_case`). The cosine-similarity gate, which IS a
+# sensitive correctness check, still holds at >0.999.
 #
 # GPU-only, guarded by `has_nvidia_gpu_accelerator()`; expected to run under
 # `flock -w 10800 /tmp/llmm-gpu.lock -c '...'` (shared GPU).
 # ===----------------------------------------------------------------------=== #
 
 from std.memory import UnsafePointer
-from std.math import sqrt
 from std.random import random_float64, seed
 from std.sys import has_nvidia_gpu_accelerator
 from std.gpu.host import DeviceContext
@@ -54,7 +42,8 @@ from std.testing import TestSuite, assert_true
 from llmm.matmul import matmul_fwd, matmul_fwd_lowp
 from llmm.amax import AmaxState
 from llmm.lowp import FP8_SPEC
-from llmm.memory import MutKernelPtr, ImmutKernelPtr
+
+from _lowp_test_common import cosine_and_rel_l2
 
 
 def _run_site_case(
@@ -189,31 +178,16 @@ def _run_site_case(
         dev_out_fp8.enqueue_copy_to(host_fp8)
     ctx.synchronize()
 
-    var l2_err = Float32(0.0)
-    var l2_want = Float32(0.0)
-    var dot = Float32(0.0)
-    var norm_got = Float32(0.0)
-    var norm_want = Float32(0.0)
-    for i in range(n_out):
-        var got = host_fp8.unsafe_ptr()[i].cast[DType.float32]()
-        var want = host_ref.unsafe_ptr()[i].cast[DType.float32]()
-        assert_true(
-            got == got,
-            label + ": NaN in matmul_fwd_lowp output at " + String(i),
-        )
-        assert_true(
-            got > Float32(-1e30) and got < Float32(1e30),
-            label + ": Inf/overflow in matmul_fwd_lowp output at " + String(i),
-        )
-        var err = got - want
-        l2_err += err * err
-        l2_want += want * want
-        dot += got * want
-        norm_got += got * got
-        norm_want += want * want
-    var rel_l2 = sqrt(l2_err / (l2_want + Float32(1e-12)))
-    var cosine = dot / (sqrt(norm_got) * sqrt(norm_want) + Float32(1e-12))
-    print(label + ": rel_l2=" + String(rel_l2) + " cosine=" + String(cosine))
+    var rel_l2 = Float32(0.0)
+    var cosine = Float32(0.0)
+    cosine_and_rel_l2(
+        host_fp8.unsafe_ptr(),
+        host_ref.unsafe_ptr(),
+        n_out,
+        label + ": matmul_fwd_lowp output",
+        rel_l2,
+        cosine,
+    )
 
     assert_true(
         rel_l2 < Float32(0.125),

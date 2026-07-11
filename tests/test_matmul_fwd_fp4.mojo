@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# tests/test_matmul_fwd_fp4.mojo — Chunk T1 gate (c):
+# tests/test_matmul_fwd_fp4.mojo — fp4 forward linear gate:
 #
 #   Run 1 forward step under fp4 (`matmul_fwd_fp4`) vs bf16 (`matmul_fwd`) on
 #   the same input/weight/bias data, for the two FP4-eligible MLP linear GEMM
@@ -33,14 +33,14 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.memory import UnsafePointer
-from std.math import sqrt
 from std.random import random_float64, seed
 from std.sys import has_nvidia_gpu_accelerator
 from std.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true
 
 from llmm.matmul import matmul_fwd, matmul_fwd_fp4
-from llmm.memory import MutKernelPtr, ImmutKernelPtr
+
+from _lowp_test_common import cosine_and_rel_l2
 
 
 def _run_site_case(
@@ -163,31 +163,16 @@ def _run_site_case(
         dev_out_fp4.enqueue_copy_to(host_fp4)
     ctx.synchronize()
 
-    var l2_err = Float32(0.0)
-    var l2_want = Float32(0.0)
-    var dot = Float32(0.0)
-    var norm_got = Float32(0.0)
-    var norm_want = Float32(0.0)
-    for i in range(n_out):
-        var got = host_fp4.unsafe_ptr()[i].cast[DType.float32]()
-        var want = host_ref.unsafe_ptr()[i].cast[DType.float32]()
-        assert_true(
-            got == got,
-            label + ": NaN in matmul_fwd_fp4 output at " + String(i),
-        )
-        assert_true(
-            got > Float32(-1e30) and got < Float32(1e30),
-            label + ": Inf/overflow in matmul_fwd_fp4 output at " + String(i),
-        )
-        var err = got - want
-        l2_err += err * err
-        l2_want += want * want
-        dot += got * want
-        norm_got += got * got
-        norm_want += want * want
-    var rel_l2 = sqrt(l2_err / (l2_want + Float32(1e-12)))
-    var cosine = dot / (sqrt(norm_got) * sqrt(norm_want) + Float32(1e-12))
-    print(label + ": rel_l2=" + String(rel_l2) + " cosine=" + String(cosine))
+    var rel_l2 = Float32(0.0)
+    var cosine = Float32(0.0)
+    cosine_and_rel_l2(
+        host_fp4.unsafe_ptr(),
+        host_ref.unsafe_ptr(),
+        n_out,
+        label + ": matmul_fwd_fp4 output",
+        rel_l2,
+        cosine,
+    )
 
     # Bound per tests/test_lowp_gemm_fp4.mojo's own empirical floor for these
     # exact MLP shapes (~0.145-0.146 measured there at rows=512; gaussian-512
@@ -214,9 +199,9 @@ def _run_site_case(
     # rel_l2^2), so fp4's ~0.151 relL2 floor implies cosine ~0.9886 (measured
     # 0.9894/0.9903 at both MLP sites, bit-identical across runs). The fp8
     # test's 0.999 bound is self-consistent only at fp8's ~0.036 floor —
-    # reusing it here demands sub-physics error (gate C failure, 2026-07-10).
-    # 0.985 sits below the measured floor with margin while still failing
-    # loudly on real bugs (wrong operand/scale/layout land <<0.98).
+    # reusing it here would demand sub-physics error for fp4's coarser
+    # format. 0.985 sits below the measured floor with margin while still
+    # failing loudly on real bugs (wrong operand/scale/layout land <<0.98).
     assert_true(
         cosine > Float32(0.985),
         label + ": cosine similarity " + String(cosine) + " <= 0.985",

@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# test_amax.mojo — Chunk C gate (docs/ai/fp8_training_design.md, "Gate C").
+# test_amax.mojo — amax reduction + AmaxState delayed-scaling gates.
 #
 # Covers: (1) scale formula (known amax history -> expected scale, e4m3/e5m2,
 # margin, clamping); (2) warmup uses current scaling, not history; (3) scales
@@ -11,8 +11,7 @@
 # GPU-only (see llmm/amax.mojo's module docstring) — every test guards with
 # `has_nvidia_gpu_accelerator()` and returns early (skips) if absent, matching
 # tests/test_zero.mojo's convention. Run under
-# `flock -w 10800 /tmp/llmm-gpu.lock -c 'pixi run mojo run -I . tests/test_amax.mojo'`
-# per the shared-GPU convention (docs/ai/... / AGENTS.md).
+# `flock -w 10800 /tmp/llmm-gpu.lock -c 'pixi run mojo run -I . tests/test_amax.mojo'`.
 # ===----------------------------------------------------------------------=== #
 
 from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
@@ -485,11 +484,9 @@ def test_update_scale_determinism() raises:
 
 
 def test_update_scale_pair_matches_two_separate_calls() raises:
-    # Optimization C (opt/fp8-kernels, docs/ai/ai_assisted_optimizations_and_
-    # benchmarks.md 2026-07-10 fp8-quant-opt entry): `update_scale_pair` (one
-    # kernel launch, two states) must be bit-identical to calling
-    # `update_scale` on each state separately, across a multi-step sequence
-    # spanning both warmup and steady state.
+    # update_scale_pair (one kernel launch, two states) must be
+    # bit-identical to calling update_scale on each state separately,
+    # across a multi-step warmup+steady-state sequence.
     if not has_nvidia_gpu_accelerator():
         return
     var ctx = DeviceContext()

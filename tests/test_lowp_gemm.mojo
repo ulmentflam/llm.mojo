@@ -1,21 +1,18 @@
 # ===----------------------------------------------------------------------=== #
-# tests/test_lowp_gemm.mojo — Chunk B gate (docs/ai/fp8_training_design.md §6):
+# tests/test_lowp_gemm.mojo — fp8 GEMM/quantize coverage:
 #
 #   1. Manual fp8 encode/decode round-trips bit-exact against Mojo's native
-#      host-target fp8 casts (the correctness oracle — probe1 in
-#      tests/probe_fp8/RESULTS.md confirms those casts work on CPU/host).
+#      host-target fp8 casts (the correctness oracle).
 #   2. The GPU `quantize_devscale`/`quantize_transpose_devscale` kernels
 #      (llmm/lowp.mojo) match the manual encoder, including saturation /
-#      zero / (fp8-)denormal / amax=0 edge cases. (The host-Float32-scale
-#      twins these tests originally gated were deleted by the DRY pass F3 —
-#      docs/ai/dry_consolidation_audit_2026-07-10.md; the tests now upload
-#      their host-computed scale into a 1-element device buffer.)
+#      zero / (fp8-)denormal / amax=0 edge cases. The tests upload their
+#      host-computed scale into a 1-element device buffer (the devscale
+#      contract).
 #   3. `lowp_gemm_devscale` (llmm/matmul.mojo) vs a plain fp32 reference GEMM
-#      on the
-#      pre-quantization bf16 data: per-element relative error < 2^-3 (E4M3's
-#      ~3 mantissa bits), across all three block-GEMM operand orientations
-#      (forward / dgrad / wgrad — see matmul.mojo's `_matmul_cublaslt_fp8`
-#      module comment for the orientation derivation).
+#      on the pre-quantization bf16 data: per-element relative error < 2^-3
+#      (E4M3's ~3 mantissa bits), across all three block-GEMM operand
+#      orientations (forward / dgrad / wgrad — see matmul.mojo's
+#      `_matmul_cublaslt_fp8` module comment for the orientation derivation).
 #   4. An ill-scaled case (tiny and huge input magnitudes with compensating
 #      scales) — proves the scale mechanism, not just well-scaled data.
 #   5. NaN/Inf-free assertions throughout.
@@ -25,11 +22,10 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.memory import UnsafePointer
-from std.math import sqrt
 from std.random import random_float64, seed
 from std.sys import has_nvidia_gpu_accelerator
 from std.gpu.host import DeviceContext
-from std.testing import TestSuite, assert_true, assert_false
+from std.testing import TestSuite, assert_true
 
 from llmm.lowp import (
     encode_e4m3,
@@ -38,15 +34,13 @@ from llmm.lowp import (
     decode_e5m2,
     quantize_devscale,
     quantize_transpose_devscale,
-    RoundMode,
     FP8_SPEC,
     E4M3_MAX,
     E5M2_MAX,
 )
 from llmm.matmul import lowp_gemm_devscale
-from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
-from _lowp_test_common import _host_gemm_ref
+from _lowp_test_common import _host_gemm_ref, cosine_and_rel_l2
 
 
 # ===----------------------------------------------------------------------=== #
@@ -141,8 +135,8 @@ def test_encode_decode_roundtrip_vs_native() raises:
 
 
 def test_encode_near_max_no_nan_pattern() raises:
-    # Regression for a real bug found in a sibling (FP4-probe) e4m3 reference
-    # encoder: a post-round exponent clamp (`if e_biased >= 15: e_biased =
+    # Regression for a real bug class in e4m3 reference encoders: a
+    # post-round exponent clamp (`if e_biased >= 15: e_biased =
     # 14; m3 = 7`) that *looks* like "saturate to 448" actually decodes to
     # 240 (exp_field=14 with mantissa=7 is not 448's bit pattern at all,
     # and e_biased=15/m3=7 is separately the format's reserved NaN
@@ -245,7 +239,7 @@ def test_quantize_kernel_matches_manual_encode() raises:
 
     comptime SCALE = Float32(2.5)
     # Host-computed scale uploaded into a 1-element device buffer (the
-    # devscale contract — the host-scale twin was deleted in DRY pass F3).
+    # devscale contract).
     var host_scale = ctx.enqueue_create_host_buffer[DType.float32](1)
     host_scale.unsafe_ptr()[0] = SCALE
     var dev_scale = ctx.enqueue_create_buffer[DType.float32](1)
@@ -282,9 +276,9 @@ def test_quantize_kernel_matches_manual_encode() raises:
 
 def test_quantize_kernel_amax_zero() raises:
     # amax=0 (all-zero input): with a caller-chosen fallback scale (any finite
-    # value -- callers must never divide by amax=0 to derive scale; that is
-    # Chunk C's job, not tested here), quantize must produce all-zero fp8
-    # bytes and no NaN/Inf.
+    # value -- callers must never divide by amax=0 to derive scale; deriving
+    # scale from amax is the caller's job, not tested here), quantize must
+    # produce all-zero fp8 bytes and no NaN/Inf.
     if not has_nvidia_gpu_accelerator():
         return
     var ctx = DeviceContext()
@@ -426,8 +420,8 @@ def _run_lowp_gemm_case[
     var dev_d = ctx.enqueue_create_buffer[OUT_DT](m * n)
 
     # Quantize scale: E4M3_MAX / amax, amax computed on host from the actual
-    # data (mimics what Chunk C's AmaxState would supply for a well-scaled
-    # single-tensor case).
+    # data (mimics what the delayed-scaling AmaxState would supply for a
+    # well-scaled single-tensor case).
     var amax_a = Float32(0.0)
     for i in range(a_n):
         var av = abs(host_a_ref.unsafe_ptr()[i])
@@ -444,9 +438,8 @@ def _run_lowp_gemm_case[
     var scale_inv_b = Float32(1.0) / scale_b
 
     # Host-computed scales uploaded into 1-element device buffers (the
-    # devscale contract — the host-scale `lowp_gemm` twin was deleted in DRY
-    # pass F3): quantize-time multipliers AND their reciprocals, kept in
-    # sync as `lowp_gemm_devscale`'s docstring requires.
+    # devscale contract): quantize-time multipliers AND their reciprocals,
+    # kept in sync as `lowp_gemm_devscale`'s docstring requires.
     var host_s_a = ctx.enqueue_create_host_buffer[DType.float32](1)
     var host_s_b = ctx.enqueue_create_host_buffer[DType.float32](1)
     host_s_a.unsafe_ptr()[0] = scale_a
@@ -514,37 +507,19 @@ def _run_lowp_gemm_case[
     # metric flagged ~17% of entries as ">2^-3 relative error" purely from
     # this cancellation artifact, while the same run's relative L2 norm was
     # 0.036 and cosine similarity 0.9993 (both comfortably inside the
-    # 2^-3-mantissa E4M3 budget this gate is checking for). This matches the
-    # metric Chunk D/E's own gates use (docs/ai/fp8_training_design.md §6,
-    # landmine #3 in MEMORY.md: naive flat/per-element error metrics have
-    # hidden real bugs before -- the fix here goes the other direction, a
-    # per-element metric giving *false positives* on ordinary cancellation).
-    var l2_err = Float32(0.0)
-    var l2_want = Float32(0.0)
-    var dot = Float32(0.0)
-    var norm_got = Float32(0.0)
-    var norm_want = Float32(0.0)
-    for i in range(m * n):
-        var got = host_d.unsafe_ptr()[i].cast[DType.float32]()
-        assert_true(
-            got == got,
-            label + ": NaN in lowp_gemm_devscale output at " + String(i),
-        )
-        assert_true(
-            got > Float32(-1e30) and got < Float32(1e30),
-            label
-            + ": Inf/overflow in lowp_gemm_devscale output at "
-            + String(i),
-        )
-        var want = host_ref.unsafe_ptr()[i]
-        var err = got - want
-        l2_err += err * err
-        l2_want += want * want
-        dot += got * want
-        norm_got += got * got
-        norm_want += want * want
-    var rel_l2 = sqrt(l2_err / (l2_want + Float32(1e-12)))
-    var cosine = dot / (sqrt(norm_got) * sqrt(norm_want) + Float32(1e-12))
+    # 2^-3-mantissa E4M3 budget this gate is checking for) -- naive
+    # flat/per-element error metrics give *false positives* on ordinary
+    # cancellation here.
+    var rel_l2 = Float32(0.0)
+    var cosine = Float32(0.0)
+    cosine_and_rel_l2(
+        host_d.unsafe_ptr(),
+        host_ref.unsafe_ptr(),
+        m * n,
+        label + ": lowp_gemm_devscale output",
+        rel_l2,
+        cosine,
+    )
     assert_true(
         rel_l2 < max_rel_l2,
         label

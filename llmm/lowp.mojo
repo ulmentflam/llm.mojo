@@ -1015,7 +1015,7 @@ struct FP8StaticScaleD12:
     checkpoint-init (`gpt2_124M_bf16.bin`) on real tinyshakespeare data --
     the campaign's standard invocation (`make train-gpt2-124m-fp8`). 20
     calibration steps, B=4 T=1024, `min(scale over layers AND steps) /
-    4.0`. Other configs (different depth/width/init/data) need their own
+    2.0`. Other configs (different depth/width/init/data) need their own
     `calibrate_fp8_scales.mojo` run -- see the module comment above.
 
     RETRY NOTE (docs/ai/speedrun_techniques_research.md A1's own "if static

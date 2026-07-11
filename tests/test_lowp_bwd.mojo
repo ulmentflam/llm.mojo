@@ -1,11 +1,10 @@
 # ===----------------------------------------------------------------------=== #
-# tests/test_lowp_bwd.mojo — Chunk E gate (docs/ai/fp8_training_design.md §6,
-# "Chunk E — Backward FP8 integration"):
+# tests/test_lowp_bwd.mojo — fp8 backward gate:
 #
-# Exercises the fp8 sibling functions added to `llmm/matmul.mojo` (mirroring
-# Chunk D's `matmul_fwd`/`matmul_fwd_lowp` split rather than branching inside
-# the existing bf16 functions — see the module comment above
-# `matmul_d_input_bwd_lowp` in llmm/matmul.mojo):
+# Exercises the fp8 sibling functions added to `llmm/matmul.mojo` (separate
+# entry points mirroring `matmul_fwd`/`matmul_fwd_lowp`'s split rather than
+# branching inside the existing bf16 functions — see the module comment
+# above `matmul_d_input_bwd_lowp` in llmm/matmul.mojo):
 #   - `matmul_d_input_bwd_lowp` (dgrad: E4M3 weight x E5M2 d_output -> bf16
 #     d_input, transpose_a=True/transpose_b=False)
 #   - `matmul_d_weight_bwd_lowp` (wgrad: E4M3 input x E5M2 d_output -> bf16
@@ -14,16 +13,15 @@
 #     `matmul_bwd`'s own bundling, and owns the ONE-PER-STEP `doutput_state`
 #     update both sub-GEMMs then read read-only)
 #
-# All three read scale/scale_inv from real Chunk-C `AmaxState`s via Chunk D's
-# device-pointer-scale `lowp_gemm_devscale` primitive (no host readback on the
-# critical path) — this exercises the actual AmaxState -> matmul_bwd_lowp
+# All three read scale/scale_inv from real `AmaxState`s via the
+# device-pointer-scale `lowp_gemm_devscale` primitive (no host readback on
+# the critical path) — this exercises the actual AmaxState -> matmul_bwd_lowp
 # coupling train_gpt2.mojo's backward call sites use.
 #
 # Compares each fp8 sibling's output against the existing bf16 function
 # (`matmul_d_input_bwd`/`matmul_d_weight_bwd`/`matmul_bwd`) on identical
-# inputs — per-tensor cosine similarity > 0.99 and relative L2 < 0.1,
-# matching Chunk E's gate metric (MEMORY.md `weak-gates-overrule-nothing`:
-# no flat atol).
+# inputs — per-tensor cosine similarity > 0.99 and relative L2 < 0.1 (an
+# aggregate metric, not a flat atol).
 #
 # GPU-only, guarded by `has_nvidia_gpu_accelerator()`. Run under
 # `flock -w 10800 /tmp/llmm-gpu.lock -c 'pixi run -e cuda mojo run -I . tests/test_lowp_bwd.mojo'`.
@@ -50,7 +48,7 @@ from llmm.matmul import (
     matmul_bwd_lowp,
     lowp_transpose_cache,
 )
-from llmm.memory import MutKernelPtr, ImmutKernelPtr
+from llmm.memory import ImmutKernelPtr
 
 from _lowp_test_common import (
     random_bf16 as _random_bf16,
@@ -133,15 +131,14 @@ def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
         ctx,
     )
 
-    # Optimization B (docs/ai/ai_assisted_optimizations_and_benchmarks.md
-    # 2026-07-10 fp8-quant-opt entry): `matmul_d_input_bwd_lowp` now takes
-    # the natural-layout fp8 quantization of `d_output` as an input (it used
-    # to quantize it internally) -- `matmul_bwd_lowp` produces this via a
-    # single `quantize_dual_devscale` call shared with the wgrad sub-GEMM;
-    # this standalone test (which calls the dgrad sibling directly, not
-    # through `matmul_bwd_lowp`) reproduces just the natural-layout half
-    # with the plain `quantize_devscale`, which is bit-identical to
-    # `quantize_dual_devscale`'s natural output on the same input/scale.
+    # `matmul_d_input_bwd_lowp` takes the natural-layout fp8 quantization of
+    # `d_output` as an input rather than quantizing it internally --
+    # `matmul_bwd_lowp` produces this via a single `quantize_dual_devscale`
+    # call shared with the wgrad sub-GEMM; this standalone test (which calls
+    # the dgrad sibling directly, not through `matmul_bwd_lowp`) reproduces
+    # just the natural-layout half with the plain `quantize_devscale`, which
+    # is bit-identical to `quantize_dual_devscale`'s natural output on the
+    # same input/scale.
     var doutput_fp8_nat = ctx.enqueue_create_buffer[DType.uint8](ROWS * OC)
     quantize_devscale[FP8_SPEC, FP8_SPEC.bwd_dtype, DType.bfloat16, "gpu"](
         device_buf_mut_ptr(doutput_fp8_nat),
@@ -151,13 +148,11 @@ def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
         ctx,
     )
 
-    # Optimization D (docs/ai/ai_assisted_optimizations_and_benchmarks.md
-    # 2026-07-10 fp8-quant-opt entry / opt/fp8-kernels follow-on):
-    # `matmul_d_input_bwd_lowp` now reads weight's TRANSPOSED fp8
-    # quantization from a persistent `(site, layer)`-keyed cache rather than
-    # quantizing it internally -- `matmul_fwd_lowp` produces that cache in
-    # the real training loop via `quantize_dual_devscale`. This standalone
-    # test (which calls the dgrad sibling directly, not through
+    # `matmul_d_input_bwd_lowp` reads weight's TRANSPOSED fp8 quantization
+    # from a persistent `(site, layer)`-keyed cache rather than quantizing
+    # it internally -- `matmul_fwd_lowp` produces that cache in the real
+    # training loop via `quantize_dual_devscale`. This standalone test
+    # (which calls the dgrad sibling directly, not through
     # `matmul_fwd_lowp`) primes the same cache itself with
     # `quantize_transpose_devscale`, bit-identical to `quantize_dual_
     # devscale`'s transposed output on the same input/scale, at a
@@ -294,7 +289,7 @@ def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
         ctx,
     )
 
-    # Optimization B (see the dgrad test above for the full rationale):
+    # (see the dgrad test above for the full rationale):
     # `matmul_d_weight_bwd_lowp` now takes the TRANSPOSED-layout fp8
     # quantization of `d_output` as an input; reproduce it here with the
     # plain `quantize_transpose_devscale` (bit-identical to
@@ -311,7 +306,7 @@ def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
         ctx,
     )
 
-    # Optimization D (see the dgrad test above for the full rationale):
+    # (see the dgrad test above for the full rationale):
     # `matmul_d_weight_bwd_lowp` now reads input's TRANSPOSED fp8
     # quantization from a persistent `(site, layer)`-keyed cache; prime it
     # here the same way, at a dedicated (site, layer) so it can't collide
@@ -456,10 +451,8 @@ def test_matmul_bwd_lowp_end_to_end() raises:
         ctx,
     )
 
-    # Optimization D (docs/ai/ai_assisted_optimizations_and_benchmarks.md
-    # 2026-07-10 fp8-quant-opt entry / opt/fp8-kernels follow-on):
     # `matmul_bwd_lowp` (via `matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_
-    # lowp`) now reads weight's/input's TRANSPOSED fp8 quantization from
+    # lowp`) reads weight's/input's TRANSPOSED fp8 quantization from
     # persistent `(site, layer)`-keyed caches that the real training loop's
     # `matmul_fwd_lowp` fills. This standalone test calls `matmul_bwd_lowp`
     # directly without a preceding `matmul_fwd_lowp` call, so it primes
