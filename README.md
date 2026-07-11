@@ -112,6 +112,8 @@ Step-time measurement (B=4, T=1024, checkpoint-init tinyshakespeare, 2 rounds wi
 
 Honest framing: at 124M params these are numerics/research configs, not throughput wins. The quantized GEMMs themselves are measurably faster than bf16's (fp8 and fp4 both cut raw GEMM compute time), but that saving is swamped by the quantize/amax/scale and (for NVFP4) Hadamard-transform overhead around small per-block GEMMs at this scale — see the quant-opt and transpose-coalescing writeups in `docs/ai/ai_assisted_optimizations_and_benchmarks.md` and the FP8/FP4 gotcha catalogs. Published FP4/FP8 throughput wins start around ~1B+ parameter models, where the GEMMs are large enough to amortize that fixed overhead.
 
+A batch/width scaling sweep confirms this on-box: FP8 stays slower than bf16 across every batch size tested at 124M (B up to 64), but crosses over to ~1.10x *faster* once the model is scaled to the 774M-class `d36` config — width, not batch, is what closes the gap; see `docs/ai/lowp_scaling_sweep_2026-07-10.md`.
+
 ### Single CPU
 
 CPU training is fp32 by policy. Official run (B=4, T=64, 2026-07-03):
