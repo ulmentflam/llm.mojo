@@ -662,6 +662,54 @@ evidence of the latter.
 **Source:** FP8 quant-opt Optimization B, 2026-07-10 (worktree
 `llmm-goal2-qopt`, branch `goal2/fp8-quant-opt`).
 
+### G3 — full-scale fp8 bit-identity twin-run gates can fail on UNMODIFIED code; always run a same-protocol control before blaming the diff
+
+**What:** Validating opt C+D (`llmm-fp8-opt`, commit `8cbeff3`) re-ran G2's
+own bit-identity gate (10-step, `-b 4 -t 1024 -x 10 -v 5 -s 0`, the FineWeb
+checkpoint/data protocol Chunk F and Optimization A/B originally used) and
+found three runs of the new binary were NOT bit-identical to each other or
+to a pre-change (`d32b199`) reference run — first divergence at steps
+2/5/7, 0.13–0.41% relative loss delta, no NaN/Inf, same
+monotonically-noisy-decreasing shape every time (the exact G2 race
+signature). Before attributing this to opt D's new persistent
+process-global transpose cache (the obvious suspect — the single highest-
+risk change in the commit), the **unmodified pre-change binary was run
+three more times under the identical protocol** as a control. It ALSO
+diverged run-to-run: first divergence at step 2 in all three pairs,
+0.33–0.52% relative loss delta — comparable to or larger than the new
+binary's own spread. **The control run is the load-bearing evidence**:
+whatever is causing this, it reproduces on code this session did not
+touch, so it cannot be conclusively pinned on opt C or D from this data
+alone. Likely (not confirmed) the same non-associative-atomic-accumulation
+timing jitter the FP4-closeout entry flagged for `ln_dparam_accum`
+(`llmm/layernorm.mojo`, present in every precision build) — that entry
+characterized it as fresh-build-first-invocation-only, but every run in
+this session was well past first invocation, suggesting either the true
+trigger rate is higher than previously characterized or today's heavier
+GPU contention (a concurrent sibling fp4 validation session was running
+`ncu` profiling under the same shared `/tmp/llmm-gpu.lock`) widened the
+timing window that lets it fire.
+
+**Rule for future validation passes:** a full-scale, multi-step bit-
+identity gate is the right tool (per G2) for catching cross-call buffer-
+lifetime races, but a FAILURE on that gate is not by itself proof the code
+under test introduced a regression — GPU kernel-launch-order-dependent
+non-associative floating point (atomics, any reduction whose order isn't
+pinned) can make this gate flaky for reasons entirely unrelated to a given
+diff, and that flakiness can vary session-to-session with GPU contention.
+**Always run the same protocol against an unmodified reference binary as a
+control before concluding "this diff broke determinism"** — three runs of
+the new code alone cannot distinguish "this diff added a race" from "this
+box/environment is noisy right now," but new-code-vs-old-code-both-fail is
+strong (not certain — a genuinely new, smaller race could still be hiding
+under the pre-existing one) evidence for the latter. Do not silently wave
+the gate to green on this basis, either: disclose the finding, including
+the control data, and let whoever owns the merge decision weigh it (per
+MEMORY.md `weak-gates-overrule-nothing`).
+
+**Source:** FP8 quant-opt C+D validation pass, 2026-07-11 (worktree
+`llmm-fp8-opt`, branch `opt/fp8-kernels`, commit `8cbeff3`).
+
 ## FP4 CHUNK T1 (forward-pass integration)
 
 ### F1 — Cosine and relL2 gate thresholds are geometrically coupled: never mix floors across precisions
