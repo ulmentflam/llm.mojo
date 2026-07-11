@@ -5,22 +5,19 @@
 # single place the fp8 (and future fp4/NVFP4) scaling machinery lives, so a new
 # precision is a new `PrecisionSpec` constant rather than new call sites.
 #
-# Chunk A (this file's initial state) only stubs the comptime shape: the
-# `PrecisionSpec` struct, the `ScalingKind` comptime enum, and `precision_spec`
-# resolving a precision name to its spec. No quantize/GEMM/scaling kernels
-# exist yet — those are Chunks B/C. Every kernel added later here must stay
-# `comptime if is_gpu[target]()`-guarded (never instantiated for the "cpu"
-# target) per the AArch64 codegen landmine documented in
-# docs/ai/fp8_training_design.md §2 and train_gpt2.mojo's `_dispatch_cpu`.
+# Every GPU kernel here MUST be comptime if is_gpu[target]()-guarded and
+# never instantiated for the "cpu" target: AArch64 GPU codegen crashes if any
+# low-precision kernel is instantiated for cpu (see train_gpt2.mojo's
+# `_dispatch_cpu`).
 # ===----------------------------------------------------------------------=== #
 
 from std.memory import UnsafePointer
 from std.math import ceildiv
 from std.gpu.host import DeviceContext
-from std.gpu.host.info import is_cpu, is_gpu
+from std.gpu.host.info import is_gpu
 from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.memory import AddressSpace
-from std.sys import simd_width_of, size_of, is_defined
+from std.sys import is_defined
 from layout import Layout, LayoutTensor
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
@@ -34,9 +31,10 @@ from llmm.memory import MutKernelPtr, ImmutKernelPtr
 struct ScalingKind:
     """Comptime enum of scaling granularities.
 
-    `PerTensor` is FP8's single scalar-per-operand scheme (§1.3). `Block1D` is
-    reserved. `Block2D` is NVFP4's 16-element-block, 2D-tiled scheme (§3 seam,
-    not implemented in Chunk A).
+    `PerTensor` is fp8's single-scalar-per-operand scheme. `Block1D` (1x16)
+    and `Block2D` (16x16) are NVFP4 granularities; the `PerTensor` amax
+    machinery in `llmm/amax.mojo` rejects the block kinds (FP4 scales are
+    computed in-kernel by `llmm/nvfp4_quant.mojo`).
     """
 
     comptime PerTensor = 0
@@ -74,8 +72,8 @@ struct PrecisionSpec(Copyable, ImplicitlyCopyable, Movable):
     var margin: Int
     """Exponent margin subtracted before computing `scale` (TE-style)."""
     var stochastic_rounding: Bool
-    """Whether `quantize`'s narrowing cast uses stochastic rounding (Chunk G)
-    instead of plain round-to-nearest-even."""
+    """Whether `quantize`'s narrowing cast uses stochastic rounding instead
+    of plain round-to-nearest-even."""
     var hadamard: Bool
     """Whether `quantize` applies a Hadamard transform before narrowing
     (outlier-spreading seam for fp4)."""
@@ -100,45 +98,19 @@ comptime FP8_SPEC = PrecisionSpec(
     False,
 )
 
-# NVFP4 (docs/ai/fp4_training_recipes_research.md §1): e2m1 data for BOTH
-# forward and backward-gradient operands (unlike fp8's asymmetric e4m3/e5m2
-# split — NVFP4 uses one element format everywhere), e4m3 per-block scale
-# (`scale_dtype`), `Block1D` (1x16) as the *default* granularity — activations
-# and gradients use 1x16 blocks; the weight path additionally uses `Block2D`
-# (16x16, `ScalingKind.Block2D`) at specific call sites, selected by the
-# caller (`llmm/nvfp4_quant.mojo`'s `nvfp4_quantize[..., BLOCK_ROWS=16]`), not
-# by a second spec constant — `block=16` here describes the along-K block
-# extent, which is identical (16) for both granularities; only the row extent
-# (`BLOCK_ROWS`, a `nvfp4_quantize` template parameter, not a `PrecisionSpec`
-# field) differs.
+# NVFP4: e2m1 for BOTH fwd and bwd operands, e4m3 per-block scale, Block1D
+# (1x16) default; the weight path uses Block2D (16x16) selected by
+# nvfp4_quantize's BLOCK_ROWS template param, not a second spec.
 #
-# `amax_history_len=0`, `margin=0`: deliberately inert, NOT a stub-pending
-# value. NVFP4 quantization computes its two-level scale (fp32 per-tensor +
-# e4m3 per-block) FRESH every `nvfp4_quantize` call, entirely device-resident
-# (`nvfp4_compute_tensor_scale` inside `llmm/nvfp4_quant.mojo`) — there is no
-# delayed/history-based scaling step for FP4 to configure (unlike fp8's
-# `PerTensor` scaling, which amortizes an amax reduction across
-# `amax_history_len` steps precisely because its single per-tensor scale is
-# coarse and benefits from temporal smoothing). NVFP4's 16-element block
-# scale already adapts *within* a tensor, so the coarser tensor-level scale
-# does not need delayed smoothing to stay accurate — see the `AmaxState`
-# Block1D/Block2D seam note in `llmm/amax.mojo` for the full reconciliation
-# (decision: FP4 does not use `AmaxState` at all; both scale levels are
-# computed in-kernel by `nvfp4_quantize`).
+# amax_history_len=0 / margin=0 are deliberately inert (NOT stub-pending):
+# NVFP4 computes its two-level scale fresh every nvfp4_quantize call, fully
+# device-resident; there is no delayed/history scaling for FP4 and it never
+# uses AmaxState.
 #
-# `stochastic_rounding=True`/`hadamard=True`: precision-level markers ("this
-# regime uses these techniques"), not a blanket per-operand switch the way
-# fp8's `quantize_devscale`/`quantize_transpose_devscale` read
-# `spec.stochastic_rounding`
-# uniformly for every operand. The recipe requires SR only on *gradient*
-# operands (weights/activations stay RNE) and RHT only on *Wgrad* operands
-# (`llmm/hadamard.mojo`) — that per-operand-role selection is a call-site
-# decision for the training-integration chunk that wires
-# `llmm/nvfp4_quant.mojo`'s `round_mode`/`ROUND_MODE_STOCHASTIC` template
-# parameter and `llmm/hadamard.mojo`'s `hadamard16_fwd_gpu` per GEMM operand,
-# not something `FP4_SPEC` itself can express with a single struct-wide bool
-# (nor should it: `PrecisionSpec` is one value per precision, not per
-# operand-role).
+# stochastic_rounding/hadamard here are precision-level markers, not
+# per-operand switches. The recipe applies SR to gradient operands only and
+# RHT to Wgrad operands only; that per-operand-role selection is made at the
+# GEMM call site, not expressible in one struct-wide bool.
 comptime FP4_SPEC = PrecisionSpec(
     DType.float4_e2m1fn,
     DType.float4_e2m1fn,
@@ -170,7 +142,7 @@ comptime _INERT_SPEC = PrecisionSpec(
 
 
 # ===----------------------------------------------------------------------=== #
-# Manual fp8 encode/decode (Chunk B).
+# Manual fp8 encode/decode.
 #
 # Mojo GPU codegen has no lowering for `pop.cast f8eXmY -> {f32,bf16}` once the
 # upcast value feeds arithmetic (confirmed empirically: probe2/probe2c in
@@ -192,17 +164,13 @@ struct RoundMode:
     comptime RNE = 0
     """Round-to-nearest-even (implemented here)."""
     comptime SR = 1
-    """Stochastic rounding — Chunk G seam (see `encode_e4m3`/`encode_e5m2`)."""
+    """Stochastic rounding — not implemented for fp8 encode (see
+    `_SR_SEAM_MSG`); use RNE."""
 
 
 # ===----------------------------------------------------------------------=== #
-# TieMode / NanPolicy — the two-oracle divergence (DRY pass F1).
-#
-# This repo carries TWO e4m3 encoders under one shared core (`_fp8_encode`
-# below), because they answer to two DIFFERENT external oracles and the
-# difference is LOAD-BEARING — do NOT force them to one rule (that is a
-# correctness regression against one of the two oracles; see
-# docs/ai/dry_consolidation_audit_2026-07-10.md finding F1):
+# TWO e4m3 encoders share _fp8_encode and answer to two DIFFERENT oracles —
+# the divergence is load-bearing, do NOT unify:
 #
 # - `encode_e4m3` (this file, TieMode.EVEN + NanPolicy.SATURATE): round-to-
 #   nearest, ties-to-EVEN, NaN saturates to ±448 — chosen to match Mojo's
@@ -214,8 +182,8 @@ struct RoundMode:
 #   and the cuBLAS/PyTorch NVFP4 block-scale convention, gated by
 #   tests/test_nvfp4_quant.mojo.
 #
-# TieMode.AWAY additionally preserves two more probe-lineage behaviors the
-# audit's tie/NaN framing did not capture (both verified bit-level against
+# TieMode.AWAY additionally preserves two more probe-lineage behaviors this
+# tie/NaN framing does not otherwise capture (both verified bit-level against
 # the pre-consolidation nvfp4 encoder, and both kept for bit-compatibility
 # with the shipped FP4 training trajectories):
 # - sign comes from a `x < 0` compare (so -0.0 collapses to +0x00), not from
@@ -441,22 +409,23 @@ def _fp8_decode[exp_bits: Int, mant_bits: Int, bias: Int](b: UInt8) -> Float32:
 
 
 comptime _SR_SEAM_MSG = (
-    "stochastic-rounding fp8 encode is a documented extension seam"
-    " (docs/ai/fp8_training_design.md §3, Chunk G): it consumes a per-element"
-    " counter-based `rand: UInt32` from llmm/rng_device.mojo's device RNG,"
-    " which does not exist yet in this worktree (Chunk G is a parallel,"
-    " independent chunk). Do not implement an RNG here — use"
-    " RoundMode.RNE until Chunk G lands and wires the SR body."
+    "stochastic-rounding fp8 encode is unimplemented. The device RNG it"
+    " needs exists (llmm/rng_device.mojo), but the fp8 narrowing-cast SR"
+    " body was never wired. Use RoundMode.RNE."
 )
 
 
+# NOTE: a second, deliberately different encode_e4m3 lives in
+# llmm/nvfp4_quant.mojo (ties-away, NaN-emitting — see the TieMode block
+# above).
 @always_inline
 def encode_e4m3[
     mode: Int = RoundMode.RNE
 ](x: Float32, rand: UInt32 = 0) -> UInt8:
     """Encode `x` (fp32) into a `float8_e4m3fn` bit pattern (as a `UInt8`),
     manually (no fp8-typed cast — see module docstring). `mode` selects RNE
-    (implemented) or SR (Chunk G seam, comptime error until wired)."""
+    (implemented) or SR (unimplemented seam, comptime error — see
+    `_SR_SEAM_MSG`)."""
     comptime if mode == RoundMode.RNE:
         return _fp8_encode[4, 3, 7, E4M3_MAX](x)
     elif mode == RoundMode.SR:
@@ -471,7 +440,8 @@ def encode_e5m2[
 ](x: Float32, rand: UInt32 = 0) -> UInt8:
     """Encode `x` (fp32) into a `float8_e5m2` bit pattern (as a `UInt8`),
     manually (no fp8-typed cast — see module docstring). `mode` selects RNE
-    (implemented) or SR (Chunk G seam, comptime error until wired)."""
+    (implemented) or SR (unimplemented seam, comptime error — see
+    `_SR_SEAM_MSG`)."""
     comptime if mode == RoundMode.RNE:
         return _fp8_encode[5, 2, 15, E5M2_MAX](x)
     elif mode == RoundMode.SR:
@@ -524,7 +494,7 @@ def decode_fp8[out_dtype: DType](b: UInt8) -> Float32:
 
 
 # ===----------------------------------------------------------------------=== #
-# GPU quantize kernels (Chunk B).
+# GPU quantize kernels.
 #
 # `out_ptr` is always `MutKernelPtr[DType.uint8]` — the fp8 buffer's *byte*
 # view, never a `Scalar[float8_e4m3fn/e5m2]` pointer, because storing through
@@ -539,27 +509,12 @@ def decode_fp8[out_dtype: DType](b: UInt8) -> Float32:
 
 
 # ===----------------------------------------------------------------------=== #
-# Device-pointer-scale quantize kernels (Chunk D).
+# Device-pointer-scale quantize kernels.
 #
-# Chunk C's `AmaxState.scale`/`scale_inv` (llmm/amax.mojo) are
-# DEVICE-resident fp32 scalars, deliberately never read back to host on
-# the training step path (design §4's landmine-2 audit: "Host readback? no").
-# A GPU kernel launch's scalar arguments are copied host->device at launch
-# time regardless of whether the source is a host variable or a device
-# pointer being dereferenced — so a `scale: Float32` parameter here would
-# force a host readback of `AmaxState.scale` right before every single
-# quantize call, once per fp8 GEMM operand per step. These `_devscale`
-# kernels instead take `scale_ptr: ImmutKernelPtr[DType.float32]` and
-# dereference it *inside* the kernel (`scale_ptr[0]`), so the scale value
-# never leaves the device — the call site passes `AmaxState.scale`'s own
-# device pointer straight through.
-#
-# History (DRY pass F3, docs/ai/dry_consolidation_audit_2026-07-10.md):
-# Chunk B originally also shipped host-`Float32`-scale twins
-# (`quantize`/`quantize_transpose`), which existed only for its unit-test
-# gate — every production call site used the `_devscale` forms. The twins
-# were deleted and `tests/test_lowp_gemm.mojo` now uploads its host-computed
-# scale into a 1-element device buffer and calls the `_devscale` forms.
+# `_devscale` kernels take scale_ptr: ImmutKernelPtr[float32] and dereference
+# it inside the kernel, so AmaxState.scale/scale_inv (device-resident) are
+# never read back to host. A scale: Float32 parameter would force a host
+# readback per operand per step.
 # ===----------------------------------------------------------------------=== #
 
 
@@ -603,13 +558,12 @@ def quantize_devscale[
     upcast feeds arithmetic, per `tests/probe_fp8/RESULTS.md` probes 2/2c/3).
 
     The scale is a value the *caller* supplies — this function does not
-    compute amax or a delayed-scaling schedule; that is Chunk C's
-    `AmaxState`/`compute_amax`/`update_scale` (§3).
+    compute amax or a delayed-scaling schedule; that is
+    `AmaxState`/`compute_amax`/`update_scale` (`llmm/amax.mojo`).
     """
     comptime assert is_gpu[target](), (
-        "quantize_devscale is GPU-only per"
-        " docs/ai/fp8_training_design.md landmine #1 (low-precision kernels"
-        " must never be instantiated for the cpu target)"
+        "quantize_devscale is GPU-only: low-precision kernels must never be"
+        " instantiated for the cpu target"
     )
     comptime BLOCK_SIZE = 256
     var num_blocks = ceildiv(n, BLOCK_SIZE)
@@ -628,22 +582,9 @@ def quantize_devscale[
 
 
 # ===----------------------------------------------------------------------=== #
-# quantize_transpose tiling constants (Optimization A, docs/ai/
-# ai_assisted_optimizations_and_benchmarks.md 2026-07-10 fp8-quant-opt entry).
-#
-# The original `_quantize_transpose_kernel` was one-thread-one-element:
-# `out_ptr[c * rows + r] = encode(...)` with `c = idx % cols` varying fastest
-# across a warp. Consecutive threads (consecutive `idx`, hence mostly
-# consecutive `c`) write to addresses `rows` elements apart — a
-# severely uncoalesced strided store (confirmed empirically: this kernel ran
-# ~4.3-4.9x slower than the byte-equivalent non-transposed `quantize` kernel
-# on the SAME tensors, an artifact fully attributable to the write pattern
-# since the per-element compute — `encode_fp8` — is identical). This tile
-# body fixes it with the same 32x32 shared-memory-tile transpose pattern
-# already proven in this file's `_gpu_transpose_add_into_kernel` (32x33
-# padded stride to dodge shared-memory bank conflicts on the transposed
-# read/write, coalesced global read AND write). See the diagnosis entry for
-# the measured before/after.
+# 32x32 shared-memory tile transpose so both global read and write are
+# coalesced; _QT_STRIDE = tile+1 pads the shared row to avoid bank conflicts
+# on the transposed access.
 # ===----------------------------------------------------------------------=== #
 
 comptime _QT_TILE = 32
@@ -660,10 +601,10 @@ def _quantize_transpose_kernel_devscale[
     rows: Int,
     cols: Int,
 ) -> None:
-    # 32x32 shared-memory tile transpose (Optimization A — see the module
-    # comment above). The scale is a device pointer, dereferenced once per
-    # thread here rather than passed as a launch scalar; a broadcast read of
-    # one device fp32, negligible next to the tile's own global traffic.
+    # 32x32 shared-memory tile transpose (see the module comment above). The
+    # scale is a device pointer, dereferenced once per thread here rather
+    # than passed as a launch scalar; a broadcast read of one device fp32,
+    # negligible next to the tile's own global traffic.
     var scale = scale_ptr[0]
     var tile = LayoutTensor[
         in_dtype,
@@ -738,14 +679,13 @@ def quantize_transpose_devscale[
     trailing-dim = channels), but not for dgrad's `weight` operand (trailing
     dim is `C`, contraction is `OC`) or for wgrad's `input`/`d_output`
     operands (trailing dims are `C`/`OC`, contraction is `rows`) — those
-    (Chunk E's orientations) need a physically transposed fp8 copy, which
-    this fused kernel produces directly from the bf16 source (skipping a
-    separate bf16-scratch transpose pass). The forward GEMM itself is
-    TN-native and never calls this.
+    orientations need a physically transposed fp8 copy, which this fused
+    kernel produces directly from the bf16 source (skipping a separate
+    bf16-scratch transpose pass). The forward GEMM itself is TN-native and
+    never calls this.
 
-    Uses a 32x32 shared-memory tile transpose (Optimization A) so both the
-    global read and the global write are coalesced — see the module comment
-    above.
+    Uses a 32x32 shared-memory tile transpose so both the global read and
+    the global write are coalesced — see the module comment above.
 
     GPU-only, same reasoning as `quantize_devscale`.
     """
@@ -771,31 +711,11 @@ def quantize_transpose_devscale[
 
 
 # ===----------------------------------------------------------------------=== #
-# quantize_dual_devscale — Optimization B (docs/ai/
-# ai_assisted_optimizations_and_benchmarks.md 2026-07-10 fp8-quant-opt entry).
-#
-# The Optimization-A diagnosis's redundancy map found three (tensor, scale)
-# pairs each read from their bf16 source TWICE per step at the SAME scale —
-# once by `quantize` (natural layout), once by `quantize_transpose`
-# (transposed layout): weight (fwd natural + dgrad transposed), input (fwd
-# natural + wgrad transposed), d_output (dgrad natural + wgrad transposed).
-# `d_output`'s pair is the only one entirely local to a single call
-# (`matmul_bwd_lowp` in llmm/matmul.mojo calls both `matmul_d_input_bwd_lowp`
-# and `matmul_d_weight_bwd_lowp`, which are where its natural/transposed
-# copies were each separately re-quantized) — weight/input's redundant
-# pair crosses the forward/backward call boundary and would need a
-# persistent per-layer fp8 cache to fuse (bigger surgery, not attempted in
-# this pass; see the doc entry's Optimization D discussion).
-#
-# This kernel reads its bf16/fp32 source ONCE per tile and emits BOTH the
-# natural-layout AND the transposed-layout fp8 copy from that single read:
-# the natural output is written during phase 1 (same address it was just
-# read from — trivially coalesced, no shared-memory round trip needed for
-# it), and the transposed output is written during phase 2 exactly as
-# `_quantize_transpose_kernel_devscale` does (Optimization A's coalesced
-# tile transpose, reading back from the same shared-memory tile). Halves
-# the redundant global-memory traffic for the d_output pair versus calling
-# `quantize_devscale` + `quantize_transpose_devscale` separately.
+# Reads the source ONCE per tile and emits BOTH the natural-layout and
+# transposed-layout fp8 copies (same tensor, same scale, two orientations
+# needed by two GEMM call sites). Bit-identical to quantize_devscale +
+# quantize_transpose_devscale run separately; a memory-traffic optimization
+# only.
 # ===----------------------------------------------------------------------=== #
 
 
@@ -877,7 +797,7 @@ def quantize_dual_devscale[
     cols: Int,
     ctx: DeviceContext,
 ) raises -> None:
-    """Dual-output quantize (Optimization B): reads `in_ptr` ([rows,cols]
+    """Dual-output quantize: reads `in_ptr` ([rows,cols]
     row-major) exactly ONCE and writes BOTH `nat_out_ptr` ([rows,cols],
     `out[i] = encode(in[i] * scale)`) and `trans_out_ptr` ([cols,rows],
     the fp8-quantized transpose) — see the module comment above for why
@@ -916,17 +836,9 @@ def precision_spec[name: StaticString]() -> PrecisionSpec:
     `PrecisionSpec`. "fp8" -> `FP8_SPEC`; "fp4" -> `FP4_SPEC`; "fp32"/"bf16" ->
     an inert placeholder (never consulted — see `_INERT_SPEC`).
 
-    "fp4" resolving to a real spec (rather than a comptime error) means
-    `-D LLMM_PRECISION=fp4` now compiles past `train_gpt2.mojo`'s unconditional
-    `comptime SPEC = precision_spec[PRECISION]()` — but that is *only* this
-    one seam closing, not a functional fp4 trainer: no GEMM call site in
-    `train_gpt2.mojo` reads `SPEC`/dispatches to `lowp_gemm_fp4`
-    (`llmm/matmul.mojo`) yet, and `LLMM_PRECISION=fp4` is not one of this
-    repo's gated build targets (`build`/`build-bf16`/`build-fp8`). Wiring the
-    actual training-loop GEMM/quantize call sites to `FP4_SPEC` is the next
-    chunk's job (same shape as fp8's Chunk A -> Chunks D/E progression: the
-    flag existing and resolving to a real spec precedes the GEMM wiring, it
-    does not imply it).
+    "fp4" resolves to `FP4_SPEC` so `-D LLMM_PRECISION=fp4` compiles; the fp4
+    GEMM call sites in `train_gpt2.mojo` dispatch on `PRECISION` directly and
+    never read `SPEC`.
     """
 
     comptime if name == "fp8":
@@ -942,10 +854,8 @@ def precision_spec[name: StaticString]() -> PrecisionSpec:
 
 
 # ===----------------------------------------------------------------------=== #
-# A1 — static/calibrated FP8 scales (docs/ai/speedrun_techniques_research.md
-# A1: modded-nanogpt trains 124M-class GPT-2 with hardcoded constant
-# per-tensor FP8 scales -- no amax, no delayed-scaling history, no
-# per-step scale-update kernel).
+# Static/calibrated FP8 scales: hardcoded constant per-tensor FP8 scales --
+# no amax, no delayed-scaling history, no per-step scale-update kernel.
 #
 # `-D LLMM_FP8_STATIC_SCALES=1` (default OFF, i.e. the existing dynamic
 # delayed-scaling `AmaxState` path is unchanged and byte-identical when this
@@ -964,8 +874,8 @@ def precision_spec[name: StaticString]() -> PrecisionSpec:
 # gpu` and `_update_scale_gpu`/`_update_scale_pair_gpu`) from the hot path,
 # per the research doc's finding that a 124M model does not need them.
 #
-# Calibration (docs/ai/speedrun_techniques_research.md A1 mission,
-# `calibrate_fp8_scales.mojo`): for each of the 12 (site, role) pairs --
+# Calibration (`calibrate_fp8_scales.mojo`): for each of the 12 (site, role)
+# pairs --
 # site in {qkv, attn_proj, fc, proj}, role in {input, weight, doutput} --
 # the calibration tool runs a real training loop with the EXISTING dynamic
 # path, lets every layer's `AmaxState` pass through its `amax_history_len
@@ -980,21 +890,16 @@ def precision_spec[name: StaticString]() -> PrecisionSpec:
 # only under-use the format's dynamic range, never overflow it. The extra
 # `SAFETY_FACTOR = 2.0` divisor on top (halving the scale once more, i.e.
 # treating every layer's calibration-time amax as if it had been `2x`
-# larger) is the mission's own suggested margin ("speedrun uses generous
-# headroom, e.g. their 100/448 for acts" -- roughly a 4-4.5x margin from
-# their conservative bf16-range estimate; we use a tighter but still
-# real 2x on top of the already-conservative per-layer-worst-case min,
-# since our calibration is a direct empirical amax measurement rather than
-# a hand-picked constant). The accepted tradeoff (documented, not a bug):
-# a later, unseen training step whose activation/weight/gradient magnitude
-# exceeds calibration-time-max-times-2 SATURATES (clamps to the format's
-# max representable value, `_fp8_encode`'s documented saturating-not-
-# overflowing behavior) rather than corrupting the run -- our encoders
-# already saturate by construction (module docstring above), so this is a
-# precision-degradation risk on outlier steps, never a correctness/NaN
-# risk. See the calibration doc entry (docs/ai/
-# ai_assisted_optimizations_and_benchmarks.md) for the raw per-layer
-# scale tables both calibration runs printed.
+# larger) is a tighter but still real 2x margin on top of the
+# already-conservative per-layer-worst-case min, since calibration is a
+# direct empirical amax measurement rather than a hand-picked constant. The
+# accepted tradeoff (documented, not a bug): a later, unseen training step
+# whose activation/weight/gradient magnitude exceeds
+# calibration-time-max-times-2 SATURATES (clamps to the format's max
+# representable value, `_fp8_encode`'s documented saturating-not-overflowing
+# behavior) rather than corrupting the run -- our encoders already saturate
+# by construction (module docstring above), so this is a
+# precision-degradation risk on outlier steps, never a correctness/NaN risk.
 #
 # Two tables, selected by `-D LLMM_FP8_STATIC_D36=1` (default off = the d12
 # table): each is calibrated for ONE model width/depth and is NOT valid for
@@ -1011,39 +916,17 @@ comptime FP8_STATIC_D36 = is_defined["LLMM_FP8_STATIC_D36"]()
 
 
 struct FP8StaticScaleD12:
-    """Calibrated 2026-07-11, GPT-2 124M (`d12`, 12 layer / 768 channel),
-    checkpoint-init (`gpt2_124M_bf16.bin`) on real tinyshakespeare data --
-    the campaign's standard invocation (`make train-gpt2-124m-fp8`). 20
-    calibration steps, B=4 T=1024, `min(scale over layers AND steps) /
-    4.0`. Other configs (different depth/width/init/data) need their own
-    `calibrate_fp8_scales.mojo` run -- see the module comment above.
+    """Calibrated for GPT-2 124M (d12, 12 layer / 768 channel),
+    checkpoint-init, 20 steps B=4 T=1024; running min(scale over layers AND
+    steps) / 2.0. Valid ONLY for this width/depth; recalibrate via
+    `calibrate_fp8_scales.mojo` for any other config.
 
-    RETRY NOTE (docs/ai/speedrun_techniques_research.md A1's own "if static
-    mode drifts, widen margin and retry ONCE"): the first calibration
-    (`min(scale over layers) / 2.0`, reading `AmaxState.scale` only ONCE at
-    the very end of the 20-step run) FAILED `verify-fp8-static-grads`'s
-    envelope gate (cosine floor violation on `ln_1_gamma_layer03`, relL2
-    max 0.81 vs the <0.50 ceiling) against the fixed `gpt2_124M_debug_
-    state.bin` reference batch -- root cause: `AmaxState`'s delayed-scaling
-    ring buffer only remembers the last `amax_history_len=16` steps, so an
-    end-of-run readback had already forgotten steps 0-3's amax, which (a
-    fresh, not-yet-adapted checkpoint) can be the single largest amax of
-    the whole run. `calibrate_fp8_scales.mojo` was fixed to read every
-    state's scale after EVERY step and keep a running min across the whole
-    trajectory (not just the final step) -- a genuine tool bug fix, not a
-    margin change. A second attempt ALSO widened the safety factor 2.0 ->
-    4.0 on top of that fix and made the gate WORSE (6 cosine-floor
-    violations instead of 2, spreading into non-fp8-adjacent tensors like
-    `wpe`) -- diagnosis: floating-point formats have roughly uniform
-    RELATIVE precision across their normal range, but pushing values too
-    far toward zero runs them into e4m3's subnormal region, where
-    precision craters; a too-small static scale trades overflow risk for
-    underflow/subnormal-precision risk, and 4.0x pushed this table into
-    that regime. This table is the actual retry: same fixed running-min
-    tool, safety factor kept at the ORIGINAL 2.0 (fixing the tool's bug was
-    enough of a change on its own, per the "retry ONCE" budget -- see the
-    doc entry for the full three-way before/after comparison, including
-    the residual gate delta this table still does not fully close).
+    The running min is taken over EVERY step of calibration, not just the
+    final one: `AmaxState`'s delayed-scaling ring buffer only remembers the
+    last `amax_history_len=16` steps, so an end-of-run-only readback can
+    miss an early step's amax (a fresh, not-yet-adapted checkpoint's amax at
+    steps 0-3 can be the largest of the whole run) and produce an unsafe
+    scale.
     """
 
     comptime QKV_INPUT = Float32(17.398058)
@@ -1061,19 +944,18 @@ struct FP8StaticScaleD12:
 
 
 struct FP8StaticScaleD36:
-    """Calibrated 2026-07-11, GPT-2 774M (`d36`, 36 layer / 1280 channel),
-    from-scratch random init (no d36 checkpoint exists) on real
-    tinyshakespeare data. 20 calibration steps, B=4 T=1024, `min(scale over
-    layers AND steps) / 2.0` (the fixed running-min tool -- see
-    `FP8StaticScaleD12`'s RETRY NOTE; this table used the fixed tool from
-    the start, no separate retry needed here). See `FP8StaticScaleD12`'s
-    docstring for the general caveat -- this table is NOT valid for d12 or
-    any other width/depth. The running-min fix mattered EVEN MORE here than
-    at d12: for a from-scratch random-init run, the doutput sites' amax at
-    step 0-2 is dramatically larger than by step 20 (e.g. `proj_doutput`'s
-    min-over-steps is ~30M vs. the step-35 value of ~1.19B, a ~40x spread)
-    -- an end-of-run-only readback would have produced a wildly unsafe
-    constant for this config.
+    """Calibrated for GPT-2 774M (d36, 36 layer / 1280 channel), from-scratch
+    random init (no d36 checkpoint exists), 20 calibration steps, B=4
+    T=1024, running min(scale over layers AND steps) / 2.0. NOT valid for
+    d12 or any other width/depth -- see `FP8StaticScaleD12`'s docstring for
+    the general caveat.
+
+    The running-min-over-every-step requirement (see `FP8StaticScaleD12`'s
+    docstring) matters even more here: for a from-scratch random-init run,
+    the doutput sites' amax at step 0-2 is dramatically larger than by step
+    20 (e.g. `proj_doutput`'s min-over-steps is ~30M vs. the step-35 value of
+    ~1.19B, a ~40x spread) -- an end-of-run-only readback would produce a
+    wildly unsafe constant for this config.
     """
 
     comptime QKV_INPUT = Float32(39.384617)

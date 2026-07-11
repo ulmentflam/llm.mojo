@@ -50,7 +50,7 @@ path.
 
 `ROUND_MODE_STOCHASTIC` (`encode_e2m1` only — `encode_e4m3` block scales stay
 RNE always, per the recipe) is wired on top of `llmm/rng_device.mojo`'s
-Squares device RNG (chunk G): given an already-drawn uniform `rand in [0,1)`,
+Squares device RNG: given an already-drawn uniform `rand in [0,1)`,
 `encode_e2m1` finds the two e2m1 grid points bracketing `|x|` and rounds up
 to the higher one with probability exactly `(|x| - lo) / (hi - lo)` — the
 standard stochastic-rounding-on-a-nonlinear-ladder construction, unbiased in
@@ -72,14 +72,13 @@ same seed. `round_mode` defaults to `ROUND_MODE_RNE` everywhere (existing
 callers are unaffected); a caller opts into SR by passing
 `round_mode=ROUND_MODE_STOCHASTIC` as `nvfp4_quantize`'s 4th template
 parameter — selecting *which* operands (gradients only, per the recipe) is
-the training-integration chunk's call-site decision, not something this
-module enforces.
+a call-site decision, not something this module enforces.
 
-## Stream registry (chunk T2, backward)
+## Stream registry
 
-`llmm/matmul.mojo`'s `lowp_gemm_fp4` (forward, Chunk T1) reserves
-`NVFP4_SR_STREAM`/`NVFP4_SR_STREAM + 1` for its A/B operands. Chunk T2's
-backward call sites (`matmul_d_input_bwd_fp4`/`matmul_d_weight_bwd_fp4`) each
+`llmm/matmul.mojo`'s `lowp_gemm_fp4` (forward) reserves
+`NVFP4_SR_STREAM`/`NVFP4_SR_STREAM + 1` for its A/B operands. The backward
+call sites (`matmul_d_input_bwd_fp4`/`matmul_d_weight_bwd_fp4`) each
 quantize a `d_output` operand with SR (the recipe's "SR on the gradient
 operand"; the paired weight/input operand stays RNE, which never touches the
 RNG at all) — two MORE distinct streams so dgrad's and wgrad's `d_output`
@@ -90,7 +89,7 @@ TRANSPOSED — see `nvfp4_quantize_transpose` below):
 `NVFP4_SR_STREAM_DGRAD_DOUTPUT = NVFP4_SR_STREAM + 2`,
 `NVFP4_SR_STREAM_WGRAD_DOUTPUT = NVFP4_SR_STREAM + 3`.
 
-## Transposed quantize (chunk T2, backward)
+## Transposed quantize
 
 cuBLASLt's NVFP4 GEMM is TN-only (`_matmul_cublaslt_fp4`'s module comment,
 mirroring fp8's `_matmul_cublaslt_fp8`), so Dgrad's `weight` operand and
@@ -115,17 +114,19 @@ of which axis is "rows" vs "k").
 
 ## Scope
 
-Standalone utility kernels only — no `llmm/matmul.mojo` / `train_gpt2.mojo`
-integration (that is the later merge's job, and `llmm/lowp.mojo`'s
-`PrecisionSpec`/`ScalingKind.Block2D` seam is where it will plug in per the
-FP8 team's design doc §3).
+This module owns the quantize/dequantize primitives only; `llmm/matmul.mojo`
+imports `nvfp4_quantize`/`nvfp4_quantize_transpose` directly at its FP4 GEMM
+call sites (`lowp_gemm_fp4` and friends) rather than going through
+`llmm/lowp.mojo`'s `PrecisionSpec`/`ScalingKind.Block2D` seam — see
+`llmm/lowp.mojo`'s `FP4_SPEC` comment for why the spec-constant fields stay
+descriptive-only.
 """
 
 from std.collections import InlineArray
 from std.math import ceildiv
 from std.sys import get_defined_int
 from std.gpu.host import DeviceContext
-from std.gpu.host.info import is_cpu, is_gpu
+from std.gpu.host.info import is_gpu
 from std.gpu.primitives import block
 from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.memory import AddressSpace
@@ -174,8 +175,8 @@ comptime NVFP4_SR_SEED = UInt64(get_defined_int["LLMM_SR_SEED", 1746221221]())
 # from the same substream.
 comptime NVFP4_SR_STREAM = UInt64(2)
 
-# Chunk T2 (backward) stream reservations — see the module docstring's
-# "Stream registry" section. `llmm/matmul.mojo`'s `matmul_d_input_bwd_fp4`
+# Backward stream reservations — see the module docstring's "Stream
+# registry" section. `llmm/matmul.mojo`'s `matmul_d_input_bwd_fp4`
 # (dgrad) and `matmul_d_weight_bwd_fp4` (wgrad) each quantize a `d_output`
 # operand with SR; these two streams keep their dither substreams disjoint
 # from the forward reservation (2, 3) and from each other.
@@ -328,9 +329,8 @@ def unpack_e2m1x2_hi(byte: UInt8) -> UInt8:
 # e4m3 (block scale) encode / decode
 #
 # Standard fp8 e4m3 (1 sign / 4 exponent / 3 mantissa, bias 7, no infinities,
-# 0x7F/0xFF reserved for NaN). Since the DRY pass F1
-# (docs/ai/dry_consolidation_audit_2026-07-10.md) these are thin wrappers
-# over the shared codec core in `llmm/lowp.mojo`:
+# 0x7F/0xFF reserved for NaN). These are thin wrappers over the shared codec
+# core in `llmm/lowp.mojo`:
 #
 # - decode is bit-for-bit the same math both modules independently carried
 #   (subnormal `m/512`, normal `(1 + m/8)*2^(e-7)` by direct exponent-field
@@ -345,16 +345,19 @@ def unpack_e2m1x2_hi(byte: UInt8) -> UInt8:
 #   llmm/lowp.mojo; do NOT collapse the two rule sets.
 #
 # Block scales in this module are always >= 0, but sign is handled for
-# generality. The pre-F1 local implementation's fix of the probe's
-# `e_biased >= 15 -> m3 = 7` saturation bug (which decodes to 240, not 448)
-# is preserved structurally by the shared core: it clamps the input
-# magnitude to max_normal (448, exactly representable) BEFORE rounding, so
-# no post-round exponent-clamp branch exists to get wrong — see
-# `_fp8_encode`'s carry-out comment and
-# tests/test_nvfp4_quant.mojo::test_e4m3_saturation.
+# generality. The `e_biased >= 15 -> m3 = 7` saturation bug a naive
+# post-round exponent clamp is prone to (decodes to 240, not 448) is
+# structurally avoided by the shared core: it clamps the input magnitude to
+# max_normal (448, exactly representable) BEFORE rounding, so no post-round
+# exponent-clamp branch exists to get wrong — see `_fp8_encode`'s carry-out
+# comment and tests/test_nvfp4_quant.mojo::test_e4m3_saturation.
 # ===----------------------------------------------------------------------=== #
 
 
+# NOTE: deliberately different from llmm/lowp.mojo's encode_e4m3
+# (ties-to-even, NaN-saturating) — this one is ties-away / NaN-emitting to
+# match the cuBLAS/PyTorch NVFP4 block-scale convention. See lowp.mojo's
+# TieMode block.
 @always_inline
 def encode_e4m3(x: Float32) -> UInt8:
     """Encode a fp32 value to an e4m3 byte, round-to-nearest
@@ -730,12 +733,12 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     sr_stream: UInt64,
     sr_step: Int,
 ) -> None:
-    """Coalesced-read counterpart of `_nvfp4_quantize_gpu[TRANSPOSE=True]`
-    (`nvfp4_quantize_transpose`'s pathology — 2026-07-10 FP4-closeout
-    finding, 3.2x per-call cost vs the natural `TRANSPOSE=False` kernel:
-    `_nvfp4_src_addr[TRANSPOSE=True]`'s read address `kidx * rows + r` has
-    `kidx` varying fastest within a thread — strided by `rows` elements per
-    step — while the natural path's `r * k + kidx` walks contiguous memory).
+    """Coalesced-read counterpart of `_nvfp4_quantize_gpu[TRANSPOSE=True]`,
+    whose naive read pattern is ~3x slower than the natural
+    `TRANSPOSE=False` kernel: `_nvfp4_src_addr[TRANSPOSE=True]`'s read
+    address `kidx * rows + r` has `kidx` varying fastest within a thread —
+    strided by `rows` elements per step — while the natural path's
+    `r * k + kidx` walks contiguous memory.
 
     Thread assignment: one thread per LOGICAL row `r` within a
     `BLOCK_SIZE`-row slab, one k-block `kb` per `block_idx.x`
@@ -767,12 +770,9 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     byte-exact by `tests/test_nvfp4_quant.mojo::
     test_quantize_transpose_matches_materialized_transpose_gpu`.
 
-    (A first-attempt 32x32 shared-memory tile version of this kernel — one
-    thread per block-scale GROUP quantizing from SMEM — measured SLOWER than
-    the naive strided kernel at the BLOCK_ROWS=16 dgrad-weight shapes,
-    284 vs 243 us/call: with 16x16 groups only 4 of 256 threads survived
-    into the quantize phase. This register-per-row design keeps every
-    thread active end-to-end.)
+    A 32x32 SMEM-tile variant is slower at BLOCK_ROWS=16 (only 4/256 threads
+    survive to quantize); this register-per-row design keeps all threads
+    active.
     """
     var kb = Int(block_idx.x)
     var r = Int(block_idx.y) * BLOCK_SIZE + Int(thread_idx.x)
@@ -905,16 +905,14 @@ def _nvfp4_quantize_impl[
         var tile_rows = nvfp4_scale_rows(rows, BLOCK_ROWS)
         var n_col_tiles = ceildiv(k_blocks, 4)
 
-        # `TRANSPOSE=True` dispatches to the coalesced-read kernel
-        # (2026-07-10/11 FP4 quantize-transpose optimization: the naive
-        # `TRANSPOSE=True` read pattern in `_nvfp4_quantize_gpu` is
-        # confirmed 3.2x slower per call than the natural, already-coalesced
-        # `TRANSPOSE=False` path — see
-        # `_nvfp4_quantize_transpose_coalesced_gpu`'s docstring).
-        # `TRANSPOSE=False` (plain `nvfp4_quantize`) is untouched — its
-        # reads are already coalesced by construction (consecutive threads'
-        # `kidx` steps by 1, matching the source's contiguous `k` axis), so
-        # a rewrite would add overhead for no access-pattern win.
+        # `TRANSPOSE=True` dispatches to the coalesced-read kernel: a strided
+        # transpose read is ~3x slower, so `TRANSPOSE=True` uses
+        # `_nvfp4_quantize_transpose_coalesced_gpu` instead (see its
+        # docstring). `TRANSPOSE=False` (plain `nvfp4_quantize`) is
+        # untouched — its reads are already coalesced by construction
+        # (consecutive threads' `kidx` steps by 1, matching the source's
+        # contiguous `k` axis), so a rewrite would add overhead for no
+        # access-pattern win.
         comptime if TRANSPOSE:
             comptime BLOCK_SIZE = 256
             comptime coalesced_kernel = _nvfp4_quantize_transpose_coalesced_gpu[
