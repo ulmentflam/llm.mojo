@@ -69,6 +69,7 @@ from llmm.lowp import (
 from llmm.amax import (
     AmaxState,
     compute_amax,
+    update_scale_pair,
     kernel_ptr_as_immut,
     device_buf_mut_ptr,
 )
@@ -782,6 +783,7 @@ def lowp_gemm_devscale[
     target: StaticString,
     transpose_a: Bool = False,
     transpose_b: Bool = False,
+    quantize_a: Bool = True,
     quantize_b: Bool = True,
 ](
     d_ptr: MutKernelPtr[out_dtype],
@@ -846,17 +848,24 @@ def lowp_gemm_devscale[
     their reciprocals (cuBLASLt's `A_SCALE_POINTER`/`B_SCALE_POINTER`
     require a device pointer, not a host value).
 
-    `quantize_b` (Optimization B, docs/ai/ai_assisted_optimizations_and_
-    benchmarks.md 2026-07-10 fp8-quant-opt entry): when False, `b_ptr` is
-    NOT read/quantized here — the caller must have already filled
-    `b_fp8_scratch` (in the layout `transpose_b` implies) via
-    `quantize_dual_devscale` (llmm/lowp.mojo), e.g. because the same bf16
-    tensor at the same scale also needs the OTHER (non-`b`) orientation at
-    another call site this step, and a fused dual-output kernel already
-    produced both from a single read. `b_ptr` is still accepted (unused in
-    this branch) to keep the signature — and every `transpose_b=True/False`
-    instantiation of this generic function — uniform. Default True keeps
-    every existing call site's behavior byte-for-byte unchanged.
+    `quantize_a`/`quantize_b` (`quantize_b`: Optimization B, docs/ai/
+    ai_assisted_optimizations_and_benchmarks.md 2026-07-10 fp8-quant-opt
+    entry; `quantize_a`: Optimization D, same doc, opt/fp8-kernels
+    follow-on session): when False, the corresponding operand (`a_ptr`/
+    `b_ptr`) is NOT read/quantized here — the caller must have already
+    filled `a_fp8_scratch`/`b_fp8_scratch` (in the layout `transpose_a`/
+    `transpose_b` implies) via `quantize_dual_devscale` (llmm/lowp.mojo),
+    e.g. because the same bf16 tensor at the same scale also needs the
+    OTHER (non-`a`/non-`b`) orientation at another call site this step (or,
+    for Optimization D's weight/input pair, at another call FROM ANOTHER
+    FUNCTION entirely, spanning the forward/backward boundary — see
+    `matmul_fwd_lowp`/`matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_lowp`'s
+    docstrings), and a fused dual-output kernel already produced both from
+    a single read. `a_ptr`/`b_ptr` are still accepted (unused in the
+    corresponding branch) to keep the signature — and every
+    `transpose_a/b=True/False` instantiation of this generic function —
+    uniform. Default True keeps every existing call site's behavior
+    byte-for-byte unchanged.
     """
     comptime assert is_gpu[target](), (
         "lowp_gemm_devscale is GPU-only per docs/ai/fp8_training_design.md"
@@ -869,14 +878,15 @@ def lowp_gemm_devscale[
         " above _matmul_cublaslt_fp8)"
     )
 
-    comptime if transpose_a:
-        quantize_transpose_devscale[FP8_SPEC, a_out_dtype, in_dtype, target](
-            a_fp8_scratch, a_ptr, a_scale_ptr, k, m, ctx
-        )
-    else:
-        quantize_devscale[FP8_SPEC, a_out_dtype, in_dtype, target](
-            a_fp8_scratch, a_ptr, a_scale_ptr, m * k, ctx
-        )
+    comptime if quantize_a:
+        comptime if transpose_a:
+            quantize_transpose_devscale[
+                FP8_SPEC, a_out_dtype, in_dtype, target
+            ](a_fp8_scratch, a_ptr, a_scale_ptr, k, m, ctx)
+        else:
+            quantize_devscale[FP8_SPEC, a_out_dtype, in_dtype, target](
+                a_fp8_scratch, a_ptr, a_scale_ptr, m * k, ctx
+            )
 
     comptime if quantize_b:
         comptime if transpose_b:
@@ -1790,6 +1800,101 @@ struct MatmulFwd:
 # ===----------------------------------------------------------------------=== #
 
 
+# ===----------------------------------------------------------------------=== #
+# Optimization D (docs/ai/ai_assisted_optimizations_and_benchmarks.md
+# 2026-07-10 fp8-quant-opt entry, "Optimization D" deferred item; landed in
+# the 2026-07-10 opt/fp8-kernels follow-on session): dual-output quantize
+# for the weight/input redundant pair that CROSSES the forward/backward call
+# boundary (unlike Optimization B's `d_output` pair, entirely local to
+# `matmul_bwd_lowp`). `matmul_fwd_lowp`'s weight/input natural-layout
+# quantize and `matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_lowp`'s
+# transposed-layout quantize of the SAME bf16 tensors at the SAME
+# (not-re-updated-between-fwd-and-bwd) scale are fused into one
+# `quantize_dual_devscale` call in forward, with the transposed copy cached
+# in a PERSISTENT per-(site,layer) device buffer that backward reads
+# read-only later in the same micro-step.
+#
+# Persistence + lifetime (docs/ai/low_precision_gotchas.md G2 is mandatory
+# background here — Optimization B's `d_output` fusion, a single-function
+# version of this same idea, produced a real, reproducible race the first
+# time it was implemented with a plain local `DeviceBuffer` handed 3 call-
+# levels deep, because Mojo's destroy-at-last-use dropped the buffer before
+# the second nested consumer ran): this cache uses
+# `llmm.memory.persistent_device_buffer` (the SAME allocate-once/process-
+# global helper `_cublaslt_workspace`/`_dbias_scratch`/layernorm's
+# persistent scratch already use), NOT a local `DeviceBuffer`. That sidesteps
+# G2's whole failure class rather than merely mitigating it with a
+# keep-alive: `persistent_device_buffer`'s `DeviceBuffer` lives inside a
+# manually `alloc`'d heap cell registered via `KGEN_CompilerRT_InsertGlobal`,
+# never a Mojo-scope-tracked local — there is no "last textual use" for
+# Mojo's ASAP destroy-at-last-use analysis to find, because the value is
+# never owned by a stack-scoped variable in the first place. (Still,
+# defensively, the natural-layout scratch buffers below — `a_scratch`/
+# `b_scratch` — remain plain per-call local `DeviceBuffer`s exactly as
+# before this optimization, created and consumed within a single function;
+# that existing pattern was never the risk G2 flagged.)
+#
+# Call-order safety (why forward-writes-then-backward-reads is safe for ANY
+# `grad_accum_steps`, not just the 1 used by this repo's benchmark configs):
+# `train_gpt2.mojo`'s training loop calls `model.forward(...)` then
+# `model.backward(...)` once per micro-step, strictly sequentially, on one
+# CUDA stream, with no interleaving of a later micro-step's forward before
+# the current micro-step's backward completes. So a per-(site,layer)
+# persistent buffer written by THIS micro-step's forward call is always
+# consumed by THIS SAME micro-step's backward call before the NEXT micro-
+# step's forward can overwrite it — true whether weight is logically
+# constant across a step's micro-batches (it is; only `model.update()`
+# changes it) or input changes every micro-batch (it does; a fresh batch is
+# loaded each micro-step) as neither property matters here: both operands
+# are unconditionally re-quantized (natural + transposed) on EVERY forward
+# call regardless, so the cache only ever needs to bridge one micro-step's
+# own forward->backward gap, never span across micro-steps. GPU stream
+# ordering (same reasoning `AmaxState`'s "no host sync" design already
+# relies on) makes backward's read of a buffer forward enqueued earlier on
+# the same stream correct with no explicit host-side synchronization.
+#
+# `site`/`layer` (new parameters below) exist purely to build this cache's
+# per-(site,layer) name — mirrors `_dbias_scratch`-style persistent buffers,
+# just parameterized per call site instead of being a single shared name.
+# `site` values are the same short tags `train_gpt2.mojo`'s call sites
+# already use to index `LowpState` (`"qkv"`, `"attn_proj"`, `"fc"`,
+# `"proj"`); forward and the corresponding backward call MUST pass the
+# identical `(site, layer)` pair for the cache lookup to hit the buffer
+# forward just filled — verified by the three-full-scale-twin-run gate this
+# optimization requires (docs/ai/low_precision_gotchas.md G2's lesson).
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def lowp_transpose_cache(
+    ctx: DeviceContext,
+    tag: StaticString,
+    site: StaticString,
+    layer: Int,
+    count: Int,
+) raises -> MutKernelPtr[DType.uint8]:
+    """Persistent per-(tag,site,layer) fp8 scratch buffer — `tag`
+    distinguishes the weight-transposed ("WT") vs. input-transposed ("IT")
+    cache; `site`/`layer` distinguish the up-to-48 (4 sites x num_layer)
+    independent GEMM operand identities sharing this one process. First call
+    for a given name allocates `count` bytes; every later call with the same
+    name just returns the cached pointer (see
+    `llmm.memory.persistent_device_buffer`'s docstring) — safe here because
+    every `(tag, site, layer)` triple's `count` is invariant across the
+    whole run (fixed `batch_size`/`seq_len`/`channels` for the training
+    config).
+    """
+    var name = (
+        String("FP8_")
+        + String(tag)
+        + String("_")
+        + String(site)
+        + String("_")
+        + String(layer)
+    )
+    return persistent_device_buffer[DType.uint8](ctx, name, count)
+
+
 def matmul_fwd_lowp[
     dtype: DType,
     target: StaticString,
@@ -1807,6 +1912,8 @@ def matmul_fwd_lowp[
     output_channels: Int64,
     mut input_state: AmaxState[FP8_SPEC],
     mut weight_state: AmaxState[FP8_SPEC],
+    site: StaticString,
+    layer: Int,
     ctx: DeviceContext,
 ) raises -> None:
     """fp8 forward linear: `out = gelu?(bias? + input @ weightᵀ)`, the same
@@ -1825,6 +1932,18 @@ def matmul_fwd_lowp[
     on every call (no persistent fp8 weight cache) because the optimizer
     updates it every step (design §5 Chunk D file comment: "weight: quantize
     from its bf16 storage ... re-quantize each step").
+
+    Optimization D: weight AND input are each quantized via
+    `quantize_dual_devscale` — ONE read of the bf16 source producing BOTH
+    the natural-layout fp8 copy (consumed immediately below, by THIS
+    function's own GEMM) and the transposed-layout copy (cached in a
+    persistent `(site, layer)`-keyed buffer via `lowp_transpose_cache`,
+    consumed later this same micro-step by `matmul_d_input_bwd_lowp`'s dgrad
+    (weight-transposed) / `matmul_d_weight_bwd_lowp`'s wgrad
+    (input-transposed) — see the module comment above this function for the
+    full lifetime/ownership design). `site`/`layer` identify this call site
+    for that cache; they carry no other meaning (not used for dispatch, only
+    for building the persistent buffer's name).
 
     GPU-only (comptime-asserted, landmine #1): fp8 is never instantiated for
     the `cpu` target.
@@ -1851,23 +1970,56 @@ def matmul_fwd_lowp[
         out_channels * in_channels,
         ctx,
     )
-    input_state.update_scale[FP8_SPEC.fwd_dtype](
-        kernel_ptr_as_immut(device_buf_mut_ptr(amax_input)), ctx
-    )
-    weight_state.update_scale[FP8_SPEC.fwd_dtype](
-        kernel_ptr_as_immut(device_buf_mut_ptr(amax_weight)), ctx
+    # Optimization C (docs/ai/ai_assisted_optimizations_and_benchmarks.md
+    # 2026-07-10 fp8-quant-opt entry / opt/fp8-kernels follow-on): both
+    # amaxes above are already computed by the time either state's scale is
+    # needed, and neither this function's own quantize (below) nor any
+    # other call site reads one state's scale before the other's is ready —
+    # fuse the two update_scale calls into one kernel launch instead of two
+    # (see `update_scale_pair`'s module comment in llmm/amax.mojo).
+    update_scale_pair[FP8_SPEC, FP8_SPEC.fwd_dtype](
+        input_state,
+        kernel_ptr_as_immut(device_buf_mut_ptr(amax_input)),
+        weight_state,
+        kernel_ptr_as_immut(device_buf_mut_ptr(amax_weight)),
+        ctx,
     )
 
-    # 2. Quantize (inside lowp_gemm_devscale, reading input_state.scale /
-    #    weight_state.scale device-side) + fp8 GEMM -> raw (bias-free) bf16
-    #    output in out_ptr. `a`=weight (m=out_channels,k=in_channels),
-    #    `b`=input (n=rows,k=in_channels) — matches matmul_fwd's own
-    #    weight-as-A/input-as-B convention (`_matmul_cublaslt[transA=True]`
-    #    called with `weight_ptr` first, `input_ptr` second).
+    # 2. Quantize (dual-output, Optimization D — see the module comment
+    #    above) + fp8 GEMM -> raw (bias-free) bf16 output in out_ptr.
+    #    `a`=weight (m=out_channels,k=in_channels), `b`=input
+    #    (n=rows,k=in_channels) — matches matmul_fwd's own weight-as-A/
+    #    input-as-B convention (`_matmul_cublaslt[transA=True]` called with
+    #    `weight_ptr` first, `input_ptr` second).
     var a_scratch = ctx.enqueue_create_buffer[DType.uint8](
         out_channels * in_channels
     )
     var b_scratch = ctx.enqueue_create_buffer[DType.uint8](rows * in_channels)
+    var weight_t = lowp_transpose_cache(
+        ctx, "WT", site, layer, in_channels * out_channels
+    )
+    var input_t = lowp_transpose_cache(
+        ctx, "IT", site, layer, in_channels * rows
+    )
+
+    quantize_dual_devscale[FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target](
+        device_buf_mut_ptr(a_scratch),
+        weight_t,
+        weight_ptr,
+        kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
+        out_channels,
+        in_channels,
+        ctx,
+    )
+    quantize_dual_devscale[FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target](
+        device_buf_mut_ptr(b_scratch),
+        input_t,
+        input_ptr,
+        kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
+        rows,
+        in_channels,
+        ctx,
+    )
 
     lowp_gemm_devscale[
         FP8_SPEC.fwd_dtype,
@@ -1877,6 +2029,8 @@ def matmul_fwd_lowp[
         target,
         transpose_a=False,
         transpose_b=False,
+        quantize_a=False,
+        quantize_b=False,
     ](
         out_ptr,
         weight_ptr,
@@ -3193,12 +3347,21 @@ def matmul_bwd[
 # `AmaxState` "once per step" contract (llmm/amax.mojo): `weight_state` (for
 # dgrad) and `input_state` (for wgrad) are the SAME per-site `AmaxState`
 # `matmul_fwd_lowp` already updated during THIS step's forward pass — dgrad/
-# wgrad only re-quantize those same bf16 tensors into a transposed fp8 copy
-# at the ALREADY-CURRENT scale, they never call `update_scale` on them again
-# (that would double-push this step's amax into the ring buffer). `doutput`
-# has no forward counterpart, so `matmul_bwd_lowp` updates it exactly once
-# (before either sub-GEMM runs) and both dgrad and wgrad read the result —
-# see `matmul_bwd_lowp`'s docstring.
+# wgrad never call `update_scale` on them again (that would double-push this
+# step's amax into the ring buffer). `doutput` has no forward counterpart,
+# so `matmul_bwd_lowp` updates it exactly once (before either sub-GEMM runs)
+# and both dgrad and wgrad read the result — see `matmul_bwd_lowp`'s
+# docstring.
+#
+# UPDATE (Optimization D, opt/fp8-kernels follow-on session): dgrad/wgrad no
+# longer re-quantize weight's/input's transposed fp8 copy themselves either
+# — `matmul_fwd_lowp` already produced it this micro-step (dual-output,
+# alongside its own natural-layout quantize) into a persistent `(site,
+# layer)`-keyed cache (`lowp_transpose_cache`), which dgrad/wgrad now read
+# read-only via `lowp_gemm_devscale`'s `quantize_a=False`. See the module
+# comment above `matmul_fwd_lowp` for the full lifetime/ownership design and
+# docs/ai/low_precision_gotchas.md G2 for why that cache is a persistent
+# process-global buffer rather than a plain per-call `DeviceBuffer`.
 # ===----------------------------------------------------------------------=== #
 
 
@@ -3218,6 +3381,8 @@ def matmul_d_input_bwd_lowp[
     output_channels: Int64,
     weight_state: AmaxState[FP8_SPEC],
     doutput_state: AmaxState[FP8_SPEC],
+    site: StaticString,
+    layer: Int,
     ctx: DeviceContext,
 ) raises -> None:
     """fp8 dgrad: `d_input = d_output @ weight` via `lowp_gemm_devscale`.
@@ -3232,6 +3397,13 @@ def matmul_d_input_bwd_lowp[
     one read instead of two). `d_output_ptr` (bf16) is still accepted only
     to satisfy `lowp_gemm_devscale`'s uniform signature under
     `quantize_b=False` — it is not read.
+
+    `site`/`layer` (Optimization D — see the module comment above
+    `matmul_fwd_lowp`): identify the SAME call site whose forward pass
+    already quantized `weight`'s transposed fp8 copy into a persistent
+    cache this micro-step, via `lowp_transpose_cache` — `weight_ptr` is
+    still accepted only to satisfy `lowp_gemm_devscale`'s uniform signature
+    under `quantize_a=False`; it is not read here.
     """
     comptime assert is_gpu[target](), (
         "matmul_d_input_bwd_lowp is GPU-only per"
@@ -3241,8 +3413,8 @@ def matmul_d_input_bwd_lowp[
     var in_channels = Int(channels)
     var out_channels = Int(output_channels)
 
-    var weight_t_scratch = ctx.enqueue_create_buffer[DType.uint8](
-        in_channels * out_channels
+    var weight_t = lowp_transpose_cache(
+        ctx, "WT", site, layer, in_channels * out_channels
     )
 
     lowp_gemm_devscale[
@@ -3253,12 +3425,13 @@ def matmul_d_input_bwd_lowp[
         target,
         transpose_a=True,
         transpose_b=False,
+        quantize_a=False,
         quantize_b=False,
     ](
         d_input_ptr,
         weight_ptr,
         d_output_ptr,
-        device_buf_mut_ptr(weight_t_scratch),
+        weight_t,
         doutput_fp8_nat_ptr,
         kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
         kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale_inv)),
@@ -3291,6 +3464,8 @@ def matmul_d_weight_bwd_lowp[
     output_channels: Int64,
     input_state: AmaxState[FP8_SPEC],
     doutput_state: AmaxState[FP8_SPEC],
+    site: StaticString,
+    layer: Int,
     ctx: DeviceContext,
 ) raises -> None:
     """fp8 wgrad: `d_weight = d_output^T @ input` via `lowp_gemm_devscale`.
@@ -3303,6 +3478,13 @@ def matmul_d_weight_bwd_lowp[
     call. `d_output_ptr` (bf16) is still accepted only to satisfy
     `lowp_gemm_devscale`'s uniform signature under `quantize_b=False` — it
     is not read.
+
+    `site`/`layer` (Optimization D — see the module comment above
+    `matmul_fwd_lowp`): identify the SAME call site whose forward pass
+    already quantized `input`'s transposed fp8 copy into a persistent
+    cache this micro-step, via `lowp_transpose_cache` — `input_ptr` is
+    still accepted only to satisfy `lowp_gemm_devscale`'s uniform signature
+    under `quantize_a=False`; it is not read here.
     """
     comptime assert is_gpu[target](), (
         "matmul_d_weight_bwd_lowp is GPU-only per"
@@ -3312,8 +3494,8 @@ def matmul_d_weight_bwd_lowp[
     var in_channels = Int(channels)
     var out_channels = Int(output_channels)
 
-    var input_t_scratch = ctx.enqueue_create_buffer[DType.uint8](
-        in_channels * rows
+    var input_t = lowp_transpose_cache(
+        ctx, "IT", site, layer, in_channels * rows
     )
 
     lowp_gemm_devscale[
@@ -3324,12 +3506,13 @@ def matmul_d_weight_bwd_lowp[
         target,
         transpose_a=True,
         transpose_b=True,
+        quantize_a=False,
         quantize_b=False,
     ](
         d_weight_ptr,
         input_ptr,
         d_output_ptr,
-        device_buf_mut_ptr(input_t_scratch),
+        input_t,
         doutput_fp8_t_ptr,
         kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
         kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale_inv)),
@@ -3364,11 +3547,19 @@ def matmul_bwd_lowp[
     input_state: AmaxState[FP8_SPEC],
     weight_state: AmaxState[FP8_SPEC],
     mut doutput_state: AmaxState[FP8_SPEC],
+    site: StaticString,
+    layer: Int,
     ctx: DeviceContext,
 ) raises -> None:
     """fp8 backward for one block-linear site (Chunk E): bias grad (bf16,
     unchanged `matmul_bias_bwd`) + dgrad + wgrad (both fp8). Sibling of
     `matmul_bwd`, mirroring Chunk D's `matmul_fwd`/`matmul_fwd_lowp` split.
+
+    `site`/`layer` (Optimization D — see the module comment above
+    `matmul_fwd_lowp`) MUST be the identical `(site, layer)` pair the
+    forward pass's `matmul_fwd_lowp` call for this same GEMM site used this
+    micro-step — they select the persistent weight/input transposed-fp8
+    caches `matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_lowp` read below.
 
     `doutput_state` is this function's only `mut` `AmaxState`: `d_output`
     has no forward counterpart (design §1.2 — it's the backward-only E5M2
@@ -3447,6 +3638,8 @@ def matmul_bwd_lowp[
         output_channels,
         weight_state,
         doutput_state,
+        site,
+        layer,
         ctx,
     )
     matmul_d_weight_bwd_lowp[dtype, target, accumulate](
@@ -3460,6 +3653,8 @@ def matmul_bwd_lowp[
         output_channels,
         input_state,
         doutput_state,
+        site,
+        layer,
         ctx,
     )
 

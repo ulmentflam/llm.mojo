@@ -29,6 +29,7 @@ from llmm.amax import (
     format_max,
     compute_amax,
     AmaxState,
+    update_scale_pair,
     kernel_ptr_as_immut,
     device_buf_mut_ptr,
 )
@@ -481,6 +482,58 @@ def test_update_scale_determinism() raises:
     var a = _run_update_scale_sequence(ctx, seq)
     var b = _run_update_scale_sequence(ctx, seq)
     assert_equal(a, b)
+
+
+def test_update_scale_pair_matches_two_separate_calls() raises:
+    # Optimization C (opt/fp8-kernels, docs/ai/ai_assisted_optimizations_and_
+    # benchmarks.md 2026-07-10 fp8-quant-opt entry): `update_scale_pair` (one
+    # kernel launch, two states) must be bit-identical to calling
+    # `update_scale` on each state separately, across a multi-step sequence
+    # spanning both warmup and steady state.
+    if not has_nvidia_gpu_accelerator():
+        return
+    var ctx = DeviceContext()
+
+    var state_a = AmaxState[_H4_SPEC](ctx)
+    var state_b = AmaxState[_H4_SPEC](ctx)
+    var paired_a = AmaxState[_H4_SPEC](ctx)
+    var paired_b = AmaxState[_H4_SPEC](ctx)
+
+    var amax_a = ctx.enqueue_create_buffer[DType.float32](1)
+    var amax_b = ctx.enqueue_create_buffer[DType.float32](1)
+
+    var seq_a = List[Float32]()
+    var seq_b = List[Float32]()
+    for i in range(10):
+        seq_a.append(Float32((i * 37 + 5) % 97) + 1.0)
+        seq_b.append(Float32((i * 53 + 3) % 61) + 1.0)
+
+    for i in range(10):
+        _write_f32(ctx, amax_a, seq_a[i])
+        _write_f32(ctx, amax_b, seq_b[i])
+        state_a.update_scale[DType.float8_e4m3fn](
+            kernel_ptr_as_immut(device_buf_mut_ptr(amax_a)), ctx
+        )
+        state_b.update_scale[DType.float8_e4m3fn](
+            kernel_ptr_as_immut(device_buf_mut_ptr(amax_b)), ctx
+        )
+        update_scale_pair[_H4_SPEC, DType.float8_e4m3fn](
+            paired_a,
+            kernel_ptr_as_immut(device_buf_mut_ptr(amax_a)),
+            paired_b,
+            kernel_ptr_as_immut(device_buf_mut_ptr(amax_b)),
+            ctx,
+        )
+        ctx.synchronize()
+
+    assert_equal(_read_f32(ctx, state_a.scale), _read_f32(ctx, paired_a.scale))
+    assert_equal(
+        _read_f32(ctx, state_a.scale_inv), _read_f32(ctx, paired_a.scale_inv)
+    )
+    assert_equal(_read_f32(ctx, state_b.scale), _read_f32(ctx, paired_b.scale))
+    assert_equal(
+        _read_f32(ctx, state_b.scale_inv), _read_f32(ctx, paired_b.scale_inv)
+    )
 
 
 def main() raises:

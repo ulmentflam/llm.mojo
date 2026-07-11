@@ -2197,6 +2197,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(3 * channels),
                     self.lowp_state.qkv_input[layer],
                     self.lowp_state.qkv_weight[layer],
+                    "qkv",
+                    layer,
                     self.ctx,
                 )
             else:
@@ -2271,6 +2273,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(channels),
                     self.lowp_state.attn_proj_input[layer],
                     self.lowp_state.attn_proj_weight[layer],
+                    "attn_proj",
+                    layer,
                     self.ctx,
                 )
             else:
@@ -2322,6 +2326,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(4 * channels),
                     self.lowp_state.fc_input[layer],
                     self.lowp_state.fc_weight[layer],
+                    "fc",
+                    layer,
                     self.ctx,
                 )
             elif PRECISION == "fp4":
@@ -2380,6 +2386,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(channels),
                     self.lowp_state.proj_input[layer],
                     self.lowp_state.proj_weight[layer],
+                    "proj",
+                    layer,
                     self.ctx,
                 )
             elif PRECISION == "fp4":
@@ -2873,6 +2881,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.lowp_state.proj_input[layer],
                     self.lowp_state.proj_weight[layer],
                     self.lowp_state.proj_doutput[layer],
+                    "proj",
+                    layer,
                     self.ctx,
                 )
             elif PRECISION == "fp4":
@@ -2954,6 +2964,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.lowp_state.fc_input[layer],
                     self.lowp_state.fc_weight[layer],
                     self.lowp_state.fc_doutput[layer],
+                    "fc",
+                    layer,
                     self.ctx,
                 )
             elif PRECISION == "fp4":
@@ -3071,6 +3083,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.lowp_state.attn_proj_input[layer],
                     self.lowp_state.attn_proj_weight[layer],
                     self.lowp_state.attn_proj_doutput[layer],
+                    "attn_proj",
+                    layer,
                     self.ctx,
                 )
             else:
@@ -3137,6 +3151,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.lowp_state.qkv_input[layer],
                     self.lowp_state.qkv_weight[layer],
                     self.lowp_state.qkv_doutput[layer],
+                    "qkv",
+                    layer,
                     self.ctx,
                 )
             else:

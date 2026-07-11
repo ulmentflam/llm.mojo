@@ -48,6 +48,7 @@ from llmm.matmul import (
     matmul_d_input_bwd_lowp,
     matmul_d_weight_bwd_lowp,
     matmul_bwd_lowp,
+    lowp_transpose_cache,
 )
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
@@ -150,6 +151,32 @@ def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
         ctx,
     )
 
+    # Optimization D (docs/ai/ai_assisted_optimizations_and_benchmarks.md
+    # 2026-07-10 fp8-quant-opt entry / opt/fp8-kernels follow-on):
+    # `matmul_d_input_bwd_lowp` now reads weight's TRANSPOSED fp8
+    # quantization from a persistent `(site, layer)`-keyed cache rather than
+    # quantizing it internally -- `matmul_fwd_lowp` produces that cache in
+    # the real training loop via `quantize_dual_devscale`. This standalone
+    # test (which calls the dgrad sibling directly, not through
+    # `matmul_fwd_lowp`) primes the same cache itself with
+    # `quantize_transpose_devscale`, bit-identical to `quantize_dual_
+    # devscale`'s transposed output on the same input/scale, at a
+    # dedicated (site, layer) so it can't collide with any other test's
+    # cache.
+    comptime site = StaticString("dgrad_test")
+    comptime layer = 0
+    var weight_t = lowp_transpose_cache(ctx, "WT", site, layer, C * OC)
+    quantize_transpose_devscale[
+        FP8_SPEC, FP8_SPEC.fwd_dtype, DType.bfloat16, "gpu"
+    ](
+        weight_t,
+        kernel_ptr_as_immut_bf16(weight),
+        kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
+        OC,
+        C,
+        ctx,
+    )
+
     # bf16 reference: the existing, already-validated matmul_d_input_bwd.
     if use_gelu_case:
         matmul_d_input_bwd[DType.bfloat16, "gpu", use_gelu=True](
@@ -191,6 +218,8 @@ def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
             Int64(OC),
             weight_state,
             doutput_state,
+            site,
+            layer,
             ctx,
         )
     else:
@@ -206,6 +235,8 @@ def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
             Int64(OC),
             weight_state,
             doutput_state,
+            site,
+            layer,
             ctx,
         )
     ctx.synchronize()
@@ -280,6 +311,25 @@ def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
         ctx,
     )
 
+    # Optimization D (see the dgrad test above for the full rationale):
+    # `matmul_d_weight_bwd_lowp` now reads input's TRANSPOSED fp8
+    # quantization from a persistent `(site, layer)`-keyed cache; prime it
+    # here the same way, at a dedicated (site, layer) so it can't collide
+    # with the dgrad test's cache above.
+    comptime site = StaticString("wgrad_test")
+    comptime layer = 0
+    var input_t = lowp_transpose_cache(ctx, "IT", site, layer, C * ROWS)
+    quantize_transpose_devscale[
+        FP8_SPEC, FP8_SPEC.fwd_dtype, DType.bfloat16, "gpu"
+    ](
+        input_t,
+        kernel_ptr_as_immut_bf16(input),
+        kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
+        ROWS,
+        C,
+        ctx,
+    )
+
     var scratch = _zeros_bf16(ctx, ROWS * OC)  # unused by the cuBLASLt path
     if accumulate_case:
         matmul_d_weight_bwd[DType.bfloat16, "gpu", accumulate=True](
@@ -319,6 +369,8 @@ def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
             Int64(OC),
             input_state,
             doutput_state,
+            site,
+            layer,
             ctx,
         )
     else:
@@ -333,6 +385,8 @@ def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
             Int64(OC),
             input_state,
             doutput_state,
+            site,
+            layer,
             ctx,
         )
     ctx.synchronize()
@@ -402,6 +456,39 @@ def test_matmul_bwd_lowp_end_to_end() raises:
         ctx,
     )
 
+    # Optimization D (docs/ai/ai_assisted_optimizations_and_benchmarks.md
+    # 2026-07-10 fp8-quant-opt entry / opt/fp8-kernels follow-on):
+    # `matmul_bwd_lowp` (via `matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_
+    # lowp`) now reads weight's/input's TRANSPOSED fp8 quantization from
+    # persistent `(site, layer)`-keyed caches that the real training loop's
+    # `matmul_fwd_lowp` fills. This standalone test calls `matmul_bwd_lowp`
+    # directly without a preceding `matmul_fwd_lowp` call, so it primes
+    # those caches itself here, at a dedicated (site, layer) pair.
+    comptime site = StaticString("bwd_lowp_e2e_test")
+    comptime layer = 0
+    var weight_t = lowp_transpose_cache(ctx, "WT", site, layer, C * OC)
+    quantize_transpose_devscale[
+        FP8_SPEC, FP8_SPEC.fwd_dtype, DType.bfloat16, "gpu"
+    ](
+        weight_t,
+        kernel_ptr_as_immut_bf16(weight),
+        kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
+        OC,
+        C,
+        ctx,
+    )
+    var input_t = lowp_transpose_cache(ctx, "IT", site, layer, C * ROWS)
+    quantize_transpose_devscale[
+        FP8_SPEC, FP8_SPEC.fwd_dtype, DType.bfloat16, "gpu"
+    ](
+        input_t,
+        kernel_ptr_as_immut_bf16(input),
+        kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
+        ROWS,
+        C,
+        ctx,
+    )
+
     matmul_bwd[DType.bfloat16, "gpu", use_gelu=False](
         device_buf_mut_ptr(d_input_ref),
         device_buf_mut_ptr(d_weight_ref),
@@ -434,6 +521,8 @@ def test_matmul_bwd_lowp_end_to_end() raises:
         input_state,
         weight_state,
         doutput_state,
+        site,
+        layer,
         ctx,
     )
     ctx.synchronize()

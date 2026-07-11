@@ -550,3 +550,184 @@ struct AmaxState[spec: PrecisionSpec](Movable):
                 " unimplemented seam (docs/ai/fp8_training_design.md §3) —"
                 " PerTensor (fp8) only in Chunk C"
             )
+
+
+# ===----------------------------------------------------------------------=== #
+# update_scale_pair — Optimization C (docs/ai/ai_assisted_optimizations_and_
+# benchmarks.md 2026-07-10 fp8-quant-opt entry, "Optimization C" deferred
+# item; landed in the 2026-07-10 opt/fp8-kernels follow-on session).
+#
+# `matmul_fwd_lowp` (llmm/matmul.mojo) calls `update_scale` twice back to
+# back, once for `input_state` and once for `weight_state` — two SEPARATE
+# 1-thread kernel launches immediately adjacent in program order, both
+# already holding their own freshly-computed `amax_current` (from two prior
+# `compute_amax` calls at the same call site) by the time either update runs.
+# Nothing about `update_scale`'s "this step's quantize needs this step's own
+# just-updated scale" ordering contract (see `AmaxState`'s calling-contract
+# docstring above) requires these two SPECIFIC calls to be separate kernel
+# launches — both amaxes are already on hand, and both states' resulting
+# scale/scale_inv are consumed later in the SAME function
+# (`lowp_gemm_devscale`), not before. `update_scale_pair` fuses them into
+# ONE kernel launch (`grid_dim=(2,)`, one block per state, `block_dim=(1,)`
+# — literally "a single kernel with one thread(-block) per state", scoped to
+# what is actually co-resident/ready at a single call site) instead of two.
+#
+# Deliberately NOT a whole-step, all-144-states batch (the mission's most
+# literal reading): every OTHER `AmaxState` in this training loop is updated
+# alone at its own call site (`matmul_bwd_lowp`'s single `doutput_state`
+# update has no sibling to pair with — dgrad/wgrad read it read-only, per
+# the "once per step" contract) or would require deferring `update_scale`
+# past the point where its OWN call site's quantize/GEMM already needs the
+# fresh scale (a step-wide batch would need a two-pass forward/backward
+# restructuring — compute every site's amax first, batch-update every
+# scale, THEN quantize/GEMM everywhere — which is exactly the "real
+# restructuring... expected value is low relative to the surgery required"
+# the original fp8-quant-opt session already evaluated and declined for
+# this same reason). Fusing the two-per-fwd-call-site pair that already
+# satisfies the ordering contract for free is the simple, real, zero-risk
+# subset of that idea; see the doc entry's Optimization C write-up for the
+# measured launch-count delta (144 -> 96 `update_scale`-family launches/
+# step) and why the wall-clock impact is expected to be negligible (the
+# fused kernel is still two single-thread blocks — this was never a
+# bandwidth-bound part of the family, only a launch-count one).
+#
+# `compute_amax`'s second-stage reduction (`_amax_aggregate_gpu`) is
+# DELIBERATELY NOT folded into this batch: `compute_amax` is a tested public
+# entry point (`tests/test_amax.mojo`) used standalone at every call site
+# (including `matmul_bwd_lowp`'s solo `doutput` site), and folding its
+# aggregate stage into a state-pair batch would mean either changing its
+# return contract (breaking the existing single-state test surface) or
+# adding a second, parallel two-state code path purely for this one caller
+# — more surface for a family that is already ~4% of GPU time and whose
+# `amax_aggregate_gpu`/`update_scale_gpu` components individually measured
+# well under 1% each (Chunk F / Optimization A-B profiles). Per the
+# mission's own "only if the design stays simple; don't force it" — it
+# wasn't kept simple, so it stays out.
+# ===----------------------------------------------------------------------=== #
+
+
+def _update_scale_pair_gpu[
+    history_len: Int,
+](
+    history0_ptr: MutKernelPtr[DType.float32],
+    scale0_ptr: MutKernelPtr[DType.float32],
+    scale_inv0_ptr: MutKernelPtr[DType.float32],
+    amax_current0_ptr: ImmutKernelPtr[DType.float32],
+    history1_ptr: MutKernelPtr[DType.float32],
+    scale1_ptr: MutKernelPtr[DType.float32],
+    scale_inv1_ptr: MutKernelPtr[DType.float32],
+    amax_current1_ptr: ImmutKernelPtr[DType.float32],
+    step: Int,
+    margin_mult: Float32,
+    fmt_max: Float32,
+) -> None:
+    # One block per state (block_dim=(1,), so each block is already a
+    # single thread — no thread_idx guard needed, matching `_update_scale_
+    # gpu`'s own single-thread-block style). block_idx.x selects which
+    # state's pointers this block operates on; the arithmetic body below is
+    # byte-for-byte `_update_scale_gpu`'s, just parameterized by the
+    # selected pointer set instead of being duplicated per state.
+    var is_second = Int(block_idx.x) == 1
+    var history_ptr = history1_ptr if is_second else history0_ptr
+    var scale_ptr = scale1_ptr if is_second else scale0_ptr
+    var scale_inv_ptr = scale_inv1_ptr if is_second else scale_inv0_ptr
+    var amax_current_ptr = amax_current1_ptr if is_second else amax_current0_ptr
+
+    var amax_current = amax_current_ptr[0]
+
+    var amax_for_scale: Float32
+    if step < history_len:
+        amax_for_scale = amax_current
+    else:
+        var m = Float32(0.0)
+        var bad = False
+        for i in range(history_len):
+            var h = history_ptr[i]
+            if isnan(h) or isinf(h):
+                bad = True
+            else:
+                m = max(m, h)
+        amax_for_scale = nan[DType.float32]() if bad else m
+
+    var scale: Float32
+    if (
+        amax_for_scale <= Float32(0.0)
+        or isnan(amax_for_scale)
+        or isinf(amax_for_scale)
+    ):
+        scale = Float32(1.0)
+    else:
+        scale = (fmt_max * margin_mult) / amax_for_scale
+
+    scale_ptr[0] = scale
+    scale_inv_ptr[0] = Float32(1.0) / scale
+
+    history_ptr[step % history_len] = amax_current
+
+
+def update_scale_pair[
+    spec: PrecisionSpec,
+    fmt_dtype: DType,
+](
+    mut state0: AmaxState[spec],
+    amax_current0: ImmutKernelPtr[DType.float32],
+    mut state1: AmaxState[spec],
+    amax_current1: ImmutKernelPtr[DType.float32],
+    ctx: DeviceContext,
+) raises -> None:
+    """Fused two-state `update_scale`: identical result to calling
+    `state0.update_scale[fmt_dtype](amax_current0, ctx)` followed by
+    `state1.update_scale[fmt_dtype](amax_current1, ctx)` (same
+    `_update_scale_gpu` arithmetic per state, same ring-buffer push order —
+    each state's own history only ever sees its own amax, in the same
+    step-indexed slot it would have under two separate calls), but as ONE
+    kernel launch instead of two. See the module comment above
+    (Optimization C) for the call-site scoping rationale and why this stays
+    a 2-state fusion rather than a whole-step batch.
+
+    Both states must be at the SAME `.step` (true for `input_state`/
+    `weight_state` at a `matmul_fwd_lowp` call site — both are only ever
+    advanced together, once per call, from `step=0`) — asserted defensively
+    since the fused kernel takes a single `step` value for both blocks.
+    `fmt_dtype` is shared too (both call sites needing this pairing quantize
+    to the same format — E4M3 for fp8's forward operand pair).
+    """
+    debug_assert(
+        state0.step == state1.step,
+        (
+            "update_scale_pair: state0/state1 must be at the same .step (only"
+            " ever advanced together at a shared call site)"
+        ),
+    )
+
+    comptime if spec.scaling == ScalingKind.PerTensor:
+        comptime H = spec.amax_history_len
+        comptime MARGIN_MULT = Float32(1 << spec.margin)
+        comptime FMT_MAX = format_max[fmt_dtype]()
+        comptime update_kernel = _update_scale_pair_gpu[H]
+
+        var compiled = ctx.compile_function[update_kernel]()
+        ctx.enqueue_function(
+            compiled,
+            device_buf_mut_ptr(state0.history),
+            device_buf_mut_ptr(state0.scale),
+            device_buf_mut_ptr(state0.scale_inv),
+            amax_current0,
+            device_buf_mut_ptr(state1.history),
+            device_buf_mut_ptr(state1.scale),
+            device_buf_mut_ptr(state1.scale_inv),
+            amax_current1,
+            state0.step,
+            MARGIN_MULT,
+            FMT_MAX,
+            grid_dim=(2,),
+            block_dim=(1,),
+        )
+        state0.step += 1
+        state1.step += 1
+    else:
+        comptime assert False, (
+            "update_scale_pair: Block1D/Block2D (FP4) scaling is an"
+            " unimplemented seam (docs/ai/fp8_training_design.md §3) —"
+            " PerTensor (fp8) only in Chunk C"
+        )

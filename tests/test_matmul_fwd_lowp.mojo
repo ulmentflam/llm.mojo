@@ -59,6 +59,7 @@ from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
 def _run_site_case(
     label: String,
+    site: StaticString,
     rows: Int,
     in_channels: Int,
     out_channels: Int,
@@ -152,6 +153,8 @@ def _run_site_case(
             Int64(out_channels),
             input_state,
             weight_state,
+            site,
+            0,
             ctx,
         )
     else:
@@ -167,6 +170,8 @@ def _run_site_case(
             Int64(out_channels),
             input_state,
             weight_state,
+            site,
+            0,
             ctx,
         )
     ctx.synchronize()
@@ -232,19 +237,19 @@ def _run_site_case(
 def test_qkv_site() raises:
     # d12 (GPT-2 124M): channels=768, B*T=256 (B=4,T=64, matching the gate-4
     # smoke-test invocation's shapes).
-    _run_site_case("qkv", 256, 768, 3 * 768, use_gelu=False)
+    _run_site_case("qkv", "qkv", 256, 768, 3 * 768, use_gelu=False)
 
 
 def test_attn_proj_site() raises:
-    _run_site_case("attn_proj", 256, 768, 768, use_gelu=False)
+    _run_site_case("attn_proj", "attn_proj", 256, 768, 768, use_gelu=False)
 
 
 def test_fc_site() raises:
-    _run_site_case("fc", 256, 768, 4 * 768, use_gelu=True)
+    _run_site_case("fc", "fc", 256, 768, 4 * 768, use_gelu=True)
 
 
 def test_proj_site() raises:
-    _run_site_case("proj", 256, 4 * 768, 768, use_gelu=False)
+    _run_site_case("proj", "proj", 256, 4 * 768, 768, use_gelu=False)
 
 
 def main() raises:
