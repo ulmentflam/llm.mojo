@@ -789,6 +789,501 @@ class GPT(nn.Module):
 
 
 """
+Low-precision (FP8 / NVFP4) Linear layers — CUDA-only `--precision` support.
+
+Both paths below are NATIVE (not emulated) tensor-core GEMMs, per
+`tests/probe_torch_precisions.py`'s capability probe: `torch._scaled_mm`
+(fp8, e4m3 x e4m3 -> bf16 forward, e5m2 x e4m3 -> bf16 grad-path) and
+`torch.nn.functional.scaled_mm` (NVFP4, `ScalingType.BlockWise1x16`) both
+dispatch real cuBLASLt/cutlass tensor-core kernels on this box (NVIDIA GB10,
+sm_121). See `docs/ai/pytorch_precision_support.md` for the full writeup.
+
+Master weights stay fp32 (`nn.Parameter`, untouched by the optimizer scheme);
+fp8/fp4 exist only as transient, per-forward-call quantized copies of the
+GEMM operands — mirroring `docs/ai/fp8_training_design.md`'s "storage stays
+high precision; low precision is a transient inside the GEMM" scheme used by
+the Mojo trainer.
+"""
+
+_FP8_E4M3_MAX = 448.0
+_FP8_E5M2_MAX = 57344.0
+_NVFP4_BLOCK = 16
+_NVFP4_MAX = 6.0
+_NVFP4_LADDER = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+
+
+def _amax_scale(x: Tensor, fp8_max: float) -> Tensor:
+    """Quantization multiplier `s` such that `(x * s).clamp(-max,max)` fills
+    the target fp8 dtype's dynamic range. `torch._scaled_mm`'s `scale_a`/
+    `scale_b` want the DEQUANT factor `1/s`, not `s` itself — verified in
+    `tests/probe_torch_precisions.py::probe_scaled_mm_fp8` (passing `s`
+    silently produces >1e5x relative error rather than raising)."""
+    amax = x.detach().abs().amax().clamp_min(1e-12).float()
+    return fp8_max / amax
+
+
+def _quantize_e4m3(x: Tensor, scale: Tensor) -> Tensor:
+    return (
+        (x.float() * scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    )
+
+
+def _quantize_e5m2(x: Tensor, scale: Tensor) -> Tensor:
+    return (
+        (x.float() * scale).clamp(-_FP8_E5M2_MAX, _FP8_E5M2_MAX).to(torch.float8_e5m2)
+    )
+
+
+def _fp8_eligible(in_features: int, out_features: int) -> bool:
+    # cuBLASLt fp8 TN GEMM requires K (in_features) a multiple of 16 (probed
+    # in tests/probe_fp8/RESULTS.md); GPT-2's own dims (768/3072/...) always
+    # satisfy this. Guarded defensively for arbitrary custom configs.
+    return in_features % 16 == 0 and out_features % 16 == 0
+
+
+class _Float8MatmulFn(torch.autograd.Function):
+    """`y = x @ weight.T (+ bias)` with the GEMM run in fp8 (forward: E4M3 x
+    E4M3 -> bf16; backward: E5M2 `d_output` x E4M3 weight/activation -> bf16,
+    the Transformer-Engine HYBRID pairing also used by the Mojo trainer, see
+    docs/ai/fp8_training_design.md §1.2). Per-tensor "current" (just-in-time)
+    amax scaling — simpler than the Mojo build's delayed/history scaling,
+    which exists purely for a performance reason (skip a max-reduction on
+    the critical path) that doesn't apply to this reference script.
+
+    cuBLASLt requires `mat_a` row-major and `mat_b` COL-major. The forward
+    GEMM gets col-major "for free" (`weight.t()` on a contiguous `[N,K]`
+    `nn.Parameter` is naturally `[K,N]` with stride `(1,K)`). The backward
+    GEMMs contract along a DIFFERENT axis than the forward GEMM did, so the
+    weight/activation/grad operand each needs re-quantizing from a freshly
+    `.t().contiguous()`-ed copy in the orientation that GEMM needs, then
+    `.t()`-ed back to a col-major VIEW — a pure memory-layout trick (the
+    quantized VALUES are unaffected by transposition, since quantization is
+    elementwise), not a numerics change. See
+    `tests/probe_torch_precisions.py`'s `probe_scaled_mm_fp8` for the same
+    pattern in isolation.
+    """
+
+    @staticmethod
+    def forward(ctx, x2d: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+        s_x = _amax_scale(x2d, _FP8_E4M3_MAX)
+        s_w = _amax_scale(weight, _FP8_E4M3_MAX)
+        xq = _quantize_e4m3(x2d, s_x)
+        wq = _quantize_e4m3(weight, s_w)
+        y = torch._scaled_mm(
+            xq,
+            wq.t(),
+            scale_a=(1.0 / s_x).reshape(1),
+            scale_b=(1.0 / s_w).reshape(1),
+            out_dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            y = y + bias.to(y.dtype)
+        ctx.save_for_backward(x2d, weight, bias if bias is not None else torch.empty(0))
+        ctx.has_bias = bias is not None
+        return y
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Tensor):
+        (grad_out,) = grad_outputs
+        x2d, weight, bias = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        s_g = _amax_scale(grad_out, _FP8_E5M2_MAX)
+        gq = _quantize_e5m2(grad_out, s_g)
+
+        # dgrad: dX[M,K] = G[M,N] @ W[N,K]. mat_b must be [N,K] col-major;
+        # requantize a [K,N]-row-major copy of W and take a `.t()` view.
+        s_w = _amax_scale(weight, _FP8_E4M3_MAX)
+        wtq = _quantize_e4m3(weight.t().contiguous(), s_w)  # [K, N] row-major
+        dx = torch._scaled_mm(
+            gq,
+            wtq.t(),
+            scale_a=(1.0 / s_g).reshape(1),
+            scale_b=(1.0 / s_w).reshape(1),
+            out_dtype=torch.bfloat16,
+        )
+
+        # wgrad: dW[N,K] = G^T[N,M] @ X[M,K]. Both operands need requantizing
+        # in the M-contracting orientation for the same col-major reason.
+        gtq = _quantize_e5m2(grad_out.t().contiguous(), s_g)  # [N, M] row-major
+        s_x = _amax_scale(x2d, _FP8_E4M3_MAX)
+        xtq = _quantize_e4m3(x2d.t().contiguous(), s_x)  # [K, M] row-major
+        dw = torch._scaled_mm(
+            gtq,
+            xtq.t(),
+            scale_a=(1.0 / s_g).reshape(1),
+            scale_b=(1.0 / s_x).reshape(1),
+            out_dtype=torch.bfloat16,
+        )
+
+        if ctx.has_bias:
+            dbias = grad_out.sum(dim=0).to(bias.dtype)
+        else:
+            dbias = None
+        return dx.to(x2d.dtype), dw.to(weight.dtype), dbias
+
+
+class Float8Linear(Linear):
+    """Drop-in replacement for `Linear` (a real subclass, so it type-checks
+    when swapped into an attribute typed `Linear`, e.g. `CausalSelfAttention.
+    c_attn`), swapped onto the model's QKV/attn-out and MLP fc/proj
+    projections under `--precision fp8` (every block, every layer — matches
+    `docs/ai/fp8_training_design.md`'s "the four per-block linear layers"
+    scope; LM head and embeddings stay bf16/fp32, same as the Mojo build).
+    Falls back to a plain matmul when `in_features`/`out_features` aren't
+    fp8-GEMM-eligible (see `_fp8_eligible`). `weight`/`bias` are inherited
+    from `Linear` unchanged (fp32 master weights); only `forward` differs.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        super().__init__(
+            in_features, out_features, bias=bias, device=device, dtype=dtype
+        )
+        self._eligible = _fp8_eligible(in_features, out_features)
+
+    @classmethod
+    def from_linear(cls, linear: "Linear") -> "Float8Linear":
+        mod = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+        with torch.no_grad():
+            mod.weight.copy_(linear.weight)
+            if linear.bias is not None and mod.bias is not None:
+                mod.bias.copy_(linear.bias)
+        if hasattr(linear, "LLMC_RESIDUAL_SCALE_FLAG"):
+            setattr(mod, "LLMC_RESIDUAL_SCALE_FLAG", linear.LLMC_RESIDUAL_SCALE_FLAG)
+        return mod
+
+    def forward(self, x: Tensor) -> Tensor:
+        orig_shape = x.shape
+        x2d = x.reshape(-1, self.in_features)
+        if not x2d.is_contiguous():
+            x2d = x2d.contiguous()
+        if self._eligible:
+            y = _Float8MatmulFn.apply(x2d, self.weight, self.bias)
+        else:
+            y = F.linear(x2d.to(self.weight.dtype), self.weight, self.bias)
+        return y.reshape(*orig_shape[:-1], self.out_features)
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _to_blocked(input_matrix: Tensor) -> Tensor:
+    """cuBLASLt's 128x4-tile / 32x4x4-internal block-scale-factor swizzle
+    (cuBLASLt docs §3.1.4.3.2). Re-derived independently (not imported from
+    `torch.testing._internal.common_quantized`, which needs the
+    not-installed `expecttest` package) — cross-checked against
+    `tests/probe_fp4/probe_fp4.cu`'s independent C++ derivation of the same
+    formula (both agree, see `tests/probe_fp4/RESULTS.md`)."""
+    rows, cols = input_matrix.shape
+    n_row_blocks = _ceil_div(rows, 128)
+    n_col_blocks = _ceil_div(cols, 4)
+    padded_rows, padded_cols = n_row_blocks * 128, n_col_blocks * 4
+    padded = input_matrix
+    if (rows, cols) != (padded_rows, padded_cols):
+        padded = torch.zeros(
+            (padded_rows, padded_cols),
+            device=input_matrix.device,
+            dtype=input_matrix.dtype,
+        )
+        padded[:rows, :cols] = input_matrix
+    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
+
+
+def _pack_uint4(uint8_data: Tensor) -> Tensor:
+    shape = uint8_data.shape
+    flat = uint8_data.contiguous().view(-1)
+    return (flat[1::2] << 4 | flat[::2]).view(*shape[:-1], shape[-1] // 2)
+
+
+def _nvfp4_eligible(in_features: int, out_features: int) -> bool:
+    # NVFP4 packs 2 elements/byte along the contraction (in_features) dim,
+    # and cuBLASLt needs the packed dim a multiple of 16 -> in_features a
+    # multiple of 32; out_features (unpacked) needs a multiple of 16. GPT-2's
+    # dims (768/3072) satisfy both; guarded for arbitrary custom configs.
+    return in_features % 32 == 0 and out_features % 16 == 0
+
+
+def _nvfp4_quantize(x2d: Tensor, block: int = _NVFP4_BLOCK) -> tuple[Tensor, Tensor]:
+    """RNE (no stochastic rounding) NVFP4 quantizer: E2M1 elements, E4M3
+    block scale (blocks along the last/contraction dim). Matches
+    `tests/probe_fp4/probe_fp4.cu`'s conventions (`scale = block_amax / 6.0`,
+    nearest-value E2M1 encode) — see `_quantize_nvfp4` in
+    `tests/probe_torch_precisions.py` for the isolated probe version this is
+    copied from."""
+    rows, cols = x2d.shape
+    ladder = torch.tensor(_NVFP4_LADDER, device=x2d.device)
+    xb = x2d.reshape(rows, cols // block, block).float()
+    amax = xb.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    scale = (amax / _NVFP4_MAX).to(torch.float8_e4m3fn)
+    scale_f32 = scale.float()
+    xq = (xb / scale_f32).clamp(-_NVFP4_MAX, _NVFP4_MAX)
+    sign = torch.sign(xq)
+    absval = xq.abs()
+    idx = torch.searchsorted(ladder, absval).clamp(max=len(ladder) - 1)
+    lo = ladder[(idx - 1).clamp(min=0)]
+    hi = ladder[idx]
+    nearest = torch.where((hi - absval).abs() < (absval - lo).abs(), hi, lo)
+    code_idx = torch.searchsorted(ladder, nearest).clamp(max=len(ladder) - 1)
+    sign_bit = (sign < 0).to(torch.uint8) << 3
+    code = (sign_bit | code_idx.to(torch.uint8)).reshape(rows, cols)
+    packed = _pack_uint4(code).view(torch.float4_e2m1fn_x2)
+    return packed, scale.reshape(rows, cols // block)
+
+
+def _nvfp4_scaled_mm(
+    a_packed: Tensor, a_scale: Tensor, b_packed_t: Tensor, b_scale: Tensor
+) -> Tensor:
+    from torch.nn.functional import ScalingType, SwizzleType
+
+    return F.scaled_mm(
+        a_packed,
+        b_packed_t,
+        scale_a=_to_blocked(a_scale),
+        scale_recipe_a=ScalingType.BlockWise1x16,
+        swizzle_a=SwizzleType.SWIZZLE_32_4_4,
+        scale_b=_to_blocked(b_scale),
+        scale_recipe_b=ScalingType.BlockWise1x16,
+        swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+        output_dtype=torch.bfloat16,
+    )
+
+
+class _NVFP4MatmulFwdFn(torch.autograd.Function):
+    """Forward-only NVFP4: `y = x @ weight.T (+ bias)` with the forward GEMM
+    run as a NATIVE NVFP4 block-scaled cuBLASLt/cutlass tensor-core GEMM
+    (`torch.nn.functional.scaled_mm`, `ScalingType.BlockWise1x16` — probed
+    WORKING on this GB10/sm_121 box, dispatching the same
+    `cutlass3x_sm120_..._ue4m3xe2m1_..._vs16` kernel
+    `tests/probe_fp4/RESULTS.md` found via raw cuBLASLt). Backward
+    (dgrad/wgrad) is plain bf16 matmul on the ORIGINAL (unquantized)
+    activation/weight — deliberately NOT NVFP4.
+
+    Why backward stays bf16: a real NVFP4 dgrad/wgrad needs each operand
+    re-blocked-and-requantized along whichever axis THAT GEMM contracts over
+    (forward contracts over in_features; dgrad contracts over out_features;
+    wgrad contracts over the batch*seq axis — three different block
+    orientations per tensor), and per
+    docs/ai/fp4_training_recipes_research.md §1, a numerically STABLE fwd+bwd
+    NVFP4 recipe additionally wants stochastic rounding on gradient operands
+    and a 16x16 Hadamard transform on the Wgrad input — machinery this
+    reference script has no other use for and doesn't implement anywhere
+    else. The Mojo trainer's `matmul_bwd_fp4` does implement all of this;
+    this class intentionally scopes down to "real NVFP4 forward, honest bf16
+    backward" so `--precision nvfp4` still demonstrates genuine end-to-end
+    NVFP4-tensor-core training (loss decreases through a real NVFP4 GEMM)
+    without silently mislabeling an under-built backward as the full recipe.
+    """
+
+    @staticmethod
+    def forward(ctx, x2d: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+        xq, xs = _nvfp4_quantize(x2d)
+        wq, ws = _nvfp4_quantize(weight)
+        y = _nvfp4_scaled_mm(xq, xs, wq.t(), ws)
+        if bias is not None:
+            y = y + bias.to(y.dtype)
+        ctx.save_for_backward(x2d, weight, bias if bias is not None else torch.empty(0))
+        ctx.has_bias = bias is not None
+        return y
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Tensor):
+        (grad_out,) = grad_outputs
+        x2d, weight, bias = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        dx = (grad_out.float() @ weight.float()).to(x2d.dtype)
+        dw = (grad_out.float().t() @ x2d.float()).to(weight.dtype)
+        if ctx.has_bias:
+            dbias = grad_out.sum(dim=0).to(bias.dtype)
+        else:
+            dbias = None
+        return dx, dw, dbias
+
+
+class NVFP4Linear(Linear):
+    """Drop-in replacement for `Linear` (a real subclass — see `Float8Linear`'s
+    docstring for why), swapped onto the MLP `c_fc`/`c_proj` projections of
+    MIDDLE transformer blocks only under `--precision nvfp4` (see
+    `_layer_in_fp4_range`, mirroring `train_gpt2.mojo`'s
+    `LLMM_FP4_FIRST`/`LLMM_FP4_LAST` policy —
+    docs/ai/fp4_training_recipes_research.md §1 "Selective high-precision
+    layers": keep the first ~2 and final ~2 blocks, plus all attention/
+    LayerNorm/embeddings/LM-head, in BF16). Forward is native NVFP4; backward
+    is bf16 — see `_NVFP4MatmulFwdFn`. Falls back to a plain matmul when
+    `in_features`/`out_features` aren't NVFP4-GEMM-eligible (`_nvfp4_eligible`).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        super().__init__(
+            in_features, out_features, bias=bias, device=device, dtype=dtype
+        )
+        self._eligible = _nvfp4_eligible(in_features, out_features)
+
+    @classmethod
+    def from_linear(cls, linear: "Linear") -> "NVFP4Linear":
+        mod = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+        with torch.no_grad():
+            mod.weight.copy_(linear.weight)
+            if linear.bias is not None and mod.bias is not None:
+                mod.bias.copy_(linear.bias)
+        if hasattr(linear, "LLMC_RESIDUAL_SCALE_FLAG"):
+            setattr(mod, "LLMC_RESIDUAL_SCALE_FLAG", linear.LLMC_RESIDUAL_SCALE_FLAG)
+        return mod
+
+    def forward(self, x: Tensor) -> Tensor:
+        orig_shape = x.shape
+        x2d = x.reshape(-1, self.in_features)
+        if not x2d.is_contiguous():
+            x2d = x2d.contiguous()
+        if self._eligible:
+            y = _NVFP4MatmulFwdFn.apply(x2d, self.weight, self.bias)
+        else:
+            y = F.linear(x2d.to(self.weight.dtype), self.weight, self.bias)
+        return y.reshape(*orig_shape[:-1], self.out_features)
+
+
+def _layer_in_fp4_range(layer: int, num_layers: int) -> bool:
+    """True if `layer` falls in the NVFP4-eligible middle-block range —
+    mirrors `train_gpt2.mojo`'s `_layer_in_fp4_range` (`LLMM_FP4_FIRST`
+    defaults to 2, `LLMM_FP4_LAST` defaults to `num_layers - 2`), overridable
+    via the same env vars for parity: `LLMM_FP4_FIRST`/`LLMM_FP4_LAST`."""
+    fp4_first = int(os.environ.get("LLMM_FP4_FIRST", 2))
+    fp4_last_override = int(os.environ.get("LLMM_FP4_LAST", -1))
+    fp4_last = fp4_last_override if fp4_last_override >= 0 else num_layers - 2
+    return fp4_first <= layer < fp4_last
+
+
+def swap_precision_layers(model: "GPT", precision: str) -> dict:
+    """Post-hoc, in-place swap of selected `Linear` submodules to
+    `Float8Linear`/`NVFP4Linear`. Must run AFTER model construction (i.e.
+    after `_init_weights`/pretrained-weight loading has already populated
+    plain `Linear`s) and BEFORE `.to(device)`/DDP-wrapping. Returns counters
+    for the startup banner."""
+    assert precision in ("fp8", "nvfp4"), precision
+    n_layer = model.config.n_layer
+    counts = {"fp8_linears": 0, "nvfp4_linears": 0, "nvfp4_layers": 0}
+    for i, block in enumerate(model.transformer.h):
+        kblock = cast(KarpathyBlock, block)
+        if precision == "fp8":
+            kblock.attn.c_attn = Float8Linear.from_linear(kblock.attn.c_attn)
+            kblock.attn.c_proj = Float8Linear.from_linear(kblock.attn.c_proj)
+            kblock.mlp.c_fc = Float8Linear.from_linear(kblock.mlp.c_fc)
+            kblock.mlp.c_proj = Float8Linear.from_linear(kblock.mlp.c_proj)
+            counts["fp8_linears"] += 4
+        elif precision == "nvfp4" and _layer_in_fp4_range(i, n_layer):
+            kblock.mlp.c_fc = NVFP4Linear.from_linear(kblock.mlp.c_fc)
+            kblock.mlp.c_proj = NVFP4Linear.from_linear(kblock.mlp.c_proj)
+            counts["nvfp4_linears"] += 2
+            counts["nvfp4_layers"] += 1
+    return counts
+
+
+def _torch_precision_capabilities(device_type: str) -> str:
+    """Short, dependency-free summary of what this torch build supports on
+    this device, for the startup banner. Presence-checks are dynamic; the
+    "empirically probed WORKING" annotation summarizes a one-time run of
+    `tests/probe_torch_precisions.py` on this box (torch/driver/GPU-specific
+    findings, not worth re-running every training step)."""
+    if device_type != "cuda":
+        return "torch fp8/nvfp4 tensor-core paths are CUDA-only; not applicable on this device."
+    cap = torch.cuda.get_device_capability()
+    name = torch.cuda.get_device_name()
+    has_fp8 = hasattr(torch, "float8_e4m3fn") and hasattr(torch, "_scaled_mm")
+    has_fp4 = hasattr(torch, "float4_e2m1fn_x2") and hasattr(torch, "_scaled_mm_v2")
+    return (
+        f"{name} (sm_{cap[0]}{cap[1]}), torch {torch.__version__}: "
+        f"float8_e4m3fn/_scaled_mm present={has_fp8}, "
+        f"float4_e2m1fn_x2/_scaled_mm_v2 present={has_fp4} "
+        f"(empirically probed WORKING on this box: e4m3xe4m3->bf16, "
+        f"e5m2xe4m3->bf16 grad-path, NVFP4 BlockWise1x16 fwd — see "
+        f"tests/probe_torch_precisions.py)"
+    )
+
+
+def precision_banner(
+    precision: str, device_type: str, swap_counts: Optional[dict] = None
+) -> str:
+    """Startup banner text: requested precision, what's actually active
+    (always native on this box — both probes passed, see
+    `tests/probe_torch_precisions.py`), and the torch capability findings."""
+    lines = [f"=== --precision={precision} ==="]
+    if precision == "fp32":
+        lines.append(
+            "Active: fp32 strict (allow_tf32=False, matmul_precision='highest'), no autocast."
+        )
+    elif precision == "tf32":
+        lines.append(
+            "Active: fp32 storage, TF32 tensor-core matmuls "
+            "(allow_tf32=True, matmul_precision='high'), no autocast."
+        )
+    elif precision == "bf16":
+        lines.append(
+            "Active: torch.amp.autocast(bfloat16) over fwd+loss; fp32 params/optimizer."
+        )
+    elif precision == "fp16":
+        lines.append(
+            "Active: torch.amp.autocast(float16) + GradScaler over "
+            "fwd+loss/backward/step; fp32 params/optimizer."
+        )
+    elif precision == "fp8":
+        lines.append(
+            "Active: NATIVE fp8 (Float8Linear on all 4 per-block projections: "
+            "qkv/attn_proj/mlp_fc/mlp_proj, every layer) — forward E4M3 x E4M3 "
+            "-> bf16, backward d_output in E5M2 (dgrad+wgrad), per-tensor "
+            "current/JIT amax scaling (not delayed-history). Everything else "
+            "(LayerNorm/softmax/embeddings/LM head) in bf16 autocast, fp32 "
+            "master weights."
+        )
+        if swap_counts:
+            lines.append(
+                f"  Swapped {swap_counts['fp8_linears']} Linear -> Float8Linear."
+            )
+    elif precision == "nvfp4":
+        lines.append(
+            "Active: NATIVE NVFP4 forward (E2M1 4-bit elements, 16-elem E4M3 "
+            "block scale, single-level BlockWise1x16 cuBLASLt/cutlass "
+            "tensor-core GEMM) on MLP fc/proj of MIDDLE blocks only "
+            "(LLMM_FP4_FIRST/LLMM_FP4_LAST-style policy, mirroring "
+            "train_gpt2.mojo); backward is bf16 matmul, NOT NVFP4 (see "
+            "NVFP4Linear docstring). Everything else bf16 autocast, fp32 "
+            "master weights."
+        )
+        if swap_counts:
+            lines.append(
+                f"  Swapped {swap_counts['nvfp4_linears']} Linear -> NVFP4Linear "
+                f"across {swap_counts['nvfp4_layers']} middle block(s)."
+            )
+    lines.append(f"  {_torch_precision_capabilities(device_type)}")
+    return "\n".join(lines)
+
+
+"""
 Our own, simple, Distributed Data Loader
 """
 
@@ -1335,6 +1830,19 @@ if __name__ == "__main__":
             "--dtype", type=str, default="float32", help="float32|float16|bfloat16"
         )
         parser.add_argument(
+            "--precision",
+            type=str,
+            default="",
+            help=(
+                "unified precision axis: fp32|tf32|bf16|fp16|fp8|nvfp4 "
+                "(fp8/nvfp4 are CUDA-only). Empty (default) preserves the "
+                "legacy --dtype/--tensorcores-driven behavior byte-for-byte, "
+                "for backward compatibility with scripts/benchmark_train.py's "
+                "MPS arm and any other existing caller. See "
+                "docs/ai/pytorch_precision_support.md."
+            ),
+        )
+        parser.add_argument(
             "--zero_stage",
             type=int,
             default=0,
@@ -1353,6 +1861,12 @@ if __name__ == "__main__":
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024, "sequence length must be between 1 and 1024"
     assert args.dtype in {"float32", "float16", "bfloat16", "float8"}, "invalid dtype"
+    _PRECISION_MODES = ("fp32", "tf32", "bf16", "fp16", "fp8", "nvfp4")
+    assert args.precision == "" or args.precision in _PRECISION_MODES, (
+        f"invalid --precision {args.precision!r}, expected '' (legacy "
+        f"--dtype/--tensorcores behavior) or one of {_PRECISION_MODES}"
+    )
+    precision_active = args.precision  # "" => legacy path, byte-identical to before
     assert args.model in {
         "gpt2",
         "gpt2-medium",
@@ -1431,23 +1945,58 @@ if __name__ == "__main__":
     print_zero_rank(f"=> Seed offset: {seed_offset}")
 
     # Set up a context manager following the desired dtype and device.
-    ptdtype = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        # "float8": torch.float8,
-    }[args.dtype]
-    # On MPS, torch.amp.autocast does not support float32 (warns and disables itself).
-    # Use nullcontext for float32 on MPS to avoid noise; use proper MPS autocast for fp16/bf16.
-    # On CPU, autocast with float32 is also a no-op so nullcontext is cleaner.
-    if device_type in ("mps", "cpu") and ptdtype == torch.float32:
-        ctx = contextlib.nullcontext()
-        print_zero_rank(f"Precision: float32 (no autocast on {device_type})")
-    else:
-        ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-        print_zero_rank(
-            f"Precision: {args.dtype} via torch.amp.autocast(device_type={device_type!r})"
+    #
+    # `precision_active == ""` (the default, i.e. `--precision` not passed) runs
+    # the ORIGINAL --dtype/--tensorcores-driven codepath below UNCHANGED — this
+    # is load-bearing for scripts/benchmark_train.py's MPS arm and any other
+    # existing caller, which never pass --precision (see
+    # docs/ai/pytorch_precision_support.md "compatibility" section).
+    scaler: Optional[torch.amp.GradScaler] = None
+    if precision_active:
+        # --- unified --precision path -------------------------------------
+        if precision_active in ("fp8", "nvfp4"):
+            assert device_type == "cuda", (
+                f"--precision {precision_active} requires CUDA "
+                f"(torch._scaled_mm's fp8/fp4 tensor-core dispatch); "
+                f"device_type={device_type!r}"
+            )
+        use_tf32 = precision_active == "tf32"
+        torch.backends.cuda.matmul.allow_tf32 = use_tf32
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = use_tf32
+        torch.set_float32_matmul_precision("high" if use_tf32 else "highest")
+
+        if precision_active in ("bf16", "fp8", "nvfp4"):
+            ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+        elif precision_active == "fp16":
+            ctx = torch.amp.autocast(device_type=device_type, dtype=torch.float16)
+        else:  # "fp32" / "tf32": strict or TF32-internal fp32 matmuls, no autocast
+            ctx = contextlib.nullcontext()
+
+        scaler = torch.amp.GradScaler(
+            device=device_type if device_type in ("cuda", "cpu") else "cpu",
+            enabled=(precision_active == "fp16" and device_type == "cuda"),
         )
+        print_zero_rank(f"Precision: --precision={precision_active!r} (unified axis)")
+    else:
+        # --- legacy path (default) ------------------------------------------
+        ptdtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            # "float8": torch.float8,
+        }[args.dtype]
+        # On MPS, torch.amp.autocast does not support float32 (warns and disables itself).
+        # Use nullcontext for float32 on MPS to avoid noise; use proper MPS autocast for fp16/bf16.
+        # On CPU, autocast with float32 is also a no-op so nullcontext is cleaner.
+        if device_type in ("mps", "cpu") and ptdtype == torch.float32:
+            ctx = contextlib.nullcontext()
+            print_zero_rank(f"Precision: float32 (no autocast on {device_type})")
+        else:
+            ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+            print_zero_rank(
+                f"Precision: {args.dtype} via torch.amp.autocast(device_type={device_type!r})"
+            )
 
     # RNG Setup
     torch.manual_seed(42)
@@ -1456,6 +2005,8 @@ if __name__ == "__main__":
 
     # Set the torch percision mode to use TensorFloat32 for matmuls
     # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    # (legacy knob; the unified --precision path above already set this itself
+    # when active, so this is a no-op unless a caller passes BOTH flags.)
     if args.tensorcores:
         torch.set_float32_matmul_precision("high")
 
@@ -1491,6 +2042,16 @@ if __name__ == "__main__":
     else:
         # Load the GPT-2 model weights
         model = GPT.from_pretrained(args.model)
+
+    # Low-precision layer swap (fp8/nvfp4 only): must happen AFTER weight
+    # init/loading above and BEFORE .to(device)/DDP-wrapping below. No-op
+    # (swap_counts stays None) for every other --precision value and for the
+    # legacy (precision_active == "") path.
+    swap_counts = None
+    if precision_active in ("fp8", "nvfp4"):
+        swap_counts = swap_precision_layers(cast(GPT, model), precision_active)
+    if precision_active:
+        print_zero_rank(precision_banner(precision_active, device_type, swap_counts))
 
     # Set Model to train mode/device
     model.train()
@@ -1716,18 +2277,35 @@ if __name__ == "__main__":
                 loss = loss / grad_accum_steps
                 lossf += loss.detach()  # track the mean loss
             if not args.inference_only:
-                loss.backward()
+                if scaler is not None:
+                    cast(Tensor, scaler.scale(loss)).backward()
+                else:
+                    loss.backward()
 
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.SUM)
 
+        # `scaler` is only non-None on the unified --precision path (see its
+        # construction above); it is a real GradScaler there, but only
+        # ACTUALLY enabled for --precision fp16 (its .scale()/.unscale_()/
+        # .step()/.update() are documented no-ops-that-fall-through-to-the-
+        # plain-optimizer-call when disabled — see torch.amp.GradScaler's
+        # docstring). The legacy (precision_active == "") path never
+        # constructs a scaler, so it always takes the `else` branch below,
+        # byte-identical to before this flag existed.
+        if scaler is not None:
+            scaler.unscale_(optimizer)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         # Determine and set the learning rate for this iteration
         lr = get_lr(step, learning_rate, decay, warmup, num_iters)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         # Step the optimizer
-        optimizer.step()
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         """
         Training step complete
