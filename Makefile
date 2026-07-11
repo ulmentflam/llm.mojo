@@ -333,21 +333,22 @@ data/.tinyshakespeare/tiny_shakespeare_train.bin:
 $(STARTER_PACK_FILES):
 	curl -fL -o $@ "$(STARTER_PACK_URL)/$@?download=true"
 
-# Writes git hook shims (respecting core.hooksPath, whatever it's set to)
-# that run `pre-commit run --hook-stage ...` per .pre-commit-config.yaml.
-# Tolerant: skips (doesn't fail `make install`) if pre-commit isn't on PATH.
+# Writes git hook shims (respecting core.hooksPath, whatever it's set to) that
+# run `pixi -q run pre-commit run --hook-stage ...` per .pre-commit-config.yaml.
+# pre-commit is a pixi dependency (installed by `make install`), so the shims do
+# not need it on the global PATH; only `pixi` (mise-managed) must be found. The
+# shims are written unconditionally; if the env is not built yet a note points
+# at `make install`.
 install-hooks:
-	@if command -v pre-commit >/dev/null 2>&1; then \
-		hooks_dir=$$(git rev-parse --git-path hooks); \
-		mkdir -p "$$hooks_dir"; \
-		printf '#!/usr/bin/env bash\nexec pre-commit run --hook-stage pre-commit\n' > "$$hooks_dir/pre-commit"; \
-		chmod +x "$$hooks_dir/pre-commit"; \
-		printf '#!/usr/bin/env bash\nexec pre-commit run --hook-stage pre-push\n' > "$$hooks_dir/pre-push"; \
-		chmod +x "$$hooks_dir/pre-push"; \
-		echo "Installed git hooks: pre-commit -> make lint, pre-push -> make check"; \
-	else \
-		echo "pre-commit not found on PATH — skipping git hook install."; \
-		echo "  Install it (e.g. 'pipx install pre-commit') then run: make install-hooks"; \
+	@hooks_dir=$$(git rev-parse --git-path hooks); \
+	mkdir -p "$$hooks_dir"; \
+	printf '#!/usr/bin/env bash\nexec pixi -q run pre-commit run --hook-stage pre-commit\n' > "$$hooks_dir/pre-commit"; \
+	chmod +x "$$hooks_dir/pre-commit"; \
+	printf '#!/usr/bin/env bash\nexec pixi -q run pre-commit run --hook-stage pre-push\n' > "$$hooks_dir/pre-push"; \
+	chmod +x "$$hooks_dir/pre-push"; \
+	echo "Installed git hooks: pre-commit -> make lint, pre-push -> make check (via pixi run pre-commit)"; \
+	if ! pixi -q run pre-commit --version >/dev/null 2>&1; then \
+		echo "  note: pre-commit is not in the pixi env yet — run 'make install' (or 'pixi install')."; \
 	fi
 
 check: lint build-mojo build build-profile

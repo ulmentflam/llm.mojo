@@ -37,6 +37,9 @@ mlx = ">=0.20"
 
 [pypi-dependencies]
 pyrefly = ">=0.16"
+# Drives the git hooks (make lint / make check) via `pixi run pre-commit`, so
+# contributors get it from `make install` without a separate global install.
+pre-commit = ">=4.6"
 
 [environments]
 cuda = ["cuda"]
