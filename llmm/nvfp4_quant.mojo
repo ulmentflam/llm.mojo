@@ -127,7 +127,10 @@ from std.sys import get_defined_int
 from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from std.gpu.primitives import block
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
+from std.gpu.memory import AddressSpace
+from layout import Layout
+from layout.layout_tensor import LayoutTensor
 
 from llmm.memory import ImmutKernelPtr, MutKernelPtr, ImmutMemPtr, MutMemPtr
 from llmm.lowp import (
@@ -709,6 +712,158 @@ def _nvfp4_quantize_gpu[
             kk += 2
 
 
+@always_inline
+def _nvfp4_quantize_transpose_coalesced_gpu[
+    dtype: DType,
+    BLOCK_ROWS: Int,
+    round_mode: Int,
+    BLOCK_SIZE: Int,
+](
+    q_ptr: MutKernelPtr[DType.uint8],
+    scale_ptr: MutKernelPtr[DType.uint8],
+    x_ptr: ImmutKernelPtr[dtype],  # physical [k, rows] row-major SOURCE
+    tensor_scale_ptr: MutKernelPtr[DType.float32],
+    rows: Int,  # LOGICAL output rows == source's trailing/contiguous axis
+    k: Int,  # LOGICAL output k == source's leading axis
+    n_col_tiles: Int,
+    sr_seed: UInt64,
+    sr_stream: UInt64,
+    sr_step: Int,
+) -> None:
+    """Coalesced-read counterpart of `_nvfp4_quantize_gpu[TRANSPOSE=True]`
+    (`nvfp4_quantize_transpose`'s pathology — 2026-07-10 FP4-closeout
+    finding, 3.2x per-call cost vs the natural `TRANSPOSE=False` kernel:
+    `_nvfp4_src_addr[TRANSPOSE=True]`'s read address `kidx * rows + r` has
+    `kidx` varying fastest within a thread — strided by `rows` elements per
+    step — while the natural path's `r * k + kidx` walks contiguous memory).
+
+    Thread assignment: one thread per LOGICAL row `r` within a
+    `BLOCK_SIZE`-row slab, one k-block `kb` per `block_idx.x`
+    (`grid = (k_blocks, ceildiv(rows, BLOCK_SIZE))`). Each thread loads its
+    16 elements `x_ptr[kidx * rows + r]`, `kidx = kb*16 .. kb*16+15`, into
+    registers; at each fixed `kidx` step, consecutive threads (consecutive
+    `r`) read CONSECUTIVE source addresses — the transposed read becomes a
+    sequence of 16 fully-coalesced warp transactions instead of 16 fully-
+    strided ones. All later steps read from those registers:
+
+    - `BLOCK_ROWS == 1`: the thread's own 16 registers ARE its scale block —
+      purely thread-local amax, no cross-thread communication at all.
+    - `BLOCK_ROWS == 16` (2D weights): the group amax spans 16 consecutive
+      rows = 16 consecutive threads; exchanged through a small per-thread-
+      amax shared-memory array (one barrier), then every thread of the group
+      reduces the same 16 values in the same (ascending-row) order.
+
+    Bit-identity with `_nvfp4_quantize_gpu[TRANSPOSE=True]`: max is an
+    order-invariant reduction (no floating-point-associativity hazard,
+    unlike a sum), the encode math (`encode_e4m3`/`encode_e2m1`) and the SR
+    counter formula (`(sr_step << 32) | (r*k + kidx)`, LOGICAL indices) are
+    byte-for-byte the same, and the packed-nibble/swizzled-scale writes are
+    the unchanged per-row formulas (`(r*k + k0)//2`,
+    `nvfp4_scale_swizzle_offset(r, kb, ...)` — one scale write per physical
+    row, which for BLOCK_ROWS=16 reproduces the replicated-value-per-row
+    layout the non-tiled kernel produces with its per-tile `rr` loop; see
+    `nvfp4_scale_buffer_size`'s docstring). The write pattern is identical
+    to the natural kernel's; only the READ pattern changes — verified
+    byte-exact by `tests/test_nvfp4_quant.mojo::
+    test_quantize_transpose_matches_materialized_transpose_gpu`.
+
+    (A first-attempt 32x32 shared-memory tile version of this kernel — one
+    thread per block-scale GROUP quantizing from SMEM — measured SLOWER than
+    the naive strided kernel at the BLOCK_ROWS=16 dgrad-weight shapes,
+    284 vs 243 us/call: with 16x16 groups only 4 of 256 threads survived
+    into the quantize phase. This register-per-row design keeps every
+    thread active end-to-end.)
+    """
+    var kb = Int(block_idx.x)
+    var r = Int(block_idx.y) * BLOCK_SIZE + Int(thread_idx.x)
+    var in_bounds = r < rows
+    var k0 = kb * NVFP4_BLOCK
+
+    # Per-thread-amax exchange buffer for the BLOCK_ROWS=16 group reduction.
+    var amax_sh = LayoutTensor[
+        DType.float32,
+        Layout.row_major(BLOCK_SIZE),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    # 1. Coalesced register load + thread-local amax. `k` is always a
+    # multiple of 16 (host wrapper enforces it), so a full k-block is
+    # guaranteed in-bounds along kidx; only `r` needs guarding. Out-of-
+    # bounds threads load zeros (amax 0.0) and must NOT return before the
+    # barrier below.
+    var vals = InlineArray[Float32, NVFP4_BLOCK](uninitialized=True)
+    var local_amax = Float32(0.0)
+    for kk in range(NVFP4_BLOCK):
+        var v = Float32(0.0)
+        if in_bounds:
+            v = x_ptr[(k0 + kk) * rows + r].cast[DType.float32]()
+        vals[kk] = v
+        var av = v if v >= 0.0 else -v
+        if av > local_amax:
+            local_amax = av
+
+    # 2. Group amax. BLOCK_ROWS=1: the thread-local value already IS the
+    # block amax. BLOCK_ROWS=16: exchange through shared memory (BLOCK_SIZE
+    # is a multiple of 16, so a 16-row group never straddles a slab
+    # boundary; out-of-bounds rows contribute 0.0, matching the non-tiled
+    # kernel's `r >= rows: continue` skip).
+    var amax: Float32
+    comptime if BLOCK_ROWS == 1:
+        amax = local_amax
+    else:
+        amax_sh.ptr[Int(thread_idx.x)] = local_amax
+        barrier()
+        var g0 = (Int(thread_idx.x) // BLOCK_ROWS) * BLOCK_ROWS
+        var m = Float32(0.0)
+        for i in range(BLOCK_ROWS):
+            var v = amax_sh.ptr[g0 + i]
+            if v > m:
+                m = v
+        amax = m
+
+    if not in_bounds:
+        return
+
+    var tensor_scale = tensor_scale_ptr[0]
+
+    # 3. block scale (identical formula to `_nvfp4_quantize_gpu`).
+    var block_scale_raw: Float32
+    if amax <= 0.0 or tensor_scale <= 0.0:
+        block_scale_raw = 1.0
+    else:
+        block_scale_raw = (amax / E2M1_MAX) / tensor_scale
+    var sc_code = encode_e4m3(block_scale_raw)
+    var sc_val = decode_e4m3(sc_code) * tensor_scale
+    if sc_val <= 0.0:
+        sc_val = 1.0
+    scale_ptr[nvfp4_scale_swizzle_offset(r, kb, n_col_tiles)] = sc_code
+
+    # 4. quantize + pack from registers (same per-element math and packed-
+    # byte addresses as `_nvfp4_quantize_gpu`).
+    var kk = 0
+    while kk < NVFP4_BLOCK:
+        var k0_idx = k0 + kk
+        var v0 = vals[kk] / sc_val
+        var c0: UInt8
+        comptime if round_mode == ROUND_MODE_STOCHASTIC:
+            var counter0 = (UInt64(sr_step) << 32) | UInt64(r * k + k0_idx)
+            var rand0 = rng_uniform01(sr_seed, counter0, sr_stream)
+            c0 = encode_e2m1[round_mode](v0, rand0)
+        else:
+            c0 = encode_e2m1[round_mode](v0)
+        var v1 = vals[kk + 1] / sc_val
+        var c1: UInt8
+        comptime if round_mode == ROUND_MODE_STOCHASTIC:
+            var counter1 = (UInt64(sr_step) << 32) | UInt64(r * k + k0_idx + 1)
+            var rand1 = rng_uniform01(sr_seed, counter1, sr_stream)
+            c1 = encode_e2m1[round_mode](v1, rand1)
+        else:
+            c1 = encode_e2m1[round_mode](v1)
+        q_ptr[(r * k + k0_idx) // 2] = pack_e2m1x2(c0, c1)
+        kk += 2
+
+
 def _nvfp4_quantize_impl[
     dtype: DType,
     target: StaticString,
@@ -749,31 +904,64 @@ def _nvfp4_quantize_impl[
         var k_blocks = k // NVFP4_BLOCK
         var tile_rows = nvfp4_scale_rows(rows, BLOCK_ROWS)
         var n_col_tiles = ceildiv(k_blocks, 4)
-        var total = tile_rows * k_blocks
-        comptime BLOCK_SIZE = 256
-        var num_blocks = ceildiv(total, BLOCK_SIZE) if total > 0 else 1
 
-        comptime quant_kernel = _nvfp4_quantize_gpu[
-            dtype, BLOCK_ROWS, round_mode, TRANSPOSE
-        ]
-        var compiled = device_ctx.compile_function[quant_kernel]()
-        device_ctx.enqueue_function(
-            compiled,
-            q_ptr,
-            scale_ptr,
-            x_ptr,
-            tensor_scale_ptr,
-            rows,
-            k,
-            tile_rows,
-            k_blocks,
-            n_col_tiles,
-            sr_seed,
-            sr_stream,
-            sr_step,
-            grid_dim=(num_blocks,),
-            block_dim=(BLOCK_SIZE,),
-        )
+        # `TRANSPOSE=True` dispatches to the coalesced-read kernel
+        # (2026-07-10/11 FP4 quantize-transpose optimization: the naive
+        # `TRANSPOSE=True` read pattern in `_nvfp4_quantize_gpu` is
+        # confirmed 3.2x slower per call than the natural, already-coalesced
+        # `TRANSPOSE=False` path — see
+        # `_nvfp4_quantize_transpose_coalesced_gpu`'s docstring).
+        # `TRANSPOSE=False` (plain `nvfp4_quantize`) is untouched — its
+        # reads are already coalesced by construction (consecutive threads'
+        # `kidx` steps by 1, matching the source's contiguous `k` axis), so
+        # a rewrite would add overhead for no access-pattern win.
+        comptime if TRANSPOSE:
+            comptime BLOCK_SIZE = 256
+            comptime coalesced_kernel = _nvfp4_quantize_transpose_coalesced_gpu[
+                dtype, BLOCK_ROWS, round_mode, BLOCK_SIZE
+            ]
+            var compiled_t = device_ctx.compile_function[coalesced_kernel]()
+            device_ctx.enqueue_function(
+                compiled_t,
+                q_ptr,
+                scale_ptr,
+                x_ptr,
+                tensor_scale_ptr,
+                rows,
+                k,
+                n_col_tiles,
+                sr_seed,
+                sr_stream,
+                sr_step,
+                grid_dim=(k_blocks, ceildiv(rows, BLOCK_SIZE)),
+                block_dim=(BLOCK_SIZE,),
+            )
+        else:
+            var total = tile_rows * k_blocks
+            comptime BLOCK_SIZE = 256
+            var num_blocks = ceildiv(total, BLOCK_SIZE) if total > 0 else 1
+
+            comptime quant_kernel = _nvfp4_quantize_gpu[
+                dtype, BLOCK_ROWS, round_mode, TRANSPOSE
+            ]
+            var compiled = device_ctx.compile_function[quant_kernel]()
+            device_ctx.enqueue_function(
+                compiled,
+                q_ptr,
+                scale_ptr,
+                x_ptr,
+                tensor_scale_ptr,
+                rows,
+                k,
+                tile_rows,
+                k_blocks,
+                n_col_tiles,
+                sr_seed,
+                sr_stream,
+                sr_step,
+                grid_dim=(num_blocks,),
+                block_dim=(BLOCK_SIZE,),
+            )
     else:
         raise Error("nvfp4_quantize is GPU-only")
 
