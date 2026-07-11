@@ -3947,3 +3947,136 @@ integration-verification and DRY-consolidation entries' trajectory gates.
 ### AI use statement
 
 Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
+
+## 2026-07-11 — FP4 kernel-optimization pass (opt/fp4-kernels): sanitizer clears F7, both deferred transpose fixes land, d36 reaches bf16 parity
+
+Mission: land the FP4 closeout's two deferred kernel fixes (F8's tiled
+RHT-prep transpose, and the confirmed-but-deferred `nvfp4_quantize_transpose`
+strided-read pathology) and re-measure. Baselines (shipped `main`, d32b199):
+fp4 184.2 ms/step at 124M/B=4/T=1024 (1.375x bf16's 133.9); d36/B=4
+fp4/bf16 = 1.245x (1073.2 vs 862.2 ms); ncu families: RHT-prep 18.8% of fp4
+GPU time (40,313.53 us — naive `_gpu_transpose_kernel` 568.28 us/call +
+`hadamard16` 691.52 us/call), NVFP4 quantize/amax/post-scale 14.4%
+(30,849.90 us), `nvfp4_quantize_transpose` 3.20x per-byte vs natural.
+
+### Step 1 — sanitizer verdict: F7 is environmental, not a race; and full-scale bit-stability is not a usable gate in this session
+
+`compute-sanitizer` (short B=1/T=256 x2-step training runs, GPU-locked):
+
+| run | tool | verdict |
+|---|---|---|
+| fp4 stock (d32b199) | racecheck | **0 hazards** (0 errors, 0 warnings) |
+| fp4 stock | memcheck | **0 errors** |
+| bf16 stock | racecheck | **0 hazards** |
+| fp4 modified (both fixes) | racecheck | **0 hazards** |
+| fp4 modified | memcheck | **0 errors** |
+
+So F7's fresh-binary divergence is NOT a correctness race — per the mission
+brief, layout-only fixes are judged by bit-identity-after-warmup. But a
+NEW characterization emerged while gating: **at B=4/T=1024, even the stock
+binary's warm runs are not bit-stable in this session** — four consecutive
+runs of a freshly-built, git-clean baseline (F7 protocol, first run
+discarded) differed pairwise from step 2 onward, on an idle GPU
+(nvidia-smi: no tenant). The closeout's "5 warm runs unanimous" property
+did not reproduce. Divergences stay small (~0.1-0.5% per-step loss), step 1
+is always bit-identical (fwd deterministic; the wiggle enters through the
+gradient path — consistent with F7's non-associative LN-backward
+`Atomic.fetch_add` hypothesis, whose summation order is scheduling-
+dependent every run, not just on first-touch). Implication: a full-scale
+bit-identity gate cannot certify ANY change in an environment where it
+fails on stock code (cf. MEMORY.md weak-gates-overrule-nothing — a gate
+must be able to catch the failure it guards, and this one "fails"
+unconditionally). Substitute gates used instead (all CAN catch a wrong
+kernel): sanitizer (above), byte-exact unit tests, and full-training
+bit-identity at the scale where training IS deterministic (B=1/T=256:
+10-step runs are bitwise self-stable run-to-run, and — decisive —
+**cross-binary bit-identical between the stock baseline and the final
+modified build**, all 10 steps + 3 val losses).
+
+### Fix 1 (commit 979d06c) — RHT-prep: tiled transpose + fused warp-shuffle Hadamard
+
+F8's 32x32-SMEM-tile transpose re-landed, plus one step beyond the recipe:
+the 16-wide forward Hadamard is FUSED into the tile kernel's write phase.
+In phase 2 a Hadamard block is exactly 16 consecutive lanes of the writing
+warp, so the butterfly runs as 4 `warp.shuffle_xor` stages (offsets
+1/2/4/8, confined to 16-lane halves; per-stage ops are the same
+`a+b`/`a-b` pairs as `_fwht16`, so bit-exact by construction). The
+separate `hadamard16_fwd_gpu` launch — and its full extra read+write of
+the tensor — is gone from the wgrad path entirely.
+
+| RHT-prep family (1-step ncu, T=1024) | before | after |
+|---|---:|---:|
+| transpose kernel | 18,184.83 us (568.28 us/call x32) | 5,399.52 us (fused: 277.22 us/call x16 + 60.25 us/call x16) |
+| hadamard16 kernel | 22,128.70 us (691.52 us/call x32) | **0 (eliminated)** |
+| **family total** | **40,313.53 us (18.8%)** | **5,399.52 us (3.1%) — 7.5x** |
+
+### Fix 2 (commit f6a1492) — `nvfp4_quantize_transpose`: register-per-row coalesced reads
+
+The planned 32x32-SMEM-tile port of fp8's Optimization A was implemented
+first and measured **SLOWER than the naive kernel** (284 vs 243 us/call at
+the dgrad-weight BLOCK_ROWS=16 shapes): quantizing one block-scale GROUP
+per thread from SMEM leaves 4 of 256 threads alive after the tile load —
+fp8's tile pattern does not transplant onto a kernel whose output work is
+per-16x16-group rather than per-element. Replaced with a register-per-row
+design (one thread per logical row per k-block; each fixed-kidx step reads
+consecutive addresses across consecutive threads -> 16 fully-coalesced
+transactions; BLOCK_ROWS=16 group amax via one SMEM exchange — max is
+order-invariant, no FP-associativity hazard). Output addresses, encode
+math, and SR counters byte-identical; the T2a byte-exact unit test stays
+green.
+
+| dgrad weight quantize_transpose | before | after |
+|---|---:|---:|
+| us/call (16 calls/step) | 243.45 | **135.57** |
+| per-byte ratio vs natural quantize (74.99 us/call same tensors) | 3.20x | **1.81x** |
+
+### Gates (final tree, all green)
+
+- `test_nvfp4_quant` 18/18 (incl. byte-exact transpose-quantize identity),
+  `test_matmul_bwd_fp4` 5/5, `test_lowp_gemm_fp4` 8/8, `test_hadamard` 5/5,
+  `test_matmul_fwd_fp4` 2/2 — every printed site-gate number identical to
+  the pre-change published values to every digit (e.g. wgrad-gaussian
+  RHT-on 0.1664202, outlier RHT-on 0.09687754, fc-bwd d_weight 0.16635847).
+- B=1/T=256 10-step training: bitwise self-stable AND cross-binary
+  identical to stock (see step 1).
+- B=4/T=1024 10-step trajectory (F7 protocol, run 2): step 1 bit-exact
+  4.408221; all later steps inside the stock baseline's own run-to-run
+  envelope (final val 3.7624 vs baseline family 3.764-3.769).
+- `make lint` clean; all commits through pre-commit hooks (no --no-verify).
+
+### Re-measurement (interleaved wall-clock, arm order flipped per round)
+
+**d12 (124M) / B=4 / T=1024** (checkpoint init, `-x 21 -v 0 -s 0`, median
+of 20 steps/round after dropping step 1, n=40/arm):
+
+| arm | r1 median | r2 median | combined | baseline |
+|---|---:|---:|---:|---:|
+| fp4 | 154.47 | 159.19 | **155.82 ms** | 184.2 ms |
+| bf16 | 134.94 | 134.91 | **134.91 ms** | 133.9 ms |
+| **fp4/bf16** | | | **1.155x** | 1.375x |
+
+**d36 (774M) / B=4 / T=1024** (`-e d36` random init, FineWeb shard, sweep
+protocol: `-x 20 -v 0 -s 0 -n 0`, first 5 dropped, mean of 15, n=30/arm):
+
+| arm | r1 mean | r2 mean | combined mean | baseline |
+|---|---:|---:|---:|---:|
+| fp4 | 870.0 | 869.9 | **870.0 ms** | 1073.2 ms |
+| bf16 | 859.5 | 873.3 | **866.4 ms** | 862.2 ms |
+| **fp4/bf16** | | | **1.004x — parity** | 1.245x |
+
+(bf16's two d36 rounds straddle the fp4 number — 859.5 first-in-window vs
+873.3 last — i.e. the residual 0.4% is inside thermal-drift noise, TF4.)
+
+fp4 step time: **184.2 -> 155.8 ms at 124M (−15.4%)** and **1073.2 ->
+870.0 ms at d36 (−18.9%)**; total 1-step GPU time 214,861.73 ->
+176,248.70 us (−18.0%). Combined fp4-specific overhead (quantize/amax/
+post-scale + RHT-prep) 71,163 -> 33,946 us; the remaining gap to bf16 at
+124M is now dominated by the quantize/amax family itself (28,547 us,
+16.2%), of which the largest single bucket is the amax-partial pass over
+the two RHT wgrad scratch tensors (7,564 us — a candidate for folding into
+the fused transpose kernel's epilogue in a future pass, since the tensor
+scale only needs the post-RHT amax).
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
