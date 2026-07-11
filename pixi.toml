@@ -8,7 +8,11 @@ version = "0.1.0"
 [tasks]
 
 # mlx (osx-arm64, below) needs the __osx virtual package to prove macOS >= 13.3;
-# declare the floor so the solve on Apple Silicon can satisfy it.
+# declare the floor so the solve on Apple Silicon can satisfy it. pixi 0.72.2
+# warns that this table is deprecated in favor of inline virtual packages on
+# `platforms`, but its resolver still rejects that syntax ("expected a string,
+# found table"), so keep this table until a newer pixi accepts the replacement.
+# (The Makefile passes `pixi -q` to hide the deprecation warning meanwhile.)
 [system-requirements]
 macos = "14.0"
 

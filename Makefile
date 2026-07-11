@@ -127,6 +127,34 @@ IS_APPLE_SILICON := $(shell [ "$$(uname -s)" = "Darwin" ] && [ "$$(uname -m)" = 
 
 SHELL := /bin/bash
 
+# Every pixi call in this Makefile goes through $(PIXI) so -q is applied
+# globally. pixi 0.72.2 prints a deprecated-[system-requirements] warning box on
+# each invocation; its suggested replacement (virtual packages inline in the
+# `platforms` array) parses but is rejected by 0.72.2's resolver ("expected a
+# string, found table"), so the manifest cannot migrate until a newer pixi
+# ships. -q hides pixi's own WARN output (the deprecation box) while passing
+# subprocess stdout/stderr and real errors through untouched. Run
+# `make PIXI=pixi <target>` to see the warnings again.
+PIXI ?= pixi -q
+
+# Pixi env auto-reprovision. mise upgrades the pixi binary in place (0.70.2 ->
+# 0.72.2 here), which leaves .pixi/envs/* provisioned by the old pixi; the next
+# on-the-fly `pixi run` reinstall can then flake with "no platform supported by
+# it matches the current system". A plain `pixi install` reprovisions cleanly,
+# so the pixi-using quality gates take this version-stamped sentinel as an
+# order-only prerequisite: the stamp path embeds the pixi version, so a bump
+# invalidates it and forces exactly one reinstall; in steady state it is a
+# no-op file test. `make install` stays the explicit manual reprovision.
+PIXI_VERSION := $(shell pixi --version 2>/dev/null | awk '{print $$2}')
+PIXI_STAMP := .pixi/.provisioned-$(PIXI_VERSION)
+
+$(PIXI_STAMP):
+	@mkdir -p .pixi
+	$(PIXI) install
+	@if [ -d .pixi/envs/cuda ]; then $(PIXI) install -e cuda; fi
+	@rm -f .pixi/.provisioned-*
+	@touch $@
+
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 \
@@ -157,6 +185,8 @@ help:
 	@echo "                        (idempotent — skips files already present; ~1.5 GB total)"
 	@echo "  install-hooks         Install git pre-commit/pre-push hooks (make lint / make check)"
 	@echo "  update                Update pixi dependencies and refresh pixi.lock"
+	@echo "  NOTE: after a pixi/toolchain upgrade, 'make install' reprovisions the env"
+	@echo "        (build/lint/check self-heal a stale env automatically)."
 	@echo ""
 	@echo "Quality gates:"
 	@echo "  check         Run lint (incl. typecheck), build-mojo, build train_gpt2, and build-profile"
@@ -270,11 +300,11 @@ help:
 # `install-cuda-with-data` for that (needed before `make train`/`make verify`/
 # `make benchmark*` will work) — or run `make data` standalone at any point.
 install:
-	pixi install
+	$(PIXI) install
 	@$(MAKE) install-hooks
 
 install-cuda:
-	pixi install -e cuda
+	$(PIXI) install -e cuda
 	@$(MAKE) install-hooks
 
 install-with-data: install
@@ -284,7 +314,7 @@ install-cuda-with-data: install-cuda
 	@$(MAKE) data
 
 update:
-	pixi update
+	$(PIXI) update
 
 # ---------------------------------------------------------------------------
 # Dataset + starter-weights download. One-time (~1.5 GB); each file is a real
@@ -298,7 +328,7 @@ data: data/.tinyshakespeare/tiny_shakespeare_train.bin $(STARTER_PACK_FILES)
 	@echo "Data ready: tokenized Tiny Shakespeare + GPT-2 124M starter weights."
 
 data/.tinyshakespeare/tiny_shakespeare_train.bin:
-	pixi run python data/tinyshakespeare.py
+	$(PIXI) run python data/tinyshakespeare.py
 
 $(STARTER_PACK_FILES):
 	curl -fL -o $@ "$(STARTER_PACK_URL)/$@?download=true"
@@ -326,9 +356,9 @@ check: lint build-mojo build build-profile
 # DataLoader uses Python glob; pixi run supplies the Modular std/toolchain env.
 build build-train: $(TRAIN_BIN)
 
-$(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+$(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES) | $(PIXI_STAMP)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
 
 # bf16 mixed-precision training binary (GPU-only — see the bf16-build-needs-
 # gpu-only-dispatch guard in train_gpt2.mojo). All training flags are passed
@@ -340,7 +370,7 @@ build-bf16: $(TRAIN_BIN_BF16)
 
 $(TRAIN_BIN_BF16): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_BF16) $(TRAIN_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_BF16) $(TRAIN_MOJO_SRC)
 
 # fp8 mixed-precision training binary (GPU-only, same policy as bf16 — see the
 # bf16-build-needs-gpu-only-dispatch guard in train_gpt2.mojo, which also
@@ -355,7 +385,7 @@ build-fp8: $(TRAIN_BIN_FP8)
 
 $(TRAIN_BIN_FP8): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_FP8) $(TRAIN_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_FP8) $(TRAIN_MOJO_SRC)
 
 # fp4 (NVFP4) mixed-precision training binary (GPU-only, same policy as
 # bf16/fp8 above). docs/ai/fp4_training_recipes_research.md: -D
@@ -371,7 +401,7 @@ build-fp4: $(TRAIN_BIN_FP4)
 
 $(TRAIN_BIN_FP4): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_FP4) $(TRAIN_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_FP4) $(TRAIN_MOJO_SRC)
 
 train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@$(TRAIN_RUNNER)
@@ -430,9 +460,9 @@ train-metal: $(TRAIN_BIN) $(TRAIN_RUNNER)
 # train_gpt2.cu).
 build-profile: $(PROFILE_BIN)
 
-$(PROFILE_BIN): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+$(PROFILE_BIN): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES) | $(PIXI_STAMP)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN) $(PROFILE_MOJO_SRC)
 
 # bf16 mixed-precision build of the harness (params/acts/grads bf16, fp32 master
 # weights + optimizer moments). GPU-only by policy; see profile_gpt2.mojo.
@@ -440,7 +470,7 @@ build-profile-bf16: $(PROFILE_BIN_BF16)
 
 $(PROFILE_BIN_BF16): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_BF16) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_BF16) $(PROFILE_MOJO_SRC)
 
 # fp8 build of the profiling harness (see build-fp8 above for the Chunk A
 # inert-flag caveat).
@@ -448,7 +478,7 @@ build-profile-fp8: $(PROFILE_BIN_FP8)
 
 $(PROFILE_BIN_FP8): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP8) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP8) $(PROFILE_MOJO_SRC)
 
 # A1 static-scales profiling harness (docs/ai/speedrun_techniques_
 # research.md A1) -- same binary shape as PROFILE_BIN_FP8, `-D
@@ -460,26 +490,26 @@ build-profile-fp8-static: $(PROFILE_BIN_FP8_STATIC)
 
 $(PROFILE_BIN_FP8_STATIC): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 -D LLMM_FP8_STATIC_SCALES=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP8_STATIC) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 -D LLMM_FP8_STATIC_SCALES=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP8_STATIC) $(PROFILE_MOJO_SRC)
 
 # fp4 build of the profiling harness (see build-fp4 above).
 build-profile-fp4: $(PROFILE_BIN_FP4)
 
 $(PROFILE_BIN_FP4): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP4) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP4) $(PROFILE_MOJO_SRC)
 
 build-infer: $(INFER_BIN)
 
 $(INFER_BIN): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN) $(INFER_MOJO_SRC)
 
 build-infer-bf16: $(INFER_BIN_BF16)
 
 $(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
 
 # fp8 build of the inference binary (see build-fp8 above for the Chunk A
 # inert-flag caveat). FP8/FP4 load the bf16 checkpoint (storage stays bf16).
@@ -487,7 +517,7 @@ build-infer-fp8: $(INFER_BIN_FP8)
 
 $(INFER_BIN_FP8): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_FP8) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_FP8) $(INFER_MOJO_SRC)
 
 # Chunk F gradient gate (docs/ai/fp8_training_design.md Chunk F / gotchas E5):
 # dump all 148 param-gradient tensors after one fwd+bwd step on the fixed
@@ -504,11 +534,11 @@ GRAD_DUMP_DIR_FP8 := build/grad_dump_fp8
 
 $(DUMP_BIN_BF16): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_BF16) $(DUMP_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_BF16) $(DUMP_MOJO_SRC)
 
 $(DUMP_BIN_FP8): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_FP8) $(DUMP_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_FP8) $(DUMP_MOJO_SRC)
 
 # GPU-only (both dump binaries require an accelerator); run under the shared
 # GPU lock in contended environments: `flock -w 10800 /tmp/llmm-gpu.lock -c
@@ -517,7 +547,7 @@ verify-fp8-grads: $(DUMP_BIN_BF16) $(DUMP_BIN_FP8)
 	@mkdir -p $(GRAD_DUMP_DIR_BF16) $(GRAD_DUMP_DIR_FP8)
 	./$(DUMP_BIN_BF16) $(GRAD_DUMP_DIR_BF16)
 	./$(DUMP_BIN_FP8) $(GRAD_DUMP_DIR_FP8)
-	pixi run -e cuda python3 tests/compare_grad_dumps.py $(GRAD_DUMP_DIR_FP8) $(GRAD_DUMP_DIR_BF16)
+	$(PIXI) run -e cuda python3 tests/compare_grad_dumps.py $(GRAD_DUMP_DIR_FP8) $(GRAD_DUMP_DIR_BF16)
 
 # A1 static-scales variant of the same gate (docs/ai/speedrun_techniques_
 # research.md A1): dumps under `-D LLMM_PRECISION=fp8 -D
@@ -531,13 +561,13 @@ GRAD_DUMP_DIR_FP8_STATIC := build/grad_dump_fp8_static
 
 $(DUMP_BIN_FP8_STATIC): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 -D LLMM_FP8_STATIC_SCALES=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_FP8_STATIC) $(DUMP_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 -D LLMM_FP8_STATIC_SCALES=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_FP8_STATIC) $(DUMP_MOJO_SRC)
 
 verify-fp8-static-grads: $(DUMP_BIN_BF16) $(DUMP_BIN_FP8_STATIC)
 	@mkdir -p $(GRAD_DUMP_DIR_BF16) $(GRAD_DUMP_DIR_FP8_STATIC)
 	./$(DUMP_BIN_BF16) $(GRAD_DUMP_DIR_BF16)
 	./$(DUMP_BIN_FP8_STATIC) $(GRAD_DUMP_DIR_FP8_STATIC)
-	pixi run -e cuda python3 tests/compare_grad_dumps.py $(GRAD_DUMP_DIR_FP8_STATIC) $(GRAD_DUMP_DIR_BF16)
+	$(PIXI) run -e cuda python3 tests/compare_grad_dumps.py $(GRAD_DUMP_DIR_FP8_STATIC) $(GRAD_DUMP_DIR_BF16)
 
 # A1 calibration tool (docs/ai/speedrun_techniques_research.md A1): runs N
 # fp8 training steps with the existing dynamic delayed-scaling path and
@@ -552,7 +582,7 @@ CALIBRATE_BIN_FP8 := build/calibrate_fp8_scales_fp8
 
 $(CALIBRATE_BIN_FP8): $(CALIBRATE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(CALIBRATE_BIN_FP8) $(CALIBRATE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(CALIBRATE_BIN_FP8) $(CALIBRATE_MOJO_SRC)
 
 calibrate-fp8-scales: $(CALIBRATE_BIN_FP8)
 	./$(CALIBRATE_BIN_FP8) $(ARGS)
@@ -568,7 +598,7 @@ EVAL_T ?= 512
 data-hellaswag: $(EVAL_BIN)
 
 $(EVAL_BIN):
-	pixi run python data/hellaswag.py
+	$(PIXI) run python data/hellaswag.py
 
 eval: build-infer-bf16 $(EVAL_BIN)
 	./$(INFER_BIN_BF16) --eval $(CHECKPOINT) $(EVAL_BIN) $(EVAL_B) $(EVAL_T)
@@ -579,13 +609,13 @@ eval-cpu: build-infer $(EVAL_BIN)
 # Runs `make eval`, computes a Wilson CI, and renders the llm.mojo-vs-llm.c
 # comparison chart into figures/ (see scripts/benchmark_eval.py's docstring).
 benchmark-eval:
-	pixi run python scripts/benchmark_eval.py
+	$(PIXI) run python scripts/benchmark_eval.py
 
 # Tracing build: same harness, with the per-thread kernel instrumentation
 # compiled in via -D LLMM_TRACE=1.
 $(PROFILE_TRACE_BIN): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_TRACE=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_TRACE_BIN) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_TRACE=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_TRACE_BIN) $(PROFILE_MOJO_SRC)
 
 # Run one forward/backward/update step and emit a Chrome-trace-format JSON of the
 # high-level phases, loadable directly at https://ui.perfetto.dev. Set
@@ -630,7 +660,7 @@ profile-ncu: $(PROFILE_PROF_BIN) $(PROFILE_SCRIPT)
 		echo "SKIPPED: profile-ncu requires NVIDIA Nsight Compute (ncu) — not available on Apple Silicon."; \
 		echo "  Use 'make profile-metal' for a Perfetto trace on the Metal GPU."; \
 	else \
-		$(PROFILE_ENV) pixi run -e cuda python $(PROFILE_SCRIPT) \
+		$(PROFILE_ENV) $(PIXI) run -e cuda python $(PROFILE_SCRIPT) \
 			--exe $(PROFILE_PROF_BIN) --target $(PROFILE_TARGET) \
 			--output $(PROFILE_PROF_BIN).ncu.csv; \
 	fi
@@ -643,7 +673,7 @@ profile-fp32-ncu: $(PROFILE_BIN) $(PROFILE_SCRIPT)
 		echo "SKIPPED: profile-fp32-ncu requires NVIDIA ncu — not available on Apple Silicon."; \
 		echo "  Use 'make profile-metal' for a Perfetto trace on the Metal GPU."; \
 	else \
-		$(PROFILE_ENV) pixi run -e cuda python $(PROFILE_SCRIPT) \
+		$(PROFILE_ENV) $(PIXI) run -e cuda python $(PROFILE_SCRIPT) \
 			--exe $(PROFILE_BIN) --target $(PROFILE_TARGET) \
 			--output $(PROFILE_BIN).ncu.csv; \
 	fi
@@ -660,7 +690,7 @@ profile-nsys: $(PROFILE_PROF_BIN)
 		echo "SKIPPED: profile-nsys requires NVIDIA Nsight Systems (nsys) — not available on Apple Silicon."; \
 		echo "  Use 'make profile-metal' for a Perfetto trace on the Metal GPU."; \
 	else \
-		$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
+		$(PROFILE_ENV) $(PIXI) run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
 			-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET); \
 		echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"; \
 	fi
@@ -673,7 +703,7 @@ profile-fp32-nsys: $(PROFILE_BIN)
 		echo "SKIPPED: profile-fp32-nsys requires NVIDIA nsys — not available on Apple Silicon."; \
 		echo "  Use 'make profile-metal' for a Perfetto trace on the Metal GPU."; \
 	else \
-		$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
+		$(PROFILE_ENV) $(PIXI) run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
 			-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET); \
 		echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"; \
 	fi
@@ -686,7 +716,7 @@ profile-nsys-cpu: PROFILE_PROF_BIN := $(PROFILE_BIN)
 profile-nsys-cpu: PROFILE_NSYS_ENV :=
 profile-nsys-cpu: PROFILE_NSYS_FLAGS := --force-overwrite true --trace=osrt --sample=process-tree
 profile-nsys-cpu: $(PROFILE_BIN)
-	$(PROFILE_ENV) pixi run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
+	$(PROFILE_ENV) $(PIXI) run $(PROFILE_NSYS_ENV) nsys profile $(PROFILE_NSYS_FLAGS) \
 		-o $(PROFILE_PROF_BIN).$(PROFILE_TARGET) $(PROFILE_PROF_BIN) $(PROFILE_TARGET)
 	@echo "nsys report: $(PROFILE_NSYS_REP) (per-thread CPU timeline in Nsight Systems)"
 
@@ -723,7 +753,7 @@ build-llmc: build-llmc-cpu build-llmc-gpu
 
 # Benchmarks: histogram of per-step train-loop time, llm.mojo vs llm.c.
 benchmark-cpu: $(PROFILE_BIN) build-llmc-cpu $(BENCH_SCRIPT)
-	pixi run python $(BENCH_SCRIPT) --device cpu $(BENCH_ARGS) \
+	$(PIXI) run python $(BENCH_SCRIPT) --device cpu $(BENCH_ARGS) \
 		--cpu-steps $(BENCH_CPU_STEPS)
 
 # Runs in the cuda pixi env: the default env's torch has no CUDA, and the
@@ -731,7 +761,7 @@ benchmark-cpu: $(PROFILE_BIN) build-llmc-cpu $(BENCH_SCRIPT)
 # with CUDA enabled" → empty sample list → row omitted), so the default env
 # yields a 4-arm table with no error. Found in the 2026-07-10 regression sweep.
 benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
-	pixi run -e cuda python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
+	$(PIXI) run -e cuda python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
 		--gpu-steps $(BENCH_GPU_STEPS)
 
 # Apple Silicon Metal GPU benchmark: llm.mojo vs PyTorch MPS vs MLX, fp32+bf16.
@@ -741,7 +771,7 @@ benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
 # run`, so no extra setup step). Hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS
 # (default 10 due to ~6.5 s/step), BENCH_COOLDOWN_S (default 30 s, M4 Max thermal).
 benchmark-metal: $(PROFILE_BIN) $(PROFILE_BIN_BF16) $(BENCH_SCRIPT)
-	pixi run python $(BENCH_SCRIPT) --device metal $(BENCH_ARGS) \
+	$(PIXI) run python $(BENCH_SCRIPT) --device metal $(BENCH_ARGS) \
 		--metal-steps $(BENCH_METAL_STEPS) --cooldown-s $(BENCH_COOLDOWN_S)
 
 # Auto mode: on Apple Silicon run the Metal benchmark; on NVIDIA run CPU + GPU.
@@ -750,12 +780,12 @@ benchmark: $(PROFILE_BIN) $(PROFILE_BIN_BF16) $(BENCH_SCRIPT)
 	@echo "Apple Silicon detected — running Metal benchmark (llm.c CUDA not available)."
 	@echo "  llm.c has no Metal port; baseline is PyTorch MPS."
 	@echo "  4 arms: llm.mojo fp32+bf16, PyTorch MPS fp32+bf16."
-	pixi run python $(BENCH_SCRIPT) --device auto $(BENCH_ARGS) \
+	$(PIXI) run python $(BENCH_SCRIPT) --device auto $(BENCH_ARGS) \
 		--cpu-steps $(BENCH_CPU_STEPS) --metal-steps $(BENCH_METAL_STEPS) \
 		--cooldown-s $(BENCH_COOLDOWN_S)
 else
 benchmark: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc $(BENCH_SCRIPT)
-	pixi run python $(BENCH_SCRIPT) --device auto $(BENCH_ARGS) \
+	$(PIXI) run python $(BENCH_SCRIPT) --device auto $(BENCH_ARGS) \
 		--cpu-steps $(BENCH_CPU_STEPS) --gpu-steps $(BENCH_GPU_STEPS)
 endif
 
@@ -769,7 +799,7 @@ LLMC_GPU_ARGS = -e gpt2_124M_bf16.bin \
 	-b $(PROFILE_B) -t $(PROFILE_T) -x $(PROFILE_STEPS) -v 0 -s 0 -l 0
 
 stage-llmc: $(BENCH_SCRIPT)
-	pixi run python $(BENCH_SCRIPT) --stage-only --device gpu
+	$(PIXI) run python $(BENCH_SCRIPT) --stage-only --device gpu
 
 # Profile Karpathy's CUDA kernels with ncu, through the SAME analysis table as
 # our Mojo kernels (profile_gpt2.py categorizes both by kernel name). Compare
@@ -778,7 +808,7 @@ profile-llmc-ncu: build-llmc-gpu stage-llmc $(PROFILE_SCRIPT)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		echo "SKIPPED: profile-llmc-ncu requires NVIDIA ncu — not available on Apple Silicon."; \
 	else \
-		pixi run -e cuda python $(PROFILE_SCRIPT) \
+		$(PIXI) run -e cuda python $(PROFILE_SCRIPT) \
 			--exe $(abspath $(LLMC_GPU_BIN)) \
 			--exe-args "$(LLMC_GPU_ARGS)" \
 			--cwd build/llmc \
@@ -790,7 +820,7 @@ profile-llmc-nsys: build-llmc-gpu stage-llmc
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		echo "SKIPPED: profile-llmc-nsys requires NVIDIA nsys — not available on Apple Silicon."; \
 	else \
-		cd build/llmc && pixi run -e cuda nsys profile --force-overwrite true \
+		cd build/llmc && $(PIXI) run -e cuda nsys profile --force-overwrite true \
 			--trace=cuda,nvtx,osrt -o $(abspath build/profile_llmc) \
 			$(abspath $(LLMC_GPU_BIN)) $(LLMC_GPU_ARGS); \
 		echo "nsys report: build/profile_llmc.nsys-rep"; \
@@ -813,7 +843,7 @@ profile-llmc-fp32-ncu: build-llmc-gpu stage-llmc $(PROFILE_SCRIPT)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		echo "SKIPPED: profile-llmc-fp32-ncu requires NVIDIA ncu — not available on Apple Silicon."; \
 	else \
-		pixi run -e cuda python $(PROFILE_SCRIPT) \
+		$(PIXI) run -e cuda python $(PROFILE_SCRIPT) \
 			--exe $(abspath $(LLMC_FP32_GPU_BIN)) \
 			--exe-args "$(LLMC_FP32_GPU_ARGS)" \
 			--launch-count $(LLMC_FP32_LAUNCH_COUNT) \
@@ -826,7 +856,7 @@ profile-llmc-fp32-nsys: build-llmc-gpu stage-llmc
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		echo "SKIPPED: profile-llmc-fp32-nsys requires NVIDIA nsys — not available on Apple Silicon."; \
 	else \
-		cd build/llmc && pixi run -e cuda nsys profile --force-overwrite true \
+		cd build/llmc && $(PIXI) run -e cuda nsys profile --force-overwrite true \
 			--trace=cuda,nvtx,osrt -o $(abspath build/profile_llmc_fp32) \
 			$(abspath $(LLMC_FP32_GPU_BIN)) $(LLMC_FP32_GPU_ARGS); \
 		echo "nsys report: build/profile_llmc_fp32.nsys-rep"; \
@@ -837,9 +867,9 @@ profile-llmc-fp32-nsys: build-llmc-gpu stage-llmc
 # the fingerprint logic lives in one place). Content-addressed: a no-op
 # when sources are unchanged, so chaining it before test-python costs
 # nothing on warm runs while keeping the two steps independently runnable.
-build-mojo:
+build-mojo: | $(PIXI_STAMP)
 	@if [ -d llmm ]; then \
-		pixi run python -m tests._max_bridge; \
+		$(PIXI) run python -m tests._max_bridge; \
 	else \
 		echo "No llmm package found, skipping mojo build."; \
 	fi
@@ -854,7 +884,7 @@ lint-python:
 	@uvx ruff check $(PYTHON_PATHS)
 	@uvx ruff format --check $(PYTHON_PATHS)
 
-lint-mojo:
+lint-mojo: | $(PIXI_STAMP)
 	@fail=0; \
 	tmpdir=$$(mktemp -d); \
 	trap "rm -rf $$tmpdir" EXIT; \
@@ -863,7 +893,7 @@ lint-mojo:
 		i=$$((i+1)); \
 		tmp="$$tmpdir/file_$$i.mojo"; \
 		cp "$$f" "$$tmp"; \
-		pixi run mojo format -q "$$tmp"; \
+		$(PIXI) run mojo format -q "$$tmp"; \
 		if ! diff -q "$$f" "$$tmp" >/dev/null; then \
 			echo "needs formatting: $$f"; \
 			fail=1; \
@@ -924,7 +954,7 @@ format-python:
 
 format-mojo:
 	@if find $(MOJO_PATHS) -name '*.mojo' -print -quit 2>/dev/null | grep -q .; then \
-		find $(MOJO_PATHS) -name '*.mojo' -print0 | xargs -0 pixi run mojo format; \
+		find $(MOJO_PATHS) -name '*.mojo' -print0 | xargs -0 $(PIXI) run mojo format; \
 	else \
 		echo "No .mojo files found, skipping mojo format."; \
 	fi
@@ -963,8 +993,8 @@ format-latex:
 		echo "No .tex files found, skipping latex format."; \
 	fi
 
-typecheck:
-	@pixi run pyrefly check $(PYTHON_PATHS)
+typecheck: | $(PIXI_STAMP)
+	@$(PIXI) run pyrefly check $(PYTHON_PATHS)
 
 test:
 	@if command -v nvidia-smi >/dev/null 2>&1 && timeout 2 nvidia-smi >/dev/null 2>&1; then \
@@ -979,12 +1009,12 @@ test-cpu: test-mojo test-python
 
 test-cuda: test-mojo test-python-cuda
 
-test-mojo:
+test-mojo: | $(PIXI_STAMP)
 	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
 		fail=0; \
 		for f in tests/test_*.mojo; do \
 			echo "==> $$f"; \
-			pixi run mojo run -I . "$$f" || fail=1; \
+			$(PIXI) run mojo run -I . "$$f" || fail=1; \
 		done; \
 		exit $$fail; \
 	else \
@@ -998,21 +1028,21 @@ test-mojo:
 # tests/_max_bridge.py): warm runs take seconds, and only a kernel-source
 # change pays compiles again.
 test-python: build-mojo
-	pixi run pytest tests/ -v -n auto
+	$(PIXI) run pytest tests/ -v -n auto
 
 test-python-cuda: build-mojo
-	MAX_USE_ACCELERATOR=1 pixi run -e cuda pytest tests/ -v
+	MAX_USE_ACCELERATOR=1 $(PIXI) run -e cuda pytest tests/ -v
 
 test-fixtures:
-	pixi run python -m tests.reference dump
+	$(PIXI) run python -m tests.reference dump
 
 # Run verification of activations, losses, and gradients against gpt2_124M_debug_state.bin.
 # We run them as separate processes because initializing both CPU and GPU standard
 # DeviceContexts in the same process leads to a MAX multi-context conflict/crash.
 verify: verify-cpu verify-gpu
 
-verify-cpu:
-	pixi run mojo test_gpt2.mojo cpu
+verify-cpu: | $(PIXI_STAMP)
+	$(PIXI) run mojo test_gpt2.mojo cpu
 
 # fp32 GEMMs default to TF32 tensor cores (llmm/vendor.mojo's USE_TF32), which
 # is the right choice for training but wrong for a strict-IEEE reference
@@ -1023,8 +1053,8 @@ verify-cpu:
 # binary auto-enables TF32 on cc>=8.0. Mirror that here with
 # -D LLMM_NO_TF32=1 so this gate keeps checking true IEEE fp32 math at the
 # tight LOSS_STEP_TOL=0.01; see verify-gpu-tf32 below for the TF32 path.
-verify-gpu:
-	pixi run -e cuda mojo -D LLMM_NO_TF32=1 test_gpt2.mojo gpu
+verify-gpu: | $(PIXI_STAMP)
+	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 test_gpt2.mojo gpu
 
 # Gates the default (TF32-on) fp32 training path against the same reference.
 # The gradient checks run at full strength (TF32 passes them with 30-100x
@@ -1036,7 +1066,7 @@ verify-gpu:
 # deviate by O(0.1+) within a few steps) still fails. Not part of
 # `make verify`/`make check`, which keep gating on strict IEEE fp32.
 verify-gpu-tf32:
-	pixi run -e cuda mojo test_gpt2.mojo gpu
+	$(PIXI) run -e cuda mojo test_gpt2.mojo gpu
 
 docs:
 	latexmk -pdf -quiet -cd docs/backprop.tex
