@@ -62,6 +62,7 @@ from llmm.hadamard import hadamard16_fwd_gpu
 from llmm.lowp import (
     PrecisionSpec,
     FP8_SPEC,
+    FP8_STATIC_SCALES,
     quantize_devscale,
     quantize_transpose_devscale,
     quantize_dual_devscale,
@@ -1959,31 +1960,44 @@ def matmul_fwd_lowp[
 
     # 1. Per-operand amax -> delayed-scaling update (Chunk C contract: call
     #    update_scale once per step BEFORE consuming state.scale below).
-    var amax_input = ctx.enqueue_create_buffer[DType.float32](1)
-    var amax_weight = ctx.enqueue_create_buffer[DType.float32](1)
-    compute_amax[FP8_SPEC, dtype](
-        device_buf_mut_ptr(amax_input), input_ptr, rows * in_channels, ctx
-    )
-    compute_amax[FP8_SPEC, dtype](
-        device_buf_mut_ptr(amax_weight),
-        weight_ptr,
-        out_channels * in_channels,
-        ctx,
-    )
-    # Optimization C (docs/ai/ai_assisted_optimizations_and_benchmarks.md
-    # 2026-07-10 fp8-quant-opt entry / opt/fp8-kernels follow-on): both
-    # amaxes above are already computed by the time either state's scale is
-    # needed, and neither this function's own quantize (below) nor any
-    # other call site reads one state's scale before the other's is ready —
-    # fuse the two update_scale calls into one kernel launch instead of two
-    # (see `update_scale_pair`'s module comment in llmm/amax.mojo).
-    update_scale_pair[FP8_SPEC, FP8_SPEC.fwd_dtype](
-        input_state,
-        kernel_ptr_as_immut(device_buf_mut_ptr(amax_input)),
-        weight_state,
-        kernel_ptr_as_immut(device_buf_mut_ptr(amax_weight)),
-        ctx,
-    )
+    #
+    #    A1 (docs/ai/speedrun_techniques_research.md, `-D
+    #    LLMM_FP8_STATIC_SCALES=1`): this whole step is SKIPPED — comptime-
+    #    gated, so `compute_amax`/`update_scale_pair` are never even
+    #    instantiated under the flag, not merely short-circuited at
+    #    runtime. `input_state.scale`/`weight_state.scale` were seeded once
+    #    at `LowpState.__init__` time from the calibrated constants
+    #    (`llmm/lowp.mojo`'s `fp8_static_scale`, threaded through
+    #    `AmaxState.__init__`'s `static_scale` parameter) and never change
+    #    again for the rest of the run — step 2 below reads them exactly
+    #    the same way in both modes. The flag-off path below is
+    #    byte-identical to before this flag existed.
+    comptime if not FP8_STATIC_SCALES:
+        var amax_input = ctx.enqueue_create_buffer[DType.float32](1)
+        var amax_weight = ctx.enqueue_create_buffer[DType.float32](1)
+        compute_amax[FP8_SPEC, dtype](
+            device_buf_mut_ptr(amax_input), input_ptr, rows * in_channels, ctx
+        )
+        compute_amax[FP8_SPEC, dtype](
+            device_buf_mut_ptr(amax_weight),
+            weight_ptr,
+            out_channels * in_channels,
+            ctx,
+        )
+        # Optimization C (docs/ai/ai_assisted_optimizations_and_benchmarks.md
+        # 2026-07-10 fp8-quant-opt entry / opt/fp8-kernels follow-on): both
+        # amaxes above are already computed by the time either state's scale is
+        # needed, and neither this function's own quantize (below) nor any
+        # other call site reads one state's scale before the other's is ready —
+        # fuse the two update_scale calls into one kernel launch instead of two
+        # (see `update_scale_pair`'s module comment in llmm/amax.mojo).
+        update_scale_pair[FP8_SPEC, FP8_SPEC.fwd_dtype](
+            input_state,
+            kernel_ptr_as_immut(device_buf_mut_ptr(amax_input)),
+            weight_state,
+            kernel_ptr_as_immut(device_buf_mut_ptr(amax_weight)),
+            ctx,
+        )
 
     # 2. Quantize (dual-output, Optimization D — see the module comment
     #    above) + fp8 GEMM -> raw (bias-free) bf16 output in out_ptr.
@@ -3599,16 +3613,21 @@ def matmul_bwd_lowp[
 
     var rows = Int(batch_size * seq_len)
     var out_channels = Int(output_channels)
-    var amax_doutput = ctx.enqueue_create_buffer[DType.float32](1)
-    compute_amax[FP8_SPEC, dtype](
-        device_buf_mut_ptr(amax_doutput),
-        d_output_ptr,
-        rows * out_channels,
-        ctx,
-    )
-    doutput_state.update_scale[FP8_SPEC.bwd_dtype](
-        kernel_ptr_as_immut(device_buf_mut_ptr(amax_doutput)), ctx
-    )
+    # A1 (see the matching comment in `matmul_fwd_lowp` above): under
+    # `-D LLMM_FP8_STATIC_SCALES=1`, `doutput_state.scale` was seeded once
+    # at `LowpState.__init__` time and never updated — skip the amax
+    # reduction + scale-update kernel entirely (comptime-gated).
+    comptime if not FP8_STATIC_SCALES:
+        var amax_doutput = ctx.enqueue_create_buffer[DType.float32](1)
+        compute_amax[FP8_SPEC, dtype](
+            device_buf_mut_ptr(amax_doutput),
+            d_output_ptr,
+            rows * out_channels,
+            ctx,
+        )
+        doutput_state.update_scale[FP8_SPEC.bwd_dtype](
+            kernel_ptr_as_immut(device_buf_mut_ptr(amax_doutput)), ctx
+        )
 
     var doutput_fp8_nat = ctx.enqueue_create_buffer[DType.uint8](
         rows * out_channels

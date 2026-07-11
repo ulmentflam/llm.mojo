@@ -20,7 +20,7 @@ from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.memory import AddressSpace
-from std.sys import simd_width_of, size_of
+from std.sys import simd_width_of, size_of, is_defined
 from layout import Layout, LayoutTensor
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
@@ -939,3 +939,228 @@ def precision_spec[name: StaticString]() -> PrecisionSpec:
         comptime assert (
             False
         ), "unknown LLMM_PRECISION value (expected fp32 | bf16 | fp8 | fp4)"
+
+
+# ===----------------------------------------------------------------------=== #
+# A1 — static/calibrated FP8 scales (docs/ai/speedrun_techniques_research.md
+# A1: modded-nanogpt trains 124M-class GPT-2 with hardcoded constant
+# per-tensor FP8 scales -- no amax, no delayed-scaling history, no
+# per-step scale-update kernel).
+#
+# `-D LLMM_FP8_STATIC_SCALES=1` (default OFF, i.e. the existing dynamic
+# delayed-scaling `AmaxState` path is unchanged and byte-identical when this
+# flag is not passed) selects a THIRD scaling mode alongside fp8's dynamic
+# path and fp4's fresh-every-call path: one constant scale PER (site, role)
+# -- not per layer, not per step -- shared by every transformer layer and
+# held fixed for the whole run. `llmm/amax.mojo`'s `AmaxState.__init__`
+# grows an optional `static_scale` parameter (default -1.0 == "dynamic",
+# unchanged behavior) that seeds `scale`/`scale_inv` from one of the
+# constants below instead of the placeholder 1.0/1.0; `llmm/matmul.mojo`'s
+# `matmul_fwd_lowp`/`matmul_bwd_lowp` skip `compute_amax` +
+# `update_scale`/`update_scale_pair` ENTIRELY under this flag (comptime-
+# gated -- those kernels are never even instantiated, not merely
+# short-circuited at runtime), which is the whole point: it deletes the
+# two memory-bound kernel families (`_amax_partial_gpu`/`_amax_aggregate_
+# gpu` and `_update_scale_gpu`/`_update_scale_pair_gpu`) from the hot path,
+# per the research doc's finding that a 124M model does not need them.
+#
+# Calibration (docs/ai/speedrun_techniques_research.md A1 mission,
+# `calibrate_fp8_scales.mojo`): for each of the 12 (site, role) pairs --
+# site in {qkv, attn_proj, fc, proj}, role in {input, weight, doutput} --
+# the calibration tool runs a real training loop with the EXISTING dynamic
+# path, lets every layer's `AmaxState` pass through its `amax_history_len
+# =16` warmup into delayed-scaling steady state, then reads back
+# `AmaxState.scale` for every layer (one host sync, off any hot path). The
+# constant committed below is `min(scale over all layers) / SAFETY_FACTOR`:
+# the MIN (not mean/median) because a smaller scale is the SAFER (more
+# headroom, i.e. less likely to overflow the fp8 format) direction --
+# `scale = fmt_max * margin_mult / amax`, so the layer with the LARGEST
+# amax has the SMALLEST correctly-sized scale, and applying that one
+# global-min scale to every OTHER layer (whose own amax is smaller) can
+# only under-use the format's dynamic range, never overflow it. The extra
+# `SAFETY_FACTOR = 2.0` divisor on top (halving the scale once more, i.e.
+# treating every layer's calibration-time amax as if it had been `2x`
+# larger) is the mission's own suggested margin ("speedrun uses generous
+# headroom, e.g. their 100/448 for acts" -- roughly a 4-4.5x margin from
+# their conservative bf16-range estimate; we use a tighter but still
+# real 2x on top of the already-conservative per-layer-worst-case min,
+# since our calibration is a direct empirical amax measurement rather than
+# a hand-picked constant). The accepted tradeoff (documented, not a bug):
+# a later, unseen training step whose activation/weight/gradient magnitude
+# exceeds calibration-time-max-times-2 SATURATES (clamps to the format's
+# max representable value, `_fp8_encode`'s documented saturating-not-
+# overflowing behavior) rather than corrupting the run -- our encoders
+# already saturate by construction (module docstring above), so this is a
+# precision-degradation risk on outlier steps, never a correctness/NaN
+# risk. See the calibration doc entry (docs/ai/
+# ai_assisted_optimizations_and_benchmarks.md) for the raw per-layer
+# scale tables both calibration runs printed.
+#
+# Two tables, selected by `-D LLMM_FP8_STATIC_D36=1` (default off = the d12
+# table): each is calibrated for ONE model width/depth and is NOT valid for
+# any other config without recalibration (`calibrate_fp8_scales.mojo` takes
+# any checkpoint/descriptor + step count as arguments) -- amax magnitudes
+# scale with width (channels) and depth (more layers => larger doutput
+# amax by the time backprop reaches the earliest layers), so a 124M-
+# calibrated constant used on a 774M run (or vice versa) has no guaranteed
+# safety margin.
+# ===----------------------------------------------------------------------=== #
+
+comptime FP8_STATIC_SCALES = is_defined["LLMM_FP8_STATIC_SCALES"]()
+comptime FP8_STATIC_D36 = is_defined["LLMM_FP8_STATIC_D36"]()
+
+
+struct FP8StaticScaleD12:
+    """Calibrated 2026-07-11, GPT-2 124M (`d12`, 12 layer / 768 channel),
+    checkpoint-init (`gpt2_124M_bf16.bin`) on real tinyshakespeare data --
+    the campaign's standard invocation (`make train-gpt2-124m-fp8`). 20
+    calibration steps, B=4 T=1024, `min(scale over layers AND steps) /
+    4.0`. Other configs (different depth/width/init/data) need their own
+    `calibrate_fp8_scales.mojo` run -- see the module comment above.
+
+    RETRY NOTE (docs/ai/speedrun_techniques_research.md A1's own "if static
+    mode drifts, widen margin and retry ONCE"): the first calibration
+    (`min(scale over layers) / 2.0`, reading `AmaxState.scale` only ONCE at
+    the very end of the 20-step run) FAILED `verify-fp8-static-grads`'s
+    envelope gate (cosine floor violation on `ln_1_gamma_layer03`, relL2
+    max 0.81 vs the <0.50 ceiling) against the fixed `gpt2_124M_debug_
+    state.bin` reference batch -- root cause: `AmaxState`'s delayed-scaling
+    ring buffer only remembers the last `amax_history_len=16` steps, so an
+    end-of-run readback had already forgotten steps 0-3's amax, which (a
+    fresh, not-yet-adapted checkpoint) can be the single largest amax of
+    the whole run. `calibrate_fp8_scales.mojo` was fixed to read every
+    state's scale after EVERY step and keep a running min across the whole
+    trajectory (not just the final step) -- a genuine tool bug fix, not a
+    margin change. A second attempt ALSO widened the safety factor 2.0 ->
+    4.0 on top of that fix and made the gate WORSE (6 cosine-floor
+    violations instead of 2, spreading into non-fp8-adjacent tensors like
+    `wpe`) -- diagnosis: floating-point formats have roughly uniform
+    RELATIVE precision across their normal range, but pushing values too
+    far toward zero runs them into e4m3's subnormal region, where
+    precision craters; a too-small static scale trades overflow risk for
+    underflow/subnormal-precision risk, and 4.0x pushed this table into
+    that regime. This table is the actual retry: same fixed running-min
+    tool, safety factor kept at the ORIGINAL 2.0 (fixing the tool's bug was
+    enough of a change on its own, per the "retry ONCE" budget -- see the
+    doc entry for the full three-way before/after comparison, including
+    the residual gate delta this table still does not fully close).
+    """
+
+    comptime QKV_INPUT = Float32(17.398058)
+    comptime QKV_WEIGHT = Float32(67.30516)
+    comptime QKV_DOUTPUT = Float32(3050403.0)
+    comptime ATTN_PROJ_INPUT = Float32(15.928889)
+    comptime ATTN_PROJ_WEIGHT = Float32(25.239437)
+    comptime ATTN_PROJ_DOUTPUT = Float32(3308183.5)
+    comptime FC_INPUT = Float32(11.27044)
+    comptime FC_WEIGHT = Float32(21.2071)
+    comptime FC_DOUTPUT = Float32(7117607.0)
+    comptime PROJ_INPUT = Float32(3.5137255)
+    comptime PROJ_WEIGHT = Float32(13.080292)
+    comptime PROJ_DOUTPUT = Float32(5799531.5)
+
+
+struct FP8StaticScaleD36:
+    """Calibrated 2026-07-11, GPT-2 774M (`d36`, 36 layer / 1280 channel),
+    from-scratch random init (no d36 checkpoint exists) on real
+    tinyshakespeare data. 20 calibration steps, B=4 T=1024, `min(scale over
+    layers AND steps) / 2.0` (the fixed running-min tool -- see
+    `FP8StaticScaleD12`'s RETRY NOTE; this table used the fixed tool from
+    the start, no separate retry needed here). See `FP8StaticScaleD12`'s
+    docstring for the general caveat -- this table is NOT valid for d12 or
+    any other width/depth. The running-min fix mattered EVEN MORE here than
+    at d12: for a from-scratch random-init run, the doutput sites' amax at
+    step 0-2 is dramatically larger than by step 20 (e.g. `proj_doutput`'s
+    min-over-steps is ~30M vs. the step-35 value of ~1.19B, a ~40x spread)
+    -- an end-of-run-only readback would have produced a wildly unsafe
+    constant for this config.
+    """
+
+    comptime QKV_INPUT = Float32(39.384617)
+    comptime QKV_WEIGHT = Float32(1943.8644)
+    comptime QKV_DOUTPUT = Float32(50785090.0)
+    comptime ATTN_PROJ_INPUT = Float32(52.321167)
+    comptime ATTN_PROJ_WEIGHT = Float32(14858.364)
+    comptime ATTN_PROJ_DOUTPUT = Float32(9442453.0)
+    comptime FC_INPUT = Float32(40.497173)
+    comptime FC_WEIGHT = Float32(1927.5294)
+    comptime FC_DOUTPUT = Float32(167026510.0)
+    comptime PROJ_INPUT = Float32(43.707317)
+    comptime PROJ_WEIGHT = Float32(14798.451)
+    comptime PROJ_DOUTPUT = Float32(15214965.0)
+
+
+def fp8_static_scale[site: StaticString, role: StaticString]() -> Float32:
+    """Resolve a (site, role) pair to its calibrated static scale constant,
+    selecting the d12 or d36 table via `FP8_STATIC_D36`. `site` in {"qkv",
+    "attn_proj", "fc", "proj"}, `role` in {"input", "weight", "doutput"} --
+    the same site tags `train_gpt2.mojo`'s `LowpState`/`matmul_fwd_lowp`/
+    `matmul_bwd_lowp` call sites already use. Comptime-resolved (both
+    `site`/`role` are compile-time `StaticString`s at every call site, since
+    they come from `LowpState.__init__`'s unrolled per-site `comptime if
+    LOWP_ENABLED:` loop body over a fixed set of literal site names) so this
+    compiles down to a single constant, not a runtime string-compare chain.
+    """
+
+    comptime if FP8_STATIC_D36:
+        comptime if site == "qkv" and role == "input":
+            return FP8StaticScaleD36.QKV_INPUT
+        elif site == "qkv" and role == "weight":
+            return FP8StaticScaleD36.QKV_WEIGHT
+        elif site == "qkv" and role == "doutput":
+            return FP8StaticScaleD36.QKV_DOUTPUT
+        elif site == "attn_proj" and role == "input":
+            return FP8StaticScaleD36.ATTN_PROJ_INPUT
+        elif site == "attn_proj" and role == "weight":
+            return FP8StaticScaleD36.ATTN_PROJ_WEIGHT
+        elif site == "attn_proj" and role == "doutput":
+            return FP8StaticScaleD36.ATTN_PROJ_DOUTPUT
+        elif site == "fc" and role == "input":
+            return FP8StaticScaleD36.FC_INPUT
+        elif site == "fc" and role == "weight":
+            return FP8StaticScaleD36.FC_WEIGHT
+        elif site == "fc" and role == "doutput":
+            return FP8StaticScaleD36.FC_DOUTPUT
+        elif site == "proj" and role == "input":
+            return FP8StaticScaleD36.PROJ_INPUT
+        elif site == "proj" and role == "weight":
+            return FP8StaticScaleD36.PROJ_WEIGHT
+        elif site == "proj" and role == "doutput":
+            return FP8StaticScaleD36.PROJ_DOUTPUT
+        else:
+            comptime assert False, (
+                "fp8_static_scale: unknown (site, role) pair -- expected"
+                " site in {qkv, attn_proj, fc, proj}, role in {input,"
+                " weight, doutput}"
+            )
+    else:
+        comptime if site == "qkv" and role == "input":
+            return FP8StaticScaleD12.QKV_INPUT
+        elif site == "qkv" and role == "weight":
+            return FP8StaticScaleD12.QKV_WEIGHT
+        elif site == "qkv" and role == "doutput":
+            return FP8StaticScaleD12.QKV_DOUTPUT
+        elif site == "attn_proj" and role == "input":
+            return FP8StaticScaleD12.ATTN_PROJ_INPUT
+        elif site == "attn_proj" and role == "weight":
+            return FP8StaticScaleD12.ATTN_PROJ_WEIGHT
+        elif site == "attn_proj" and role == "doutput":
+            return FP8StaticScaleD12.ATTN_PROJ_DOUTPUT
+        elif site == "fc" and role == "input":
+            return FP8StaticScaleD12.FC_INPUT
+        elif site == "fc" and role == "weight":
+            return FP8StaticScaleD12.FC_WEIGHT
+        elif site == "fc" and role == "doutput":
+            return FP8StaticScaleD12.FC_DOUTPUT
+        elif site == "proj" and role == "input":
+            return FP8StaticScaleD12.PROJ_INPUT
+        elif site == "proj" and role == "weight":
+            return FP8StaticScaleD12.PROJ_WEIGHT
+        elif site == "proj" and role == "doutput":
+            return FP8StaticScaleD12.PROJ_DOUTPUT
+        else:
+            comptime assert False, (
+                "fp8_static_scale: unknown (site, role) pair -- expected"
+                " site in {qkv, attn_proj, fc, proj}, role in {input,"
+                " weight, doutput}"
+            )

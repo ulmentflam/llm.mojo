@@ -21,7 +21,12 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.memory import alloc, UnsafePointer, memcpy, memset_zero
 
 from llmm.io import read_and_copy
-from llmm.lowp import precision_spec, FP8_SPEC
+from llmm.lowp import (
+    precision_spec,
+    FP8_SPEC,
+    FP8_STATIC_SCALES,
+    fp8_static_scale,
+)
 from llmm.amax import AmaxState
 from llmm.dataloader import DataLoader
 from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
@@ -745,20 +750,94 @@ struct LowpState(Movable):
         # See the module comment above: only elaborated for LOWP_ENABLED
         # (fp8/fp4) GPU builds — bf16/fp32 leave every list empty and launch
         # no GPU kernels here (landmine #1).
+        #
+        # A1 (docs/ai/speedrun_techniques_research.md, `-D
+        # LLMM_FP8_STATIC_SCALES=1`): every layer of a given (site, role)
+        # shares the SAME one calibrated constant (`llmm/lowp.mojo`'s
+        # `fp8_static_scale`) — deliberately NOT per-layer (unlike the
+        # dynamic path's per-layer `AmaxState` history, which exists
+        # because different layers have unrelated magnitude statistics —
+        # see the module comment above `LowpState`). Static mode instead
+        # follows modded-nanogpt's own recipe (one hardcoded constant per
+        # tensor ROLE, shared globally) — the calibration tool already
+        # picked the safe (min-over-layers, margined) constant per
+        # (site, role), so reusing it for every layer is intentional, not
+        # a simplification that drops per-layer coverage.
         comptime if LOWP_ENABLED:
-            for _ in range(num_layer):
-                self.qkv_input.append(AmaxState[FP8_SPEC](ctx))
-                self.qkv_weight.append(AmaxState[FP8_SPEC](ctx))
-                self.qkv_doutput.append(AmaxState[FP8_SPEC](ctx))
-                self.attn_proj_input.append(AmaxState[FP8_SPEC](ctx))
-                self.attn_proj_weight.append(AmaxState[FP8_SPEC](ctx))
-                self.attn_proj_doutput.append(AmaxState[FP8_SPEC](ctx))
-                self.fc_input.append(AmaxState[FP8_SPEC](ctx))
-                self.fc_weight.append(AmaxState[FP8_SPEC](ctx))
-                self.fc_doutput.append(AmaxState[FP8_SPEC](ctx))
-                self.proj_input.append(AmaxState[FP8_SPEC](ctx))
-                self.proj_weight.append(AmaxState[FP8_SPEC](ctx))
-                self.proj_doutput.append(AmaxState[FP8_SPEC](ctx))
+            comptime if FP8_STATIC_SCALES:
+                comptime qkv_input_s = fp8_static_scale["qkv", "input"]()
+                comptime qkv_weight_s = fp8_static_scale["qkv", "weight"]()
+                comptime qkv_doutput_s = fp8_static_scale["qkv", "doutput"]()
+                comptime attn_proj_input_s = fp8_static_scale[
+                    "attn_proj", "input"
+                ]()
+                comptime attn_proj_weight_s = fp8_static_scale[
+                    "attn_proj", "weight"
+                ]()
+                comptime attn_proj_doutput_s = fp8_static_scale[
+                    "attn_proj", "doutput"
+                ]()
+                comptime fc_input_s = fp8_static_scale["fc", "input"]()
+                comptime fc_weight_s = fp8_static_scale["fc", "weight"]()
+                comptime fc_doutput_s = fp8_static_scale["fc", "doutput"]()
+                comptime proj_input_s = fp8_static_scale["proj", "input"]()
+                comptime proj_weight_s = fp8_static_scale["proj", "weight"]()
+                comptime proj_doutput_s = fp8_static_scale["proj", "doutput"]()
+                for _ in range(num_layer):
+                    self.qkv_input.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=qkv_input_s)
+                    )
+                    self.qkv_weight.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=qkv_weight_s)
+                    )
+                    self.qkv_doutput.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=qkv_doutput_s)
+                    )
+                    self.attn_proj_input.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=attn_proj_input_s)
+                    )
+                    self.attn_proj_weight.append(
+                        AmaxState[FP8_SPEC](
+                            ctx, static_scale=attn_proj_weight_s
+                        )
+                    )
+                    self.attn_proj_doutput.append(
+                        AmaxState[FP8_SPEC](
+                            ctx, static_scale=attn_proj_doutput_s
+                        )
+                    )
+                    self.fc_input.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=fc_input_s)
+                    )
+                    self.fc_weight.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=fc_weight_s)
+                    )
+                    self.fc_doutput.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=fc_doutput_s)
+                    )
+                    self.proj_input.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=proj_input_s)
+                    )
+                    self.proj_weight.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=proj_weight_s)
+                    )
+                    self.proj_doutput.append(
+                        AmaxState[FP8_SPEC](ctx, static_scale=proj_doutput_s)
+                    )
+            else:
+                for _ in range(num_layer):
+                    self.qkv_input.append(AmaxState[FP8_SPEC](ctx))
+                    self.qkv_weight.append(AmaxState[FP8_SPEC](ctx))
+                    self.qkv_doutput.append(AmaxState[FP8_SPEC](ctx))
+                    self.attn_proj_input.append(AmaxState[FP8_SPEC](ctx))
+                    self.attn_proj_weight.append(AmaxState[FP8_SPEC](ctx))
+                    self.attn_proj_doutput.append(AmaxState[FP8_SPEC](ctx))
+                    self.fc_input.append(AmaxState[FP8_SPEC](ctx))
+                    self.fc_weight.append(AmaxState[FP8_SPEC](ctx))
+                    self.fc_doutput.append(AmaxState[FP8_SPEC](ctx))
+                    self.proj_input.append(AmaxState[FP8_SPEC](ctx))
+                    self.proj_weight.append(AmaxState[FP8_SPEC](ctx))
+                    self.proj_doutput.append(AmaxState[FP8_SPEC](ctx))
 
 
 def _gpt2_hyperparameters(depth: Int) raises -> Tuple[Int, Int]:

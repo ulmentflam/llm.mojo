@@ -325,17 +325,30 @@ def _amax_state_init_gpu[
     history_ptr: MutKernelPtr[DType.float32],
     scale_ptr: MutKernelPtr[DType.float32],
     scale_inv_ptr: MutKernelPtr[DType.float32],
+    static_scale: Float32,
 ) -> None:
     var tid = Int(thread_idx.x)
     if tid < history_len:
         history_ptr[tid] = 0.0
     if tid == 0:
-        # Placeholder scale/scale_inv: never meant to be consumed for a real
-        # quantize before the first `update_scale` call — see the calling
-        # contract documented on `update_scale`. 1.0 is a harmless, finite
-        # default rather than an uninitialized/garbage value.
-        scale_ptr[0] = 1.0
-        scale_inv_ptr[0] = 1.0
+        # A1 (docs/ai/speedrun_techniques_research.md): `static_scale > 0`
+        # seeds scale/scale_inv from a calibrated constant (llmm/lowp.mojo's
+        # `fp8_static_scale`) instead of the placeholder 1.0/1.0 — this is
+        # the ONLY write `AmaxState.scale`/`scale_inv` ever receive under
+        # `-D LLMM_FP8_STATIC_SCALES=1` (matmul.mojo's `matmul_fwd_lowp`/
+        # `matmul_bwd_lowp` skip `update_scale`/`update_scale_pair` entirely
+        # in that mode — see the module comment above `FP8_STATIC_SCALES`).
+        # `static_scale <= 0` (including the default -1.0 sentinel) is the
+        # ordinary dynamic path: placeholder scale/scale_inv = 1.0/1.0,
+        # never meant to be consumed for a real quantize before the first
+        # `update_scale` call — see the calling contract documented on
+        # `update_scale`.
+        if static_scale > Float32(0.0):
+            scale_ptr[0] = static_scale
+            scale_inv_ptr[0] = Float32(1.0) / static_scale
+        else:
+            scale_ptr[0] = 1.0
+            scale_inv_ptr[0] = 1.0
 
 
 def _update_scale_gpu[
@@ -482,7 +495,14 @@ struct AmaxState[spec: PrecisionSpec](Movable):
     var scale_inv: DeviceBuffer[DType.float32]
     var step: Int
 
-    def __init__(out self, ctx: DeviceContext) raises:
+    def __init__(
+        out self, ctx: DeviceContext, static_scale: Float32 = Float32(-1.0)
+    ) raises:
+        """`static_scale` (A1, default -1.0 == dynamic/unchanged): when >0,
+        seeds `scale`/`scale_inv` from this calibrated constant instead of
+        the placeholder 1.0/1.0 — see `_amax_state_init_gpu`'s docstring.
+        Every existing call site (all of them omit this argument) is
+        byte-identical to before this parameter was added."""
         comptime if Self.spec.scaling == ScalingKind.PerTensor:
             comptime H = Self.spec.amax_history_len
             self.history = ctx.enqueue_create_buffer[DType.float32](H)
@@ -497,6 +517,7 @@ struct AmaxState[spec: PrecisionSpec](Movable):
                 device_buf_mut_ptr(self.history),
                 device_buf_mut_ptr(self.scale),
                 device_buf_mut_ptr(self.scale_inv),
+                static_scale,
                 grid_dim=(1,),
                 block_dim=(max(H, 1),),
             )

@@ -131,11 +131,11 @@ SHELL := /bin/bash
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
-        build-profile build-profile-bf16 build-profile-fp8 build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
+        build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
         build-infer build-infer-bf16 build-infer-fp8 data-hellaswag eval eval-cpu benchmark-eval \
-        verify-fp8-grads \
+        verify-fp8-grads verify-fp8-static-grads calibrate-fp8-scales \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
@@ -450,6 +450,18 @@ $(PROFILE_BIN_FP8): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP8) $(PROFILE_MOJO_SRC)
 
+# A1 static-scales profiling harness (docs/ai/speedrun_techniques_
+# research.md A1) -- same binary shape as PROFILE_BIN_FP8, `-D
+# LLMM_FP8_STATIC_SCALES=1` added. Used for the ncu launch-count/family
+# comparison (`make profile-ncu PROFILE_PROF_BIN=$(PROFILE_BIN_FP8_STATIC)`).
+PROFILE_BIN_FP8_STATIC := build/profile_gpt2_fp8_static
+
+build-profile-fp8-static: $(PROFILE_BIN_FP8_STATIC)
+
+$(PROFILE_BIN_FP8_STATIC): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 -D LLMM_FP8_STATIC_SCALES=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP8_STATIC) $(PROFILE_MOJO_SRC)
+
 # fp4 build of the profiling harness (see build-fp4 above).
 build-profile-fp4: $(PROFILE_BIN_FP4)
 
@@ -506,6 +518,44 @@ verify-fp8-grads: $(DUMP_BIN_BF16) $(DUMP_BIN_FP8)
 	./$(DUMP_BIN_BF16) $(GRAD_DUMP_DIR_BF16)
 	./$(DUMP_BIN_FP8) $(GRAD_DUMP_DIR_FP8)
 	pixi run -e cuda python3 tests/compare_grad_dumps.py $(GRAD_DUMP_DIR_FP8) $(GRAD_DUMP_DIR_BF16)
+
+# A1 static-scales variant of the same gate (docs/ai/speedrun_techniques_
+# research.md A1): dumps under `-D LLMM_PRECISION=fp8 -D
+# LLMM_FP8_STATIC_SCALES=1` instead of the dynamic-delayed-scaling default,
+# compared against the SAME bf16 reference dump (`verify-fp8-grads`'s
+# `DUMP_BIN_BF16`/`GRAD_DUMP_DIR_BF16`, no need to regenerate it) — the
+# envelope gate (tests/compare_grad_dumps.py) doesn't care which fp8 variant
+# produced the "test" dump.
+DUMP_BIN_FP8_STATIC := build/dump_grads_gpt2_fp8_static
+GRAD_DUMP_DIR_FP8_STATIC := build/grad_dump_fp8_static
+
+$(DUMP_BIN_FP8_STATIC): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 -D LLMM_FP8_STATIC_SCALES=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_FP8_STATIC) $(DUMP_MOJO_SRC)
+
+verify-fp8-static-grads: $(DUMP_BIN_BF16) $(DUMP_BIN_FP8_STATIC)
+	@mkdir -p $(GRAD_DUMP_DIR_BF16) $(GRAD_DUMP_DIR_FP8_STATIC)
+	./$(DUMP_BIN_BF16) $(GRAD_DUMP_DIR_BF16)
+	./$(DUMP_BIN_FP8_STATIC) $(GRAD_DUMP_DIR_FP8_STATIC)
+	pixi run -e cuda python3 tests/compare_grad_dumps.py $(GRAD_DUMP_DIR_FP8_STATIC) $(GRAD_DUMP_DIR_BF16)
+
+# A1 calibration tool (docs/ai/speedrun_techniques_research.md A1): runs N
+# fp8 training steps with the existing dynamic delayed-scaling path and
+# prints each site-role's converged AmaxState.scale, plus a paste-ready
+# Mojo comptime table (one host readback at the very end — see the tool's
+# own docstring). `ARGS="<checkpoint_or_descriptor> <steps> <B> <T>
+# <safety_factor>"` overrides the defaults (gpt2_124M_bf16.bin, 20, 4, 1024,
+# 2.0) -- e.g. `make calibrate-fp8-scales ARGS="d36 20 4 1024 2.0"` for a
+# from-scratch d36 (774M) calibration run.
+CALIBRATE_MOJO_SRC := calibrate_fp8_scales.mojo
+CALIBRATE_BIN_FP8 := build/calibrate_fp8_scales_fp8
+
+$(CALIBRATE_BIN_FP8): $(CALIBRATE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	pixi run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(CALIBRATE_BIN_FP8) $(CALIBRATE_MOJO_SRC)
+
+calibrate-fp8-scales: $(CALIBRATE_BIN_FP8)
+	./$(CALIBRATE_BIN_FP8) $(ARGS)
 
 # HellaSwag eval: `make eval` builds the bf16 inference binary, ensures the
 # eval data is tokenized (see data/hellaswag.py), and scores a checkpoint.
