@@ -1,6 +1,6 @@
 # LLM.🔥
 
-This project is my port of Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) that extends the GPU kernel functionality of @dorjeduck's [llm.🔥](https://github.com/dorjeduck/llm.mojo) in honor of [Mojo's](https://mojolang.org) v1.0.0 release (this project tracks the 1.0.0b3 nightly). The headline results: matching or beating llm.c's CUDA path at both training precisions on an NVIDIA GB10 (bf16 parity with a nominal edge, fp32 ~7% faster with TF32), 1.72× faster than PyTorch MPS bf16 on an Apple M4 Max (see [Benchmarks](#benchmarks)), and working FP8 (e4m3/e5m2) and NVFP4 (e2m1) low-precision training support alongside bf16/fp32. Visit [llm.c](https://github.com/karpathy/llm.c) for a detailed explanation of the original project.
+This project is my port of Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) that extends the GPU kernel functionality of @dorjeduck's [llm.🔥](https://github.com/dorjeduck/llm.mojo) in honor of [Mojo's](https://mojolang.org) v1.0.0 release (this project tracks the 1.0.0b3 nightly). The headline results: matching or beating llm.c's CUDA path at both training precisions on an NVIDIA GB10 (bf16 parity, fp32 ~7% faster with TF32), 1.72× faster than PyTorch MPS bf16 on an Apple M4 Max (see [Benchmarks](#benchmarks)), and working FP8 (e4m3/e5m2) and NVFP4 (e2m1) low-precision training support alongside bf16/fp32. Visit [llm.c](https://github.com/karpathy/llm.c) for a detailed explanation of the original project.
 
 > **Note**: This project is based on nightly Mojo 1.0.0b3 release.
 
@@ -81,18 +81,18 @@ Average training loop times across llm.mojo, llm.c, and PyTorch, all with matche
 
 ### Single GPU
 
-Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warmup, all six arms interleaved in one session, 2026-07-10 22:35 — measured directly on the shipped tree, HEAD `f3cbf69`, after today's full TF32/perf + FP8 + NVFP4 + consolidation campaign; confirms the pre-merge branch-era table below within noise, all six arms within 1.2% of it):
+Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warmup, all six arms interleaved in one session, 2026-07-11 15:31 — measured directly on the shipped tree, HEAD `c1a48d5`, after the Metal test-restoration + MLX-benchmark merge; confirms the 2026-07-10 post-campaign table within noise, all six arms within 1.7% of it):
 
 | configuration | mean ms/step | tok/s | vs llm.c |
 |---|---:|---:|---|
-| llm.mojo bf16 | **133.25** | **30740** | parity, nominal edge (1.007× vs llm.c bf16, ≈noise) |
-| llm.c CUDA bf16 | 134.17 | 30528 | baseline (bf16) |
-| llm.mojo fp32 (TF32) | **273.64** | **14968** | **1.07× faster** (vs llm.c fp32) |
-| llm.c CUDA fp32 (TF32) | 293.40 | 13960 | baseline (fp32) |
-| PyTorch bf16 | 503.43 | 8136 | — |
-| PyTorch fp32 | 578.25 | 7083 | — |
+| llm.mojo bf16 | **135.34** | **30265** | parity (0.999× vs llm.c bf16, ≈noise) |
+| llm.c CUDA bf16 | 135.14 | 30308 | baseline (bf16) |
+| llm.mojo fp32 (TF32) | **278.57** | **14704** | **1.07× faster** (vs llm.c fp32) |
+| llm.c CUDA fp32 (TF32) | 297.29 | 13778 | baseline (fp32) |
+| PyTorch bf16 | 503.71 | 8132 | — |
+| PyTorch fp32 | 582.89 | 7027 | — |
 
-!['Best Single GPU Benchmark'](figures/benchmark_gpu_b4_t1024_2026-07-10_2235_NVIDIA-GB10_DGX-Spark.png)
+!['Best Single GPU Benchmark'](figures/benchmark_gpu_b4_t1024_2026-07-11_1531_NVIDIA-GB10_DGX-Spark.png)
 
 > **TF32 note**: llm.mojo's fp32 GPU GEMMs now use TF32 tensor cores by default (`CUBLAS_COMPUTE_32F_FAST_TF32`), matching llm.c's fp32 behavior — its fp32 build auto-enables TF32 on any compute-capability-8.0+ GPU, so the fp32 rows above are TF32-vs-TF32. Build with `-D LLMM_NO_TF32=1` to restore strict IEEE fp32 math (that is also what `make verify-gpu` gates on; the default TF32 path has its own gate, `make verify-gpu-tf32`).
 
