@@ -4746,3 +4746,116 @@ boundaries.
 Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
 
 
+## 2026-07-11 — FINAL CAMPAIGN SCOREBOARD: fp8+fp4 optimization campaign assembly verification (branch `integrate/lowp-opt`, HEAD `66e9fec`)
+
+Final verification of the ASSEMBLED tree — shipped main + fp8 Optimizations
+C/D + speedrun A1/A5/A6 (static scales / fast-accum / site flags) + fp4
+tiled RHT-prep and coalesced quantize-transpose. Each piece passed its
+gates on its own branch; three parallel branches touched `llmm/matmul.mojo`,
+so every gate below was re-run on the merged tree in one session
+(2026-07-11, GB10, GPU-idle-verified lock windows, binaries mtime-verified
+fresh against all sources).
+
+### Gate battery — all PASS
+
+| gate | result |
+|---|---|
+| `make verify-gpu` (strict IEEE fp32) | PASS |
+| `make verify-gpu-tf32` | PASS |
+| `make verify-cpu` | PASS (first attempt, no load-flake retry needed) |
+| `make verify-fp8-grads` (dynamic path, 148 tensors) | PASS — cosine min 0.9366 / median 0.9870 / max 0.9993; relL2 min 0.0412 / median 0.1742 / max 0.4616 — **identical to the C/D-era stats to every printed digit**, i.e. the dynamic fp8 path is bit-preserving through the full merged assembly |
+
+### Unit suites — 10/10 suites green, 90 tests total
+
+| suite | count |
+|---|---|
+| `tests/test_lowp_gemm.mojo` | 10/10 |
+| `tests/test_lowp_bwd.mojo` | 5/5 |
+| `tests/test_amax.mojo` (incl. pair test) | 20/20 |
+| `tests/test_rng_sr.mojo` | 13/13 |
+| `tests/test_matmul_fwd_lowp.mojo` | 4/4 |
+| `tests/test_lowp_gemm_fp4.mojo` | 8/8 |
+| `tests/test_nvfp4_quant.mojo` (incl. byte-exact transpose-quantize identity) | 18/18 |
+| `tests/test_hadamard.mojo` | 5/5 |
+| `tests/test_matmul_fwd_fp4.mojo` | 2/2 |
+| `tests/test_matmul_bwd_fp4.mojo` | 5/5 |
+
+### Trajectory checks (10-step, checkpoint-init tinyshakespeare, B=4 T=1024, F7 warmup discarded per fresh binary)
+
+Step 1 (the deterministic single-fwd/bwd point) is **bit-exact against the
+documented references in all three precisions**: bf16 4.369226 / norm
+17.1131, fp8-dynamic 4.390939 / 16.5327, fp4-default 4.408221 / 17.2049.
+Steps 2-10 sit inside the documented assembled-tree run-to-run wiggle band;
+final-step deltas vs bf16: fp8 +0.36%, fp4 +0.93% — inside the documented
+~0.6-1% envelopes. No NaN/Inf anywhere.
+
+### Static-scales gate rerun (`verify-fp8-static-grads`) — FAILS, reproducing the A1 disclosure digit-for-digit
+
+Re-ran the narrow single-fixed-batch static gate once on the assembled
+tree (fresh `dump_grads_gpt2_fp8_static` build, same bf16 reference dump
+as the passing dynamic gate). Result identical to the A1 session's shipped
+v3 numbers: overall FAIL with
+
+- **(a) cosine floor >0.93: FAIL** — 4 tensors below floor:
+  `ln_2_gamma_layer03` 0.8933 (worst, 0.037 below), `ln_1_gamma_layer03`
+  0.9069, `ln_1_gamma_layer01` 0.9080, `ln_2_gamma_layer02` 0.9262.
+- **(b) relL2 envelope: FAIL** — median 0.2057 vs <0.20 (2.9% over);
+  max 0.5110 vs <0.50 (2.2% over, on `ln_2_gamma_layer02`).
+- **(c) depth-monotonicity: PASS** (0 violations).
+- **(d) NaN/Inf sentinel: PASS** (0 nonfinite).
+
+Same failure surface as disclosed (LN gains at shallow layers 1-3, both
+aggregate relL2 ceilings marginally exceeded), fully deterministic across
+sessions — a stable, characterized limitation of one-constant-per-(site,
+role) calibration on the step-0/T=64 fixed-batch probe, not a regression
+introduced by the merge. Training-loop envelopes (A1 entry above) remain
+clean. Disposition stays with the coordinator; static mode remains
+default-OFF (`-D LLMM_FP8_STATIC_SCALES=1` opt-in).
+
+### OFFICIAL REMEASURE — the campaign scoreboard
+
+Interleaved, arm order flipped between rounds, one GPU-lock window per
+config, 20 measured steps/arm/round (first step dropped), n=40/arm at d12
+and n=38/arm at d36. d12: checkpoint-init `gpt2_124M_bf16.bin`,
+tinyshakespeare, `-b 4 -t 1024 -x 21 -v 0 -s 0`. d36: from-scratch `-e
+d36`, FineWeb shard 90, `-x 20 -v 0 -s 0 -n 0`. fp8-static built with
+`-D LLMM_FP8_STATIC_SCALES=1` (+ `-D LLMM_FP8_STATIC_D36=1` for the d36
+arm, i.e. the A1 session's d36 calibration table). tok/s = 4096/ms
+sanity-checked against every binary's own printout.
+
+**d12 (GPT-2 124M) / B=4 / T=1024, median ms/step:**
+
+| arm | r1 | r2 | combined | tok/s | vs bf16 | campaign start | post-wave2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| bf16 | 135.00 | 134.70 | **134.91** | 30,361 | 1.000x | 133.9 | — |
+| fp8-dynamic | 146.55 | 146.67 | **146.57** | 27,945 | **1.086x** | 150.5 (1.124x) | 1.080x |
+| fp8-static | 144.71 | 144.47 | **144.55** | 28,337 | **1.071x** | — | 1.068x (A1 entry) |
+| fp4-default | 154.34 | 154.37 | **154.33** | 26,540 | **1.144x** | 184.2 (1.375x) | 1.155x |
+
+**d36 (774M-class) / B=4 / T=1024, median ms/step:**
+
+| arm | r1 | r2 | combined | tok/s | vs bf16 | campaign start | post-wave2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| bf16 | 863.91 | 873.23 | **869.47** | 4,711 | 1.000x | 862.2 | — |
+| fp8-dynamic | 762.12 | 764.63 | **763.80** | 5,363 | **0.878x** | 792.9 (0.920x) | 0.881x |
+| fp8-static | 739.69 | 743.22 | **741.24** | 5,526 | **0.853x** | — | 0.865x (A1 entry) |
+| fp4-default | 870.48 | 873.35 | **871.12** | 4,702 | **1.002x — parity** | 1073.2 (1.245x) | 1.004x |
+
+### Start-vs-end campaign deltas
+
+| metric | campaign start | campaign end | delta |
+|---|---:|---:|---:|
+| fp8 d12 step time | 150.5 ms (1.124x bf16) | 146.6 ms (1.086x) / 144.6 ms static (1.071x) | **-2.6% / -3.9%** |
+| fp8 d36 ratio | 0.920x | 0.878x dynamic / **0.853x static** | fp8 lead over bf16 widened from 8.0% to **12.2% / 14.7%** |
+| fp4 d12 step time | 184.2 ms (1.375x bf16) | 154.3 ms (1.144x) | **-16.2%** |
+| fp4 d36 ratio | 1.245x | **1.002x — parity** | -19.5% step time (1073.2 -> 871.1 ms) |
+
+Every arm matches or slightly beats its post-wave2 branch-era measurement
+on the assembled tree (fp8 d12 1.086x vs 1.080x is within the documented
+round-to-round spread; fp4 d12 1.144x vs 1.155x slightly better; d36
+ratios reproduce to <0.5pp) — the assembly carries the full campaign
+gains with zero regression.
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.

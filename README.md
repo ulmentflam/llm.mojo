@@ -102,17 +102,19 @@ Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warm
 
 FP8 and NVFP4 are working training precisions, not just inference formats: FP8 quantizes the per-block linear GEMMs (QKV/attn-proj/MLP fc/fc-proj, forward and backward) to transient e4m3/e5m2 operands with delayed scaling, computing in FP8 tensor cores while keeping fp32 master weights and optimizer state; NVFP4 block-scales the middle transformer blocks' MLP GEMMs to e2m1 on cuBLASLt, using stochastic rounding plus a random Hadamard transform (per the published NVFP4 training recipe) to control the extra quantization variance. Both converge alongside bf16 at GPT-2 124M scale — see the loss envelopes below and `make verify-fp8-grads` / the fp8/fp4 gates in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
-Step-time measurement (B=4, T=1024, checkpoint-init tinyshakespeare, 2 rounds with arm order alternated per round, 40 measured steps/arm after a discarded fresh-binary warmup run, 2026-07-10, shipped tree):
+Step-time measurement (B=4, T=1024, checkpoint-init tinyshakespeare, 2 rounds with arm order alternated per round, 40 measured steps/arm after a discarded fresh-binary warmup run, 2026-07-11, post-optimization-campaign tree):
 
-| precision | mean ms/step | vs bf16 | 50-step loss envelope vs bf16 | build target |
+| precision | median ms/step | vs bf16 | 50-step loss envelope vs bf16 | build target |
 |---|---:|---:|---:|---|
-| bf16 | 133.9 | baseline | baseline | `make build-bf16` |
-| FP8 (e4m3/e5m2) | 150.5 | 1.12× slower | median 0.57% | `make build-fp8` |
-| NVFP4 (e2m1) | 184.2 | 1.38× slower | median 0.89% | `make build-fp4` |
+| bf16 | 134.9 | baseline | baseline | `make build-bf16` |
+| FP8 (e4m3/e5m2) | 146.6 | 1.09× slower | median 0.57% | `make build-fp8` |
+| NVFP4 (e2m1) | 154.3 | 1.14× slower | median 0.89% | `make build-fp4` |
+
+The 2026-07-10/11 optimization campaign (coalesced/fused quantize-transpose kernels, persistent fp8 weight-transpose caching, dual-output quantize, fused tiled RHT-prep for NVFP4) cut FP8 from 150.5 to 146.6 ms and NVFP4 from 184.2 to 154.3 ms at this scale, and at the 774M-class `d36` config FP8 is now ~12% *faster* than bf16 (0.878×) while NVFP4 reaches parity (1.002×). An optional calibrated static-scales mode (`-D LLMM_FP8_STATIC_SCALES=1`, default off) removes the per-step amax/scale-update kernels entirely and shaves a further ~1.5% at 124M and ~3% at `d36` (0.853×), at the cost of per-config offline calibration — see the A1 writeup and the final campaign scoreboard in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
 Honest framing: at 124M params these are numerics/research configs, not throughput wins. The quantized GEMMs themselves are measurably faster than bf16's (fp8 and fp4 both cut raw GEMM compute time), but that saving is swamped by the quantize/amax/scale and (for NVFP4) Hadamard-transform overhead around small per-block GEMMs at this scale — see the quant-opt and transpose-coalescing writeups in `docs/ai/ai_assisted_optimizations_and_benchmarks.md` and the FP8/FP4 gotcha catalogs. Published FP4/FP8 throughput wins start around ~1B+ parameter models, where the GEMMs are large enough to amortize that fixed overhead.
 
-A batch/width scaling sweep confirms this on-box: FP8 stays slower than bf16 across every batch size tested at 124M (B up to 64), but crosses over to ~1.10x *faster* once the model is scaled to the 774M-class `d36` config — width, not batch, is what closes the gap; see `docs/ai/lowp_scaling_sweep_2026-07-10.md`.
+A batch/width scaling sweep confirms this on-box: FP8 stays slower than bf16 across every batch size tested at 124M (B up to 64), but crosses over to being decisively *faster* once the model is scaled to the 774M-class `d36` config (0.878× dynamic, 0.853× static after the campaign) — width, not batch, is what closes the gap; see `docs/ai/lowp_scaling_sweep_2026-07-10.md`.
 
 ### Single CPU
 
