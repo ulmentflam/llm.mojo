@@ -1,6 +1,6 @@
 # LLM.🔥
 
-This project is my port of Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) that extends the GPU kernel functionality of @dorjeduck's [llm.🔥](https://github.com/dorjeduck/llm.mojo) in honor of [Mojo's](https://mojolang.org) v1.0.0 release (this project tracks the 1.0.0b3 nightly). The headline results: matching or beating llm.c's CUDA path at both training precisions on an NVIDIA GB10 (bf16 parity with a nominal edge, fp32 ~6% faster with TF32), and 1.72× faster than PyTorch MPS bf16 on an Apple M4 Max (see [Benchmarks](#benchmarks)). Visit [llm.c](https://github.com/karpathy/llm.c) for a detailed explanation of the original project.
+This project is my port of Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) that extends the GPU kernel functionality of @dorjeduck's [llm.🔥](https://github.com/dorjeduck/llm.mojo) in honor of [Mojo's](https://mojolang.org) v1.0.0 release (this project tracks the 1.0.0b3 nightly). The headline results: matching or beating llm.c's CUDA path at both training precisions on an NVIDIA GB10 (bf16 parity with a nominal edge, fp32 ~7% faster with TF32), 1.72× faster than PyTorch MPS bf16 on an Apple M4 Max (see [Benchmarks](#benchmarks)), and working FP8 (e4m3/e5m2) and NVFP4 (e2m1) low-precision training support alongside bf16/fp32. Visit [llm.c](https://github.com/karpathy/llm.c) for a detailed explanation of the original project.
 
 > **Note**: This project is based on nightly Mojo 1.0.0b3 release.
 
@@ -81,22 +81,36 @@ Average training loop times across llm.mojo, llm.c, and PyTorch, all with matche
 
 ### Single GPU
 
-Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warmup, all six arms interleaved in one session, 2026-07-10 16:04):
+Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warmup, all six arms interleaved in one session, 2026-07-10 22:35 — measured directly on the shipped tree, HEAD `f3cbf69`, after today's full TF32/perf + FP8 + NVFP4 + consolidation campaign; confirms the pre-merge branch-era table below within noise, all six arms within 1.2% of it):
 
 | configuration | mean ms/step | tok/s | vs llm.c |
 |---|---:|---:|---|
-| llm.mojo bf16 | **134.0** | **30570** | parity, nominal edge (1.004× vs llm.c bf16, ≈noise) |
-| llm.c CUDA bf16 | 134.5 | 30447 | baseline (bf16) |
-| llm.mojo fp32 (TF32) | **276.9** | **14791** | **1.06× faster** (vs llm.c fp32) |
-| llm.c CUDA fp32 (TF32) | 294.1 | 13927 | baseline (fp32) |
-| PyTorch bf16 | 504.3 | 8123 | — |
-| PyTorch fp32 | 579.5 | 7068 | — |
+| llm.mojo bf16 | **133.25** | **30740** | parity, nominal edge (1.007× vs llm.c bf16, ≈noise) |
+| llm.c CUDA bf16 | 134.17 | 30528 | baseline (bf16) |
+| llm.mojo fp32 (TF32) | **273.64** | **14968** | **1.07× faster** (vs llm.c fp32) |
+| llm.c CUDA fp32 (TF32) | 293.40 | 13960 | baseline (fp32) |
+| PyTorch bf16 | 503.43 | 8136 | — |
+| PyTorch fp32 | 578.25 | 7083 | — |
 
-!['Best Single GPU Benchmark'](figures/benchmark_gpu_b4_t1024_2026-07-10_1604_NVIDIA-GB10_DGX-Spark.png)
+!['Best Single GPU Benchmark'](figures/benchmark_gpu_b4_t1024_2026-07-10_2235_NVIDIA-GB10_DGX-Spark.png)
 
 > **TF32 note**: llm.mojo's fp32 GPU GEMMs now use TF32 tensor cores by default (`CUBLAS_COMPUTE_32F_FAST_TF32`), matching llm.c's fp32 behavior — its fp32 build auto-enables TF32 on any compute-capability-8.0+ GPU, so the fp32 rows above are TF32-vs-TF32. Build with `-D LLMM_NO_TF32=1` to restore strict IEEE fp32 math (that is also what `make verify-gpu` gates on; the default TF32 path has its own gate, `make verify-gpu-tf32`).
 
 > **Backward-kernel note**: the 07-10 afternoon numbers add two backward-pass optimizations on top of TF32 — a redesigned fused LN-backward (one register-accumulating kernel plus a block-per-channel finalize, replacing 4 launches per invocation; −6.9 ms fp32 / −3.1 ms bf16 kernel-family time) and a fused, 128-bit-vectorized matmul dbias reduction (−1.5 ms fp32 / −1.0 ms bf16). Both are gated by the full verify battery above.
+
+### Low-precision training (FP8 / NVFP4)
+
+FP8 and NVFP4 are working training precisions, not just inference formats: FP8 quantizes the per-block linear GEMMs (QKV/attn-proj/MLP fc/fc-proj, forward and backward) to transient e4m3/e5m2 operands with delayed scaling, computing in FP8 tensor cores while keeping fp32 master weights and optimizer state; NVFP4 block-scales the middle transformer blocks' MLP GEMMs to e2m1 on cuBLASLt, using stochastic rounding plus a random Hadamard transform (per the published NVFP4 training recipe) to control the extra quantization variance. Both converge alongside bf16 at GPT-2 124M scale — see the loss envelopes below and `make verify-fp8-grads` / the fp8/fp4 gates in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
+
+Step-time measurement (B=4, T=1024, checkpoint-init tinyshakespeare, 2 rounds with arm order alternated per round, 40 measured steps/arm after a discarded fresh-binary warmup run, 2026-07-10, shipped tree):
+
+| precision | mean ms/step | vs bf16 | 50-step loss envelope vs bf16 | build target |
+|---|---:|---:|---:|---|
+| bf16 | 133.9 | baseline | baseline | `make build-bf16` |
+| FP8 (e4m3/e5m2) | 150.5 | 1.12× slower | median 0.57% | `make build-fp8` |
+| NVFP4 (e2m1) | 184.2 | 1.38× slower | median 0.89% | `make build-fp4` |
+
+Honest framing: at 124M params these are numerics/research configs, not throughput wins. The quantized GEMMs themselves are measurably faster than bf16's (fp8 and fp4 both cut raw GEMM compute time), but that saving is swamped by the quantize/amax/scale and (for NVFP4) Hadamard-transform overhead around small per-block GEMMs at this scale — see the quant-opt and transpose-coalescing writeups in `docs/ai/ai_assisted_optimizations_and_benchmarks.md` and the FP8/FP4 gotcha catalogs. Published FP4/FP8 throughput wins start around ~1B+ parameter models, where the GEMMs are large enough to amortize that fixed overhead.
 
 ### Single CPU
 
@@ -172,7 +186,7 @@ In order to speed up testing, I decided to leverage LLMs/AI to help write and ac
 
 ## Agentic Optimizations
 
-After I reached functional success, my kernels were dramatically underperforming Karpathy and PyTorch. I did the initial profiling and caught that attention was the initial bottleneck. After a few attempts at writing a more optimal attention kernel, I decided to leverage AI agents for optimizing the kernel. Originally I leveraged Google Gemini, and after quickly running out of credits, I decided to leverage OpenCode and NVIDIA Nemotron 3 Ultra. After Nemotron 3 struggled for a few days on the optimization, I pivoted to Claude Opus (and more recently Fable) to optimize the kernel, eventually reaching parity in bfloat16 (and later, with TF32 enabled on the fp32 GEMMs, pulling ~4% ahead of llm.c in float32 too). The full exploration is documented in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`. My initial results are documented below:
+After I reached functional success, my kernels were dramatically underperforming Karpathy and PyTorch. I did the initial profiling and caught that attention was the initial bottleneck. After a few attempts at writing a more optimal attention kernel, I decided to leverage AI agents for optimizing the kernel. Originally I leveraged Google Gemini, and after quickly running out of credits, I decided to leverage OpenCode and NVIDIA Nemotron 3 Ultra. After Nemotron 3 struggled for a few days on the optimization, I pivoted to Claude Opus (and more recently Fable) to optimize the kernel, eventually reaching parity in bfloat16 (and later, with TF32 enabled on the fp32 GEMMs plus a round of backward-kernel fusion, pulling ~7% ahead of llm.c in float32 too). The full exploration is documented in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`. My initial results are documented below:
 
 !['Bad Times'](figures/benchmark_gpu_b4_t1024_2026-06-30_0909_NVIDIA-GB10_DGX-Spark.png)
 

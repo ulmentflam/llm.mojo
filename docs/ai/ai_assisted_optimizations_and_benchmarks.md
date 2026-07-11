@@ -3826,4 +3826,124 @@ fp4 **1.03% vs the reference window's own 1.03%** (identical), fp8 0.71%
 vs 0.64% (both consistent with the branch-era 0.57% at n=10). No NaN/Inf
 in any of the six runs; all losses decrease.
 
-_Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen._
+### AI use statement
+
+Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
+
+## 2026-07-10 (evening) — shipped-tree official benchmark: 6-arm re-measurement + FP8/FP4 step-time arms, README updated
+
+Everything above this entry (TF32+perf, FP8 training, NVFP4 training, and
+the DRY consolidation pass) was measured on branch/worktree trees, then
+gated behavior-neutral against `main` and merged. This entry re-measures
+the official numbers directly on `main` HEAD `f3cbf69` (the actual shipped
+tree, not a proxy for it) and updates the README accordingly.
+
+### Fresh builds
+
+All eight binaries rebuilt from a clean state this session and freshness
+verified via `find <sources> -newer <binary>` (empty output on every one):
+`build/train_gpt2`, `build/train_gpt2_bf16`, `build/train_gpt2_fp8`,
+`build/train_gpt2_fp4`, `build/profile_gpt2`, `build/profile_gpt2_bf16`,
+and llm.c's `train_gpt2` (CPU), `train_gpt2cu` (bf16, `NO_MULTI_GPU=1`),
+`train_gpt2fp32cu` (fp32, needs `NO_MULTI_GPU=1` passed explicitly — the
+repo `Makefile`'s `build-llmc-gpu` target only passes it to `train_gpt2cu`,
+same gotcha the perf-hunt closeout entry already logged).
+
+### Harness bug found and fixed: `scripts/benchmark_train.py` UnicodeDecodeError
+
+The first `make benchmark-gpu` attempt crashed mid-run:
+`UnicodeDecodeError: 'utf-8' codec can't decode bytes ... invalid
+continuation byte`, raised while capturing `train_gpt2fp32cu`'s stdout.
+Root cause is in llm.c's own `train_gpt2_fp32.cu`: sampling is gated by
+`step > 0 && step % sample_every == 0 || last_step` — due to operator
+precedence, the `|| last_step` clause fires regardless of `-s`, so the
+benchmark's "push sampling past the run" trick (`-s 10000`) does not
+actually suppress the final-step sample generation. The printed sample is
+raw GPT-2 byte-level-BPE token bytes, which are not guaranteed to align to
+valid UTF-8 boundaries — an intermittent crash depending on which token the
+run happens to sample at its last step, unrelated to any of today's llm.mojo
+changes. Fixed by adding `errors="replace"` to `_run()`'s `subprocess.run`
+call in `scripts/benchmark_train.py` (the harness only regex-parses the
+plain-ASCII timing lines, so lossy-replacing stray bytes in the unused
+sample text is harmless). Re-ran clean after the fix.
+
+### Official 6-arm benchmark (2026-07-10 22:35)
+
+Pre-run state: `free -g` 121 total / 74 used / 46 available; `nvidia-smi`
+0% util, 41°C, no other GPU tenants. One `/tmp/llmm-gpu.lock` hold for the
+whole interleaved run: `make benchmark-gpu BENCH_B=4 BENCH_T=1024` (40
+steps, first 5 dropped as warmup → n=35/arm; llm.c fp32's fixed short-epoch
+limitation still applies → n=3). Figure:
+`figures/benchmark_gpu_b4_t1024_2026-07-10_2235_NVIDIA-GB10_DGX-Spark.png`.
+
+| arm | n | mean ms | median | std | tok/s | 16:04 branch-era | Δ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| llm.mojo fp32 (TF32) | 35 | **273.64** | 273.74 | 1.01 | 14,968 | 276.93 | −1.19% |
+| llm.mojo bf16 | 35 | **133.25** | 133.14 | 0.94 | 30,740 | 133.99 | −0.55% |
+| llm.c CUDA fp32 (TF32) | 3 | 293.40 | 293.25 | 0.52 | 13,960 | 294.10 | −0.24% |
+| llm.c CUDA bf16 | 35 | 134.17 | 134.17 | 0.86 | 30,528 | 134.53 | −0.27% |
+| PyTorch fp32 | 35 | 578.25 | 578.57 | 2.35 | 7,083 | 579.52 | −0.22% |
+| PyTorch bf16 | 35 | 503.43 | 503.85 | 2.54 | 8,136 | 504.26 | −0.16% |
+
+`tok/s = 4096/ms` sanity-checked exact on every row. **All six arms are
+within 1.2% of the 16:04 pre-merge branch-era table — no arm crosses the
+3% flag threshold.** This is the expected outcome given the merge was
+already gated behavior-neutral against these same numbers; this entry is
+the confirmatory re-measurement on the actual shipped tree, not a new
+finding. fp32: llm.mojo beats llm.c CUDA **293.40 vs 273.64 ms — 1.072×
+(~7.2%) faster**, a shade better than the branch-era 1.062× (~6.2%), well
+inside run-to-run noise. bf16: parity with a nominal edge, **134.17 vs
+133.25 ms (1.007×)**, consistent with the branch-era characterization.
+
+### Low-precision (FP8 / NVFP4) step-time arms
+
+`benchmark-gpu`'s harness has no fp8/fp4 arms (the `profile_gpt2` binaries
+it drives don't have fp8/fp4 builds wired into the bench script), so this
+is a separate, same-style interleaved measurement directly against
+`build/train_gpt2_{bf16,fp8,fp4}` via `scripts/run_train_gpt2_bf16.sh`
+(`BIN=` override), real tinyshakespeare data, checkpoint-init from
+`gpt2_124M_bf16.bin`, default B=4/T=1024 (same problem size as the 6-arm
+run above). Protocol: one full discarded warmup run per binary first (F7,
+the documented fresh-binary first-invocation wobble), then 2 rounds with
+arm order alternated (`[bf16,fp8,fp4]` then `[fp4,fp8,bf16]`), each round
+running 25 steps/arm with the first 5 dropped in-process, for 40 measured
+steps/arm total — all inside one `/tmp/llmm-gpu.lock` hold immediately
+following the 6-arm run above.
+
+| precision | n | mean ms | median | std | tok/s | vs bf16 |
+|---|---:|---:|---:|---:|---:|---:|
+| bf16 | 40 | 133.90 | 134.03 | 1.08 | 30,589 | baseline |
+| FP8 (e4m3/e5m2) | 40 | 150.47 | 150.52 | 0.86 | 27,222 | 1.124× slower |
+| NVFP4 (e2m1) | 40 | 184.19 | 184.44 | 1.25 | 22,238 | 1.375× slower |
+
+Compared against the FP4-closeout entry's own Gate-7 step-time snapshot
+(bf16 132.86 / fp8 149.21 / fp4 182.59 mean ms/step, n=18, back-to-back but
+not fully arm-alternated): all three arms are **+0.79% to +0.88%** higher
+here — consistent with each other, well inside noise, no evidence of a
+performance regression surviving the merge. The 50-step loss envelopes
+(median |relative loss delta| vs bf16: fp8 0.57%, fp4 0.89%, from the FP4
+closeout and integration-verification entries above) were not
+re-measured this session — this entry is a step-time-only re-confirmation;
+numerical behavior was already independently re-verified by the
+integration-verification and DRY-consolidation entries' trajectory gates.
+
+### README updated
+
+- Headline sentence: now also states working FP8 (e4m3/e5m2) and NVFP4
+  (e2m1) training support.
+- Single GPU table + figure + timestamp replaced with the 22:35 numbers
+  above (old figure kept on disk, just no longer referenced — the new run
+  supersedes it as the shipped-tree official measurement).
+- New "Low-precision training (FP8 / NVFP4)" subsection added after the
+  backward-kernel note, with the step-time table above and the 50-step
+  loss-envelope numbers (fp8 0.57% / fp4 0.89%), an explanation of what
+  each precision actually quantizes, and an explicit "not a throughput win
+  at 124M" caveat (published FP4/FP8 wins start ~1B+ params — quantization
+  overhead dominates at this GEMM size, per the quant-opt/transpose-
+  coalescing writeups above).
+- "Agentic Optimizations" section's stale "~4% ahead" fp32 claim updated
+  to "~7% ahead", matching this session's measured 1.072×.
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.

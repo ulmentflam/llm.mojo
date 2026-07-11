@@ -278,8 +278,22 @@ def _run(cmd, env=None, cwd=None, timeout=2400):
     e = dict(os.environ)
     if env:
         e.update(env)
+    # errors="replace": llm.c's fp32cu binary samples generated text at its
+    # last step regardless of -s (upstream `step > 0 && step % sample_every
+    # == 0 || last_step` always fires on the final step), and printed GPT-2
+    # byte-level-BPE token bytes are not guaranteed to be valid UTF-8 on
+    # their own — a strict decode intermittently crashes the whole benchmark
+    # depending on which token got sampled. We only regex-parse the timing
+    # lines (which are always plain ASCII), so lossy-replacing any stray
+    # invalid bytes in the (unused) sample text is harmless.
     p = subprocess.run(
-        cmd, env=e, cwd=cwd, capture_output=True, text=True, timeout=timeout
+        cmd,
+        env=e,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=timeout,
     )
     return p.stdout + "\n" + p.stderr
 
