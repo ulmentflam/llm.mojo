@@ -3947,3 +3947,275 @@ integration-verification and DRY-consolidation entries' trajectory gates.
 ### AI use statement
 
 Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
+
+## 2026-07-11 — FP8 quant-opt C+D validation: bit-preserving confirmed, headline d36 ratio improves, run-to-run determinism caveat found (not attributable to C+D)
+
+Validation-only pass (no code changes) for `opt/fp8-kernels` commit `8cbeff3`
+(worktree `llmm-fp8-opt`, parent `d32b199` = shipped `main`), which landed
+two more quantize-family launch-count optimizations on top of the
+`goal2/fp8-quant-opt` session above (Optimizations A/B) but shipped with its
+GPU gates unrun (context-budget handoff). This entry runs that gate battery.
+
+**Optimization C** (`llmm/amax.mojo` `update_scale_pair` +
+`matmul_fwd_lowp`): fuses `matmul_fwd_lowp`'s two adjacent 1-thread
+`update_scale` launches (`input_state` + `weight_state`) into one kernel
+launch (grid=(2,), one single-thread block per state, byte-identical
+arithmetic to the two separate `_update_scale_gpu` calls) — 96→48
+`update_scale`-class launches/step at d12. Deliberately not a whole-step
+144-state batch (`matmul_bwd_lowp`'s `doutput` update has no ready sibling
+to pair with; a step-wide batch needs the two-pass restructuring the
+original quant-opt session already declined as not worth the surgery for a
+~4%-of-GPU-time family).
+
+**Optimization D** (`llmm/matmul.mojo` + `train_gpt2.mojo`): `weight` and
+`input` are now each quantized once per forward call via
+`quantize_dual_devscale` — natural fp8 copy consumed immediately by the
+forward GEMM, transposed copy written into a **persistent per-(site,layer)
+process-global cache** (`lowp_transpose_cache`, built on the
+`KGEN_CompilerRT_InsertGlobal` pattern specifically to avoid G2's
+`DeviceBuffer`-across-nested-calls lifetime hazard — no Mojo-scope-tracked
+local buffer crosses the fwd→bwd gap, so destroy-at-last-use has nothing to
+drop). `matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_lowp` read that cache
+read-only via a new `quantize_a=False` leg of `lowp_gemm_devscale` instead
+of re-reading the bf16 source with `quantize_transpose_devscale`. This
+eliminates the E4M3 `quantize_transpose` family from the steady-state step
+(96 launches + both redundant bf16 re-reads/step at d12) — the deferred
+lever the original quant-opt session flagged as "clearest remaining,
+higher risk than Optimization B." Correctness of the cache depends on fwd
+and bwd running strictly sequentially per micro-step on one stream, and
+both operands being re-quantized fresh on every forward call (weight
+because the natural copy is needed regardless, input because it changes
+per micro-batch) — so the cache only ever bridges one micro-step's own
+fwd→bwd gap, correct for any `grad_accum_steps`.
+
+### Gate 1 — `make verify-fp8-grads`: PASS, numbers IDENTICAL to baseline
+
+cosine min 0.9366 / median 0.9870 / max 0.9993; relL2 min 0.0412 / median
+0.1742 / max 0.4616 (n=148) — identical to 4 decimal places to every prior
+entry in this file back through Chunk F. Confirms both optimizations are
+bit-preserving at the single-step, fixed-batch (T=64) granularity, as
+designed: `update_scale_pair` computes the same arithmetic as two separate
+calls, and `quantize_dual_devscale` computes the same `encode_fp8` value
+per output element as the two separate `quantize`/`quantize_transpose`
+calls it replaces.
+
+### Gate 2 — unit suites: all PASS
+
+| suite | result |
+|---|---|
+| `tests/test_lowp_gemm.mojo` | 10/10 |
+| `tests/test_lowp_bwd.mojo` | 5/5 |
+| `tests/test_amax.mojo` (incl. new `test_update_scale_pair_matches_two_separate_calls`) | 20/20 |
+| `tests/test_matmul_fwd_lowp.mojo` | 4/4 |
+
+### Gate 3 — full-scale 10-step bit-identity twin-runs: FAILS as literally specified, but a control run shows the SAME failure on the unmodified pre-change baseline
+
+This is "the gate that caught opt B's race" (G2), so it was run carefully:
+checkpoint `log124M/model_19552.bin` (the FineWeb-trained checkpoint used by
+the original Chunk F / Optimization A/B bit-stability gates), FineWeb
+train/val shards (glob pattern, matching the full training run's own
+invocation), `-b 4 -t 1024 -x 10 -v 5 -s 0`, first-ever invocation of each
+freshly-built binary discarded (F7 warmup) before any measured run.
+
+**Three runs of the new (`8cbeff3`) `train_gpt2_fp8` binary, plus one
+reference run of the pre-change (`d32b199`) binary, are NOT bit-identical:**
+
+| pair | first divergence step | max relative loss delta |
+|---|---:|---:|
+| baseline vs new run 1 | 2 | 0.330% |
+| baseline vs new run 3 | 2 | 0.408% |
+| new run 1 vs new run 2 | 5 | 0.193% |
+| new run 2 vs new run 3 | 7 | 0.125% |
+| new run 1 vs new run 3 | 5 | 0.246% |
+
+No NaN/Inf, no qualitative divergence (loss stays in the same
+monotonically-noisy-decreasing shape) — every pairwise diff is a
+small-but-real floating-point-valid difference starting a few steps in,
+the same *signature* G2 characterized as a race (not "a new but consistent
+numerics path," which would show identical divergence step/direction on
+every repeat).
+
+**Control experiment — is this new, or pre-existing?** The pre-change
+(`d32b199`) `train_gpt2_fp8` binary was run two additional times under the
+identical protocol, entirely unmodified by this session:
+
+| pair (baseline binary, self-comparison) | first divergence step | max relative loss delta |
+|---|---:|---:|
+| baseline ref A vs ref B | 2 | 0.337% |
+| baseline ref B vs ref C | 2 | 0.372% |
+| baseline ref A vs ref C | 2 | 0.517% |
+
+**The unmodified pre-change binary shows the same class of run-to-run
+non-determinism** — divergence starting at step 2 (earlier and, in two of
+three pairs, larger in magnitude than the new binary's own 5/7-step-onset,
+0.13–0.25% spread). This was not expected: the original quant-opt session
+(Optimization A/B, same day) reported clean bitwise-identical twin runs
+under what is nominally the same protocol. The most likely explanation,
+not confirmed against source and disclosed as a hypothesis rather than a
+finding, is the non-associative-atomic-accumulation timing jitter the
+FP4-closeout entry already flagged for `llmm/layernorm.mojo`'s
+`ln_dparam_accum` (`Atomic[DType.float32].fetch_add`, present in every
+precision's build, not fp8-specific) — that entry characterized it as a
+fresh-build-only, first-invocation-only fragility, but this session's data
+(all runs here are well past first invocation) suggests the true trigger
+rate/scope may be broader than that characterization, possibly amplified
+by today's heavier GPU contention (a sibling fp4 validation pass was
+running concurrent `ncu` profiling during part of this session under the
+shared `/tmp/llmm-gpu.lock`).
+
+**Verdict, disclosed rather than adjudicated:** gate 3 as literally
+specified (three-way bit-identity to a pre-change baseline) fails, but the
+control experiment is the load-bearing fact here — it fails in an
+equivalent way on code this session did not touch. This is reported to the
+coordinator as the headline risk of this validation pass rather than
+resolved unilaterally: per MEMORY.md `weak-gates-overrule-nothing`, a
+failing gate should not be waved off without positive evidence it isn't
+catching a real regression, and the control run is exactly that evidence,
+but it is not proof, and opt D's new persistent process-global cache is
+the single highest-risk change in this commit by the predecessor's own
+design note. New gotcha G3 in `low_precision_gotchas.md` codifies this for
+future sessions.
+
+### Gate 4 — d12 + d36 interleaved wall-clock remeasurement: both ratios improve
+
+Protocol: 2 rounds per config, arm order flipped each round (`[fp8,bf16]`
+then `[bf16,fp8]`), 20 steps/run with the first 5 dropped in-process
+(n=30 measured steps/arm), all four binaries already warm from gates 1–3
+before this gate started (no fresh-binary F7 wobble). d12: checkpoint
+`gpt2_124M_bf16.bin`, tinyshakespeare data (matches the shipped-tree
+official-benchmark protocol above). d36: `-e d36` (774M, from scratch,
+C=1280/L=36), FineWeb shard `fineweb_train_000090.bin`/
+`fineweb_val_000000.bin` (matches the `lowp_scaling_sweep_2026-07-10.md`
+protocol).
+
+| config | arm | n | mean ms/step | median ms/step |
+|---|---|---:|---:|---:|
+| d12 (124M) | fp8 | 30 | 145.976 | 146.135 |
+| d12 (124M) | bf16 | 30 | 135.112 | 134.495 |
+| d36 (774M) | fp8 | 30 | 763.435 | 763.240 |
+| d36 (774M) | bf16 | 30 | 866.096 | 863.840 |
+
+| config | fp8/bf16 ratio (before, C+D) | fp8/bf16 ratio (after, C+D) | change |
+|---|---:|---:|---:|
+| d12, B=4 | 1.124x (150.5/133.9 ms) | **1.080x** (mean) / 1.087x (median) | fp8 4-4.5pp closer to bf16 |
+| d36, B=4 | 0.920x (792.9/862.2 ms) | **0.881x** (mean) / 0.884x (median) | fp8 now **~13.5% faster** than bf16, was ~8.7% faster |
+
+**d36 is the headline: fp8's advantage over bf16 at 774M widens from
+1.087x faster (1/0.920) to 1.135x faster (1/0.881)** — Optimizations C+D
+remove real overhead that was cutting into fp8's win at the scale where it
+already beat bf16, and simultaneously narrow (not close) the gap at 124M
+where fp8 was still slower. Both directions move the same way one would
+expect from removing pure launch/redundant-read overhead uncorrelated with
+model width.
+
+### Launch-count / GPU-time proof (1-step `ncu`, `PROFILE_T=1024`, `build/profile_gpt2_fp8`)
+
+| metric | pre-C+D (post-Optimization-B) | post-C+D | Δ |
+|---|---:|---:|---:|
+| total kernel launches | 1,406 | **1,167** | **-17.0%** |
+| quantize family launches | ~816 | **672** | **-17.6%** |
+| quantize family GPU time | 29,081.0 us (16.8%) | **24,610.5 us (14.8%)** | **-15.4%**, -2.0pp share |
+| total GPU time (1 step) | 173,571.3 us | **165,764.1 us** | **-4.5%** |
+
+Per-kernel breakdown of the post-C+D quantize family (48 distinct kernels,
+1,167 launches, 165,764.1 us total):
+
+| kernel | calls | us | % of total |
+|---|---:|---:|---:|
+| `quantize_dual_kernel_devscale` (E4M3, weight+input, **new from D**) | 96 | 8,909.4 | 5.37% |
+| `quantize_dual_kernel_devscale` (E5M2, d_output, from Optimization B, unchanged) | 48 | 8,722.4 | 5.26% |
+| `amax_partial_gpu` | 144 | 5,930.7 | 3.58% |
+| `amax_aggregate_gpu` | 144 | 470.7 | 0.28% |
+| `amax_state_init_gpu` | 144 | 311.9 | 0.19% |
+| `update_scale_gpu` (single, `doutput`, unchanged) | 48 | 133.8 | 0.08% |
+| `update_scale_pair_gpu` (**new from C**) | 48 | 131.7 | 0.08% |
+
+The old `quantize_transpose` (E4M3) and separate natural `quantize` (E4M3)
+kernels — 24.1%/8.7% and a further chunk of pre-C+D fp8 time respectively
+in the Optimization A/B tables above — no longer appear at all: both are
+folded into the single `quantize_dual_kernel_devscale` (E4M3) launch,
+exactly as designed.
+
+### Launch-gap timeline (`nsys`, d12/B=4, 5 steps): gaps are NOT a material fraction of step time
+
+Coordinator-requested addition (scope upgrade mid-session): does this
+many-tiny-kernel fp8 shape leave a fusion/CUDA-graphs opportunity on the
+table, or is the quantize family's cost real kernel-busy time? Captured
+with `nsys profile -o fp8_timeline --stats=true build/train_gpt2_fp8 -e
+gpt2_124M_bf16.bin -b 4 -t 1024 -x 5 -v 0 -s 0` (tinyshakespeare, checkpoint
+init, same d12/B=4 config as gate 4 above), then queried the resulting
+`.sqlite` trace directly for GPU-timeline gaps (single CUDA stream used
+throughout — no cross-stream overlap to account for). Step boundaries were
+located via the once-per-step `adamw_update` kernel (5 instances, one per
+training step); steps 2–5 (4 complete windows bounded by consecutive
+`adamw_update` starts) were used as the steady-state sample — step 1's
+window is contaminated by process startup/data-loading and was excluded,
+matching this validation pass's own "discard the first window" convention.
+
+| | value |
+|---|---:|
+| steady-state steps sampled | 4 (steps 2–5) |
+| avg total window/step | 149.208 ms |
+| avg GPU-busy/step (union of kernel intervals) | 145.648 ms (**97.61%**) |
+| avg gap/step (no kernel executing) | 3.561 ms (**2.39%**) |
+| kernel launches/step (full wall-clock run, includes val/logging kernels the isolated 1-step `ncu` profile above doesn't) | 1,023 |
+
+**GPU-busy time dominates: 97.6% of every step is spent with a kernel
+actually executing.** The remaining 2.4% gap is not spread evenly across
+the many small quantize/amax launches — it is concentrated almost entirely
+(11,586.4 us of the 14,242 us total gap time across all 4 steps, **81%**)
+at ONE recurring boundary per step:
+
+| gap location (recurring, 1x/step) | total time (4 steps) | avg/step | % of all gap time |
+|---|---:|---:|---:|
+| `fused_classifier` (loss/logits) → next step's first GEMM | 11,586.4 us | 2,896.6 us | 81.4% |
+| `adamw_update` → next step's `encoder_fwd` | 1,412.5 us | 353.1 us | 9.9% |
+| all quantize/amax-family inter-kernel gaps combined (hundreds of small boundaries, e.g. `amax_partial`→`amax_aggregate`, `update_scale`→`quantize_dual`) | ~450 us | ~113 us | ~3.2% |
+| everything else (long tail, <20us each) | ~790 us | ~198 us | ~5.5% |
+
+The dominant gap (`fused_classifier` → next GEMM) is a per-step, once-only
+boundary, not a many-tiny-kernel pattern — consistent with a host-side
+synchronization point (most plausibly the loss/norm readback the training
+loop needs to print `step N | loss ... | norm ...` to the console before
+issuing the next step's kernels) rather than CPU dispatch overhead spread
+across the quantize family's hundreds of small launches. The quantize/amax
+family's own inter-kernel gaps, aggregated across all ~672 of those
+launches/step, sum to well under 1% of step time.
+
+**Conclusion for the next optimization wave's priorities:** at d12/B=4,
+launch-gap/CPU-dispatch overhead is not a material lever — fusing the
+quantize family's many small kernels into fewer launches (or moving to
+CUDA graphs) would save at most the ~3.2% of the already-small 2.4% gap
+budget attributable to that family, i.e. a low-single-digit-percent-of-gap
+(not of step time) ceiling. The quantize family's real cost, per the
+launch-count table above (14.8% of GPU time, 24,610.5 us/step), is
+overwhelmingly kernel-busy time — actual memory traffic and compute inside
+those kernels — which per-kernel tuning (the same class of work
+Optimizations A/B/C/D already did: coalescing, redundant-read elimination,
+launch batching) continues to be the higher-leverage direction, not
+fusion/graphs. The one real, actionable finding here is the
+`fused_classifier`→next-step gap (81% of all gap time, ~2.9 ms/step,
+~1.9% of total step time) — worth a future investigation into whether the
+per-step console-print's loss/norm readback can be made async/pipelined
+with the next step's kernel launches, but even eliminating it entirely
+would move the needle by under 2% of step time, not a step-change.
+
+### Session summary
+
+| stage | d12 fp8/bf16 | d36 fp8/bf16 | quantize family % of GPU time | total launches/step |
+|---|---:|---:|---:|---:|
+| Optimization A+B (prior session) | 1.124x | 0.920x | 16.8% | 1,406 |
+| + Optimization C+D (this commit) | **1.080x** | **0.881x** | **14.8%** | **1,167** |
+
+**Gates 1, 2, and 4 all PASS/improve cleanly.** Gate 3 (bit-identity) fails
+as literally specified, but with strong (not conclusive) control evidence
+that the failure is a pre-existing, environment-sensitive determinism
+issue unrelated to this commit's changes — flagged for the coordinator
+rather than resolved here, per this validation pass's explicit no-fixes
+mandate. `make lint` clean; all four builds compile clean (unchanged from
+the predecessor's handoff, not re-verified beyond the gates above since no
+code changed in this pass).
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
