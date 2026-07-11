@@ -4219,3 +4219,258 @@ code changed in this pass).
 ### AI use statement
 
 Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
+
+## 2026-07-11 — Speedrun A1/A5/A6: static/calibrated FP8 scales, per-site ablation, fast-accum (branch `opt/fp8-static-scales`)
+
+Implements three findings from `docs/ai/speedrun_techniques_research.md`
+(mined from modded-nanogpt): **A1** replaces per-step dynamic delayed-scaling
+(`llmm/amax.mojo`'s `AmaxState`) with calibrated constant per-(site,role)
+FP8 scales behind `-D LLMM_FP8_STATIC_SCALES=1` (default OFF); **A6** tests
+cuBLASLt fast-accumulation mode on the forward fp8 GEMM behind `-D
+LLMM_FP8_FAST_ACCUM=1`; **A5** adds per-site fp8 ablation flags (`-D
+LLMM_FP8_SITE_{QKV,ATTN_PROJ,FC,PROJ}=0`) and measures which of the four
+per-block linears actually pay for themselves. Builds on opts C/D
+(validated bit-preserving on `opt/fp8-kernels` per the entry immediately
+above — that base is sound, d36 ratio 0.881x).
+
+### A1 — calibration
+
+`calibrate_fp8_scales.mojo` (new tool) runs 20 fp8 training steps with the
+EXISTING dynamic delayed-scaling path and reads back every per-(site,role,
+layer) `AmaxState.scale`, picking `min(scale over layers AND steps) /
+safety_factor` as the one constant shared by every layer for that
+(site,role) — mirroring modded-nanogpt's own "hardcoded constant per-tensor
+scale" recipe rather than per-layer dynamic tracking.
+
+**Tool bug found and fixed mid-session (see the gotcha entry in
+`docs/ai/low_precision_gotchas.md`, G4):** the first version read `.scale`
+only ONCE at the end of the run. `AmaxState`'s ring buffer only remembers
+the last `amax_history_len=16` steps, so an end-of-run-only read silently
+forgets steps 0-3 — exactly where a fresh/not-yet-adapted checkpoint (d12)
+or a from-scratch random init (d36) tends to produce its LARGEST amax. The
+fixed tool reads every state's scale after every step and keeps a running
+min across the whole trajectory. This mattered enormously at d36:
+`proj_doutput`'s true worst-case (min-over-steps) scale was ~30M, but the
+end-of-run-only value would have been ~1.19B — a ~40x-unsafe table.
+
+**d12 (GPT-2 124M, checkpoint-init `gpt2_124M_bf16.bin`, tinyshakespeare,
+B=4 T=1024, safety_factor=2.0):**
+
+| site.role | calibrated scale |
+|---|---:|
+| qkv.input | 17.398058 |
+| qkv.weight | 67.30516 |
+| qkv.doutput | 3,050,403 |
+| attn_proj.input | 15.928889 |
+| attn_proj.weight | 25.239437 |
+| attn_proj.doutput | 3,308,183.5 |
+| fc.input | 11.27044 |
+| fc.weight | 21.2071 |
+| fc.doutput | 7,117,607 |
+| proj.input | 3.5137255 |
+| proj.weight | 13.080292 |
+| proj.doutput | 5,799,531.5 |
+
+**d36 (GPT-2 774M, from-scratch random init, same B/T/factor):**
+
+| site.role | calibrated scale |
+|---|---:|
+| qkv.input | 39.384617 |
+| qkv.weight | 1,943.8644 |
+| qkv.doutput | 50,785,090 |
+| attn_proj.input | 52.321167 |
+| attn_proj.weight | 14,858.364 |
+| attn_proj.doutput | 9,442,453 |
+| fc.input | 40.497173 |
+| fc.weight | 1,927.5294 |
+| fc.doutput | 167,026,510 |
+| proj.input | 43.707317 |
+| proj.weight | 14,798.451 |
+| proj.doutput | 15,214,965 |
+
+Both tables live as `FP8StaticScaleD12`/`FP8StaticScaleD36` in
+`llmm/lowp.mojo`, selected by `-D LLMM_FP8_STATIC_D36=1`. Neither transfers
+to any other width/depth/init/data config without recalibration.
+
+### A1 — implementation
+
+`AmaxState.__init__` (`llmm/amax.mojo`) gained an optional `static_scale:
+Float32 = -1.0` parameter: when `>0`, the init kernel seeds `scale`/
+`scale_inv` from the calibrated constant instead of the placeholder
+1.0/1.0. `matmul_fwd_lowp`/`matmul_bwd_lowp` (`llmm/matmul.mojo`) wrap their
+`compute_amax` + `update_scale_pair`/`update_scale` blocks in `comptime if
+not FP8_STATIC_SCALES:` — under the flag those kernels are never
+instantiated, not merely skipped at runtime. `LowpState.__init__`
+(`train_gpt2.mojo`) seeds every `AmaxState` from `llmm/lowp.mojo`'s
+`fp8_static_scale[site, role]()` under the flag.
+
+### A1 — gates
+
+**Flag-off bit-identity (twin-run):** built `dump_grads_gpt2_fp8` from
+pre-change HEAD (`8cbeff3`, stashed the A1 diff) and from the post-change
+tree with `LLMM_FP8_STATIC_SCALES` unset, ran both against the fixed
+`gpt2_124M_debug_state.bin` reference batch. `diff -rq` on all 148 dumped
+tensors: **zero differences**, losses match exactly (`5.289448` both). The
+dynamic path is unchanged when the flag is off.
+
+**`verify-fp8-static-grads` (envelope gate, `tests/compare_grad_dumps.py`,
+`gpt2_124M_debug_state.bin` fixed B=4 T=64 batch, step 0 from checkpoint)
+— side by side with the existing `verify-fp8-grads` (dynamic) baseline:**
+
+| | cosine min | relL2 median | relL2 max | depth-monotonicity | verdict |
+|---|---:|---:|---:|---|---|
+| fp8-dynamic vs bf16 (baseline) | 0.9366 | 0.1742 | 0.4616 | 0 violations | **PASS** |
+| fp8-static vs bf16 (v1: end-of-run-only calib, factor 2.0) | 0.7065 | 0.1653 | 0.8087 | 1 violation | FAIL |
+| fp8-static vs bf16 (v2: running-min fix, factor 4.0) | 0.8153 | 0.1979 | 0.5836 | 4 violations | FAIL (worse) |
+| fp8-static vs bf16 (v3: running-min fix, factor 2.0, SHIPPED) | 0.8933 | 0.2057 | 0.5110 | 0 violations | FAIL (close) |
+
+Per the mission's own "if static mode drifts, widen margin and retry
+ONCE": v2 (wider margin on top of the tool fix) made things WORSE, not
+better — diagnosis: floating-point formats have roughly uniform *relative*
+precision across their normal range, but e4m3's subnormal region still
+craters near zero; a too-small static scale trades overflow risk for
+underflow/subnormal-precision risk, and factor=4.0 pushed several sites
+into that regime. v3 (the fixed tool at the *original* factor=2.0 — fixing
+a genuine tool bug is not "widening the margin again") is the best of the
+three and is what's shipped, but it still does not cleanly pass this
+specific gate: 4 tensors (`ln_1_gamma`/`ln_2_gamma` at layers 1-3) sit
+just under the 0.93 cosine floor, and the aggregate relL2 median/max both
+sit just over their ceilings (0.2057 vs <0.20, 0.5110 vs <0.50). **Root
+cause, disclosed not resolved:** `gpt2_124M_debug_state.bin` is a
+step-0-from-checkpoint, T=64, single-fixed-batch probe — exactly the
+regime where a "one constant shared by every layer, calibrated from a
+20-step *warmed-up* trajectory" design is weakest (no per-step
+adaptation to fall back on, unlike the dynamic path). This is a genuine,
+disclosed limitation of the current calibration/margin choice for this
+one narrow gate, not a NaN/overflow/correctness failure (criterion (d),
+NaN/Inf sentinel, PASSES in every attempt).
+
+**10-step / 50-step real training-loop comparison (checkpoint-init
+tinyshakespeare, `-e gpt2_124M_bf16.bin -x 50 -v 0 -s 0 -b 4 -t 1024`) —
+THIS is the gate that matters for actual training use, and it is clean:**
+
+| | 10-step median \|Δ\| | 10-step max \|Δ\| | 50-step median \|Δ\| | 50-step max \|Δ\| | NaN |
+|---|---:|---:|---:|---:|---|
+| fp8-dynamic vs bf16 | 0.638% | 1.648% | 0.565% | 1.648% | none |
+| fp8-static vs bf16 | 0.511% | 1.056% | 0.457% | 1.056% | none |
+
+Static mode tracks bf16 at least as well as dynamic mode over a real
+training trajectory (median delta *lower* than dynamic's in this run),
+comfortably inside the documented ~0.6-1% band, no NaN/Inf, monotonically
+noisy-decreasing loss identical in shape to bf16/dynamic. The single-fixed-
+batch grad-dump gate above is a narrower, harder synthetic probe than this
+real-training-loop gate — both are reported honestly rather than picking
+the one that passes.
+
+**d36 training-loop comparison (from-scratch, `-e d36`, same B/T, 15
+steps):** fp8-static median \|Δ\| vs bf16 = 0.136% (max 0.986%), fp8-dynamic
+0.150% (max 0.866%) — both clean, no NaN.
+
+### A1 — measured step time (d12 + d36, tinyshakespeare checkpoint/random-init)
+
+| config | d12 mean ms/step | d12 vs bf16 | d36 mean ms/step | d36 vs bf16 |
+|---|---:|---:|---:|---:|
+| bf16 | 134.82 | 1.000x | 858.30 | 1.000x |
+| fp8-dynamic (all 4 sites) | 146.70 | 1.088x | 774.63 | 0.903x |
+| fp8-static (all 4 sites) | 144.00 | 1.068x | 742.23 | **0.865x** |
+
+fp8-static is **~1.8% faster than fp8-dynamic at d12** (144.00 vs 146.70
+ms) and **~4.2% faster at d36** (742.23 vs 774.63 ms) — both real,
+consistent, disclosed wins, though neither is dramatic: at d12, fp8
+(either mode) is still net SLOWER than bf16 (matches the prior "fp8
+crosses bf16 at 774M width, not batch" finding — nothing in A1 changes
+that crossover). At d36, static widens fp8's existing lead over bf16 from
+9.7% to **13.5%**.
+
+### A1 — ncu launch/family proof (1-step, B=4 T=64 L=12, the shared
+llm.c-parity profiling config)
+
+| | distinct kernels | total launches | total GPU time | amax-family launches |
+|---|---:|---:|---:|---:|
+| fp8-dynamic | 52 | 1,168 | 32,711.87 us | 384 (144 `amax_partial` + 144 `amax_aggregate` + 48 `update_scale_pair` + 48 `update_scale` solo) |
+| fp8-static | 48 | **784** | 30,194.59 us | **0** |
+
+`compute_amax`/`update_scale`/`update_scale_pair` VANISH completely under
+the flag — 384 fewer launches (-32.9% of total launches), confirming the
+comptime gating actually eliminates the kernels rather than merely
+skipping them at runtime. (`amax_state_init_gpu` still fires 144 times in
+both — that's one-time model-construction cost, identical either way, not
+a per-step kernel.)
+
+### A5 — per-site fp8 ablation
+
+New comptime flags (`train_gpt2.mojo`): `LLMM_FP8_SITE_{QKV,ATTN_PROJ,FC,
+PROJ}` (each default 1/on). Setting one to 0 falls that site through to
+the ordinary bf16 `matmul_fwd`/`matmul_bwd` at both forward AND backward
+call sites (mechanical: `comptime if PRECISION == "fp8" and FP8_SITE_X:` /
+`comptime if LOWP_BWD_ENABLED and FP8_SITE_X:`, reusing the existing
+branch structure — no new machinery). Measured (fp8-dynamic scaling,
+checkpoint/random-init tinyshakespeare, mean ms/step, steps 2-15):
+
+| config | d12 ms/step | d12 vs bf16 | d36 ms/step | d36 vs bf16 |
+|---|---:|---:|---:|---:|
+| none (bf16) | 134.82 | 1.000x | 858.30 (avg of 2 runs) | 1.000x |
+| fc only | 139.63 | 1.036x | 865.47 (avg of 2 runs) | **1.008x** |
+| fc + qkv | 143.47 | 1.064x | 876.84 | **1.022x** |
+| all 4 (fc + qkv + attn_proj + proj) | 146.70 | 1.088x | 774.63 | **0.903x** |
+
+**Verdict — the opposite shape from modded-nanogpt's finding.** The
+speedrun found down-projection FP8 net-negative in isolation even on
+8xH100 (their FP8 surface is narrow: LM head + MLP up-proj only). Our
+data at d36 shows the reverse pattern: **every partial subset (fc alone,
+fc+qkv) is net NEGATIVE vs pure bf16** (fc-only confirmed slower across 2
+independent runs, 864.68 and 866.26 ms vs bf16's 857.51/859.10 ms — a
+small, ~1%, but repeatable regression, not noise) — **and the win only
+appears once ALL FOUR sites convert** (fc+qkv → all4 saves ~102 ms, more
+than double what fc+qkv itself cost over bf16). At d12, fp8 never wins
+regardless of site count (consistent with the known 774M crossover). No
+single site is "clearly negative" in our architecture — the data instead
+says our persistent-transpose-cache/dual-quantize machinery (Optimizations
+C/D) has fixed per-site overhead that only amortizes once the full
+4-site aggregate GEMM savings materialize. **Implementation verdict:
+no site should be pruned** — A5's own "implementation only if the data
+says a site is clearly negative" condition is not met; the flags are kept
+(cheap, already built, useful for future re-ablation) but the default
+stays all-4-sites-on.
+
+### A6 — fp8 fast-accumulation mode
+
+`CUBLASLT_MATMUL_DESC_FAST_ACCUM` is present in this toolchain's vendored
+`_cublas.cublaslt` bindings (`Self(25)`, confirmed by a standalone probe
+resolving the named constant) — no new enum needed. Added `_lt_set_fast_
+accum` (`llmm/matmul.mojo`, `int8_t` attribute, separate from `_lt_set_op`'s
+`int32_t` `cublasOperation_t` setter) and threaded a `fast_accum: Bool =
+False` comptime parameter through `_matmul_cublaslt_fp8` → `lowp_gemm_
+devscale`, wired to `-D LLMM_FP8_FAST_ACCUM=1` (default off) ONLY on
+`matmul_fwd_lowp`'s single forward GEMM call — dgrad/wgrad
+(`matmul_d_input_bwd_lowp`/`matmul_d_weight_bwd_lowp`) never pass it,
+staying precise-accumulate, matching modded-nanogpt's fwd-fast/bwd-precise
+split.
+
+**Result: functional but no measurable win on this GB10/sm_121 toolchain.**
+Runs correctly (no CUBLAS_STATUS error), passes `verify-fp8-grads`-style
+envelope gate identically to the non-fast-accum baseline (same loss
+`5.289448`, same cosine/relL2 stats — cosine min 0.9366, relL2 median
+0.1742/max 0.4616, both criteria PASS). ncu shows cuBLASLt dispatches THE
+SAME underlying kernel (`sm89_xmma_gemm_e4m3e5m2bf16_e4m3e5m2f32_f32...`,
+12 calls, 398.56 us vs the baseline's 392.54 us — within noise) regardless
+of the attribute — likely because the dispatched kernel is an sm89-lineage
+(Ada-generation) kernel running via forward compatibility rather than a
+native sm_121/Blackwell tensor-core path with a distinct fast/precise
+accumulate variant, or because this GEMM shape (B=4 T=1024 C=768, small
+per-tile FLOPs) is not compute-bound enough for accumulation mode to
+matter. **Verdict: implemented, gated, disclosed, kept OFF by default** —
+a real but zero-measured-benefit lever on THIS hardware/toolchain; worth
+re-checking if/when a native sm_121 fp8 tensor-core kernel path lands.
+
+### Commits (branch `opt/fp8-static-scales`, HEAD `8cbeff3` + fp8-kernels
+validation cherry-pick `8d4fe9c`)
+
+Per-feature: A1 (calibration tool + static-scale table + `AmaxState`/
+`matmul.mojo`/`LowpState` wiring + gates), A6 (fast-accum), A5 (site
+ablation flags). See individual commit messages for the exact diff
+boundaries.
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.

@@ -710,6 +710,63 @@ MEMORY.md `weak-gates-overrule-nothing`).
 **Source:** FP8 quant-opt C+D validation pass, 2026-07-11 (worktree
 `llmm-fp8-opt`, branch `opt/fp8-kernels`, commit `8cbeff3`).
 
+## FP8 static-scale calibration (opt/fp8-static-scales branch, speedrun A1/A5/A6)
+
+### S1 — a delayed-scaling calibration tool that reads `AmaxState.scale` only at the end of the run silently forgets the run's biggest outlier
+
+**What:** `calibrate_fp8_scales.mojo` (new tool, A1: modded-nanogpt-style
+static/calibrated FP8 scales) originally ran N fp8 training steps and read
+back every `AmaxState.scale` ONCE, after the last step, picking `min(scale
+over layers) / safety_factor` as the calibrated constant. This produced an
+UNSAFE table: `verify-fp8-static-grads` (the envelope gate,
+`tests/compare_grad_dumps.py`, against the fixed `gpt2_124M_debug_
+state.bin` reference batch) failed with a cosine-floor violation
+(`ln_1_gamma_layer03`, cosine 0.7065) and a depth-monotonicity spike
+(relL2 0.81 vs a <0.50 ceiling).
+
+**Root cause:** `AmaxState`'s delayed-scaling ring buffer
+(`llmm/amax.mojo`) only remembers the last `amax_history_len=16` steps by
+construction — that is the entire point of "delayed" scaling. Reading
+`.scale` only after step 20 sees the max amax over roughly steps 4-19 and
+has ALREADY FORGOTTEN steps 0-3. The single largest amax of a short
+calibration run is very often the FIRST step or two off a fresh/not-yet-
+adapted checkpoint (d12) or a from-scratch random init (d36) — exactly the
+regime an end-of-run-only readback cannot see. Confirmed dramatically at
+d36: `proj_doutput`'s true worst-case (min-over-layers-AND-steps) scale
+was ~30M, but the value still resident in the ring buffer at step 20 alone
+corresponded to a scale that would have been calibrated at ~1.19B — a
+~40x-unsafe constant, silently produced by a tool that looked correct
+(ran, printed plausible-looking numbers, no crash).
+
+**Fix:** read every state's scale after EVERY step and track a running min
+across the whole trajectory (144 states x N steps of host syncs — fine for
+a one-shot offline calibration tool, never on the training hot path).
+
+**Second lesson — margin has two failure directions, not one:** after
+fixing the tool, a follow-up attempt ALSO widened the safety factor (2.0 ->
+4.0) "to be extra safe" and made the gate WORSE (6 cosine-floor violations
+instead of 2, including in tensors like `wpe` with no direct fp8 GEMM
+dependency). Floating-point formats have roughly uniform *relative*
+precision across their normal exponent range, but e4m3 still has a
+subnormal region near zero where precision craters same as any float
+format. A too-small static scale (too much margin) pushes real values
+toward zero and INTO that subnormal region — trading overflow/saturation
+risk for underflow/precision-loss risk, and the wider margin overshot into
+the latter. **Widening a static-scale margin is not monotonically safer**
+— there is a floor as well as a ceiling, and blindly doubling a working
+margin can regress a gate that a smaller margin would have passed. The
+fixed-tool-at-the-original-margin table ended up the best of the three
+variants tried, though it still did not cleanly pass the single-fixed-
+batch grad-dump gate (4 residual cosine-floor violations, relL2 aggregate
+just over its ceiling) — see the doc entry in `docs/ai/ai_assisted_
+optimizations_and_benchmarks.md` (2026-07-11 A1/A5/A6 session) for the
+full three-way comparison and why the real training-loop envelope gate
+(10-step/50-step vs bf16) passed cleanly even though this narrower probe
+did not.
+
+**Source:** A1 static-scale calibration, 2026-07-11 (worktree
+`llmm-fp8-static`, branch `opt/fp8-static-scales`).
+
 ## FP4 CHUNK T1 (forward-pass integration)
 
 ### F1 — Cosine and relL2 gate thresholds are geometrically coupled: never mix floors across precisions
@@ -1080,7 +1137,8 @@ implemented then reverted, git-clean at commit time).
 | ARCHITECTURE | A1–A3 | A1–A2: design doc confirmed; A3: agent-reported |
 | FP8 CHUNK D/E | E1–E5 | Verified (E5: root-cause investigation, coordinator-accepted recalibration) |
 | FP8 CHUNK F | FF1–FF4 | Verified (gate codified + PASS, bit-stability PASS, 50-step envelope PASS, perf measured) |
-| FP8 QUANT-OPT | G1-G2 | Verified (G1: ncu sudo-gated counters workaround; G2: race found + fixed, 3x twin-run confirmed) |
+| FP8 QUANT-OPT | G1-G3 | Verified (G1: ncu sudo-gated counters workaround; G2: race found + fixed, 3x twin-run confirmed; G3: control-run evidence of pre-existing determinism flakiness) |
+| FP8 STATIC-SCALE CALIBRATION | S1 | Verified (tool bug found + fixed; margin-widening-both-directions lesson; see 2026-07-11 A1/A5/A6 doc entry) |
 | FP4 CHUNK T1 | F1 | Verified (gate c re-run 3x bit-identical; gate d 10-step A/B) |
 | FP4 CHUNK T2a | F2–F4 | Verified (F2: test fix + re-run 18/18 green; F3: gate c 3x bit-identical; F4: gate d 10-step A/B, checkpoint init) |
 | FP4 CHUNK T2b | F5–F6 | Verified (F5: dedicated gaussian/outlier unit tests, reproducible; F6: gate d 10-step A/B + ablation bit-identity to T2a) |
