@@ -164,6 +164,30 @@ comptime LOWP_ENABLED = PRECISION == "fp8" or PRECISION == "fp4"
 comptime LOWP_BWD_ENABLED = (PRECISION == "fp8") and not is_defined[
     "LLMM_FP8_FWD_ONLY"
 ]()
+
+# A5 (docs/ai/speedrun_techniques_research.md): per-site fp8 ablation gates.
+# modded-nanogpt's own evidence (record 84 / PR 306) is that FP8 on the MLP
+# DOWN-projection was a net *loss* even on 8xH100 (wide input activations
+# make it bandwidth-bound) -- worth ablating on our much more
+# bandwidth-starved GB10. Reuses the existing per-site `comptime if
+# PRECISION == "fp8":` / `comptime if LOWP_BWD_ENABLED:` branch structure at
+# each of the four per-block-linear call sites below: each site's condition
+# additionally requires its own `-D LLMM_FP8_SITE_<SITE>=0` NOT be set (all
+# four default ON, i.e. `LOWP_ENABLED`'s existing "every site is fp8"
+# behavior is exactly reproduced when none of these flags are passed --
+# flag-off/all-default is byte-identical to before this ablation knob
+# existed). Setting one to 0 falls that SINGLE site through to the ordinary
+# bf16 `matmul_fwd`/`matmul_bwd` else-branch every non-fp8 PRECISION already
+# uses, both forward AND backward (a site disabled in forward must also be
+# disabled in backward -- `matmul_fwd_lowp`'s persistent transpose cache
+# and `LowpState`'s AmaxState scale for a site are only valid if THAT SAME
+# site's forward call actually ran this step).
+comptime FP8_SITE_QKV = get_defined_int["LLMM_FP8_SITE_QKV", 1]() != 0
+comptime FP8_SITE_ATTN_PROJ = (
+    get_defined_int["LLMM_FP8_SITE_ATTN_PROJ", 1]() != 0
+)
+comptime FP8_SITE_FC = get_defined_int["LLMM_FP8_SITE_FC", 1]() != 0
+comptime FP8_SITE_PROJ = get_defined_int["LLMM_FP8_SITE_PROJ", 1]() != 0
 comptime STORAGE_DTYPE = (
     DType.float32 if PRECISION == "fp32" else DType.bfloat16
 )
@@ -2263,7 +2287,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # docs/ai/fp4_training_recipes_research.md §1 "Selective
             # high-precision layers"); only PRECISION=="fp8" takes the
             # matmul_fwd_lowp path here.
-            comptime if PRECISION == "fp8":
+            comptime if PRECISION == "fp8" and FP8_SITE_QKV:
                 matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](l_qkv),
                     as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
@@ -2339,7 +2363,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
             # Matmul Attn Proj. Always bf16 under fp4 (same rationale as the
             # QKV site above — attention stays out of FP4 per the recipe).
-            comptime if PRECISION == "fp8":
+            comptime if PRECISION == "fp8" and FP8_SITE_ATTN_PROJ:
                 matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](l_attn_proj),
                     as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
@@ -2392,7 +2416,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # matmul_fwd_fp4; first/last blocks fall through to the same
             # bf16 matmul_fwd the fp32/bf16 builds use. fp8 is unchanged
             # (matmul_fwd_lowp on every layer, byte-identical to before).
-            comptime if PRECISION == "fp8":
+            comptime if PRECISION == "fp8" and FP8_SITE_FC:
                 matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=True](
                     as_mut_kernel[GPT2_DTYPE](l_fch_gelu),
                     as_mut_kernel[GPT2_DTYPE](l_fch),
@@ -2452,7 +2476,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
             # Matmul Proj. The other FP4-eligible MLP linear — same
             # three-way dispatch as the FC site above.
-            comptime if PRECISION == "fp8":
+            comptime if PRECISION == "fp8" and FP8_SITE_PROJ:
                 matmul_fwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](l_fc_proj),
                     as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
@@ -2944,7 +2968,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var loop_t0 = global_perf_counter_ns()
             # fp8 site (Chunk E): C=4*channels, OC=channels;
             # input=l_fch_gelu, weight=l_proj_weight, d_output=d_l_fc_proj.
-            comptime if LOWP_BWD_ENABLED:
+            comptime if LOWP_BWD_ENABLED and FP8_SITE_PROJ:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=True](
                     as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
                     as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
@@ -3027,7 +3051,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # linear FC: d_l_ln_2 = d_fch @ fc_weight.
             # fp8 site (Chunk E): C=channels, OC=4*channels; input=l_ln_2,
             # weight=l_fc_weight, d_output=d_l_fch_gelu.
-            comptime if LOWP_BWD_ENABLED:
+            comptime if LOWP_BWD_ENABLED and FP8_SITE_FC:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
                     as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
@@ -3146,7 +3170,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # fp8 site (Chunk E): C=channels, OC=channels;
             # input=l_attn_merged, weight=l_attn_proj_weight,
             # d_output=d_l_attn_proj.
-            comptime if LOWP_BWD_ENABLED:
+            comptime if LOWP_BWD_ENABLED and FP8_SITE_ATTN_PROJ:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
                     as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
@@ -3214,7 +3238,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # QKV matmul backward.
             # fp8 site (Chunk E): C=channels, OC=3*channels; input=l_ln_1,
             # weight=l_qkv_weight, d_output=d_l_qkv.
-            comptime if LOWP_BWD_ENABLED:
+            comptime if LOWP_BWD_ENABLED and FP8_SITE_QKV:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
                     as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
