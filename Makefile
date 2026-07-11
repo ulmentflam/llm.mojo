@@ -221,7 +221,7 @@ help:
 	@echo "  benchmark     Histogram of train-loop time (auto: Metal on Apple, NVIDIA GPU on Linux)"
 	@echo "  benchmark-cpu Only the CPU comparison (no CUDA / Metal needed)"
 	@echo "  benchmark-gpu Only the NVIDIA GPU comparison"
-	@echo "  benchmark-metal  Apple Silicon Metal GPU: llm.mojo fp32+bf16 vs PyTorch MPS fp32+bf16"
+	@echo "  benchmark-metal  Apple Silicon Metal GPU: llm.mojo vs PyTorch MPS vs MLX (fp32+bf16)"
 	@echo "                   (4 arms in one graph, mirroring benchmark-gpu's fp32+bf16 layout)"
 	@echo "                   llm.c has no Metal port — baseline is PyTorch MPS"
 	@echo "                   (hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS, BENCH_COOLDOWN_S)"
@@ -734,11 +734,12 @@ benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
 	pixi run -e cuda python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
 		--gpu-steps $(BENCH_GPU_STEPS)
 
-# Apple Silicon Metal GPU benchmark: llm.mojo fp32+bf16 vs PyTorch MPS fp32+bf16.
-# 4 arms in one graph, mirroring how benchmark-gpu combines fp32+bf16 for NVIDIA.
-# No llm.c dependency — llm.c has no Metal port; the baseline is PyTorch MPS.
-# Hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS (default 10 due to ~6.5 s/step),
-#              BENCH_COOLDOWN_S (default 30 s — thermal discipline for M4 Max).
+# Apple Silicon Metal GPU benchmark: llm.mojo vs PyTorch MPS vs MLX, fp32+bf16.
+# 6 arms in one graph, mirroring how benchmark-gpu combines fp32+bf16 for NVIDIA.
+# No llm.c dependency — llm.c has no Metal port; the baselines are PyTorch MPS and
+# MLX (Apple's array framework — the osx-arm64 `mlx` dep pixi installs on `pixi
+# run`, so no extra setup step). Hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS
+# (default 10 due to ~6.5 s/step), BENCH_COOLDOWN_S (default 30 s, M4 Max thermal).
 benchmark-metal: $(PROFILE_BIN) $(PROFILE_BIN_BF16) $(BENCH_SCRIPT)
 	pixi run python $(BENCH_SCRIPT) --device metal $(BENCH_ARGS) \
 		--metal-steps $(BENCH_METAL_STEPS) --cooldown-s $(BENCH_COOLDOWN_S)

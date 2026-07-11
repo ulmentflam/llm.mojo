@@ -7,6 +7,11 @@ version = "0.1.0"
 
 [tasks]
 
+# mlx (osx-arm64, below) needs the __osx virtual package to prove macOS >= 13.3;
+# declare the floor so the solve on Apple Silicon can satisfy it.
+[system-requirements]
+macos = "14.0"
+
 [dependencies]
 mojo = "1.0.0b3.*"
 max = "26.5.*"
@@ -19,6 +24,12 @@ tiktoken = ">=0.6"
 pytest = ">=8.0"
 pytest-xdist = ">=3"
 matplotlib = ">=3.11.0,<4"
+
+# MLX (Apple's array framework) is the third arm of the Metal training
+# benchmark (scripts/benchmark_mlx.py). It builds only for Apple Silicon, so it
+# is scoped to osx-arm64 — the linux-aarch64 solve must not try to resolve it.
+[target.osx-arm64.dependencies]
+mlx = ">=0.20"
 
 [pypi-dependencies]
 pyrefly = ">=0.16"

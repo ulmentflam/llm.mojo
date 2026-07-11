@@ -3,3 +3,8 @@ project-includes = [
     "**/*.ipynb",
 ]
 search-path = ["data"]
+
+# mlx (Apple's array framework, the Metal benchmark's MLX arm) ships no type
+# stubs, so a static import check can't resolve it. Treat it as Any rather than
+# fail the typecheck; it's exercised at runtime by scripts/benchmark_mlx.py.
+replace-imports-with-any = ["mlx", "mlx.core", "mlx.nn", "mlx.optimizers"]

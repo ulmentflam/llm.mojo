@@ -1,0 +1,96 @@
+{
+  "device": "metal",
+  "series": [
+    {
+      "name": "metal/llm.mojo-fp32",
+      "label": "llm.mojo\nfp32",
+      "family": "llm.mojo",
+      "precision": "fp32",
+      "n": 5,
+      "mean": 283.58,
+      "median": 284.58,
+      "std": 3.66,
+      "min": 284.58,
+      "tok_s": 903,
+      "samples": []
+    },
+    {
+      "name": "metal/llm.mojo-bf16",
+      "label": "llm.mojo\nbf16",
+      "family": "llm.mojo",
+      "precision": "bf16",
+      "n": 5,
+      "mean": 270.68,
+      "median": 270.98,
+      "std": 2.73,
+      "min": 270.98,
+      "tok_s": 946,
+      "samples": []
+    },
+    {
+      "name": "metal/torch-mps-fp32",
+      "label": "PyTorch MPS\nfp32",
+      "family": "PyTorch",
+      "precision": "fp32",
+      "n": 5,
+      "mean": 484.62,
+      "median": 484.95,
+      "std": 1.01,
+      "min": 484.95,
+      "tok_s": 528,
+      "samples": []
+    },
+    {
+      "name": "metal/torch-mps-bf16",
+      "label": "PyTorch MPS\nbf16",
+      "family": "PyTorch",
+      "precision": "bf16",
+      "n": 5,
+      "mean": 602.5,
+      "median": 602.17,
+      "std": 1.88,
+      "min": 602.17,
+      "tok_s": 425,
+      "samples": []
+    },
+    {
+      "name": "metal/mlx-fp32",
+      "label": "MLX\nfp32",
+      "family": "MLX",
+      "precision": "fp32",
+      "n": 5,
+      "mean": 298.99,
+      "median": 299.64,
+      "std": 1.55,
+      "min": 299.64,
+      "tok_s": 856,
+      "samples": []
+    },
+    {
+      "name": "metal/mlx-bf16",
+      "label": "MLX\nbf16",
+      "family": "MLX",
+      "precision": "bf16",
+      "n": 5,
+      "mean": 215.61,
+      "median": 215.89,
+      "std": 2.33,
+      "min": 215.89,
+      "tok_s": 1187,
+      "samples": []
+    }
+  ],
+  "info": {
+    "date": "2026-07-11 15:02:36",
+    "date_display": "July 11th, 2026",
+    "host": "Evans-MacBook-Air.local",
+    "os": "macOS-26.5.2-arm64-arm-64bit",
+    "cpu": "Apple M4",
+    "cores": "10",
+    "gpu": "Apple M4",
+    "platform": "Mac M4"
+  },
+  "footer": "Thermal discipline: 30s cooldown between each of the 6 arms (M4 Max throttle cliff ~8 s, P16). llm.c has no Metal port \u2014 baselines are PyTorch MPS and MLX.",
+  "B": 4,
+  "T": 64
+}
