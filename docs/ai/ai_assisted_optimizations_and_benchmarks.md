@@ -4216,6 +4216,276 @@ mandate. `make lint` clean; all four builds compile clean (unchanged from
 the predecessor's handoff, not re-verified beyond the gates above since no
 code changed in this pass).
 
+## 2026-07-11 — FP4 kernel-optimization pass (opt/fp4-kernels): sanitizer clears F7, both deferred transpose fixes land, d36 reaches bf16 parity
+
+Mission: land the FP4 closeout's two deferred kernel fixes (F8's tiled
+RHT-prep transpose, and the confirmed-but-deferred `nvfp4_quantize_transpose`
+strided-read pathology) and re-measure. Baselines (shipped `main`, d32b199):
+fp4 184.2 ms/step at 124M/B=4/T=1024 (1.375x bf16's 133.9); d36/B=4
+fp4/bf16 = 1.245x (1073.2 vs 862.2 ms); ncu families: RHT-prep 18.8% of fp4
+GPU time (40,313.53 us — naive `_gpu_transpose_kernel` 568.28 us/call +
+`hadamard16` 691.52 us/call), NVFP4 quantize/amax/post-scale 14.4%
+(30,849.90 us), `nvfp4_quantize_transpose` 3.20x per-byte vs natural.
+
+### Step 1 — sanitizer verdict: F7 is environmental, not a race; and full-scale bit-stability is not a usable gate in this session
+
+`compute-sanitizer` (short B=1/T=256 x2-step training runs, GPU-locked):
+
+| run | tool | verdict |
+|---|---|---|
+| fp4 stock (d32b199) | racecheck | **0 hazards** (0 errors, 0 warnings) |
+| fp4 stock | memcheck | **0 errors** |
+| bf16 stock | racecheck | **0 hazards** |
+| fp4 modified (both fixes) | racecheck | **0 hazards** |
+| fp4 modified | memcheck | **0 errors** |
+
+So F7's fresh-binary divergence is NOT a correctness race — per the mission
+brief, layout-only fixes are judged by bit-identity-after-warmup. But a
+NEW characterization emerged while gating: **at B=4/T=1024, even the stock
+binary's warm runs are not bit-stable in this session** — four consecutive
+runs of a freshly-built, git-clean baseline (F7 protocol, first run
+discarded) differed pairwise from step 2 onward, on an idle GPU
+(nvidia-smi: no tenant). The closeout's "5 warm runs unanimous" property
+did not reproduce. Divergences stay small (~0.1-0.5% per-step loss), step 1
+is always bit-identical (fwd deterministic; the wiggle enters through the
+gradient path — consistent with F7's non-associative LN-backward
+`Atomic.fetch_add` hypothesis, whose summation order is scheduling-
+dependent every run, not just on first-touch). Implication: a full-scale
+bit-identity gate cannot certify ANY change in an environment where it
+fails on stock code (cf. MEMORY.md weak-gates-overrule-nothing — a gate
+must be able to catch the failure it guards, and this one "fails"
+unconditionally). Substitute gates used instead (all CAN catch a wrong
+kernel): sanitizer (above), byte-exact unit tests, and full-training
+bit-identity at the scale where training IS deterministic (B=1/T=256:
+10-step runs are bitwise self-stable run-to-run, and — decisive —
+**cross-binary bit-identical between the stock baseline and the final
+modified build**, all 10 steps + 3 val losses).
+
+### Fix 1 (commit 979d06c) — RHT-prep: tiled transpose + fused warp-shuffle Hadamard
+
+F8's 32x32-SMEM-tile transpose re-landed, plus one step beyond the recipe:
+the 16-wide forward Hadamard is FUSED into the tile kernel's write phase.
+In phase 2 a Hadamard block is exactly 16 consecutive lanes of the writing
+warp, so the butterfly runs as 4 `warp.shuffle_xor` stages (offsets
+1/2/4/8, confined to 16-lane halves; per-stage ops are the same
+`a+b`/`a-b` pairs as `_fwht16`, so bit-exact by construction). The
+separate `hadamard16_fwd_gpu` launch — and its full extra read+write of
+the tensor — is gone from the wgrad path entirely.
+
+| RHT-prep family (1-step ncu, T=1024) | before | after |
+|---|---:|---:|
+| transpose kernel | 18,184.83 us (568.28 us/call x32) | 5,399.52 us (fused: 277.22 us/call x16 + 60.25 us/call x16) |
+| hadamard16 kernel | 22,128.70 us (691.52 us/call x32) | **0 (eliminated)** |
+| **family total** | **40,313.53 us (18.8%)** | **5,399.52 us (3.1%) — 7.5x** |
+
+### Fix 2 (commit f6a1492) — `nvfp4_quantize_transpose`: register-per-row coalesced reads
+
+The planned 32x32-SMEM-tile port of fp8's Optimization A was implemented
+first and measured **SLOWER than the naive kernel** (284 vs 243 us/call at
+the dgrad-weight BLOCK_ROWS=16 shapes): quantizing one block-scale GROUP
+per thread from SMEM leaves 4 of 256 threads alive after the tile load —
+fp8's tile pattern does not transplant onto a kernel whose output work is
+per-16x16-group rather than per-element. Replaced with a register-per-row
+design (one thread per logical row per k-block; each fixed-kidx step reads
+consecutive addresses across consecutive threads -> 16 fully-coalesced
+transactions; BLOCK_ROWS=16 group amax via one SMEM exchange — max is
+order-invariant, no FP-associativity hazard). Output addresses, encode
+math, and SR counters byte-identical; the T2a byte-exact unit test stays
+green.
+
+| dgrad weight quantize_transpose | before | after |
+|---|---:|---:|
+| us/call (16 calls/step) | 243.45 | **135.57** |
+| per-byte ratio vs natural quantize (74.99 us/call same tensors) | 3.20x | **1.81x** |
+
+### Gates (final tree, all green)
+
+- `test_nvfp4_quant` 18/18 (incl. byte-exact transpose-quantize identity),
+  `test_matmul_bwd_fp4` 5/5, `test_lowp_gemm_fp4` 8/8, `test_hadamard` 5/5,
+  `test_matmul_fwd_fp4` 2/2 — every printed site-gate number identical to
+  the pre-change published values to every digit (e.g. wgrad-gaussian
+  RHT-on 0.1664202, outlier RHT-on 0.09687754, fc-bwd d_weight 0.16635847).
+- B=1/T=256 10-step training: bitwise self-stable AND cross-binary
+  identical to stock (see step 1).
+- B=4/T=1024 10-step trajectory (F7 protocol, run 2): step 1 bit-exact
+  4.408221; all later steps inside the stock baseline's own run-to-run
+  envelope (final val 3.7624 vs baseline family 3.764-3.769).
+- `make lint` clean; all commits through pre-commit hooks (no --no-verify).
+
+### Re-measurement (interleaved wall-clock, arm order flipped per round)
+
+**d12 (124M) / B=4 / T=1024** (checkpoint init, `-x 21 -v 0 -s 0`, median
+of 20 steps/round after dropping step 1, n=40/arm):
+
+| arm | r1 median | r2 median | combined | baseline |
+|---|---:|---:|---:|---:|
+| fp4 | 154.47 | 159.19 | **155.82 ms** | 184.2 ms |
+| bf16 | 134.94 | 134.91 | **134.91 ms** | 133.9 ms |
+| **fp4/bf16** | | | **1.155x** | 1.375x |
+
+**d36 (774M) / B=4 / T=1024** (`-e d36` random init, FineWeb shard, sweep
+protocol: `-x 20 -v 0 -s 0 -n 0`, first 5 dropped, mean of 15, n=30/arm):
+
+| arm | r1 mean | r2 mean | combined mean | baseline |
+|---|---:|---:|---:|---:|
+| fp4 | 870.0 | 869.9 | **870.0 ms** | 1073.2 ms |
+| bf16 | 859.5 | 873.3 | **866.4 ms** | 862.2 ms |
+| **fp4/bf16** | | | **1.004x — parity** | 1.245x |
+
+(bf16's two d36 rounds straddle the fp4 number — 859.5 first-in-window vs
+873.3 last — i.e. the residual 0.4% is inside thermal-drift noise, TF4.)
+
+fp4 step time: **184.2 -> 155.8 ms at 124M (−15.4%)** and **1073.2 ->
+870.0 ms at d36 (−18.9%)**; total 1-step GPU time 214,861.73 ->
+176,248.70 us (−18.0%). Combined fp4-specific overhead (quantize/amax/
+post-scale + RHT-prep) 71,163 -> 33,946 us; the remaining gap to bf16 at
+124M is now dominated by the quantize/amax family itself (28,547 us,
+16.2%), of which the largest single bucket is the amax-partial pass over
+the two RHT wgrad scratch tensors (7,564 us — a candidate for folding into
+the fused transpose kernel's epilogue in a future pass, since the tensor
+scale only needs the post-RHT amax).
+
+## 2026-07-11 — EXPERIMENT: FP4 layer-coverage stability screen (opt/fp4-kernels, 200-step, 124M)
+
+**Question:** the NVFP4 recipe (`>=1B`-scale literature) keeps the first ~2
+and last ~2 blocks' MLPs in bf16; our default (`LLMM_FP4_FIRST=2`,
+`LLMM_FP4_LAST=num_layer-2`) inherits that exclusion unmeasured at 124M.
+Does widening fp4 coverage to *every* block's MLP destabilize training at
+this scale over a short horizon? Zero `llmm/`/`train_gpt2.mojo` code
+changes — flags-and-measurement only, four fresh binaries built off HEAD
+`e9a75ad` (the just-landed 7.5x RHT-prep + coalesced quantize-transpose
+kernels).
+
+**Arms** (all: `gpt2_124M_bf16.bin` checkpoint init, tinyshakespeare,
+B=4/T=1024, `-x 200 -v 100 -s 0`, one GPU-lock window, binaries mtime-
+verified fresh before every run):
+
+| arm | build flags | layers in fp4 (d12) |
+|---|---|---|
+| 0 (reference) | `-D LLMM_BF16=1` | none (bf16) |
+| 1 (default coverage) | `-D LLMM_PRECISION=fp4` | 2..9 (8/12 blocks) |
+| 2 (all-layers) | `-D LLMM_PRECISION=fp4 -D LLMM_FP4_FIRST=0 -D LLMM_FP4_LAST=12` | 0..11 (12/12 blocks) |
+| 3 (all-layers, RHT off) | arm 2 flags `+ -D LLMM_FP4_NO_RHT=1` | 0..11, plain RNE/SR wgrad path |
+
+Arm 3 was run because arms 1–2 both came back stable (see below), per the
+mission's own gating condition.
+
+### Results
+
+**Per-step relative loss delta vs ARM0 (bf16), n=200 steps each:**
+
+| arm | mean Δ | median Δ | max \|Δ\| | first-100 mean \|Δ\| | second-100 mean \|Δ\| |
+|---|---:|---:|---:|---:|---:|
+| 1 fp4 default | +1.61% | +1.26% | 7.65% | 0.99% | 2.40% |
+| 2 fp4 all-layers | +2.57% | +2.08% | 9.15% | 1.66% | 3.53% |
+| 3 fp4 all-layers, no RHT | +2.67% | +2.07% | 10.38% | 1.68% | 3.71% |
+
+**Loss-spike count** (step-over-step jump >5% where bf16's own same-step
+jump is <2%; denominator: 38/199 transitions qualify as "bf16 calm enough
+to test against"):
+
+| arm | spikes | worst jump |
+|---|---:|---:|
+| 1 fp4 default | 2/38 | 5.15% |
+| 2 fp4 all-layers | 2/38 | 7.66% |
+| 3 fp4 all-layers, no RHT | 1/38 | 7.80% |
+
+**NaN/Inf:** none in any of the 4 arms (grepped all four full logs).
+
+**Val loss** (step 0 / 100 / 200):
+
+| arm | step 0 | step 100 | step 200 |
+|---|---:|---:|---:|
+| 0 bf16 | 4.5133057 | 3.636153 | 3.7216253 |
+| 1 fp4 default | 4.546688 | 3.6433403 | 3.703814 |
+| 2 fp4 all-layers | 4.5574856 | 3.640629 | 3.6777856 |
+| 3 fp4 all-layers, no RHT | 4.5574856 | 3.651947 | 3.7099519 |
+
+(Arms 2/3 share an identical step-0 val loss — expected, `LLMM_FP4_NO_RHT`
+only changes the weight-gradient path, not the forward pass.) All four
+arms land within **1.2% of each other** at step 200 — arm 2 (all-layers,
+RHT on) actually posts the *lowest* val loss of the four, arm 0 (bf16) the
+highest. At this short horizon none of the fp4 configurations show
+degraded generalization vs bf16.
+
+**Step time** (mean of steps 5–200, ms; arm 2 was expected to be *faster*
+than arm 1 per the mission brief's own assumption — more layers moved off
+bf16 GEMM onto the fp4 path):
+
+| arm | mean ms/step | vs bf16 | vs arm 1 |
+|---|---:|---:|---:|
+| 0 bf16 | 134.77 | 1.000x | — |
+| 1 fp4 default | 155.45 | 1.153x | — |
+| 2 fp4 all-layers | 166.75 | 1.237x | **1.073x slower** |
+| 3 fp4 all-layers, no RHT | 169.85 | 1.260x | 1.260x (1.019x slower than arm 2) |
+
+**Surprise, contradicting the mission brief's assumption:** arm 2 is
+*slower* than arm 1, not faster. At 124M the fp4 GEMM path is still net
+slower than bf16 per-layer (this branch's own closeout number: fp4 stock
+155.8 ms vs bf16 134.9 ms/step) because the quantize/amax/RHT-prep
+overhead per fp4-converted layer isn't yet amortized by the narrower GEMM
+at this width — so converting *more* layers to fp4 adds more of that
+per-layer overhead rather than removing bf16-GEMM cost, and total step
+time goes up, not down. Widening coverage is a **speed regression** at
+124M, independent of any stability question.
+
+**RHT-off (arm 3) is also slower than RHT-on (arm 2)**, which looks
+backwards until you note this branch (`opt/fp4-kernels`, `e9a75ad`)
+specifically fused/coalesced the RHT-prep transpose (commits `979d06c`,
+`f6a1492`); `-D LLMM_FP4_NO_RHT=1` reverts to the *old*, unoptimized plain
+RNE/SR quantization path (Chunk T2a's ablation branch in `matmul.mojo`),
+which never received this pass's speedups. The "RHT costs extra prep work"
+intuition no longer holds on this tree — RHT-on is now the fast path.
+
+### Verdicts
+
+1. **Is all-layers-MLP fp4 stable at 200 steps? Yes.** No NaN/Inf in any
+   arm; spike rates are low and comparable across arms (1–2 flagged
+   spikes out of 38 qualifying transitions, all in the 5–10% range, none
+   catastrophic); val loss at step 200 is within 1.2% across all four
+   arms, with the all-layers arm actually best. Widening coverage does
+   not visibly destabilize training over this horizon.
+2. **Is the recipe's first/last-block bf16 exclusion load-bearing at
+   124M/200 steps, or conservatism? On this evidence, conservatism — not
+   load-bearing.** Nothing in the 200-step screen distinguishes arm 2 from
+   arm 1 on stability grounds (comparable spike counts, no drift blowup,
+   comparable or better val loss). But widening coverage buys nothing at
+   124M either: it is strictly slower (arm2 1.073x slower than arm1) with
+   no measurable quality benefit, so there's no practical reason to widen
+   it in production regardless of the stability verdict.
+3. **Is RHT load-bearing at widened coverage? Not for stability, but yes
+   for quality/speed on this tree.** Arm 3 (no RHT) shows no NaN/Inf and
+   a similar loss-delta/spike profile to arm 2 (RHT on) — ablating RHT at
+   widened coverage does not destabilize the widened config either. It
+   does cost measurably: worse val loss at both step 100 (+0.31%) and step
+   200 (+0.87%) than arm 2, and (on this branch specifically) is *also*
+   slower, since RHT-on is the newly-optimized path.
+
+**Both fp4-vs-bf16 loss deltas grow from first-100 to second-100 steps in
+all three fp4 arms (roughly 2.4x, consistent across arms 1/2/3)** — this
+is trajectory divergence from differing per-step gradients (chaotic
+sensitivity, expected for any two independently-evolving optimizers on
+real, non-overfit data), not a coverage-specific instability signal, since
+the growth rate is essentially the same magnitude regardless of coverage
+width.
+
+**Caveat — 200 steps is a SHORT horizon.** This screen can only catch
+*fast* destabilization: NaN/Inf, large per-step spikes uncorrelated with
+bf16's own noise, or an early, sharply accelerating divergence trend. It
+cannot rule out slow-onset instability (e.g. a widened-coverage run that
+looks fine for 200 steps but diverges at step 5,000, or a quality gap that
+only appears after the LR schedule's decay phase). A definitive answer
+needs the project's standard reproduction target: a full GPT-2 124M /
+FineWeb-10B run (`docs/ai/gpt2_124m_fineweb_training_run.md`'s protocol) to
+completion, comparing final validation loss and HellaSwag accuracy between
+default-coverage and all-layers fp4, not just a 200-step screen.
+
+**Artifacts:** four fresh binaries (`build/train_gpt2_{bf16,fp4,fp4_all,
+fp4_all_norht}`, sequential `mojo build`, mtime-verified), full per-step
+logs and the parsing/analysis script kept in the experiment's scratch
+directory (not checked into the repo — this entry's tables are the
+durable record).
+
 ### AI use statement
 
 Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
@@ -4474,4 +4744,5 @@ boundaries.
 ### AI use statement
 
 Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
+
 

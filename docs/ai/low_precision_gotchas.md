@@ -997,6 +997,26 @@ F3/F4/E5 — the coordinator's brief explicitly anticipated this possibility
 
 ### F7 — A freshly-rebuilt binary's FIRST invocation can diverge from its own later invocations; this is not an SR/seed bug and is not fp4-specific
 
+**UPDATE (2026-07-11, opt/fp4-kernels): RESOLVED as environmental.**
+`compute-sanitizer` was run to completion: racecheck AND memcheck are
+CLEAN (0 hazards, 0 errors) on the stock fp4 binary, the stock bf16
+binary, and the modified (tiled-kernel) fp4 binary — F7 is confirmed NOT
+a correctness race. Additionally, the "warm runs are unanimous" part of
+the original characterization did NOT reproduce in the follow-up session:
+at B=4/T=1024, four consecutive warm runs of a git-clean stock baseline
+differed pairwise from step 2 onward, on an idle GPU (step 1 always
+bit-identical; the wiggle enters via the gradient path, consistent with
+the LN-backward-atomics hypothesis below — whose summation order is
+scheduling-dependent on EVERY run, not only first-touch). Practical
+implication, superseding the "discard the first post-build run" advice:
+full-scale multi-step bit-identity is NOT a reliable gate on this box,
+period — it can fail on stock code (cf. weak-gates-overrule-nothing: a
+gate that fails unconditionally certifies nothing). Gate layout-only
+kernel changes with (a) sanitizer runs, (b) byte-exact unit tests, and
+(c) full-training bit-identity at a scale where training IS deterministic
+(B=1/T=256 10-step runs are bitwise stable run-to-run AND cross-binary).
+See the 2026-07-11 entry in `ai_assisted_optimizations_and_benchmarks.md`.
+
 **What:** The closeout's bit-stability re-check ran two back-to-back fp4
 10-step twin runs immediately after a fresh `make build-fp4` (as part of
 gating the F8 transpose-coalescing optimization below) and got a
@@ -1056,6 +1076,24 @@ attempting the F8 optimization below; reproduced independently on
 git-clean `matmul.mojo`).
 
 ### F8 — `_rht_transpose_prep`'s naive transpose has the same coalescing pathology fp8 fixed with a 32x32 tile; the fix is ready but unshipped pending sanitizer confirmation of F7
+
+**UPDATE (2026-07-11, opt/fp4-kernels): RESOLVED — SHIPPED, and superseded
+by a fused version.** The re-attempt recipe below was executed: sanitizer
+cleared F7 (see F7's update), the tiled kernel was re-landed, and the
+Hadamard was additionally FUSED into the tile kernel's write phase as a
+4-stage `warp.shuffle_xor` butterfly (a Hadamard block is exactly 16
+consecutive lanes of the writing warp; per-stage ops are the same
+`a+b`/`a-b` pairs as `_fwht16`, so bit-exact), eliminating the separate
+`hadamard16_fwd_gpu` launch from the wgrad path entirely. RHT-prep family:
+40,313.53 -> 5,399.52 us/step (7.5x). Commit 979d06c. The companion
+deferred fix (`nvfp4_quantize_transpose`, commit f6a1492) also landed —
+with a caveat worth keeping: fp8's 32x32-SMEM-tile pattern transplanted
+naively was SLOWER than the naive kernel (284 vs 243 us/call — quantizing
+one 16x16 block-scale group per thread from SMEM leaves 4/256 threads
+alive); a register-per-row design (coalesced reads, every thread live)
+was needed instead, 243.45 -> 135.57 us/call. New step times: 124M/B=4
+fp4/bf16 1.375x -> 1.155x; d36/B=4 1.245x -> 1.004x (parity). Full
+writeup: 2026-07-11 entry in `ai_assisted_optimizations_and_benchmarks.md`.
 
 **What:** `llmm/matmul.mojo`'s `_gpu_transpose_kernel` (used by Chunk T2b's
 `_rht_transpose_prep` to materialize `RHT(operand^T)` scratch for Wgrad) is
@@ -1143,7 +1181,7 @@ implemented then reverted, git-clean at commit time).
 | FP4 CHUNK T1 | F1 | Verified (gate c re-run 3x bit-identical; gate d 10-step A/B) |
 | FP4 CHUNK T2a | F2–F4 | Verified (F2: test fix + re-run 18/18 green; F3: gate c 3x bit-identical; F4: gate d 10-step A/B, checkpoint init) |
 | FP4 CHUNK T2b | F5–F6 | Verified (F5: dedicated gaussian/outlier unit tests, reproducible; F6: gate d 10-step A/B + ablation bit-identity to T2a) |
-| FP4 CLOSEOUT | F7–F8 | Verified (F7: reproduced 2x independently on git-clean code; F8: fix implemented+gated+reverted, root-caused via F7) |
+| FP4 CLOSEOUT | F7–F8 | RESOLVED 2026-07-11 (F7: sanitizer-cleared as environmental scheduling jitter, full-scale bit-identity retired as a gate; F8: shipped + Hadamard fused, commits 979d06c/f6a1492) |
 
 ---
 
