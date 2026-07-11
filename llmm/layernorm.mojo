@@ -1487,35 +1487,20 @@ def _layernorm_bwd_fused_gpu[
     channels: Int,
     blocks_cap: Int,
 ) -> None:
-    # Fused LN-backward MAIN pass (the "big" launch of a 2-kernel design; the
-    # tiny deterministic finalize is _ln_bwd_fused_finalize_gpu below). In one
-    # sweep over [B,T,C] it produces d_input, folds the residual-grad seed
-    # (HAS_RESID_IN), and reduces dgamma/dbeta — replacing the 3-kernel
-    # sequence (_layernorm_bwd_residual_gpu + _ln_dparam_accum_gpu +
-    # _ln_dparam_finalize_gpu) plus the separate residual_grad_broadcast.
+    # Fused LN-backward MAIN pass (paired with the _ln_bwd_fused_finalize_gpu
+    # launch below). One sweep over [B,T,C] produces d_input, folds the
+    # residual-grad seed (HAS_RESID_IN), and reduces dgamma/dbeta.
     #
-    # Redesign (2026-07-10) vs the first fused attempt (edd2b67): dgamma/dbeta
-    # accumulate into per-thread REGISTERS across every row this block
-    # processes, NOT into a 16 KB/block shared array with a per-element RMW in
-    # the hot loop. Thread `tid` owns a fixed, disjoint set of channel offsets
-    # on every row of its grid-stride loop (i = tile_base + tid*width for the
-    # aligned path; i = col_base + tid for the scalar path), so no other
-    # thread ever touches its accumulator — the reduction is deterministic and
-    # stays in registers until a single scratch flush at the end. The
-    # cross-block reduction that the previous attempt did inside this kernel
-    # with a "last block finalizes" serial tail (~60% of its wall time, one SM
-    # busy while 47 idle) is now a separate, fully parallel finalize launch.
-    # This removes the shared array (restores occupancy), the per-element
-    # shared traffic, and the serial tail — the three regressions the first
-    # attempt's ncu profile flagged.
+    # dgamma/dbeta accumulate into per-thread REGISTERS, not shared memory:
+    # thread `tid` owns a fixed disjoint set of channel offsets on every row
+    # (i = tile_base + tid*width aligned; i = col_base + tid scalar), so no
+    # other thread touches its accumulator. The reduction is therefore
+    # deterministic and needs only a single scratch flush at the end; the
+    # cross-block sum is a separate finalize launch.
     #
-    # Numerically identical to edd2b67: same per-row accumulation order into
-    # the register partials, same block-order cross-block sum in the finalize,
-    # so dgamma/dbeta are bit-for-bit what the shared-array version produced
-    # (determinism preserved). `aligned` alignment proof unchanged: the host
-    # dispatch sets aligned=True only when channels % width == 0, which makes
-    # every row*channels+i offset provably width-aligned and the scalar tail
-    # (i < channels < i+width) provably unreachable.
+    # `aligned` proof: the host dispatch sets aligned=True only when
+    # channels % width == 0, making every row*channels+i offset width-aligned
+    # and the scalar tail (i < channels < i+width) unreachable.
     comptime BLOCK_SPAN = BLOCK_SIZE * width
     comptime align = align_of[SIMD[dtype, width]]()
     # Number of comptime-unrolled work chunks a single thread can own. For the
@@ -1735,19 +1720,13 @@ def _ln_bwd_fused_finalize_gpu[
     num_blocks: Int,
     blocks_cap: Int,
 ) -> None:
-    # Deterministic cross-block reduction of _layernorm_bwd_fused_gpu's
-    # per-block dgamma/dbeta partials. ONE BLOCK PER CHANNEL (block_idx.x ==
-    # channel), so all `channels` blocks run concurrently across every SM
-    # instead of the single "last block" the first fused attempt used (that
-    # serial tail was the dominant regression) and instead of a thread-per-
-    # channel grid (only ceil(C/256) blocks -> most SMs idle, ~2.4 ms). The
-    # channel's blocks_cap partials are contiguous in the channel-major
-    # scratch, so the block's threads read them fully coalesced, grid-stride
-    # over blocks_cap, then a block reduction sums them. Deterministic (fixed
-    # block dims -> fixed tree order -> bit-reproducible run to run).
-    # d_gamma/d_beta ALWAYS accumulate (grad accumulation across micro-steps),
-    # matching _ln_dparam_finalize_gpu. Scratch needs no re-zero: the main
-    # kernel overwrites every [0:num_blocks) slot in full each launch.
+    # Deterministic cross-block reduction of the per-block dgamma/dbeta
+    # partials. ONE BLOCK PER CHANNEL (block_idx.x == channel) so all channels
+    # reduce concurrently; each channel's blocks_cap partials are contiguous in
+    # the channel-major scratch and read fully coalesced. Fixed block dims ->
+    # fixed reduction tree -> bit-reproducible. d_gamma/d_beta ALWAYS
+    # accumulate (grad accumulation across micro-steps). No re-zero needed: the
+    # main kernel overwrites every [0:num_blocks) slot each launch.
     var col = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var base = col * blocks_cap
@@ -2292,11 +2271,10 @@ def layernorm_fused_residual_bwd[
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
-        # CPU path is untouched: still the old two-launch-equivalent
-        # sequence (seed broadcast, if any + LN backward + broadcast), just
-        # with the seed call relocated from the train_gpt2.mojo call site
-        # into this function so both targets share one call signature. Same
-        # kernels, same order, same arithmetic as before this change.
+        # CPU: seed broadcast (if HAS_RESID_IN) then layernorm_bwd then
+        # broadcast. The seed call lives here (not at the train_gpt2.mojo
+        # call site) so both targets share one signature; arithmetic and
+        # kernel order are unchanged.
         comptime if HAS_RESID_IN:
             _layernorm_fused_residual_bwd_broadcast_cpu[dtype, width](
                 d_inp1_ptr,
@@ -2333,20 +2311,12 @@ def layernorm_fused_residual_bwd[
         # d_gamma/d_beta. Together they replace what used to be up to 3 kernels
         # here (the d_input+broadcast kernel plus the dparam accum/finalize
         # pair) and, at each train_gpt2.mojo call site, a 4th kernel (the
-        # separate `residual_grad_broadcast` launch). The first single-kernel
-        # attempt (edd2b67) folded the finalize INTO the main kernel via a
-        # "last block finalizes" serial tail that ncu showed cost ~60% of its
-        # wall time (one SM busy, 47 idle) and, with a 16 KB/block dgamma/dbeta
-        # shared array, capped occupancy at 50% — both regressions this
-        # 2-kernel + register-accumulate design removes.
+        # separate `residual_grad_broadcast` launch).
         comptime BLOCK_SIZE = 256
-        # One wave at the register-bound residency (ncu: 3 blocks/SM at 72
-        # reg/thread -> 3*num_sm fully saturates every SM in a single wave).
-        # Fewer blocks means fewer per-block dgamma/dbeta partials, which
-        # directly shrinks BOTH the main kernel's channel-major scratch flush
-        # (a strided write whose cost scales with the block count) and the
-        # finalize's per-channel reduction. The first attempt used 32 (1536
-        # blocks) — 5x the partials and a matching flush/finalize tax.
+        # SM_OVERPROVISION=3: at 72 reg/thread the kernel is register-bound to
+        # 3 blocks/SM, so 3*num_sm saturates every SM in one wave. Fewer
+        # blocks means fewer per-block partials, shrinking both the scratch
+        # flush and the finalize reduction.
         comptime SM_OVERPROVISION = 3
         comptime width = 4
         comptime CHANNELS_CAP = 2048
@@ -2438,8 +2408,7 @@ def layernorm_fused_residual_bwd[
         # Pass 2 (finalize): deterministic parallel reduction of the
         # num_row_blocks per-block partials into d_gamma/d_beta — ONE BLOCK PER
         # CHANNEL (grid.x == channels) so every SM stays busy, reading each
-        # channel's contiguous partials coalesced. Replaces the first attempt's
-        # serial single-block in-kernel finalize.
+        # channel's contiguous partials coalesced.
         comptime finalize_k = _ln_bwd_fused_finalize_gpu[pdtype, FINALIZE_BLOCK]
         var fcompiled = device_ctx.compile_function[finalize_k]()
         device_ctx.enqueue_function(
