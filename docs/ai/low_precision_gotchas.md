@@ -767,6 +767,7 @@ did not.
 **Source:** A1 static-scale calibration, 2026-07-11 (worktree
 `llmm-fp8-static`, branch `opt/fp8-static-scales`).
 
+
 ## FP4 CHUNK T1 (forward-pass integration)
 
 ### F1 — Cosine and relL2 gate thresholds are geometrically coupled: never mix floors across precisions
