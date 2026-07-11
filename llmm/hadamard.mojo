@@ -10,10 +10,7 @@ require transforming the weight, breaking forward/backward 2D-scale
 consistency). RHT "Gaussianizes" outliers within a 16-element block so NVFP4
 quantization (see `llmm/nvfp4_quant.mojo`) has less error to absorb.
 
-This module builds the transform + its exact inverse only. Wiring it into
-the Wgrad GEMM call sites (`llmm/matmul.mojo:matmul_d_weight_bwd`) is
-integration work for a later merge — out of scope here per the coordinator's
-HARD CONSTRAINT (do not touch `llmm/matmul.mojo`).
+This module builds the transform and its exact inverse only.
 
 ## Math
 
@@ -30,9 +27,9 @@ directions reuse `_fwht16`.
 
 ## Sign vector provenance
 
-`HADAMARD_SIGNS` below is fixed for all of training (per the recipe — NOT
-regenerated per call, NOT a device RNG). It was generated once, offline,
-deterministically:
+The sign vector is a single fixed +/-1 vector for ALL of training — NOT
+regenerated per call, NOT a device RNG. Hardcoded literal below (generated
+once from `random.Random(1234)`):
 
 ```python
 import random
@@ -41,11 +38,8 @@ signs = [1 if rng.random() < 0.5 else -1 for _ in range(16)]
 # -> [-1, 1, 1, -1, -1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1]
 ```
 
-and hardcoded as a literal below. This is intentionally *not* built on top
-of any device RNG — the coordinator's device-RNG chunk (stochastic-rounding
-cast, `llmm/lowp.mojo` Chunk G in the FP8 team's design) is separate
-infrastructure for per-element stochastic rounding, not for this one-time
-global sign vector.
+The `hadamard_sign()` values below must not change or checkpoints/repro
+diverge.
 
 ## GPU-only
 
@@ -54,15 +48,14 @@ instantiated under low-precision-adjacent code — see memory note
 `bf16-build-needs-gpu-only-dispatch`), the kernel-launching entry points
 below are `comptime if is_gpu[target]()`-guarded and raise on any other
 target. Nothing here actually uses an fp8/fp4 SIMD dtype (bf16 in/out,
-fp32 compute), but the guard is kept for consistency with the rest of the
-low-precision-adjacent surface and because these kernels are meant to run
+fp32 compute), but the guard is kept because these kernels are meant to run
 only on the GPU training path.
 """
 
 from std.collections import InlineArray
 from std.math import ceildiv
 from std.gpu.host import DeviceContext
-from std.gpu.host.info import is_cpu, is_gpu
+from std.gpu.host.info import is_gpu
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.memory import ImmutKernelPtr, MutKernelPtr

@@ -2,12 +2,8 @@
 # rng_device.mojo — counter-based, stateless device RNG + a stochastic-rounding
 # fp32 -> bf16 cast built on top of it.
 #
-# See docs/ai/fp8_training_design.md §3/§6 "Chunk G". This is the reusable
-# primitive consumed by:
-#   - llmm/adamw.mojo's master-weight store (SR instead of plain RNE,
-#     behind `-D LLMM_SR_MASTER=1`; closes the `~line 141` TODO).
-#   - the future `quantize()` seam in llmm/lowp.mojo (Chunks B/C, owned by
-#     other agents), for fp8/fp4 narrowing casts.
+# Consumers: llmm/adamw.mojo's SR master-weight store (LLMM_SR_MASTER) and
+# llmm/nvfp4_quant.mojo's ROUND_MODE_STOCHASTIC e2m1 encode.
 #
 # `llmm/rand.mojo` (MT19937) is the *host-only*, stateful generator used for
 # from-scratch weight init (bit-matches torch/llm.c). This file is a
@@ -51,11 +47,11 @@
 # Both generators are counter-based/stateless; the choice is implementation
 # risk and cost, not the determinism/race-freedom property (both have it).
 #
-# ## Contract (what other chunks — and quantize()'s SR seam — can rely on)
+# ## Contract
 #
 #   - `rng_key(seed, stream=0) -> UInt64`: expand a 64-bit seed (+ a stream id
 #     that separates independent random substreams, e.g. "adamw master store"
-#     vs. a future "fp8 grad quantize") into a Squares key. Call once per
+#     vs. "nvfp4 gradient quantize") into a Squares key. Call once per
 #     kernel launch / call site, reuse across all elements.
 #   - `squares32(counter, key) -> UInt32`: the core generator. `counter` is
 #     normally a per-element index (or a mix of element index and step).
@@ -72,6 +68,11 @@
 #   - `sr_cast_bf16(x, seed, counter, stream=0) -> BFloat16`: one-call
 #     convenience combining `rng_u32` + `sr_round_bits`.
 #
+# Stream registry (one id per SR call site, all sharing LLMM_SR_SEED): 1 =
+# adamw SR-master; 2/3 = nvfp4 forward A/B operands; 4/5 = nvfp4
+# dgrad/wgrad d_output. New SR call sites take the next id and record it
+# here.
+#
 # All functions here are plain `def`s over scalar `UInt64`/`UInt32`/`Float32`
 # math — no `is_gpu[target]()`/`is_cpu[target]()` branching, unlike the
 # fp8/bf16 *kernel* dispatch elsewhere in this tree. There is nothing
@@ -84,7 +85,8 @@
 # "host reference" — `tests/test_rng_sr.mojo` calls these same functions
 # directly on host as the reference, and separately launches a GPU kernel
 # that calls them, to prove the toolchain lowers them identically on both
-# targets (the real risk on this box, per the landmine notes above).
+# targets (the real risk on this box: AArch64 GPU codegen gaps for
+# narrow-dtype/exotic arithmetic).
 # ===----------------------------------------------------------------------=== #
 
 from std.memory import bitcast

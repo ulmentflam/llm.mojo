@@ -22,15 +22,11 @@ from llmm.rng_device import sr_cast_bf16
 comptime CHUNK_SIZE = 4096
 comptime UNROLL = 4
 
-# Stochastic-rounding master->low-precision store (docs/ai/fp8_training_design.md
-# §3/§6 Chunk G; closes the TODO in `_adamw_update` below). Default OFF: every
-# existing build/verify gate (fp32, bf16) stays on the untouched
-# `param.cast[dtype]()` RNE code path with zero behavioral change — that
-# unchanged-code-path property, not a runtime check, is the bit-identity
-# proof. Build with `-D LLMM_SR_MASTER=1` to opt in; currently only valid for
-# a bf16 low-precision param store (`llmm/rng_device.mojo`'s `sr_cast_bf16`).
-# fp8/fp4 stochastic-rounding encoders are a separate seam owned by Chunk B
-# (docs/ai/fp8_training_design.md §3) and are not wired here.
+# Opt-in stochastic rounding for the master->low-precision param store,
+# enabled with `-D LLMM_SR_MASTER=1`. Default OFF: the store falls through
+# to the plain `param.cast[dtype]()` RNE path below. Only valid for a bf16
+# param store (asserted in `_adamw_update`); fp8/fp4 encoders are not wired
+# through here.
 comptime SR_MASTER_ENABLED = is_defined["LLMM_SR_MASTER"]()
 
 # Fixed by default (not wall-clock-derived) so `-D LLMM_SR_MASTER=1` runs are
@@ -40,10 +36,9 @@ comptime SR_MASTER_ENABLED = is_defined["LLMM_SR_MASTER"]()
 # (train_gpt2.mojo's from-scratch weight-init seed).
 comptime SR_MASTER_SEED = UInt64(get_defined_int["LLMM_SR_SEED", 1746221221]())
 
-# `llmm/rng_device.mojo`'s `stream` id reserved for this call site, so its
-# random substream stays independent of any future SR call site sharing the
-# same seed (e.g. Chunk B/E's fp8/fp4 gradient-quantize SR, which should pick
-# a different stream constant).
+# rng_device stream id reserved for this call site so its substream stays
+# independent of any other SR call site sharing LLMM_SR_SEED. See
+# llmm/rng_device.mojo's stream registry.
 comptime SR_MASTER_STREAM = UInt64(1)
 
 
@@ -183,10 +178,8 @@ def _adamw_update[
     comptime if SR_MASTER_ENABLED:
         comptime assert dtype == DType.bfloat16, (
             "LLMM_SR_MASTER=1 requires a bf16 low-precision param store"
-            " (dtype == DType.bfloat16); fp8/fp4 stochastic-rounding"
-            " encoders are a separate seam"
-            " (docs/ai/fp8_training_design.md §3, owned by Chunk B) not"
-            " wired into llmm/adamw.mojo"
+            " (dtype == DType.bfloat16); fp8/fp4 stochastic rounding is not"
+            " wired into this kernel"
         )
         var sr_param = SIMD[DType.bfloat16, width]()
         comptime for lane in range(width):
