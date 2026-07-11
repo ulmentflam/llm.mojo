@@ -38,9 +38,10 @@ PROFILE_BIN := build/profile_gpt2
 # CPU training is fp32 by policy. Used as the llm.mojo bf16 bar in the GPU
 # benchmark.
 PROFILE_BIN_BF16 := build/profile_gpt2_bf16
-# fp8 build (-D LLMM_PRECISION=fp8, Chunk A of docs/ai/fp8_training_design.md).
-# GPU-only, same policy as bf16. At Chunk A, fp8 selects the bf16 GEMM path
-# (inert flag) — Chunks B/D/E wire the actual fp8 GEMM.
+# fp8 build (-D LLMM_PRECISION=fp8, docs/ai/fp8_training_design.md). GPU-only,
+# same policy as bf16. Full fp8 mixed-precision training: e4m3/e5m2 transient
+# GEMM operands via cuBLASLt, delayed scaling, fp32 masters (chunks A-G +
+# quant-opt all landed; gate: make verify-fp8-grads).
 PROFILE_BIN_FP8 := build/profile_gpt2_fp8
 # fp4 (NVFP4) build (-D LLMM_PRECISION=fp4, docs/ai/fp4_training_recipes_
 # research.md). GPU-only, same policy as bf16/fp8. See build-fp4 above for
@@ -129,6 +130,7 @@ SHELL := /bin/bash
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
         typecheck check clean build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 \
+        train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
@@ -166,13 +168,18 @@ help:
 	@echo "  build-bf16    Compile train_gpt2.mojo (-D LLMM_BF16) to build/train_gpt2_bf16"
 	@echo "  train-bf16    Build and run build/train_gpt2_bf16 (ARGS=\"...\" for training flags)"
 	@echo "  build-fp8     Compile train_gpt2.mojo (-D LLMM_PRECISION=fp8) to build/train_gpt2_fp8"
-	@echo "                (Chunk A: inert flag, bit-identical to bf16 until Chunks B/D/E land)"
+	@echo "                (full fp8 mixed-precision training: e4m3 fwd / e5m2 grads via"
+	@echo "                 cuBLASLt, delayed scaling, fp32 masters; gate: verify-fp8-grads)"
 	@echo "  train-fp8     Build and run build/train_gpt2_fp8 (ARGS=\"...\" for training flags)"
 	@echo "  build-fp4     Compile train_gpt2.mojo (-D LLMM_PRECISION=fp4) to build/train_gpt2_fp4"
-	@echo "                (NVFP4 fwd on the MLP fc/fc_proj GEMMs of middle blocks only;"
-	@echo "                 qkv/attn_proj/attention/LN/embeddings/head + fp4 backward stay"
-	@echo "                 bf16 — see docs/ai/fp4_training_recipes_research.md)"
+	@echo "                (full NVFP4 recipe on the MLP fc/fc_proj GEMMs of middle blocks:"
+	@echo "                 e2m1 block-scaled fwd+bwd, stochastic-rounded grads, RHT wgrad"
+	@echo "                 [-D LLMM_FP4_NO_RHT=1 to ablate]; qkv/attn_proj/attention/LN/"
+	@echo "                 embeddings/head stay bf16 — docs/ai/fp4_training_recipes_research.md)"
 	@echo "  train-fp4     Build and run build/train_gpt2_fp4 (ARGS=\"...\" for training flags)"
+	@echo "  train-gpt2-124m[-fp32|-bf16|-fp8|-fp4]"
+	@echo "                Checkpoint-init training from the released GPT-2 124M weights"
+	@echo "                (bare target = bf16). STEPS=N (default 10), ARGS=\"...\" pass-through"
 	@echo ""
 	@echo "Profiling:"
 	@echo "  build-profile Compile profile_gpt2.mojo to build/profile_gpt2"
@@ -385,6 +392,31 @@ train-fp8: $(TRAIN_BIN_FP8) $(TRAIN_RUNNER_BF16)
 # as train-fp8 above.
 train-fp4: $(TRAIN_BIN_FP4) $(TRAIN_RUNNER_BF16)
 	@BIN=$(TRAIN_BIN_FP4) $(TRAIN_RUNNER_BF16) $(ARGS)
+
+# GPT-2 124M checkpoint-init training: start from the released GPT-2 124M
+# weights (starter-pack .bin files, see `make data`) instead of a random d12
+# init — the invocation every precision gate in the 2026-07-10 campaign used.
+# STEPS and extra flags are overridable: `make train-gpt2-124m STEPS=50
+# ARGS="-o log124M"`. bf16 is the recommended GPU precision (see README
+# benchmarks); fp8/fp4 are numerics/research configs. Inference binaries have
+# no low-precision wiring yet, so there is deliberately no build-infer-fp4.
+GPT2_124M_CKPT_FP32 := gpt2_124M.bin
+GPT2_124M_CKPT_LOWP := gpt2_124M_bf16.bin
+STEPS ?= 10
+
+train-gpt2-124m: train-gpt2-124m-bf16
+
+train-gpt2-124m-fp32: $(TRAIN_BIN) $(TRAIN_RUNNER)
+	@$(TRAIN_RUNNER) -e $(GPT2_124M_CKPT_FP32) -x $(STEPS) $(ARGS)
+
+train-gpt2-124m-bf16: $(TRAIN_BIN_BF16) $(TRAIN_RUNNER_BF16)
+	@$(TRAIN_RUNNER_BF16) -e $(GPT2_124M_CKPT_LOWP) -x $(STEPS) $(ARGS)
+
+train-gpt2-124m-fp8: $(TRAIN_BIN_FP8) $(TRAIN_RUNNER_BF16)
+	@BIN=$(TRAIN_BIN_FP8) $(TRAIN_RUNNER_BF16) -e $(GPT2_124M_CKPT_LOWP) -x $(STEPS) $(ARGS)
+
+train-gpt2-124m-fp4: $(TRAIN_BIN_FP4) $(TRAIN_RUNNER_BF16)
+	@BIN=$(TRAIN_BIN_FP4) $(TRAIN_RUNNER_BF16) -e $(GPT2_124M_CKPT_LOWP) -x $(STEPS) $(ARGS)
 
 # Metal (Apple GPU) training: force WORLD_SIZE=1 because multi-GPU collectives
 # are NVIDIA-only. Metal is the default device on Apple Silicon (no extra flags
