@@ -9,10 +9,9 @@
 # raw GPU kernel means attempting to compile its body for the ambient
 # (non-GPU) host target and hitting
 # "Current compilation target does not support operation: _get_intrinsic_name".
-# That's a different flavor of the same class of landmine documented in
-# `bf16-build-needs-gpu-only-dispatch` (AArch64 codegen breaks if a GPU-only
-# kernel is ever instantiated outside an explicit `compile_function[...]`
-# GPU dispatch) — the fix here is the same in spirit: keep raw kernel `def`s
+# That's the same class of failure as AArch64 codegen breaking whenever a
+# GPU-only kernel is instantiated outside an explicit `compile_function[...]`
+# GPU dispatch — the fix here is the same in spirit: keep raw kernel `def`s
 # out of any module that also does `__functions_in_module()` reflection.
 # Putting them in this separate, non-`test_*`, TestSuite-free module sidesteps
 # it entirely: `tests/test_rng_sr.mojo` only ever *imports* these, so they

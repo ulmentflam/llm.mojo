@@ -2,8 +2,6 @@
 # Tests for llmm.rng_device — counter-based device RNG (Widynski's Squares)
 # + fp32 -> bf16 stochastic-rounding cast.
 #
-# See docs/ai/fp8_training_design.md §3/§6 "Chunk G".
-#
 # Run with:  make test-mojo   (equivalent to `pixi run mojo run -I . tests/test_rng_sr.mojo`)
 # GPU-launching tests self-skip if no NVIDIA GPU is present (matching
 # tests/test_zero.mojo's convention); when a GPU *is* present, wrap the
@@ -11,7 +9,7 @@
 #   flock -w 10800 /tmp/llmm-gpu.lock -c \
 #     'pixi run mojo run -I . tests/test_rng_sr.mojo'
 #
-# Coverage (docs/ai/fp8_training_design.md's Chunk G gate):
+# Coverage:
 #   (a) RNG determinism: same (seed, counter, stream) -> identical output,
 #       different counters -> different output, and a GPU kernel calling the
 #       exact same functions matches the host call bit-for-bit.
@@ -25,12 +23,11 @@
 #       "output is always one of the two representable neighbors" — the
 #       correctness properties the unbiasedness claim in (c) depends on.
 #
-# The flag-off RNE bit-identity gate for llmm/adamw.mojo (chunk G's other
-# deliverable) is *not* re-tested here — see the module docstring in
-# llmm/adamw.mojo (`SR_MASTER_ENABLED`) for why the `-D LLMM_SR_MASTER=1`-off
-# path is provably unchanged code (the `else` branch is byte-identical to
-# the original `param.cast[dtype]()` line), plus the empirical before/after
-# training-loss diff recorded in this chunk's landing commit message.
+# The flag-off RNE bit-identity gate for llmm/adamw.mojo is *not* re-tested
+# here — see the module docstring in llmm/adamw.mojo (`SR_MASTER_ENABLED`)
+# for why the `-D LLMM_SR_MASTER=1`-off path is provably unchanged code (the
+# `else` branch is byte-identical to the original `param.cast[dtype]()`
+# line).
 # ===----------------------------------------------------------------------=== #
 
 from std.memory import bitcast, UnsafePointer
@@ -173,9 +170,9 @@ def test_rng_uniform01_mean_and_bucket_uniformity() raises:
     # for a correctly-uniform generator, not a tuned-to-barely-pass tolerance.
     assert_true(abs(mean - 0.5) < 0.01)
 
-    # Chi-square-ish bucket check (not a formal p-value lookup — see module
-    # docstring / task scope: "no need for full TestU01"). Expected count per
-    # bucket is N/NUM_BUCKETS = 20000; chi-square(9 dof) has mean 9, std
+    # Chi-square-ish bucket check (not a formal p-value lookup; a full
+    # TestU01-style suite is out of scope for this codebase). Expected count
+    # per bucket is N/NUM_BUCKETS = 20000; chi-square(9 dof) has mean 9, std
     # sqrt(18)~=4.24, so a true-uniform generator overwhelmingly lands well
     # under 60 (~12 std above the mean) and a badly broken one blows past it.
     var expected = Float64(N) / Float64(NUM_BUCKETS)
@@ -345,7 +342,6 @@ def test_sr_cast_bf16_unbiased() raises:
 
 def test_rng_u32_device_matches_host() raises:
     if not has_nvidia_gpu_accelerator():
-        print("no NVIDIA GPU accelerator detected — skipping (no-op)")
         return
 
     var ctx = DeviceContext()
@@ -380,7 +376,6 @@ def test_rng_u32_device_matches_host() raises:
 
 def test_sr_cast_device_matches_host_and_is_deterministic() raises:
     if not has_nvidia_gpu_accelerator():
-        print("no NVIDIA GPU accelerator detected — skipping (no-op)")
         return
 
     var ctx = DeviceContext()

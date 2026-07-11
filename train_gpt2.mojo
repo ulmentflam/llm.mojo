@@ -22,7 +22,6 @@ from std.memory import alloc, UnsafePointer, memcpy, memset_zero
 
 from llmm.io import read_and_copy
 from llmm.lowp import (
-    precision_spec,
     FP8_SPEC,
     FP8_STATIC_SCALES,
     fp8_static_scale,
@@ -108,12 +107,60 @@ comptime NUM_ACTIVATION_TENSORS = 26
 # of the weights (MASTER_DTYPE) — matching llm.c — so the low-precision params
 # are only ever a rounded view of the fp32 math.
 #
-# Storage stays bf16 under fp8/fp4 too (docs/ai/fp8_training_design.md §1.1):
-# fp8/fp4 are transient dtypes inside the GEMM only (Chunk B/D/E), never the
-# parameter/activation/gradient storage dtype. That's why `STORAGE_DTYPE`
-# collapses fp8/fp4 onto bfloat16 below, and why `USE_BF16` (kept for the
-# adamw/zero fp32-master plumbing, unchanged meaning: "keep an fp32 master +
-# bf16 storage") is true for fp8/fp4 builds too.
+# fp8/fp4 are transient dtypes used only inside the GEMM, never the
+# parameter/activation/gradient storage dtype — so STORAGE_DTYPE collapses
+# fp8/fp4 onto bfloat16, and USE_BF16 (fp32-master + bf16 storage) is true
+# for fp8/fp4 too.
+
+
+# ===----------------------------------------------------------------------=== #
+# Build-flag registry (comptime -D unless marked env). Single source of truth;
+# defining files hold the mechanics.
+#
+# Precision axis
+#   LLMM_PRECISION=fp32|bf16|fp8|fp4   default fp32. Master axis (below).
+#   LLMM_BF16=1                        alias for LLMM_PRECISION=bf16;
+#                                      comptime-error if both set inconsistently.
+# FP8 (all inert unless LLMM_PRECISION=fp8)
+#   LLMM_FP8_FWD_ONLY=1        keep fp8 forward, force all 4 backward sites bf16.
+#   LLMM_FP8_SITE_QKV=0        per-site fp8 off-switch (default 1=on); a site
+#   LLMM_FP8_SITE_ATTN_PROJ=0  disabled here is bf16 in BOTH fwd and bwd (the
+#   LLMM_FP8_SITE_FC=0         transpose cache + AmaxState scale are only valid
+#   LLMM_FP8_SITE_PROJ=0       if that site's forward ran this step).
+#   LLMM_FP8_STATIC_SCALES=1   calibrated constant scales; skips (never
+#                              instantiates) the amax/update_scale kernels.
+#                              Defined in llmm/lowp.mojo.
+#   LLMM_FP8_STATIC_D36=1      select the d36 constant table (default d12).
+#                              Only meaningful with LLMM_FP8_STATIC_SCALES.
+#   LLMM_FP8_FAST_ACCUM=1      cuBLASLt fast accumulation, FORWARD GEMM only;
+#                              dgrad/wgrad always precise. llmm/matmul.mojo.
+# FP4 (all inert unless LLMM_PRECISION=fp4)
+#   LLMM_FP4_FIRST=<int>       first N blocks stay bf16 (default 2).
+#   LLMM_FP4_LAST=<int>        fp4 range end; default -1 = num_layers-2,
+#                              resolved at runtime (_layer_in_fp4_range).
+#   LLMM_FP4_NO_RHT=1          ablation: disable the Wgrad random Hadamard
+#                              transform. llmm/matmul.mojo.
+# Stochastic rounding
+#   LLMM_SR_MASTER=1           SR on the master->bf16 param store (llmm/adamw.mojo).
+#   LLMM_SR_SEED=<int>         shared SR seed, default 1746221221 (adamw +
+#                              nvfp4; decorrelated by stream id, see
+#                              llmm/rng_device.mojo's stream registry).
+# Numerics / dispatch
+#   LLMM_NO_TF32=1             true IEEE fp32 GEMMs (llmm/vendor.mojo).
+#   LLMM_FORCE_PORTABLE_GPU=1  vendor-neutral GPU path (llmm/vendor.mojo).
+#   LLMM_DISABLE_METAL=1       CPU fallback on Apple GPU (llmm/vendor.mojo).
+#   WORLD_SIZE=<int>           comptime monomorphization value, default 1;
+#                              runtime env WORLD_SIZE must match.
+# Runtime env vars (read at startup, not -D)
+#   LLMM_USE_CPU=1             force CPU dispatch (raises under bf16-storage
+#                              builds, which includes fp8/fp4).
+#   LLMM_OUTPUT_DIR=<path>     override output_log_dir.
+#   LLMM_SAVE_EVERY=<int>      override checkpoint_every.
+#   LLMM_RECOMPUTE=1           test_gpt2 only: activation-recompute build in
+#                              run_test. Not read by train_gpt2 (see docs).
+# Profiling (out of precision scope): LLMM_ATTN_PROFILE, LLMM_PROFILE_*,
+#   LLMM_THREAD_TRACE, LLMM_TRACE.
+# ===----------------------------------------------------------------------=== #
 def _resolve_precision() -> StaticString:
     """Resolve the `LLMM_PRECISION` axis, honoring the `LLMM_BF16=1` back-
     compat alias (== `LLMM_PRECISION=bf16`). Comptime-errors if both are set
@@ -144,44 +191,23 @@ def _resolve_precision() -> StaticString:
 
 comptime PRECISION = _resolve_precision()
 comptime LOWP_ENABLED = PRECISION == "fp8" or PRECISION == "fp4"
-# Investigation knob (fp8 fwd/bwd error isolation, Chunk E gate probe): building
-# with `-D LLMM_FP8_FWD_ONLY=1` keeps the fp8 forward linears but forces the four
-# per-block backward sites onto their bf16 `matmul_bwd` else-branch, so a grad
-# dump splits the fp8 error budget into forward-only vs forward+backward. Default
-# (flag unset) is full fp8 backward, byte-identical to before this knob existed.
-#
-# fp8-only (NOT `LOWP_ENABLED`): the four `matmul_bwd_lowp` backward sites are
-# fp8-specific (E5M2 `d_output` operand via `LowpState`'s `*_doutput`
-# `AmaxState`s — see that struct's docstring). FP4 backward (Chunk T2:
-# SR on gradient operands, RHT on Wgrad inputs lands in T2b, per
-# docs/ai/fp4_training_recipes_research.md §1) is a SEPARATE, THIRD branch
-# at the two FP4-eligible MLP backward sites (proj/fc) — `elif PRECISION ==
-# "fp4":`, gated per-layer by `_layer_in_fp4_range` exactly like the forward
-# pass's FC/Proj sites — not folded into `LOWP_BWD_ENABLED` (which stays
-# fp8-only) since fp4's backward machinery (`matmul_bwd_fp4`) has a
-# different signature (no `AmaxState`s, an `sr_step` counter instead) than
-# fp8's `matmul_bwd_lowp`.
-comptime LOWP_BWD_ENABLED = (PRECISION == "fp8") and not is_defined[
+# -D LLMM_FP8_FWD_ONLY=1 keeps the fp8 forward linears but forces the four
+# per-block backward sites onto their bf16 matmul_bwd branch. Default unset is
+# full fp8 backward.
+
+# fp4's backward (matmul_bwd_fp4) is a separate branch at the two
+# FP4-eligible MLP sites: it has a different signature (no AmaxStates; an
+# sr_step counter) than fp8's matmul_bwd_lowp, so it is not folded into
+# FP8_BWD_ENABLED.
+comptime FP8_BWD_ENABLED = (PRECISION == "fp8") and not is_defined[
     "LLMM_FP8_FWD_ONLY"
 ]()
 
-# A5 (docs/ai/speedrun_techniques_research.md): per-site fp8 ablation gates.
-# modded-nanogpt's own evidence (record 84 / PR 306) is that FP8 on the MLP
-# DOWN-projection was a net *loss* even on 8xH100 (wide input activations
-# make it bandwidth-bound) -- worth ablating on our much more
-# bandwidth-starved GB10. Reuses the existing per-site `comptime if
-# PRECISION == "fp8":` / `comptime if LOWP_BWD_ENABLED:` branch structure at
-# each of the four per-block-linear call sites below: each site's condition
-# additionally requires its own `-D LLMM_FP8_SITE_<SITE>=0` NOT be set (all
-# four default ON, i.e. `LOWP_ENABLED`'s existing "every site is fp8"
-# behavior is exactly reproduced when none of these flags are passed --
-# flag-off/all-default is byte-identical to before this ablation knob
-# existed). Setting one to 0 falls that SINGLE site through to the ordinary
-# bf16 `matmul_fwd`/`matmul_bwd` else-branch every non-fp8 PRECISION already
-# uses, both forward AND backward (a site disabled in forward must also be
-# disabled in backward -- `matmul_fwd_lowp`'s persistent transpose cache
-# and `LowpState`'s AmaxState scale for a site are only valid if THAT SAME
-# site's forward call actually ran this step).
+# Per-site fp8 gates (default all on). Setting -D LLMM_FP8_SITE_<SITE>=0
+# routes that single site to the bf16 matmul_fwd/matmul_bwd branch in BOTH
+# passes — a site disabled in forward MUST be disabled in backward, because
+# matmul_fwd_lowp's transpose cache and the site's AmaxState scale are only
+# valid if that site's forward ran this step.
 comptime FP8_SITE_QKV = get_defined_int["LLMM_FP8_SITE_QKV", 1]() != 0
 comptime FP8_SITE_ATTN_PROJ = (
     get_defined_int["LLMM_FP8_SITE_ATTN_PROJ", 1]() != 0
@@ -199,25 +225,22 @@ comptime MASTER_DTYPE = DType.float32
 # `_dispatch_cpu` GPU-only guard (which raises whenever `USE_BF16`) need no
 # change and automatically also gate fp8/fp4 off the CPU target (landmine #1).
 comptime USE_BF16 = STORAGE_DTYPE == DType.bfloat16
-comptime SPEC = precision_spec[PRECISION]()
 
-# FP4 layer-range policy (docs/ai/fp4_training_recipes_research.md §1
-# "Selective high-precision layers"): NVFP4 applies ONLY to the MLP linears
-# (fc/fc_proj) of MIDDLE transformer blocks; qkv/attn_proj/attention/LN/
-# embeddings/LM-head stay bf16 EVERYWHERE regardless of PRECISION (see the
-# four call sites below — only two of the four Matmul sites even consult
-# these bounds). `LLMM_FP4_FIRST` defaults to 2 (first 2 blocks stay bf16).
-# `LLMM_FP4_LAST` defaults to `num_layer - 2` (final 2 blocks stay bf16) —
-# resolved at runtime (`-1` sentinel below) since `num_layer` is a runtime
-# value (the model descriptor, e.g. `-e d12`, is not known at comptime), not
-# a comptime constant; override either bound with
+# FP4 layer-range policy: NVFP4 applies ONLY to the MLP linears (fc/fc_proj)
+# of MIDDLE transformer blocks; qkv/attn_proj/attention/LN/embeddings/LM-head
+# stay bf16 EVERYWHERE regardless of PRECISION (see the four call sites below
+# — only two of the four Matmul sites even consult these bounds).
+# `LLMM_FP4_FIRST` defaults to 2 (first 2 blocks stay bf16). `LLMM_FP4_LAST`
+# defaults to `num_layer - 2` (final 2 blocks stay bf16) — resolved at
+# runtime (`-1` sentinel below) since `num_layer` is a runtime value (the
+# model descriptor, e.g. `-e d12`, is not known at comptime), not a comptime
+# constant; override either bound with
 # `-D LLMM_FP4_FIRST=<int>`/`-D LLMM_FP4_LAST=<int>` (e.g. for the 12-layer
-# d12 default this is layers [2, 10), i.e. layers 2..9 in fp4, matching the
-# recipe's "first ~2 and final several blocks stay bf16" for a small model).
-# Only elaborated/consulted under `PRECISION == "fp4"` — inert (unread) for
-# every other PRECISION value.
-comptime LLMM_FP4_FIRST = get_defined_int["LLMM_FP4_FIRST", 2]()
-comptime LLMM_FP4_LAST_OVERRIDE = get_defined_int["LLMM_FP4_LAST", -1]()
+# d12 default this is layers [2, 10), i.e. layers 2..9 in fp4). Only
+# elaborated/consulted under `PRECISION == "fp4"` — inert (unread) for every
+# other PRECISION value.
+comptime FP4_FIRST = get_defined_int["LLMM_FP4_FIRST", 2]()
+comptime FP4_LAST_RAW = get_defined_int["LLMM_FP4_LAST", -1]()
 comptime GPT2_MAGIC = 20240520
 # llm.c's model-file magic (the HF starter-pack gpt2_124M*.bin that `make data`
 # downloads); same header layout and version convention as ours.
@@ -238,18 +261,14 @@ comptime SCRATCH_PADDED_VOCAB_SIZE = 50304
 @always_inline
 def _layer_in_fp4_range(layer: Int, num_layers: Int) -> Bool:
     """True if `layer` falls in the FP4-eligible middle-block range (the
-    `LLMM_FP4_FIRST`/`LLMM_FP4_LAST` comptime constants above) — the recipe's
-    "first ~2 and final several blocks stay bf16" policy. `LLMM_FP4_LAST`'s
+    `FP4_FIRST`/`FP4_LAST_RAW` comptime constants above). `LLMM_FP4_LAST`'s
     `-1` sentinel resolves to `num_layers - 2` here (runtime, since
     `num_layers` is not a comptime value). Only meaningful under
     `PRECISION == "fp4"`; call sites comptime-gate on that before consulting
     this (see the FC/Proj matmul sites in the forward pass).
     """
-    var fp4_last = (
-        LLMM_FP4_LAST_OVERRIDE if LLMM_FP4_LAST_OVERRIDE
-        >= 0 else num_layers - 2
-    )
-    return layer >= LLMM_FP4_FIRST and layer < fp4_last
+    var fp4_last = FP4_LAST_RAW if FP4_LAST_RAW >= 0 else num_layers - 2
+    return layer >= FP4_FIRST and layer < fp4_last
 
 
 # ===----------------------------------------------------------------------=== #
@@ -679,83 +698,80 @@ struct GPT2Config:
 
 
 # ===----------------------------------------------------------------------=== #
-# LowpState — shared per-tensor fp8 delayed-scaling state container.
+# Fp8State — shared per-tensor fp8 delayed-scaling state container.
 #
-# docs/ai/fp8_training_design.md restricts fp8 to the four per-block linear
-# GEMMs (QKV projection, attention-output projection, MLP fc, MLP proj — §1.2
-# "FP8 GEMMs = the four per-block linear layers only"; the LM head and every
-# other op stay bf16). Each of those four sites needs its own delayed-scaling
-# `AmaxState[FP8_SPEC]` (Chunk C, llmm/amax.mojo) PER TRANSFORMER LAYER — not
-# one shared across layers — because delayed scaling's whole premise (§1.3:
-# "the scale used this step is derived from *prior* steps' amax") only holds
-# if the amax history a site's scale is built from actually comes from
-# repeated observations of *that same tensor*; layer 0's QKV weight and layer
-# 11's QKV weight have unrelated magnitude statistics, so collapsing them onto
-# one shared `AmaxState` would let one layer's outlier amax silently mis-scale
-# every other layer's GEMM.
+# Each of the four per-block linear GEMMs (QKV projection, attention-output
+# projection, MLP fc, MLP proj) needs its own delayed-scaling
+# `AmaxState[FP8_SPEC]` PER TRANSFORMER LAYER — not one shared across layers —
+# because delayed scaling's premise ("the scale used this step is derived
+# from prior steps' amax") only holds if the amax history a site's scale is
+# built from comes from repeated observations of *that same tensor*; layer
+# 0's QKV weight and layer 11's QKV weight have unrelated magnitude
+# statistics, so collapsing them onto one shared `AmaxState` would let one
+# layer's outlier amax silently mis-scale every other layer's GEMM.
 #
-# This container is Chunk D's first commit (coordinator instruction): it is
-# the single source of truth for every fp8 GEMM operand's scaling state, so
-# Chunk E (backward, running in parallel) can extend it without renaming or
-# reshaping anything Chunk D already committed. Three role-groups per site,
-# each a `List[AmaxState[FP8_SPEC]]` of length `num_layer`:
-#   - `*_input`  — the site's forward input activation (E4M3), Chunk D.
+# Single source of truth for every fp8 GEMM operand's scaling state. Three
+# role-groups per site, each a `List[AmaxState[FP8_SPEC]]` of length
+# `num_layer`:
+#   - `*_input`  — the site's forward input activation (E4M3).
 #   - `*_weight` — the site's weight (E4M3, requantized every step from its
-#     bf16 storage — weights change every step post-optimizer), Chunk D.
-#   - `*_doutput` — the site's backward `d_output` gradient (E5M2). Defined
-#     HERE (not by Chunk E) so the container's shape is stable the moment
-#     Chunk D commits it; Chunk D allocates but never reads/writes these
-#     (`update_scale`/`compute_amax` on them is exclusively Chunk E's
-#     forward-declared-but-not-yet-wired territory) — see docs/ai/
-#     fp8_training_design.md §5 point 2/3 (dgrad's E5M2 `d_output` operand,
-#     wgrad's E5M2 `d_output` operand; QKV/attn-proj/fc/proj backward
-#     counterparts at :2465/:2485/:2548/:2593 in the design's line numbering).
+#     bf16 storage — weights change every step post-optimizer).
+#   - `*_doutput` — the site's backward `d_output` gradient (E5M2).
 #
 # Forward's weight/input E4M3 `AmaxState`s are also what backward's "same
-# tensors as forward" E4M3 operand (design §1.2 row 3) reuses — Chunk E reads
-# `*_input`/`*_weight` (not new states) for dgrad's weight operand and wgrad's
-# input operand, per the design's explicit "same tensors as forward"
-# instruction; only the gradient operand (`*_doutput`, E5M2) is new state.
+# tensors as forward" E4M3 operand reuses — backward reads `*_input`/
+# `*_weight` (not new states) for dgrad's weight operand and wgrad's input
+# operand; only the gradient operand (`*_doutput`, E5M2) is new state.
 #
-# Comptime-gated to `LOWP_ENABLED` builds: the field type (`List[AmaxState[
-# FP8_SPEC]]`) is always well-formed (FP8_SPEC is a fixed constant regardless
-# of PRECISION — see llmm/lowp.mojo), so the `GPT2` struct declares this field
-# unconditionally (mirrors the existing `master_buf`/`USE_BF16` convention:
-# "always declare the field; make it an inert placeholder — empty lists here,
-# a size-1 buffer there — under the regimes that don't need it" — see that
-# field's docstring a few hundred lines below). It is `__init__`'s BODY that
-# is comptime-gated (`comptime if LOWP_ENABLED:` below), not the field's
-# existence: under bf16/fp32, that branch is never elaborated, so no
-# `AmaxState` (and therefore no GPU kernel launch — `AmaxState.__init__`
-# compiles and enqueues an init kernel) is ever instantiated for those builds,
-# preserving landmine #1 (no low-precision/GPU-only code may be instantiated
-# for the `cpu` target) exactly the way `_dispatch_cpu`'s `comptime if
-# USE_BF16:` already does for the whole GPU dispatch path.
+# The field type (`List[AmaxState[FP8_SPEC]]`) is always well-formed
+# (FP8_SPEC is a fixed constant regardless of PRECISION — see
+# llmm/lowp.mojo), so the `GPT2` struct declares this field unconditionally
+# (mirrors the existing `master_buf`/`USE_BF16` convention: "always declare
+# the field; make it an inert placeholder — empty lists here, a size-1 buffer
+# there — under the regimes that don't need it"). It is `__init__`'s
+# population loop that is comptime-gated on `PRECISION == "fp8"` (narrower
+# than `LOWP_ENABLED`, which also covers fp4 — fp4 never reads this state, so
+# gating on the broader flag would allocate 12 x num_layer unread
+# `AmaxState`s and their GPU init kernels for no reason): under bf16/fp32/fp4,
+# that branch is never elaborated, so no `AmaxState` (and therefore no GPU
+# kernel launch — `AmaxState.__init__` compiles and enqueues an init kernel)
+# is ever instantiated for those builds, preserving the invariant that no
+# low-precision/GPU-only code may be instantiated for the `cpu` target
+# exactly the way `_dispatch_cpu`'s `comptime if USE_BF16:` already does for
+# the whole GPU dispatch path.
 # ===----------------------------------------------------------------------=== #
 
 
-struct LowpState(Movable):
+struct Fp8State(Movable):
     """Per-layer, per-site `AmaxState[FP8_SPEC]` container for every fp8 GEMM
     operand in the model (the four per-block linears' input/weight/d_output).
-    See the module comment above for the shape rationale and the Chunk D/E
-    ownership split. Empty lists under bf16/fp32 (`LOWP_ENABLED == False`).
+    See the module comment above for the shape rationale. Empty lists unless
+    `PRECISION == "fp8"`.
     """
 
     var qkv_input: List[AmaxState[FP8_SPEC]]
     var qkv_weight: List[AmaxState[FP8_SPEC]]
-    var qkv_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+    var qkv_doutput: List[
+        AmaxState[FP8_SPEC]
+    ]  # backward d_output operand (E5M2)
 
     var attn_proj_input: List[AmaxState[FP8_SPEC]]
     var attn_proj_weight: List[AmaxState[FP8_SPEC]]
-    var attn_proj_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+    var attn_proj_doutput: List[
+        AmaxState[FP8_SPEC]
+    ]  # backward d_output operand (E5M2)
 
     var fc_input: List[AmaxState[FP8_SPEC]]
     var fc_weight: List[AmaxState[FP8_SPEC]]
-    var fc_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+    var fc_doutput: List[
+        AmaxState[FP8_SPEC]
+    ]  # backward d_output operand (E5M2)
 
     var proj_input: List[AmaxState[FP8_SPEC]]
     var proj_weight: List[AmaxState[FP8_SPEC]]
-    var proj_doutput: List[AmaxState[FP8_SPEC]]  # Chunk E (bwd, E5M2)
+    var proj_doutput: List[
+        AmaxState[FP8_SPEC]
+    ]  # backward d_output operand (E5M2)
 
     def __init__(out self, num_layer: Int, ctx: DeviceContext) raises:
         self.qkv_input = List[AmaxState[FP8_SPEC]]()
@@ -771,23 +787,21 @@ struct LowpState(Movable):
         self.proj_weight = List[AmaxState[FP8_SPEC]]()
         self.proj_doutput = List[AmaxState[FP8_SPEC]]()
 
-        # See the module comment above: only elaborated for LOWP_ENABLED
-        # (fp8/fp4) GPU builds — bf16/fp32 leave every list empty and launch
-        # no GPU kernels here (landmine #1).
+        # See the module comment above: only elaborated for PRECISION ==
+        # "fp8" GPU builds — bf16/fp32/fp4 leave every list empty and launch
+        # no GPU kernels here.
         #
-        # A1 (docs/ai/speedrun_techniques_research.md, `-D
-        # LLMM_FP8_STATIC_SCALES=1`): every layer of a given (site, role)
+        # `-D LLMM_FP8_STATIC_SCALES=1`: every layer of a given (site, role)
         # shares the SAME one calibrated constant (`llmm/lowp.mojo`'s
         # `fp8_static_scale`) — deliberately NOT per-layer (unlike the
         # dynamic path's per-layer `AmaxState` history, which exists
         # because different layers have unrelated magnitude statistics —
-        # see the module comment above `LowpState`). Static mode instead
-        # follows modded-nanogpt's own recipe (one hardcoded constant per
-        # tensor ROLE, shared globally) — the calibration tool already
-        # picked the safe (min-over-layers, margined) constant per
-        # (site, role), so reusing it for every layer is intentional, not
-        # a simplification that drops per-layer coverage.
-        comptime if LOWP_ENABLED:
+        # see the module comment above `Fp8State`). Static mode instead
+        # shares one hardcoded constant per tensor ROLE globally — the
+        # calibration tool already picked the safe (min-over-layers,
+        # margined) constant per (site, role), so reusing it for every layer
+        # is intentional, not a simplification that drops per-layer coverage.
+        comptime if PRECISION == "fp8":
             comptime if FP8_STATIC_SCALES:
                 comptime qkv_input_s = fp8_static_scale["qkv", "input"]()
                 comptime qkv_weight_s = fp8_static_scale["qkv", "weight"]()
@@ -1041,10 +1055,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var grad_acts_stats_memory: MutMemPtr[StatsDType]
     var num_grads: Int
 
-    # Chunk D: shared per-tensor fp8 delayed-scaling state (see `LowpState`'s
-    # docstring above). Always declared (mirrors `master_buf`'s USE_BF16
-    # convention); populated only under LOWP_ENABLED (empty lists otherwise).
-    var lowp_state: LowpState
+    # Shared per-tensor fp8 delayed-scaling state (see `Fp8State`'s docstring
+    # above). Always declared (mirrors `master_buf`'s USE_BF16 convention);
+    # populated only under PRECISION == "fp8" (empty lists otherwise).
+    var fp8_state: Fp8State
 
     # Runstate Configurations
     var batch_size: Int  # The batch size of the current forward pass (Our B).
@@ -1122,7 +1136,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # with the real, per-layer-populated container once `self.config` is
         # finalized (see below, after the checkpoint/safetensors/from-scratch
         # branches and `self.allocate_gradients()`).
-        self.lowp_state = LowpState(0, ctx)
+        self.fp8_state = Fp8State(0, ctx)
 
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
@@ -1273,13 +1287,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # Allocate weight gradients.
         self.allocate_gradients()
 
-        # fp8 delayed-scaling state (Chunk D): one AmaxState per GEMM operand
-        # site per layer. Config is finalized by all three branches above, so
-        # config.num_layer is valid here. See `LowpState`'s module comment
-        # for why this is unconditional (empty lists, no GPU work, under
-        # bf16/fp32 — the ctor's body is itself `comptime if LOWP_ENABLED:`
-        # gated).
-        self.lowp_state = LowpState(self.config.num_layer, ctx)
+        # fp8 delayed-scaling state: one AmaxState per GEMM operand site per
+        # layer. Config is finalized by all three branches above, so
+        # config.num_layer is valid here. See `Fp8State`'s module comment for
+        # why this is unconditional (empty lists, no GPU work, under
+        # bf16/fp32/fp4 — the ctor's population loop is itself `comptime if
+        # PRECISION == "fp8":` gated).
+        self.fp8_state = Fp8State(self.config.num_layer, ctx)
 
         # Allocate optimizer moments.
         self.allocate_optimizer_moments()
@@ -2298,8 +2312,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(seq_len),
                     Int64(channels),
                     Int64(3 * channels),
-                    self.lowp_state.qkv_input[layer],
-                    self.lowp_state.qkv_weight[layer],
+                    self.fp8_state.qkv_input[layer],
+                    self.fp8_state.qkv_weight[layer],
                     "qkv",
                     layer,
                     self.ctx,
@@ -2374,8 +2388,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(seq_len),
                     Int64(channels),
                     Int64(channels),
-                    self.lowp_state.attn_proj_input[layer],
-                    self.lowp_state.attn_proj_weight[layer],
+                    self.fp8_state.attn_proj_input[layer],
+                    self.fp8_state.attn_proj_weight[layer],
                     "attn_proj",
                     layer,
                     self.ctx,
@@ -2427,8 +2441,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(seq_len),
                     Int64(channels),
                     Int64(4 * channels),
-                    self.lowp_state.fc_input[layer],
-                    self.lowp_state.fc_weight[layer],
+                    self.fp8_state.fc_input[layer],
+                    self.fp8_state.fc_weight[layer],
                     "fc",
                     layer,
                     self.ctx,
@@ -2487,8 +2501,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(seq_len),
                     Int64(4 * channels),
                     Int64(channels),
-                    self.lowp_state.proj_input[layer],
-                    self.lowp_state.proj_weight[layer],
+                    self.fp8_state.proj_input[layer],
+                    self.fp8_state.proj_weight[layer],
                     "proj",
                     layer,
                     self.ctx,
@@ -2749,14 +2763,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
 
-        # FP4 backward SR counter (Chunk T2): unique per (outer training
-        # step, micro-step) so grad-accumulation micro-steps within one
-        # optimizer step draw distinct dither instead of reusing the same
-        # bit pattern every micro-step under the fixed default seed — same
-        # "unique per (step, element)" convention `llmm/adamw.mojo`'s
-        # `LLMM_SR_MASTER` seam and `llmm/nvfp4_quant.mojo`'s per-element
-        # counter both use, one level up (per call, not per element). Only
-        # consulted under `PRECISION == "fp4"` (inert elsewhere).
+        # fp4 SR step counter: unique per (training step, micro-step) so
+        # grad-accum micro-steps draw distinct dither; only consulted under
+        # fp4.
         var fp4_sr_step = step * grad_accum_steps + micro_step
 
         var batch_size = self.batch_size
@@ -2966,9 +2975,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # matmul_d_input_bwd computes d_l_fch_gelu = gelu'(l_fch) ⊙
             # (d_fc_proj @ proj_weight) = d_fch (post-GELU-grad, still 4C-wide).
             var loop_t0 = global_perf_counter_ns()
-            # fp8 site (Chunk E): C=4*channels, OC=channels;
+            # fp8 site: C=4*channels, OC=channels;
             # input=l_fch_gelu, weight=l_proj_weight, d_output=d_l_fc_proj.
-            comptime if LOWP_BWD_ENABLED and FP8_SITE_PROJ:
+            comptime if FP8_BWD_ENABLED and FP8_SITE_PROJ:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=True](
                     as_mut_kernel[GPT2_DTYPE](d_l_fch_gelu),
                     as_mut_kernel[GPT2_DTYPE](d_l_proj_weight),
@@ -2981,15 +2990,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(seq_len),
                     Int64(4 * channels),
                     Int64(channels),
-                    self.lowp_state.proj_input[layer],
-                    self.lowp_state.proj_weight[layer],
-                    self.lowp_state.proj_doutput[layer],
+                    self.fp8_state.proj_input[layer],
+                    self.fp8_state.proj_weight[layer],
+                    self.fp8_state.proj_doutput[layer],
                     "proj",
                     layer,
                     self.ctx,
                 )
             elif PRECISION == "fp4":
-                # fp4 site (Chunk T2, MLP-eligible middle blocks only): same
+                # fp4 site (MLP-eligible middle blocks only): same
                 # C=4*channels, OC=channels, input=l_fch_gelu,
                 # weight=l_proj_weight, d_output=d_l_fc_proj mapping as the
                 # fp8 branch above; outside `_layer_in_fp4_range` falls
@@ -3049,9 +3058,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # post-GELU-grad, from the fused projection backward above). This
             # matmul lives entirely below the GELU, so it just backprops the
             # linear FC: d_l_ln_2 = d_fch @ fc_weight.
-            # fp8 site (Chunk E): C=channels, OC=4*channels; input=l_ln_2,
+            # fp8 site: C=channels, OC=4*channels; input=l_ln_2,
             # weight=l_fc_weight, d_output=d_l_fch_gelu.
-            comptime if LOWP_BWD_ENABLED and FP8_SITE_FC:
+            comptime if FP8_BWD_ENABLED and FP8_SITE_FC:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_2),
                     as_mut_kernel[GPT2_DTYPE](d_l_fc_weight),
@@ -3064,15 +3073,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(seq_len),
                     Int64(channels),
                     Int64(4 * channels),
-                    self.lowp_state.fc_input[layer],
-                    self.lowp_state.fc_weight[layer],
-                    self.lowp_state.fc_doutput[layer],
+                    self.fp8_state.fc_input[layer],
+                    self.fp8_state.fc_weight[layer],
+                    self.fp8_state.fc_doutput[layer],
                     "fc",
                     layer,
                     self.ctx,
                 )
             elif PRECISION == "fp4":
-                # fp4 site (Chunk T2, MLP-eligible middle blocks only): same
+                # fp4 site (MLP-eligible middle blocks only): same
                 # C=channels, OC=4*channels, input=l_ln_2, weight=l_fc_weight,
                 # d_output=d_l_fch_gelu mapping as the fp8 branch above.
                 if _layer_in_fp4_range(layer, num_layers):
@@ -3167,10 +3176,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
 
             # Attention projection backward.
-            # fp8 site (Chunk E): C=channels, OC=channels;
+            # fp8 site: C=channels, OC=channels;
             # input=l_attn_merged, weight=l_attn_proj_weight,
             # d_output=d_l_attn_proj.
-            comptime if LOWP_BWD_ENABLED and FP8_SITE_ATTN_PROJ:
+            comptime if FP8_BWD_ENABLED and FP8_SITE_ATTN_PROJ:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_attn_merged),
                     as_mut_kernel[GPT2_DTYPE](d_l_attn_proj_weight),
@@ -3183,9 +3192,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(seq_len),
                     Int64(channels),
                     Int64(channels),
-                    self.lowp_state.attn_proj_input[layer],
-                    self.lowp_state.attn_proj_weight[layer],
-                    self.lowp_state.attn_proj_doutput[layer],
+                    self.fp8_state.attn_proj_input[layer],
+                    self.fp8_state.attn_proj_weight[layer],
+                    self.fp8_state.attn_proj_doutput[layer],
                     "attn_proj",
                     layer,
                     self.ctx,
@@ -3236,9 +3245,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
 
             # QKV matmul backward.
-            # fp8 site (Chunk E): C=channels, OC=3*channels; input=l_ln_1,
+            # fp8 site: C=channels, OC=3*channels; input=l_ln_1,
             # weight=l_qkv_weight, d_output=d_l_qkv.
-            comptime if LOWP_BWD_ENABLED and FP8_SITE_QKV:
+            comptime if FP8_BWD_ENABLED and FP8_SITE_QKV:
                 matmul_bwd_lowp[GPT2_DTYPE, Self.target, use_gelu=False](
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
                     as_mut_kernel[GPT2_DTYPE](d_l_qkv_weight),
@@ -3251,9 +3260,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     Int64(seq_len),
                     Int64(channels),
                     Int64(3 * channels),
-                    self.lowp_state.qkv_input[layer],
-                    self.lowp_state.qkv_weight[layer],
-                    self.lowp_state.qkv_doutput[layer],
+                    self.fp8_state.qkv_input[layer],
+                    self.fp8_state.qkv_weight[layer],
+                    self.fp8_state.qkv_doutput[layer],
                     "qkv",
                     layer,
                     self.ctx,

@@ -239,9 +239,8 @@ def run_test[
     # (default on NVIDIA — llmm/vendor.mojo's USE_TF32; `make verify-gpu`
     # disables it with -D LLMM_NO_TF32=1 to keep this gate strict-IEEE), the
     # 10-bit-mantissa GEMM inputs drift the per-step loss slightly: measured
-    # max |delta| over the 10-step overfit run is 0.0102 with no growth trend
-    # (see docs/ai/ai_assisted_optimizations_and_benchmarks.md, 2026-07-10
-    # entry). 0.02 = ~2x that measured drift — loose enough that healthy TF32
+    # max |delta| over the 10-step overfit run is 0.0102 with no growth
+    # trend. 0.02 = ~2x that measured drift — loose enough that healthy TF32
     # rounding passes, tight enough that a real regression (which shows up as
     # a large per-step deviation or a growing trend, e.g. the dead-gradient
     # trajectories this check exists to catch deviate by O(0.1+) within a few

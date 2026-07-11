@@ -34,7 +34,7 @@ def test_sign_vector_is_plus_minus_one() raises:
         assert_true(s == Float32(1.0) or s == Float32(-1.0))
 
 
-def test_sign_vector_matches_documented_provenance() raises:
+def test_sign_vector_matches_reference() raises:
     # python random.Random(1234): 1 if rng.random() < 0.5 else -1, 16 draws.
     var expected: List[Float32] = [
         -1.0,
@@ -59,9 +59,8 @@ def test_sign_vector_matches_documented_provenance() raises:
 
 
 # ===----------------------------------------------------------------------=== #
-# GPU: known golden vector (independently computed in Python, see
-# llmm/hadamard.mojo module docstring / this file's task notes: x=[1..16],
-# fixed sign vector above -> y = H16 @ (s ⊙ x); inverse recovers x exactly).
+# GPU: known golden vector, independently computed in Python: x=[1..16],
+# fixed sign vector above -> y = H16 @ (s ⊙ x); inverse recovers x exactly.
 # All values here are small integers, exactly representable in bf16, so this
 # test uses tight tolerances despite running through a bf16 buffer.
 # ===----------------------------------------------------------------------=== #

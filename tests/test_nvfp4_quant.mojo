@@ -11,8 +11,10 @@ from std.sys import has_nvidia_gpu_accelerator
 from std.gpu.host import DeviceContext
 from std.testing import assert_equal, assert_true, TestSuite
 
-from llmm.memory import MutMemPtr, MutKernelPtr, ImmutKernelPtr
+from llmm.memory import MutKernelPtr, ImmutKernelPtr
 from llmm.rand import MT19937
+
+from _lowp_test_common import pseudo_gaussian_fill
 from llmm.nvfp4_quant import (
     encode_e2m1,
     decode_e2m1,
@@ -55,10 +57,9 @@ def test_e2m1_negative_zero_collapses_to_positive() raises:
     assert_equal(Int(encode_e2m1(neg_zero)), 0)
 
 
-def test_e2m1_tie_breaking_matches_probe() raises:
+def test_e2m1_ties_to_lower_magnitude() raises:
     # Exact midpoints between adjacent magnitudes round to the LOWER
-    # magnitude (matches tests/probe_fp4/probe_fp4.cu::encode_e2m1's
-    # strict-`<`-only-updates tie behavior). Values: (0,0.5)->0.25,
+    # magnitude (strict-`<`-only-updates tie behavior). Values: (0,0.5)->0.25,
     # (0.5,1)->0.75, (1,1.5)->1.25, (1.5,2)->1.75, (2,3)->2.5, (3,4)->3.5,
     # (4,6)->5.0.
     var ties: List[Float32] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
@@ -110,14 +111,13 @@ def test_e4m3_saturation() raises:
     assert_equal(decode_e4m3(code), Float32(448.0))
 
 
-def test_e4m3_golden_value_matches_probe_algorithm() raises:
-    # amax=6.5 over the 16-value block in
-    # test_quantize_matches_probe_golden_vector below -> scale = amax/6.0.
-    # Cross-checked against an independent Python port of
-    # tests/probe_fp4/probe_fp4.cu::encode_e4m3 (frexp-based; this Mojo
-    # version is bitcast-based but mathematically identical -- see module
-    # docstring). Both give sc_code = 0x39 (e_biased=7, m3=1) and
-    # decode(0x39) == 1.125 exactly.
+def test_e4m3_golden_value() raises:
+    # amax=6.5 over the 16-value block in test_quantize_golden_vector below
+    # -> scale = amax/6.0. Cross-checked against an independent Python
+    # implementation of encode_e4m3 (frexp-based; this Mojo version is
+    # bitcast-based but mathematically identical -- see module docstring).
+    # Both give sc_code = 0x39 (e_biased=7, m3=1) and decode(0x39) == 1.125
+    # exactly.
     var scale = Float32(6.5) / Float32(6.0)
     var code = encode_e4m3(scale)
     assert_equal(Int(code), 0x39)
@@ -137,14 +137,13 @@ def test_e4m3_roundtrip_relative_error_bounded() raises:
 
 
 # ===----------------------------------------------------------------------=== #
-# Cross-check against the probe's own quantize algorithm on a fixed 16-value
-# block (golden vector independently computed in Python from a port of
-# tests/probe_fp4/probe_fp4.cu's encode_e2m1/encode_e4m3/pack_e2m1x2 -- see
-# the AI agent's task notes; reproduced verbatim here as literals).
+# Golden vector for a fixed 16-value block, independently computed in
+# Python and checked against this codec's encode_e2m1/encode_e4m3/
+# pack_e2m1x2 (reproduced verbatim here as literals).
 # ===----------------------------------------------------------------------=== #
 
 
-def test_quantize_matches_probe_golden_vector() raises:
+def test_quantize_golden_vector() raises:
     var x: List[Float32] = [
         0.1,
         -0.3,
@@ -209,7 +208,7 @@ def test_quantize_matches_probe_golden_vector() raises:
 
 
 # ===----------------------------------------------------------------------=== #
-# Scale swizzle (host-only, no GPU) -- ported from probe_fp4.cu::swizzle_scales
+# Scale swizzle (host-only, no GPU)
 # ===----------------------------------------------------------------------=== #
 
 
@@ -248,30 +247,6 @@ def test_swizzle_bijection_no_collisions() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-@always_inline
-def _pseudo_gaussian_fill(
-    mut rng: MT19937,
-    data: MutMemPtr[DType.float32],
-    numel: Int,
-    mean: Float32,
-    std: Float32,
-) -> None:
-    """Irwin-Hall approximate-normal fill: sum of 12 uniform(0,1) draws has
-    mean 6, variance 1, so `(sum - 6)*std + mean` approximates N(mean, std^2).
-    Deliberately avoids `llmm.rand.normal_`'s Box-Muller (sin/cos/log), which
-    pulls in a libm link dependency (`-lm`) that the Makefile's generic
-    `test-mojo` loop does not pass (see llmm/rand.mojo's own gotcha in
-    Makefile's MOJO_LINK_FLAGS comment) -- this keeps the test file linkable
-    via the same plain `pixi run mojo run -I .` invocation as every other
-    tests/test_*.mojo file.
-    """
-    for i in range(numel):
-        var s = Float32(0.0)
-        for _ in range(12):
-            s += rng.randfloat32()
-        data[i] = (s - 6.0) * std + mean
-
-
 def _quantize_roundtrip_case[
     BLOCK_ROWS: Int
 ](
@@ -286,7 +261,7 @@ def _quantize_roundtrip_case[
 
     var host_fp32 = ctx.enqueue_create_host_buffer[DType.float32](n)
     var rng = MT19937(seed)
-    _pseudo_gaussian_fill(rng, host_fp32.unsafe_ptr(), n, mean, std)
+    pseudo_gaussian_fill(rng, host_fp32.unsafe_ptr(), n, std, mean)
     ctx.synchronize()
 
     var host_bf16 = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
@@ -360,7 +335,6 @@ def test_quantize_1d_roundtrip_gaussian_gpu() raises:
     var rel_l2 = _quantize_roundtrip_case[1](
         32, 256, Float32(0.0), Float32(1.0), UInt32(42)
     )
-    print("nvfp4 1D (1x16) roundtrip rel_l2 =", rel_l2)
     assert_true(rel_l2 < 0.20)
 
 
@@ -370,13 +344,12 @@ def test_quantize_2d_roundtrip_gaussian_gpu() raises:
     var rel_l2 = _quantize_roundtrip_case[16](
         64, 256, Float32(0.0), Float32(1.0), UInt32(43)
     )
-    print("nvfp4 2D (16x16) roundtrip rel_l2 =", rel_l2)
     # Coarser granularity (256 elements/scale vs 16) -> looser bound.
     assert_true(rel_l2 < 0.35)
 
 
 def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
-    # Chunk T2 (backward): `nvfp4_quantize_transpose` must produce
+    # `nvfp4_quantize_transpose` (backward) must produce
     # BYTE-IDENTICAL output to materializing the transpose in bf16 host-side
     # and calling plain `nvfp4_quantize` on it -- both are the SAME
     # deterministic RNE computation over the SAME set of logical values, just

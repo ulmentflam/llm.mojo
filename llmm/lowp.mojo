@@ -916,10 +916,12 @@ comptime FP8_STATIC_D36 = is_defined["LLMM_FP8_STATIC_D36"]()
 
 
 struct FP8StaticScaleD12:
-    """Calibrated for GPT-2 124M (d12, 12 layer / 768 channel),
-    checkpoint-init, 20 steps B=4 T=1024; running min(scale over layers AND
-    steps) / 2.0. Valid ONLY for this width/depth; recalibrate via
-    `calibrate_fp8_scales.mojo` for any other config.
+    """Calibrated for GPT-2 124M (`d12`, 12 layer / 768 channel),
+    checkpoint-init (`gpt2_124M_bf16.bin`) on tinyshakespeare (`make
+    train-gpt2-124m-fp8`), 20 steps B=4 T=1024; constants are
+    `min(scale over layers AND steps) / 2.0`. Valid ONLY for this
+    width/depth/init/data; recalibrate via `calibrate_fp8_scales.mojo`
+    for any other config -- see the module comment above.
 
     The running min is taken over EVERY step of calibration, not just the
     final one: `AmaxState`'s delayed-scaling ring buffer only remembers the
@@ -976,10 +978,10 @@ def fp8_static_scale[site: StaticString, role: StaticString]() -> Float32:
     """Resolve a (site, role) pair to its calibrated static scale constant,
     selecting the d12 or d36 table via `FP8_STATIC_D36`. `site` in {"qkv",
     "attn_proj", "fc", "proj"}, `role` in {"input", "weight", "doutput"} --
-    the same site tags `train_gpt2.mojo`'s `LowpState`/`matmul_fwd_lowp`/
+    the same site tags `train_gpt2.mojo`'s `Fp8State`/`matmul_fwd_lowp`/
     `matmul_bwd_lowp` call sites already use. Comptime-resolved (both
     `site`/`role` are compile-time `StaticString`s at every call site, since
-    they come from `LowpState.__init__`'s unrolled per-site `comptime if
+    they come from `Fp8State.__init__`'s unrolled per-site `comptime if
     LOWP_ENABLED:` loop body over a fixed set of literal site names) so this
     compiles down to a single constant, not a runtime string-compare chain.
     """

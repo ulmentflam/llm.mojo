@@ -1,27 +1,19 @@
 # ===----------------------------------------------------------------------=== #
-# Shared helpers for the HEAD-side low-precision test gates
-# (tests/test_lowp_gemm.mojo, tests/test_lowp_bwd.mojo, tests/test_amax.mojo).
+# Shared helpers for the low-precision test gates (tests/test_lowp_gemm.mojo,
+# tests/test_lowp_bwd.mojo, tests/test_amax.mojo, tests/test_lowp_gemm_fp4.mojo,
+# tests/test_matmul_bwd_fp4.mojo, tests/test_matmul_fwd_lowp.mojo,
+# tests/test_matmul_fwd_fp4.mojo, tests/test_nvfp4_quant.mojo).
 #
-# Split into its own module for the same reason as
-# tests/_rng_sr_gpu_kernels.mojo: `TestSuite.discover_tests[
+# Split into its own module because `TestSuite.discover_tests[
 # __functions_in_module()]()` reflects over *every* function defined in the
 # importing module to find its `test_`-prefixed ones, and constructing that
 # reflection tuple forces every listed function's signature to be resolved.
 # Plain host-side helpers like these don't hit the GPU-kernel-on-host-target
-# failure `_rng_sr_gpu_kernels.mojo` documents, but keeping shared,
+# failure tests/_rng_sr_gpu_kernels.mojo documents, but keeping shared,
 # non-`test_`-prefixed helpers out of each test module's own
 # `__functions_in_module()` tuple avoids them being (redundantly) treated as
 # discoverable test candidates and keeps one canonical body instead of one
-# per file. See docs/ai/dry_consolidation_audit_2026-07-10.md finding F5.
-#
-# TODO(post fp4-merge): tests/test_lowp_gemm_fp4.mojo and
-# tests/test_nvfp4_quant.mojo (currently on the in-flight fp4 branch, not
-# touched by this module's introduction) carry their own copies of this
-# logic -- `test_lowp_gemm_fp4.mojo`'s `_host_gemm_ref` is exactly this
-# module's `_host_gemm_ref[transpose_a=False, transpose_b=True]` (its own
-# comment says "ported here rather than imported since it is file-local
-# there"), and its `_rel_l2` is exactly this module's `rel_l2`. Once that
-# branch merges, point both at this module instead of their local copies.
+# per file.
 # ===----------------------------------------------------------------------=== #
 
 from std.memory import UnsafePointer
@@ -30,9 +22,11 @@ from std.random import random_float64
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.testing import assert_true
 
+from llmm.rand import MT19937
+
 
 # ===----------------------------------------------------------------------=== #
-# Host fp32 GEMM reference (tests/test_lowp_gemm.mojo lines 63-90, verbatim).
+# Host fp32 GEMM reference.
 #
 # Matches lowp_gemm_devscale's operand-orientation convention (matmul.mojo's
 # `_matmul_cublaslt_fp8` module comment): `d[j*m+i] = sum_p a_role(i,p) *
@@ -73,30 +67,26 @@ def _host_gemm_ref[
 
 
 # ===----------------------------------------------------------------------=== #
-# rel_l2 (from tests/test_lowp_gemm_fp4.mojo's `_rel_l2`, verbatim, incl. its
-# Float64 accumulation/return -- kept as-is for a drop-in future import per
-# the TODO above; not currently called by the three HEAD-side test files).
-# ===----------------------------------------------------------------------=== #
-
-
-@always_inline
-def rel_l2(
-    got: UnsafePointer[Float32, MutUntrackedOrigin],
-    want: UnsafePointer[Float32, MutUntrackedOrigin],
-    n: Int,
-) -> Float64:
-    var sq_err = Float64(0.0)
-    var sq_want = Float64(0.0)
-    for i in range(n):
-        var e = Float64(got[i]) - Float64(want[i])
-        sq_err += e * e
-        sq_want += Float64(want[i]) * Float64(want[i])
-    return sqrt(sq_err / (sq_want if sq_want > 0.0 else 1.0))
-
-
-# ===----------------------------------------------------------------------=== #
-# cosine_and_rel_l2 (from tests/test_lowp_bwd.mojo's `_cosine_and_rel_l2`,
-# verbatim). Used by test_lowp_bwd.mojo.
+# cosine_and_rel_l2 — two overloads, both computing aggregate metrics
+# (relative L2 norm + cosine similarity) rather than a naive per-element
+# `|got-want| / |want|`: GEMM outputs cross zero (sums of k signed
+# products), and near those zero-crossings a tiny, entirely
+# quantization-proportionate absolute error produces an arbitrarily large
+# *relative* error against a near-zero `want` -- not a real correctness
+# signal.
+#
+# The DeviceBuffer overload (from tests/test_lowp_bwd.mojo's
+# `_cosine_and_rel_l2`) does its own GPU readback and asserts against fixed
+# internal thresholds (rel_l2 < 0.1, cosine > 0.99) -- used by
+# tests/test_lowp_bwd.mojo, tests/test_amax.mojo.
+#
+# The host-pointer overload below is dtype-generic over both operands (bf16
+# or fp32 host arrays, matching whichever dtype a caller already has after
+# its own readback/reference computation) and reports the metrics via
+# out-params instead of asserting internally, so each call site keeps its
+# own calibrated thresholds -- used by tests/test_lowp_gemm.mojo,
+# tests/test_lowp_gemm_fp4.mojo, tests/test_matmul_bwd_fp4.mojo,
+# tests/test_matmul_fwd_lowp.mojo, tests/test_matmul_fwd_fp4.mojo.
 # ===----------------------------------------------------------------------=== #
 
 
@@ -142,10 +132,76 @@ def cosine_and_rel_l2(
     )
 
 
+def cosine_and_rel_l2[
+    GotDT: DType = DType.float32,
+    WantDT: DType = DType.float32,
+](
+    got: UnsafePointer[Scalar[GotDT], MutUntrackedOrigin],
+    want: UnsafePointer[Scalar[WantDT], MutUntrackedOrigin],
+    n: Int,
+    label: String,
+    mut rel_l2_out: Float32,
+    mut cosine_out: Float32,
+) raises -> None:
+    """Host-pointer overload (see the module comment above). Asserts NaN/Inf
+    on `got`; reports `rel_l2_out`/`cosine_out` for the CALLER to assert
+    against its own thresholds.
+    """
+    var l2_err = Float32(0.0)
+    var dot = Float32(0.0)
+    var norm_got = Float32(0.0)
+    var norm_want = Float32(0.0)
+    for i in range(n):
+        var g = got[i].cast[DType.float32]()
+        var w = want[i].cast[DType.float32]()
+        assert_true(g == g, label + ": NaN at " + String(i))
+        assert_true(
+            g > Float32(-1e30) and g < Float32(1e30),
+            label + ": Inf/overflow at " + String(i),
+        )
+        var e = g - w
+        l2_err += e * e
+        dot += g * w
+        norm_got += g * g
+        norm_want += w * w
+    rel_l2_out = sqrt(l2_err / (norm_want + Float32(1e-12)))
+    cosine_out = dot / (sqrt(norm_got) * sqrt(norm_want) + Float32(1e-12))
+
+
 # ===----------------------------------------------------------------------=== #
-# bf16 fill/random helpers (from tests/test_lowp_bwd.mojo, verbatim: used by
-# test_lowp_bwd.mojo) plus tests/test_amax.mojo's explicit-value bf16
-# builder (verbatim, used by test_amax.mojo). Kept as distinct functions --
+# pseudo_gaussian_fill — Irwin-Hall approximate-normal fill: sum of 12
+# uniform(0,1) draws has mean 6, variance 1, so `(sum - 6)*std + mean`
+# approximates N(mean, std^2). Deliberately avoids `llmm.rand.normal_`'s
+# Box-Muller (sin/cos/log), which pulls in a libm link dependency (`-lm`)
+# that the Makefile's generic `test-mojo` loop does not pass -- this keeps
+# the test file linkable via the same plain `pixi run mojo run -I .`
+# invocation as every other tests/test_*.mojo file. Dtype-generic (fp32 or
+# bf16 output) so it serves both direct-fp32-input and direct-bf16-input
+# callers.
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def pseudo_gaussian_fill[
+    DT: DType = DType.float32,
+](
+    mut rng: MT19937,
+    data: UnsafePointer[Scalar[DT], MutUntrackedOrigin],
+    numel: Int,
+    std: Float32,
+    mean: Float32 = 0.0,
+) -> None:
+    for i in range(numel):
+        var s = Float32(0.0)
+        for _ in range(12):
+            s += rng.randfloat32()
+        data[i] = ((s - 6.0) * std + mean).cast[DT]()
+
+
+# ===----------------------------------------------------------------------=== #
+# bf16 fill/random helpers: used by test_lowp_bwd.mojo (random_bf16/
+# zeros_bf16/clone_bf16) and test_amax.mojo (make_bf16_tensor, an
+# explicit-value bf16 builder). Kept as distinct functions --
 # `random_bf16`/`zeros_bf16` fill by count, `make_bf16_tensor` fills from an
 # explicit `List[Float32]` -- rather than folding one into the other, to
 # avoid changing either call site's behavior.

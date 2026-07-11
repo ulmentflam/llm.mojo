@@ -1730,7 +1730,7 @@ def matmul_fwd_lowp[
 
     `input_state`/`weight_state` are this call site's `AmaxState[FP8_SPEC]`
     (one instance per transformer layer per site, from `train_gpt2.mojo`'s
-    `LowpState` container) — updated in place (`update_scale`) every call, so
+    `Fp8State` container) — updated in place (`update_scale`) every call, so
     repeated calls (one per training step) build the delayed-scaling
     history. The weight is re-quantized from its bf16 storage on every call
     (no persistent fp8 weight cache) because the optimizer updates it every
@@ -1762,7 +1762,7 @@ def matmul_fwd_lowp[
     # 1. Per-operand amax -> delayed-scaling update (call update_scale once
     #    per step BEFORE reading state.scale below). Under -D
     #    LLMM_FP8_STATIC_SCALES=1 this whole block is comptime-skipped
-    #    (never instantiated); scales were seeded once at LowpState.__init__
+    #    (never instantiated); scales were seeded once at Fp8State.__init__
     #    and never change.
     comptime if not FP8_STATIC_SCALES:
         var amax_input = ctx.enqueue_create_buffer[DType.float32](1)
@@ -3496,7 +3496,7 @@ def matmul_bwd_lowp[
     var out_channels = Int(output_channels)
     # See the matching comment in `matmul_fwd_lowp` above: under
     # `-D LLMM_FP8_STATIC_SCALES=1`, `doutput_state.scale` was seeded once
-    # at `LowpState.__init__` time and never updated — skip the amax
+    # at `Fp8State.__init__` time and never updated — skip the amax
     # reduction + scale-update kernel entirely (comptime-gated).
     comptime if not FP8_STATIC_SCALES:
         var amax_doutput = ctx.enqueue_create_buffer[DType.float32](1)
@@ -3583,7 +3583,7 @@ def matmul_bwd_lowp[
 # have no room for fp4's scratch buffers, and bf16/fp32/fp8 callers must
 # stay byte-for-byte unchanged). `train_gpt2.mojo` wires these into a THIRD
 # `elif PRECISION == "fp4":` branch alongside fp8's `comptime if
-# LOWP_BWD_ENABLED:`, gated per-layer by `_layer_in_fp4_range` (the same
+# FP8_BWD_ENABLED:`, gated per-layer by `_layer_in_fp4_range` (the same
 # middle-block policy the forward pass uses) — outside that range it falls
 # through to plain bf16 `matmul_bwd`.
 #

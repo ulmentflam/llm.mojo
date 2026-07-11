@@ -1,17 +1,15 @@
 # ===----------------------------------------------------------------------=== #
-# tests/test_lowp_gemm_fp4.mojo — FP4-GEMM chunk gate
-# (docs/ai/fp4_readiness_summary.md, docs/ai/fp4_training_recipes_research.md):
+# tests/test_lowp_gemm_fp4.mojo — FP4-GEMM coverage:
 #
 #   1. `lowp_gemm_fp4` (llmm/matmul.mojo) vs a plain fp32 reference GEMM on
-#      gaussian data, matching tests/probe_fp4/RESULTS.md's own methodology
-#      (M=N=K=512, target rel L2 ~0.1445) — plus a `bf16_control_gemm` arm
-#      through the identical cuBLASLt call path/D-readback convention, which
-#      must land at ~bf16-rounding-only error (~0.003): the probe's own
-#      "comparison-harness bug" lesson (RESULTS.md, "First-pass version of
-#      this probe had a column-major-vs-row-major output indexing bug...").
+#      gaussian data (M=N=K=512, target rel L2 ~0.1445) — plus a
+#      `bf16_control_gemm` arm through the identical cuBLASLt call
+#      path/D-readback convention, which must land at ~bf16-rounding-only
+#      error (~0.003): a control arm that isolates comparison-harness bugs
+#      (D layout/readback) from real fp4 kernel error.
 #   2. Real GPT-2 MLP shapes (768x3072, 3072x768) at a representative row
 #      count, weight operand quantized with 2D 16x16 block scaling
-#      (`b_block_rows=16`) per the recipe.
+#      (`b_block_rows=16`).
 #   3. Ill-scaled inputs (tiny/huge magnitude) — no NaN/Inf, no collapse.
 #   4. RHT (llmm/hadamard.mojo) composed with quantize+GEMM: verifies the
 #      documented `(H@a)^T @ (H@b) == 16 * a^T @ b` contract survives FP4
@@ -23,14 +21,13 @@
 # run under `flock -w 10800 /tmp/llmm-gpu.lock -c '...'` (shared GPU).
 # ===----------------------------------------------------------------------=== #
 
-from std.math import sqrt
 from std.memory import UnsafePointer
 from std.sys import has_nvidia_gpu_accelerator
 from std.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true, assert_equal
 
 from llmm.rand import MT19937
-from llmm.memory import MutKernelPtr, ImmutKernelPtr, MutMemPtr
+from llmm.memory import MutKernelPtr, ImmutKernelPtr
 from llmm.hadamard import hadamard16_fwd_gpu
 from llmm.nvfp4_quant import (
     encode_e2m1,
@@ -42,29 +39,12 @@ from llmm.nvfp4_quant import (
 )
 from llmm.matmul import lowp_gemm_fp4, bf16_control_gemm
 
+from _lowp_test_common import pseudo_gaussian_fill, cosine_and_rel_l2
+
 
 # ===----------------------------------------------------------------------=== #
 # Helpers
 # ===----------------------------------------------------------------------=== #
-
-
-@always_inline
-def _pseudo_gaussian_fill(
-    mut rng: MT19937,
-    data: MutMemPtr[DType.float32],
-    numel: Int,
-    std: Float32,
-) -> None:
-    """Irwin-Hall approximate-normal fill (see
-    tests/test_nvfp4_quant.mojo's identical helper for the derivation/link
-    dependency rationale: avoids `llmm.rand.normal_`'s Box-Muller, which
-    needs `-lm`, not passed by the generic `make test-mojo` loop).
-    """
-    for i in range(numel):
-        var s = Float32(0.0)
-        for _ in range(12):
-            s += rng.randfloat32()
-        data[i] = (s - 6.0) * std
 
 
 # Host fp32 GEMM reference, forward orientation only (matches lowp_gemm_fp4's
@@ -91,21 +71,6 @@ def _host_gemm_ref(
 
 
 @always_inline
-def _rel_l2(
-    got: UnsafePointer[Float32, MutUntrackedOrigin],
-    want: UnsafePointer[Float32, MutUntrackedOrigin],
-    n: Int,
-) -> Float64:
-    var sq_err = Float64(0.0)
-    var sq_want = Float64(0.0)
-    for i in range(n):
-        var e = Float64(got[i]) - Float64(want[i])
-        sq_err += e * e
-        sq_want += Float64(want[i]) * Float64(want[i])
-    return sqrt(sq_err / (sq_want if sq_want > 0.0 else 1.0))
-
-
-@always_inline
 def _assert_finite(
     d: UnsafePointer[Float32, MutUntrackedOrigin], n: Int, label: String
 ) raises:
@@ -119,8 +84,8 @@ def _assert_finite(
 
 
 # ===----------------------------------------------------------------------=== #
-# 1. lowp_gemm_fp4 vs fp32 reference (gaussian, probe-matching shape) +
-#    bf16 control arm through the identical harness.
+# 1. lowp_gemm_fp4 vs fp32 reference (gaussian) + bf16 control arm through
+#    the identical harness.
 # ===----------------------------------------------------------------------=== #
 
 
@@ -147,8 +112,8 @@ def _run_fp4_gemm_case[
     var host_a_f32 = ctx.enqueue_create_host_buffer[DType.float32](a_n)
     var host_b_f32 = ctx.enqueue_create_host_buffer[DType.float32](b_n)
     var rng = MT19937(UInt32(2026))
-    _pseudo_gaussian_fill(rng, host_a_f32.unsafe_ptr(), a_n, std)
-    _pseudo_gaussian_fill(rng, host_b_f32.unsafe_ptr(), b_n, std)
+    pseudo_gaussian_fill(rng, host_a_f32.unsafe_ptr(), a_n, std)
+    pseudo_gaussian_fill(rng, host_b_f32.unsafe_ptr(), b_n, std)
     ctx.synchronize()
 
     # bf16-round the inputs once, host-side, so the fp32 reference is against
@@ -261,40 +226,47 @@ def _run_fp4_gemm_case[
         k,
     )
 
-    _assert_finite(host_got.unsafe_ptr(), m * n, label + " (fp4)")
-    _assert_finite(host_got_bf16.unsafe_ptr(), m * n, label + " (bf16)")
-
-    var rel_l2 = _rel_l2(host_got.unsafe_ptr(), host_ref.unsafe_ptr(), m * n)
-    var rel_l2_bf16 = _rel_l2(
-        host_got_bf16.unsafe_ptr(), host_ref.unsafe_ptr(), m * n
+    var rel_l2 = Float32(0.0)
+    var cosine = Float32(0.0)
+    cosine_and_rel_l2(
+        host_got.unsafe_ptr(),
+        host_ref.unsafe_ptr(),
+        m * n,
+        label + " (fp4)",
+        rel_l2,
+        cosine,
     )
-    print(label, "fp4 rel_l2 =", rel_l2, " bf16-control rel_l2 =", rel_l2_bf16)
-
+    var rel_l2_bf16 = Float32(0.0)
+    var cosine_bf16 = Float32(0.0)
+    cosine_and_rel_l2(
+        host_got_bf16.unsafe_ptr(),
+        host_ref.unsafe_ptr(),
+        m * n,
+        label + " (bf16)",
+        rel_l2_bf16,
+        cosine_bf16,
+    )
     assert_true(
-        rel_l2 < max_rel_l2,
+        Float64(rel_l2) < max_rel_l2,
         label + ": fp4 rel_l2 " + String(rel_l2) + " >= " + String(max_rel_l2),
     )
     assert_true(
-        rel_l2_bf16 < max_bf16_rel_l2,
+        Float64(rel_l2_bf16) < max_bf16_rel_l2,
         label
         + ": bf16-control rel_l2 "
         + String(rel_l2_bf16)
         + " >= "
         + String(max_bf16_rel_l2)
         + " -- if this fails while fp4's rel_l2 also looks wrong, suspect"
-        " the comparison harness (D layout/readback), not the fp4 kernel"
-        " (see tests/probe_fp4/RESULTS.md's own postmortem)",
+        " the comparison harness (D layout/readback), not the fp4 kernel",
     )
 
 
 def test_fp4_gemm_gaussian_probe_shape() raises:
-    # Matches tests/probe_fp4/RESULTS.md's M=N=K=512 setup as closely as a
-    # bf16-input (vs the probe's raw fp32) harness allows. std chosen so
-    # magnitudes land in a similar dynamic-range regime to the probe's
-    # uniform[-3,3] (std=1.7 gaussian has comparable spread); target rel_l2
-    # a bit looser than the probe's exact 0.1445 to allow for the
-    # gaussian-vs-uniform distribution difference and bf16 (vs fp32) input
-    # rounding, while still being tight enough to catch a broken kernel.
+    # M=N=K=512, gaussian data (std=1.7 for a comparable dynamic range to a
+    # uniform[-3,3] reference); bf16 (vs fp32) input rounding widens the
+    # target rel_l2 slightly, while still being tight enough to catch a
+    # broken kernel.
     _run_fp4_gemm_case(
         512, 512, 512, Float32(1.7), "gaussian-512", max_rel_l2=0.20
     )
@@ -304,13 +276,9 @@ def test_fp4_gemm_ill_scaled_tiny() raises:
     # Tiny magnitudes (~2e-4) -- would flush toward e2m1's zero/subnormal
     # grid points without the per-tensor fp32 scale compensating. Proves the
     # scale mechanism (no NaN/Inf/collapse), looser bound (mirrors
-    # tests/test_lowp_gemm.mojo's fp8 ill-scaled-tiny case). Shape matches
-    # the probe's own 512^3 (tests/probe_fp4/RESULTS.md's confirmed-dispatch
-    # size, `cutlass...128x128x256...vs16`) rather than a smaller ad hoc
-    # shape, since cuBLASLt's NVFP4 block-scaled kernels are tuned for that
-    # tile and a much smaller M/N/K risks `cublasLtMatmulAlgoGetHeuristic`
-    # returning zero candidates for reasons unrelated to this test's actual
-    # purpose (scale-mechanism correctness, not kernel-dispatch coverage).
+    # tests/test_lowp_gemm.mojo's fp8 ill-scaled-tiny case). Use 512^3: much
+    # smaller M/N/K can make cublasLtMatmulAlgoGetHeuristic return zero
+    # NVFP4 candidates, a dispatch artifact unrelated to this test.
     _run_fp4_gemm_case(
         512,
         512,
@@ -324,7 +292,7 @@ def test_fp4_gemm_ill_scaled_tiny() raises:
 
 def test_fp4_gemm_ill_scaled_huge() raises:
     # Huge magnitudes (~5e3) -- would saturate e2m1 without a compensating
-    # (small) tensor scale. Same probe-matching shape rationale as above.
+    # (small) tensor scale. Same shape rationale as above.
     _run_fp4_gemm_case(
         512, 512, 512, Float32(5.0e3), "ill-scaled-huge", max_rel_l2=0.20
     )
@@ -341,8 +309,7 @@ def test_fp4_gemm_mlp_fc_up_shape() raises:
     # reference tractable in a unit test; the channel/contraction dims (768,
     # 3072 -- 48 and 192 sixteen-element blocks respectively) are the real
     # GPT-2 124M MLP shapes and are what exercises realistic block-scaling
-    # statistics. b_block_rows=16 -> weight operand uses 2D 16x16 scaling
-    # per the recipe.
+    # statistics. b_block_rows=16 -> weight operand uses 2D 16x16 scaling.
     _run_fp4_gemm_case[b_block_rows=16](
         512,
         3072,
@@ -385,11 +352,10 @@ def test_fp4_rht_quantize_gemm_contract() raises:
         return
     var ctx = DeviceContext()
     comptime IN_DT = DType.bfloat16
-    # Shape matches the probe's own 512^3 (tests/probe_fp4/RESULTS.md) --
-    # see test_fp4_gemm_ill_scaled_tiny's comment for why a much smaller
-    # shape risks a dispatch-heuristic false negative unrelated to this
-    # test's actual purpose. 512 is also a multiple of both NVFP4_BLOCK and
-    # HADAMARD_BLOCK (16).
+    # 512^3 -- see test_fp4_gemm_ill_scaled_tiny's comment for why a much
+    # smaller shape risks a dispatch-heuristic false negative unrelated to
+    # this test's actual purpose. 512 is also a multiple of both
+    # NVFP4_BLOCK and HADAMARD_BLOCK (16).
     var m = 512
     var n = 512
     var k = 512
@@ -397,8 +363,8 @@ def test_fp4_rht_quantize_gemm_contract() raises:
     var host_a_f32 = ctx.enqueue_create_host_buffer[DType.float32](m * k)
     var host_b_f32 = ctx.enqueue_create_host_buffer[DType.float32](n * k)
     var rng = MT19937(UInt32(4242))
-    _pseudo_gaussian_fill(rng, host_a_f32.unsafe_ptr(), m * k, Float32(1.0))
-    _pseudo_gaussian_fill(rng, host_b_f32.unsafe_ptr(), n * k, Float32(1.0))
+    pseudo_gaussian_fill(rng, host_a_f32.unsafe_ptr(), m * k, Float32(1.0))
+    pseudo_gaussian_fill(rng, host_b_f32.unsafe_ptr(), n * k, Float32(1.0))
     ctx.synchronize()
 
     var host_a_bf16 = ctx.enqueue_create_host_buffer[IN_DT](m * k)
@@ -514,11 +480,16 @@ def test_fp4_rht_quantize_gemm_contract() raises:
     for i in range(m * n):
         host_ref_scaled.unsafe_ptr()[i] = host_ref.unsafe_ptr()[i] * 16.0
 
-    _assert_finite(host_got.unsafe_ptr(), m * n, "rht-quantize-gemm")
-    var rel_l2 = _rel_l2(
-        host_got.unsafe_ptr(), host_ref_scaled.unsafe_ptr(), m * n
+    var rel_l2 = Float32(0.0)
+    var cosine = Float32(0.0)
+    cosine_and_rel_l2(
+        host_got.unsafe_ptr(),
+        host_ref_scaled.unsafe_ptr(),
+        m * n,
+        "rht-quantize-gemm",
+        rel_l2,
+        cosine,
     )
-    print("rht-quantize-gemm rel_l2 (vs 16*fp32 ref) =", rel_l2)
     assert_true(
         rel_l2 < 0.25,
         "RHT+quantize+GEMM rel_l2 vs 16*fp32 ref = "
@@ -593,7 +564,7 @@ def test_sr_nvfp4_quantize_deterministic_under_fixed_seed() raises:
 
     var host_f32 = ctx.enqueue_create_host_buffer[DType.float32](n)
     var rng = MT19937(UInt32(99))
-    _pseudo_gaussian_fill(rng, host_f32.unsafe_ptr(), n, Float32(1.0))
+    pseudo_gaussian_fill(rng, host_f32.unsafe_ptr(), n, Float32(1.0))
     ctx.synchronize()
     var host_bf16 = ctx.enqueue_create_host_buffer[IN_DT](n)
     for i in range(n):

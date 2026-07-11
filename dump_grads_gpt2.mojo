@@ -1,8 +1,7 @@
 # ===----------------------------------------------------------------------=== #
-# dump_grads_gpt2.mojo — Chunk E Gate C tooling (docs/ai/fp8_training_design.md
-# §6, "Gate E": per-tensor gradient comparison over ALL ~148 parameter
-# gradient tensors, NOT a flat atol — see MEMORY.md
-# `weak-gates-overrule-nothing`).
+# dump_grads_gpt2.mojo — per-tensor gradient dump tool for cross-precision
+# comparison (a per-tensor comparison catches regressions a flat atol over
+# the whole gradient vector would hide).
 #
 # Loads the SAME fixed reference batch `test_gpt2.mojo` uses
 # (gpt2_124M_debug_state.bin's B=4,T=64 x/y), runs exactly one forward+
@@ -11,18 +10,16 @@
 # classes (ln_1_gamma/beta, qkv_weight/bias, attn_proj_weight/bias,
 # ln_2_gamma/beta, fc_weight/bias, proj_weight/bias -- L files each) and as a
 # single file for the 4 global tensors (wte, wpe, ln_f_gamma, ln_f_beta) --
-# L=12 for the 124M config, so 12*12 + 4 = 148 files, matching the design's
-# count exactly. Always dumps as raw fp32 (bf16 host-cast to fp32) so the
-# comparison script needs no per-build dtype awareness.
+# L=12 for the 124M config, so 12*12 + 4 = 148 files. Always dumps as raw
+# fp32 (bf16 host-cast to fp32) so the comparison script needs no per-build
+# dtype awareness.
 #
 # Build this SAME file into both train configurations (`-D LLMM_PRECISION=fp8`
-# and `-D LLMM_BF16=1`) and run each against a different `<out_dir>` -- with
-# Chunk D's `matmul_fwd_lowp` wiring merged, the fp8 build's forward pass is
-# ALSO fp8 (design §1.2's four per-block linears), so this compares the full
-# fp8-fwd+fp8-bwd training step against the bf16 reference (the gate's
-# intended shape: "fwd will also be fp8 ... gate vs bf16 reference"), not an
-# isolated backward-only delta. Compare the two directories with
-# `tests/compare_grad_dumps.py`.
+# and `-D LLMM_BF16=1`) and run each against a different `<out_dir>` -- the
+# fp8 build's forward pass is also fp8 (the four per-block linears), so this
+# compares the full fp8-fwd+fp8-bwd training step against the bf16
+# reference, not an isolated backward-only delta. Compare the two
+# directories with `tests/compare_grad_dumps.py`.
 #
 # Usage: pixi run -e cuda mojo run -I . dump_grads_gpt2.mojo <out_dir>
 # ===----------------------------------------------------------------------=== #
