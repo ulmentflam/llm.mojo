@@ -199,12 +199,8 @@ def pseudo_gaussian_fill[
 
 
 # ===----------------------------------------------------------------------=== #
-# bf16 fill/random helpers: used by test_lowp_bwd.mojo (random_bf16/
-# zeros_bf16/clone_bf16) and test_amax.mojo (make_bf16_tensor, an
-# explicit-value bf16 builder). Kept as distinct functions --
-# `random_bf16`/`zeros_bf16` fill by count, `make_bf16_tensor` fills from an
-# explicit `List[Float32]` -- rather than folding one into the other, to
-# avoid changing either call site's behavior.
+# Distinct on purpose: random_bf16/zeros_bf16 fill by count; make_bf16_tensor
+# fills from an explicit List[Float32]. Kept separate so no call site changes.
 # ===----------------------------------------------------------------------=== #
 
 

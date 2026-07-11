@@ -6,7 +6,7 @@ from .io import read_and_copy
 # GPT-2 Tokenizer (decode only)
 #
 # Loads the binary vocab written by train_gpt2.py / llm.c and maps token ids
-# back to raw byte strings for unconditional generation. As noted this is Decode Only.
+# back to raw byte strings for unconditional generation.
 # ===----------------------------------------------------------------------=== #
 
 

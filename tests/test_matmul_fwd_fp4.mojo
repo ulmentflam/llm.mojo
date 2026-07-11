@@ -220,4 +220,11 @@ def test_proj_site() raises:
 
 
 def main() raises:
-    TestSuite.discover_tests[__functions_in_module()]().run()
+    # fp4 GEMM is cuBLASLt-only (comptime assert HAS_CUBLAS in llmm/matmul.mojo);
+    # comptime-gate discovery so non-CUDA compiles to a skip, not a build error.
+    comptime if has_nvidia_gpu_accelerator():
+        TestSuite.discover_tests[__functions_in_module()]().run()
+    else:
+        print(
+            "SKIP tests/test_matmul_fwd_fp4.mojo: NVFP4/cuBLASLt is NVIDIA-only"
+        )

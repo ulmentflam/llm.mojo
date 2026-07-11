@@ -36,7 +36,6 @@ def get_dtype_size(dtype: DType) raises -> Int:
         )
 
 
-# Generic utility function to read count elements from a FileHandle directly into an UnsafePointer.
 def read_and_copy[
     dtype: DType,
 ](mut file: FileHandle, dest: MutMemPtr[dtype], count: Int,) raises:

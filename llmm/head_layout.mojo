@@ -3,11 +3,6 @@ from std.gpu.memory import CacheOperation, load as gpu_cache_load
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
-# NOTE: I am trying this layout to see if it does a decent job of saving code and
-# logically splitting the code into smaller pieces. I will also consider breaking out
-# forward and backward passes into separate files in a similar manner.
-
-
 # ===----------------------------------------------------------------------=== #
 # Constants
 # ===----------------------------------------------------------------------=== #

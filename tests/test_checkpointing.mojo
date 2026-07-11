@@ -91,7 +91,6 @@ def test_model_checkpoint_roundtrip() raises:
     assert_equal(header.config == config, True)
     assert_equal(header.config.num_parameters(), n)
 
-    # Read the params back into a fresh buffer and compare element-wise.
     var restored = alloc[Float32](n)
     var read_header = read_model_checkpoint(path, restored, n)
     assert_equal(read_header.config == config, True)
@@ -247,7 +246,6 @@ def _setup_loader_data() raises:
 def test_dataloader_capture_restore() raises:
     _setup_loader_data()
 
-    # Run a loader forward a few batches, then snapshot its position.
     var loader = DataLoader("test_ckpt_loader.bin", batch_size=2, seq_len=4)
     loader.next_batch()
     loader.next_batch()
@@ -269,7 +267,6 @@ def test_dataloader_capture_restore() raises:
     var expected_first = loader.inputs.load(0)
     var expected_last = loader.inputs.load(7)
 
-    # Restore into a fresh loader from the persisted state.
     var m_out = alloc[Float32](1)
     var v_out = alloc[Float32](1)
     var restored = read_state_checkpoint(path, m_out, v_out, 1)

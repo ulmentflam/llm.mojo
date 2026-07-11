@@ -14,7 +14,6 @@ import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch._inductor.config as config
 import torch.nn.init as init
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -2062,8 +2061,13 @@ if __name__ == "__main__":
                 "[NOTE] torch.compile is not supported on MPS (AssertionError: duplicate template name) — skipping compilation."
             )
         else:
-            if hasattr(config, "coordinate_descent_tuning"):
-                config.coordinate_descent_tuning = True  # suggested by @Chillee
+            # Lazy import: pulling torch._inductor in at module load drags in the
+            # dynamo/inductor stack, which hangs `import train_gpt2` and every test
+            # that imports it. Only compiled non-MPS training needs this flag.
+            import torch._inductor.config as inductor_config
+
+            if hasattr(inductor_config, "coordinate_descent_tuning"):
+                inductor_config.coordinate_descent_tuning = True  # @Chillee
             print_zero_rank("Compiling the model...")
             model = cast(nn.Module, torch.compile(model))
 

@@ -66,7 +66,6 @@ def _layernorm_fwd_cpu[
         i += width
     var mean = sum_vec.reduce_add()
 
-    # Handle the tail of the mean.
     for j in range(i, channels):
         mean += (
             (input_ptr + row_offset + j).load[width=1]().cast[DType.float32]()
@@ -89,7 +88,6 @@ def _layernorm_fwd_cpu[
         i += width
     var variance = var_vec.reduce_add()
 
-    # Handle the tail of the variance.
     for j in range(i, channels):
         var x = (
             (input_ptr + row_offset + j).load[width=1]().cast[DType.float32]()
@@ -117,7 +115,6 @@ def _layernorm_fwd_cpu[
         (output_ptr + row_offset + i).store(o.cast[dtype]())
         i += width
 
-    # Handle the tail of the output.
     for j in range(i, channels):
         var x = (
             (input_ptr + row_offset + j).load[width=1]().cast[DType.float32]()
@@ -286,7 +283,6 @@ def _layernorm_fwd_gpu[
                     var o = n * g + b
                     (output_ptr + idx).store(o.cast[dtype]())
 
-        # Store the Mean and RSTD
         if tid == 0:
             mean_ptr[row] = mean
             rstd_ptr[row] = rstd
@@ -468,7 +464,6 @@ def _layernorm_fused_residual_fwd_cpu[
         i += width
     var mean = sum_vec.reduce_add()
 
-    # Handle the tail of the mean.
     for j in range(i, channels):
         var val1 = (inp1_ptr + row_offset + j).load[width=1]()
         var val2 = (inp2_ptr + row_offset + j).load[width=1]()
@@ -493,7 +488,6 @@ def _layernorm_fused_residual_fwd_cpu[
         i += width
     var variance = var_vec.reduce_add()
 
-    # Handle the tail of the variance.
     for j in range(i, channels):
         var x = (
             (residual_ptr + row_offset + j)
@@ -523,7 +517,6 @@ def _layernorm_fused_residual_fwd_cpu[
         (normed_ptr + row_offset + i).store(o.cast[dtype]())
         i += width
 
-    # Handle the tail of the output.
     for j in range(i, channels):
         var x = (
             (residual_ptr + row_offset + j)
@@ -746,7 +739,6 @@ def _layernorm_fused_residual_fwd_gpu[
                 var o = n * g + b
                 normed_ptr[idx] = o.cast[dtype]()
 
-        # Store the Mean and RSTD
         if tid == 0:
             mean_ptr[row] = mean
             rstd_ptr[row] = rstd

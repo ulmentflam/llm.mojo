@@ -51,8 +51,6 @@ from llmm.vendor import HAS_CUBLAS, HAS_METAL, USE_TF32
 # KV Cache
 # ===----------------------------------------------------------------------=== #
 
-# NOTE: Simple implementation of a KV cache for the attention mechanism.
-
 
 struct KVCache:
     var fwd_addr: Int
@@ -120,18 +118,10 @@ comptime LOG2_EXP_MIN = Scalar[DType.float32](
 comptime C4 = Scalar[DType.float32](
     0.009618129
 )  # FlashAttention 4 polynomial coefficient
-comptime C3 = Scalar[DType.float32](
-    0.055504108
-)  # FlashAttention 4 polynomial coefficient
-comptime C2 = Scalar[DType.float32](
-    0.240179544
-)  # FlashAttention 4 polynomial coefficient
-comptime C1 = Scalar[DType.float32](
-    0.69314718
-)  # FlashAttention 4 polynomial coefficient
-comptime C0 = Scalar[DType.float32](
-    1.0
-)  # FlashAttention 4 polynomial coefficient
+comptime C3 = Scalar[DType.float32](0.055504108)
+comptime C2 = Scalar[DType.float32](0.240179544)
+comptime C1 = Scalar[DType.float32](0.69314718)
+comptime C0 = Scalar[DType.float32](1.0)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -231,8 +221,8 @@ def _attention_query_key_dot_product[
 ](
     query_row: ImmutKernelPtr[dtype],
     key_row: ImmutKernelPtr[dtype],
-    head_dim: Int,  # The dimension of the head
-    attention_scale: Scalar[DType.float32],  # The attention scale
+    head_dim: Int,
+    attention_scale: Scalar[DType.float32],
 ) -> Scalar[DType.float32]:
     var accumulator = SIMD[DType.float32, width](0.0)
     var dimension = 0
@@ -259,9 +249,9 @@ def _attention_rescale_and_add_value_to_output[
 ](
     output_row: MutKernelPtr[dtype],
     value_row: ImmutKernelPtr[dtype],
-    rescale_factor: Scalar[DType.float32],  # The rescale factor
-    attention_weight: Scalar[DType.float32],  # The attention weight
-    head_dim: Int,  # The dimension of the head
+    rescale_factor: Scalar[DType.float32],
+    attention_weight: Scalar[DType.float32],
+    head_dim: Int,
 ) -> None:
     @always_inline
     def _vectorize_head_dim[
@@ -297,8 +287,8 @@ def _attention_add_weighted_value_to_output[
 ](
     output_row: MutKernelPtr[dtype],
     value_row: ImmutKernelPtr[dtype],
-    attention_weight: Scalar[DType.float32],  # The attention weight
-    head_dim: Int,  # The dimension of the head
+    attention_weight: Scalar[DType.float32],
+    head_dim: Int,
 ) -> None:
     @always_inline
     def _vectorize_head_dim[
@@ -2004,7 +1994,6 @@ def _attention_bwd_update_step[
     # dS_ij = P_ij *(dP_ij - D_i)
     var dS_ij = P_ij * (dP_ij - D_i)
 
-    # Accumulate gradients
     # dq_row += (scale * dS_ij) * K_j
     _attention_add_weighted_value_to_output[dtype, width](
         dq_row, k_row, attention_scale * dS_ij, head_dim
@@ -2044,7 +2033,6 @@ def _attention_bwd_cpu[
     var head_offset = head_index * seq_len * head_dim
     var lse_head = log_sum_exp_ptr + head_index * seq_len
 
-    # Pointers for this head
     var q_head = query_ptr + head_offset
     var k_head = key_ptr + head_offset
     var v_head = value_ptr + head_offset
@@ -2070,7 +2058,6 @@ def _attention_bwd_cpu[
             Scalar[DType.float32](1.0),
         )
 
-    # Main backward pass.
     for i in range(seq_len):
         var q_row = q_head + i * head_dim
         var do_row = do_head + i * head_dim
@@ -2078,7 +2065,6 @@ def _attention_bwd_cpu[
         var L_i = lse_head[i]
         var D_i = D[i]
 
-        # Initialize dq_row to 0.
         for d in range(head_dim):
             dq_row[d] = Scalar[dtype](0.0)
 
@@ -2239,21 +2225,8 @@ def _attention_gpu_bwd_dq_tile_block[
         Scalar[DType.float32](head_dim)
     )
 
-    # Shared memory (SRAM) via .stack_allocation().
-    #
-    # GPU shared memory is a small, fast scratchpad. It cannot be heap-allocated
-    # at runtime from device code. The compiler must know each buffer's size before
-    # launch so it can reserve space and reject kernels that exceed the hardware limit.
-    #
-    # .stack_allocation() is Mojo's equivalent of CUDA's `__shared__ T buf[N]`:
-    # each call reserves one compile-time-sized slab in the block's shared
-    # memory. We declare separate LayoutTensors (not one raw byte array) so
-    # indexing stays typed and row-major strides are explicit.
-    #
-    # Br/Bc/MAX_HEAD_DIM are comptime constants so tile geometry is fixed at
-    # compile time. Rows are padded to MAX_HEAD_DIM columns even when
-    # head_dim < 128, letting one kernel binary serve any head_dim ≤ 128
-    # without recompilation (same trick as the forward kernel).
+    # Shared tiles via .stack_allocation() (Mojo's __shared__). Rows padded to
+    # MAX_HEAD_DIM so one binary serves any head_dim <= 128.
     var q_shared = LayoutTensor[
         dtype,
         Layout.row_major(Br, MAX_HEAD_DIM),
@@ -2461,7 +2434,6 @@ def _attention_gpu_bwd_dq_tile_block[
                     ]()
             barrier()
 
-    # Write final dq_shared block out to DRAM.
     _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, False](
         dq_tile_dram, dq_shared, query_tile_rows, head_dim
     )
@@ -2568,9 +2540,8 @@ def _attention_gpu_bwd_dkv_tile_block[
         Scalar[DType.float32](head_dim)
     )
 
-    # Shared memory layout mirrors pass 1 but with K/V/dK/dV as the outer
-    # (Bc-row) tiles and Q/dO/O streamed on the inner loop. Same as FlashAttention-2 Algorithm 4.
-    # Same .stack_allocation() is required as in the previous kernel.
+    # Shared layout mirrors pass 1: K/V/dK/dV are the outer (Bc-row) tiles;
+    # Q/dO/O stream inner.
     var key_shared = LayoutTensor[
         dtype,
         Layout.row_major(Bc, MAX_HEAD_DIM),
@@ -2710,7 +2681,7 @@ def _attention_gpu_bwd_dkv_tile_block[
             Layout.row_major(MAX_HEAD_DIM),
             MutAnyOrigin,
             address_space=AddressSpace.GENERIC,
-        ].stack_allocation()  # Stack-allocated generic memory is much faster then heap the way we previously allocated it.
+        ].stack_allocation()
         var private_dk = private_dk_tensor.ptr
         var private_dv_tensor = LayoutTensor[
             DType.float32,
@@ -3587,9 +3558,17 @@ def _attn_headout4_gpu[
         # BM×BK = THREADS → every thread loads exactly 1 element — 0% idle.
         # SIMD coalescing: 32 consecutive tids → 2 rows × 16 cols each (2 cache
         # lines, both fully utilised because rows are K=1024 apart in memory).
+        # Zero-pad the K-remainder. K (= T for A·V and dQ) need not be a multiple
+        # of BK, but the inner kk loop is a `comptime for` fixed at BK steps. Metal
+        # returns OOB reads as garbage instead of faulting (CUDA never runs this;
+        # cuBLAS does A·V there), so an unaligned T (generation/tests at 9, 17)
+        # would spill garbage into every accumulator. Always true for aligned
+        # production shapes (T=1024, HD=64), so no fast-path change.
         var ra = tid // BK
         var ca = tid % BK
-        a_sh.ptr[ra * (BK + 1) + ca] = a_ptr[a_base + ra * K + k + ca]
+        a_sh.ptr[ra * (BK + 1) + ca] = a_ptr[a_base + ra * K + k + ca] if (
+            m_off + ra < M and k + ca < K
+        ) else Scalar[dt](0)
 
         # Load B tile [BK, BN]: tid → row = tid//BN, col = tid%BN.
         # BK×BN = THREADS → every thread loads exactly 1 element.
@@ -3597,7 +3576,9 @@ def _attn_headout4_gpu[
         # BN cols → 1 cache line per SIMD pair → perfect coalescing.
         var rb = tid // BN
         var cb = tid % BN
-        b_sh.ptr[rb * (BN + 1) + cb] = b_ptr[b_base + (k + rb) * N + cb]
+        b_sh.ptr[rb * (BN + 1) + cb] = b_ptr[b_base + (k + rb) * N + cb] if (
+            k + rb < K and n_off + cb < N
+        ) else Scalar[dt](0)
 
         barrier()
 
@@ -3748,14 +3729,21 @@ def _attn_headout4_transA_gpu[
         # Load A tile [BK, BM] transposed into a_sh[k_local, m_local]:
         # A[k0+k_local, m_off+m_local]. Row-major [K,M] → m is contiguous, so
         # consecutive tids (→ consecutive m_local) coalesce.
+        # Same K-remainder zero-pad as _attn_headout4_gpu (K = T here): the
+        # comptime-unrolled kk loop always runs BK steps, so an unaligned T would
+        # otherwise spill garbage into the dK/dV accumulators on Metal.
         var ra = tid // BM  # k-row in tile  [0, BK)
         var ca = tid % BM  # m-col in tile  [0, BM)
-        a_sh.ptr[ra * (BM + 1) + ca] = a_ptr[a_base + (k + ra) * M + m_off + ca]
+        a_sh.ptr[ra * (BM + 1) + ca] = a_ptr[
+            a_base + (k + ra) * M + m_off + ca
+        ] if (k + ra < K and m_off + ca < M) else Scalar[dt](0)
 
         # Load B tile [BK, BN] into b_sh[k_local, n_local]: B[k0+k_local, n_off+n].
         var rb = tid // BN
         var cb = tid % BN
-        b_sh.ptr[rb * (BN + 1) + cb] = b_ptr[b_base + (k + rb) * N + n_off + cb]
+        b_sh.ptr[rb * (BN + 1) + cb] = b_ptr[
+            b_base + (k + rb) * N + n_off + cb
+        ] if (k + rb < K and n_off + cb < N) else Scalar[dt](0)
 
         barrier()
 

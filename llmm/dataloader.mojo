@@ -40,7 +40,6 @@ struct DataLoader:
     var current_shard_idx: Int
     var current_sample_idx: Int
 
-    # File handle.
     var tokens_file: FileHandle
 
     # Data buffers.
@@ -126,7 +125,6 @@ struct DataLoader:
         for i in range(len(self.files)):
             self.shard_indices.append(i)
 
-        # Open first file to initialize self.tokens_file
         self.tokens_file = open(self.files[0], "r")
 
         # Now that all fields are initialized, we can safely call self methods
@@ -156,14 +154,11 @@ struct DataLoader:
 
         self.num_tokens = num_tokens
 
-        # Reset the loader.
         self.reset()
 
     def _load_shard_metadata(mut self) raises:
         # Read header: 256 Int32 integers = 1024 bytes
-        _ = self.tokens_file.seek(
-            0
-        )  # _ = discards the return value. This is not great style/syntaxt, should raise with the modular team.
+        _ = self.tokens_file.seek(0)
         var header_bytes = self.tokens_file.read_bytes(self.header_bytes)
         if len(header_bytes) < self.header_bytes:
             raise Error(
@@ -190,7 +185,7 @@ struct DataLoader:
             raise Error(
                 "DataLoader error: Invalid magic number in header: "
                 + String(self.magic)
-            )  # SHOULD NEVER HAPPEN, AS WE ASSERTED THE MAGIC NUMBER ABOVE.
+            )
 
     def _load_shard(mut self, shard_index: Int) -> Int:
         var actual_shard_idx = shard_index
@@ -281,9 +276,7 @@ struct DataLoader:
         )  # +1 because we need to read one extra token for the targets.
         var bytes_to_read = tokens_to_read * self.token_size
 
-        _ = self.tokens_file.seek(
-            UInt64(current_offset)
-        )  # _ = discards the return value. I don't like this.
+        _ = self.tokens_file.seek(UInt64(current_offset))
         var bytes_read = self.tokens_file.read_bytes(bytes_to_read)
         if len(bytes_read) < bytes_to_read:
             raise Error(

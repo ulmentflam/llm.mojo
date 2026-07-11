@@ -285,7 +285,6 @@ def softmax_fwd_gpu[
     vocab_size: Int64,  # Our V
     vocab_size_padded: Int64,  # Our Vp
 ) -> None:
-    # NOTE: This is mainly for wrapping the dispatch parameters into a function.
     _softmax_fwd_gpu[dtype, BLOCK_SIZE, width](
         Int(batch_size * seq_len),
         Int(thread_idx.x),
@@ -593,7 +592,6 @@ def softmax_bwd_gpu[
     vocab_size: Int64,  # Our V
     vocab_size_padded: Int64,  # Our Vp
 ) -> None:
-    # NOTE: This is mainly for wrapping the dispatch parameters into a function.
     _softmax_bwd_gpu[dtype, BLOCK_SIZE, width](
         Int(batch_size * seq_len),
         Int(thread_idx.x),

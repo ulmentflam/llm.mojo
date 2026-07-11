@@ -132,7 +132,6 @@ def _fused_classifier_cpu[
         logits_ptr[base + target_idx] = ((p_t - 1.0) * d_loss).cast[dtype]()
 
         # Zero the padded tail so the backward matmul reads zeros.
-        # NOTE: This is required for our kernel.
         for i in range(vocab_size, vocab_size_padded):
             logits_ptr[base + i] = Scalar[dtype](0)
 

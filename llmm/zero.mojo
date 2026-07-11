@@ -506,14 +506,12 @@ struct ShardedParameter[
                     Self.dtype
                 ](1)
 
-    # Load sharded parameter from CPU HostBuffer to GPU DeviceBuffer
     @always_inline
     def load_to_gpu(self, ctx: DeviceContext) raises -> None:
         comptime if Self.offload and not is_cpu[Self.target]():
             self.sharded_buffer.enqueue_copy_from(self.host_sharded_buffer)
             ctx.synchronize()
 
-    # Offload sharded buffer from GPU DeviceBuffer to CPU HostBuffer
     @always_inline
     def offload_to_cpu(self, ctx: DeviceContext) raises -> None:
         comptime if Self.offload and not is_cpu[Self.target]():

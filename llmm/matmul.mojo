@@ -1720,7 +1720,7 @@ def matmul_fwd_lowp[
     layer: Int,
     ctx: DeviceContext,
 ) raises -> None:
-    """fp8 forward linear: `out = gelu?(bias? + input @ weightᵀ)`, the same
+    """Forward linear (fp8): `out = gelu?(bias? + input @ weightᵀ)`, the same
     geometry as `matmul_fwd`, but the GEMM itself runs E4M3 x E4M3 -> bf16
     via `lowp_gemm_devscale` (forward orientation: `transpose_a=False,
     transpose_b=False` — both `weight` `[out_channels,channels]` and `input`
@@ -2104,8 +2104,9 @@ def _dbias_accum_gpu[
 ) -> None:
     # dbias[c] += sum over a row-chunk of dOutput[:, c]. One thread per column
     # (adjacent threads → adjacent columns → COALESCED reads), and grid.y splits
-    # the row reduction so occupancy stays high even for small OC. Each block's
-    # per-column partial is atomically added into the fp32 scratch.
+    # the row reduction so occupancy stays high even for small OC. Each block
+    # writes its per-column partial to a [row_blocks, OC] scratch (no atomics;
+    # the finalize pass reduces it — see the store below).
     var col = Int(block_idx.x * block_dim.x + thread_idx.x)
     if col >= out_channels:
         return
@@ -3283,7 +3284,7 @@ def matmul_d_input_bwd_lowp[
     layer: Int,
     ctx: DeviceContext,
 ) raises -> None:
-    """fp8 dgrad: `d_input = d_output @ weight` via `lowp_gemm_devscale`.
+    """Dgrad (fp8): `d_input = d_output @ weight` via `lowp_gemm_devscale`.
     `weight_state`/`doutput_state` are read-only here (not `mut`) — see the
     module comment above for why neither is updated in this function.
 
@@ -3365,7 +3366,7 @@ def matmul_d_weight_bwd_lowp[
     layer: Int,
     ctx: DeviceContext,
 ) raises -> None:
-    """fp8 wgrad: `d_weight = d_output^T @ input` via `lowp_gemm_devscale`.
+    """Wgrad (fp8): `d_weight = d_output^T @ input` via `lowp_gemm_devscale`.
     `input_state`/`doutput_state` are read-only here (not `mut`) — see the
     module comment above for why neither is updated in this function.
 
@@ -3447,7 +3448,7 @@ def matmul_bwd_lowp[
     layer: Int,
     ctx: DeviceContext,
 ) raises -> None:
-    """fp8 backward for one block-linear site: bias grad (bf16, unchanged
+    """Backward for one block-linear site (fp8): bias grad (bf16, unchanged
     `matmul_bias_bwd`) + dgrad + wgrad (both fp8). Sibling of `matmul_bwd`,
     mirroring the forward `matmul_fwd`/`matmul_fwd_lowp` split.
 

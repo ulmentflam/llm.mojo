@@ -40,7 +40,6 @@ def lerp[
 
 
 def test_lerp_endpoints() raises:
-    # weight = 0 → start; weight = 1 → end.
     assert_almost_equal(lerp[DType.float32](2.0, 9.0, 0.0), 2.0, atol=1e-6)
     assert_almost_equal(lerp[DType.float32](2.0, 9.0, 1.0), 9.0, atol=1e-6)
 
@@ -75,12 +74,9 @@ def test_bias_correction_t2() raises:
 # ===----------------------------------------------------------------------=== #
 # Single-step equivalence + property checks.
 #
-# These three tests are intentionally written as TODO scaffolds — wiring the
-# kernel call here requires deciding how to allocate test tensors (HostBuffer
-# vs DeviceContext on CPU) and that decision is best made after the first
-# Python<->Mojo equivalence run sanity-checks the registered op signature.
-# Each test is a `def` so it shows up in the run as a clearly-skipped
-# placeholder rather than going un-noticed.
+# Intentionally TODO scaffolds: the test-tensor allocation path (HostBuffer vs
+# CPU DeviceContext) is best decided after the first Python<->Mojo equivalence
+# run pins the op signature.
 # ===----------------------------------------------------------------------=== #
 
 

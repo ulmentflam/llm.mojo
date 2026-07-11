@@ -1256,7 +1256,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             model_header.free()
 
-            # Allocate parameters and read them from the checkpoint.
             self.allocate_parameters(model_file)
         elif self.checkpoint_path.endswith(".safetensors"):
             # HuggingFace-exported checkpoint (see scripts/export_to_hf.py).
@@ -1284,7 +1283,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.config = parse_model_descriptor(self.checkpoint_path)
             self.allocate_parameters_random()
 
-        # Allocate weight gradients.
         self.allocate_gradients()
 
         # fp8 delayed-scaling state: one AmaxState per GEMM operand site per
@@ -1295,7 +1293,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # PRECISION == "fp8":` gated).
         self.fp8_state = Fp8State(self.config.num_layer, ctx)
 
-        # Allocate optimizer moments.
         self.allocate_optimizer_moments()
 
         # Init Activations and activation gradients (allocated dynamically per batch).
@@ -1314,7 +1311,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.inputs_dev = MutMemPtr[DType.int32](unsafe_from_address=zero)
         self.targets_dev = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
-        # Print out the model summary (rank 0 only).
         if self.zero_ctx.rank == 0:
             print("Model Summary:")
             print("--------------------------------")
@@ -1363,7 +1359,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.param_sizes[Parameters.ln_f_gamma] = C
         self.param_sizes[Parameters.ln_f_beta] = C
 
-        # Count the total number of parameters.
         var num_parameters = 0
         for i in range(NUM_PARAMETER_TENSORS):
             num_parameters += self.param_sizes[i]
@@ -1850,7 +1845,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.act_sizes[Activations.attn_merged] = L * B * T * C
         self.act_sizes[Activations.att_probs] = L * B * NH * T * T
 
-        # Count total activations
         var num_activations = 0
         for i in range(NUM_ACTIVATION_TENSORS):
             num_activations += self.act_sizes[i]
@@ -2049,7 +2043,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         ):
             raise Error("GPT2 error: Optimizer moments not allocated")
 
-        # Convienence variables.
         var vocab_size = self.config.vocab_size
         var vocab_size_padded = self.config.padded_vocab_size
         var num_layers = self.config.num_layer
@@ -2072,7 +2065,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     " the previous allocations"
                 )
 
-        # Cache the inputs and targets
         memcpy(dest=self.inputs, src=inputs, count=batch_size * seq_len)
 
         if targets != NULL_INT32_PTR:
@@ -2162,7 +2154,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         #########################################################
 
         var residual: MutMemPtr[GPT2_DTYPE]
-        # Forward the encoder.
         encoder_fwd[GPT2_DTYPE, Self.target](
             as_mut_kernel[GPT2_DTYPE](self.acts.encoded),
             as_immut_kernel_from_mut[DType.int32](enc_inputs),
@@ -2185,7 +2176,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     + (layer - 1) * batch_size * seq_len * channels
                 )
 
-            # Get the weight (gamma) and bias (beta) pointers for this layer
             var l_ln_1_gamma = self.params.ln_1_gamma + layer * channels
             var l_ln_1_beta = self.params.ln_1_beta + layer * channels
             var l_qkv_weight = (
@@ -2207,7 +2197,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             var l_proj_bias = self.params.proj_bias + layer * channels
 
-            # Get the pointers for the activations for this layer
             var l_ln_1 = (
                 self.acts.ln_1 + layer * batch_size * seq_len * channels
             )
@@ -2633,7 +2622,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             comptime if not HAS_METAL:
                 self.ctx.synchronize()
 
-            # Copy losses back to host.
             var count = batch_size * seq_len
             self.ctx.enqueue_copy(
                 dst_ptr=rebind[UnsafePointer[Scalar[StatsDType], MutAnyOrigin]](
@@ -2646,7 +2634,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             self.ctx.synchronize()
 
-            # Average loss into self.mean_loss.
             var total_loss: Float32 = 0.0
             for i in range(count):
                 total_loss += self.losses_host_buf[i].cast[DType.float32]()
@@ -2843,7 +2830,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for layer in range(num_layers - 1, -1, -1):
             var layer_offset = layer * layer_stride
 
-            # Layer weights.
             var l_ln_1_gamma = self.params.ln_1_gamma + layer * channels
             var l_ln_1_beta = self.params.ln_1_beta + layer * channels
             var l_qkv_weight = (
@@ -2865,7 +2851,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             var l_proj_bias = self.params.proj_bias + layer * channels
 
-            # Layer weight gradients.
             var d_l_ln_1_gamma = self.grads.ln_1_gamma + layer * channels
             var d_l_ln_1_beta = self.grads.ln_1_beta + layer * channels
             var d_l_qkv_weight = (
@@ -2889,7 +2874,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             var d_l_proj_bias = self.grads.proj_bias + layer * channels
 
-            # Saved activations for this layer.
             var l_ln_1 = self.acts.ln_1 + layer_offset
             var l_ln_1_mean = self.acts.ln_1_mean + layer * batch_size * seq_len
             var l_ln_1_rstd = self.acts.ln_1_rstd + layer * batch_size * seq_len
@@ -2915,7 +2899,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var l_fch_gelu = self.acts.fch_gelu + fch_layer * fch_layer_stride
             var l_fc_proj = self.acts.fc_proj + layer_offset
 
-            # Activation gradients for this layer.
             var d_l_ln_1 = self.grad_acts.ln_1 + layer_offset
             var d_l_qkv = self.grad_acts.qkv + layer * qkv_layer_stride
             var d_l_q = self.grad_acts.q + layer_offset

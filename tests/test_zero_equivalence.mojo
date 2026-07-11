@@ -42,7 +42,6 @@ def setup_test_files() raises:
     var channels = 16
     var padded_vocab_size = 64
 
-    # Create gpt2_tiny.bin
     var header = np.zeros(256, dtype=np.int32)
     header[0] = 20240520  # magic
     header[1] = 3  # version
@@ -61,7 +60,6 @@ def setup_test_files() raises:
     _ = f.write(weights.tobytes())
     f.close()
 
-    # Create debug state
     var state_header = np.zeros(256, dtype=np.int32)
     state_header[0] = 20240520
     state_header[1] = 3
@@ -179,7 +177,6 @@ def run_zero_equivalence_test(stage: Int) raises:
         cpu_coordinator_ptr=None,
     )
 
-    # Forward pass
     model0.forward(
         rebind[MutMemPtr[DType.int32]](x),
         rebind[MutMemPtr[DType.int32]](y),
@@ -196,7 +193,6 @@ def run_zero_equivalence_test(stage: Int) raises:
     )
     model1.ctx.synchronize()
 
-    # Backward pass
     model0.zero_gradients()
     model0.backward()
     model0.ctx.synchronize()
@@ -226,7 +222,6 @@ def run_zero_equivalence_test(stage: Int) raises:
         for i in range(local_len1):
             model1.sharded_grads_memory[i] = model1.grads_memory[offset1 + i]
 
-    # Run update pass
     model0.update(
         t=1,
         learning_rate=Scalar[DType.float32](1e-4),

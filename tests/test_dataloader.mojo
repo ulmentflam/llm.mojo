@@ -8,10 +8,8 @@ def setup_test_files() raises:
     var sys = Python.import_module("sys")
     sys.path.append(".")
 
-    # Use python interop to generate the token shard files
     var utils = Python.import_module("data.utils")
 
-    # Generate mock tokens [0, 1, 2, ..., 99]
     var py_tokens = Python.evaluate("[i for i in range(100)]")
 
     # Write a GPT-2 token file (UInt16 tokens, magic = 20240520)
@@ -50,11 +48,9 @@ def cleanup_test_files() raises:
 
 
 def test_dataloader_gpt2() raises:
-    # batch_size = 2, seq_len = 4
     # With 100 tokens, we should have plenty of batches
     var loader = DataLoader("test_gpt2_data.bin", batch_size=2, seq_len=4)
 
-    # Check loaded metadata
     assert_equal(loader.magic, 20240520)
     assert_equal(loader.token_size, 2)
     assert_equal(loader.num_tokens, 100)
@@ -69,7 +65,6 @@ def test_dataloader_gpt2() raises:
     # Row 1: [5, 6, 7, 8]
     loader.next_batch()
 
-    # Verify inputs
     assert_equal(loader.inputs.load(0), 0)
     assert_equal(loader.inputs.load(1), 1)
     assert_equal(loader.inputs.load(2), 2)
@@ -79,7 +74,6 @@ def test_dataloader_gpt2() raises:
     assert_equal(loader.inputs.load(6), 6)
     assert_equal(loader.inputs.load(7), 7)
 
-    # Verify targets
     assert_equal(loader.targets.load(0), 1)
     assert_equal(loader.targets.load(1), 2)
     assert_equal(loader.targets.load(2), 3)
@@ -103,7 +97,6 @@ def test_dataloader_gpt2() raises:
 def test_dataloader_llama3() raises:
     var loader = DataLoader("test_llama3_data.bin", batch_size=3, seq_len=2)
 
-    # Check loaded metadata
     assert_equal(loader.magic, 20240801)
     assert_equal(loader.token_size, 4)
     assert_equal(loader.num_tokens, 100)

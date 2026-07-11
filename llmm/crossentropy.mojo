@@ -37,18 +37,13 @@ def _crossentropy_ohe_fwd[
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
 ) -> None:
-    # Load the target at the current index as an int64 which is the index of the target token in the vocabulary.
     var target_idx = Int(targets_ptr[idx])
-    # Load the probability at the target vocab index. Cast to float32 to take the log
-    # This is equal to setting the pointer offset to b * T * Vp + t * Vp in the iterative loop.
-    # This is because you can arrange it as Vp * (b * T + t) which in our thread parallized loop is equal to idx
-    # Then when we look at the target_idx, we are just adding that as the offset. (Similar to the ptr arithmitc aboe)
+    # offset idx*Vp + target_idx; idx == b*T+t here
     # Int(vocab_size_padded) is load-bearing: without it the offset math
     # falls back to a deprecated implicit Int -> Int64 conversion.
     var prob = probs_ptr[idx * Int(vocab_size_padded) + target_idx].cast[
         DType.float32
     ]()
-    # Store the log of the probability to the losses pointer.
     losses_ptr[idx] = -log(prob)
 
 
@@ -73,14 +68,9 @@ def crossentropy_ohe_fwd_cpu[
     def _chunk(c: Int):
         var base = c * CHUNK_SIZE
         var total = Int(batch_size * seq_len)  # Our B * T
-        var count = min(
-            CHUNK_SIZE, total - base
-        )  # Used to count our local iterator for this thread.
+        var count = min(CHUNK_SIZE, total - base)
 
-        # We can't improve this over the SIMD width because we aren't loading over a single memory location.
-        # Karpathy's logic uses b * T + t as the index to the target tokens.
-        # Because we are using synchronous parallelization, we can use the local index to calculate the index to the target tokens.
-        # This way we compute over many chunks in parallel.
+        # Target loads are scattered (one per row): no SIMD win; local idx == b*T+t
         for local in range(count):
             var idx = base + local
             _crossentropy_ohe_fwd[dtype](
@@ -143,7 +133,6 @@ def crossentropy_ohe_fwd[
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
         var dev_ctx = ctx
-        # Each thread handles the a batch_size * seq_len element. Unlike our adamw op that also handles width elements.
         # One GPU thread per (b, t) output — no SIMD width, so num_threads = B*T.
         var num_threads = Int(batch_size * seq_len)
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
