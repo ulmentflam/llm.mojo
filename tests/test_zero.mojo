@@ -173,7 +173,9 @@ def test_sharded_parameter_gather_cpu() raises:
     var all_sharded = InlineArray[
         UnsafePointer[Scalar[DTYPE], MutUntrackedOrigin], 1
     ](uninitialized=True)
-    all_sharded[0] = param.sharded_buffer.unsafe_ptr()
+    all_sharded[0] = param.sharded_buffer.unsafe_ptr().unsafe_origin_cast[
+        MutUntrackedOrigin
+    ]()
 
     comptime in_layout = row_major(1, size)
     comptime out_layout = row_major(1, size)
@@ -217,7 +219,9 @@ def test_sharded_parameter_gather_gpu() raises:
     var all_sharded = InlineArray[
         UnsafePointer[Scalar[DTYPE], MutUntrackedOrigin], 1
     ](uninitialized=True)
-    all_sharded[0] = param.sharded_buffer.unsafe_ptr()
+    all_sharded[0] = param.sharded_buffer.unsafe_ptr().unsafe_origin_cast[
+        MutUntrackedOrigin
+    ]()
 
     comptime in_layout = row_major(1, size)
     comptime out_layout = row_major(1, size)
@@ -525,7 +529,11 @@ def test_multi_sharded_parameter_gather_cpu() raises:
             param.sharded_buffer.enqueue_copy_from(host_in)
             ctx.synchronize()
 
-            shared_ptrs[rank] = param.sharded_buffer.unsafe_ptr()
+            shared_ptrs[
+                rank
+            ] = param.sharded_buffer.unsafe_ptr().unsafe_origin_cast[
+                MutUntrackedOrigin
+            ]()
             z_ctx.cpu_coordinator_ptr.value()[].barrier2[].wait()
 
             var all_sharded = InlineArray[

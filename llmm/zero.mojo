@@ -548,7 +548,9 @@ struct ShardedParameter[
                 zero_ctx.rank,
                 zero_ctx.cpu_coordinator_ptr,
                 all_sharded_buffers[zero_ctx.rank],
-                full_buffer.unsafe_ptr(),
+                full_buffer.unsafe_ptr().unsafe_origin_cast[
+                    MutUntrackedOrigin
+                ](),
             )
 
             var offset = zero_ctx.rank * self.sharded_size

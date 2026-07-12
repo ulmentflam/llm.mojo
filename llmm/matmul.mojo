@@ -558,7 +558,7 @@ def _matmul_cublaslt[
             .bitcast[NoneType]()
             .as_immutable()
             .as_unsafe_any_origin(),
-            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            d_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
             c_l,
             d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
@@ -730,7 +730,7 @@ def _matmul_cublaslt_fp8[
             .bitcast[NoneType]()
             .as_immutable()
             .as_unsafe_any_origin(),
-            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            d_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
             c_l,
             d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
@@ -1028,7 +1028,7 @@ def _matmul_cublaslt_fp4[
             .bitcast[NoneType]()
             .as_immutable()
             .as_unsafe_any_origin(),
-            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            d_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
             c_l,
             d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
@@ -2190,14 +2190,16 @@ def _dbias_fused_gpu[
     # count itself (one launch per `matmul_bias_bwd` call, 48/step) is
     # unchanged from the scalar fused kernel this replaces.
     #
-    # REQUIRES out_channels % width == 0 (checked by the caller before
-    # launch, not re-checked here — every bias this model produces, C/3C/4C
-    # at 768/2304/3072, is a multiple of 8, so this never trips in practice;
-    # since `col` only ever takes multiples of `width` and out_channels
-    # itself is a multiple of `width`, `col < out_channels` already implies
-    # `col + width <= out_channels`, so no separate ragged-edge/tail branch
-    # is needed here). A future irregular OC would need a scalar-tail path,
-    # deliberately not added here to keep the hot loop branch-free.
+    # RAGGED OC: out_channels need not be a multiple of `width`. The caller
+    # rounds the column-group count up (`ceildiv(oc, width)`), so the single
+    # last thread of the last column-block may own fewer than `width`
+    # columns; that thread takes the scalar-tail branch below (in both the
+    # accum and finalize halves) instead of a width-wide transaction, which
+    # would read/write past column oc into the next row-block's scratch
+    # region. Every aligned thread — and every bias this model actually
+    # produces, C/3C/4C at 768/2304/3072, is a multiple of 8 — stays on the
+    # branch-free 128-bit fast path; the tail branch is a predictable,
+    # at-most-once-per-block divergence that only the odd-OC tests exercise.
     #
     # GOTCHA: this relies on `threadfence(Scope.GPU)`, which is NVIDIA-only
     # (comptime-asserts `is_nvidia_gpu()`) — never call this kernel outside a
@@ -2210,14 +2212,29 @@ def _dbias_fused_gpu[
     if col < out_channels:
         var r0 = by * row_tile
         var r1 = min(r0 + row_tile, rows)
-        var acc = SIMD[DType.float32, width](0.0)
-        for r in range(r0, r1):
-            acc += (
-                (d_output_ptr + r * out_channels + col)
-                .load[width=width]()
-                .cast[DType.float32]()
-            )
-        (scratch + by * out_channels + col).store(acc)
+        if col + width <= out_channels:
+            # Aligned fast path: one 128-bit vector transaction per row.
+            var acc = SIMD[DType.float32, width](0.0)
+            for r in range(r0, r1):
+                acc += (
+                    (d_output_ptr + r * out_channels + col)
+                    .load[width=width]()
+                    .cast[DType.float32]()
+                )
+            (scratch + by * out_channels + col).store(acc)
+        else:
+            # Ragged tail (oc % width != 0): this thread owns the final
+            # <width columns. Reduce them one at a time — a width-wide
+            # load/store here would run past column oc and clobber the next
+            # row-block's scratch. Only the last thread of the last
+            # column-block ever reaches this branch.
+            for c in range(col, out_channels):
+                var acc = Scalar[DType.float32](0.0)
+                for r in range(r0, r1):
+                    acc += d_output_ptr[r * out_channels + c].cast[
+                        DType.float32
+                    ]()
+                scratch[by * out_channels + c] = acc
 
     # Every thread that may have written above must fence its own write —
     # __threadfence() only orders the calling thread's prior stores, so a
@@ -2236,16 +2253,29 @@ def _dbias_fused_gpu[
     if col >= out_channels:
         return
 
-    var total = SIMD[DType.float32, width](0.0)
-    for rb in range(row_blocks):
-        total += (scratch + rb * out_channels + col).load[width=width]()
-    comptime if accumulate:
-        var previous = (
-            (d_bias_ptr + col).load[width=width]().cast[DType.float32]()
-        )
-        (d_bias_ptr + col).store((previous + total).cast[dtype]())
+    if col + width <= out_channels:
+        var total = SIMD[DType.float32, width](0.0)
+        for rb in range(row_blocks):
+            total += (scratch + rb * out_channels + col).load[width=width]()
+        comptime if accumulate:
+            var previous = (
+                (d_bias_ptr + col).load[width=width]().cast[DType.float32]()
+            )
+            (d_bias_ptr + col).store((previous + total).cast[dtype]())
+        else:
+            (d_bias_ptr + col).store(total.cast[dtype]())
     else:
-        (d_bias_ptr + col).store(total.cast[dtype]())
+        # Ragged-tail finalize — scalar, mirroring the scalar accum above.
+        for c in range(col, out_channels):
+            var total = Scalar[DType.float32](0.0)
+            for rb in range(row_blocks):
+                total += scratch[rb * out_channels + c]
+            comptime if accumulate:
+                d_bias_ptr[c] = (
+                    d_bias_ptr[c].cast[DType.float32]() + total
+                ).cast[dtype]()
+            else:
+                d_bias_ptr[c] = total.cast[dtype]()
 
     # Self-reset: the next call reusing this column-block's counter slot
     # (next layer / next grad-accum micro-batch) must see 0 again. No
@@ -2374,17 +2404,11 @@ def matmul_bias_bwd[
             #    Over/under-shooting this factor (tried 0.5x, 1.5x, 2x) both
             #    measured worse; 1x was the local optimum.
             comptime width = simd_width_of[dtype]()
-            if oc % width != 0:
-                raise Error(
-                    "matmul_bias_bwd: out_channels ("
-                    + String(oc)
-                    + ") must be a multiple of the dbias vector width ("
-                    + String(width)
-                    + ") — the fused GPU kernel has no scalar-tail path"
-                )
-            # num_groups = number of width-wide column vectors (exact, since
-            # oc % width == 0 is checked above).
-            var num_groups = oc // width
+            # num_groups = number of width-wide column vectors, rounded UP so
+            # a ragged tail (oc % width != 0) still gets a thread; that single
+            # last thread runs the scalar-tail branch in `_dbias_fused_gpu`
+            # over its <width leftover columns (see the kernel).
+            var num_groups = ceildiv(oc, width)
             var fused_col_blocks = max(ceildiv(num_groups, BLOCK_SIZE // 2), 1)
             var fused_block_threads = ceildiv(num_groups, fused_col_blocks)
             comptime FUSED_ROW_BLOCKS = ROW_BLOCKS * width
