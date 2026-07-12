@@ -5,7 +5,6 @@ the GPU -- flock per project policy).
 """
 
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext
 from std.testing import (
     assert_equal,
     assert_true,
@@ -21,6 +20,7 @@ from llmm.hadamard import (
     hadamard16_fwd_gpu,
     hadamard16_inv_gpu,
 )
+from _gpu_test_common import shared_gpu_ctx
 
 
 # ===----------------------------------------------------------------------=== #
@@ -69,7 +69,7 @@ def test_sign_vector_matches_reference() raises:
 def test_hadamard_known_vector_gpu() raises:
     if not has_nvidia_gpu_accelerator():
         return
-    var ctx = DeviceContext()
+    var ctx = shared_gpu_ctx()
     var rows = 1
     var k = HADAMARD_BLOCK
 
@@ -173,7 +173,7 @@ def test_hadamard_known_vector_gpu() raises:
 def test_hadamard_orthogonality_random_gpu() raises:
     if not has_nvidia_gpu_accelerator():
         return
-    var ctx = DeviceContext()
+    var ctx = shared_gpu_ctx()
     var rows = 5
     var k = HADAMARD_BLOCK * 4  # 4 blocks per row
     var n = rows * k
@@ -251,7 +251,7 @@ def test_hadamard_multi_row_grid_indexing_gpu() raises:
     # make sure every row is touched exactly once.
     if not has_nvidia_gpu_accelerator():
         return
-    var ctx = DeviceContext()
+    var ctx = shared_gpu_ctx()
     var rows = 13
     var k = HADAMARD_BLOCK * 3
     var n = rows * k

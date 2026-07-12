@@ -8,13 +8,13 @@ swizzle tests below need no device at all).
 
 from std.math import sqrt
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext
 from std.testing import assert_equal, assert_true, TestSuite
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 from llmm.rand import MT19937
 
 from _lowp_test_common import pseudo_gaussian_fill
+from _gpu_test_common import shared_gpu_ctx
 from llmm.nvfp4_quant import (
     encode_e2m1,
     decode_e2m1,
@@ -256,7 +256,7 @@ def _quantize_roundtrip_case[
     given BLOCK_ROWS granularity, dequantizes via the host reference, and
     returns the relative-L2 error vs the original fp32 data.
     """
-    var ctx = DeviceContext()
+    var ctx = shared_gpu_ctx()
     var n = rows * k
 
     var host_fp32 = ctx.enqueue_create_host_buffer[DType.float32](n)
@@ -362,7 +362,7 @@ def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
     # quantization noise.
     if not has_nvidia_gpu_accelerator():
         return
-    var ctx = DeviceContext()
+    var ctx = shared_gpu_ctx()
     comptime BLOCK_ROWS = 1
     # source [src_rows, src_k]; logical (transposed) output [src_k, src_rows]
     # -- src_rows must be a multiple of 16 (nvfp4_quantize_transpose's
@@ -488,7 +488,7 @@ def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
 def test_quantize_all_zero_tensor_gpu() raises:
     if not has_nvidia_gpu_accelerator():
         return
-    var ctx = DeviceContext()
+    var ctx = shared_gpu_ctx()
     var rows = 8
     var k = 32
     var n = rows * k
@@ -542,7 +542,7 @@ def test_quantize_all_zero_tensor_gpu() raises:
 def test_quantize_large_outlier_no_overflow_gpu() raises:
     if not has_nvidia_gpu_accelerator():
         return
-    var ctx = DeviceContext()
+    var ctx = shared_gpu_ctx()
     var rows = 4
     var k = 32
     var n = rows * k

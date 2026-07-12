@@ -33,7 +33,6 @@
 from std.memory import bitcast, UnsafePointer
 from std.math import isnan, isinf, nan, inf, ceildiv
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext
 from std.testing import (
     TestSuite,
     assert_true,
@@ -50,6 +49,7 @@ from llmm.rng_device import (
     sr_cast_bf16,
 )
 from _rng_sr_gpu_kernels import rng_u32_kernel, sr_cast_kernel
+from _gpu_test_common import shared_gpu_ctx
 
 
 # ===----------------------------------------------------------------------=== #
@@ -344,7 +344,7 @@ def test_rng_u32_device_matches_host() raises:
     if not has_nvidia_gpu_accelerator():
         return
 
-    var ctx = DeviceContext()
+    var ctx = shared_gpu_ctx()
     comptime N = 4096
     comptime BLOCK_SIZE = 128
     var seed: UInt64 = 8675309
@@ -378,7 +378,7 @@ def test_sr_cast_device_matches_host_and_is_deterministic() raises:
     if not has_nvidia_gpu_accelerator():
         return
 
-    var ctx = DeviceContext()
+    var ctx = shared_gpu_ctx()
     comptime N = 4096
     comptime BLOCK_SIZE = 128
     var seed: UInt64 = 20260710
