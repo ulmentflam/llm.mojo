@@ -36,6 +36,22 @@ ATTENTION_TOLERANCES: dict[str, dict[str, float]] = {
     "float16": {"atol": 5e-3, "rtol": 2e-2},
 }
 
+# Tolerance for fp32 cases that actually execute on an NVIDIA accelerator, where
+# the fp32 cuBLAS(Lt) attention GEMMs (QKᵀ/A·V fwd, dQ/dK/dV bwd) run on TF32
+# tensor cores rather than true-IEEE fp32 CUDA cores. TF32 keeps the fp32
+# exponent but truncates the mantissa to 10 bits, so results carry ~1e-3
+# rounding vs the fp32 reference. This is an *intentional*, documented behavior
+# (llmm/vendor.mojo `USE_TF32`, default-on, enabled in commit c27a1f9 to match
+# llm.c's fp32 arm, which auto-selects CUBLAS_COMPUTE_32F_FAST_TF32 on cc>=8.0),
+# NOT a kernel bug: the identical shapes pass the strict fp32 tolerance below
+# when the kernel is built with -D LLMM_NO_TF32=1 (verified). Sized from the
+# worst measured GPU/reference divergence (bwd fp32_gpt2 dq: 1.6e-3 abs; the
+# huge *relative* diffs on near-zero grads are why atol, not rtol, is the gate).
+# This tolerance applies ONLY on the NVIDIA/TF32 path — the default CPU path and
+# the Metal path (linalg.matmul, no TF32) keep the strict fp32 tolerance, so the
+# tight fp32 gate that catches real kernel bugs stays fully in force there.
+TF32_ATTENTION_TOLERANCE: dict[str, float] = {"atol": 3e-3, "rtol": 2e-3}
+
 
 @dataclass(frozen=True)
 class Case:
@@ -98,6 +114,33 @@ def _device_for_case(case: "Case"):
     if not case.prefer_accelerator:
         return None
     return Accelerator() if accelerator_count() > 0 else CPU()
+
+
+def _runs_on_tf32_accelerator(case: "Case") -> bool:
+    """True iff `case` executes on an NVIDIA accelerator, where fp32 attention
+    GEMMs use TF32 tensor cores (see TF32_ATTENTION_TOLERANCE).
+
+    Mirrors _device_for_case's device resolution: an fp32 case reaches the
+    accelerator when it is not forced to CPU and either sets prefer_accelerator
+    or the shared pick_device() default was flipped to the accelerator via
+    MAX_USE_ACCELERATOR=1 — provided one is actually present. The final
+    torch.cuda check distinguishes an NVIDIA accelerator (cuBLAS/TF32) from a
+    Metal one (linalg.matmul, no TF32), so only the NVIDIA path is loosened.
+    """
+    from max.driver import accelerator_count
+
+    if case.dtype != "float32":
+        return False
+    if os.environ.get("LLMM_TEST_FORCE_CPU") or case.force_cpu:
+        return False
+    if accelerator_count() == 0:
+        return False
+    on_accelerator = case.prefer_accelerator or bool(
+        os.environ.get("MAX_USE_ACCELERATOR")
+    )
+    if not on_accelerator:
+        return False
+    return torch.cuda.is_available()
 
 
 CASES: tuple[Case, ...] = (
@@ -484,7 +527,10 @@ def _assert_matches_reference(
     got_out = from_storage(got_out_storage, case.dtype).reshape(expected_out.shape)
 
     if tol is None:
-        tol = ATTENTION_TOLERANCES[case.dtype]
+        if _runs_on_tf32_accelerator(case):
+            tol = TF32_ATTENTION_TOLERANCE
+        else:
+            tol = ATTENTION_TOLERANCES[case.dtype]
     np.testing.assert_allclose(
         got_out,
         expected_out,
@@ -852,7 +898,10 @@ def test_backward_matches_torch(case: Case):
     got_dk = from_storage(got_dk_storage, case.dtype).reshape(_shape(case))
     got_dv = from_storage(got_dv_storage, case.dtype).reshape(_shape(case))
 
-    tol = ATTENTION_TOLERANCES[case.dtype]
+    if _runs_on_tf32_accelerator(case):
+        tol = TF32_ATTENTION_TOLERANCE
+    else:
+        tol = ATTENTION_TOLERANCES[case.dtype]
 
     np.testing.assert_allclose(
         got_dq,
