@@ -1015,7 +1015,12 @@ test-mojo: | $(PIXI_STAMP)
 		fail=0; \
 		for f in tests/test_*.mojo; do \
 			echo "==> $$f"; \
-			$(PIXI) run mojo run -I . "$$f" || fail=1; \
+			start=$$(date +%s); \
+			timeout 600 $(PIXI) run mojo run -I . "$$f"; \
+			rc=$$?; \
+			end=$$(date +%s); \
+			echo "==> $$f done in $$((end - start))s (exit $$rc)"; \
+			if [ $$rc -ne 0 ]; then fail=1; fi; \
 		done; \
 		exit $$fail; \
 	else \
