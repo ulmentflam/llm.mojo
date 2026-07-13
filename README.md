@@ -1,6 +1,6 @@
 # LLM.🔥
 
-This project is my port of Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) that extends the GPU kernel functionality of @dorjeduck's [llm.🔥](https://github.com/dorjeduck/llm.mojo) in honor of [Mojo's](https://mojolang.org) v1.0.0 release (this project tracks the 1.0.0b3 nightly). The headline results: matching or beating llm.c's CUDA path at both training precisions on an NVIDIA GB10 (bf16 parity, fp32 ~7% faster with TF32), 1.72× faster than PyTorch MPS bf16 on an Apple M4 Max (see [Benchmarks](#benchmarks)), and working FP8 (e4m3/e5m2) and NVFP4 (e2m1) low-precision training support alongside bf16/fp32. Visit [llm.c](https://github.com/karpathy/llm.c) for a detailed explanation of the original project.
+This is my port of Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c), extending the GPU kernels of @dorjeduck's [llm.🔥](https://github.com/dorjeduck/llm.mojo) in honor of [Mojo's](https://mojolang.org) v1.0.0 release (this project tracks the 1.0.0b3 nightly). The headline results: it matches or beats llm.c's CUDA path at both training precisions on an NVIDIA GB10 (bf16 parity, fp32 ~7% faster with TF32); it runs 1.71× faster than PyTorch MPS bf16 on an Apple M4 Max (though Apple's own MLX is faster still; see [Benchmarks](#benchmarks)); and it adds working FP8 (e4m3/e5m2) and NVFP4 (e2m1) low-precision training alongside bf16/fp32. See [llm.c](https://github.com/karpathy/llm.c) for a detailed explanation of the original project.
 
 > **Note**: This project is based on nightly Mojo 1.0.0b3 release.
 
@@ -66,7 +66,7 @@ For additional help, see `make help`.
 
 For a long-running training run you want to survive crashes/reboots
 unattended, supervise it with [autosentry](https://github.com/ulmentflam/autosentry)
-(self-healing process supervisor — checkpoint-resume on restart, OOM
+(a self-healing process supervisor: checkpoint-resume on restart, OOM
 batch-halving, Claude-agent escalation on unrecognized failures) via this
 repo's `.autosentry/autosentry.yaml`, `scripts/run_train_gpt2_bf16.sh`, and
 `scripts/ensure_supervisor.sh`. See
@@ -81,7 +81,7 @@ Average training loop times across llm.mojo, llm.c, and PyTorch, all with matche
 
 ### Single GPU
 
-Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warmup, all six arms interleaved in one session, 2026-07-11 15:31 — measured directly on the shipped tree, HEAD `c1a48d5`, after the Metal test-restoration + MLX-benchmark merge; confirms the 2026-07-10 post-campaign table within noise, all six arms within 1.7% of it):
+Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warmup, all six arms interleaved in one session, 2026-07-11 15:31, measured directly on the shipped tree, HEAD `c1a48d5`, after the Metal test-restoration + MLX-benchmark merge; confirms the 2026-07-10 post-campaign table within noise, all six arms within 1.7% of it):
 
 | configuration | mean ms/step | tok/s | vs llm.c |
 |---|---:|---:|---|
@@ -94,13 +94,13 @@ Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warm
 
 !['Best Single GPU Benchmark'](figures/benchmark_gpu_b4_t1024_2026-07-11_1531_NVIDIA-GB10_DGX-Spark.png)
 
-> **TF32 note**: llm.mojo's fp32 GPU GEMMs now use TF32 tensor cores by default (`CUBLAS_COMPUTE_32F_FAST_TF32`), matching llm.c's fp32 behavior — its fp32 build auto-enables TF32 on any compute-capability-8.0+ GPU, so the fp32 rows above are TF32-vs-TF32. Build with `-D LLMM_NO_TF32=1` to restore strict IEEE fp32 math (that is also what `make verify-gpu` gates on; the default TF32 path has its own gate, `make verify-gpu-tf32`).
+> **TF32 note**: llm.mojo's fp32 GPU GEMMs now use TF32 tensor cores by default (`CUBLAS_COMPUTE_32F_FAST_TF32`), matching llm.c's fp32 behavior: its fp32 build auto-enables TF32 on any compute-capability-8.0+ GPU, so the fp32 rows above are TF32-vs-TF32. Build with `-D LLMM_NO_TF32=1` to restore strict IEEE fp32 math (that is also what `make verify-gpu` gates on; the default TF32 path has its own gate, `make verify-gpu-tf32`).
 
-> **Backward-kernel note**: the 07-10 afternoon numbers add two backward-pass optimizations on top of TF32 — a redesigned fused LN-backward (one register-accumulating kernel plus a block-per-channel finalize, replacing 4 launches per invocation; −6.9 ms fp32 / −3.1 ms bf16 kernel-family time) and a fused, 128-bit-vectorized matmul dbias reduction (−1.5 ms fp32 / −1.0 ms bf16). Both are gated by the full verify battery above.
+> **Backward-kernel note**: the 07-10 afternoon numbers add two backward-pass optimizations on top of TF32: a redesigned fused LN-backward (one register-accumulating kernel plus a block-per-channel finalize, replacing 4 launches per invocation; −6.9 ms fp32 / −3.1 ms bf16 kernel-family time) and a fused, 128-bit-vectorized matmul dbias reduction (−1.5 ms fp32 / −1.0 ms bf16). Both are gated by the full verify battery above.
 
 ### Low-precision training (FP8 / NVFP4)
 
-FP8 and NVFP4 are working training precisions, not just inference formats: FP8 quantizes the per-block linear GEMMs (QKV/attn-proj/MLP fc/fc-proj, forward and backward) to transient e4m3/e5m2 operands with delayed scaling, computing in FP8 tensor cores while keeping fp32 master weights and optimizer state; NVFP4 block-scales the middle transformer blocks' MLP GEMMs to e2m1 on cuBLASLt, using stochastic rounding plus a random Hadamard transform (per the published NVFP4 training recipe) to control the extra quantization variance. Both converge alongside bf16 at GPT-2 124M scale — see the loss envelopes below and `make verify-fp8-grads` / the fp8/fp4 gates in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
+FP8 and NVFP4 are working training precisions, not just inference formats: FP8 quantizes the per-block linear GEMMs (QKV/attn-proj/MLP fc/fc-proj, forward and backward) to transient e4m3/e5m2 operands with delayed scaling, computing in FP8 tensor cores while keeping fp32 master weights and optimizer state; NVFP4 block-scales the middle transformer blocks' MLP GEMMs to e2m1 on cuBLASLt, using stochastic rounding plus a random Hadamard transform (per the published NVFP4 training recipe) to control the extra quantization variance. Both converge alongside bf16 at GPT-2 124M scale. See the loss envelopes below and `make verify-fp8-grads` / the fp8/fp4 gates in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
 Step-time measurement (B=4, T=1024, checkpoint-init tinyshakespeare, 2 rounds with arm order alternated per round, 40 measured steps/arm after a discarded fresh-binary warmup run, 2026-07-11, post-optimization-campaign tree):
 
@@ -110,11 +110,11 @@ Step-time measurement (B=4, T=1024, checkpoint-init tinyshakespeare, 2 rounds wi
 | FP8 (e4m3/e5m2) | 146.6 | 1.09× slower | median 0.57% | `make build-fp8` |
 | NVFP4 (e2m1) | 154.3 | 1.14× slower | median 0.89% | `make build-fp4` |
 
-The 2026-07-10/11 optimization campaign (coalesced/fused quantize-transpose kernels, persistent fp8 weight-transpose caching, dual-output quantize, fused tiled RHT-prep for NVFP4) cut FP8 from 150.5 to 146.6 ms and NVFP4 from 184.2 to 154.3 ms at this scale, and at the 774M-class `d36` config FP8 is now ~12% *faster* than bf16 (0.878×) while NVFP4 reaches parity (1.002×). An optional calibrated static-scales mode (`-D LLMM_FP8_STATIC_SCALES=1`, default off) removes the per-step amax/scale-update kernels entirely and shaves a further ~1.5% at 124M and ~3% at `d36` (0.853×), at the cost of per-config offline calibration — see the A1 writeup and the final campaign scoreboard in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
+The 2026-07-10/11 optimization campaign (coalesced/fused quantize-transpose kernels, persistent fp8 weight-transpose caching, dual-output quantize, fused tiled RHT-prep for NVFP4) cut FP8 from 150.5 to 146.6 ms and NVFP4 from 184.2 to 154.3 ms at this scale, and at the 774M-class `d36` config FP8 is now ~12% *faster* than bf16 (0.878×) while NVFP4 reaches parity (1.002×). An optional calibrated static-scales mode (`-D LLMM_FP8_STATIC_SCALES=1`, default off) removes the per-step amax/scale-update kernels entirely and shaves a further ~1.5% at 124M and ~3% at `d36` (0.853×), at the cost of per-config offline calibration. See the A1 writeup and the final campaign scoreboard in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
-Honest framing: at 124M params these are numerics/research configs, not throughput wins. The quantized GEMMs themselves are measurably faster than bf16's (fp8 and fp4 both cut raw GEMM compute time), but that saving is swamped by the quantize/amax/scale and (for NVFP4) Hadamard-transform overhead around small per-block GEMMs at this scale — see the quant-opt and transpose-coalescing writeups in `docs/ai/ai_assisted_optimizations_and_benchmarks.md` and the FP8/FP4 gotcha catalogs. Published FP4/FP8 throughput wins start around ~1B+ parameter models, where the GEMMs are large enough to amortize that fixed overhead.
+Honest framing: at 124M params these are numerics/research configs, not throughput wins. The quantized GEMMs themselves are measurably faster than bf16's (fp8 and fp4 both cut raw GEMM compute time), but that saving is swamped by the quantize/amax/scale and (for NVFP4) Hadamard-transform overhead around small per-block GEMMs at this scale. See the quant-opt and transpose-coalescing writeups in `docs/ai/ai_assisted_optimizations_and_benchmarks.md` and the FP8/FP4 gotcha catalogs. Published FP4/FP8 throughput wins start around ~1B+ parameter models, where the GEMMs are large enough to amortize that fixed overhead.
 
-A batch/width scaling sweep confirms this on-box: FP8 stays slower than bf16 across every batch size tested at 124M (B up to 64), but crosses over to being decisively *faster* once the model is scaled to the 774M-class `d36` config (0.878× dynamic, 0.853× static after the campaign) — width, not batch, is what closes the gap; see `docs/ai/lowp_scaling_sweep_2026-07-10.md`.
+A batch/width scaling sweep confirms this on-box: FP8 stays slower than bf16 across every batch size tested at 124M (B up to 64), but crosses over to being decisively *faster* once the model is scaled to the 774M-class `d36` config (0.878× dynamic, 0.853× static after the campaign). Width, not batch, is what closes the gap; see `docs/ai/lowp_scaling_sweep_2026-07-10.md`.
 
 ### Single CPU
 
@@ -131,34 +131,49 @@ CPU training is fp32 by policy. Official run (B=4, T=64, 2026-07-03):
 
 ### Apple Silicon (Metal GPU)
 
-I ported this to Metal GPU on Apple Silicon as well. The initial Metal port came in around 3627 ms/step, about 4.1× slower than PyTorch MPS at the time. After a round of kernel work it landed at 498.9 ms in bf16, which is 1.72× faster. Official run on an M4 Max (B=4, T=1024, cold GPU, 30 s inter-arm cooldowns, 2026-07-03):
+I ported this to the Metal GPU on Apple Silicon as well. The first working port ran at about 3627 ms/step (roughly 4.1× slower than PyTorch MPS); a round of kernel work moved it well ahead of PyTorch's Metal path at both precisions. Official run on an M4 Max (B=4, cold GPU, 30 s inter-arm cooldowns, 2026-07-13), at the full training sequence length T=1024:
 
-| configuration | mean ms/step | tok/s | vs PyTorch MPS |
-|---|---:|---:|---|
-| llm.mojo bf16 | **498.9** | **8210** | **1.72× faster** (vs MPS bf16) |
-| llm.mojo fp32 | 652.1 | 6282 | **1.27× faster** (vs MPS fp32) |
-| PyTorch MPS fp32 | 830.3 | 4933 | baseline |
-| PyTorch MPS bf16 | 857.3 | 4778 | baseline |
+| configuration | mean ms/step | tok/s | vs PyTorch MPS | vs MLX |
+|---|---:|---:|---|---|
+| llm.mojo bf16 | **503.3** | **8138** | **1.71× faster** (MPS bf16) | 1.24× slower |
+| llm.mojo fp32 | 665.2 | 6157 | **1.25× faster** (MPS fp32) | 1.40× slower |
+| PyTorch MPS fp32 | 830.8 | 4930 | baseline | — |
+| PyTorch MPS bf16 | 861.8 | 4753 | baseline | — |
+| MLX fp32 | 475.7 | 8610 | — | baseline |
+| MLX bf16 | 406.5 | 10077 | — | baseline |
 
-!['Metal GPU Benchmark'](figures/benchmark_metal_b4_t1024_2026-07-03_1048_Apple-M4-Max_Mac-M4-Max.png)
+!['Metal GPU Benchmark (T=1024)'](figures/benchmark_metal_b4_t1024_2026-07-13_1400_Apple-M4-Max_Mac-M4-Max.png)
 
-On a second Apple machine — a fanless M4 (MacBook Air), B=4, T=64 — the benchmark adds **MLX** (Apple's array framework) as a native-Apple baseline alongside PyTorch MPS. Here llm.mojo bf16 initially *trailed* MLX bf16 (270.7 vs 215.6 ms/step). A July 2026 profiling campaign traced the gap to the causal-attention QKᵀ path issuing **48 serial per-head `linalg.matmul` launches** on Metal — pure kernel-dispatch overhead that, at this short sequence length, was ~half of per-layer time. Wiring in a single-launch batched Metal scoreout kernel (a kernel that already existed in `attention.mojo` but was never wired up) cut the bf16 step **−29% (≈269 → ≈190 ms/step)**, moving llm.mojo bf16 **ahead of MLX bf16**; fp32 improves too. The change is gated by the full `make test` equivalence battery. Full write-up (with the closed-out bf16-GEMM and AdamW investigations): [`docs/ai/metal_beat_mlx_campaign_2026-07-11.md`](docs/ai/metal_beat_mlx_campaign_2026-07-11.md). Regenerate the official M4 Air figure/JSON with `make benchmark-metal` on an **idle, cold** machine (the fanless Air must start cold for the 30 s inter-arm cooldowns to hold).
+At the short benchmark length T=64 (same machine, same session), llm.mojo stays well ahead of PyTorch MPS, and MLX pulls further out front: the M4 Max's large GPU clears the tiny T=64 workload almost instantly under MLX.
 
-Run `make benchmark-metal` to reproduce. It runs all six arms in one shot (llm.mojo fp32/bf16, PyTorch MPS fp32/bf16, MLX fp32/bf16), with 30 s cooldowns between them (the M4 throttles after ~8 s of sustained GPU load, so these are not optional). Correctness is gated by `make test`, which checks 16 gradient tensors plus the 10-step loss trajectory against PyTorch. The full gotcha catalog (address-space bugs, in-order queue semantics, threadgroup limits, the correctness campaign) is in [`docs/ai/metal_port_gotchas_and_optimizations.md`](docs/ai/metal_port_gotchas_and_optimizations.md), and the benchmarking setup is in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
+| configuration | mean ms/step | tok/s | vs PyTorch MPS | vs MLX |
+|---|---:|---:|---|---|
+| llm.mojo fp32 | 165.0 | 1551 | **1.90× faster** | 2.3× slower |
+| llm.mojo bf16 | 189.7 | 1349 | **1.69× faster** | 3.5× slower |
+| PyTorch MPS fp32 | 312.7 | 819 | baseline | — |
+| PyTorch MPS bf16 | 320.7 | 798 | baseline | — |
+| MLX fp32 | 71.5 | 3580 | — | baseline |
+| MLX bf16 | 54.8 | 4674 | — | baseline |
+
+!['Metal GPU Benchmark (T=64)'](figures/benchmark_metal_b4_t64_2026-07-13_1404_Apple-M4-Max_Mac-M4-Max.png)
+
+On Apple Silicon, llm.mojo runs faster than PyTorch's Metal (MPS) path at both sequence lengths, while Apple's own MLX is faster than both. The difference is almost entirely the matmul, which is about 70% of a training step: on Metal, MAX's `linalg.matmul` runs bf16 at only about 1.1× its fp32 speed, while MLX's bf16 uses tensor cores for roughly 2× (see `bench_gemm.mojo` and [`docs/ai/metal_beat_mlx_campaign_2026-07-11.md`](docs/ai/metal_beat_mlx_campaign_2026-07-11.md)).
+
+Run `make benchmark-metal` to reproduce (add `BENCH_T=64` for the short-sequence table). It runs all six arms in one shot (llm.mojo fp32/bf16, PyTorch MPS fp32/bf16, MLX fp32/bf16) with 30 s cooldowns between them (the M4 throttles after about 8 s of sustained GPU load, so these are not optional). Correctness is gated by `make test`, which checks 16 gradient tensors plus the 10-step loss trajectory against PyTorch. The full gotcha catalog (address-space bugs, in-order queue semantics, threadgroup limits, the correctness campaign) is in [`docs/ai/metal_port_gotchas_and_optimizations.md`](docs/ai/metal_port_gotchas_and_optimizations.md), and the benchmarking setup is in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
 ## Evaluation
 
-`make eval` scores a checkpoint on HellaSwag (via our own `llmm/eval_dataloader.mojo` + `infer_gpt2.mojo`, ported from llm.c's `EvalLoader`) and prints `k/n = accuracy`. Our from-scratch GPT-2 124M (10B FineWeb tokens, bf16) scores **2965/10042 = 29.53%** (acc_norm), with a Wilson 95% CI of **[28.6%, 30.4%]** — Karpathy's own llm.c reproduction of the identical setup (124M, d12, 10B FineWeb tokens; [discussion #481](https://github.com/karpathy/llm.c/discussions/481)) reports 29.9%, which falls comfortably inside that interval: statistically indistinguishable from our own measurement, not just "close."
+`make eval` scores a checkpoint on HellaSwag (via our own `llmm/eval_dataloader.mojo` + `infer_gpt2.mojo`, ported from llm.c's `EvalLoader`) and prints `k/n = accuracy`. Our from-scratch GPT-2 124M (10B FineWeb tokens, bf16) scores **2965/10042 = 29.53%** (acc_norm), with a Wilson 95% CI of **[28.6%, 30.4%]**. Karpathy's own llm.c reproduction of the identical setup (124M, d12, 10B FineWeb tokens; [discussion #481](https://github.com/karpathy/llm.c/discussions/481)) reports 29.9%, which falls comfortably inside that interval: statistically indistinguishable from our own measurement, not just "close."
 
-This checkpoint is published on HuggingFace: **[ulmentflam/gpt2-124m-fineweb-mojo](https://huggingface.co/ulmentflam/gpt2-124m-fineweb-mojo)** (safetensors + the original raw `llm.mojo`/`llm.c`-format checkpoint). `infer_gpt2.mojo` can load it three ways — a local `.bin`, a local `.safetensors`, or straight from the Hub (`--hf ulmentflam/gpt2-124m-fineweb-mojo`) — see `llmm/safetensors.mojo` / `llmm/hf_download.mojo`. Full training-run details (hyperparameters, timeline, hardware) are in [`docs/ai/gpt2_124m_fineweb_training_run.md`](docs/ai/gpt2_124m_fineweb_training_run.md).
+This checkpoint is published on HuggingFace: **[ulmentflam/gpt2-124m-fineweb-mojo](https://huggingface.co/ulmentflam/gpt2-124m-fineweb-mojo)** (safetensors + the original raw `llm.mojo`/`llm.c`-format checkpoint). `infer_gpt2.mojo` can load it three ways: a local `.bin`, a local `.safetensors`, or straight from the Hub (`--hf ulmentflam/gpt2-124m-fineweb-mojo`). See `llmm/safetensors.mojo` / `llmm/hf_download.mojo`. Full training-run details (hyperparameters, timeline, hardware) are in [`docs/ai/gpt2_124m_fineweb_training_run.md`](docs/ai/gpt2_124m_fineweb_training_run.md).
 
 !['HellaSwag Eval Comparison'](figures/hellaswag_eval_2026-07-10_1132_NVIDIA-GB10_DGX-Spark.png)
 
-Run `make benchmark-eval` to reproduce this chart (it runs `make eval` and computes the Wilson CI); pass `--k`/`--n` to `scripts/benchmark_eval.py` directly to re-render from a cached result instead of re-scoring the full 10,042-example split. GPT-2 124M original and GPT-3 Small are included as scale/methodology context, not statistical comparisons — see the script's docstring for why.
+Run `make benchmark-eval` to reproduce this chart (it runs `make eval` and computes the Wilson CI); pass `--k`/`--n` to `scripts/benchmark_eval.py` directly to re-render from a cached result instead of re-scoring the full 10,042-example split. GPT-2 124M original and GPT-3 Small are included as scale/methodology context, not statistical comparisons. See the script's docstring for why.
 
 ## Test
 
-We ported `test_gpt2.c` from the original repository to validate our port's functionality. We also have a full verification suite available via make.
+We ported `test_gpt2.c` from the original repository to validate our port. A full verification suite is also available via make.
 
 > **Note**: `make test` checks activations as well as gradients, so it needs reference files regenerated by the PyTorch script (`pixi run python train_gpt2.py`), a one-time step on a fresh clone. The starter-pack debug state downloaded by `make data` is llm.c's activation-free format and is not sufficient. `make train` works with the downloaded starter pack directly.
 
@@ -184,11 +199,11 @@ Future development includes:
 
 LLMs in Mojo without the need for PyTorch or CPython. Inspired by Karpathy's [llm.c](https://github.com/karpathy/llm.c), with a focus on proving out the viability of autograd in pure Mojo syntax. The focus is to reproduce GPT-2 and GPT-3 alongside a parallel PyTorch reference in `train_gpt*.py`.
 
-A personal goal of this project is to write all kernel and main Python code without using any LSPs or LLMs, writing every algorithm (forward and backpropagation) from scratch. I received feedback recently that my "coding and math expertise" is not strong enough, and building out this framework is how I intend to strengthen those skills. Just like writing a compiler, writing the fundamentals of generative models from scratch sharpens both engineering and mathematics.
+A personal goal is to write all kernel and main Python code without any LSPs or LLMs, writing every algorithm (forward and backpropagation) from scratch. I received feedback recently that my "coding and math expertise" is not strong enough, and building out this framework is how I intend to strengthen those skills. Just like writing a compiler, writing the fundamentals of generative models from scratch sharpens both engineering and mathematics.
 
 As part of that goal, I will be leveraging NVIDIA Nsight and Perfetto for performance analysis and comparison against my PyTorch implementation of GPT-2. As the project evolves, I will include benchmarking results and other insights into the performance comparisons between Mojo, PyTorch, and even Karpathy's C implementation.
 
-In order to speed up testing, I decided to leverage LLMs/AI to help write and accelerate runtime of test cases. All of the code in `llmm/` and the root directory is written by hand, but the tests have been aided by LSPs and LLMs in order to accelerate writing them. I also use the formatter and compiler to typecheck, but that has always been the case.
+To speed up testing, I used LLMs/AI to help write the test cases and accelerate their runtime. All of the code in `llmm/` and the root directory is written by hand, but the tests have been aided by LSPs and LLMs in order to accelerate writing them. I also use the formatter and compiler to typecheck, but that has always been the case.
 
 ## Agentic Optimizations
 

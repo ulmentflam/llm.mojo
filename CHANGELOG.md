@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-07-13
+
+### Fixed
+
+- **Metal: T=1024 training-step regression from the batched attention scoreout.**
+  The batched single-launch QKᵀ kernel wired into `_attention_bmm_scoreout` on
+  2026-07-11 was gated only by `hd == 64 and T % 32 == 0`, so it also took over
+  the full training sequence length T=1024. That kernel is a plain tiled SIMD
+  GEMM and only wins while QKᵀ is dispatch-bound at short T; at T=1024 QKᵀ is
+  compute-bound, where the per-head `linalg.matmul` path reaches far more of peak.
+  The unconditional wire-in silently slowed the T=1024 step (M4 Max, B=4): bf16
+  from ~499 to ~717 ms, fp32 from ~652 to ~881 ms, while PyTorch MPS was
+  unchanged. Fix: gate the batched path to `T <= SCOREOUT_MAX_T` (256), so T=64
+  keeps the batched win (164 vs 261 ms/step) and T=1024 takes the per-head
+  fallback (502 vs 718 ms/step). The three gate constants (`SCOREOUT_HEAD_DIM`,
+  `SCOREOUT_T_MULTIPLE`, `SCOREOUT_MAX_T`) are now named comptime values. Gated by
+  the attention-equivalence battery (`tests/test_attention_equivalence.py`, 32
+  cases).
+
+### Performance
+
+- **Apple Silicon (Metal) benchmark refreshed on an M4 Max (2026-07-13).** New
+  six-arm figures at T=1024 and T=64 (llm.mojo fp32/bf16, PyTorch MPS fp32/bf16,
+  MLX fp32/bf16). llm.mojo stays faster than PyTorch MPS at both lengths (bf16
+  1.71x, fp32 1.25x at T=1024), but MLX leads on this machine at both lengths.
+  The gap is the matmul: MAX's Metal `linalg.matmul` runs bf16 at only ~1.1x its
+  own fp32 rate (no bf16 tensor cores), while MLX's steel_gemm gets ~2x, and a
+  hand-written tensor-core GEMM does not compile on Metal in the pinned 1.0.0b3
+  nightly (`TensorCore.store_d`). See `README.md` and `bench_gemm.mojo`.
+
 ## [Unreleased] - 2026-07-11
 
 ### Performance

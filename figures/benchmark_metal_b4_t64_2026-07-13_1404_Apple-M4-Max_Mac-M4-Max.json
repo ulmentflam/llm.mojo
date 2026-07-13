@@ -1,0 +1,132 @@
+{
+  "device": "metal",
+  "series": [
+    {
+      "name": "metal/llm.mojo-fp32",
+      "label": "llm.mojo\nfp32",
+      "family": "llm.mojo",
+      "precision": "fp32",
+      "n": 5,
+      "mean": 165.0276,
+      "median": 161.35,
+      "std": 5.102831825565103,
+      "min": 161.221,
+      "tok_s": 1551.2556687487427,
+      "samples": [
+        161.35,
+        161.251,
+        174.15900000000002,
+        167.157,
+        161.221
+      ]
+    },
+    {
+      "name": "metal/llm.mojo-bf16",
+      "label": "llm.mojo\nbf16",
+      "family": "llm.mojo",
+      "precision": "bf16",
+      "n": 5,
+      "mean": 189.7336,
+      "median": 179.24400000000003,
+      "std": 19.709432326680528,
+      "min": 166.62,
+      "tok_s": 1349.2602259167593,
+      "samples": [
+        176.18800000000002,
+        179.24400000000003,
+        166.62,
+        214.54299999999998,
+        212.07299999999998
+      ]
+    },
+    {
+      "name": "metal/torch-mps-fp32",
+      "label": "PyTorch MPS\nfp32",
+      "family": "PyTorch",
+      "precision": "fp32",
+      "n": 5,
+      "mean": 312.662,
+      "median": 313.81,
+      "std": 4.670329324576589,
+      "min": 303.57,
+      "tok_s": 818.7755467565615,
+      "samples": [
+        315.68,
+        316.51,
+        313.81,
+        303.57,
+        313.74
+      ]
+    },
+    {
+      "name": "metal/torch-mps-bf16",
+      "label": "PyTorch MPS\nbf16",
+      "family": "PyTorch",
+      "precision": "bf16",
+      "n": 5,
+      "mean": 320.74399999999997,
+      "median": 316.8,
+      "std": 5.4903719363992085,
+      "min": 316.07,
+      "tok_s": 798.1443144688599,
+      "samples": [
+        316.4,
+        316.07,
+        324.94,
+        329.51,
+        316.8
+      ]
+    },
+    {
+      "name": "metal/mlx-fp32",
+      "label": "MLX\nfp32",
+      "family": "MLX",
+      "precision": "fp32",
+      "n": 5,
+      "mean": 71.514,
+      "median": 71.66,
+      "std": 0.3648342089223535,
+      "min": 71.06,
+      "tok_s": 3579.718656486842,
+      "samples": [
+        71.06,
+        71.7,
+        71.13,
+        71.66,
+        72.02
+      ]
+    },
+    {
+      "name": "metal/mlx-bf16",
+      "label": "MLX\nbf16",
+      "family": "MLX",
+      "precision": "bf16",
+      "n": 5,
+      "mean": 54.766,
+      "median": 54.41,
+      "std": 0.7960552744627747,
+      "min": 53.97,
+      "tok_s": 4674.433042398568,
+      "samples": [
+        55.02,
+        54.41,
+        54.23,
+        53.97,
+        56.2
+      ]
+    }
+  ],
+  "info": {
+    "date": "2026-07-13 14:04:32",
+    "date_display": "July 13th, 2026",
+    "host": "Unicorn-MacBook-Pro-8.local",
+    "os": "macOS-26.5.2-arm64-arm-64bit",
+    "cpu": "Apple M4 Max",
+    "cores": "16",
+    "gpu": "Apple M4 Max",
+    "platform": "Mac M4 Max"
+  },
+  "footer": "Thermal discipline: 30s cooldown between each of the 6 arms (M4 Max throttle cliff ~8 s, P16). llm.c has no Metal port \u2014 baselines are PyTorch MPS and MLX.",
+  "B": 4,
+  "T": 64
+}

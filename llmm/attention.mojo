@@ -108,6 +108,15 @@ comptime USE_LT_ATTN = False  # cuBLASLt-batched attention: verified NEUTRAL —
 # selects the identical cutlass wmma/tensorop kernels as cublasGemmStridedBatchedEx
 # (hd=64 is at the hardware floor for both APIs, same as llm.c). Path kept, off.
 comptime MAX_HEAD_DIM = 128
+
+# Metal batched-scoreout gate (_attention_bmm_scoreout). The single-launch batched
+# QKᵀ kernel is comptime-pinned to HD=64 and needs T a multiple of its tile
+# (SCOREOUT_HEAD_DIM / SCOREOUT_T_MULTIPLE). It only wins while QKᵀ is dispatch-
+# bound (short T); past SCOREOUT_MAX_T the per-head linalg.matmul reaches far more
+# of peak, so long sequences take that fallback instead.
+comptime SCOREOUT_HEAD_DIM = 64
+comptime SCOREOUT_T_MULTIPLE = 32
+comptime SCOREOUT_MAX_T = 256
 comptime TAU = Scalar[DType.float32](
     8.0
 )  # FlashAttention 4 deferred-max threshold
@@ -4364,20 +4373,19 @@ def _attention_bmm_scoreout[
     # (optionally) fp32 for dO·Vᵀ. cuBLAS writes the fp32 accumulator straight
     # into c; the scale is deferred to the softmax/dS.
     #
-    # Metal: dispatch all BH heads in a single custom tiled kernel
-    # (_launch_batched_scoreout) instead of BH serial linalg.matmul calls — the
-    # same "all heads in one launch" treatment _attention_bmm_headout and
-    # _attention_bmm_kvgrad already get. At small T (e.g. T=64) the BH-loop's
-    # per-call dispatch overhead dominates: measured ~48 serial matmul launches
-    # costing ~5 ms/layer here vs a few kernel launches at a few hundred µs once
-    # batched. _attn_batched_scoreout_gpu is comptime-pinned to HD=64 (GPT-2
-    # 124M) and has no load-side bounds check (matches _attn_headout4_gpu's
-    # documented aligned-T-only contract — see its comment above), so it's only
-    # safe for hd==64 and T a multiple of 32; training's fixed shapes (T=64,
-    # T=1024) both qualify. Anything else (odd T from generation/tests) falls
-    # back to the generic per-head path below.
+    # Metal: dispatch all BH heads in one tiled kernel (_launch_batched_scoreout)
+    # instead of BH serial linalg.matmul calls. It only wins while QKᵀ is
+    # dispatch-bound at short T (T=64: 164 vs 261 ms/step); once T is long enough
+    # that QKᵀ is compute-bound the per-head matmul reaches more of peak and wins
+    # (T=1024: 718 batched vs 502 fallback, M4 Max B=4 bf16), so gate the
+    # batched path to T <= SCOREOUT_MAX_T. Aligned-T-only contract (no load-side
+    # bounds check); odd T falls through to the per-head path below.
     comptime if HAS_METAL and dtype == out_dtype:
-        if hd == 64 and T % 32 == 0:
+        if (
+            hd == SCOREOUT_HEAD_DIM
+            and T % SCOREOUT_T_MULTIPLE == 0
+            and T <= SCOREOUT_MAX_T
+        ):
             _launch_batched_scoreout[dtype](
                 a_ptr,
                 b_ptr,
