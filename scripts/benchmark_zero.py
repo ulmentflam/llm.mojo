@@ -250,20 +250,48 @@ _STAGE_LABELS = {
 }
 
 
-def _gpu_name_token():
-    """Short sanitized GPU product token for the figure filename."""
+def _gpu_name_raw():
+    """Full GPU product name from the live machine, or '' if unavailable."""
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
             stderr=subprocess.DEVNULL,
             text=True,
         )
-        name = out.strip().splitlines()[0]
-        # "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition" is too
-        # long for a filename; the first five words identify the product.
-        return "-".join(name.split()[:5])
+        return out.strip().splitlines()[0]
     except Exception:
-        return "unknown-gpu"
+        return ""
+
+
+def _gpu_token_from_name(name):
+    """Short sanitized GPU product token for the figure filename."""
+    # "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition" is too long
+    # for a filename; the first five words identify the product.
+    return "-".join(name.split()[:5]) if name else "unknown-gpu"
+
+
+def _gpu_name_token():
+    """Live GPU token (used on the run side)."""
+    return _gpu_token_from_name(_gpu_name_raw())
+
+
+def _gpu_token_for_doc(doc, json_path):
+    """Resolve the GPU token when re-rendering, without the live machine.
+
+    Prefers the name persisted in the JSON, then the token embedded in the
+    JSON filename, and only then falls back to querying the live machine. This
+    is what makes ``--plot`` portable to a box that did not run the benchmark.
+    """
+    name = doc.get("gpu")
+    if name:
+        return _gpu_token_from_name(name)
+    if json_path:
+        stem = os.path.splitext(os.path.basename(json_path))[0]
+        parts = stem.split("_")
+        # stem tail is ..._{gpu_token}_{host}; host carries no underscore.
+        if len(parts) >= 2 and parts[-1] == doc.get("host"):
+            return parts[-2]
+    return _gpu_name_token()
 
 
 def _grouped_bars(ax, stages, fp32_vals, bf16_vals, fmt):
@@ -392,7 +420,8 @@ def plot(json_path, out_path=None):
     world = doc["world_size"]
     date = doc["generated"][:10]
     # One rank per GPU: name what the ranks ran on, not the box's GPU count.
-    gpu_product = _gpu_name_token().replace("-", " ")
+    gpu_token = _gpu_token_for_doc(doc, json_path)
+    gpu_product = gpu_token.replace("-", " ")
     subtitle = (
         f"{world}× {gpu_product} · B={flags['b']} T={flags['t']} per rank"
         f" · {flags['steps']} steps (first 2 excluded) · {date}"
@@ -405,14 +434,17 @@ def plot(json_path, out_path=None):
         fontsize=13,
         fontweight="semibold",
     )
-    ax_mem.text(
-        0.0,
-        1.10,
+    # Center the subtitle on the whole figure (matching the suptitle) rather
+    # than pinning it to the left axes.
+    fig.text(
+        0.5,
+        0.92,
         subtitle,
-        transform=ax_mem.transAxes,
+        transform=fig.transFigure,
         color=TEXT_GRAY,
         fontsize=9.5,
-        ha="left",
+        ha="center",
+        va="top",
     )
     fig.legend(
         handles=[
@@ -437,7 +469,7 @@ def plot(json_path, out_path=None):
         hhmm = doc["generated"][11:16].replace(":", "")
         stem = (
             f"benchmark_zero_w{world}_b{flags['b']}_t{flags['t']}"
-            f"_{date}_{hhmm}_{_gpu_name_token()}_{doc['host']}"
+            f"_{date}_{hhmm}_{gpu_token}_{doc['host']}"
         )
         out_path = os.path.join(root, "figures", f"{stem}.png")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -543,6 +575,7 @@ def main():
     doc = {
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
         "host": host,
+        "gpu": _gpu_name_raw() or None,
         "gpu_count": len(_query_gpu_mem_mib()),
         "world_size": args.world_size,
         "flags": {"b": args.b, "t": args.t, "d": args.d, "steps": args.steps},
