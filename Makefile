@@ -193,6 +193,8 @@ help:
 	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
 	@echo "  build-train   Alias for build"
 	@echo "  train         Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
+	@echo "                Multi-GPU: build with WORLD_SIZE=N (one rank/GPU, compile-time)"
+	@echo "                and pick a ZeRO stage at runtime with -z 0|1|2|3 (or ZERO_STAGE=)"
 	@echo "  train-cpu     Build and run build/train_gpt2 on CPU (LLMM_USE_CPU=1)"
 	@echo "  train-metal   Build (WORLD_SIZE=1) and run on Apple Metal GPU (experimental)"
 	@echo "  build-bf16    Compile train_gpt2.mojo (-D LLMM_BF16) to build/train_gpt2_bf16"
@@ -253,6 +255,8 @@ help:
 	@echo "  benchmark-gpu Only the NVIDIA GPU comparison"
 	@echo "  benchmark-metal  Apple Silicon Metal GPU: llm.mojo vs PyTorch MPS vs MLX (fp32+bf16)"
 	@echo "                   (4 arms in one graph, mirroring benchmark-gpu's fp32+bf16 layout)"
+	@echo "  benchmark-zero   ZeRO stages 0-3 at BENCH_ZERO_WORLD GPUs (default 8): per-stage"
+	@echo "                   memory + step time, fp32 vs bf16, JSON + chart into figures/"
 	@echo "                   llm.c has no Metal port — baseline is PyTorch MPS"
 	@echo "                   (hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS, BENCH_COOLDOWN_S)"
 	@echo "  profile-llmc-ncu  Profile llm.c bf16 CUDA kernels with ncu (NVIDIA only)"
@@ -765,11 +769,12 @@ benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
 	$(PIXI) run -e cuda python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
 		--gpu-steps $(BENCH_GPU_STEPS)
 
-# ZeRO per-stage benchmark (RUN side only — writes a machine-readable JSON, no
-# plotting; the coordinator owns charts/README). Builds the WORLD_SIZE-sized
-# fp32 + bf16 training binaries, then drives scripts/benchmark_zero.py across
-# ZeRO stages with identical -b/-t/-d flags so the per-stage memory/throughput
-# numbers are comparable. Override BENCH_ZERO_* on the command line, e.g.
+# ZeRO per-stage benchmark. Builds the WORLD_SIZE-sized fp32 + bf16 training
+# binaries, drives scripts/benchmark_zero.py across ZeRO stages with identical
+# -b/-t/-d flags so the per-stage memory/throughput numbers are comparable
+# (JSON out), then renders the README chart (peak per-GPU memory + mean step
+# time, fp32 vs bf16) into a dated, hardware-stamped PNG under figures/.
+# Override BENCH_ZERO_* on the command line, e.g.
 # `make benchmark-zero BENCH_ZERO_WORLD=8 BENCH_ZERO_STAGES=0,1,2,3`.
 BENCH_ZERO_WORLD ?= 8
 BENCH_ZERO_STAGES ?= 0,1,2,3
@@ -786,6 +791,7 @@ benchmark-zero:
 		-b $(BENCH_ZERO_B) -t $(BENCH_ZERO_T) --steps $(BENCH_ZERO_STEPS) \
 		--fp32-binary $(TRAIN_BIN) --bf16-binary $(TRAIN_BIN_BF16) \
 		--output $(BENCH_ZERO_OUT)
+	$(PIXI) run python scripts/benchmark_zero.py --plot $(BENCH_ZERO_OUT)
 
 # Apple Silicon Metal GPU benchmark: llm.mojo vs PyTorch MPS vs MLX, fp32+bf16.
 # 6 arms in one graph, mirroring how benchmark-gpu combines fp32+bf16 for NVIDIA.

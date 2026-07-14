@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Collect per-ZeRO-stage training benchmark data at a fixed world size.
+"""Collect and chart per-ZeRO-stage training benchmark data at a fixed world size.
 
-Run side ONLY: this drives the training binary once per (precision, stage),
-parses per-step timing/loss from stdout, samples per-GPU memory via
-``nvidia-smi`` during the run, and writes a machine-readable JSON. It does NOT
-plot anything (the coordinator owns charts/README/Makefile docs).
+Run side: drives the training binary once per (precision, stage), parses
+per-step timing/loss from stdout, samples per-GPU memory via ``nvidia-smi``
+during the run, and writes a machine-readable JSON.
+
+Plot side (``--plot bench.json``): renders the README chart from a previously
+collected JSON — peak per-GPU memory and mean step time per stage, fp32 vs
+bf16 — into a dated, hardware-stamped PNG under ``figures/`` (with the source
+JSON copied alongside), matching scripts/benchmark_train.py's conventions.
 
 ZeRO's headline number is the memory-per-stage curve: stage 1 shards the
 optimizer state, stage 2 also shards gradients, stage 3 also shards parameters,
@@ -212,8 +216,234 @@ def _run_stage(binary, world_size, stage, b, t, d, steps, timeout_s, extra):
     }
 
 
+# Chart style: mirrors scripts/benchmark_train.py's house rules (fixed llm.mojo
+# hue; precision encoded via hatching over the same hue, never by color; text
+# and scaffolding in neutral inks, never a series hue; value label on each bar).
+LLM_MOJO_BLUE = "#2a78d6"
+TEXT_INK = "#1a1a19"
+TEXT_GRAY = "#5f5e56"
+GRID_COLOR = "#e5e4dd"
+LEGEND_FILL = "#cccccc"
+
+_STAGE_LABELS = {
+    0: "Stage 0\n(DDP)",
+    1: "Stage 1\n(+opt shard)",
+    2: "Stage 2\n(+grad shard)",
+    3: "Stage 3\n(+param shard)",
+}
+
+
+def _gpu_name_token():
+    """Short sanitized GPU product token for the figure filename."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        name = out.strip().splitlines()[0]
+        # "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition" is too
+        # long for a filename; the first five words identify the product.
+        return "-".join(name.split()[:5])
+    except Exception:
+        return "unknown-gpu"
+
+
+def _grouped_bars(ax, stages, fp32_vals, bf16_vals, fmt):
+    """One panel of paired fp32/bf16 bars with per-bar value labels."""
+    width = 0.38
+    xs = list(range(len(stages)))
+    ax.yaxis.grid(True, color=GRID_COLOR, linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+
+    for offset, vals, precision in (
+        (-width / 2, fp32_vals, "fp32"),
+        (+width / 2, bf16_vals, "bf16"),
+    ):
+        for x, v in zip(xs, vals):
+            if v is None:
+                continue
+            bar = ax.bar(
+                x + offset,
+                v,
+                width=width,
+                color=LLM_MOJO_BLUE,
+                edgecolor=TEXT_INK,
+                linewidth=1.2,
+                zorder=3,
+            )[0]
+            if precision == "bf16":
+                # White hatch + ink outline needs two artists (hatch lines
+                # draw in the edgecolor) — same gotcha as benchmark_train.py.
+                bar.set_hatch("///")
+                bar.set_edgecolor("white")
+                bar.set_linewidth(0)
+                ax.bar(
+                    x + offset,
+                    v,
+                    width=width,
+                    fill=False,
+                    edgecolor=TEXT_INK,
+                    linewidth=1.2,
+                    zorder=4,
+                )
+            ax.annotate(
+                fmt(v),
+                (x + offset, v),
+                textcoords="offset points",
+                xytext=(0, 3),
+                ha="center",
+                va="bottom",
+                fontsize=8.5,
+                color=TEXT_INK,
+                zorder=5,
+            )
+
+    top = max(v for v in fp32_vals + bf16_vals if v is not None)
+    ax.set_ylim(0, top * 1.14)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([_STAGE_LABELS.get(s, f"Stage {s}") for s in stages])
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(TEXT_GRAY)
+    ax.tick_params(colors=TEXT_GRAY, labelsize=9)
+    for lbl in ax.get_xticklabels():
+        lbl.set_color(TEXT_INK)
+
+
+def plot(json_path, out_path=None):
+    import shutil
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    root = _repo_root()
+    with open(json_path) as f:
+        doc = json.load(f)
+
+    ok = [r for r in doc["results"] if r["status"] == "ok"]
+    skipped = [
+        (r["precision"], r["stage"]) for r in doc["results"] if r["status"] != "ok"
+    ]
+    stages = sorted({r["stage"] for r in ok})
+    if not stages:
+        raise SystemExit(f"{json_path}: no successful stage runs to plot")
+
+    def series(precision, field):
+        by_stage = {r["stage"]: r for r in ok if r["precision"] == precision}
+        vals = []
+        for s in stages:
+            r = by_stage.get(s)
+            if r is None:
+                vals.append(None)
+            elif field == "mem":
+                vals.append(max(r["peak_mem_mib_per_gpu_delta"].values()))
+            else:
+                vals.append(r[field])
+        return vals
+
+    fig, (ax_mem, ax_ms) = plt.subplots(1, 2, figsize=(11.5, 5.4), layout="constrained")
+    fig.patch.set_facecolor("white")
+    for ax in (ax_mem, ax_ms):
+        ax.set_facecolor("white")
+
+    _grouped_bars(
+        ax_mem,
+        stages,
+        series("fp32", "mem"),
+        series("bf16", "mem"),
+        fmt=lambda v: f"{v:,.0f}",
+    )
+    ax_mem.set_title(
+        "Peak GPU memory (MiB per GPU, above idle)", color=TEXT_INK, fontsize=11
+    )
+
+    _grouped_bars(
+        ax_ms,
+        stages,
+        series("fp32", "mean_step_ms"),
+        series("bf16", "mean_step_ms"),
+        fmt=lambda v: f"{v:.1f}",
+    )
+    ax_ms.set_title("Mean step time (ms)", color=TEXT_INK, fontsize=11)
+
+    flags = doc["flags"]
+    world = doc["world_size"]
+    date = doc["generated"][:10]
+    # One rank per GPU: name what the ranks ran on, not the box's GPU count.
+    gpu_product = _gpu_name_token().replace("-", " ")
+    subtitle = (
+        f"{world}× {gpu_product} · B={flags['b']} T={flags['t']} per rank"
+        f" · {flags['steps']} steps (first 2 excluded) · {date}"
+    )
+    if skipped:
+        subtitle += "  ·  not run: " + ", ".join(f"{p} z{s}" for p, s in skipped)
+    fig.suptitle(
+        f"ZeRO stages — GPT-2 124M training, WORLD_SIZE={world}",
+        color=TEXT_INK,
+        fontsize=13,
+        fontweight="semibold",
+    )
+    ax_mem.text(
+        0.0,
+        1.10,
+        subtitle,
+        transform=ax_mem.transAxes,
+        color=TEXT_GRAY,
+        fontsize=9.5,
+        ha="left",
+    )
+    fig.legend(
+        handles=[
+            Patch(
+                facecolor=LEGEND_FILL, edgecolor=TEXT_INK, linewidth=1.2, label="fp32"
+            ),
+            Patch(
+                facecolor=LEGEND_FILL,
+                edgecolor=TEXT_INK,
+                linewidth=1.2,
+                hatch="///",
+                label="bf16",
+            ),
+        ],
+        loc="upper right",
+        bbox_to_anchor=(0.99, 1.0),
+        frameon=False,
+        fontsize=9.5,
+    )
+
+    if out_path is None:
+        hhmm = doc["generated"][11:16].replace(":", "")
+        stem = (
+            f"benchmark_zero_w{world}_b{flags['b']}_t{flags['t']}"
+            f"_{date}_{hhmm}_{_gpu_name_token()}_{doc['host']}"
+        )
+        out_path = os.path.join(root, "figures", f"{stem}.png")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    json_copy = os.path.splitext(out_path)[0] + ".json"
+    if os.path.abspath(json_copy) != os.path.abspath(json_path):
+        shutil.copyfile(json_path, json_copy)
+    print(out_path)
+    return out_path
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--plot",
+        metavar="JSON",
+        help="skip running; render the chart from this benchmark JSON",
+    )
+    ap.add_argument(
+        "--plot-out",
+        default=None,
+        help="output PNG path for --plot (default: auto under figures/)",
+    )
     ap.add_argument("--world-size", type=int, default=8)
     ap.add_argument("--stages", default="0,1,2,3")
     ap.add_argument("-b", type=int, default=4)
@@ -243,6 +473,10 @@ def main():
     )
     ap.add_argument("--output", default="bench_zero_world8.json")
     args = ap.parse_args()
+
+    if args.plot:
+        plot(args.plot, args.plot_out)
+        return
 
     root = _repo_root()
     stages = [int(s) for s in args.stages.split(",") if s.strip() != ""]

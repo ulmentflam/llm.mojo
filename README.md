@@ -70,6 +70,21 @@ make train
 
 For additional help, see `make help`.
 
+Multi-GPU training: build with `WORLD_SIZE=N` (one rank per GPU, compile-time)
+and choose a ZeRO sharding stage at runtime:
+
+```bash
+make build WORLD_SIZE=8
+scripts/run_train_gpt2.sh -z 2   # ZeRO: 0=DDP, 1=+opt shard, 2=+grad shard, 3=+param shard
+```
+
+To pretrain on FineWeb instead of Tiny Shakespeare, tokenize it first
+(`--streaming` avoids the ~60 GB Arrow materialization on small-disk hosts):
+
+```bash
+pixi run python data/fineweb.py -t classic -v 10B -m gpt-2 --streaming
+```
+
 For a long-running training run you want to survive crashes/reboots
 unattended, supervise it with [autosentry](https://github.com/ulmentflam/autosentry)
 (a self-healing process supervisor: checkpoint-resume on restart, OOM
@@ -103,6 +118,16 @@ Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warm
 > **TF32 note**: llm.mojo's fp32 GPU GEMMs now use TF32 tensor cores by default (`CUBLAS_COMPUTE_32F_FAST_TF32`), matching llm.c's fp32 behavior: its fp32 build auto-enables TF32 on any compute-capability-8.0+ GPU, so the fp32 rows above are TF32-vs-TF32. Build with `-D LLMM_NO_TF32=1` to restore strict IEEE fp32 math (that is also what `make verify-gpu` gates on; the default TF32 path has its own gate, `make verify-gpu-tf32`).
 
 > **Backward-kernel note**: the 07-10 afternoon numbers add two backward-pass optimizations on top of TF32: a redesigned fused LN-backward (one register-accumulating kernel plus a block-per-channel finalize, replacing 4 launches per invocation; −6.9 ms fp32 / −3.1 ms bf16 kernel-family time) and a fused, 128-bit-vectorized matmul dbias reduction (−1.5 ms fp32 / −1.0 ms bf16). Both are gated by the full verify battery above.
+
+### Multi-GPU (ZeRO stages 0–3)
+
+Multi-GPU data-parallel training runs one rank per GPU inside a single process: build with `make build WORLD_SIZE=N` (compile-time, like llm.c's `-DMULTI_GPU`) and pick the ZeRO stage at runtime with `-z 0|1|2|3` — stage 0 is plain DDP, stage 1 shards optimizer state, stage 2 also shards gradients, stage 3 also shards parameters. All four stages are equivalence-gated against the single-GPU baseline (`tests/test_zero_equivalence.mojo` at world sizes 2 and 8, per-parameter match to 1e-5; per-step training losses agree across stages to ~1e-4 at world size 8). The collectives are staged reduce-scatter/all-gather over driver-routed device-to-device copies, so they work on PCIe boxes without CUDA P2P or NVLink — see [`docs/ai/zero_multigpu_rewrite_2026-07-14.md`](docs/ai/zero_multigpu_rewrite_2026-07-14.md) for the design and [`docs/ai/zero_world8_verification_2026-07-14.md`](docs/ai/zero_world8_verification_2026-07-14.md) for the verification campaign.
+
+Measured on 4× NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB, PCIe, no P2P), GPT-2 124M, B=4 T=64 per rank, 12 steps (first 2 dropped as warmup):
+
+!['ZeRO stage benchmark (WORLD_SIZE=4)'](figures/benchmark_zero_w4_b4_t64_2026-07-14_0728_NVIDIA-RTX-PRO-6000-Blackwell_workstation-max.png)
+
+Honest reading of the curves: the real memory win today is stage 0 → 1 (optimizer-state sharding; −24% fp32, −34% bf16 peak per-GPU). Stages 2/3 don't yet save more than stage 1 because the full gradient buffer still exists transiently during backward and stage 3 re-gathers parameters coarse-grained — bucketed backward reduction and parameter streaming are the documented follow-ups. On speed: stages 2/3 run at stage-0 DDP speed, while stage 1 pays extra for its full-parameter all-gather after the sharded update. Reproduce with `make benchmark-zero BENCH_ZERO_WORLD=4` (defaults to 8; writes the JSON and renders this chart into `figures/`).
 
 ### Low-precision training (FP8 / NVFP4)
 
@@ -198,7 +223,7 @@ make verify
 ## Development Roadmap
 Future development includes:
 
-1. Full ZeRO-3 verification
+1. ZeRO memory follow-ups: bucketed backward gradient reduction (stage 2) and parameter streaming (stage 3)
 2. Mamba1/Mamba2/Mamba3 architecture and MoE
 
 ## Motivation
