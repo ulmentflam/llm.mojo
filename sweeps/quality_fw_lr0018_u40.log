@@ -1,0 +1,226 @@
+Rank: 0 World size: 1 ZeRO stage: 0
+GPU detected — training on GPU.
++-----------------------+----------------------------------------------------+
+| Parameter             | Value                                              |
++-----------------------+----------------------------------------------------+
+| train data pattern    | data/.fineweb10B/fineweb_train_*.bin               |
+| val data pattern      | data/.fineweb10B/fineweb_val_000000.bin            |
+| output log dir        | NULL                                               |
+| checkpoint_every      | 0                                                  |
+| resume                | 0                                                  |
+| micro batch size B    | 16                                                 |
+| sequence length T     | 1024                                               |
+| total batch size      | 524288                                             |
+| LR scheduler          | cosine                                             |
+| learning rate (LR)    | 0.0018                                             |
+| warmup iterations     | 40                                                 |
+| final LR fraction     | 0.0                                                |
+| weight decay          | 0.1                                                |
+| max_steps             | 150                                                |
+| val_loss_every        | 25                                                 |
+| val_max_steps         | 20                                                 |
+| sample_every          | 0                                                  |
+| genT                  | 64                                                 |
+| overfit_single_batch  | 0                                                  |
++-----------------------+----------------------------------------------------+
+Model Summary:
+--------------------------------
+Model Name: GPT-2
+Model Magic Number: 20240520
+Model Config:
+--------------------------------
+Max Sequence Length: 1024
+Vocab Size: 50257
+Number of Layers: 12
+Number of Heads: 12
+Number of Channels: 768
+Padded Vocab Size: 50304
+--------------------------------
+Number of Parameters: 124475904
+--------------------------------
+Number of Activations: 0
+--------------------------------
+Number of Gradients: 124475904
+--------------------------------
++-----------------------+----------------------------------------------------+
+| weight init method    | d12                                                |
+| max_sequence_length T | 1024                                               |
+| vocab_size V          | 50257                                              |
+| padded_vocab_size Vp  | 50304                                              |
+| num_layers L          | 12                                                 |
+| num_heads NH          | 12                                                 |
+| channels C            | 768                                                |
+| num_parameters        | 124475904                                          |
++-----------------------+----------------------------------------------------+
+Loaded train tokens from data/.fineweb10B/fineweb_train_*.bin
+Number of tokens: 7800000000
+Loaded val tokens from data/.fineweb10B/fineweb_val_000000.bin
+Number of tokens: 100000000
+Loaded tokenizer from gpt2_tokenizer.bin
+batch_size B=16 * seq_len T=1024 * num_processes=1 and total_batch_size=524288
+=> setting grad_accum_steps=32
++-----------------------+----------------------------------------------------+
+| train_num_batches     | 150                                                |
+| val_num_batches       | 20                                                 |
+| num_processes         | 1                                                  |
+| zero_stage            | 0                                                  |
++-----------------------+----------------------------------------------------+
+Number of Activations: 6590349312
+Number of Activation Gradients: 2746269696
+val loss 11.008389
+step 1/150 | loss 11.008743 (nanz)| norm 15.7121 (nanz)| lr 4.5e-05 | 6971.78 ms | n/a fp32 MFU | 75201 tok/s
+step 2/150 | loss 10.216873 (nanz)| norm 6.5435 (nanz)| lr 9e-05 | 6793.08 ms | n/a fp32 MFU | 77180 tok/s
+step 3/150 | loss 9.855741 (nanz)| norm 3.2696 (nanz)| lr 0.00013500001 | 6820.05 ms | n/a fp32 MFU | 77023 tok/s
+step 4/150 | loss 9.649742 (nanz)| norm 2.3094 (nanz)| lr 0.00018 | 6862.44 ms | n/a fp32 MFU | 76805 tok/s
+step 5/150 | loss 9.509871 (nanz)| norm 1.9985 (nanz)| lr 0.000225 | 6892.48 ms | n/a fp32 MFU | 76606 tok/s
+step 6/150 | loss 9.336651 (nanz)| norm 1.9261 (nanz)| lr 0.00027000002 | 6885.19 ms | n/a fp32 MFU | 76504 tok/s
+step 7/150 | loss 9.141713 (nanz)| norm 1.8240 (nanz)| lr 0.000315 | 6903.29 ms | n/a fp32 MFU | 76399 tok/s
+step 8/150 | loss 8.869203 (nanz)| norm 1.7034 (nanz)| lr 0.00036 | 6912.85 ms | n/a fp32 MFU | 76307 tok/s
+step 9/150 | loss 8.690329 (nanz)| norm 1.4666 (nanz)| lr 0.000405 | 6926.01 ms | n/a fp32 MFU | 76217 tok/s
+step 10/150 | loss 8.488240 (nanz)| norm 3.2498 (nanz)| lr 0.00045 | 6939.53 ms | n/a fp32 MFU | 76127 tok/s
+step 11/150 | loss 8.276733 (nanz)| norm 1.2581 (nanz)| lr 0.000495 | 6935.40 ms | n/a fp32 MFU | 76060 tok/s
+step 12/150 | loss 8.105606 (nanz)| norm 1.1490 (nanz)| lr 0.00054000004 | 6944.30 ms | n/a fp32 MFU | 75995 tok/s
+step 13/150 | loss 7.887187 (nanz)| norm 0.9546 (nanz)| lr 0.000585 | 6958.63 ms | n/a fp32 MFU | 75924 tok/s
+step 14/150 | loss 7.830671 (nanz)| norm 10.6193 (nanz)| lr 0.00063 | 6991.36 ms | n/a fp32 MFU | 75829 tok/s
+step 15/150 | loss 7.774096 (nanz)| norm 2.4916 (nanz)| lr 0.00067499996 | 6970.99 ms | n/a fp32 MFU | 75768 tok/s
+step 16/150 | loss 7.704970 (nanz)| norm 1.2719 (nanz)| lr 0.00072 | 6964.71 ms | n/a fp32 MFU | 75722 tok/s
+step 17/150 | loss 7.681894 (nanz)| norm 1.1047 (nanz)| lr 0.000765 | 6978.41 ms | n/a fp32 MFU | 75670 tok/s
+step 18/150 | loss 7.736942 (nanz)| norm 0.9410 (nanz)| lr 0.00081 | 6987.04 ms | n/a fp32 MFU | 75615 tok/s
+step 19/150 | loss 7.705483 (nanz)| norm 0.7059 (nanz)| lr 0.00085499993 | 6999.04 ms | n/a fp32 MFU | 75557 tok/s
+step 20/150 | loss 7.692928 (nanz)| norm 2.1617 (nanz)| lr 0.0009 | 7008.60 ms | n/a fp32 MFU | 75496 tok/s
+step 21/150 | loss 7.672391 (nanz)| norm 1.1301 (nanz)| lr 0.000945 | 7006.29 ms | n/a fp32 MFU | 75445 tok/s
+step 22/150 | loss 7.628036 (nanz)| norm 1.0920 (nanz)| lr 0.00099 | 7008.81 ms | n/a fp32 MFU | 75396 tok/s
+step 23/150 | loss 7.534071 (nanz)| norm 0.9405 (nanz)| lr 0.001035 | 7016.62 ms | n/a fp32 MFU | 75346 tok/s
+step 24/150 | loss 7.547297 (nanz)| norm 0.9053 (nanz)| lr 0.0010800001 | 7012.09 ms | n/a fp32 MFU | 75304 tok/s
+step 25/150 | loss 7.471575 (nanz)| norm 1.4202 (nanz)| lr 0.001125 | 7021.86 ms | n/a fp32 MFU | 75259 tok/s
+val loss 7.5921297
+step 26/150 | loss 7.527236 (nanz)| norm 1.1871 (nanz)| lr 0.00117 | 7037.50 ms | n/a fp32 MFU | 75207 tok/s
+step 27/150 | loss 7.455785 (nanz)| norm 0.6961 (nanz)| lr 0.0012149999 | 7035.58 ms | n/a fp32 MFU | 75160 tok/s
+step 28/150 | loss 7.433235 (nanz)| norm 0.6540 (nanz)| lr 0.00126 | 7038.73 ms | n/a fp32 MFU | 75115 tok/s
+step 29/150 | loss 7.442756 (nanz)| norm 0.6518 (nanz)| lr 0.001305 | 7047.06 ms | n/a fp32 MFU | 75068 tok/s
+step 30/150 | loss 7.408717 (nanz)| norm 0.4374 (nanz)| lr 0.0013499999 | 7029.91 ms | n/a fp32 MFU | 75036 tok/s
+step 31/150 | loss 7.371145 (nanz)| norm 0.5130 (nanz)| lr 0.0013949999 | 7029.88 ms | n/a fp32 MFU | 75007 tok/s
+step 32/150 | loss 7.305338 (nanz)| norm 0.5316 (nanz)| lr 0.00144 | 7032.32 ms | n/a fp32 MFU | 74979 tok/s
+step 33/150 | loss 7.260395 (nanz)| norm 0.4418 (nanz)| lr 0.001485 | 7037.61 ms | n/a fp32 MFU | 74949 tok/s
+step 34/150 | loss 7.251900 (nanz)| norm 0.8019 (nanz)| lr 0.00153 | 7042.39 ms | n/a fp32 MFU | 74918 tok/s
+step 35/150 | loss 7.280642 (nanz)| norm 0.3664 (nanz)| lr 0.001575 | 7045.59 ms | n/a fp32 MFU | 74888 tok/s
+step 36/150 | loss 7.214783 (nanz)| norm 0.6499 (nanz)| lr 0.00162 | 7048.59 ms | n/a fp32 MFU | 74857 tok/s
+step 37/150 | loss 7.185114 (nanz)| norm 0.6798 (nanz)| lr 0.0016650001 | 7041.81 ms | n/a fp32 MFU | 74833 tok/s
+step 38/150 | loss 7.168327 (nanz)| norm 0.5871 (nanz)| lr 0.0017099999 | 7050.14 ms | n/a fp32 MFU | 74806 tok/s
+step 39/150 | loss 7.196505 (nanz)| norm 0.7143 (nanz)| lr 0.0017549999 | 7050.11 ms | n/a fp32 MFU | 74780 tok/s
+step 40/150 | loss 7.185179 (nanz)| norm 0.8789 (nanz)| lr 0.0018 | 7048.33 ms | n/a fp32 MFU | 74757 tok/s
+step 41/150 | loss 7.109582 (nanz)| norm 0.7729 (nanz)| lr 0.0018 | 7054.22 ms | n/a fp32 MFU | 74732 tok/s
+step 42/150 | loss 7.094618 (nanz)| norm 0.4741 (nanz)| lr 0.0017996329 | 7057.01 ms | n/a fp32 MFU | 74707 tok/s
+step 43/150 | loss 7.133002 (nanz)| norm 0.5769 (nanz)| lr 0.0017985322 | 7060.78 ms | n/a fp32 MFU | 74682 tok/s
+step 44/150 | loss 7.053451 (nanz)| norm 0.4720 (nanz)| lr 0.0017966985 | 7059.82 ms | n/a fp32 MFU | 74658 tok/s
+step 45/150 | loss 6.985944 (nanz)| norm 0.4312 (nanz)| lr 0.0017941336 | 7059.17 ms | n/a fp32 MFU | 74637 tok/s
+step 46/150 | loss 7.004590 (nanz)| norm 0.5894 (nanz)| lr 0.0017908393 | 7064.47 ms | n/a fp32 MFU | 74613 tok/s
+step 47/150 | loss 7.024096 (nanz)| norm 0.6239 (nanz)| lr 0.0017868184 | 7064.75 ms | n/a fp32 MFU | 74591 tok/s
+step 48/150 | loss 6.980200 (nanz)| norm 0.5631 (nanz)| lr 0.0017820742 | 7064.85 ms | n/a fp32 MFU | 74570 tok/s
+step 49/150 | loss 6.957675 (nanz)| norm 0.5103 (nanz)| lr 0.0017766107 | 7062.80 ms | n/a fp32 MFU | 74552 tok/s
+step 50/150 | loss 6.910575 (nanz)| norm 0.4642 (nanz)| lr 0.0017704321 | 7062.21 ms | n/a fp32 MFU | 74535 tok/s
+val loss 7.003213
+step 51/150 | loss 6.848458 (nanz)| norm 0.3939 (nanz)| lr 0.0017635436 | 7061.24 ms | n/a fp32 MFU | 74519 tok/s
+step 52/150 | loss 6.891515 (nanz)| norm 0.4716 (nanz)| lr 0.0017559509 | 7060.24 ms | n/a fp32 MFU | 74505 tok/s
+step 53/150 | loss 6.878831 (nanz)| norm 0.4203 (nanz)| lr 0.0017476599 | 7060.28 ms | n/a fp32 MFU | 74492 tok/s
+step 54/150 | loss 6.892817 (nanz)| norm 0.3801 (nanz)| lr 0.0017386776 | 7055.69 ms | n/a fp32 MFU | 74482 tok/s
+step 55/150 | loss 6.815291 (nanz)| norm 0.4513 (nanz)| lr 0.0017290112 | 7054.68 ms | n/a fp32 MFU | 74473 tok/s
+step 56/150 | loss 6.775056 (nanz)| norm 0.2667 (nanz)| lr 0.0017186687 | 7053.34 ms | n/a fp32 MFU | 74466 tok/s
+step 57/150 | loss 6.794215 (nanz)| norm 0.3680 (nanz)| lr 0.0017076586 | 7056.81 ms | n/a fp32 MFU | 74457 tok/s
+step 58/150 | loss 6.788257 (nanz)| norm 0.3296 (nanz)| lr 0.0016959896 | 7062.77 ms | n/a fp32 MFU | 74445 tok/s
+step 59/150 | loss 6.749443 (nanz)| norm 0.3218 (nanz)| lr 0.0016836715 | 7064.04 ms | n/a fp32 MFU | 74433 tok/s
+step 60/150 | loss 6.742253 (nanz)| norm 0.2227 (nanz)| lr 0.0016707141 | 7058.88 ms | n/a fp32 MFU | 74425 tok/s
+step 61/150 | loss 6.767086 (nanz)| norm 0.3109 (nanz)| lr 0.0016571281 | 7061.42 ms | n/a fp32 MFU | 74415 tok/s
+step 62/150 | loss 6.721008 (nanz)| norm 0.2947 (nanz)| lr 0.0016429246 | 7059.71 ms | n/a fp32 MFU | 74407 tok/s
+step 63/150 | loss 6.785844 (nanz)| norm 0.4279 (nanz)| lr 0.0016281152 | 7060.64 ms | n/a fp32 MFU | 74399 tok/s
+step 64/150 | loss 6.675229 (nanz)| norm 0.2368 (nanz)| lr 0.001612712 | 7059.90 ms | n/a fp32 MFU | 74392 tok/s
+step 65/150 | loss 6.707383 (nanz)| norm 0.3323 (nanz)| lr 0.0015967274 | 7056.64 ms | n/a fp32 MFU | 74387 tok/s
+step 66/150 | loss 6.692073 (nanz)| norm 0.2120 (nanz)| lr 0.0015801745 | 7061.20 ms | n/a fp32 MFU | 74380 tok/s
+step 67/150 | loss 6.762464 (nanz)| norm 0.2383 (nanz)| lr 0.001563067 | 7060.30 ms | n/a fp32 MFU | 74374 tok/s
+step 68/150 | loss 6.720873 (nanz)| norm 0.2932 (nanz)| lr 0.0015454186 | 7065.93 ms | n/a fp32 MFU | 74365 tok/s
+step 69/150 | loss 6.705740 (nanz)| norm 0.2445 (nanz)| lr 0.0015272438 | 7064.12 ms | n/a fp32 MFU | 74357 tok/s
+step 70/150 | loss 6.721552 (nanz)| norm 0.2599 (nanz)| lr 0.0015085574 | 7056.89 ms | n/a fp32 MFU | 74354 tok/s
+step 71/150 | loss 6.653314 (nanz)| norm 0.2276 (nanz)| lr 0.0014893747 | 7060.11 ms | n/a fp32 MFU | 74349 tok/s
+step 72/150 | loss 6.655938 (nanz)| norm 0.2700 (nanz)| lr 0.0014697112 | 7060.99 ms | n/a fp32 MFU | 74344 tok/s
+step 73/150 | loss 6.689117 (nanz)| norm 0.2695 (nanz)| lr 0.0014495831 | 7065.47 ms | n/a fp32 MFU | 74337 tok/s
+step 74/150 | loss 6.654840 (nanz)| norm 0.2521 (nanz)| lr 0.0014290067 | 7063.99 ms | n/a fp32 MFU | 74331 tok/s
+step 75/150 | loss 6.663027 (nanz)| norm 0.2042 (nanz)| lr 0.0014079989 | 7068.65 ms | n/a fp32 MFU | 74323 tok/s
+val loss 6.754524
+step 76/150 | loss 6.648323 (nanz)| norm 0.2187 (nanz)| lr 0.0013865767 | 7068.20 ms | n/a fp32 MFU | 74315 tok/s
+step 77/150 | loss 6.697968 (nanz)| norm 0.2248 (nanz)| lr 0.0013647577 | 7068.37 ms | n/a fp32 MFU | 74308 tok/s
+step 78/150 | loss 6.650945 (nanz)| norm 0.1812 (nanz)| lr 0.0013425596 | 7065.53 ms | n/a fp32 MFU | 74303 tok/s
+step 79/150 | loss 6.441962 (nanz)| norm 0.3436 (nanz)| lr 0.0013200006 | 7061.80 ms | n/a fp32 MFU | 74300 tok/s
+step 80/150 | loss 6.574326 (nanz)| norm 0.3990 (nanz)| lr 0.0012970989 | 7067.93 ms | n/a fp32 MFU | 74294 tok/s
+step 81/150 | loss 6.617119 (nanz)| norm 0.2570 (nanz)| lr 0.0012738734 | 7064.66 ms | n/a fp32 MFU | 74289 tok/s
+step 82/150 | loss 6.686371 (nanz)| norm 0.2113 (nanz)| lr 0.001250343 | 7061.67 ms | n/a fp32 MFU | 74287 tok/s
+step 83/150 | loss 6.628332 (nanz)| norm 0.2581 (nanz)| lr 0.0012265268 | 7062.98 ms | n/a fp32 MFU | 74284 tok/s
+step 84/150 | loss 6.581634 (nanz)| norm 0.2723 (nanz)| lr 0.0012024443 | 7057.21 ms | n/a fp32 MFU | 74285 tok/s
+step 85/150 | loss 6.616829 (nanz)| norm 0.2439 (nanz)| lr 0.0011781153 | 7064.03 ms | n/a fp32 MFU | 74281 tok/s
+step 86/150 | loss 6.554652 (nanz)| norm 0.2626 (nanz)| lr 0.0011535593 | 7062.63 ms | n/a fp32 MFU | 74279 tok/s
+step 87/150 | loss 6.595475 (nanz)| norm 0.1992 (nanz)| lr 0.0011287965 | 7063.38 ms | n/a fp32 MFU | 74276 tok/s
+step 88/150 | loss 6.533848 (nanz)| norm 0.2340 (nanz)| lr 0.001103847 | 7062.89 ms | n/a fp32 MFU | 74274 tok/s
+step 89/150 | loss 6.544375 (nanz)| norm 0.2447 (nanz)| lr 0.0010787315 | 7066.01 ms | n/a fp32 MFU | 74270 tok/s
+step 90/150 | loss 6.520699 (nanz)| norm 0.2538 (nanz)| lr 0.00105347 | 7067.14 ms | n/a fp32 MFU | 74266 tok/s
+step 91/150 | loss 6.582962 (nanz)| norm 0.2245 (nanz)| lr 0.0010280833 | 7066.02 ms | n/a fp32 MFU | 74263 tok/s
+step 92/150 | loss 6.565279 (nanz)| norm 0.2428 (nanz)| lr 0.0010025923 | 7063.72 ms | n/a fp32 MFU | 74261 tok/s
+step 93/150 | loss 6.579024 (nanz)| norm 0.2174 (nanz)| lr 0.0009770175 | 7065.23 ms | n/a fp32 MFU | 74258 tok/s
+step 94/150 | loss 6.543115 (nanz)| norm 0.2249 (nanz)| lr 0.00095137994 | 7062.83 ms | n/a fp32 MFU | 74257 tok/s
+step 95/150 | loss 6.496804 (nanz)| norm 0.2503 (nanz)| lr 0.00092570035 | 7064.21 ms | n/a fp32 MFU | 74255 tok/s
+step 96/150 | loss 6.484720 (nanz)| norm 0.2299 (nanz)| lr 0.0008999999 | 7062.50 ms | n/a fp32 MFU | 74254 tok/s
+step 97/150 | loss 6.547544 (nanz)| norm 0.2266 (nanz)| lr 0.0008742995 | 7061.95 ms | n/a fp32 MFU | 74253 tok/s
+step 98/150 | loss 6.545837 (nanz)| norm 0.1968 (nanz)| lr 0.00084862 | 7060.75 ms | n/a fp32 MFU | 74253 tok/s
+step 99/150 | loss 6.501915 (nanz)| norm 0.2246 (nanz)| lr 0.00082298246 | 7063.38 ms | n/a fp32 MFU | 74252 tok/s
+step 100/150 | loss 6.474597 (nanz)| norm 0.2927 (nanz)| lr 0.00079740764 | 7066.12 ms | n/a fp32 MFU | 74249 tok/s
+val loss 6.608078
+step 101/150 | loss 6.516690 (nanz)| norm 0.3172 (nanz)| lr 0.00077191653 | 7065.28 ms | n/a fp32 MFU | 74247 tok/s
+step 102/150 | loss 6.457866 (nanz)| norm 0.2594 (nanz)| lr 0.00074652996 | 7067.58 ms | n/a fp32 MFU | 74244 tok/s
+step 103/150 | loss 6.427941 (nanz)| norm 0.2585 (nanz)| lr 0.0007212685 | 7070.34 ms | n/a fp32 MFU | 74239 tok/s
+step 104/150 | loss 6.480360 (nanz)| norm 0.2153 (nanz)| lr 0.000696153 | 7064.98 ms | n/a fp32 MFU | 74238 tok/s
+step 105/150 | loss 6.517879 (nanz)| norm 0.2218 (nanz)| lr 0.00067120354 | 7063.35 ms | n/a fp32 MFU | 74237 tok/s
+step 106/150 | loss 6.508462 (nanz)| norm 0.1997 (nanz)| lr 0.0006464407 | 7065.70 ms | n/a fp32 MFU | 74235 tok/s
+step 107/150 | loss 6.463092 (nanz)| norm 0.2038 (nanz)| lr 0.00062188454 | 7062.79 ms | n/a fp32 MFU | 74235 tok/s
+step 108/150 | loss 6.493494 (nanz)| norm 0.1520 (nanz)| lr 0.0005975555 | 7060.13 ms | n/a fp32 MFU | 74236 tok/s
+step 109/150 | loss 6.486072 (nanz)| norm 0.2235 (nanz)| lr 0.000573473 | 7064.54 ms | n/a fp32 MFU | 74235 tok/s
+step 110/150 | loss 6.520102 (nanz)| norm 0.1558 (nanz)| lr 0.00054965686 | 7064.51 ms | n/a fp32 MFU | 74234 tok/s
+step 111/150 | loss 6.462564 (nanz)| norm 0.2005 (nanz)| lr 0.0005261265 | 7059.74 ms | n/a fp32 MFU | 74236 tok/s
+step 112/150 | loss 6.478217 (nanz)| norm 0.1703 (nanz)| lr 0.000502901 | 7061.42 ms | n/a fp32 MFU | 74236 tok/s
+step 113/150 | loss 6.460471 (nanz)| norm 0.1754 (nanz)| lr 0.00047999944 | 7065.82 ms | n/a fp32 MFU | 74234 tok/s
+step 114/150 | loss 6.458993 (nanz)| norm 0.1686 (nanz)| lr 0.0004574402 | 7067.00 ms | n/a fp32 MFU | 74232 tok/s
+step 115/150 | loss 6.468865 (nanz)| norm 0.1541 (nanz)| lr 0.0004352421 | 7066.92 ms | n/a fp32 MFU | 74230 tok/s
+step 116/150 | loss 6.470234 (nanz)| norm 0.1701 (nanz)| lr 0.0004134233 | 7070.56 ms | n/a fp32 MFU | 74226 tok/s
+step 117/150 | loss 6.457219 (nanz)| norm 0.1367 (nanz)| lr 0.00039200115 | 7066.58 ms | n/a fp32 MFU | 74224 tok/s
+step 118/150 | loss 6.411841 (nanz)| norm 0.1699 (nanz)| lr 0.00037099334 | 7059.23 ms | n/a fp32 MFU | 74227 tok/s
+step 119/150 | loss 6.450339 (nanz)| norm 0.1509 (nanz)| lr 0.000350417 | 7060.59 ms | n/a fp32 MFU | 74228 tok/s
+step 120/150 | loss 6.405772 (nanz)| norm 0.1592 (nanz)| lr 0.00033028884 | 7059.78 ms | n/a fp32 MFU | 74230 tok/s
+step 121/150 | loss 6.437595 (nanz)| norm 0.1617 (nanz)| lr 0.0003106252 | 7062.52 ms | n/a fp32 MFU | 74230 tok/s
+step 122/150 | loss 6.351776 (nanz)| norm 0.1810 (nanz)| lr 0.0002914425 | 7059.57 ms | n/a fp32 MFU | 74232 tok/s
+step 123/150 | loss 6.514378 (nanz)| norm 0.1782 (nanz)| lr 0.0002727561 | 7063.59 ms | n/a fp32 MFU | 74232 tok/s
+step 124/150 | loss 6.358644 (nanz)| norm 0.1428 (nanz)| lr 0.00025458128 | 7061.21 ms | n/a fp32 MFU | 74232 tok/s
+step 125/150 | loss 6.398092 (nanz)| norm 0.1074 (nanz)| lr 0.00023693293 | 7066.85 ms | n/a fp32 MFU | 74230 tok/s
+val loss 6.5228143
+step 126/150 | loss 6.382874 (nanz)| norm 0.1158 (nanz)| lr 0.00021982532 | 7066.10 ms | n/a fp32 MFU | 74229 tok/s
+step 127/150 | loss 6.443820 (nanz)| norm 0.1308 (nanz)| lr 0.00020327249 | 7066.58 ms | n/a fp32 MFU | 74227 tok/s
+step 128/150 | loss 6.429363 (nanz)| norm 0.1409 (nanz)| lr 0.00018728792 | 7066.33 ms | n/a fp32 MFU | 74225 tok/s
+step 129/150 | loss 6.428390 (-0.78z)| norm 0.1190 (-0.47z)| lr 0.00017188465 | 7071.47 ms | n/a fp32 MFU | 74221 tok/s
+step 130/150 | loss 6.440671 (-0.78z)| norm 0.1861 (-0.41z)| lr 0.00015707525 | 7073.48 ms | n/a fp32 MFU | 74216 tok/s
+step 131/150 | loss 6.443392 (-0.79z)| norm 0.1783 (-0.41z)| lr 0.00014287178 | 7074.79 ms | n/a fp32 MFU | 74211 tok/s
+step 132/150 | loss 6.411255 (-0.85z)| norm 0.1131 (-0.46z)| lr 0.00012928585 | 7075.81 ms | n/a fp32 MFU | 74205 tok/s
+step 133/150 | loss 6.372546 (-0.93z)| norm 0.1476 (-0.41z)| lr 0.00011632853 | 7069.60 ms | n/a fp32 MFU | 74203 tok/s
+step 134/150 | loss 6.424577 (-0.86z)| norm 0.1341 (-0.42z)| lr 0.00010401027 | 7069.30 ms | n/a fp32 MFU | 74201 tok/s
+step 135/150 | loss 6.398859 (-0.93z)| norm 0.1209 (-0.42z)| lr 9.234132e-05 | 7072.04 ms | n/a fp32 MFU | 74197 tok/s
+step 136/150 | loss 6.354231 (-1.03z)| norm 0.1506 (-0.38z)| lr 8.133123e-05 | 7076.86 ms | n/a fp32 MFU | 74192 tok/s
+step 137/150 | loss 6.365367 (-1.02z)| norm 0.1381 (-0.38z)| lr 7.098874e-05 | 7075.47 ms | n/a fp32 MFU | 74187 tok/s
+step 138/150 | loss 6.389166 (-0.98z)| norm 0.1080 (-0.40z)| lr 6.1322375e-05 | 7072.26 ms | n/a fp32 MFU | 74184 tok/s
+step 139/150 | loss 6.331428 (-1.12z)| norm 0.1269 (-0.37z)| lr 5.234009e-05 | 7068.75 ms | n/a fp32 MFU | 74184 tok/s
+step 140/150 | loss 6.404669 (-0.95z)| norm 0.0954 (-0.40z)| lr 4.4049168e-05 | 7069.96 ms | n/a fp32 MFU | 74182 tok/s
+step 141/150 | loss 6.351948 (-1.07z)| norm 0.1105 (-0.37z)| lr 3.6456262e-05 | 7074.86 ms | n/a fp32 MFU | 74179 tok/s
+step 142/150 | loss 6.415706 (-0.91z)| norm 0.1058 (-0.78z)| lr 2.9567813e-05 | 7070.32 ms | n/a fp32 MFU | 74177 tok/s
+step 143/150 | loss 6.437101 (-0.85z)| norm 0.1372 (-0.75z)| lr 2.3389237e-05 | 7065.44 ms | n/a fp32 MFU | 74179 tok/s
+step 144/150 | loss 6.395986 (-0.95z)| norm 0.1293 (-0.77z)| lr 1.7925686e-05 | 7063.16 ms | n/a fp32 MFU | 74181 tok/s
+step 145/150 | loss 6.399681 (-0.93z)| norm 0.1026 (-0.85z)| lr 1.3181501e-05 | 7062.09 ms | n/a fp32 MFU | 74184 tok/s
+step 146/150 | loss 6.332554 (-1.11z)| norm 0.0926 (-0.87z)| lr 9.160709e-06 | 7061.80 ms | n/a fp32 MFU | 74187 tok/s
+step 147/150 | loss 6.377294 (-0.98z)| norm 0.0928 (-0.86z)| lr 5.8664737e-06 | 7057.65 ms | n/a fp32 MFU | 74192 tok/s
+step 148/150 | loss 6.424701 (-0.84z)| norm 0.1359 (-0.79z)| lr 3.3014237e-06 | 7064.46 ms | n/a fp32 MFU | 74193 tok/s
+step 149/150 | loss 6.424726 (-0.84z)| norm 0.1082 (-0.90z)| lr 1.467812e-06 | 7067.79 ms | n/a fp32 MFU | 74192 tok/s
+step 150/150 | loss 6.391083 (-0.94z)| norm 0.1204 (-0.85z)| lr 3.6703347e-07 | 7068.42 ms | n/a fp32 MFU | 74192 tok/s
+val loss 6.501873

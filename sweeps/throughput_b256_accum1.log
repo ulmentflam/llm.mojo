@@ -1,0 +1,86 @@
+Rank: 0 World size: 1 ZeRO stage: 0
+GPU detected — training on GPU.
++-----------------------+----------------------------------------------------+
+| Parameter             | Value                                              |
++-----------------------+----------------------------------------------------+
+| train data pattern    | data/.tinyshakespeare/tiny_shakespeare_train.bin   |
+| val data pattern      | data/.tinyshakespeare/tiny_shakespeare_train.bin   |
+| output log dir        | NULL                                               |
+| checkpoint_every      | 0                                                  |
+| resume                | 0                                                  |
+| micro batch size B    | 256                                                |
+| sequence length T     | 1024                                               |
+| total batch size      | 262144                                             |
+| LR scheduler          | cosine                                             |
+| learning rate (LR)    | 0.0006                                             |
+| warmup iterations     | 0                                                  |
+| final LR fraction     | 1.0                                                |
+| weight decay          | 0.1                                                |
+| max_steps             | 25                                                 |
+| val_loss_every        | 0                                                  |
+| val_max_steps         | 20                                                 |
+| sample_every          | 0                                                  |
+| genT                  | 64                                                 |
+| overfit_single_batch  | 0                                                  |
++-----------------------+----------------------------------------------------+
+Model Summary:
+--------------------------------
+Model Name: GPT-2
+Model Magic Number: 20240520
+Model Config:
+--------------------------------
+Max Sequence Length: 1024
+Vocab Size: 50257
+Number of Layers: 12
+Number of Heads: 12
+Number of Channels: 768
+Padded Vocab Size: 50304
+--------------------------------
+Number of Parameters: 124475904
+--------------------------------
+Number of Activations: 0
+--------------------------------
+Number of Gradients: 124475904
+--------------------------------
++-----------------------+----------------------------------------------------+
+| weight init method    | d12                                                |
+| max_sequence_length T | 1024                                               |
+| vocab_size V          | 50257                                              |
+| padded_vocab_size Vp  | 50304                                              |
+| num_layers L          | 12                                                 |
+| num_heads NH          | 12                                                 |
+| channels C            | 768                                                |
+| num_parameters        | 124475904                                          |
++-----------------------+----------------------------------------------------+
+Loaded train tokens from data/.tinyshakespeare/tiny_shakespeare_train.bin
+Number of tokens: 305260
+Loaded val tokens from data/.tinyshakespeare/tiny_shakespeare_train.bin
+Number of tokens: 305260
+Loaded tokenizer from gpt2_tokenizer.bin
+batch_size B=256 * seq_len T=1024 * num_processes=1 and total_batch_size=262144
+=> setting grad_accum_steps=1
++-----------------------+----------------------------------------------------+
+| train_num_batches     | 25                                                 |
+| val_num_batches       | 1                                                  |
+| num_processes         | 1                                                  |
+| zero_stage            | 0                                                  |
++-----------------------+----------------------------------------------------+
+Number of Activations: 105445588992
+Number of Activation Gradients: 43940315136
+##(##(cuda[0]:0x64001a7bce00)##: memory_manager(chunk_size: 91268055040 ; max_cache_size: 91268055040 ; free_list: 0x64001a7bef70)
+cuda[0])##: oom log ===== begin =====
+##(cuda[0])##: oom log request=196.31GB reason="device driver memAlloc failed: CUDA call failed: CUDA_ERROR_OUT_OF_MEMORY (out of memory)
+To get more accurate error information, set MODULAR_DEBUG=device-sync-mode."
+##(cuda[0])##: oom log mm max_cache=85GB cache_used=2.25GB free=337.95GB free_blocks=4 chunk_size=85GB chunks=1
+##(cuda[0])##: oom log freelist=[freeList]@0x64001a7bf000 primary=1
+##(cuda[0])##: oom log   bucket=0 empty
+##(cuda[0])##: oom log   bucket=1 empty
+##(cuda[0])##: oom log freelist=[mm:root]@0x64001a7bef70 primary=0
+##(cuda[0])##: oom log   bucket=0 count=4 total=337.95GB smallest=512B largest=337.95GB
+##(cuda[0])##: oom log   bucket=0 hist 2^9=2 2^11=1 2^38=1
+##(cuda[0])##: oom log   bucket=0 top4=337.95GB,2KB,512B,512B
+##(cuda[0])##: oom log   bucket=1 empty
+##(cuda[0])##: oom log chunk=0 base=0x320000000 size=340GB in_use_blocks=16 in_use=2.05GB free_blocks=4 free=337.95GB largest_free=337.95GB
+##(cuda[0])##: oom log ===== end =====
+Unhandled exception caught during execution: At oss/modular/mojo/stdlib/std/gpu/host/device_context.mojo:4199:35: CUDA call failed: CUDA_ERROR_OUT_OF_MEMORY (out of memory)
+To get more accurate error information, set MODULAR_DEBUG=device-sync-mode.

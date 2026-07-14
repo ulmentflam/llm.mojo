@@ -1,0 +1,94 @@
+Rank: 0 World size: 1 ZeRO stage: 0
+GPU detected — training on GPU.
++-----------------------+----------------------------------------------------+
+| Parameter             | Value                                              |
++-----------------------+----------------------------------------------------+
+| train data pattern    | data/.tinyshakespeare/tiny_shakespeare_train.bin   |
+| val data pattern      | data/.tinyshakespeare/tiny_shakespeare_train.bin   |
+| output log dir        | NULL                                               |
+| checkpoint_every      | 0                                                  |
+| resume                | 0                                                  |
+| micro batch size B    | 16                                                 |
+| sequence length T     | 1024                                               |
+| total batch size      | 65536                                              |
+| LR scheduler          | cosine                                             |
+| learning rate (LR)    | 0.0006                                             |
+| warmup iterations     | 0                                                  |
+| final LR fraction     | 1.0                                                |
+| weight decay          | 0.1                                                |
+| max_steps             | 25                                                 |
+| val_loss_every        | 0                                                  |
+| val_max_steps         | 20                                                 |
+| sample_every          | 0                                                  |
+| genT                  | 64                                                 |
+| overfit_single_batch  | 0                                                  |
++-----------------------+----------------------------------------------------+
+Model Summary:
+--------------------------------
+Model Name: GPT-2
+Model Magic Number: 20240520
+Model Config:
+--------------------------------
+Max Sequence Length: 1024
+Vocab Size: 50257
+Number of Layers: 12
+Number of Heads: 12
+Number of Channels: 768
+Padded Vocab Size: 50304
+--------------------------------
+Number of Parameters: 124475904
+--------------------------------
+Number of Activations: 0
+--------------------------------
+Number of Gradients: 124475904
+--------------------------------
++-----------------------+----------------------------------------------------+
+| weight init method    | d12                                                |
+| max_sequence_length T | 1024                                               |
+| vocab_size V          | 50257                                              |
+| padded_vocab_size Vp  | 50304                                              |
+| num_layers L          | 12                                                 |
+| num_heads NH          | 12                                                 |
+| channels C            | 768                                                |
+| num_parameters        | 124475904                                          |
++-----------------------+----------------------------------------------------+
+Loaded train tokens from data/.tinyshakespeare/tiny_shakespeare_train.bin
+Number of tokens: 305260
+Loaded val tokens from data/.tinyshakespeare/tiny_shakespeare_train.bin
+Number of tokens: 305260
+Loaded tokenizer from gpt2_tokenizer.bin
+batch_size B=16 * seq_len T=1024 * num_processes=1 and total_batch_size=65536
+=> setting grad_accum_steps=4
++-----------------------+----------------------------------------------------+
+| train_num_batches     | 25                                                 |
+| val_num_batches       | 18                                                 |
+| num_processes         | 1                                                  |
+| zero_stage            | 0                                                  |
++-----------------------+----------------------------------------------------+
+Number of Activations: 6590349312
+Number of Activation Gradients: 2746269696
+step 1/25 | loss 10.998476 (nanz)| norm nan (nanz)| lr 0.0006 | 574.62 ms | n/a bf16 MFU | 114050 tok/s
+step 2/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 383.27 ms | n/a bf16 MFU | 170993 tok/s
+step 3/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 378.46 ms | n/a bf16 MFU | 172106 tok/s
+step 4/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 378.21 ms | n/a bf16 MFU | 172518 tok/s
+step 5/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 378.23 ms | n/a bf16 MFU | 172721 tok/s
+step 6/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 378.76 ms | n/a bf16 MFU | 172789 tok/s
+step 7/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 379.16 ms | n/a bf16 MFU | 172799 tok/s
+step 8/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 379.26 ms | n/a bf16 MFU | 172799 tok/s
+step 9/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 379.36 ms | n/a bf16 MFU | 172793 tok/s
+step 10/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 379.61 ms | n/a bf16 MFU | 172772 tok/s
+step 11/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 379.67 ms | n/a bf16 MFU | 172752 tok/s
+step 12/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 379.89 ms | n/a bf16 MFU | 172724 tok/s
+step 13/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 380.00 ms | n/a bf16 MFU | 172696 tok/s
+step 14/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 379.86 ms | n/a bf16 MFU | 172679 tok/s
+step 15/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 380.21 ms | n/a bf16 MFU | 172648 tok/s
+step 16/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 380.28 ms | n/a bf16 MFU | 172619 tok/s
+step 17/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 380.36 ms | n/a bf16 MFU | 172591 tok/s
+step 18/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 380.24 ms | n/a bf16 MFU | 172570 tok/s
+step 19/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 380.51 ms | n/a bf16 MFU | 172542 tok/s
+step 20/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 380.73 ms | n/a bf16 MFU | 172510 tok/s
+step 21/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 381.54 ms | n/a bf16 MFU | 172452 tok/s
+step 22/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 381.60 ms | n/a bf16 MFU | 172398 tok/s
+step 23/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 380.88 ms | n/a bf16 MFU | 172373 tok/s
+step 24/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 381.27 ms | n/a bf16 MFU | 172338 tok/s
+step 25/25 | loss nan (nanz)| norm nan (nanz)| lr 0.0006 | 381.35 ms | n/a bf16 MFU | 172304 tok/s
