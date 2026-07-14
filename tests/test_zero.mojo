@@ -604,13 +604,21 @@ def _gpu_multirank_available() raises -> Bool:
         return False
 
 
-def run_multi_gpu_collective_test(which: Int) raises:
-    """Drive one staged-copy GPU collective end to end (N=2).
+def test_multi_gpu_collectives() raises:
+    """Drive all three staged-copy GPU collectives end to end (N=2).
 
-    `which`: 0 = allreduce, 1 = reducescatter, 2 = allgather. Exercises
-    per-rank DeviceContext(device_id=rank), coordinator pointer exchange,
-    cross-device staged copies, and the fp32-accumulate add kernel.
+    Exercises per-rank DeviceContext(device_id=rank), coordinator pointer
+    exchange, cross-device staged copies, and the fp32-accumulate add
+    kernel — allreduce, reducescatter, and allgather sequentially inside
+    ONE rank-thread session. A single combined test (not three) on
+    purpose: every extra GPU test pays a full CUDA context-init per rank,
+    which on a degraded driver (e.g. a co-resident faulted GPU) runs into
+    minutes and pushed this file past make test-mojo's 600 s per-file
+    timeout when the ops were separate tests.
     """
+    if not _gpu_multirank_available():
+        return
+
     comptime WORLD_SIZE = 2
     comptime DTYPE = DType.float32
     comptime shard = 64
@@ -619,10 +627,13 @@ def run_multi_gpu_collective_test(which: Int) raises:
     var cpu_coord_ptr = alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
-    # rank_outputs[r*size + j] snapshots rank r's full buffer after the op;
-    # rank_shards[r*shard + j] snapshots rank r's shard output (reducescatter).
-    var rank_outputs = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
-    var rank_shards = alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
+    # Per-op snapshots, indexed [rank*len + j]:
+    #   ar_out    — full buffer after allreduce
+    #   rs_shard  — shard output after reducescatter
+    #   ag_out    — full buffer after allgather
+    var ar_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rs_shard = alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
+    var ag_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
 
     @parameter
     def _run_rank(rank: Int):
@@ -636,16 +647,10 @@ def run_multi_gpu_collective_test(which: Int) raises:
             )
             z_ctx.ensure_comm_setup(shard * size_of[Scalar[DTYPE]]())
 
-            # Full buffer: rank r's element j = (r+1)*(j+1).
             var host = ctx.enqueue_create_host_buffer[DTYPE](size)
-            for j in range(size):
-                host[j] = Float32((rank + 1) * (j + 1))
+            var host_s = ctx.enqueue_create_host_buffer[DTYPE](shard)
             var buf = ctx.enqueue_create_buffer[DTYPE](size)
-            buf.enqueue_copy_from(host)
             var shard_buf = ctx.enqueue_create_buffer[DTYPE](shard)
-            shard_buf.enqueue_fill(Float32(0.0))
-            ctx.synchronize()
-
             var buf_ptr = rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
                 buf.unsafe_ptr().as_unsafe_any_origin()
             )
@@ -653,85 +658,77 @@ def run_multi_gpu_collective_test(which: Int) raises:
                 shard_buf.unsafe_ptr().as_unsafe_any_origin()
             )
 
-            if which == 0:
-                z_ctx.allreduce[DTYPE](buf_ptr, size)
-            elif which == 1:
-                z_ctx.reducescatter[DTYPE](buf_ptr, shard_ptr, shard)
-            else:
-                # Stage the allgather precondition: only my shard is mine;
-                # zero the other slice so stale data can't fake a pass.
-                for j in range(size):
-                    host[j] = Float32(0.0)
-                var off = rank * shard
-                for j in range(shard):
-                    host[off + j] = Float32((rank + 1) * 1000 + j)
-                buf.enqueue_copy_from(host)
-                ctx.synchronize()
-                z_ctx.allgather[DTYPE](buf_ptr, shard)
-
+            # ---- allreduce: rank r's element j = (r+1)*(j+1) ----
+            for j in range(size):
+                host[j] = Float32((rank + 1) * (j + 1))
+            buf.enqueue_copy_from(host)
+            ctx.synchronize()
+            z_ctx.allreduce[DTYPE](buf_ptr, size)
             buf.enqueue_copy_to(host)
             ctx.synchronize()
             for j in range(size):
-                rank_outputs[rank * size + j] = host[j]
-            var host_s = ctx.enqueue_create_host_buffer[DTYPE](shard)
+                ar_out[rank * size + j] = host[j]
+
+            # ---- reducescatter: same inputs, shard output ----
+            for j in range(size):
+                host[j] = Float32((rank + 1) * (j + 1))
+            buf.enqueue_copy_from(host)
+            shard_buf.enqueue_fill(Float32(0.0))
+            ctx.synchronize()
+            z_ctx.reducescatter[DTYPE](buf_ptr, shard_ptr, shard)
             shard_buf.enqueue_copy_to(host_s)
             ctx.synchronize()
             for j in range(shard):
-                rank_shards[rank * shard + j] = host_s[j]
+                rs_shard[rank * shard + j] = host_s[j]
+
+            # ---- allgather: only my slice is mine; the other is zeroed so
+            # stale data can't fake a pass ----
+            for j in range(size):
+                host[j] = Float32(0.0)
+            var off = rank * shard
+            for j in range(shard):
+                host[off + j] = Float32((rank + 1) * 1000 + j)
+            buf.enqueue_copy_from(host)
+            ctx.synchronize()
+            z_ctx.allgather[DTYPE](buf_ptr, shard)
+            buf.enqueue_copy_to(host)
+            ctx.synchronize()
+            for j in range(size):
+                ag_out[rank * size + j] = host[j]
         except e:
             print("multi-gpu rank", rank, "error:", e)
 
     sync_parallelize[_run_rank](WORLD_SIZE)
 
-    if which == 0:
-        # allreduce: every rank's full buffer[j] == 3*(j+1)  (sum of r+1).
-        for r in range(WORLD_SIZE):
-            for j in range(size):
-                assert_almost_equal[DTYPE](
-                    rank_outputs[r * size + j], Float32(3 * (j + 1)), atol=1e-5
-                )
-    elif which == 1:
-        # reducescatter: rank r's shard[j] == 3*(r*shard + j + 1).
-        for r in range(WORLD_SIZE):
+    # allreduce: every rank's full buffer[j] == 3*(j+1)  (sum of r+1).
+    for r in range(WORLD_SIZE):
+        for j in range(size):
+            assert_almost_equal[DTYPE](
+                ar_out[r * size + j], Float32(3 * (j + 1)), atol=1e-5
+            )
+    # reducescatter: rank r's shard[j] == 3*(r*shard + j + 1).
+    for r in range(WORLD_SIZE):
+        for j in range(shard):
+            assert_almost_equal[DTYPE](
+                rs_shard[r * shard + j],
+                Float32(3 * (r * shard + j + 1)),
+                atol=1e-5,
+            )
+    # allgather: every rank's slice k == rank k's staged shard values.
+    for r in range(WORLD_SIZE):
+        for k in range(WORLD_SIZE):
             for j in range(shard):
                 assert_almost_equal[DTYPE](
-                    rank_shards[r * shard + j],
-                    Float32(3 * (r * shard + j + 1)),
+                    ag_out[r * size + k * shard + j],
+                    Float32((k + 1) * 1000 + j),
                     atol=1e-5,
                 )
-    else:
-        # allgather: every rank's slice k == rank k's staged shard values.
-        for r in range(WORLD_SIZE):
-            for k in range(WORLD_SIZE):
-                for j in range(shard):
-                    assert_almost_equal[DTYPE](
-                        rank_outputs[r * size + k * shard + j],
-                        Float32((k + 1) * 1000 + j),
-                        atol=1e-5,
-                    )
 
-    rank_outputs.free()
-    rank_shards.free()
+    ar_out.free()
+    rs_shard.free()
+    ag_out.free()
     cpu_coord_ptr[].free()
     cpu_coord_ptr.free()
-
-
-def test_multi_gpu_allreduce() raises:
-    if not _gpu_multirank_available():
-        return
-    run_multi_gpu_collective_test(0)
-
-
-def test_multi_gpu_reducescatter() raises:
-    if not _gpu_multirank_available():
-        return
-    run_multi_gpu_collective_test(1)
-
-
-def test_multi_gpu_allgather() raises:
-    if not _gpu_multirank_available():
-        return
-    run_multi_gpu_collective_test(2)
 
 
 def main() raises:
