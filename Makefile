@@ -1038,13 +1038,17 @@ test-cpu: test-mojo test-python
 
 test-cuda: test-mojo test-python-cuda
 
+# Per-file cap: test_zero.mojo's multi-GPU collective tests legitimately need
+# ~20 min of per-rank CUDA context init on the 8-GPU box, so 600s was a false
+# failure there. Override per invocation with TEST_FILE_TIMEOUT=<seconds>.
+TEST_FILE_TIMEOUT ?= 1800
 test-mojo: | $(PIXI_STAMP)
 	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
 		fail=0; \
 		for f in tests/test_*.mojo; do \
 			echo "==> $$f"; \
 			start=$$(date +%s); \
-			timeout 600 $(PIXI) run mojo run -I . "$$f"; \
+			timeout $(TEST_FILE_TIMEOUT) $(PIXI) run mojo run -I . "$$f"; \
 			rc=$$?; \
 			end=$$(date +%s); \
 			echo "==> $$f done in $$((end - start))s (exit $$rc)"; \
