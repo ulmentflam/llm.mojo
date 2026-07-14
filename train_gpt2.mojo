@@ -1040,6 +1040,22 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var grads: ParameterTensors[GPT2_DTYPE]
     var grads_memory: MutMemPtr[GPT2_DTYPE]
 
+    # ZeRO-2/3 bucketed-backward gradient buffers (only allocated for
+    # WORLD_SIZE > 1 and zero_stage >= 2; otherwise 1-element placeholders).
+    # `grad_pool` is a small reused buffer holding one gradient *bucket* at a
+    # time as backward produces it (the largest simultaneous bucket is
+    # wte+wpe ~150 MB fp32, or one transformer layer ~27 MB). `grad_shard` is
+    # the persistent optimizer-sized reduced-shard accumulator that AdamW
+    # consumes: each bucket is reduce-scattered (and += accumulated across
+    # grad-accum micro-steps) into it during backward. Peak gradient residency
+    # becomes O(pool + shard) instead of O(full model). See
+    # docs/ai/zero_grad_bucketing_design_2026-07-14.md.
+    var grad_pool_buf: DeviceBuffer[GPT2_DTYPE]
+    var grad_pool_memory: MutMemPtr[GPT2_DTYPE]
+    var grad_pool_elems: Int
+    var grad_shard_buf: DeviceBuffer[GPT2_DTYPE]
+    var grad_shard_memory: MutMemPtr[GPT2_DTYPE]
+
     # Buffers for AdamW (always fp32, independent of the parameter precision).
     var m_memory: MutMemPtr[MASTER_DTYPE]
     var v_memory: MutMemPtr[MASTER_DTYPE]
@@ -1154,6 +1170,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.params_memory = NULL_DTYPE_PTR
         self.grads_memory = NULL_DTYPE_PTR
+        self.grad_pool_memory = NULL_DTYPE_PTR
+        self.grad_pool_elems = 0
+        self.grad_shard_memory = NULL_DTYPE_PTR
         self.m_memory = NULL_MASTER_PTR
         self.v_memory = NULL_MASTER_PTR
         self.master_memory = NULL_MASTER_PTR
@@ -1186,6 +1205,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.grad_pool_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.grad_shard_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.v_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
@@ -1741,8 +1762,104 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.has_allocated_params = True
 
+    def _use_bucketing(self) -> Bool:
+        """True when backward should reduce-scatter gradient buckets in place
+        instead of materializing the full gradient buffer. Enabled for the
+        sharded-gradient stages (ZeRO-2/3) at WORLD_SIZE > 1; z0/z1 keep the
+        monolithic full grads buffer (z1 all-reduces it, z0 is DDP)."""
+        comptime if Self.WORLD_SIZE > 1:
+            return self.zero_ctx.zero_stage >= 2
+        else:
+            return False
+
+    def _per_layer_pool_elems(self) -> Int:
+        """Total element count of one transformer layer's 12 weight-gradient
+        tensors (their per-layer strides summed) — the pool footprint of the
+        per-layer bucket."""
+        var s = 0
+        for i in range(Parameters.ln_1_gamma, Parameters.proj_bias + 1):
+            s += self.param_sizes[i] // self.config.num_layer
+        return s
+
+    def _grad_pool_elems(self) -> Int:
+        """Largest simultaneous gradient bucket: wte+wpe (held together during
+        the encoder backward) vs one transformer layer's 12 tensors."""
+        var wte_wpe = (
+            self.param_sizes[Parameters.wte] + self.param_sizes[Parameters.wpe]
+        )
+        return max(wte_wpe, self._per_layer_pool_elems())
+
+    def _zero_grad_pool(mut self, cnt: Int) raises:
+        """Zero the first `cnt` elements of the gradient pool before a bucket's
+        weight-gradient kernels run (they += accumulate). The pool is recycled
+        across buckets and micro-steps, so this clears the previous occupant."""
+        comptime if is_cpu[Self.target]():
+            for i in range(cnt):
+                self.grad_pool_memory[i] = Scalar[GPT2_DTYPE](0)
+        else:
+            self.ctx.enqueue_memset(
+                self.grad_pool_buf.create_sub_buffer[GPT2_DTYPE](0, cnt),
+                Scalar[GPT2_DTYPE](0),
+            )
+
+    def _reduce_grad_bucket(
+        mut self,
+        dest_starts: List[Int],
+        pool_offsets: List[Int],
+        lengths: List[Int],
+    ) raises:
+        """Reduce-scatter one gradient bucket from the pool into the persistent
+        shard accumulator (+= across ranks and micro-steps)."""
+        self.zero_ctx.reducescatter_buckets[GPT2_DTYPE](
+            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                self.grad_pool_memory.as_unsafe_any_origin()
+            ),
+            dest_starts,
+            pool_offsets,
+            lengths,
+            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                self.grad_shard_memory.as_unsafe_any_origin()
+            ),
+            self.optimizer_num_parameters,
+        )
+
     def allocate_gradients(mut self) raises:
         self.grads = ParameterTensors[GPT2_DTYPE]()
+        if self._use_bucketing():
+            # ZeRO-2/3 bucketed backward: do NOT allocate the full padded
+            # gradient buffer. Instead keep a small reused per-bucket pool and
+            # a persistent optimizer-sized reduced-shard accumulator. Backward
+            # repoints self.grads.* into the pool per bucket, reduce-scatters
+            # each into grad_shard, and recycles the pool — peak gradient
+            # residency O(pool + shard) instead of O(full model). See
+            # docs/ai/zero_grad_bucketing_design_2026-07-14.md.
+            self.grad_pool_elems = self._grad_pool_elems()
+            self.grad_pool_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+                self.grad_pool_elems
+            )
+            self.grad_pool_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+            self.grad_shard_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+                self.optimizer_num_parameters
+            )
+            self.grad_shard_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+            self.ctx.synchronize()
+            self.grad_pool_memory = rebind_mut_mem[GPT2_DTYPE](
+                self.grad_pool_buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+            self.grad_shard_memory = rebind_mut_mem[GPT2_DTYPE](
+                self.grad_shard_buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+            # grads_memory / self.grads.* point at the pool base. Their per-
+            # tensor pointers are overwritten per bucket in backward before any
+            # kernel writes through them (the pool is far smaller than the full
+            # tensor-major layout, so the raw + layer*stride arithmetic
+            # point_parameters computes here is never dereferenced as-is).
+            self.grads_memory = self.grad_pool_memory
+            self.grads.point_parameters(self.param_sizes, self.grads_memory)
+            self.num_grads = self.num_parameters
+            self.has_allocated_grads = True
+            return
+
         self.grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             self.padded_num_parameters
         )
@@ -1754,13 +1871,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.grads.point_parameters(self.param_sizes, self.grads_memory)
         self.num_grads = self.num_parameters
 
-        # ZeRO-2/3 reduce-scatter gradients IN PLACE into grads_memory: after the
-        # reduce, rank r's shard [r*opt, (r+1)*opt) of grads_memory holds the
-        # cross-rank gradient sum, and the optimizer reads it from
+        # ZeRO-0/1 reduce-scatter gradients IN PLACE into grads_memory: after
+        # the reduce, rank r's shard [r*opt, (r+1)*opt) of grads_memory holds
+        # the cross-rank gradient sum, and the optimizer reads it from
         # grads_memory + rank*opt — the exact same addressing ZeRO-1 uses after
-        # its all-reduce. No separate gradient shard buffer is allocated for any
-        # stage (this is what lets ZeRO-2/3 peak memory fall to the ZeRO-1 level
-        # rather than sitting above it by one extra gradient shard).
+        # its all-reduce.
 
         self.has_allocated_grads = True
 
@@ -2696,7 +2811,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # first micro-step (zero_param_grads=False on later micro-steps lets the
         # backward kernels keep `+=`-accumulating into them).
         if zero_param_grads and self.has_allocated_grads:
-            self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+            if self._use_bucketing():
+                # No monolithic gradient buffer exists under bucketing: zero the
+                # reduced-shard accumulator once at the first micro-step. Each
+                # bucket's reduce-scatter += accumulates into it across the
+                # grad-accum loop, and backward zeroes each pool slice itself
+                # before its bucket's kernels run.
+                self.grad_shard_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+            else:
+                self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
 
         comptime if is_cpu[Self.target]():
             # CPU backward kernels were not audited for overwrite-vs-accumulate
@@ -2815,6 +2938,41 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var qkv_layer_stride = layer_stride * 3
         var fch_layer_stride = layer_stride * 4
 
+        # ZeRO-2/3 backward gradient bucketing (see
+        # docs/ai/zero_grad_bucketing_design_2026-07-14.md). Instead of writing
+        # the whole tensor-major gradient buffer and reduce-scattering once at
+        # the end, each bucket (the LM-head wte grad; ln_f; each transformer
+        # layer's 12 tensors; the encoder wte/wpe grad) is produced into a small
+        # reused pool by repointing self.grads.* into it, then reduce-scattered
+        # into the persistent shard accumulator and the pool recycled.
+        var bucketing = self._use_bucketing()
+        # Flat base (global padded-parameter offset) of every parameter tensor:
+        # prefix sums of param_sizes, matching point_parameters' tensor-major
+        # layout that the optimizer shard slices [r*opt, (r+1)*opt) tile.
+        var flat_base = List[Int]()
+        var _fb_acc = 0
+        for i in range(len(self.param_sizes)):
+            flat_base.append(_fb_acc)
+            _fb_acc += self.param_sizes[i]
+        # Per-layer stride (param_sizes[i] / num_layers) and pool slot for each
+        # of the 12 per-layer tensors [ln_1_gamma .. proj_bias]; other tensors
+        # get stride 0 / slot 0 (their buckets start at pool offset 0).
+        var layer_grad_stride = List[Int]()
+        var pool_slot = List[Int]()
+        var _ps_acc = 0
+        for i in range(len(self.param_sizes)):
+            if Parameters.ln_1_gamma <= i <= Parameters.proj_bias:
+                layer_grad_stride.append(self.param_sizes[i] // num_layers)
+                pool_slot.append(_ps_acc)
+                _ps_acc += self.param_sizes[i] // num_layers
+            else:
+                layer_grad_stride.append(0)
+                pool_slot.append(0)
+        var per_layer_pool = _ps_acc
+        var wte_size = self.param_sizes[Parameters.wte]
+        var wpe_size = self.param_sizes[Parameters.wpe]
+        var pool = self.grad_pool_memory
+
         ##############################################################
         # Backward Pass
         ##############################################################
@@ -2823,6 +2981,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # in forward(), which already wrote dlogits in-place into acts.logits with
         # the constant dL/dloss = 1/(B·T·grad_accum_steps). The backward reads them
         # directly here, eliminating a redundant 206M-element pass (matches llm.c).
+
+        # Bucket 1 — wte (LM-head contribution). wte is tied (written again by
+        # encoder_bwd at the end); reduce-scatter linearity lets its two
+        # contributions accumulate onto the shard separately so it need not stay
+        # resident across the layer loop.
+        if bucketing:
+            self.grads.wte = pool  # pool[0 : wte_size]
+            self._zero_grad_pool(wte_size)
 
         # LM head matmul backward (wte has no bias).
         matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
@@ -2840,6 +3006,19 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             Int64(vocab_size_padded),
             self.ctx,
         )
+
+        if bucketing:
+            var d = List[Int]()
+            d.append(flat_base[Parameters.wte])
+            var po = List[Int]()
+            po.append(0)
+            var ln = List[Int]()
+            ln.append(wte_size)
+            self._reduce_grad_bucket(d, po, ln)
+            # Bucket 2 — ln_f (gamma at pool[0], beta at pool[C]).
+            self.grads.ln_f_gamma = pool
+            self.grads.ln_f_beta = pool + channels
+            self._zero_grad_pool(2 * channels)
 
         # Final fused LayerNorm backward.
         var last_layer = num_layers - 1
@@ -2874,9 +3053,88 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx,
         )
 
+        if bucketing:
+            var d = List[Int]()
+            d.append(flat_base[Parameters.ln_f_gamma])
+            d.append(flat_base[Parameters.ln_f_beta])
+            var po = List[Int]()
+            po.append(0)
+            po.append(channels)
+            var ln = List[Int]()
+            ln.append(channels)
+            ln.append(channels)
+            self._reduce_grad_bucket(d, po, ln)
+
         # Backward through the transformer blocks.
         for layer in range(num_layers - 1, -1, -1):
             var layer_offset = layer * layer_stride
+
+            # Bucket 3 (per layer) — repoint the 12 weight-grad tensors into the
+            # pool so the existing `self.grads.X + layer*stride_X` arithmetic
+            # below lands at `pool + pool_slot_X`, then zero the layer's pool
+            # slice (the weight-grad kernels += accumulate).
+            if bucketing:
+                self.grads.ln_1_gamma = (
+                    pool
+                    + pool_slot[Parameters.ln_1_gamma]
+                    - layer * layer_grad_stride[Parameters.ln_1_gamma]
+                )
+                self.grads.ln_1_beta = (
+                    pool
+                    + pool_slot[Parameters.ln_1_beta]
+                    - layer * layer_grad_stride[Parameters.ln_1_beta]
+                )
+                self.grads.qkv_weight = (
+                    pool
+                    + pool_slot[Parameters.qkv_weight]
+                    - layer * layer_grad_stride[Parameters.qkv_weight]
+                )
+                self.grads.qkv_bias = (
+                    pool
+                    + pool_slot[Parameters.qkv_bias]
+                    - layer * layer_grad_stride[Parameters.qkv_bias]
+                )
+                self.grads.attn_proj_weight = (
+                    pool
+                    + pool_slot[Parameters.attn_proj_weight]
+                    - layer * layer_grad_stride[Parameters.attn_proj_weight]
+                )
+                self.grads.attn_proj_bias = (
+                    pool
+                    + pool_slot[Parameters.attn_proj_bias]
+                    - layer * layer_grad_stride[Parameters.attn_proj_bias]
+                )
+                self.grads.ln_2_gamma = (
+                    pool
+                    + pool_slot[Parameters.ln_2_gamma]
+                    - layer * layer_grad_stride[Parameters.ln_2_gamma]
+                )
+                self.grads.ln_2_beta = (
+                    pool
+                    + pool_slot[Parameters.ln_2_beta]
+                    - layer * layer_grad_stride[Parameters.ln_2_beta]
+                )
+                self.grads.fc_weight = (
+                    pool
+                    + pool_slot[Parameters.fc_weight]
+                    - layer * layer_grad_stride[Parameters.fc_weight]
+                )
+                self.grads.fc_bias = (
+                    pool
+                    + pool_slot[Parameters.fc_bias]
+                    - layer * layer_grad_stride[Parameters.fc_bias]
+                )
+                self.grads.proj_weight = (
+                    pool
+                    + pool_slot[Parameters.proj_weight]
+                    - layer * layer_grad_stride[Parameters.proj_weight]
+                )
+                self.grads.proj_bias = (
+                    pool
+                    + pool_slot[Parameters.proj_bias]
+                    - layer * layer_grad_stride[Parameters.proj_bias]
+                )
+                self._zero_grad_pool(per_layer_pool)
 
             var l_ln_1_gamma = self.params.ln_1_gamma + layer * channels
             var l_ln_1_beta = self.params.ln_1_beta + layer * channels
@@ -3399,6 +3657,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
 
+            # Reduce-scatter this layer's 12 weight-grad tensors as one bucket
+            # (one collective / barrier per layer). Each tensor's global flat
+            # range is flat_base[X] + layer*stride_X; its pool sub-range is
+            # pool_slot[X] : +stride_X.
+            if bucketing:
+                var d = List[Int]()
+                var po = List[Int]()
+                var ln = List[Int]()
+                for i in range(Parameters.ln_1_gamma, Parameters.proj_bias + 1):
+                    d.append(flat_base[i] + layer * layer_grad_stride[i])
+                    po.append(pool_slot[i])
+                    ln.append(layer_grad_stride[i])
+                self._reduce_grad_bucket(d, po, ln)
+
+        # Bucket 4 — wte (encoder contribution, accumulates onto the shard via
+        # reduce-scatter linearity) + wpe. Repoint both into the pool.
+        if bucketing:
+            self.grads.wte = pool  # pool[0 : wte_size]
+            self.grads.wpe = pool + wte_size  # pool[wte_size : +wpe_size]
+            self._zero_grad_pool(wte_size + wpe_size)
+
         # Encoder backward: scatter token grads into wte, sum position grads into wpe.
         # On GPU (Metal), bucket_info/workload_indices are HostBuffers whose raw
         # pointers read as zeros inside Metal kernels — use device copies uploaded
@@ -3421,6 +3700,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx,
         )
 
+        if bucketing:
+            var d = List[Int]()
+            d.append(flat_base[Parameters.wte])
+            d.append(flat_base[Parameters.wpe])
+            var po = List[Int]()
+            po.append(0)
+            po.append(wte_size)
+            var ln = List[Int]()
+            ln.append(wte_size)
+            ln.append(wpe_size)
+            self._reduce_grad_bucket(d, po, ln)
+
         # Wait for all GPU backward kernels to finish. Metal's enqueue_copy
         # (device→host) requires the source buffer to be idle; without this
         # synchronize the runtime raises "Invalid Metal buffer pointer" when
@@ -3429,6 +3720,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx.synchronize()
 
         comptime if Self.WORLD_SIZE > 1:
+            # ZeRO-2/3 bucketing already reduce-scattered every bucket into the
+            # shard accumulator inline above — once PER micro-step (the shard
+            # += accumulates across the grad-accum loop, so the full gradient
+            # never has to stay resident). Nothing left to do at either end.
+            if bucketing:
+                return
             # Reduce gradients across ranks ONLY on the last micro-step of the
             # gradient-accumulation loop (llm.c semantics). Reducing every
             # micro-step would be wrong, not just wasteful: the stage-0/1
@@ -3514,6 +3811,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     # replicated), ZeRO-2/3 in-place reduce-scattered (only slice
                     # [offset, offset+opt) holds the reduced sum) — same address.
                     g_ptr = self.grads_memory + offset
+                    # Bucketing keeps no full grads buffer: the reduced shard is
+                    # the accumulator at grad_shard_memory[0 : opt].
+                    if self._use_bucketing():
+                        g_ptr = self.grad_shard_memory
                     update_num_params = local_num_params
 
             if update_num_params > 0:
@@ -3601,9 +3902,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     )
                     self.ctx.synchronize()
                 else:
-                    # ZeRO 2/3: grads were reduce-scattered IN PLACE, so this
-                    # rank's reduced shard sits at grads_memory + offset (same
-                    # addressing as ZeRO-1's post-allreduce read).
+                    # ZeRO 2/3: grads were reduce-scattered into this rank's
+                    # reduced shard. Under bucketing that shard is the
+                    # accumulator grad_shard_memory[0 : opt]; otherwise (the
+                    # legacy in-place path) it sits at grads_memory + offset.
                     var offset = (
                         self.zero_ctx.rank * self.optimizer_num_parameters
                     )
@@ -3611,15 +3913,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.num_parameters - offset,
                         self.optimizer_num_parameters,
                     )
+                    var g_shard = self.grads_memory + offset
+                    if self._use_bucketing():
+                        g_shard = self.grad_shard_memory
                     if local_num_params > 0:
                         adamw_update[GPT2_DTYPE, Self.target](
                             local_num_params,
                             as_mut_kernel[GPT2_DTYPE](
                                 self.params_memory + offset
                             ),
-                            as_mut_kernel[GPT2_DTYPE](
-                                self.grads_memory + offset
-                            ),
+                            as_mut_kernel[GPT2_DTYPE](g_shard),
                             as_mut_kernel[MASTER_DTYPE](self.master_memory),
                             USE_BF16,
                             as_mut_kernel[MASTER_DTYPE](self.m_memory),
@@ -3689,6 +3992,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 grads_src = self.grads_memory + (
                     self.zero_ctx.rank * self.optimizer_num_parameters
                 )
+                # Bucketing keeps the reduced shard in the accumulator, not in a
+                # full grads buffer sliced at rank*opt.
+                if self._use_bucketing():
+                    grads_src = self.grad_shard_memory
                 sharded = True
         comptime width = simd_width_of[GPT2_DTYPE]()
 

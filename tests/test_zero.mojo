@@ -814,7 +814,26 @@ def test_multi_gpu_collectives() raises:
     var ar_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
     var rs_shard = alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
     var rs_ip_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rsb_shard = alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
     var ag_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+
+    # reducescatter_buckets legs: two buckets in a contiguous pool mapping to
+    # SCATTERED global flat ranges — bucket A -> flat [0,32) (rank 0's shard),
+    # bucket B -> flat [48,80) (spans rank 0's tail and rank 1's head). This is
+    # the ZeRO-2/3 backward-bucketing path; it exercises the staged-copy GPU
+    # reduce with a partial bucket/shard overlap. Pool value == (r+1)*(f+1).
+    comptime BA_LEN = 32
+    comptime BB_LEN = 32
+    comptime BPOOL = BA_LEN + BB_LEN
+    var bdest = List[Int]()
+    bdest.append(0)
+    bdest.append(48)
+    var bpoff = List[Int]()
+    bpoff.append(0)
+    bpoff.append(BA_LEN)
+    var blens = List[Int]()
+    blens.append(BA_LEN)
+    blens.append(BB_LEN)
 
     @parameter
     def _run_rank(rank: Int):
@@ -873,6 +892,35 @@ def test_multi_gpu_collectives() raises:
             for j in range(size):
                 rs_ip_out[rank * size + j] = host[j]
 
+            # ---- reducescatter_buckets: scattered buckets in a pool -> shard --
+            var bpool = ctx.enqueue_create_buffer[DTYPE](BPOOL)
+            var bpool_host = ctx.enqueue_create_host_buffer[DTYPE](BPOOL)
+            for b in range(len(bdest)):
+                for j in range(blens[b]):
+                    bpool_host[bpoff[b] + j] = Float32(
+                        (rank + 1) * (bdest[b] + j + 1)
+                    )
+            bpool.enqueue_copy_from(bpool_host)
+            var bshard = ctx.enqueue_create_buffer[DTYPE](shard)
+            bshard.enqueue_fill(Float32(0.0))
+            ctx.synchronize()
+            z_ctx.reducescatter_buckets[DTYPE](
+                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                    bpool.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                bdest,
+                bpoff,
+                blens,
+                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                    bshard.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                shard,
+            )
+            bshard.enqueue_copy_to(host_s)
+            ctx.synchronize()
+            for j in range(shard):
+                rsb_shard[rank * shard + j] = host_s[j]
+
             # ---- allgather: only my slice is mine; the other is zeroed so
             # stale data can't fake a pass ----
             for j in range(size):
@@ -928,10 +976,22 @@ def test_multi_gpu_collectives() raises:
                     Float32((k + 1) * 1000 + j),
                     atol=1e-5,
                 )
+    # reducescatter_buckets: for each global flat f covered by a bucket, the
+    # owning rank's shard[f - r*shard] == sum_k (k+1)*(f+1) == 3*(f+1);
+    # uncovered indices stay 0. Covered flats: [0,32) and [48,80).
+    for r in range(WORLD_SIZE):
+        for j in range(shard):
+            var f = r * shard + j
+            var covered = (f < 32) or (f >= 48 and f < 80)
+            var expected = Float32(3 * (f + 1)) if covered else Float32(0.0)
+            assert_almost_equal[DTYPE](
+                rsb_shard[r * shard + j], expected, atol=1e-5
+            )
 
     ar_out.free()
     rs_shard.free()
     rs_ip_out.free()
+    rsb_shard.free()
     ag_out.free()
     cpu_coord_ptr[].free()
     cpu_coord_ptr.free()

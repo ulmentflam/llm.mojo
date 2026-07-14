@@ -213,16 +213,23 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
 
         # All-reduce of gradients over N identical ranks == N * g. update()
         # divides grad_scale by WORLD_SIZE, so the effective gradient is g again.
-        for i in range(NUM_PARAMS):
-            model.grads_memory[i] = model.grads_memory[i] * Scalar[GPT2_DTYPE](
-                N
-            )
-
-        # Every sharded stage now reads its gradient shard from
-        # grads_memory + rank*shard: ZeRO-1 all-reduces (grads replicated),
-        # ZeRO-2/3 reduce-scatter IN PLACE (only slice [off, off+ln) reduced).
-        # The `* N` above already put the reduced sum there, so no separate
-        # shard copy is needed for any stage.
+        #
+        # ZeRO-2/3 now bucket the backward: reducescatter_buckets' no-coordinator
+        # branch already deposited THIS rank's local reduced shard into
+        # grad_shard_memory[0 : opt] (the concatenation of all N ranks' shards is
+        # the full reduced gradient). Scale that shard by N to model the
+        # all-identical-rank sum; update() then reads it directly. ZeRO-1 keeps
+        # the full replicated grads buffer, scaled in place as before.
+        if stage >= 2:
+            for i in range(shard):
+                model.grad_shard_memory[i] = model.grad_shard_memory[
+                    i
+                ] * Scalar[GPT2_DTYPE](N)
+        else:
+            for i in range(NUM_PARAMS):
+                model.grads_memory[i] = model.grads_memory[i] * Scalar[
+                    GPT2_DTYPE
+                ](N)
 
         model.update(
             t=1,

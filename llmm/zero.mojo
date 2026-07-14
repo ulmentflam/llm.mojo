@@ -808,6 +808,14 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         """
         var lo = self.rank * opt
         var hi = lo + opt
+        # Flush this rank's pool writes (the backward kernels that filled the
+        # bucket were enqueued on self.ctx before this call) BEFORE the host
+        # barrier1 inside _register_and_sync, so that once every rank passes
+        # that barrier each peer's pool is GPU-complete and safe to pull. Unlike
+        # allreduce/reducescatter_inplace — which the caller invokes only after
+        # backward()'s trailing synchronize — reducescatter_buckets runs INLINE
+        # during backward (once per layer), so its inputs are not yet flushed.
+        self.ctx.synchronize()
         var coord_ptr = _register_and_sync[dtype, MutAnyOrigin, MutAnyOrigin](
             self.rank, self.cpu_coordinator_ptr, pool_ptr, shard_ptr
         )
