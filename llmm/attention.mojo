@@ -1593,9 +1593,9 @@ def attention_fwd_gemm[
         # softmax's store traffic.
         device_ctx.enqueue_memset(att_buf, Scalar[dtype](0))
         var sptr = alloc[BufType](1)
-        sptr.init_pointee_move(scores_buf^)
+        sptr.unsafe_write(scores_buf^)
         var aptr = alloc[BufType](1)
-        aptr.init_pointee_move(att_buf^)
+        aptr.unsafe_write(att_buf^)
         scores_addr = Int(sptr)
         att_addr = Int(aptr)
         if cache:
@@ -1859,7 +1859,7 @@ def attention_fwd[
             if addr_fwd == 0:
                 var compiled = device_ctx.compile_function[gpu_kernel]()
                 var ptr = alloc[CompiledType](1)
-                ptr.init_pointee_copy(compiled)
+                ptr.unsafe_write(compiled^)
                 addr_fwd = Int(ptr)
                 if cache:
                     cache.value()[].fwd_addr = addr_fwd
@@ -2993,7 +2993,7 @@ def _gemm_scratch_buffer[
         if zero_on_alloc:
             ctx.enqueue_memset(buf, Scalar[bdt](0))
         var p = alloc[BufType](1)
-        p.init_pointee_move(buf^)
+        p.unsafe_write(buf^)
         out_addr = Int(p)
     var bp = UnsafePointer[mut=True, type=BufType, origin=MutUntrackedOrigin](
         unsafe_from_address=out_addr
@@ -4908,7 +4908,7 @@ def attention_bwd[
             if addr_dq == 0:
                 var compiled_dq = device_ctx.compile_function[gpu_kernel_dq]()
                 var ptr_dq = alloc[CompiledTypeDQ](1)
-                ptr_dq.init_pointee_copy(compiled_dq)
+                ptr_dq.unsafe_write(compiled_dq^)
                 addr_dq = Int(ptr_dq)
                 if cache:
                     cache.value()[].bwd_dq_addr = addr_dq
@@ -4981,7 +4981,7 @@ def attention_bwd[
             if addr_dkv == 0:
                 var compiled_dkv = device_ctx.compile_function[gpu_kernel_dkv]()
                 var ptr_dkv = alloc[CompiledTypeDKV](1)
-                ptr_dkv.init_pointee_copy(compiled_dkv)
+                ptr_dkv.unsafe_write(compiled_dkv^)
                 addr_dkv = Int(ptr_dkv)
                 if cache:
                     cache.value()[].bwd_dkv_addr = addr_dkv

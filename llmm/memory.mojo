@@ -104,7 +104,7 @@ def persistent_device_buffer[
     if zero:
         ctx.enqueue_memset(buf, Scalar[dtype](0))
     var hp = alloc[BufType](1)
-    hp.init_pointee_move(buf^)
+    hp.unsafe_write(buf^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(name), hp.bitcast[NoneType]()
     )
