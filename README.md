@@ -123,11 +123,11 @@ Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warm
 
 Multi-GPU data-parallel training runs one rank per GPU inside a single process: build with `make build WORLD_SIZE=N` (compile-time, like llm.c's `-DMULTI_GPU`) and pick the ZeRO stage at runtime with `-z 0|1|2|3` — stage 0 is plain DDP, stage 1 shards optimizer state, stage 2 also shards gradients, stage 3 also shards parameters. All four stages are equivalence-gated against the single-GPU baseline (`tests/test_zero_equivalence.mojo` at world sizes 2 and 8, per-parameter match to 1e-5; per-step training losses agree across stages to ~1e-4 at world size 8). The collectives are staged reduce-scatter/all-gather over driver-routed device-to-device copies, so they work on PCIe boxes without CUDA P2P or NVLink — see [`docs/ai/zero_multigpu_rewrite_2026-07-14.md`](docs/ai/zero_multigpu_rewrite_2026-07-14.md) for the design and [`docs/ai/zero_world8_verification_2026-07-14.md`](docs/ai/zero_world8_verification_2026-07-14.md) for the verification campaign.
 
-Measured on 8× NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB, PCIe, no P2P), GPT-2 124M, B=4 T=64 per rank, 12 steps (first 2 dropped as warmup):
+Measured on 4× NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB, PCIe, no P2P), GPT-2 124M, B=4 T=64 per rank, 12 steps (first 2 dropped as warmup), after the stage-2/3 memory pass (per-layer gradient bucketing and stage-3 parameter streaming):
 
-!['ZeRO stage benchmark (WORLD_SIZE=8)'](figures/benchmark_zero_w8_b4_t64_2026-07-14_1313_NVIDIA-RTX-PRO-6000-Blackwell_workstation-max.png)
+!['ZeRO stage benchmark (WORLD_SIZE=4)'](figures/benchmark_zero_w4_b4_t64_2026-07-14_1711_NVIDIA-RTX-PRO-6000-Blackwell_workstation-max.png)
 
-The memory win comes from stage 1's optimizer-state sharding, which cuts peak per-GPU memory by 23% in fp32 and 42% in bf16. Stages 2 and 3 currently hold at stage-1 memory rather than dropping further, because the full gradient buffer still exists transiently during backward and stage 3 re-gathers parameters coarse-grained; bucketed backward reduction and parameter streaming (the roadmap items) will unlock their additional savings. On speed, stages 2 and 3 run at stage-0 DDP pace, while stage 1 pays 25–45% extra step time for its full-parameter all-gather after the sharded update. Reproduce with `make benchmark-zero` (writes the JSON and renders this chart into `figures/`).
+Each stage now buys additional per-GPU memory. Stage 1's optimizer-state sharding saves 768 MiB in fp32 (1 GiB in bf16, where the fp32 master weights shard too), stage 2's bucketed backward reduction saves another 256 MiB, and stage 3's parameter streaming another 256 MiB. The floor at this model size is the tied `wte` embedding (~150 MiB): it is written at both ends of the backward pass and gathered whole for the LM head, so it stays resident — vocab-chunking those kernels is the documented follow-up (see [`docs/ai/zero_grad_bucketing_design_2026-07-14.md`](docs/ai/zero_grad_bucketing_design_2026-07-14.md) and [`docs/ai/zero_stage3_param_streaming_2026-07-14.md`](docs/ai/zero_stage3_param_streaming_2026-07-14.md)). The savings trade against step time: stages 2 and 3 pay for their per-layer collectives, with stage 3's just-in-time parameter gathers costing the most. Two calibration notes: at this tiny benchmark shape the collective overhead is a large fraction of the 50 ms step, but at production shapes (B≥32, T=1024, ~250–470 ms steps) it is a few percent — while activations dominate peak memory there and ZeRO's model-state savings become a small fraction. The stages earn their keep at model scales where state dominates. All stages stay numerically equivalence-gated against the single-GPU baseline (per-parameter match to 1e-5 at world sizes 2 and 8). Reproduce with `make benchmark-zero` (`BENCH_ZERO_WORLD=N`; writes the JSON and renders this chart into `figures/`).
 
 ### Low-precision training (FP8 / NVFP4)
 
@@ -223,7 +223,7 @@ make verify
 ## Development Roadmap
 Future development includes:
 
-1. ZeRO memory follow-ups: bucketed backward gradient reduction (stage 2) and parameter streaming (stage 3)
+1. ZeRO: de-resident the tied `wte` embedding (vocab-chunked LM head + indexed encoder gather) to push stages 2/3 below the current ~150 MiB floor
 2. Mamba1/Mamba2/Mamba3 architecture and MoE
 
 ## Motivation
