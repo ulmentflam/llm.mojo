@@ -28,7 +28,7 @@ from llmm.lowp import (
     fp8_static_scale,
 )
 from llmm.amax import AmaxState
-from llmm.dataloader import DataLoader
+from llmm.dataloader import DataLoader, resolve_data_files
 from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
 from llmm.checkpointing import (
     CheckpointConfig,
@@ -3979,6 +3979,11 @@ struct TrainArgs(Copyable, Movable):
 
     var train_data_pattern: String  # -i  train tokens (glob ok)
     var val_data_pattern: String  # -j  val tokens (glob ok)
+    # Shard file lists resolved from the patterns above. Populated ONCE on the
+    # main thread (see main()) so the per-rank host threads never call into
+    # CPython's glob — concurrent interpreter init crashes libpython.
+    var train_files: List[String]
+    var val_files: List[String]
     var load_filename: String  # -e  .bin checkpoint OR model descriptor
     var output_log_dir: String  # -o  checkpoint dir ("" = no logging)
     var checkpoint_every: Int  # -n  write a checkpoint every N steps
@@ -4009,6 +4014,8 @@ def default_train_args() -> TrainArgs:
     return TrainArgs(
         train_data_pattern="./data/.tinyshakespeare/tiny_shakespeare_train.bin",
         val_data_pattern="./data/.tinyshakespeare/tiny_shakespeare_val.bin",
+        train_files=List[String](),
+        val_files=List[String](),
         load_filename="gpt2_124M.bin",
         output_log_dir="",
         checkpoint_every=0,
@@ -4127,8 +4134,11 @@ def train[
     # If we are only overfitting a single batch for debugging, overfit the first
     # batch of val (it is smaller and faster), exactly like llm.c / train_gpt2.py.
     var train_data_pattern = args.train_data_pattern
+    var train_files = args.train_files.copy()
     if args.overfit_single_batch == 1:
+        # Overfit the (smaller, faster) first val batch, like llm.c.
         train_data_pattern = args.val_data_pattern
+        train_files = args.val_files.copy()
 
     var B = args.batch_size
     var T = args.seq_len
@@ -4221,14 +4231,16 @@ def train[
         var os = Python.import_module("os")
         _ = os.makedirs(output_dir, exist_ok=True)
 
-    # Build the dataloaders. The data patterns may be a single file or a glob.
+    # Build the dataloaders from the file lists resolved on the main thread
+    # (see main()). Passing the resolved list keeps rank threads free of the
+    # CPython glob call that would otherwise race across ranks.
     var train_tokens = train_data_pattern
     var val_tokens = args.val_data_pattern
 
-    var train_loader = DataLoader(train_tokens, B, T, rank, WORLD_SIZE)
+    var train_loader = DataLoader(train_files^, B, T, rank, WORLD_SIZE)
     printf0(rank, "Loaded train tokens from " + train_tokens)
     printf0(rank, "Number of tokens: " + String(train_loader.num_tokens))
-    var val_loader = DataLoader(val_tokens, B, T, rank, WORLD_SIZE)
+    var val_loader = DataLoader(args.val_files.copy(), B, T, rank, WORLD_SIZE)
     printf0(rank, "Loaded val tokens from " + val_tokens)
     printf0(rank, "Number of tokens: " + String(val_loader.num_tokens))
 
@@ -4791,6 +4803,14 @@ def main() raises:
     var world_size = 1
     if not _parse_train_args(args, rank, world_size):
         return
+
+    # Resolve data glob patterns to concrete file lists ONCE, here on the main
+    # thread, before any rank threads spawn. Globbing goes through CPython, and
+    # doing that concurrently from the bare per-rank threads that multi-rank
+    # training spawns crashes libpython (racing interpreter init). Each rank's
+    # DataLoader then consumes the pre-resolved list with no Python interop.
+    args.train_files = resolve_data_files(args.train_data_pattern)
+    args.val_files = resolve_data_files(args.val_data_pattern)
 
     print(
         "Rank:",

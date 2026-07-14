@@ -19,6 +19,44 @@ comptime RNG_SEED = 42  # The meaning of life, the universe, and everything.
 
 
 # ===----------------------------------------------------------------------=== #
+# File resolution
+# ===----------------------------------------------------------------------=== #
+
+
+def resolve_data_files(filename_pattern: String) raises -> List[String]:
+    """Resolve a data path/glob pattern into a sorted list of shard files.
+
+    A pattern containing `*`/`?` is expanded via CPython's `glob` module.
+    That first Python call initializes the interpreter, which is NOT safe to
+    do concurrently from the bare per-rank host threads that multi-rank
+    training spawns (racing `Py_Initialize`/import crashes libpython in
+    `PyImport_ImportModule`). Callers that fan out to per-rank DataLoaders must
+    resolve ONCE on the main thread and hand each rank the plain list this
+    returns, keeping the rank threads free of Python interop entirely.
+
+    A literal (wildcard-free) path skips Python altogether.
+    """
+    var files = List[String]()
+    if "*" not in filename_pattern and "?" not in filename_pattern:
+        files.append(filename_pattern)
+        return files^
+
+    var glob = Python.import_module(GLOB)
+    var py_files = glob.glob(filename_pattern)
+    py_files.sort()
+
+    if len(py_files) == 0:
+        raise Error(
+            "DataLoader error: No files matched the pattern: "
+            + filename_pattern
+        )
+
+    for i in range(len(py_files)):
+        files.append(String(py_files[i]))
+    return files^
+
+
+# ===----------------------------------------------------------------------=== #
 # DataLoader
 # ===----------------------------------------------------------------------=== #
 
@@ -73,6 +111,31 @@ struct DataLoader:
         num_processes: Int = 1,
         should_shuffle: Bool = False,
     ) raises:
+        """Construct from a path or glob pattern (resolves via CPython `glob`).
+
+        Convenience for single-threaded callers. Multi-rank training must NOT
+        use this from rank threads — resolve with `resolve_data_files` on the
+        main thread and use the `files:` overload below.
+        """
+        self = DataLoader(
+            resolve_data_files(filename_pattern),
+            batch_size,
+            seq_len,
+            process_rank,
+            num_processes,
+            should_shuffle,
+        )
+
+    def __init__(
+        out self,
+        var files: List[String],
+        batch_size: Int,
+        seq_len: Int,
+        process_rank: Int = 0,
+        num_processes: Int = 1,
+        should_shuffle: Bool = False,
+    ) raises:
+        """Construct from a pre-resolved shard file list (no Python interop)."""
         # Initialize scalar fields.
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -95,32 +158,21 @@ struct DataLoader:
         self.local_batch_offset_bytes = 0
         self.header_bytes = HEADER_SIZE * 4  # sizeof(int) = 4 bytes.
 
-        # Initialize empty collection fields.
-        self.files = List[String]()
+        # Initialize collection fields. `files` is already resolved (globbing,
+        # if any, happened on the main thread via `resolve_data_files`), so no
+        # Python interop occurs here — this constructor is safe to run from the
+        # per-rank host threads that multi-rank training spawns.
+        self.files = files^
         self.shard_indices = List[Int]()
         self.intra_shard_indices = List[Int]()
+
+        if len(self.files) == 0:
+            raise Error("DataLoader error: empty file list")
 
         # Allocate buffers for the input and target tokens.
         self.inputs = alloc[Scalar[DType.int32]](batch_size * seq_len)
         self.targets = alloc[Scalar[DType.int32]](batch_size * seq_len)
         self.has_allocated = True
-
-        # Check if there is a wildcard. If not, bypass Python to avoid thread safety issues.
-        if "*" not in filename_pattern and "?" not in filename_pattern:
-            self.files.append(filename_pattern)
-        else:
-            var glob = Python.import_module(GLOB)
-            var py_files = glob.glob(filename_pattern)
-            py_files.sort()
-
-            if len(py_files) == 0:
-                raise Error(
-                    "DataLoader error: No files matched the pattern: "
-                    + filename_pattern
-                )
-
-            for i in range(len(py_files)):
-                self.files.append(String(py_files[i]))
 
         for i in range(len(self.files)):
             self.shard_indices.append(i)
