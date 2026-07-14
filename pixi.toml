@@ -2,7 +2,7 @@
 authors = ["ulmentflam <johnwowen3@gmail.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "llm.mojo"
-platforms = ["osx-arm64", "linux-aarch64"]
+platforms = ["osx-arm64", "linux-aarch64", "linux-64"]
 version = "0.1.0"
 
 [tasks]
@@ -48,4 +48,10 @@ cuda = ["cuda"]
 cuda = "12.2"
 
 [feature.cuda.target.linux-aarch64.dependencies]
+pytorch-gpu = ">=2.2"
+
+# x86_64 CUDA hosts (e.g. the Blackwell workstation) resolve the same GPU
+# PyTorch build. Scoped per-target so the osx-arm64 solve, which has no
+# pytorch-gpu, is never asked to resolve it.
+[feature.cuda.target.linux-64.dependencies]
 pytorch-gpu = ">=2.2"
