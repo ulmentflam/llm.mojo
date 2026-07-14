@@ -119,6 +119,12 @@ matching the WORLD_SIZE=1 baseline to `atol=1e-5`.
 
 ## The GPU multi-GPU blocker (root-caused, NOT fixed)
 
+> **UPDATE (same day):** fixed in the follow-up campaign — all four ZeRO
+> stages now train at WORLD_SIZE=8 via hand-rolled staged-copy collectives
+> (this box turned out to have no CUDA P2P at all, so the design sketch
+> below was adapted). See
+> [`zero_multigpu_rewrite_2026-07-14.md`](zero_multigpu_rewrite_2026-07-14.md).
+
 Every ZeRO stage crashes on the GPU target at the first collective:
 
 ```
