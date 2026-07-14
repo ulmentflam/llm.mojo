@@ -149,24 +149,41 @@ def _run_stage(binary, world_size, stage, b, t, d, steps, timeout_s, extra):
     stderr_tail = ""
     stdout = ""
     try:
-        proc = subprocess.run(
+        # NEVER hard-kill a multi-rank run: SIGKILL amputates the ranks'
+        # cross-device FREE traffic mid-flight and hangs the GPU's GSP
+        # firmware (Xid 119/120, GPU needs a PF FLR to come back — observed
+        # twice on this host's GPU 1, dmesg 2026-07-14). Escalate gently:
+        # SIGINT, then SIGTERM, then SIGKILL as a last resort.
+        popen = subprocess.Popen(
             cmd,
             cwd=root,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_s,
         )
-        stdout = proc.stdout
-        if proc.returncode != 0:
+        try:
+            stdout, stderr = popen.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            status = "timeout"
+            import signal
+
+            for sig, grace_s in ((signal.SIGINT, 30), (signal.SIGTERM, 15)):
+                popen.send_signal(sig)
+                try:
+                    stdout, stderr = popen.communicate(timeout=grace_s)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            else:
+                popen.kill()
+                stdout, stderr = popen.communicate()
+        if status == "ok" and popen.returncode != 0:
             status = "crashed"
             # The Mojo runtime prints "Unhandled exception …" to stdout, so fall
             # back to the stdout tail when stderr is empty.
-            tail_src = (proc.stderr or "").strip() or (stdout or "").strip()
+            tail_src = (stderr or "").strip() or (stdout or "").strip()
             stderr_tail = "\n".join(tail_src.splitlines()[-8:])
-    except subprocess.TimeoutExpired as e:
-        status = "timeout"
-        stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
     finally:
         wall = time.time() - t0
         sampler.stop()
