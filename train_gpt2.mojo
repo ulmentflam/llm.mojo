@@ -1,6 +1,6 @@
 from std.math import sqrt, ceildiv, isnan, nan, exp, log
-from std.os import getenv
-from std.python import Python
+from std.os import getenv, listdir, makedirs
+from std.os.path import isdir
 from std.sys import (
     argv,
     has_accelerator,
@@ -3936,14 +3936,33 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # promoting the loaded low-precision params is the best restoration
         # (matches llm.c's fallback when master weights are absent).
         comptime if USE_BF16:
+            # The master copy shadows THIS RANK's optimizer shard (see
+            # allocate_optimizer_moments): master_buf holds
+            # optimizer_num_parameters elements — comm_shard, NOT
+            # num_parameters, for sharded stages (WORLD_SIZE > 1, ZeRO >= 1).
+            # Copying num_parameters here overruns the shard-sized device
+            # buffer (CUDA_ERROR_INVALID_VALUE on every rank), and seeding
+            # from offset 0 would hand every rank rank-0's weights. Seed
+            # exactly this rank's shard from the loaded params; the last
+            # rank's shard may extend past num_parameters into the alignment
+            # padding, which stays zero (host_params has no padding to read).
+            var n_master = self.optimizer_num_parameters
+            var master_src_offset = 0
+            comptime if Self.WORLD_SIZE > 1:
+                if self.zero_ctx.zero_stage >= 1:
+                    master_src_offset = self.zero_ctx.rank * n_master
             var host_master = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
-                self.num_parameters
+                n_master
             )
             self.ctx.synchronize()
-            for i in range(self.num_parameters):
-                host_master[i] = host_params[i].cast[MASTER_DTYPE]()
+            for i in range(n_master):
+                var src = master_src_offset + i
+                var val = Scalar[GPT2_DTYPE](0)
+                if src < self.num_parameters:
+                    val = host_params[src]
+                host_master[i] = val.cast[MASTER_DTYPE]()
             self._copy_host_to_device[MASTER_DTYPE](
-                self.master_memory, host_master, self.num_parameters
+                self.master_memory, host_master, n_master
             )
             self.ctx.synchronize()
 
@@ -3984,6 +4003,10 @@ struct TrainArgs(Copyable, Movable):
     # CPython's glob — concurrent interpreter init crashes libpython.
     var train_files: List[String]
     var val_files: List[String]
+    # Latest checkpoint step in -o (or -1), resolved ONCE in main() before rank
+    # threads spawn so every rank resumes from the same step (per-rank
+    # _find_max_step calls could disagree if a checkpoint landed mid-spawn).
+    var resume_from_step: Int
     var load_filename: String  # -e  .bin checkpoint OR model descriptor
     var output_log_dir: String  # -o  checkpoint dir ("" = no logging)
     var checkpoint_every: Int  # -n  write a checkpoint every N steps
@@ -4016,6 +4039,7 @@ def default_train_args() -> TrainArgs:
         val_data_pattern="./data/.tinyshakespeare/tiny_shakespeare_val.bin",
         train_files=List[String](),
         val_files=List[String](),
+        resume_from_step=-1,
         load_filename="gpt2_124M.bin",
         output_log_dir="",
         checkpoint_every=0,
@@ -4081,13 +4105,16 @@ def _build_lr_scheduler(
 
 def _find_max_step(output_log_dir: String) raises -> Int:
     """Return the highest step N for which `model_N.bin` exists in the dir, or
-    -1 if none is found. Used by `-y 1` to resume the latest checkpoint."""
-    var os = Python.import_module("os")
-    if not Bool(os.path.isdir(output_log_dir)):
+    -1 if none is found. Used by `-y 1` to resume the latest checkpoint.
+
+    Pure Mojo (std.os) on purpose: this must stay free of Python interop so it
+    can never race the CPython interpreter across rank threads (see main() —
+    it is resolved there, once, before rank threads spawn, and the result is
+    passed into train() via TrainArgs.resume_from_step)."""
+    if not isdir(output_log_dir):
         return -1
     var max_step = -1
-    var entries = os.listdir(output_log_dir)
-    for entry in entries:
+    for entry in listdir(output_log_dir):
         var name = String(entry)
         if name.startswith("model_") and name.endswith(".bin"):
             var step = atol(name[byte = 6 : name.byte_length() - 4])
@@ -4225,11 +4252,11 @@ def train[
     printf0(rank, bar)
 
     # Disk checkpointing: -o output_log_dir, -n checkpoint_every, -y resume.
+    # The output dir is created in main() before rank threads spawn (even
+    # rank 0 runs on a worker thread here, and Python/filesystem setup must
+    # not race the other ranks' startup).
     var output_dir = args.output_log_dir
     var save_every = args.checkpoint_every
-    if save_every > 0 and output_dir != "" and rank == 0:
-        var os = Python.import_module("os")
-        _ = os.makedirs(output_dir, exist_ok=True)
 
     # Build the dataloaders from the file lists resolved on the main thread
     # (see main()). Passing the resolved list keeps rank threads free of the
@@ -4294,9 +4321,11 @@ def train[
 
     # Optionally resume params, optimizer moments, RNG and dataloader position
     # from the latest checkpoint in the output dir (mirrors llm.c's -y 1).
+    # The step was resolved once in main() (see TrainArgs.resume_from_step) so
+    # all ranks agree on it and no directory scan runs on rank threads.
     var start_step = 0
     if args.resume == 1 and output_dir != "":
-        var resume_from = _find_max_step(output_dir)
+        var resume_from = args.resume_from_step
         if resume_from >= 0:
             var model_path = (
                 output_dir + "/model_" + String(resume_from) + ".bin"
@@ -4811,6 +4840,15 @@ def main() raises:
     # DataLoader then consumes the pre-resolved list with no Python interop.
     args.train_files = resolve_data_files(args.train_data_pattern)
     args.val_files = resolve_data_files(args.val_data_pattern)
+
+    # Checkpointing setup, likewise hoisted to the main thread: create the
+    # output dir once (in multi-rank mode even rank 0 runs on a worker
+    # thread), and resolve the -y 1 resume step once so every rank resumes
+    # from the same checkpoint.
+    if args.checkpoint_every > 0 and args.output_log_dir != "":
+        makedirs(args.output_log_dir, exist_ok=True)
+    if args.resume == 1 and args.output_log_dir != "":
+        args.resume_from_step = _find_max_step(args.output_log_dir)
 
     print(
         "Rank:",
