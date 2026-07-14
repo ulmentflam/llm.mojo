@@ -757,14 +757,28 @@ def test_causal_mask_respected():
 
 
 def test_position_zero_equals_value():
-    """With only key 0 in the causal window, output row 0 equals V[:, :, 0]."""
+    """With only key 0 in the causal window, output row 0 equals V[:, :, 0].
+
+    The softmax at position 0 is exactly 1.0 (single element, no precision
+    loss there), but the A·V GEMM that reads it still runs through cuBLAS
+    like every other step of attention_fwd_gemm. On an NVIDIA accelerator
+    that GEMM is fp32-in/TF32-compute (see TF32_ATTENTION_TOLERANCE above),
+    so it rounds V[:, :, 0, :]'s mantissa to 10 bits before multiplying by
+    the (exact) 1.0 probability — the strict ATTENTION_TOLERANCES fp32 gate
+    is too tight there. Use the same TF32-aware tolerance selection
+    `_assert_matches_reference` uses for every other case in this file.
+    """
     case = next(c for c in CASES if c.name == "fp32_small")
     q, k, v = _make_inputs(case)
 
     got_out_storage, _ = _run_kernel(case, q, k, v)
     got_out = from_storage(got_out_storage, case.dtype).reshape(_shape(case))
 
-    tol = ATTENTION_TOLERANCES[case.dtype]
+    tol = (
+        TF32_ATTENTION_TOLERANCE
+        if _runs_on_tf32_accelerator(case)
+        else (ATTENTION_TOLERANCES[case.dtype])
+    )
     np.testing.assert_allclose(
         got_out[:, :, 0, :],
         v[:, :, 0, :],
