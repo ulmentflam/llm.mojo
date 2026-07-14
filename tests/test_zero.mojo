@@ -578,5 +578,158 @@ def test_multi_sharded_parameter_gather_cpu() raises:
     cpu_coord_ptr.free()
 
 
+# ===----------------------------------------------------------------------=== #
+# Multi-rank GPU tests (staged-copy collectives; 2 NVIDIA GPUs required)
+# ===----------------------------------------------------------------------=== #
+
+
+def _gpu_multirank_available() raises -> Bool:
+    if not has_nvidia_gpu_accelerator():
+        return False
+    if DeviceContext.number_of_devices() < 2:
+        return False
+    # A driver-faulted GPU ("GPU requires reset") can shrink the usable
+    # ordinal range below number_of_devices(); probe both devices for real.
+    try:
+        var c0 = DeviceContext(device_id=0)
+        var c1 = DeviceContext(device_id=1)
+        var b0 = c0.enqueue_create_buffer[DType.float32](4)
+        var b1 = c1.enqueue_create_buffer[DType.float32](4)
+        b0.enqueue_fill(Float32(0.0))
+        b1.enqueue_fill(Float32(0.0))
+        c0.synchronize()
+        c1.synchronize()
+        return True
+    except:
+        return False
+
+
+def test_multi_gpu_collectives() raises:
+    """Drive all three staged-copy GPU collectives end to end (N=2).
+
+    Exercises per-rank DeviceContext(device_id=rank), coordinator pointer
+    exchange, cross-device staged copies, and the fp32-accumulate add
+    kernel — allreduce, reducescatter, and allgather sequentially inside
+    ONE rank-thread session. A single combined test (not three) on
+    purpose: every extra GPU test pays a full CUDA context-init per rank,
+    which on a degraded driver (e.g. a co-resident faulted GPU) runs into
+    minutes and pushed this file past make test-mojo's 600 s per-file
+    timeout when the ops were separate tests.
+    """
+    if not _gpu_multirank_available():
+        return
+
+    comptime WORLD_SIZE = 2
+    comptime DTYPE = DType.float32
+    comptime shard = 64
+    comptime size = shard * WORLD_SIZE
+
+    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
+
+    # Per-op snapshots, indexed [rank*len + j]:
+    #   ar_out    — full buffer after allreduce
+    #   rs_shard  — shard output after reducescatter
+    #   ag_out    — full buffer after allgather
+    var ar_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rs_shard = alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
+    var ag_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+
+    @parameter
+    def _run_rank(rank: Int):
+        try:
+            var ctx = DeviceContext(device_id=rank)
+            var z_ctx = ZeroContext["gpu", WORLD_SIZE](
+                rank=rank,
+                zero_stage=1,
+                ctx=ctx,
+                cpu_coord=cpu_coord_ptr,
+            )
+            z_ctx.ensure_comm_setup(shard * size_of[Scalar[DTYPE]]())
+
+            var host = ctx.enqueue_create_host_buffer[DTYPE](size)
+            var host_s = ctx.enqueue_create_host_buffer[DTYPE](shard)
+            var buf = ctx.enqueue_create_buffer[DTYPE](size)
+            var shard_buf = ctx.enqueue_create_buffer[DTYPE](shard)
+            var buf_ptr = rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+            var shard_ptr = rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                shard_buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+
+            # ---- allreduce: rank r's element j = (r+1)*(j+1) ----
+            for j in range(size):
+                host[j] = Float32((rank + 1) * (j + 1))
+            buf.enqueue_copy_from(host)
+            ctx.synchronize()
+            z_ctx.allreduce[DTYPE](buf_ptr, size)
+            buf.enqueue_copy_to(host)
+            ctx.synchronize()
+            for j in range(size):
+                ar_out[rank * size + j] = host[j]
+
+            # ---- reducescatter: same inputs, shard output ----
+            for j in range(size):
+                host[j] = Float32((rank + 1) * (j + 1))
+            buf.enqueue_copy_from(host)
+            shard_buf.enqueue_fill(Float32(0.0))
+            ctx.synchronize()
+            z_ctx.reducescatter[DTYPE](buf_ptr, shard_ptr, shard)
+            shard_buf.enqueue_copy_to(host_s)
+            ctx.synchronize()
+            for j in range(shard):
+                rs_shard[rank * shard + j] = host_s[j]
+
+            # ---- allgather: only my slice is mine; the other is zeroed so
+            # stale data can't fake a pass ----
+            for j in range(size):
+                host[j] = Float32(0.0)
+            var off = rank * shard
+            for j in range(shard):
+                host[off + j] = Float32((rank + 1) * 1000 + j)
+            buf.enqueue_copy_from(host)
+            ctx.synchronize()
+            z_ctx.allgather[DTYPE](buf_ptr, shard)
+            buf.enqueue_copy_to(host)
+            ctx.synchronize()
+            for j in range(size):
+                ag_out[rank * size + j] = host[j]
+        except e:
+            print("multi-gpu rank", rank, "error:", e)
+
+    sync_parallelize[_run_rank](WORLD_SIZE)
+
+    # allreduce: every rank's full buffer[j] == 3*(j+1)  (sum of r+1).
+    for r in range(WORLD_SIZE):
+        for j in range(size):
+            assert_almost_equal[DTYPE](
+                ar_out[r * size + j], Float32(3 * (j + 1)), atol=1e-5
+            )
+    # reducescatter: rank r's shard[j] == 3*(r*shard + j + 1).
+    for r in range(WORLD_SIZE):
+        for j in range(shard):
+            assert_almost_equal[DTYPE](
+                rs_shard[r * shard + j],
+                Float32(3 * (r * shard + j + 1)),
+                atol=1e-5,
+            )
+    # allgather: every rank's slice k == rank k's staged shard values.
+    for r in range(WORLD_SIZE):
+        for k in range(WORLD_SIZE):
+            for j in range(shard):
+                assert_almost_equal[DTYPE](
+                    ag_out[r * size + k * shard + j],
+                    Float32((k + 1) * 1000 + j),
+                    atol=1e-5,
+                )
+
+    ar_out.free()
+    rs_shard.free()
+    ag_out.free()
+    cpu_coord_ptr[].free()
+    cpu_coord_ptr.free()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

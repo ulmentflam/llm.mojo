@@ -1,17 +1,16 @@
 from std.atomic import Atomic
 from std.sys.info import size_of
 from std.ffi import external_call
+from std.math import ceildiv
 from comm import Signal, MAX_GPUS
 from comm.allgather import allgather
-from comm.allreduce import allreduce
 from std.collections import InlineArray
 from layout.tile_layout import row_major
 from std.algorithm import sync_parallelize
+from std.gpu import block_dim, block_idx, thread_idx
 from layout import TileTensor, TensorLayout
 from std.memory import UnsafePointer, memcpy, alloc
 from std.gpu.host.info import is_cpu, is_gpu
-from comm.reducescatter import reducescatter
-from comm.sync import enable_p2p, init_signal_buffer
 from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.sys import has_nvidia_gpu_accelerator
 
@@ -68,6 +67,15 @@ struct CpuBarrier:
 
 
 struct CpuCoordinator:
+    """Host-thread coordinator for N ranks living in one process.
+
+    Despite the name it coordinates both CPU-rank and GPU-rank threads: the
+    barriers and pointer-exchange slots are pure host constructs, and for the
+    multi-GPU path `shared_inputs`/`shared_outputs` carry *device* pointer
+    addresses (each rank registers its own device buffer, peers read the
+    address and pull via cross-device staged copies).
+    """
+
     var barrier1: UnsafePointer[CpuBarrier, MutUntrackedOrigin]
     var barrier2: UnsafePointer[CpuBarrier, MutUntrackedOrigin]
     var shared_inputs: UnsafePointer[
@@ -76,6 +84,9 @@ struct CpuCoordinator:
     var shared_outputs: UnsafePointer[
         UnsafePointer[UInt8, MutUntrackedOrigin], MutUntrackedOrigin
     ]
+    # One Float64 slot per rank for host-side scalar reductions (loss
+    # averaging, global grad-norm partial sums across shards).
+    var shared_scalars: UnsafePointer[Float64, MutUntrackedOrigin]
 
     def __init__(out self, num_threads: Int):
         self.barrier1 = alloc[CpuBarrier](1)
@@ -88,12 +99,14 @@ struct CpuCoordinator:
         self.shared_outputs = alloc[UnsafePointer[UInt8, MutUntrackedOrigin]](
             num_threads
         )
+        self.shared_scalars = alloc[Float64](num_threads)
 
     def free(self) -> None:
         self.barrier1.free()
         self.barrier2.free()
         self.shared_inputs.free()
         self.shared_outputs.free()
+        self.shared_scalars.free()
 
 
 @always_inline
@@ -192,11 +205,64 @@ def _allgather_cpu[
 
 
 # ===----------------------------------------------------------------------=== #
+# GPU staged-copy collective kernel
+# ===----------------------------------------------------------------------=== #
+
+
+def _add_inplace_gpu[
+    dtype: DType
+](
+    dst: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    src: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    size: Int,
+) -> None:
+    """dst[i] += src[i], accumulating in fp32 (bf16-safe)."""
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if idx < size:
+        var s = (dst + idx).load().cast[DType.float32]() + (
+            src + idx
+        ).load().cast[DType.float32]()
+        (dst + idx).store(s.cast[dtype]())
+
+
+comptime _ADD_BLOCK = 256
+
+
+# ===----------------------------------------------------------------------=== #
 # ZeRO Context
 # ===----------------------------------------------------------------------=== #
 
 
 struct ZeroContext[target: StaticString, N: Int = 1]:
+    """Per-rank collective context.
+
+    CPU (N >= 2): ranks are host threads; collectives are memcpy loops
+    synchronized by the shared CpuCoordinator barriers.
+
+    NVIDIA GPU (N >= 2): ranks are host threads, one DeviceContext per GPU
+    (device_id == rank). The GPUs on the target box expose no CUDA P2P
+    mappings (DeviceContext.can_access == False even though nvidia-smi
+    reports P2P "OK"), so Modular's `comm` kernels — which hard-require P2P
+    — are unusable; the collectives are instead hand-rolled as
+    reduce-scatter + all-gather over driver-staged cross-device copies:
+
+      * each rank registers its device pointer in the shared coordinator,
+      * peers wrap the registered addresses in non-owning DeviceBuffer views
+        (with a peer DeviceContext handle) and pull slices via
+        ctx.enqueue_copy(dst_buf=..., src_buf=...), which the driver routes
+        without P2P mappings,
+      * partial sums accumulate through a per-rank scratch shard buffer with
+        a small fp32-accumulate add kernel (_add_inplace_gpu).
+
+    Traffic per rank is 2*(N-1)/N of the buffer per allreduce — same as a
+    ring — measured ~75 GB/s aggregate on the 8-GPU fp32 GPT-2 gradient
+    (~92 ms), vs. N*(N-1) for comm's naive all-pull fallback (which also
+    crashes on cross-device raw-pointer copies on this toolchain).
+
+    signal_buffer remains only because the (P2P-only, unusable here)
+    comm-based ShardedParameter.gather path reads it; it is a 1-byte dummy.
+    """
+
     var rank: Int
     var zero_stage: Int
     var ctx: DeviceContext
@@ -204,6 +270,11 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
     var cpu_coordinator_ptr: Optional[
         UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
     ]
+    # Multi-GPU staged-copy state (empty / 1-byte until ensure_comm_setup runs
+    # on an NVIDIA GPU target with N >= 2).
+    var peer_ctxs: List[DeviceContext]
+    var comm_scratch: DeviceBuffer[DType.uint8]
+    var comm_scratch_bytes: Int
 
     def __init__(
         out self,
@@ -218,33 +289,63 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         self.zero_stage = zero_stage
         self.ctx = ctx
         self.cpu_coordinator_ptr = cpu_coord
-        # P2P signaling (enable_p2p / init_signal_buffer) uses CUDA IPC handles
-        # that have no Metal equivalent. On Apple GPU or CPU the signal_buffer
-        # is a 1-byte dummy that is never used; the GPU collective methods
-        # (allreduce / reducescatter / allgather) raise at runtime for N>=2 on
-        # non-NVIDIA targets — see the comments in those methods.
-        #
-        # Only do the P2P/signal-buffer setup for N >= 2. For N == 1 (the common
-        # single-GPU training case, and the single-rank unit tests) every GPU
-        # collective early-returns without touching the signal buffer, so
-        # enable_p2p() — which enumerates and cross-enables peer access across
-        # ALL visible GPUs — is pure startup cost. On an 8-GPU box that call is
-        # both slow and highly sensitive to contention from other jobs (it was
-        # the dominant cost that pushed tests/test_zero.mojo's single-rank GPU
-        # case toward the make-test timeout). Skipping it for N == 1 leaves a
-        # 1-byte dummy signal_buffer, exactly as on non-NVIDIA targets.
-        comptime if (
-            not is_cpu[Self.target]()
-            and has_nvidia_gpu_accelerator()
-            and Self.N >= 2
-        ):
-            _ = enable_p2p()
-            self.signal_buffer = ctx.enqueue_create_buffer[DType.uint8](
-                max(Self.N, MAX_GPUS) * size_of[Signal]()
+        self.peer_ctxs = List[DeviceContext]()
+        self.comm_scratch_bytes = 0
+        # 1-byte placeholders. ensure_comm_setup sizes comm_scratch for real
+        # multi-GPU use; signal_buffer is a dummy on every path now (see the
+        # struct docstring — the P2P comm kernels are unusable on this box,
+        # and every collective early-returns for N == 1 without touching it).
+        self.signal_buffer = ctx.enqueue_create_buffer[DType.uint8](1)
+        self.comm_scratch = ctx.enqueue_create_buffer[DType.uint8](1)
+
+    def ensure_comm_setup(mut self, max_shard_bytes: Int) raises:
+        """Size the staged-copy scratch shard and build peer DeviceContext
+        handles. Must be called (with the largest per-rank shard size in
+        bytes) before any GPU collective at N >= 2; a no-op elsewhere.
+        """
+        comptime if not is_cpu[Self.target]() and Self.N >= 2:
+            comptime if has_nvidia_gpu_accelerator():
+                if not self.cpu_coordinator_ptr:
+                    raise Error(
+                        "ZeroContext: a shared CpuCoordinator is required for"
+                        " multi-GPU collectives (world_size >= 2)"
+                    )
+                if self.comm_scratch_bytes < max_shard_bytes:
+                    self.comm_scratch = self.ctx.enqueue_create_buffer[
+                        DType.uint8
+                    ](max_shard_bytes)
+                    self.comm_scratch_bytes = max_shard_bytes
+                    self.ctx.synchronize()
+                if len(self.peer_ctxs) == 0:
+                    for i in range(Self.N):
+                        self.peer_ctxs.append(DeviceContext(device_id=i))
+            else:
+                raise Error(
+                    "Multi-GPU collectives require Nvidia GPUs; not supported"
+                    " on this hardware"
+                )
+
+    def allreduce_scalar(self, v: Float64) raises -> Float64:
+        """Sum a host-side scalar across all ranks (any target). Returns v
+        unchanged for N == 1 / missing coordinator."""
+        if Self.N == 1 or not self.cpu_coordinator_ptr:
+            return v
+        var coord_ptr = self.cpu_coordinator_ptr.value()
+        coord_ptr[].shared_scalars[self.rank] = v
+        coord_ptr[].barrier1[].wait()
+        var total = Float64(0.0)
+        for i in range(Self.N):
+            total += coord_ptr[].shared_scalars[i]
+        coord_ptr[].barrier2[].wait()
+        return total
+
+    @always_inline
+    def _check_scratch[dtype: DType](self, shard_elems: Int) raises:
+        if self.comm_scratch_bytes < shard_elems * size_of[Scalar[dtype]]():
+            raise Error(
+                "ZeroContext: comm scratch too small — call"
+                " ensure_comm_setup(max_shard_bytes) before GPU collectives"
             )
-            init_signal_buffer(self.signal_buffer, ctx)
-        else:
-            self.signal_buffer = ctx.enqueue_create_buffer[DType.uint8](1)
 
     def signal_ptr(self) -> UnsafePointer[Signal, MutUntrackedOrigin]:
         return rebind[UnsafePointer[Signal, MutUntrackedOrigin]](
@@ -280,48 +381,97 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             _allreduce_cpu[dtype](self.rank, Self.N, size, coord_ptr)
             coord_ptr[].barrier2[].wait()
         else:
-            # Multi-GPU collectives use the `comm` package's allreduce /
-            # reducescatter / allgather, which rely on CUDA P2P (NVLink /
-            # CUDA IPC) — there is no equivalent for Apple Metal. For N>=2
-            # on a non-NVIDIA GPU this branch raises at runtime; single-GPU
-            # (N==1) returns early above and never hits this check.
+            # Staged-copy allreduce = in-place reduce-scatter + all-gather.
+            # See the struct docstring for why comm's P2P kernels are not used.
+            # In-place is safe by slice-disjointness: in phase 1 rank r only
+            # writes its own buffer's slice [r*shard, (r+1)*shard) while peers
+            # only read slice p (their own index) of r's buffer; in phase 2
+            # rank r writes its slices p != r while peers read slice r.
             comptime if Self.N >= 2:
                 comptime if has_nvidia_gpu_accelerator():
-                    var in_layout = row_major(size)
-                    var out_layout = row_major(size)
-
-                    var input_tensors = InlineArray[
-                        TileTensor[dtype, type_of(in_layout), MutAnyOrigin],
-                        Self.N,
-                    ](uninitialized=True)
-                    for i in range(Self.N):
-                        input_tensors[i] = TileTensor(
-                            Span[Scalar[dtype], MutAnyOrigin](
-                                ptr=ptr, length=size
-                            ),
-                            in_layout,
+                    var shard = size // Self.N
+                    if shard * Self.N != size:
+                        raise Error(
+                            "ZeroContext.allreduce: size must be divisible by"
+                            " N (pass the padded parameter count)"
                         )
+                    self._check_scratch[dtype](shard)
+                    var coord_ptr = _register_and_sync[
+                        dtype, MutAnyOrigin, MutAnyOrigin
+                    ](self.rank, self.cpu_coordinator_ptr, ptr, ptr)
 
-                    var output_tensor = TileTensor(
-                        Span[Scalar[dtype], MutAnyOrigin](ptr=ptr, length=size),
-                        out_layout,
-                    )
-
-                    var rank_sigs = self.get_rank_sigs_any()
-
-                    allreduce[
-                        dtype,
-                        Self.N,
-                        type_of(in_layout),
-                        MutAnyOrigin,
-                        type_of(out_layout),
+                    # Phase 1: reduce every rank's slice[rank] into my
+                    # slice[rank].
+                    var scr = rebind[
+                        UnsafePointer[Scalar[dtype], MutAnyOrigin]
                     ](
-                        input_tensors,
-                        output_tensor,
-                        rank_sigs,
-                        self.ctx,
+                        self.comm_scratch.unsafe_ptr()
+                        .bitcast[Scalar[dtype]]()
+                        .as_unsafe_any_origin()
                     )
+                    comptime add_k = _add_inplace_gpu[dtype]
+                    var compiled_add = self.ctx.compile_function[add_k]()
+                    var my_slice = ptr + self.rank * shard
+                    for step in range(1, Self.N):
+                        var p = (self.rank + step) % Self.N
+                        var peer_base = rebind[
+                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                        ](
+                            coord_ptr[]
+                            .shared_inputs[p]
+                            .bitcast[Scalar[dtype]]()
+                            .as_unsafe_any_origin()
+                        )
+                        var src_view = DeviceBuffer[dtype](
+                            self.peer_ctxs[p],
+                            peer_base + self.rank * shard,
+                            shard,
+                            owning=False,
+                        )
+                        var scr_view = DeviceBuffer[dtype](
+                            self.ctx, scr, shard, owning=False
+                        )
+                        self.ctx.enqueue_copy(
+                            dst_buf=scr_view, src_buf=src_view
+                        )
+                        self.ctx.enqueue_function(
+                            compiled_add,
+                            my_slice,
+                            rebind[
+                                UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
+                            ](scr.as_unsafe_any_origin()),
+                            shard,
+                            grid_dim=(ceildiv(shard, _ADD_BLOCK), 1),
+                            block_dim=(_ADD_BLOCK,),
+                        )
                     self.ctx.synchronize()
+                    coord_ptr[].barrier2[].wait()
+
+                    # Phase 2: gather every peer's reduced slice[p].
+                    for step in range(1, Self.N):
+                        var p = (self.rank + step) % Self.N
+                        var peer_base = rebind[
+                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                        ](
+                            coord_ptr[]
+                            .shared_inputs[p]
+                            .bitcast[Scalar[dtype]]()
+                            .as_unsafe_any_origin()
+                        )
+                        var src_view = DeviceBuffer[dtype](
+                            self.peer_ctxs[p],
+                            peer_base + p * shard,
+                            shard,
+                            owning=False,
+                        )
+                        var dst_view = DeviceBuffer[dtype](
+                            self.ctx, ptr + p * shard, shard, owning=False
+                        )
+                        self.ctx.enqueue_copy(
+                            dst_buf=dst_view, src_buf=src_view
+                        )
+                    self.ctx.synchronize()
+                    coord_ptr[].barrier1[].wait()
                 else:
                     raise Error(
                         "Multi-GPU collectives require Nvidia GPUs; not"
@@ -357,46 +507,79 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             )
             coord_ptr[].barrier2[].wait()
         else:
-            # Same CUDA P2P requirement as allreduce — raises on non-NVIDIA for N>=2.
+            # Staged-copy reduce-scatter: each rank pulls slice
+            # [rank*shard, (rank+1)*shard) of every peer's full input buffer
+            # (length N*shard — callers pass the padded parameter count) and
+            # accumulates into its own separate shard output buffer. Nobody
+            # writes any input buffer, so concurrent peer reads are safe.
             comptime if Self.N >= 2:
                 comptime if has_nvidia_gpu_accelerator():
-                    var in_layout = row_major(sharded_size)
-                    var out_layout = row_major(sharded_size)
-
-                    var input_tensors = InlineArray[
-                        TileTensor[dtype, type_of(in_layout), MutAnyOrigin],
-                        Self.N,
-                    ](uninitialized=True)
-                    for i in range(Self.N):
-                        input_tensors[i] = TileTensor(
-                            Span[Scalar[dtype], MutAnyOrigin](
-                                ptr=input_ptr + i * sharded_size,
-                                length=sharded_size,
-                            ),
-                            in_layout,
-                        )
-
-                    var output_tensor = TileTensor(
-                        Span[Scalar[dtype], MutAnyOrigin](
-                            ptr=output_ptr, length=sharded_size
-                        ),
-                        out_layout,
-                    )
-
-                    var rank_sigs = self.get_rank_sigs_any()
-
-                    reducescatter[
-                        dtype,
-                        Self.N,
-                        type_of(in_layout),
-                        MutAnyOrigin,
+                    var shard = sharded_size
+                    self._check_scratch[dtype](shard)
+                    var coord_ptr = _register_and_sync[
+                        dtype, MutAnyOrigin, MutAnyOrigin
                     ](
-                        input_tensors,
-                        output_tensor,
-                        rank_sigs,
-                        self.ctx,
+                        self.rank,
+                        self.cpu_coordinator_ptr,
+                        input_ptr,
+                        output_ptr,
                     )
+
+                    # Own slice seeds the accumulator (same-device copy).
+                    self.ctx.enqueue_copy(
+                        dst_ptr=output_ptr,
+                        src_ptr=rebind[
+                            UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
+                        ](
+                            (
+                                input_ptr + self.rank * shard
+                            ).as_unsafe_any_origin()
+                        ),
+                        size=shard,
+                    )
+                    var scr = rebind[
+                        UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                    ](
+                        self.comm_scratch.unsafe_ptr()
+                        .bitcast[Scalar[dtype]]()
+                        .as_unsafe_any_origin()
+                    )
+                    comptime add_k = _add_inplace_gpu[dtype]
+                    var compiled_add = self.ctx.compile_function[add_k]()
+                    for step in range(1, Self.N):
+                        var p = (self.rank + step) % Self.N
+                        var peer_base = rebind[
+                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                        ](
+                            coord_ptr[]
+                            .shared_inputs[p]
+                            .bitcast[Scalar[dtype]]()
+                            .as_unsafe_any_origin()
+                        )
+                        var src_view = DeviceBuffer[dtype](
+                            self.peer_ctxs[p],
+                            peer_base + self.rank * shard,
+                            shard,
+                            owning=False,
+                        )
+                        var scr_view = DeviceBuffer[dtype](
+                            self.ctx, scr, shard, owning=False
+                        )
+                        self.ctx.enqueue_copy(
+                            dst_buf=scr_view, src_buf=src_view
+                        )
+                        self.ctx.enqueue_function(
+                            compiled_add,
+                            output_ptr,
+                            rebind[
+                                UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
+                            ](scr.as_unsafe_any_origin()),
+                            shard,
+                            grid_dim=(ceildiv(shard, _ADD_BLOCK), 1),
+                            block_dim=(_ADD_BLOCK,),
+                        )
                     self.ctx.synchronize()
+                    coord_ptr[].barrier2[].wait()
                 else:
                     raise Error(
                         "Multi-GPU collectives require Nvidia GPUs; not"
@@ -427,55 +610,41 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             _allgather_cpu[dtype](self.rank, Self.N, sharded_size, coord_ptr)
             coord_ptr[].barrier2[].wait()
         else:
-            # Same CUDA P2P requirement as allreduce — raises on non-NVIDIA for N>=2.
+            # Staged-copy all-gather: rank r's shard already sits at
+            # ptr + r*shard of its own full buffer; pull every peer p's slice
+            # [p*shard, (p+1)*shard) from p's buffer into mine. Rank r never
+            # writes its own slice r (peers read exactly that slice), so
+            # concurrent pulls are safe.
             comptime if Self.N >= 2:
                 comptime if has_nvidia_gpu_accelerator():
-                    var in_layout = row_major(sharded_size)
-                    var out_layout = row_major(sharded_size)
-
-                    var input_tensors = InlineArray[
-                        TileTensor[dtype, type_of(in_layout), MutAnyOrigin],
-                        Self.N,
-                    ](uninitialized=True)
-                    for i in range(Self.N):
-                        input_tensors[i] = TileTensor(
-                            Span[Scalar[dtype], MutAnyOrigin](
-                                ptr=ptr + i * sharded_size,
-                                length=sharded_size,
-                            ),
-                            in_layout,
+                    var shard = sharded_size
+                    var coord_ptr = _register_and_sync[
+                        dtype, MutAnyOrigin, MutAnyOrigin
+                    ](self.rank, self.cpu_coordinator_ptr, ptr, ptr)
+                    for step in range(1, Self.N):
+                        var p = (self.rank + step) % Self.N
+                        var peer_base = rebind[
+                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                        ](
+                            coord_ptr[]
+                            .shared_inputs[p]
+                            .bitcast[Scalar[dtype]]()
+                            .as_unsafe_any_origin()
                         )
-
-                    var output_tensors = InlineArray[
-                        TileTensor[dtype, type_of(out_layout), MutAnyOrigin],
-                        Self.N,
-                    ](uninitialized=True)
-                    for i in range(Self.N):
-                        output_tensors[i] = TileTensor(
-                            Span[Scalar[dtype], MutAnyOrigin](
-                                ptr=ptr + i * sharded_size,
-                                length=sharded_size,
-                            ),
-                            out_layout,
+                        var src_view = DeviceBuffer[dtype](
+                            self.peer_ctxs[p],
+                            peer_base + p * shard,
+                            shard,
+                            owning=False,
                         )
-
-                    var rank_sigs = self.get_rank_sigs_any()
-
-                    allgather[
-                        dtype,
-                        Self.N,
-                        type_of(in_layout),
-                        MutAnyOrigin,
-                        type_of(out_layout),
-                        MutAnyOrigin,
-                    ](
-                        input_tensors,
-                        output_tensors,
-                        rank_sigs,
-                        self.ctx,
-                        my_rank=self.rank,
-                    )
+                        var dst_view = DeviceBuffer[dtype](
+                            self.ctx, ptr + p * shard, shard, owning=False
+                        )
+                        self.ctx.enqueue_copy(
+                            dst_buf=dst_view, src_buf=src_view
+                        )
                     self.ctx.synchronize()
+                    coord_ptr[].barrier2[].wait()
                 else:
                     raise Error(
                         "Multi-GPU collectives require Nvidia GPUs; not"
