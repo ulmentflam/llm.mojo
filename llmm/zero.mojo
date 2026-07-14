@@ -586,6 +586,102 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                         " supported on this hardware"
                     )
 
+    def reducescatter_inplace[
+        dtype: DType
+    ](self, ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin], size: Int,) raises:
+        """In-place reduce-scatter: rank r's shard [r*shard, (r+1)*shard) of
+        `ptr` is overwritten with the cross-rank SUM of that slice; every other
+        slice is left holding this rank's local (unreduced) contribution.
+
+        This is exactly `allreduce`'s phase 1 without the follow-up all-gather.
+        The optimizer for ZeRO-2/3 then reads its reduced gradient shard
+        directly from `ptr + rank*shard` (identical addressing to ZeRO-1's
+        post-allreduce read), so no separate shard buffer is needed. `size` is
+        the padded parameter count (divisible by N); shard = size // N.
+
+        In-place is safe by slice-disjointness: rank r writes only slice r while
+        every peer p reads only slice p of r's buffer (untouched by r), and r's
+        own read of slice r precedes its write per element.
+        """
+        comptime if is_cpu[Self.target]():
+            if Self.N == 1 or not self.cpu_coordinator_ptr:
+                return
+            var shard = size // Self.N
+            var coord_ptr = _register_and_sync[
+                dtype, MutAnyOrigin, MutAnyOrigin
+            ](self.rank, self.cpu_coordinator_ptr, ptr, ptr)
+            _reducescatter_cpu[dtype](
+                self.rank,
+                Self.N,
+                shard,
+                (ptr + self.rank * shard).as_unsafe_any_origin(),
+                coord_ptr,
+            )
+            coord_ptr[].barrier2[].wait()
+        else:
+            comptime if Self.N >= 2:
+                comptime if has_nvidia_gpu_accelerator():
+                    var shard = size // Self.N
+                    if shard * Self.N != size:
+                        raise Error(
+                            "ZeroContext.reducescatter_inplace: size must be"
+                            " divisible by N (pass the padded parameter count)"
+                        )
+                    self._check_scratch[dtype](shard)
+                    var coord_ptr = _register_and_sync[
+                        dtype, MutAnyOrigin, MutAnyOrigin
+                    ](self.rank, self.cpu_coordinator_ptr, ptr, ptr)
+
+                    var scr = rebind[
+                        UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                    ](
+                        self.comm_scratch.unsafe_ptr()
+                        .bitcast[Scalar[dtype]]()
+                        .as_unsafe_any_origin()
+                    )
+                    comptime add_k = _add_inplace_gpu[dtype]
+                    var compiled_add = self.ctx.compile_function[add_k]()
+                    var my_slice = ptr + self.rank * shard
+                    for step in range(1, Self.N):
+                        var p = (self.rank + step) % Self.N
+                        var peer_base = rebind[
+                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                        ](
+                            coord_ptr[]
+                            .shared_inputs[p]
+                            .bitcast[Scalar[dtype]]()
+                            .as_unsafe_any_origin()
+                        )
+                        var src_view = DeviceBuffer[dtype](
+                            self.peer_ctxs[p],
+                            peer_base + self.rank * shard,
+                            shard,
+                            owning=False,
+                        )
+                        var scr_view = DeviceBuffer[dtype](
+                            self.ctx, scr, shard, owning=False
+                        )
+                        self.ctx.enqueue_copy(
+                            dst_buf=scr_view, src_buf=src_view
+                        )
+                        self.ctx.enqueue_function(
+                            compiled_add,
+                            my_slice,
+                            rebind[
+                                UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
+                            ](scr.as_unsafe_any_origin()),
+                            shard,
+                            grid_dim=(ceildiv(shard, _ADD_BLOCK), 1),
+                            block_dim=(_ADD_BLOCK,),
+                        )
+                    self.ctx.synchronize()
+                    coord_ptr[].barrier2[].wait()
+                else:
+                    raise Error(
+                        "Multi-GPU collectives require Nvidia GPUs; not"
+                        " supported on this hardware"
+                    )
+
     def allgather[
         dtype: DType
     ](

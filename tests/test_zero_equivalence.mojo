@@ -218,11 +218,11 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
                 N
             )
 
-        # ZeRO-1 reads grads_memory + rank*shard directly; ZeRO-2/3 read the
-        # reduce-scattered shard from sharded_grads_memory.
-        if stage >= 2:
-            for i in range(ln):
-                model.sharded_grads_memory[i] = model.grads_memory[off + i]
+        # Every sharded stage now reads its gradient shard from
+        # grads_memory + rank*shard: ZeRO-1 all-reduces (grads replicated),
+        # ZeRO-2/3 reduce-scatter IN PLACE (only slice [off, off+ln) reduced).
+        # The `* N` above already put the reduced sum there, so no separate
+        # shard copy is needed for any stage.
 
         model.update(
             t=1,
