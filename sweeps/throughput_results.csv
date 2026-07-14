@@ -1,0 +1,10 @@
+sweep,b,seq_T,total_batch_d,grad_accum,med_ms_per_step,per_gpu_tok_s,gpu,notes
+8gpu_emul,16,1024,65536,4,380.81,172099,4,per-GPU emulation of 8-GPU step (-d=65536)
+8gpu_emul,32,1024,65536,2,389.37,168313,4,per-GPU emulation of 8-GPU step (-d=65536)
+8gpu_emul,64,1024,65536,1,387.90,168953,4,per-GPU emulation of 8-GPU step (-d=65536)
+saturation,8,1024,8192,1,50.53,162138,5,pure micro-batch throughput (accum=1)
+saturation,16,1024,16384,1,98.84,165763,5,pure micro-batch throughput (accum=1)
+saturation,32,1024,32768,1,198.56,165028,5,pure micro-batch throughput (accum=1)
+saturation,64,1024,65536,1,378.80,173010,6,pure micro-batch throughput (accum=1)
+saturation,128,1024,131072,1,,,6,OOM: single alloc request 98.16GB > 96GB
+saturation,256,1024,262144,1,,,6,OOM: single alloc request 196.31GB > 96GB
