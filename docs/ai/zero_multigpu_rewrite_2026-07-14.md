@@ -146,9 +146,15 @@ reduce-scatter-based paths round bf16 sums differently; val ~3.919 both.
 Grad accumulation: `-d 4096` (accum=2) at z1/W8 trains (25.7k tok/s).
 
 Tests: `tests/test_zero_equivalence.mojo` 6/6 (W2+W8 CPU equivalence,
-unchanged semantics); `tests/test_zero.mojo` 12/12 including three NEW
-multi-GPU tests (N=2) driving the staged allreduce / reducescatter /
-allgather end to end.
+unchanged semantics); `tests/test_zero.mojo` 10/10 including a NEW
+combined multi-GPU test (N=2) driving the staged allreduce /
+reducescatter / allgather end to end in one rank-thread session (one
+test, not three, because each GPU test pays per-rank CUDA context inits
+that intermittently stall for minutes while GPU 1 sits in its fault
+state — with separate tests the file crossed `make test-mojo`'s 600 s
+per-file timeout; even consolidated, this file's wall time on THIS box
+fluctuates with the degraded driver until the GPU is reset, ~2 s on a
+healthy one).
 
 ## Benchmark data
 
