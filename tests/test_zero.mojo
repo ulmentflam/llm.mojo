@@ -462,6 +462,111 @@ def test_multi_cpu_reducescatter_inplace() raises:
     cpu_coord_ptr.free()
 
 
+def test_multi_cpu_reducescatter_buckets() raises:
+    """Bucketed reduce-scatter (the ZeRO-2/3 backward-bucketing path): buckets
+    living contiguously in a per-rank pool but destined for SCATTERED global
+    flat ranges are cross-rank summed and land, per element, in the owning
+    rank's shard accumulator. Mirrors the tensor-major GPT-2 layout, where a
+    layer's gradient tensors sit at far-apart flat offsets but are produced
+    together into one pool.
+    """
+    var ctx = DeviceContext(api="cpu")
+    comptime WORLD_SIZE = 4
+    comptime DTYPE = DType.float32
+    comptime opt = 16
+    comptime padded = opt * WORLD_SIZE  # 64
+
+    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
+
+    # Two buckets: bucket 0 -> flat [0,16) (rank 0's shard), bucket 1 ->
+    # flat [40,56) (spans ranks 2 and 3). The pool holds them back to back.
+    # A third bucket -> flat [16,20) (start of rank 1's shard).
+    comptime B0_LEN = 16
+    comptime B1_LEN = 16
+    comptime B2_LEN = 4
+    comptime POOL = B0_LEN + B1_LEN + B2_LEN
+    var dest = List[Int]()
+    dest.append(0)
+    dest.append(40)
+    dest.append(16)
+    var poff = List[Int]()
+    poff.append(0)
+    poff.append(B0_LEN)
+    poff.append(B0_LEN + B1_LEN)
+    var lens = List[Int]()
+    lens.append(B0_LEN)
+    lens.append(B1_LEN)
+    lens.append(B2_LEN)
+
+    var rank_shards = alloc[Scalar[DTYPE]](WORLD_SIZE * opt)
+    for i in range(WORLD_SIZE * opt):
+        rank_shards[i] = 0.0
+
+    @parameter
+    def _run_rank(rank: Int):
+        try:
+            var z_ctx = ZeroContext["cpu", WORLD_SIZE](
+                rank=rank, zero_stage=2, ctx=ctx, cpu_coord=cpu_coord_ptr
+            )
+            var pool = ctx.enqueue_create_buffer[DTYPE](POOL)
+            var host_pool = ctx.enqueue_create_host_buffer[DTYPE](POOL)
+            # pool element value == (rank+1) * (global_flat_index + 1)
+            for b in range(len(dest)):
+                for j in range(lens[b]):
+                    host_pool.unsafe_ptr()[poff[b] + j] = Float32(
+                        (rank + 1) * (dest[b] + j + 1)
+                    )
+            pool.enqueue_copy_from(host_pool)
+            var shard = ctx.enqueue_create_buffer[DTYPE](opt)
+            shard.enqueue_fill(Float32(0.0))
+            ctx.synchronize()
+
+            z_ctx.reducescatter_buckets[DTYPE](
+                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                    pool.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                dest,
+                poff,
+                lens,
+                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                    shard.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                opt,
+            )
+            ctx.synchronize()
+            var host_shard = ctx.enqueue_create_host_buffer[DTYPE](opt)
+            shard.enqueue_copy_to(host_shard)
+            ctx.synchronize()
+            for j in range(opt):
+                rank_shards[rank * opt + j] = host_shard.unsafe_ptr()[j]
+        except e:
+            print("reducescatter_buckets rank error:", e)
+
+    sync_parallelize[_run_rank](WORLD_SIZE)
+
+    # Expected: for each global flat index f covered by a bucket, the owning
+    # rank's shard[f - r*opt] == sum_k (k+1)*(f+1) == 10*(f+1). Uncovered
+    # indices stay 0. Covered flats: [0,16), [16,20), [40,56).
+    @parameter
+    def _covered(f: Int) -> Bool:
+        return (f < 20) or (f >= 40 and f < 56)
+
+    for r in range(WORLD_SIZE):
+        for j in range(opt):
+            var f = r * opt + j
+            var expected = Float32(10 * (f + 1)) if _covered(f) else Float32(
+                0.0
+            )
+            assert_almost_equal[DTYPE](
+                rank_shards[r * opt + j], expected, atol=1e-4
+            )
+
+    rank_shards.free()
+    cpu_coord_ptr[].free()
+    cpu_coord_ptr.free()
+
+
 def test_multi_cpu_allgather() raises:
     var ctx = DeviceContext(api="cpu")
     comptime WORLD_SIZE = 4

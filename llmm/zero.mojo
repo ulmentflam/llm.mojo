@@ -274,6 +274,10 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
     # on an NVIDIA GPU target with N >= 2).
     var peer_ctxs: List[DeviceContext]
     var comm_scratch: DeviceBuffer[DType.uint8]
+    # Second scratch region: `reducescatter_buckets` stages peer pulls into
+    # comm_scratch2 while accumulating in comm_scratch. Same size as
+    # comm_scratch; a 1-byte dummy until ensure_comm_setup runs.
+    var comm_scratch2: DeviceBuffer[DType.uint8]
     var comm_scratch_bytes: Int
 
     def __init__(
@@ -297,6 +301,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         # and every collective early-returns for N == 1 without touching it).
         self.signal_buffer = ctx.enqueue_create_buffer[DType.uint8](1)
         self.comm_scratch = ctx.enqueue_create_buffer[DType.uint8](1)
+        self.comm_scratch2 = ctx.enqueue_create_buffer[DType.uint8](1)
 
     def ensure_comm_setup(mut self, max_shard_bytes: Int) raises:
         """Size the staged-copy scratch shard and build peer DeviceContext
@@ -312,6 +317,9 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     )
                 if self.comm_scratch_bytes < max_shard_bytes:
                     self.comm_scratch = self.ctx.enqueue_create_buffer[
+                        DType.uint8
+                    ](max_shard_bytes)
+                    self.comm_scratch2 = self.ctx.enqueue_create_buffer[
                         DType.uint8
                     ](max_shard_bytes)
                     self.comm_scratch_bytes = max_shard_bytes
@@ -681,6 +689,187 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                         "Multi-GPU collectives require Nvidia GPUs; not"
                         " supported on this hardware"
                     )
+
+    def reducescatter_buckets[
+        dtype: DType
+    ](
+        self,
+        pool_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        dest_starts: List[Int],
+        pool_offsets: List[Int],
+        lengths: List[Int],
+        shard_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        opt: Int,
+    ) raises:
+        """Bucketed reduce-scatter for ZeRO-2/3 backward gradient bucketing.
+
+        `pool_ptr` holds one or more contiguous gradient *buckets* this rank
+        produced during backward. Bucket b lives at `pool_ptr[pool_offsets[b] :
+        +lengths[b]]` and its elements map to the **global padded parameter
+        flat range** `[dest_starts[b], dest_starts[b] + lengths[b])`.
+
+        For every global flat index f covered by a bucket, the reduced value is
+        the SUM over ranks of that bucket element. Index f is owned by rank
+        `f // opt`; only the owning rank keeps it, **accumulating** into
+        `shard_ptr[f - owner*opt]` (`+=`). The caller zeroes `shard_ptr` once
+        at the first micro-step, so across a gradient-accumulation loop the
+        shard ends up holding sum-over-(ranks, micro-steps) — exactly what the
+        sharded AdamW step consumes, at O(bucket + shard) peak instead of
+        O(full model) gradient residency.
+
+        All ranks call this with identical `dest_starts/pool_offsets/lengths`
+        for the same set of buckets, so the barriers below keep every peer's
+        pool alive across the cross-rank reads and let each rank recycle its
+        pool for the next bucket after the call returns.
+        """
+        comptime if is_cpu[Self.target]():
+            if Self.N == 1 or not self.cpu_coordinator_ptr:
+                # Single rank: the whole vector is this rank's shard (opt ==
+                # padded), so each bucket accumulates straight into shard[dest].
+                for b in range(len(dest_starts)):
+                    var d = dest_starts[b]
+                    var po = pool_offsets[b]
+                    for j in range(lengths[b]):
+                        shard_ptr[d + j] += pool_ptr[po + j]
+                return
+            var coord_ptr = _register_and_sync[
+                dtype, MutAnyOrigin, MutAnyOrigin
+            ](self.rank, self.cpu_coordinator_ptr, pool_ptr, shard_ptr)
+            var lo = self.rank * opt
+            var hi = lo + opt
+            for b in range(len(dest_starts)):
+                var d = dest_starts[b]
+                var po = pool_offsets[b]
+                var ln = lengths[b]
+                # Intersection of this bucket's flat range with my shard.
+                var f0 = max(d, lo)
+                var f1 = min(d + ln, hi)
+                for f in range(f0, f1):
+                    var sum_val = Scalar[dtype](0.0)
+                    for k in range(Self.N):
+                        var k_pool = rebind[
+                            UnsafePointer[Scalar[dtype], MutUntrackedOrigin]
+                        ](coord_ptr[].shared_inputs[k])
+                        sum_val += k_pool[po + (f - d)]
+                    shard_ptr[f - lo] += sum_val
+            coord_ptr[].barrier2[].wait()
+        else:
+            comptime if Self.N >= 2:
+                comptime if has_nvidia_gpu_accelerator():
+                    self._reducescatter_buckets_gpu[dtype](
+                        pool_ptr,
+                        dest_starts,
+                        pool_offsets,
+                        lengths,
+                        shard_ptr,
+                        opt,
+                    )
+                else:
+                    raise Error(
+                        "Multi-GPU collectives require Nvidia GPUs; not"
+                        " supported on this hardware"
+                    )
+
+    def _reducescatter_buckets_gpu[
+        dtype: DType
+    ](
+        self,
+        pool_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        dest_starts: List[Int],
+        pool_offsets: List[Int],
+        lengths: List[Int],
+        shard_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        opt: Int,
+    ) raises:
+        """Staged-copy GPU path for `reducescatter_buckets`.
+
+        Per bucket, each rank reduces only the slice that overlaps its own
+        shard: seed a scratch with its own pool sub-range, pull+add every
+        peer's matching sub-range, then add the reduced slice into its shard
+        accumulator. Two scratch regions (accumulator + peer staging) live in
+        `comm_scratch` (sized to `opt` >= any bucket-shard overlap; a second
+        `comm_scratch2` of the same size stages peer pulls).
+        """
+        var lo = self.rank * opt
+        var hi = lo + opt
+        var coord_ptr = _register_and_sync[dtype, MutAnyOrigin, MutAnyOrigin](
+            self.rank, self.cpu_coordinator_ptr, pool_ptr, shard_ptr
+        )
+
+        var acc = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            self.comm_scratch.unsafe_ptr()
+            .bitcast[Scalar[dtype]]()
+            .as_unsafe_any_origin()
+        )
+        var stg = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            self.comm_scratch2.unsafe_ptr()
+            .bitcast[Scalar[dtype]]()
+            .as_unsafe_any_origin()
+        )
+        comptime add_k = _add_inplace_gpu[dtype]
+        var compiled_add = self.ctx.compile_function[add_k]()
+
+        for b in range(len(dest_starts)):
+            var d = dest_starts[b]
+            var po = pool_offsets[b]
+            var ln = lengths[b]
+            var f0 = max(d, lo)
+            var f1 = min(d + ln, hi)
+            if f1 <= f0:
+                continue
+            var seg = f1 - f0
+            var my_pool_off = po + (f0 - d)
+            # Seed accumulator with my own pool slice (same-device copy).
+            self.ctx.enqueue_copy(
+                dst_ptr=acc,
+                src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+                    (pool_ptr + my_pool_off).as_unsafe_any_origin()
+                ),
+                size=seg,
+            )
+            for step in range(1, Self.N):
+                var p = (self.rank + step) % Self.N
+                var peer_base = rebind[
+                    UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                ](
+                    coord_ptr[]
+                    .shared_inputs[p]
+                    .bitcast[Scalar[dtype]]()
+                    .as_unsafe_any_origin()
+                )
+                var src_view = DeviceBuffer[dtype](
+                    self.peer_ctxs[p],
+                    peer_base + my_pool_off,
+                    seg,
+                    owning=False,
+                )
+                var stg_view = DeviceBuffer[dtype](
+                    self.ctx, stg, seg, owning=False
+                )
+                self.ctx.enqueue_copy(dst_buf=stg_view, src_buf=src_view)
+                self.ctx.enqueue_function(
+                    compiled_add,
+                    acc,
+                    rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+                        stg.as_unsafe_any_origin()
+                    ),
+                    seg,
+                    grid_dim=(ceildiv(seg, _ADD_BLOCK), 1),
+                    block_dim=(_ADD_BLOCK,),
+                )
+            # Accumulate the reduced slice into my shard: shard[f0-lo] += acc.
+            self.ctx.enqueue_function(
+                compiled_add,
+                shard_ptr + (f0 - lo),
+                rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+                    acc.as_unsafe_any_origin()
+                ),
+                seg,
+                grid_dim=(ceildiv(seg, _ADD_BLOCK), 1),
+                block_dim=(_ADD_BLOCK,),
+            )
+        self.ctx.synchronize()
+        coord_ptr[].barrier2[].wait()
 
     def allgather[
         dtype: DType
