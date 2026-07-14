@@ -15,6 +15,7 @@ Example of downloading the 100B sample of FineWeb-Edu, from the data directory:
 """
 
 import functools
+import glob
 import os
 import argparse
 import multiprocessing as mp
@@ -22,6 +23,7 @@ import multiprocessing as mp
 import numpy as np
 from tqdm import tqdm
 from datasets import load_dataset
+from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
 from utils import get_gpt2_encoding, write_datafile
@@ -86,6 +88,7 @@ def main(
     version: str = "10B",
     model_desc: str = "gpt-2",
     shard_size: int = 10**8,
+    streaming: bool = False,
 ) -> None:
     assert version in {"10B", "100B"}, "version must be one of: 10B, 100B"
     assert fineweb_type in {"edu", "classic"}, "type must be one of: edu, classic"
@@ -98,11 +101,35 @@ def main(
 
     # download the dataset
     if fineweb_type == "classic":
-        fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split="train")
+        repo_id = "HuggingFaceFW/fineweb"
         name = "fineweb"
     else:  # edu
-        fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
+        repo_id = "HuggingFaceFW/fineweb-edu"
         name = "edu_fineweb"
+    if streaming:
+        # Plain load_dataset() needs the parquet download PLUS a full Arrow
+        # re-encode in the datasets cache before iteration starts (~60 GB for
+        # the 10B sample, before any tokenized output) — more than smaller
+        # hosts have. Instead, fetch just the sample's parquet files into the
+        # hub cache (snapshot_download reuses already-cached blobs, so a
+        # previously failed non-streaming run's download isn't repeated) and
+        # stream directly from them. Sorted file order keeps shard contents
+        # deterministic, matching the non-streaming path.
+        subdir = remote_name.replace("-", "/")  # sample-10BT -> sample/10BT
+        snapshot_dir = snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            allow_patterns=f"{subdir}/*.parquet",
+        )
+        parquet_files = sorted(
+            glob.glob(os.path.join(snapshot_dir, subdir, "*.parquet"))
+        )
+        assert parquet_files, f"no parquet files under {snapshot_dir}/{subdir}"
+        fw = load_dataset(
+            "parquet", data_files=parquet_files, split="train", streaming=True
+        )
+    else:
+        fw = load_dataset(repo_id, name=remote_name, split="train")
 
     if model_desc == "gpt-2":
         tokenize = tokenize_gpt2
@@ -201,5 +228,11 @@ if __name__ == "__main__":
         default=10**8,
         help="Size of each data shard in the output .bin files, in tokens",
     )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="stream-tokenize from the hub-cached parquet files instead of "
+        "materializing an Arrow copy (needs ~60 GB less disk)",
+    )
     args = parser.parse_args()
-    main(args.type, args.version, args.model_desc, args.shard_size)
+    main(args.type, args.version, args.model_desc, args.shard_size, args.streaming)
