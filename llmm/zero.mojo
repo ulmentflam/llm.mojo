@@ -723,7 +723,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         pool for the next bucket after the call returns.
         """
         comptime if is_cpu[Self.target]():
-            if Self.N == 1 or not self.cpu_coordinator_ptr:
+            if Self.N == 1:
                 # Single rank: the whole vector is this rank's shard (opt ==
                 # padded), so each bucket accumulates straight into shard[dest].
                 for b in range(len(dest_starts)):
@@ -731,6 +731,22 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     var po = pool_offsets[b]
                     for j in range(lengths[b]):
                         shard_ptr[d + j] += pool_ptr[po + j]
+                return
+            if not self.cpu_coordinator_ptr:
+                # N > 1 with no coordinator (the sequential-rank equivalence
+                # harness): no peers to sum, so deposit only THIS rank's local
+                # bucket contribution into the slice that overlaps its shard.
+                # The harness scales the shard by N afterward to model the
+                # all-identical-rank reduce (see test_zero_equivalence).
+                var lo = self.rank * opt
+                var hi = lo + opt
+                for b in range(len(dest_starts)):
+                    var d = dest_starts[b]
+                    var po = pool_offsets[b]
+                    var f0 = max(d, lo)
+                    var f1 = min(d + lengths[b], hi)
+                    for f in range(f0, f1):
+                        shard_ptr[f - lo] += pool_ptr[po + (f - d)]
                 return
             var coord_ptr = _register_and_sync[
                 dtype, MutAnyOrigin, MutAnyOrigin
