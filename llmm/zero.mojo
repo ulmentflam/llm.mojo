@@ -960,6 +960,145 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                         " supported on this hardware"
                     )
 
+    def allgather_ranges[
+        dtype: DType
+    ](
+        self,
+        shard_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        shard_size: Int,
+        dst_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        dst_offsets: List[Int],
+        flat_starts: List[Int],
+        lengths: List[Int],
+    ) raises:
+        """Gather arbitrary flat sub-ranges of the *conceptual full* parameter
+        vector out of the per-rank persistent shards into a local window.
+
+        This is the primitive behind ZeRO-3 per-layer parameter streaming. The
+        full vector is sharded so that rank r owns indices
+        `[r*shard_size, (r+1)*shard_size)`, stored at local offset 0 of its
+        `shard_base` buffer. Every rank calls this collective with the SAME
+        `(dst_offsets, flat_starts, lengths)` lists (they describe the tensor
+        slices of the layer being streamed); each rank fills its OWN `dst_base`
+        window — range i lands at `dst_base + dst_offsets[i]` and covers
+        `[flat_starts[i], flat_starts[i]+lengths[i])` of the full vector.
+
+        For each requested range and each rank p, the intersection with p's
+        shard is copied from p's shard (a same-device copy when p is me, a
+        driver-staged cross-device pull otherwise, mirroring `allgather`). No
+        shard is ever written, so concurrent peer reads are safe; a trailing
+        barrier orders this gather against the next collective's slot reuse.
+        """
+        var count = len(lengths)
+        comptime if is_cpu[Self.target]():
+            if Self.N == 1 or not self.cpu_coordinator_ptr:
+                # Single rank owns the whole vector at local offset 0.
+                for i in range(count):
+                    var fs = flat_starts[i]
+                    var d = dst_base + dst_offsets[i]
+                    for j in range(lengths[i]):
+                        d[j] = shard_base[fs + j]
+                return
+            var coord_ptr = _register_and_sync[
+                dtype, MutAnyOrigin, MutAnyOrigin
+            ](self.rank, self.cpu_coordinator_ptr, shard_base, shard_base)
+            for i in range(count):
+                var fs = flat_starts[i]
+                var ln = lengths[i]
+                var d = dst_base + dst_offsets[i]
+                for p in range(Self.N):
+                    var lo = max(fs, p * shard_size)
+                    var hi = min(fs + ln, (p + 1) * shard_size)
+                    if hi <= lo:
+                        continue
+                    var peer = rebind[
+                        UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                    ](
+                        coord_ptr[]
+                        .shared_inputs[p]
+                        .bitcast[Scalar[dtype]]()
+                        .as_unsafe_any_origin()
+                    )
+                    var d_off = lo - fs
+                    var s_off = lo - p * shard_size
+                    for j in range(hi - lo):
+                        d[d_off + j] = peer[s_off + j]
+            coord_ptr[].barrier2[].wait()
+        else:
+            comptime if Self.N >= 2:
+                comptime if has_nvidia_gpu_accelerator():
+                    var coord_ptr = _register_and_sync[
+                        dtype, MutAnyOrigin, MutAnyOrigin
+                    ](
+                        self.rank,
+                        self.cpu_coordinator_ptr,
+                        shard_base,
+                        shard_base,
+                    )
+                    for i in range(count):
+                        var fs = flat_starts[i]
+                        var ln = lengths[i]
+                        for p in range(Self.N):
+                            var lo = max(fs, p * shard_size)
+                            var hi = min(fs + ln, (p + 1) * shard_size)
+                            if hi <= lo:
+                                continue
+                            var n = hi - lo
+                            var d = dst_base + dst_offsets[i] + (lo - fs)
+                            if p == self.rank:
+                                self.ctx.enqueue_copy(
+                                    dst_ptr=d,
+                                    src_ptr=rebind[
+                                        UnsafePointer[
+                                            Scalar[dtype], ImmutAnyOrigin
+                                        ]
+                                    ](
+                                        (
+                                            shard_base + (lo - p * shard_size)
+                                        ).as_unsafe_any_origin()
+                                    ),
+                                    size=n,
+                                )
+                            else:
+                                var peer_base = rebind[
+                                    UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                                ](
+                                    coord_ptr[]
+                                    .shared_inputs[p]
+                                    .bitcast[Scalar[dtype]]()
+                                    .as_unsafe_any_origin()
+                                )
+                                var src_view = DeviceBuffer[dtype](
+                                    self.peer_ctxs[p],
+                                    peer_base + (lo - p * shard_size),
+                                    n,
+                                    owning=False,
+                                )
+                                var dst_view = DeviceBuffer[dtype](
+                                    self.ctx, d, n, owning=False
+                                )
+                                self.ctx.enqueue_copy(
+                                    dst_buf=dst_view, src_buf=src_view
+                                )
+                    self.ctx.synchronize()
+                    coord_ptr[].barrier2[].wait()
+                else:
+                    raise Error(
+                        "Multi-GPU collectives require Nvidia GPUs; not"
+                        " supported on this hardware"
+                    )
+            else:
+                # N == 1 GPU: own buffer holds the whole vector at offset 0.
+                for i in range(count):
+                    self.ctx.enqueue_copy(
+                        dst_ptr=dst_base + dst_offsets[i],
+                        src_ptr=rebind[
+                            UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
+                        ]((shard_base + flat_starts[i]).as_unsafe_any_origin()),
+                        size=lengths[i],
+                    )
+                self.ctx.synchronize()
+
 
 # ===----------------------------------------------------------------------=== #
 # ShardedParameter for Zero-3 Sharding & Offload

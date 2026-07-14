@@ -997,5 +997,99 @@ def test_multi_gpu_collectives() raises:
     cpu_coord_ptr.free()
 
 
+def test_multi_cpu_allgather_ranges() raises:
+    """Gather arbitrary flat sub-ranges (the ZeRO-3 per-layer parameter-
+    streaming primitive `allgather_ranges`) of a sharded vector from every rank's
+    persistent shard into a local window. The conceptual full vector holds
+    value == index; rank r owns [r*shard, (r+1)*shard). Two requested ranges
+    deliberately straddle shard boundaries so the cross-rank staged pulls are
+    exercised. Every rank must reconstruct the same window == the full vector's
+    values at those indices.
+    """
+    var ctx = DeviceContext(api="cpu")
+    comptime WORLD_SIZE = 4
+    comptime DTYPE = DType.float32
+    comptime shard = 16
+    # Two ranges: [8,24) spans shards 0-1; [30,50) spans shards 1-3.
+    comptime lenA = 16
+    comptime lenB = 20
+    comptime win = lenA + lenB
+
+    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
+
+    var rank_windows = alloc[Scalar[DTYPE]](WORLD_SIZE * win)
+    for i in range(WORLD_SIZE * win):
+        rank_windows[i] = 0.0
+
+    @parameter
+    def _run_rank(rank: Int):
+        try:
+            var z_ctx = ZeroContext["cpu", WORLD_SIZE](
+                rank=rank,
+                zero_stage=3,
+                ctx=ctx,
+                cpu_coord=cpu_coord_ptr,
+            )
+
+            # This rank's persistent shard: value == global index.
+            var shard_buf = ctx.enqueue_create_buffer[DTYPE](shard)
+            var host_shard = ctx.enqueue_create_host_buffer[DTYPE](shard)
+            for j in range(shard):
+                host_shard.unsafe_ptr()[j] = Float32(rank * shard + j)
+            shard_buf.enqueue_copy_from(host_shard)
+            ctx.synchronize()
+
+            var win_buf = ctx.enqueue_create_buffer[DTYPE](win)
+            var dst_offsets = List[Int]()
+            dst_offsets.append(0)
+            dst_offsets.append(lenA)
+            var flat_starts = List[Int]()
+            flat_starts.append(8)
+            flat_starts.append(30)
+            var lengths = List[Int]()
+            lengths.append(lenA)
+            lengths.append(lenB)
+
+            z_ctx.allgather_ranges[DTYPE](
+                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                    shard_buf.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                shard,
+                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                    win_buf.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                dst_offsets,
+                flat_starts,
+                lengths,
+            )
+            ctx.synchronize()
+
+            var host_win = ctx.enqueue_create_host_buffer[DTYPE](win)
+            win_buf.enqueue_copy_to(host_win)
+            ctx.synchronize()
+            for j in range(win):
+                rank_windows[rank * win + j] = host_win.unsafe_ptr()[j]
+        except e:
+            print("allgather_ranges rank error:", e)
+
+    sync_parallelize[_run_rank](WORLD_SIZE)
+
+    # Every rank's window == full-vector values at [8,24) then [30,50).
+    for r in range(WORLD_SIZE):
+        for j in range(lenA):
+            assert_almost_equal[DTYPE](
+                rank_windows[r * win + j], Float32(8 + j), atol=1e-6
+            )
+        for j in range(lenB):
+            assert_almost_equal[DTYPE](
+                rank_windows[r * win + lenA + j], Float32(30 + j), atol=1e-6
+            )
+
+    rank_windows.free()
+    cpu_coord_ptr[].free()
+    cpu_coord_ptr.free()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
