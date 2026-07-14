@@ -1105,8 +1105,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var zero_ctx: ZeroContext[Self.target, Self.WORLD_SIZE]
     var optimizer_num_parameters: Int
     var padded_num_parameters: Int
-    var sharded_grads_buf: DeviceBuffer[GPT2_DTYPE]
-    var sharded_grads_memory: MutMemPtr[GPT2_DTYPE]
 
     def __init__(
         out self,
@@ -1153,9 +1151,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
         var NULL_MASTER_PTR = MutMemPtr[MASTER_DTYPE](unsafe_from_address=zero)
         var NULL_INT32_PTR = MutMemPtr[DType.int32](unsafe_from_address=zero)
-
-        self.sharded_grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
-        self.sharded_grads_memory = NULL_DTYPE_PTR
 
         self.params_memory = NULL_DTYPE_PTR
         self.grads_memory = NULL_DTYPE_PTR
@@ -1759,37 +1754,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.grads.point_parameters(self.param_sizes, self.grads_memory)
         self.num_grads = self.num_parameters
 
-        comptime if Self.WORLD_SIZE > 1:
-            # ZeRO-2/3 shards the gradient communication (reduce-scatter).
-            # ZeRO-1 uses allreduce so gradients stay fully replicated in grads_memory;
-            # the optimizer reads grads_memory + rank*opt directly, no shard buffer needed.
-            if self.zero_ctx.zero_stage >= 2:
-                self.sharded_grads_buf = self.ctx.enqueue_create_buffer[
-                    GPT2_DTYPE
-                ](self.optimizer_num_parameters)
-                self.sharded_grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
-                self.ctx.synchronize()
-                self.sharded_grads_memory = rebind_mut_mem[GPT2_DTYPE](
-                    self.sharded_grads_buf.unsafe_ptr().as_unsafe_any_origin()
-                )
-            else:
-                # ZeRO-0 (DDP) and ZeRO-1 keep gradients fully replicated;
-                # no sharded_grads_buf is needed.
-                self.sharded_grads_buf = self.ctx.enqueue_create_buffer[
-                    GPT2_DTYPE
-                ](1)
-                var zero = 0
-                self.sharded_grads_memory = MutMemPtr[GPT2_DTYPE](
-                    unsafe_from_address=zero
-                )
-        else:
-            self.sharded_grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-                1
-            )
-            var zero = 0
-            self.sharded_grads_memory = MutMemPtr[GPT2_DTYPE](
-                unsafe_from_address=zero
-            )
+        # ZeRO-2/3 reduce-scatter gradients IN PLACE into grads_memory: after the
+        # reduce, rank r's shard [r*opt, (r+1)*opt) of grads_memory holds the
+        # cross-rank gradient sum, and the optimizer reads it from
+        # grads_memory + rank*opt — the exact same addressing ZeRO-1 uses after
+        # its all-reduce. No separate gradient shard buffer is allocated for any
+        # stage (this is what lets ZeRO-2/3 peak memory fall to the ZeRO-1 level
+        # rather than sitting above it by one extra gradient shard).
 
         self.has_allocated_grads = True
 
@@ -2726,9 +2697,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # backward kernels keep `+=`-accumulating into them).
         if zero_param_grads and self.has_allocated_grads:
             self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
-            comptime if Self.WORLD_SIZE > 1:
-                if self.zero_ctx.zero_stage >= 2:
-                    self.sharded_grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
 
         comptime if is_cpu[Self.target]():
             # CPU backward kernels were not audited for overwrite-vs-accumulate
@@ -3472,8 +3440,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # ZeRO-0 (DDP) and ZeRO-1 use allreduce: full gradient sum is replicated
             # to all ranks (2N communication). ZeRO-1 then reads grads_memory + rank*opt
             # in the optimizer step.
-            # ZeRO-2/3 use reduce-scatter: each rank receives only its gradient shard
-            # (N communication), which is stored in sharded_grads_memory.
+            # ZeRO-2/3 use an IN-PLACE reduce-scatter (N communication): rank r's
+            # shard [r*opt, (r+1)*opt) of grads_memory is overwritten with the
+            # cross-rank gradient sum. The optimizer then reads that shard from
+            # grads_memory + rank*opt — identical addressing to ZeRO-1's
+            # post-allreduce read, so no separate shard buffer is needed.
             if self.zero_ctx.zero_stage <= 1:
                 # Padded length: the staged GPU allreduce slices the buffer
                 # into WORLD_SIZE equal SIMD-aligned shards. The padding tail
@@ -3486,14 +3457,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.padded_num_parameters,
                 )
             else:
-                self.zero_ctx.reducescatter(
+                self.zero_ctx.reducescatter_inplace(
                     rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.grads_memory.as_unsafe_any_origin()
                     ),
-                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                        self.sharded_grads_memory.as_unsafe_any_origin()
-                    ),
-                    self.optimizer_num_parameters,
+                    self.padded_num_parameters,
                 )
             self.ctx.synchronize()
 
@@ -3541,13 +3509,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.optimizer_num_parameters,
                     )
                     p_ptr = self.params_memory + offset
-                    # ZeRO-1: grads were allreduced — each rank reads its shard directly
-                    # from the replicated grads_memory (no sharded_grads_buf allocated).
-                    # ZeRO-2/3: grads were reduce-scattered into sharded_grads_memory.
-                    if self.zero_ctx.zero_stage == 1:
-                        g_ptr = self.grads_memory + offset
-                    else:
-                        g_ptr = self.sharded_grads_memory
+                    # Every sharded stage now reads its gradient shard from
+                    # grads_memory + offset: ZeRO-1 all-reduced (grads fully
+                    # replicated), ZeRO-2/3 in-place reduce-scattered (only slice
+                    # [offset, offset+opt) holds the reduced sum) — same address.
+                    g_ptr = self.grads_memory + offset
                     update_num_params = local_num_params
 
             if update_num_params > 0:
@@ -3635,7 +3601,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     )
                     self.ctx.synchronize()
                 else:
-                    # ZeRO 2/3: grads were reduce-scattered into sharded_grads_memory.
+                    # ZeRO 2/3: grads were reduce-scattered IN PLACE, so this
+                    # rank's reduced shard sits at grads_memory + offset (same
+                    # addressing as ZeRO-1's post-allreduce read).
                     var offset = (
                         self.zero_ctx.rank * self.optimizer_num_parameters
                     )
@@ -3650,7 +3618,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                                 self.params_memory + offset
                             ),
                             as_mut_kernel[GPT2_DTYPE](
-                                self.sharded_grads_memory
+                                self.grads_memory + offset
                             ),
                             as_mut_kernel[MASTER_DTYPE](self.master_memory),
                             USE_BF16,
@@ -3692,13 +3660,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         Multi-rank consistency: after backward() the gradient state differs by
         stage. ZeRO-0/1 all-reduce, so grads_memory holds the identical global
         gradient sum on every rank and the local norm IS the global norm.
-        ZeRO-2/3 reduce-scatter, so grads_memory holds each rank's *local,
-        unreduced* gradient — its norm is meaningless for clipping and differs
-        per rank. Instead we take the sum of squares over this rank's REDUCED
-        shard (sharded_grads_memory; the shards tile the full vector), then sum
-        those partials across ranks via the host-side scalar all-reduce. This
-        makes stage-2/3 clipping decisions identical to stage-0/1 (up to fp
-        summation order).
+        ZeRO-2/3 reduce-scatter IN PLACE, so only this rank's shard
+        [rank*opt, (rank+1)*opt) of grads_memory holds the reduced sum (the
+        other slices hold local, unreduced gradients — meaningless for
+        clipping). Instead we take the sum of squares over this rank's REDUCED
+        shard at grads_memory + rank*opt (the shards tile the full vector),
+        then sum those partials across ranks via the host-side scalar
+        all-reduce. This makes stage-2/3 clipping decisions identical to
+        stage-0/1 (up to fp summation order).
 
         Normalization: after the cross-rank reduce, grads hold the SUM over
         ranks while the optimizer applies grad_scale / WORLD_SIZE (i.e. the
@@ -3713,9 +3682,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         comptime if Self.WORLD_SIZE > 1:
             if self.zero_ctx.zero_stage >= 2:
                 # optimizer_num_parameters includes the zero-filled padding
-                # tail on the last rank(s); zeros contribute nothing.
+                # tail on the last rank(s); zeros contribute nothing. The
+                # in-place reduce-scatter left this rank's reduced shard at
+                # grads_memory + rank*opt.
                 n = self.optimizer_num_parameters
-                grads_src = self.sharded_grads_memory
+                grads_src = self.grads_memory + (
+                    self.zero_ctx.rank * self.optimizer_num_parameters
+                )
                 sharded = True
         comptime width = simd_width_of[GPT2_DTYPE]()
 

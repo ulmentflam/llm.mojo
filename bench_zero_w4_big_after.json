@@ -1,0 +1,407 @@
+{
+  "generated": "2026-07-14T13:54:02",
+  "host": "workstation-max",
+  "gpu_count": 8,
+  "world_size": 4,
+  "flags": {
+    "b": 32,
+    "t": 1024,
+    "d": null,
+    "steps": 8
+  },
+  "note": "Run-side data only (no plotting). mean_step_ms excludes the first 2 warmup steps. peak_mem_mib_* sampled via nvidia-smi during the run. Stages with status!='ok' did not train.",
+  "results": [
+    {
+      "stage": 0,
+      "precision": "fp32",
+      "world_size": 4,
+      "flags": {
+        "b": 32,
+        "t": 1024,
+        "d": null,
+        "steps": 8
+      },
+      "status": "ok",
+      "mean_step_ms": 466.4083333333333,
+      "tokens_per_sec": 281024.13836230774,
+      "tokens_per_step": 131072,
+      "peak_mem_mib_per_gpu_raw": {
+        "0": 2,
+        "1": 2,
+        "2": 2,
+        "3": 83394,
+        "4": 83394,
+        "5": 83394,
+        "6": 83394,
+        "7": 2
+      },
+      "peak_mem_mib_per_gpu_delta": {
+        "0": 0,
+        "1": 0,
+        "2": 0,
+        "3": 83392,
+        "4": 83392,
+        "5": 83392,
+        "6": 83392,
+        "7": 0
+      },
+      "peak_mem_mib_max_delta": 83392,
+      "num_gpus_touched": 4,
+      "losses": [
+        3.441621,
+        3.930758,
+        3.798117,
+        3.625041,
+        3.59148,
+        3.685365,
+        3.496075,
+        3.615246
+      ],
+      "wall_s": 13.5,
+      "stderr_tail": ""
+    },
+    {
+      "stage": 1,
+      "precision": "fp32",
+      "world_size": 4,
+      "flags": {
+        "b": 32,
+        "t": 1024,
+        "d": null,
+        "steps": 8
+      },
+      "status": "ok",
+      "mean_step_ms": 491.715,
+      "tokens_per_sec": 266560.91435079265,
+      "tokens_per_step": 131072,
+      "peak_mem_mib_per_gpu_raw": {
+        "0": 2,
+        "1": 2,
+        "2": 2,
+        "3": 82626,
+        "4": 82626,
+        "5": 82626,
+        "6": 82626,
+        "7": 2
+      },
+      "peak_mem_mib_per_gpu_delta": {
+        "0": 0,
+        "1": 0,
+        "2": 0,
+        "3": 82624,
+        "4": 82624,
+        "5": 82624,
+        "6": 82624,
+        "7": 0
+      },
+      "peak_mem_mib_max_delta": 82624,
+      "num_gpus_touched": 4,
+      "losses": [
+        3.441621,
+        3.930767,
+        3.7981,
+        3.625026,
+        3.591466,
+        3.685368,
+        3.496078,
+        3.615241
+      ],
+      "wall_s": 13.2,
+      "stderr_tail": ""
+    },
+    {
+      "stage": 2,
+      "precision": "fp32",
+      "world_size": 4,
+      "flags": {
+        "b": 32,
+        "t": 1024,
+        "d": null,
+        "steps": 8
+      },
+      "status": "ok",
+      "mean_step_ms": 471.0733333333333,
+      "tokens_per_sec": 278241.1797172415,
+      "tokens_per_step": 131072,
+      "peak_mem_mib_per_gpu_raw": {
+        "0": 2,
+        "1": 2,
+        "2": 2,
+        "3": 82626,
+        "4": 82626,
+        "5": 82626,
+        "6": 82626,
+        "7": 2
+      },
+      "peak_mem_mib_per_gpu_delta": {
+        "0": 0,
+        "1": 0,
+        "2": 0,
+        "3": 82624,
+        "4": 82624,
+        "5": 82624,
+        "6": 82624,
+        "7": 0
+      },
+      "peak_mem_mib_max_delta": 82624,
+      "num_gpus_touched": 4,
+      "losses": [
+        3.441621,
+        3.930765,
+        3.798118,
+        3.62503,
+        3.591472,
+        3.685379,
+        3.496075,
+        3.615244
+      ],
+      "wall_s": 13.2,
+      "stderr_tail": ""
+    },
+    {
+      "stage": 3,
+      "precision": "fp32",
+      "world_size": 4,
+      "flags": {
+        "b": 32,
+        "t": 1024,
+        "d": null,
+        "steps": 8
+      },
+      "status": "ok",
+      "mean_step_ms": 475.3533333333333,
+      "tokens_per_sec": 275735.9437891814,
+      "tokens_per_step": 131072,
+      "peak_mem_mib_per_gpu_raw": {
+        "0": 2,
+        "1": 2,
+        "2": 2,
+        "3": 82626,
+        "4": 82626,
+        "5": 82626,
+        "6": 82626,
+        "7": 2
+      },
+      "peak_mem_mib_per_gpu_delta": {
+        "0": 0,
+        "1": 0,
+        "2": 0,
+        "3": 82624,
+        "4": 82624,
+        "5": 82624,
+        "6": 82624,
+        "7": 0
+      },
+      "peak_mem_mib_max_delta": 82624,
+      "num_gpus_touched": 4,
+      "losses": [
+        3.441621,
+        3.930763,
+        3.798117,
+        3.625059,
+        3.591467,
+        3.685368,
+        3.496086,
+        3.615243
+      ],
+      "wall_s": 14.1,
+      "stderr_tail": ""
+    },
+    {
+      "stage": 0,
+      "precision": "bf16",
+      "world_size": 4,
+      "flags": {
+        "b": 32,
+        "t": 1024,
+        "d": null,
+        "steps": 8
+      },
+      "status": "ok",
+      "mean_step_ms": 254.13833333333332,
+      "tokens_per_sec": 515750.6082645279,
+      "tokens_per_step": 131072,
+      "peak_mem_mib_per_gpu_raw": {
+        "0": 1598,
+        "1": 2,
+        "2": 830,
+        "3": 43972,
+        "4": 43972,
+        "5": 43972,
+        "6": 44797,
+        "7": 830
+      },
+      "peak_mem_mib_per_gpu_delta": {
+        "0": 1596,
+        "1": 0,
+        "2": 828,
+        "3": 43970,
+        "4": 43970,
+        "5": 43970,
+        "6": 44795,
+        "7": 828
+      },
+      "peak_mem_mib_max_delta": 44795,
+      "num_gpus_touched": 7,
+      "losses": [
+        3.454052,
+        3.745329,
+        3.589264,
+        3.513307,
+        3.487669,
+        3.632502,
+        3.459283,
+        3.581243
+      ],
+      "wall_s": 9.0,
+      "stderr_tail": ""
+    },
+    {
+      "stage": 1,
+      "precision": "bf16",
+      "world_size": 4,
+      "flags": {
+        "b": 32,
+        "t": 1024,
+        "d": null,
+        "steps": 8
+      },
+      "status": "ok",
+      "mean_step_ms": 259.8283333333333,
+      "tokens_per_sec": 504456.14732804353,
+      "tokens_per_step": 131072,
+      "peak_mem_mib_per_gpu_raw": {
+        "0": 1598,
+        "1": 2,
+        "2": 830,
+        "3": 42692,
+        "4": 42692,
+        "5": 42692,
+        "6": 42692,
+        "7": 830
+      },
+      "peak_mem_mib_per_gpu_delta": {
+        "0": 0,
+        "1": 0,
+        "2": 0,
+        "3": 42690,
+        "4": 42690,
+        "5": 42690,
+        "6": 41860,
+        "7": 0
+      },
+      "peak_mem_mib_max_delta": 42690,
+      "num_gpus_touched": 4,
+      "losses": [
+        3.454052,
+        3.745329,
+        3.589264,
+        3.513307,
+        3.487669,
+        3.632502,
+        3.459283,
+        3.581243
+      ],
+      "wall_s": 9.2,
+      "stderr_tail": ""
+    },
+    {
+      "stage": 2,
+      "precision": "bf16",
+      "world_size": 4,
+      "flags": {
+        "b": 32,
+        "t": 1024,
+        "d": null,
+        "steps": 8
+      },
+      "status": "ok",
+      "mean_step_ms": 251.20666666666668,
+      "tokens_per_sec": 521769.5921021204,
+      "tokens_per_step": 131072,
+      "peak_mem_mib_per_gpu_raw": {
+        "0": 2,
+        "1": 2,
+        "2": 2,
+        "3": 42692,
+        "4": 42692,
+        "5": 42692,
+        "6": 42692,
+        "7": 2
+      },
+      "peak_mem_mib_per_gpu_delta": {
+        "0": 0,
+        "1": 0,
+        "2": 0,
+        "3": 42690,
+        "4": 42690,
+        "5": 42690,
+        "6": 42690,
+        "7": 0
+      },
+      "peak_mem_mib_max_delta": 42690,
+      "num_gpus_touched": 4,
+      "losses": [
+        3.454052,
+        3.745388,
+        3.589267,
+        3.513663,
+        3.487595,
+        3.632418,
+        3.459252,
+        3.581689
+      ],
+      "wall_s": 9.0,
+      "stderr_tail": ""
+    },
+    {
+      "stage": 3,
+      "precision": "bf16",
+      "world_size": 4,
+      "flags": {
+        "b": 32,
+        "t": 1024,
+        "d": null,
+        "steps": 8
+      },
+      "status": "ok",
+      "mean_step_ms": 250.31333333333336,
+      "tokens_per_sec": 523631.7149173035,
+      "tokens_per_step": 131072,
+      "peak_mem_mib_per_gpu_raw": {
+        "0": 2,
+        "1": 2,
+        "2": 2,
+        "3": 42692,
+        "4": 42692,
+        "5": 42692,
+        "6": 42692,
+        "7": 2
+      },
+      "peak_mem_mib_per_gpu_delta": {
+        "0": 0,
+        "1": 0,
+        "2": 0,
+        "3": 42690,
+        "4": 42690,
+        "5": 42690,
+        "6": 42690,
+        "7": 0
+      },
+      "peak_mem_mib_max_delta": 42690,
+      "num_gpus_touched": 4,
+      "losses": [
+        3.454052,
+        3.745388,
+        3.589267,
+        3.513663,
+        3.487595,
+        3.632418,
+        3.459252,
+        3.581689
+      ],
+      "wall_s": 9.4,
+      "stderr_tail": ""
+    }
+  ]
+}

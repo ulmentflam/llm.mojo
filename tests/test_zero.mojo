@@ -387,6 +387,81 @@ def test_multi_cpu_reducescatter() raises:
     cpu_coord_ptr.free()
 
 
+def test_multi_cpu_reducescatter_inplace() raises:
+    """In-place reduce-scatter (the ZeRO-2/3 gradient path): rank r's OWN slice
+    [r*shard, (r+1)*shard) of its full buffer is overwritten with the cross-rank
+    sum; every other slice keeps this rank's local value. This is what lets the
+    optimizer read its reduced gradient shard from grads_memory + rank*shard
+    without a separate shard buffer.
+    """
+    var ctx = DeviceContext(api="cpu")
+    comptime WORLD_SIZE = 4
+    comptime DTYPE = DType.float32
+    comptime size = 64
+    comptime sharded_size = size // WORLD_SIZE
+
+    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
+
+    # Each rank's full buffer holds the constant (r+1) everywhere.
+    var rank_bufs = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    for r in range(WORLD_SIZE):
+        for i in range(size):
+            rank_bufs[r * size + i] = Float32(r + 1)
+
+    @parameter
+    def _run_rank(rank: Int):
+        try:
+            var z_ctx = ZeroContext["cpu", WORLD_SIZE](
+                rank=rank,
+                zero_stage=2,
+                ctx=ctx,
+                cpu_coord=cpu_coord_ptr,
+            )
+
+            var host_ptr = rank_bufs + rank * size
+            var buf = ctx.enqueue_create_buffer[DTYPE](size)
+            var host_in = ctx.enqueue_create_host_buffer[DTYPE](size)
+            for j in range(size):
+                host_in.unsafe_ptr()[j] = host_ptr[j]
+            buf.enqueue_copy_from(host_in)
+            ctx.synchronize()
+
+            z_ctx.reducescatter_inplace[DTYPE](
+                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                    buf.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                size,
+            )
+            ctx.synchronize()
+
+            var host_out = ctx.enqueue_create_host_buffer[DTYPE](size)
+            buf.enqueue_copy_to(host_out)
+            ctx.synchronize()
+            for j in range(size):
+                host_ptr[j] = host_out.unsafe_ptr()[j]
+
+        except e:
+            print("reducescatter_inplace rank error:", e)
+
+    sync_parallelize[_run_rank](WORLD_SIZE)
+
+    # Sum over ranks of (r+1) == 1+2+3+4 == 10.
+    for r in range(WORLD_SIZE):
+        for k in range(WORLD_SIZE):
+            var expected = Float32(10.0) if k == r else Float32(r + 1)
+            for i in range(sharded_size):
+                assert_almost_equal[DTYPE](
+                    rank_bufs[r * size + k * sharded_size + i],
+                    expected,
+                    atol=1e-6,
+                )
+
+    rank_bufs.free()
+    cpu_coord_ptr[].free()
+    cpu_coord_ptr.free()
+
+
 def test_multi_cpu_allgather() raises:
     var ctx = DeviceContext(api="cpu")
     comptime WORLD_SIZE = 4
@@ -633,6 +708,7 @@ def test_multi_gpu_collectives() raises:
     #   ag_out    — full buffer after allgather
     var ar_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
     var rs_shard = alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
+    var rs_ip_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
     var ag_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
 
     @parameter
@@ -681,6 +757,17 @@ def test_multi_gpu_collectives() raises:
             for j in range(shard):
                 rs_shard[rank * shard + j] = host_s[j]
 
+            # ---- reducescatter_inplace: same inputs, reduced in place ----
+            for j in range(size):
+                host[j] = Float32((rank + 1) * (j + 1))
+            buf.enqueue_copy_from(host)
+            ctx.synchronize()
+            z_ctx.reducescatter_inplace[DTYPE](buf_ptr, size)
+            buf.enqueue_copy_to(host)
+            ctx.synchronize()
+            for j in range(size):
+                rs_ip_out[rank * size + j] = host[j]
+
             # ---- allgather: only my slice is mine; the other is zeroed so
             # stale data can't fake a pass ----
             for j in range(size):
@@ -714,6 +801,19 @@ def test_multi_gpu_collectives() raises:
                 Float32(3 * (r * shard + j + 1)),
                 atol=1e-5,
             )
+    # reducescatter_inplace: rank r's OWN slice r holds the reduced sum
+    # 3*(global_index+1); every other slice k keeps rank r's local input
+    # (r+1)*(global_index+1).
+    for r in range(WORLD_SIZE):
+        for k in range(WORLD_SIZE):
+            for j in range(shard):
+                var gidx = k * shard + j
+                var expected = Float32(3 * (gidx + 1)) if k == r else Float32(
+                    (r + 1) * (gidx + 1)
+                )
+                assert_almost_equal[DTYPE](
+                    rs_ip_out[r * size + gidx], expected, atol=1e-5
+                )
     # allgather: every rank's slice k == rank k's staged shard values.
     for r in range(WORLD_SIZE):
         for k in range(WORLD_SIZE):
@@ -726,6 +826,7 @@ def test_multi_gpu_collectives() raises:
 
     ar_out.free()
     rs_shard.free()
+    rs_ip_out.free()
     ag_out.free()
     cpu_coord_ptr[].free()
     cpu_coord_ptr.free()
