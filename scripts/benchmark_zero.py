@@ -391,7 +391,10 @@ def plot(json_path, out_path=None):
                 vals.append(r[field])
         return vals
 
-    fig, (ax_mem, ax_ms) = plt.subplots(1, 2, figsize=(11.5, 5.4), layout="constrained")
+    fig, (ax_mem, ax_ms) = plt.subplots(1, 2, figsize=(11.5, 5.6))
+    # Reserve a top band for the two-line header (title + config line) so it
+    # sits above the per-panel titles instead of colliding with them.
+    fig.subplots_adjust(left=0.055, right=0.985, top=0.80, bottom=0.115, wspace=0.14)
     fig.patch.set_facecolor("white")
     for ax in (ax_mem, ax_ms):
         ax.set_facecolor("white")
@@ -433,18 +436,18 @@ def plot(json_path, out_path=None):
         color=TEXT_INK,
         fontsize=13,
         fontweight="semibold",
+        y=0.965,
     )
-    # Center the subtitle on the whole figure (matching the suptitle) rather
-    # than pinning it to the left axes.
+    # Config line on its own row, centered under the title and above the
+    # per-panel titles (subplots_adjust top=0.80 reserves the room).
     fig.text(
         0.5,
-        0.92,
+        0.895,
         subtitle,
-        transform=fig.transFigure,
         color=TEXT_GRAY,
         fontsize=9.5,
         ha="center",
-        va="top",
+        va="center",
     )
     fig.legend(
         handles=[
