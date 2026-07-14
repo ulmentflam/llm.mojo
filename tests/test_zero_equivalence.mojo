@@ -1,6 +1,6 @@
 from std.testing import assert_almost_equal, assert_true, TestSuite
 from std.sys.info import size_of
-from std.memory import alloc, UnsafePointer, memcpy
+from std.memory import alloc, UnsafePointer
 from std.gpu.host import DeviceContext
 from std.algorithm import sync_parallelize
 from std.python import Python
@@ -13,7 +13,6 @@ from train_gpt2 import GPT2, GPT2_DTYPE
 comptime NUM_PARAMS = 4592
 comptime B = 2
 comptime T = 8
-comptime WORLD_SIZE = 2
 
 
 def read_to_dtype_pointer[
@@ -21,13 +20,23 @@ def read_to_dtype_pointer[
 ](
     ptr: UnsafePointer[Scalar[T], _], mut file_handle: FileHandle, size: Int
 ) raises -> None:
+    # Element-wise copy, mirroring llmm.io.read_and_copy. A byte-wise memcpy from
+    # `bytes_data.unsafe_ptr()` is unsafe here: rebinding that pointer to an
+    # untracked origin drops the List's lifetime tracking, so `bytes_data` is
+    # freed at its last tracked use (the `.unsafe_ptr()` call) *before* the copy
+    # runs — the allocator then clobbers the first element (magic read back as
+    # garbage). Looping over the List keeps it live across the whole copy.
     var bytes_to_read = size * size_of[T]()
     var bytes_data = file_handle.read_bytes(bytes_to_read)
-    var d = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](ptr)
-    var s = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
-        bytes_data.unsafe_ptr()
-    )
-    memcpy(dest=d, src=s, count=bytes_to_read)
+    if len(bytes_data) < bytes_to_read:
+        raise Error("Failed to read enough bytes from file")
+    var dest = rebind[UnsafePointer[Scalar[T], MutUntrackedOrigin]](ptr)
+    var src_ptr = bytes_data.unsafe_ptr().bitcast[Scalar[T]]()
+    for i in range(size):
+        dest[i] = src_ptr[i]
+    # Keep `bytes_data` live until the copy is done: `src_ptr` does not own it,
+    # so without this the List can be freed mid-loop (see comment above).
+    _ = bytes_data^
 
 
 def setup_test_files() raises:
@@ -88,7 +97,14 @@ def cleanup_test_files() raises:
         pass
 
 
-def run_zero_equivalence_test(stage: Int) raises:
+def run_zero_equivalence_test[N: Int](stage: Int) raises:
+    """ZeRO optimizer-sharding equivalence at world size `N`.
+
+    Simulates `N` ranks sequentially on CPU (all ranks see the same batch —
+    this checks the sharded-optimizer math, not data parallelism) and asserts
+    the reduce-scatter -> sharded AdamW -> all-gather round trip reconstructs
+    the exact parameters a single-GPU (WORLD_SIZE=1) baseline produces.
+    """
     # 1. Load inputs and targets from the debug state file
     var state_file = open("gpt2_tiny_debug_state.bin", "r")
     var state_header = alloc[Int32](256)
@@ -161,107 +177,71 @@ def run_zero_equivalence_test(stage: Int) raises:
         baseline_params.free()
         raise Error("Baseline execution failed")
 
-    # 3. Test ZeRO Stage 1 and Stage 2 with WORLD_SIZE = 2 (Sequential simulation)
-    var model0 = GPT2["cpu", WORLD_SIZE](
-        "gpt2_tiny.bin",
-        rank=0,
-        zero_stage=stage,
-        ctx=ctx,
-        cpu_coordinator_ptr=None,
-    )
-    var model1 = GPT2["cpu", WORLD_SIZE](
-        "gpt2_tiny.bin",
-        rank=1,
-        zero_stage=stage,
-        ctx=ctx,
-        cpu_coordinator_ptr=None,
-    )
+    # 3. Simulate the N ranks one at a time. GPT2 is not Movable (so it can't
+    # live in a List); instead we rely on every rank being identical here — same
+    # gpt2_tiny.bin init, same batch, so every rank computes the same gradient
+    # `g`. The all-reduce (sum over N ranks) is therefore exactly `N * g`, and
+    # each rank's owned shard [rank*shard, ...) is optimized independently of the
+    # others. So we can build one rank's model, drive it, assert its shard
+    # matches the baseline slice, discard it, and repeat. The full parameter
+    # vector is the concatenation of the N shards, so per-shard equivalence to
+    # the baseline is exactly whole-vector equivalence after an all-gather.
+    for r in range(N):
+        var model = GPT2["cpu", N](
+            "gpt2_tiny.bin",
+            rank=r,
+            zero_stage=stage,
+            ctx=ctx,
+            cpu_coordinator_ptr=None,
+        )
+        model.forward(
+            rebind[MutMemPtr[DType.int32]](x),
+            rebind[MutMemPtr[DType.int32]](y),
+            B,
+            T,
+        )
+        model.ctx.synchronize()
+        model.zero_gradients()
+        model.backward()
+        model.ctx.synchronize()
 
-    model0.forward(
-        rebind[MutMemPtr[DType.int32]](x),
-        rebind[MutMemPtr[DType.int32]](y),
-        B,
-        T,
-    )
-    model0.ctx.synchronize()
+        # `optimizer_num_parameters` is padded up to the AdamW SIMD width, so
+        # N * shard >= NUM_PARAMS; the last rank(s) may run into zero padding.
+        var shard = model.optimizer_num_parameters
+        var off = r * shard
+        var ln = min(NUM_PARAMS - off, shard) if off < NUM_PARAMS else 0
 
-    model1.forward(
-        rebind[MutMemPtr[DType.int32]](x),
-        rebind[MutMemPtr[DType.int32]](y),
-        B,
-        T,
-    )
-    model1.ctx.synchronize()
+        # All-reduce of gradients over N identical ranks == N * g. update()
+        # divides grad_scale by WORLD_SIZE, so the effective gradient is g again.
+        for i in range(NUM_PARAMS):
+            model.grads_memory[i] = model.grads_memory[i] * Scalar[GPT2_DTYPE](
+                N
+            )
 
-    model0.zero_gradients()
-    model0.backward()
-    model0.ctx.synchronize()
+        # ZeRO-1 reads grads_memory + rank*shard directly; ZeRO-2/3 read the
+        # reduce-scattered shard from sharded_grads_memory.
+        if stage >= 2:
+            for i in range(ln):
+                model.sharded_grads_memory[i] = model.grads_memory[off + i]
 
-    model1.zero_gradients()
-    model1.backward()
-    model1.ctx.synchronize()
+        model.update(
+            t=1,
+            learning_rate=Scalar[DType.float32](1e-4),
+            beta1=Scalar[DType.float32](0.9),
+            beta2=Scalar[DType.float32](0.999),
+            eps=Scalar[DType.float32](1e-8),
+            weight_decay=Scalar[DType.float32](0.01),
+        )
+        model.ctx.synchronize()
 
-    # 4. Manual Allreduce / Reducescatter of gradients
-    for i in range(NUM_PARAMS):
-        var sum_grad = model0.grads_memory[i] + model1.grads_memory[i]
-        model0.grads_memory[i] = sum_grad
-        model1.grads_memory[i] = sum_grad
-
-    # ZeRO-1: grads are allreduced and replicated in grads_memory; update() reads
-    #         grads_memory + rank*opt directly — no sharded_grads_memory needed.
-    # ZeRO-2/3: fill sharded_grads_memory with the reduce-scattered shard so
-    #           update() reads from sharded_grads_memory.
-    if stage >= 2:
-        var shard_size = model0.optimizer_num_parameters
-        var local_len0 = min(NUM_PARAMS, shard_size)
-        for i in range(local_len0):
-            model0.sharded_grads_memory[i] = model0.grads_memory[i]
-
-        var offset1 = shard_size
-        var local_len1 = min(NUM_PARAMS - offset1, shard_size)
-        for i in range(local_len1):
-            model1.sharded_grads_memory[i] = model1.grads_memory[offset1 + i]
-
-    model0.update(
-        t=1,
-        learning_rate=Scalar[DType.float32](1e-4),
-        beta1=Scalar[DType.float32](0.9),
-        beta2=Scalar[DType.float32](0.999),
-        eps=Scalar[DType.float32](1e-8),
-        weight_decay=Scalar[DType.float32](0.01),
-    )
-    model0.ctx.synchronize()
-
-    model1.update(
-        t=1,
-        learning_rate=Scalar[DType.float32](1e-4),
-        beta1=Scalar[DType.float32](0.9),
-        beta2=Scalar[DType.float32](0.999),
-        eps=Scalar[DType.float32](1e-8),
-        weight_decay=Scalar[DType.float32](0.01),
-    )
-    model1.ctx.synchronize()
-
-    # 4b. Stage-3 specific: verify per-rank param shards BEFORE any allgather.
-    # ZeRO-3 skips the post-update allgather (stage 1/2 call it inside update());
-    # instead the next forward() gathers shards on demand. Assert that each rank's
-    # persistent owned shard already matches the corresponding baseline slice.
-    if stage >= 3:
+        # Verify this rank's owned shard matches the baseline slice. For ZeRO-3
+        # this is the pre-allgather persistent shard; for ZeRO-1/2 update() has
+        # already written params_memory[off:off+ln] in place.
         try:
-            var ss3 = model0.optimizer_num_parameters
-            var len3_0 = min(NUM_PARAMS, ss3)
-            for i in range(len3_0):
+            for i in range(ln):
                 assert_almost_equal(
-                    model0.params_memory[i].cast[DType.float32](),
-                    baseline_params[i],
-                    atol=1e-5,
-                )
-            var off3_1 = ss3
-            var len3_1 = min(NUM_PARAMS - off3_1, ss3)
-            for i in range(len3_1):
-                assert_almost_equal(
-                    model1.params_memory[off3_1 + i].cast[DType.float32](),
-                    baseline_params[off3_1 + i],
+                    model.params_memory[off + i].cast[DType.float32](),
+                    baseline_params[off + i],
                     atol=1e-5,
                 )
         except e:
@@ -269,64 +249,48 @@ def run_zero_equivalence_test(stage: Int) raises:
             y.free()
             baseline_params.free()
             raise Error(
-                "Stage-3 per-shard equivalence check failed: " + String(e)
+                "Equivalence check failed at rank "
+                + String(r)
+                + ": "
+                + String(e)
             )
-
-    # 5. Manual Allgather of parameters
-    var shard_size = model0.optimizer_num_parameters
-    var local_len0 = min(NUM_PARAMS, shard_size)
-    for i in range(local_len0):
-        model1.params_memory[i] = model0.params_memory[i]
-
-    var offset1 = shard_size
-    var local_len1 = min(NUM_PARAMS - offset1, shard_size)
-    for i in range(local_len1):
-        model0.params_memory[offset1 + i] = model1.params_memory[offset1 + i]
-
-    # 6. Verify equivalence
-    try:
-        for i in range(NUM_PARAMS):
-            assert_almost_equal(
-                model0.params_memory[i].cast[DType.float32](),
-                baseline_params[i],
-                atol=1e-5,
-            )
-            assert_almost_equal(
-                model1.params_memory[i].cast[DType.float32](),
-                baseline_params[i],
-                atol=1e-5,
-            )
-    except e:
-        x.free()
-        y.free()
-        baseline_params.free()
-        raise Error("Equivalence check failed: " + String(e))
 
     x.free()
     y.free()
     baseline_params.free()
 
 
-def test_zero_stage1_equivalence() raises:
-    run_zero_equivalence_test(1)
+def test_zero_stage1_equivalence_w2() raises:
+    run_zero_equivalence_test[2](1)
 
 
-def test_zero_stage2_equivalence() raises:
-    run_zero_equivalence_test(2)
+def test_zero_stage2_equivalence_w2() raises:
+    run_zero_equivalence_test[2](2)
 
 
-def test_zero_stage3_equivalence() raises:
+def test_zero_stage3_equivalence_w2() raises:
     # ZeRO-3 uses reduce-scatter for gradients (same as stage 2) and sharded
-    # AdamW (same as stage 2), but defers the post-update param allgather to
-    # the next forward() call rather than doing it immediately after update().
-    # run_zero_equivalence_test(3) verifies:
-    #   - Grad reduce-scatter shards feed the optimizer correctly (implicitly,
-    #     via the final param equivalence).
-    #   - Each rank's per-shard params match the baseline BEFORE any allgather
-    #     (the stage-3 specific check inserted at step 4b above).
-    #   - Simulating the forward()-triggered allgather reconstructs the full
-    #     parameter vector identically to the stage-2 / baseline result.
-    run_zero_equivalence_test(3)
+    # AdamW (same as stage 2), but defers the post-update param allgather to the
+    # next forward() call rather than doing it immediately after update(). The
+    # test verifies the reduce-scatter shards feed the optimizer correctly, the
+    # per-shard params match the baseline BEFORE any allgather (step 4b), and the
+    # simulated allgather reconstructs the full vector identically to baseline.
+    run_zero_equivalence_test[2](3)
+
+
+def test_zero_stage1_equivalence_w8() raises:
+    run_zero_equivalence_test[8](1)
+
+
+def test_zero_stage2_equivalence_w8() raises:
+    run_zero_equivalence_test[8](2)
+
+
+def test_zero_stage3_equivalence_w8() raises:
+    # Same round trip as the W2 stage-3 test at the mission's target world size
+    # (8). Exercises the shard-length padding (NUM_PARAMS=4592 is not divisible
+    # by 8) and the last-rank shard that runs into the zero padding.
+    run_zero_equivalence_test[8](3)
 
 
 def main() raises:

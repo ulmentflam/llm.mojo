@@ -223,7 +223,21 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         # is a 1-byte dummy that is never used; the GPU collective methods
         # (allreduce / reducescatter / allgather) raise at runtime for N>=2 on
         # non-NVIDIA targets — see the comments in those methods.
-        comptime if not is_cpu[Self.target]() and has_nvidia_gpu_accelerator():
+        #
+        # Only do the P2P/signal-buffer setup for N >= 2. For N == 1 (the common
+        # single-GPU training case, and the single-rank unit tests) every GPU
+        # collective early-returns without touching the signal buffer, so
+        # enable_p2p() — which enumerates and cross-enables peer access across
+        # ALL visible GPUs — is pure startup cost. On an 8-GPU box that call is
+        # both slow and highly sensitive to contention from other jobs (it was
+        # the dominant cost that pushed tests/test_zero.mojo's single-rank GPU
+        # case toward the make-test timeout). Skipping it for N == 1 leaves a
+        # 1-byte dummy signal_buffer, exactly as on non-NVIDIA targets.
+        comptime if (
+            not is_cpu[Self.target]()
+            and has_nvidia_gpu_accelerator()
+            and Self.N >= 2
+        ):
             _ = enable_p2p()
             self.signal_buffer = ctx.enqueue_create_buffer[DType.uint8](
                 max(Self.N, MAX_GPUS) * size_of[Signal]()

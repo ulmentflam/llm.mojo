@@ -164,7 +164,7 @@ $(PIXI_STAMP):
         profile-metal \
         build-infer build-infer-bf16 build-infer-fp8 data-hellaswag eval eval-cpu benchmark-eval \
         verify-fp8-grads verify-fp8-static-grads calibrate-fp8-scales \
-        build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal \
+        build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal benchmark-zero \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures \
@@ -764,6 +764,28 @@ benchmark-cpu: $(PROFILE_BIN) build-llmc-cpu $(BENCH_SCRIPT)
 benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
 	$(PIXI) run -e cuda python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
 		--gpu-steps $(BENCH_GPU_STEPS)
+
+# ZeRO per-stage benchmark (RUN side only — writes a machine-readable JSON, no
+# plotting; the coordinator owns charts/README). Builds the WORLD_SIZE-sized
+# fp32 + bf16 training binaries, then drives scripts/benchmark_zero.py across
+# ZeRO stages with identical -b/-t/-d flags so the per-stage memory/throughput
+# numbers are comparable. Override BENCH_ZERO_* on the command line, e.g.
+# `make benchmark-zero BENCH_ZERO_WORLD=8 BENCH_ZERO_STAGES=0,1,2,3`.
+BENCH_ZERO_WORLD ?= 8
+BENCH_ZERO_STAGES ?= 0,1,2,3
+BENCH_ZERO_B ?= 4
+BENCH_ZERO_T ?= 64
+BENCH_ZERO_STEPS ?= 12
+BENCH_ZERO_OUT ?= bench_zero_world$(BENCH_ZERO_WORLD).json
+
+benchmark-zero:
+	$(MAKE) build WORLD_SIZE=$(BENCH_ZERO_WORLD)
+	$(MAKE) build-bf16 WORLD_SIZE=$(BENCH_ZERO_WORLD)
+	$(PIXI) run python scripts/benchmark_zero.py \
+		--world-size $(BENCH_ZERO_WORLD) --stages $(BENCH_ZERO_STAGES) \
+		-b $(BENCH_ZERO_B) -t $(BENCH_ZERO_T) --steps $(BENCH_ZERO_STEPS) \
+		--fp32-binary $(TRAIN_BIN) --bf16-binary $(TRAIN_BIN_BF16) \
+		--output $(BENCH_ZERO_OUT)
 
 # Apple Silicon Metal GPU benchmark: llm.mojo vs PyTorch MPS vs MLX, fp32+bf16.
 # 6 arms in one graph, mirroring how benchmark-gpu combines fp32+bf16 for NVIDIA.
