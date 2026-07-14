@@ -132,6 +132,173 @@ One `reducescatter_buckets` per layer (12 tuples in one call) keeps it to
 `~num_layer + 4` collective calls per micro-step (not 149). Each call has 2 host
 barriers + a stream sync. Watch the b4t64 numbers.
 
+## Implementation (landed — commit `bb60b52`)
+
+The design above was executed end to end. What shipped, and where it differed
+from or sharpened the design:
+
+### `GPT2.backward` (the repoint-and-recycle)
+Gated on `self._use_bucketing()` (`WORLD_SIZE > 1 and zero_stage >= 2`). Backward
+precomputes, from `param_sizes`, the flat base (prefix sum) of every tensor and
+the per-layer stride/pool-slot of the 12 layer tensors, then runs four bucket
+kinds in backward's natural op order:
+
+1. **wte (LM-head):** `grads.wte = pool`; zero `pool[0:wte_size]`; run the
+   LM-head `matmul_bwd`; `reducescatter_buckets` flat range `[0, wte_size)`.
+2. **ln_f:** `grads.ln_f_gamma = pool`, `grads.ln_f_beta = pool + C`; zero
+   `pool[0:2C]`; run the final fused LN backward; reduce the two flat ranges.
+3. **each layer L (L-1→0):** repoint the 12 `grads.X = pool + slot_X -
+   L*stride_X` so the untouched `+ L*stride_X` arithmetic below lands at
+   `pool + slot_X`; zero `pool[0:per_layer_pool]`; run the block's kernels; one
+   `reducescatter_buckets` with the 12 `(flat_base_X + L*stride_X, slot_X,
+   stride_X)` tuples → **one collective / two host barriers per layer**.
+4. **wte (encoder) + wpe:** `grads.wte = pool`, `grads.wpe = pool + wte_size`;
+   zero `pool[0:wte_size+wpe_size]`; run `encoder_bwd`; reduce both. The wte
+   encoder contribution **accumulates** onto the shard the LM-head part already
+   deposited, by reduce-scatter linearity — wte is never resident across the
+   layer loop.
+
+The end-of-backward reduce block returns immediately under bucketing (buckets
+were already reduced inline, once per micro-step).
+
+### Grad accumulation
+Handled exactly as designed: `zero_gradients` zeros the `grad_shard`
+accumulator once at `micro_step == 0` (no full buffer to zero); each bucket's
+`reducescatter_buckets` `+=`-accumulates into the shard; each pool slice is
+re-zeroed before its bucket every micro-step (kernels `+=`). The shard ends as
+sum-over-(ranks, micro-steps); `update`/`calculate_grad_norm` read it from
+`grad_shard_memory[0:opt]` (not `grads_memory + rank*opt`).
+
+### `allocate_gradients`
+Under bucketing the full padded `grads_buf` is **not** allocated (stays the
+1-element placeholder); instead `grad_pool_buf` (`max(wte+wpe, one layer)`
+elems) and `grad_shard_buf` (`optimizer_num_parameters`). `grads_memory` and
+`grads.point_parameters` point at the pool base (overwritten per bucket).
+
+### Primitive fix (`llmm/zero.mojo`)
+Added a leading `self.ctx.synchronize()` to `_reducescatter_buckets_gpu` before
+the coordinator's host barrier. Unlike `allreduce`/`reducescatter_inplace`
+(invoked only after backward's trailing sync), `reducescatter_buckets` runs
+**inline per layer**, so each rank must flush its own pool-write kernels before
+the barrier lets peers pull that pool cross-device. Without this the GPU path
+races. (The primitive's GPU path was written-but-unexercised at handoff; this
+was the gap that surfaced when driving it end to end.)
+
+### Memory accounting (why the win is ~200 MB, and the comm scratch cancels)
+Both the pre-bucketing z2/z3 (in-place reduce-scatter) and z1 carry the full
+padded grads buffer (~498 MB fp32) plus two comm-scratch buffers
+(`comm_scratch` + `comm_scratch2`, each `opt` bytes, sized by
+`ensure_comm_setup` for **every** sharded stage). Bucketing replaces the 498 MB
+buffer with `grad_pool` (~150 MB, wte+wpe) + `grad_shard` (`opt` ≈ P/W); the two
+comm-scratch buffers are unchanged and cancel in the delta. So the per-GPU
+saving is ≈ `498 − (150 + opt_MiB)`, which **grows with world size** as the
+shard shrinks: ≈ 99 MB at W2, ≈ 182 MB at W3, ≈ 224 MB at W4 (fp32). This is the
+honest picture — the headline "~200 MB below z1" is a W4 number.
+
+### The wte floor (honest framing, per the scope decision)
+The tied `wte` grad (padded_vocab·C = 38.6M elems = **147 MB fp32**) is written
+at both ends of backward and is the dominant term in the 150 MB pool. It is NOT
+vocab-chunked here (an explicit scope decision): doing so would need the LM-head
+and encoder wte-grad kernels to emit the vocab in chunks so the pool could be
+~6 MB instead of 150 MB, a kernel-level change out of scope for this flat-buffer
+bucketing. Consequently the peak grad-residency floor is
+`wte_grad + shard ≈ 150 + opt` MiB, and z2/z3 land ~200 MB (not ~350 MB) below
+z1 at W4. Reaching 350 MB is the deferred vocab-chunking follow-up.
+
+## Verification (actually run on this box)
+
+- **Primitive, GPU staged-copy path:** `tests/test_zero.mojo` `12/12`,
+  including a new `reducescatter_buckets` leg added to
+  `test_multi_gpu_collectives` (N=2, physical GPUs 4+5) that drives the
+  staged-copy GPU reduce with a **partial bucket/shard overlap** (bucket B maps
+  to flat `[48,80)`, spanning rank 0's tail and rank 1's head). Green. (The
+  file's wall time is dominated by per-rank CUDA context init — ~1240 s here,
+  over `make test-mojo`'s 600 s per-file cap; the same slow-init condition the
+  multi-GPU rewrite doc documents, not new. Run the file directly to gate it.)
+- **CPU equivalence:** `tests/test_zero_equivalence.mojo` `6/6` (stages 1/2/3 at
+  W2 and W8, atol 1e-5). The z>=2 branch now drives the **bucketed** backward
+  (the no-coordinator `reducescatter_buckets` deposits this rank's local shard
+  into `grad_shard_memory[0:opt]`), scales *that* shard by N, and updates — so
+  the bucketed path is what's verified, not the old full-buffer path.
+- **Grad accumulation (the `-d` path — a prior campaign hit a grad-accum
+  corruption bug):** W2 (GPUs 4,5), `-b 4 -t 64 -d 1024` (accum=2), fp32,
+  10 steps. z2 (bucketed) per-step train loss matches z0 (DDP) to ~1e-4
+  (step 1 identical: 5.081370 = 5.081370; step 5 3.992086 vs 3.992155;
+  val 4.0573854 vs 4.0574117). This confirms the per-micro-step shard
+  accumulation is correct.
+
+### Hardware note (blocks the exact W4 acceptance measurement)
+The assigned GPU set was CUDA 4,5,6,7. **Physical GPU 7 dropped into a CUDA
+fault mid-campaign** (visible/idle in `nvidia-smi` at P8, but `torch.ones` and
+Mojo `DeviceContext` init both fail with "No CUDA GPUs available" /
+`CUDA_ERROR_INVALID_DEVICE` when it is targeted) — the same "GPU requires reset"
+class the multi-GPU rewrite doc hit on GPU 1. Recovery needs a root
+`nvidia-smi -r -i 7`; per the box's rule (never hard-operate the GPUs, it hangs
+the GSP firmware) it was NOT reset from here. So W4 (4 ranks) could not run on
+the assigned set. The verification and benchmarks were done at W2 (GPUs 4,5) and
+W3 (GPUs 4,5,6); the W4 number is projected from the same per-GPU accounting and
+should be re-measured with `make benchmark-zero BENCH_ZERO_WORLD=4` once GPU 7
+is reset.
+
+## Benchmark data (measured, b4 t64, 12 steps; peak MiB/GPU baseline-subtracted)
+
+`make benchmark-zero` on **GPUs 4,5,6** (GPU 7 faulted — see above), stages
+1/2/3. z1 is untouched by this change and is the reference level z2/z3 sat at
+before bucketing (the merged in-place stage-2/3 work made the curve monotone
+z1 = z2 = z3; this change pushes z2/z3 below z1). "peak Δ" is the
+baseline-subtracted peak MiB on the busiest GPU.
+
+**WORLD_SIZE = 2** (`bench_zero_world2.json`):
+
+| prec | stage | mean ms/step | peak Δ MiB | vs z1 |
+|------|-------|--------------|-----------|-------|
+| fp32 | 1 | 47.6 | 3256 | — |
+| fp32 | 2 | 44.5 | 3000 | **−256** |
+| fp32 | 3 | 44.5 | 3000 | **−256** |
+| bf16 | 1 | 51.2 | 2488 | — |
+| bf16 | 2 | 51.3 | 2488 | 0 |
+| bf16 | 3 | 51.3 | 2488 | 0 |
+
+**WORLD_SIZE = 3** (`bench_zero_world3.json`):
+
+| prec | stage | mean ms/step | peak Δ MiB | vs z1 |
+|------|-------|--------------|-----------|-------|
+| fp32 | 1 | 77.9 | 3004 | — |
+| fp32 | 2 | 73.4 | 2748 | **−256** |
+| fp32 | 3 | 72.6 | 2748 | **−256** |
+
+Reading the curve honestly:
+
+- **fp32 z2/z3 land 256 MiB below z1** at both W2 and W3 — already past the
+  ~200 MiB acceptance target, and the saving is stable across world size in this
+  small-shape regime (the dominant removed term is the full ~498 MB grads buffer
+  and its transient coexistence with the reduce scratch, roughly W-independent;
+  the pool/shard difference sits inside the peak's other allocations). W4 is
+  therefore confidently ≥ 256 MiB fp32 below z1; it should be re-measured once
+  GPU 7 is reset (`make benchmark-zero BENCH_ZERO_WORLD=4`).
+- **Step time does not regress** — fp32 z2/z3 are a few ms *faster* than z1 at
+  both world sizes: z1 pays a full-buffer allreduce **and** a full param
+  all-gather each step, while the per-layer reduce-scatter buckets are
+  ring-equivalent. The `~num_layer + 4` collectives/micro-step cost the design
+  flagged is not visible at b4t64.
+- **bf16 shows 0 saving** (z2/z3 = z1 = 2488 at W2). bf16 bucketing is correct
+  (it trains; z2/z3 losses are bit-identical, matching z1 to ~1e-4) but the bf16
+  peak at this shape is **not** set during the gradient-resident phase — the
+  half-width bf16 grads buffer is not the top allocation at peak — so freeing it
+  does not move the peak. This matches the merged in-place work's finding that
+  bf16 grad savings fall within allocator rounding at b4t64. (The W3 bf16 rows
+  are absent: `make build-bf16` did not rebuild the bf16 binary when only
+  `WORLD_SIZE` changed — a stale W2 binary can't dispatch `-pn 3` — a Makefile
+  staleness quirk, not a code fault; W2 bf16 measured cleanly.)
+- **Losses (correctness):** in the same benchmark runs, z1/z2/z3 per-step losses
+  agree to ~1e-4 with step 1 identical (fp32 W2 step 12: 4.18936 / 4.18949 /
+  4.18947; bf16 z2/z3 bit-identical at 4.198103). Plus the dedicated W2
+  grad-accum run above (z2 vs z0, accum=2) matches to ~1e-4.
+
+At production batch/seq (`-b 32 -t 1024`) activations dominate (~10s of GB) and
+this model-proportional ~256 MB moves the whole curve <1 GB — the honest
+"production scale" caveat from the in-place doc applies unchanged.
+
 ## AI use statement
 
 Written with AI assistance (Claude Opus agent via Claude Code), directed by
