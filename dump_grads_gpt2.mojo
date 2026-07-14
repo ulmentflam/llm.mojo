@@ -31,10 +31,9 @@ from std.memory import alloc, UnsafePointer
 from std.gpu.host import DeviceContext
 
 from llmm.memory import MutMemPtr
-from llmm.io import write_buffer
+from llmm.io import write_buffer, read_and_copy
 
 from train_gpt2 import GPT2, Parameters, GPT2_DTYPE
-from test_gpt2 import read_to_dtype_pointer
 
 
 def dump_tensor[
@@ -130,15 +129,46 @@ def main() raises:
     # data" across the fp8 and bf16 builds this tool is run against.
     var state_file = open("gpt2_124M_debug_state.bin", "r")
     var state_header = alloc[Int32](256)
-    read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
-    var B: Int = Int(state_header[2])
-    var T: Int = Int(state_header[3])
-    var x = alloc[SIMD[DType.int32, 1]](B * T)
-    var y = alloc[SIMD[DType.int32, 1]](B * T)
-    read_to_dtype_pointer[DType.int32](x, state_file, B * T)
-    read_to_dtype_pointer[DType.int32](y, state_file, B * T)
+    read_and_copy[DType.int32](
+        state_file,
+        rebind[MutMemPtr[DType.int32]](state_header.as_unsafe_any_origin()),
+        256,
+    )
+    var dB: Int = Int(state_header[2])
+    var dT: Int = Int(state_header[3])
+    var dbg_x = alloc[SIMD[DType.int32, 1]](dB * dT)
+    var dbg_y = alloc[SIMD[DType.int32, 1]](dB * dT)
+    read_and_copy[DType.int32](
+        state_file,
+        rebind[MutMemPtr[DType.int32]](dbg_x.as_unsafe_any_origin()),
+        dB * dT,
+    )
+    read_and_copy[DType.int32](
+        state_file,
+        rebind[MutMemPtr[DType.int32]](dbg_y.as_unsafe_any_origin()),
+        dB * dT,
+    )
     state_file.close()
     state_header.free()
+
+    # Optional argv override: <out_dir> [T] [B]. Default is the fixed debug
+    # batch (dB=4, dT=64). A larger T (e.g. 1024) tiles the debug tokens to
+    # fill B*T with valid in-range tokens -- lets this tool reproduce
+    # shape-dependent kernel bugs the T=64 reference batch never exercises.
+    var B: Int = dB
+    var T: Int = dT
+    if len(args) >= 3:
+        T = Int(atol(String(args[2])))
+    if len(args) >= 4:
+        B = Int(atol(String(args[3])))
+    var x = alloc[SIMD[DType.int32, 1]](B * T)
+    var y = alloc[SIMD[DType.int32, 1]](B * T)
+    var ndbg = dB * dT
+    for i in range(B * T):
+        x[i] = dbg_x[i % ndbg]
+        y[i] = dbg_y[i % ndbg]
+    dbg_x.free()
+    dbg_y.free()
 
     model.forward(
         rebind[MutMemPtr[DType.int32]](x),
