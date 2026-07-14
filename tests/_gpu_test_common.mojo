@@ -33,7 +33,7 @@ def shared_gpu_ctx() raises -> DeviceContext:
         return gp.value().bitcast[DeviceContext]()[]
     var ctx = DeviceContext()
     var hp = alloc[DeviceContext](1)
-    hp.init_pointee_move(ctx^)
+    hp.unsafe_write(ctx^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(name), hp.bitcast[NoneType]()
     )
