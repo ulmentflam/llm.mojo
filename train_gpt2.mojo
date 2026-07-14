@@ -1106,6 +1106,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var optimizer_num_parameters: Int
     var padded_num_parameters: Int
 
+    # ZeRO-3 parameter streaming. When `z3_streaming` is set (only when
+    # zero_stage >= 3, WORLD_SIZE > 1, and a real coordinator is attached), the
+    # full parameter buffer is NOT resident: `params_buf`/`params_memory` hold
+    # only this rank's flat shard `[rank*opt, (rank+1)*opt)` at local offset 0,
+    # and forward/backward gather each transformer layer's tensors just-in-time
+    # into `param_window_buf` (and the embedding/head tensors once per step into
+    # `embed_window_buf`), re-pointing `self.params.*` at the windows. This drops
+    # resident params from the full ~padded_num_parameters to
+    # shard + one-layer + embed. Without a coordinator (the CPU equivalence
+    # harness) streaming stays off and params remain fully resident, so that
+    # path is unchanged.
+    var z3_streaming: Bool
+    var param_window_buf: DeviceBuffer[GPT2_DTYPE]
+    var embed_window_buf: DeviceBuffer[GPT2_DTYPE]
+
     def __init__(
         out self,
         checkpoint_path: String,
@@ -1184,6 +1199,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.acts = ActivationTensors[GPT2_DTYPE]()
         self.grad_acts = ActivationTensors[GPT2_DTYPE]()
 
+        self.z3_streaming = False
+        self.param_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.embed_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
@@ -1308,6 +1326,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.allocate_optimizer_moments()
 
+        # ZeRO-3 parameter streaming: the parameter buffer was already allocated
+        # shard-only by the allocation path (see `_z3_finalize_params`); now that
+        # the optimizer master copy is seeded, allocate the per-layer / embedding
+        # gather windows. `z3_streaming` was set by the allocation path.
+        if self.z3_streaming:
+            self._z3_alloc_windows()
+
         # Init Activations and activation gradients (allocated dynamically per batch).
         self.acts = ActivationTensors[GPT2_DTYPE]()
         self.acts_memory = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
@@ -1344,6 +1369,251 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             print("--------------------------------")
             print("Number of Gradients: " + String(self.num_grads))
             print("--------------------------------")
+
+    # ===------------------------------------------------------------------=== #
+    # ZeRO-3 parameter streaming helpers
+    # ===------------------------------------------------------------------=== #
+
+    @always_inline
+    def _z3_param_offset(self, t: Int) -> Int:
+        """Flat offset of parameter tensor `t` in the conceptual full parameter
+        vector (tensors are laid out back-to-back by `point_parameters`)."""
+        var acc = 0
+        for i in range(t):
+            acc += self.param_sizes[i]
+        return acc
+
+    @always_inline
+    def _z3_shard_ptr(self) -> UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]:
+        """This rank's persistent parameter shard base (offset 0 == full-vector
+        index rank*optimizer_num_parameters) as a collective-ready pointer."""
+        return rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            self.params_memory.as_unsafe_any_origin()
+        )
+
+    @always_inline
+    def _z3_want_streaming(self) -> Bool:
+        """True when ZeRO-3 parameter streaming should be active: stage >= 3, a
+        real world size, and a coordinator attached (a real multi-rank run). The
+        CPU equivalence harness passes no coordinator and stays non-streaming.
+        """
+        comptime if Self.WORLD_SIZE > 1:
+            if (
+                self.zero_ctx.zero_stage >= 3
+                and self.zero_ctx.cpu_coordinator_ptr
+            ):
+                return True
+        return False
+
+    def _z3_finalize_params(
+        mut self, host_full: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+    ) raises:
+        """Shared tail of the three parameter-allocation paths. `host_full` holds
+        all `num_parameters` params on the host. Under ZeRO-3 streaming the
+        device `params_buf` is allocated at only shard size and seeded with this
+        rank's slice `[rank*opt, rank*opt+opt)` — the full parameter buffer is
+        NEVER made resident on the device (which is what actually lowers peak;
+        freeing a full device buffer later does not, because the runtime's
+        caching allocator keeps its high-water mark). Otherwise the full padded
+        buffer is allocated and seeded as before.
+
+        `point_parameters` is still run so the non-streaming paths are unchanged;
+        for streaming its outputs are stale (they assume the full layout) but
+        harmless — forward/backward re-point `self.params.*` into the gather
+        windows before every use.
+        """
+        var stream = self._z3_want_streaming()
+        var buf_size = (
+            self.optimizer_num_parameters if stream else self.padded_num_parameters
+        )
+        self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](buf_size)
+        self.params_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        self.params_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.params_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        if stream:
+            var off = self.zero_ctx.rank * self.optimizer_num_parameters
+            var ln = min(
+                self.num_parameters - off, self.optimizer_num_parameters
+            )
+            if ln > 0:
+                self.ctx.enqueue_copy(
+                    dst_ptr=rebind[
+                        UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+                    ](self.params_memory.as_unsafe_any_origin()),
+                    src_ptr=rebind[
+                        UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                    ]((host_full + off).as_unsafe_any_origin()),
+                    size=ln,
+                )
+        else:
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.params_memory.as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[
+                    UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                ](host_full.as_unsafe_any_origin()),
+                size=self.num_parameters,
+            )
+        self.ctx.synchronize()
+        self.params.point_parameters(self.param_sizes, self.params_memory)
+        self.z3_streaming = stream
+        self.has_allocated_params = True
+
+    def _z3_alloc_windows(mut self) raises:
+        """Allocate the ZeRO-3 streaming gather windows (once, after params are
+        set up): a per-layer window (one transformer layer's 12 tensors) and an
+        embedding/head window (wte, wpe, ln_f gamma/beta)."""
+        var L = self.config.num_layer
+        var layer_win = 0
+        for t in range(Parameters.ln_1_gamma, Parameters.ln_f_gamma):
+            layer_win += self.param_sizes[t] // L
+        self.param_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+            layer_win
+        )
+        var embed_win = (
+            self.param_sizes[Parameters.wte]
+            + self.param_sizes[Parameters.wpe]
+            + self.param_sizes[Parameters.ln_f_gamma]
+            + self.param_sizes[Parameters.ln_f_beta]
+        )
+        self.embed_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+            embed_win
+        )
+        self.ctx.synchronize()
+
+    def _z3_stream_embed(mut self) raises:
+        """Gather wte / wpe / ln_f_{gamma,beta} into `embed_window_buf` and point
+        `self.params.{wte,wpe,ln_f_gamma,ln_f_beta}` at it. These are not
+        per-layer, so this runs once per forward and the window stays valid
+        through the LM head and the whole backward (params do not change until
+        `update()`)."""
+        var idxs = [
+            Parameters.wte,
+            Parameters.wpe,
+            Parameters.ln_f_gamma,
+            Parameters.ln_f_beta,
+        ]
+        var dst_offsets = List[Int]()
+        var flat_starts = List[Int]()
+        var lengths = List[Int]()
+        var acc = 0
+        for k in range(len(idxs)):
+            var t = idxs[k]
+            dst_offsets.append(acc)
+            flat_starts.append(self._z3_param_offset(t))
+            lengths.append(self.param_sizes[t])
+            acc += self.param_sizes[t]
+
+        var wbase = rebind_mut_mem[GPT2_DTYPE](
+            self.embed_window_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+            self._z3_shard_ptr(),
+            self.optimizer_num_parameters,
+            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                wbase.as_unsafe_any_origin()
+            ),
+            dst_offsets,
+            flat_starts,
+            lengths,
+        )
+        self.params.wte = wbase + dst_offsets[0]
+        self.params.wpe = wbase + dst_offsets[1]
+        self.params.ln_f_gamma = wbase + dst_offsets[2]
+        self.params.ln_f_beta = wbase + dst_offsets[3]
+
+    def _z3_stream_layer(mut self, layer: Int) raises:
+        """Gather transformer `layer`'s 12 tensors into `param_window_buf` and
+        re-point the 12 per-layer `self.params.*` bases so that the existing
+        `self.params.<t> + layer*stride` addressing in forward/backward lands on
+        the window (base is offset by `-layer*stride`; the negative term is pure
+        address arithmetic, never dereferenced out of range)."""
+        var L = self.config.num_layer
+        var idxs = [
+            Parameters.ln_1_gamma,
+            Parameters.ln_1_beta,
+            Parameters.qkv_weight,
+            Parameters.qkv_bias,
+            Parameters.attn_proj_weight,
+            Parameters.attn_proj_bias,
+            Parameters.ln_2_gamma,
+            Parameters.ln_2_beta,
+            Parameters.fc_weight,
+            Parameters.fc_bias,
+            Parameters.proj_weight,
+            Parameters.proj_bias,
+        ]
+        var dst_offsets = List[Int]()
+        var flat_starts = List[Int]()
+        var lengths = List[Int]()
+        var acc = 0
+        for k in range(len(idxs)):
+            var t = idxs[k]
+            var stride = self.param_sizes[t] // L
+            dst_offsets.append(acc)
+            flat_starts.append(self._z3_param_offset(t) + layer * stride)
+            lengths.append(stride)
+            acc += stride
+
+        var wbase = rebind_mut_mem[GPT2_DTYPE](
+            self.param_window_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+            self._z3_shard_ptr(),
+            self.optimizer_num_parameters,
+            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                wbase.as_unsafe_any_origin()
+            ),
+            dst_offsets,
+            flat_starts,
+            lengths,
+        )
+
+        # Re-base so the existing `<ptr> + layer*stride` addressing in
+        # forward/backward lands on this layer's window slot.
+        self.params.ln_1_gamma = wbase + (dst_offsets[0] - layer * lengths[0])
+        self.params.ln_1_beta = wbase + (dst_offsets[1] - layer * lengths[1])
+        self.params.qkv_weight = wbase + (dst_offsets[2] - layer * lengths[2])
+        self.params.qkv_bias = wbase + (dst_offsets[3] - layer * lengths[3])
+        self.params.attn_proj_weight = wbase + (
+            dst_offsets[4] - layer * lengths[4]
+        )
+        self.params.attn_proj_bias = wbase + (
+            dst_offsets[5] - layer * lengths[5]
+        )
+        self.params.ln_2_gamma = wbase + (dst_offsets[6] - layer * lengths[6])
+        self.params.ln_2_beta = wbase + (dst_offsets[7] - layer * lengths[7])
+        self.params.fc_weight = wbase + (dst_offsets[8] - layer * lengths[8])
+        self.params.fc_bias = wbase + (dst_offsets[9] - layer * lengths[9])
+        self.params.proj_weight = wbase + (
+            dst_offsets[10] - layer * lengths[10]
+        )
+        self.params.proj_bias = wbase + (dst_offsets[11] - layer * lengths[11])
+
+    def _z3_gather_full(
+        mut self, dst: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+    ) raises:
+        """Reconstruct the full parameter vector (natural layout) into `dst` from
+        the per-rank shards. Collective — every rank must call it. Used only for
+        checkpoint writing, where the persistent state is shard-only."""
+        var dst_offsets = List[Int]()
+        var flat_starts = List[Int]()
+        var lengths = List[Int]()
+        for t in range(NUM_PARAMETER_TENSORS):
+            var o = self._z3_param_offset(t)
+            dst_offsets.append(o)
+            flat_starts.append(o)
+            lengths.append(self.param_sizes[t])
+        self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+            self._z3_shard_ptr(),
+            self.optimizer_num_parameters,
+            dst,
+            dst_offsets,
+            flat_starts,
+            lengths,
+        )
 
     def _compute_param_sizes(mut self) raises:
         """Fill param_sizes, num_parameters, and the optimizer sharding counts
@@ -1434,27 +1704,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         read_and_copy[GPT2_DTYPE](model_file, temp_ptr, self.num_parameters)
         model_file.close()
 
-        self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.padded_num_parameters
-        )
-
-        self.params_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
-        self.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                self.params_buf.unsafe_ptr().as_unsafe_any_origin()
-            ),
-            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+        self._z3_finalize_params(
+            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 temp_ptr.as_unsafe_any_origin()
-            ),
-            size=self.num_parameters,
+            )
         )
-        self.ctx.synchronize()
-        self.params_memory = rebind_mut_mem[GPT2_DTYPE](
-            self.params_buf.unsafe_ptr().as_unsafe_any_origin()
-        )
-        self.params.point_parameters(self.param_sizes, self.params_memory)
-
-        self.has_allocated_params = True
 
     def allocate_parameters_random(mut self) raises:
         """Allocate parameters and fill them with a GPT-2 random init, exactly
@@ -1551,27 +1805,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         fp32_scratch.free()
 
-        # Copy the host params to the device, zero-padding the sharded tail.
-        self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.padded_num_parameters
-        )
-        self.params_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
-        self.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                self.params_buf.unsafe_ptr().as_unsafe_any_origin()
-            ),
-            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+        # Copy the host params to the device (shard-only under ZeRO-3 streaming).
+        self._z3_finalize_params(
+            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 hp.as_unsafe_any_origin()
-            ),
-            size=self.num_parameters,
+            )
         )
-        self.ctx.synchronize()
-        self.params_memory = rebind_mut_mem[GPT2_DTYPE](
-            self.params_buf.unsafe_ptr().as_unsafe_any_origin()
-        )
-        self.params.point_parameters(self.param_sizes, self.params_memory)
-
-        self.has_allocated_params = True
 
     def allocate_parameters_from_safetensors(
         mut self, safetensors_path: String
@@ -1720,26 +1959,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         st.read_tensor[GPT2_DTYPE]("transformer.ln_f.bias", hp + base)
         base += C
 
-        self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
-            self.padded_num_parameters
-        )
-        self.params_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
-        self.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                self.params_buf.unsafe_ptr().as_unsafe_any_origin()
-            ),
-            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+        self._z3_finalize_params(
+            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 hp.as_unsafe_any_origin()
-            ),
-            size=self.num_parameters,
+            )
         )
-        self.ctx.synchronize()
-        self.params_memory = rebind_mut_mem[GPT2_DTYPE](
-            self.params_buf.unsafe_ptr().as_unsafe_any_origin()
-        )
-        self.params.point_parameters(self.param_sizes, self.params_memory)
-
-        self.has_allocated_params = True
 
     def allocate_gradients(mut self) raises:
         self.grads = ParameterTensors[GPT2_DTYPE]()
@@ -1793,9 +2017,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # give every rank rank-0's weights as its master and corrupt all
             # rank > 0 shards on the first bf16 update. (The last rank's shard
             # may extend into the zero-filled padding; harmless to copy.)
+            # Under ZeRO-3 streaming params_memory holds ONLY this rank's shard
+            # at offset 0, so read the master seed from there; otherwise the
+            # shard lives at rank*opt inside the full resident buffer.
             var master_src_offset = 0
             comptime if Self.WORLD_SIZE > 1:
-                if self.zero_ctx.zero_stage >= 1:
+                if self.zero_ctx.zero_stage >= 1 and not self.z3_streaming:
                     master_src_offset = (
                         self.zero_ctx.rank * self.optimizer_num_parameters
                     )
@@ -2186,12 +2413,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx.synchronize()
 
         comptime if Self.WORLD_SIZE > 1:
-            # ZeRO-3: Gather all parameter shards into params_buf before running forward.
-            # Each rank holds its persistent shard at params_memory + rank * optimizer_num_parameters.
-            # This is a coarse-grained gather: one allgather per forward pass rather than per layer.
-            # It is memory-correct ZeRO-3 sharding of persistent state, but does NOT yet achieve
-            # the peak-memory savings of true per-layer streaming (gather/free per tensor).
-            if self.zero_ctx.zero_stage >= 3:
+            if self.z3_streaming:
+                # ZeRO-3 streaming: params are shard-only at rest. Gather the
+                # embedding/head tensors once here (needed by the encoder now and
+                # the LM head / final layernorm later); each transformer layer's
+                # tensors are gathered just-in-time inside the layer loop below.
+                self._z3_stream_embed()
+                self.ctx.synchronize()
+            elif self.zero_ctx.zero_stage >= 3:
+                # Non-streaming ZeRO-3 (the CPU equivalence harness runs with no
+                # coordinator): params stay fully resident and this all-gather is
+                # a no-op. Kept so that path's behaviour is unchanged.
                 self.zero_ctx.allgather(
                     rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.params_memory.as_unsafe_any_origin()
@@ -2217,6 +2449,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
 
         for layer in range(num_layers):
+            # ZeRO-3 streaming: gather this layer's parameters just-in-time and
+            # re-point self.params.* into the per-layer window before the l_*
+            # slices below are taken.
+            if self.z3_streaming:
+                self._z3_stream_layer(layer)
+
             if (
                 layer == 0
             ):  # First layer, use the encoded activations as the pointer
@@ -2876,6 +3114,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         # Backward through the transformer blocks.
         for layer in range(num_layers - 1, -1, -1):
+            # ZeRO-3 streaming: re-gather this layer's parameters (the forward's
+            # per-layer window only retained the last layer). The embedding/head
+            # window from the forward is still valid (params are unchanged until
+            # update()), so the LM-head / final-layernorm backward above reused
+            # it directly.
+            if self.z3_streaming:
+                self._z3_stream_layer(layer)
+
             var layer_offset = layer * layer_stride
 
             var l_ln_1_gamma = self.params.ln_1_gamma + layer * channels
@@ -3508,11 +3754,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.num_parameters - offset,
                         self.optimizer_num_parameters,
                     )
-                    p_ptr = self.params_memory + offset
+                    # ZeRO-3 streaming keeps only the shard resident at
+                    # params_memory offset 0; otherwise the shard lives at
+                    # rank*opt inside the full param buffer.
+                    p_ptr = self.params_memory + (
+                        0 if self.z3_streaming else offset
+                    )
                     # Every sharded stage now reads its gradient shard from
                     # grads_memory + offset: ZeRO-1 all-reduced (grads fully
                     # replicated), ZeRO-2/3 in-place reduce-scattered (only slice
                     # [offset, offset+opt) holds the reduced sum) — same address.
+                    # grads stay a full buffer even under ZeRO-3 streaming.
                     g_ptr = self.grads_memory + offset
                     update_num_params = local_num_params
 
@@ -3611,11 +3863,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.num_parameters - offset,
                         self.optimizer_num_parameters,
                     )
+                    # ZeRO-3 streaming keeps only the shard resident at
+                    # params_memory offset 0; ZeRO-2 (and non-streaming ZeRO-3)
+                    # index the shard at rank*opt inside the full param buffer.
+                    var p_off = 0 if self.z3_streaming else offset
                     if local_num_params > 0:
                         adamw_update[GPT2_DTYPE, Self.target](
                             local_num_params,
                             as_mut_kernel[GPT2_DTYPE](
-                                self.params_memory + offset
+                                self.params_memory + p_off
                             ),
                             as_mut_kernel[GPT2_DTYPE](
                                 self.grads_memory + offset
@@ -3824,9 +4080,26 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         """
         # ZeRO-3 keeps only this rank's parameter shard resident in
         # params_memory after update() (the next forward re-gathers it). Gather
-        # the full parameter set before snapshotting the model.
+        # the full parameter set before snapshotting the model. Under streaming
+        # the persistent buffer is shard-only, so reconstruct into a temporary
+        # full buffer (a collective — all ranks participate); otherwise the
+        # non-streaming ZeRO-3 all-gather refills the resident full buffer.
+        var snap_full = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+            self.num_parameters if self.z3_streaming else 1
+        )
+        var snap_src = self.params_memory
         comptime if Self.WORLD_SIZE > 1:
-            if self.zero_ctx.zero_stage >= 3:
+            if self.z3_streaming:
+                self._z3_gather_full(
+                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        snap_full.unsafe_ptr().as_unsafe_any_origin()
+                    )
+                )
+                self.ctx.synchronize()
+                snap_src = rebind_mut_mem[GPT2_DTYPE](
+                    snap_full.unsafe_ptr().as_unsafe_any_origin()
+                )
+            elif self.zero_ctx.zero_stage >= 3:
                 self.zero_ctx.allgather(
                     rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.params_memory.as_unsafe_any_origin()
@@ -3841,7 +4114,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             self.ctx.synchronize()
             self._copy_device_to_host[GPT2_DTYPE](
-                host_params, self.params_memory, self.num_parameters
+                host_params, snap_src, self.num_parameters
             )
             self.ctx.synchronize()
             write_model_checkpoint(
@@ -3895,9 +4168,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             ),
             self.num_parameters,
         )
-        self._copy_host_to_device[GPT2_DTYPE](
-            self.params_memory, host_params, self.num_parameters
-        )
+        if self.z3_streaming:
+            # Streaming keeps only this rank's shard resident; copy just
+            # [rank*opt, rank*opt+ln) of the loaded full vector into it.
+            var off = self.zero_ctx.rank * self.optimizer_num_parameters
+            var ln = min(
+                self.num_parameters - off, self.optimizer_num_parameters
+            )
+            if ln > 0:
+                self.ctx.enqueue_copy(
+                    dst_ptr=rebind[
+                        UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+                    ](self.params_memory.as_unsafe_any_origin()),
+                    src_ptr=rebind[
+                        UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                    ]((host_params.unsafe_ptr() + off).as_unsafe_any_origin()),
+                    size=ln,
+                )
+        else:
+            self._copy_host_to_device[GPT2_DTYPE](
+                self.params_memory, host_params, self.num_parameters
+            )
         self.ctx.synchronize()
 
         # Mixed precision: the fp32 master copy was seeded from the *initial*
