@@ -3095,6 +3095,12 @@ def _attention_bwd_p_and_ds_gpu[
     var grid_stride = Int(grid_dim.x) * Int(block_dim.x)
     var plane = seq_len * seq_len
 
+    # scores_ptr/dp_ptr/p_ptr/ds_ptr all share `dtype`, so one alignment
+    # covers every vectorized load/store below. e0 = b*width for grid-strided
+    # integer b, so it is provably a multiple of width regardless of the
+    # runtime plane/seq_len values — same proof shape as adamw's
+    # idx = global_tid*width.
+    comptime align = align_of[SIMD[dtype, width]]()
     comptime if aligned:
         var b = lane
         while b < num_blocks:
@@ -3105,24 +3111,36 @@ def _attention_bwd_p_and_ds_gpu[
             var jbase = rem % seq_len
             # Causal: a width-block lies entirely above the diagonal iff
             # jbase > i (width divides seq_len, so the block never straddles
-            # a row). Its P/dS are structurally zero, so skip the
-            # load+compute+store entirely — the persistent buffers hold
-            # zeros there (P is zero-on-alloc scratch, dS zeroed once on
-            # allocation), and the dense gradient GEMMs read them as zero.
-            # This halves the plane traffic in the backward's largest
-            # kernel.
+            # a row). Its P/dS are structurally zero.
+            #
+            # We MUST explicitly zero these blocks every step. The earlier
+            # design skipped them (`continue`) and relied on the persistent
+            # scratch staying zero from its one-time zero-on-alloc memset,
+            # since nothing "should" ever write the upper triangle. On the
+            # Blackwell (sm_120) build that invariant did not hold: the
+            # untouched upper-triangle of the dS buffer came back holding
+            # NaN/Inf bit patterns (238 of them in layer 11 head 0 alone on
+            # the very first backward call, buffer verified all-zero the
+            # instant before this kernel launched), which the dense
+            # dQ = dS·K / dK = dSᵀ·Q GEMMs then summed into every query/key
+            # gradient — turning the whole backward pass NaN from step 1.
+            # The forward was unaffected (finite loss) and fp32 was clean,
+            # which is why it looked LR-independent and precision-specific.
+            # An explicit vectorized zero-store is cheap (a streaming write,
+            # no load/compute) and makes correctness independent of whatever
+            # stale contents the scratch carries.
+            # See docs/ai/bf16_backward_nan_upper_triangle_bug.md.
             if jbase > i:
+                var zero_vec = SIMD[dtype, width](0)
+                (ds_ptr + e0).store[width=width, alignment=align](zero_vec)
+                comptime if not stored_p:
+                    (p_ptr + e0).store[width=width, alignment=align](zero_vec)
                 b += grid_stride
                 continue
             var d_i = d_ptr[bh * seq_len + i]
             # `stored_p`: scores_ptr already holds P (the forward's stored
             # softmax probs), so read it directly — no QKᵀ recompute, no
-            # exp/lse, no P store. e0 = b*width for grid-strided integer b,
-            # so it is provably a multiple of width regardless of the
-            # runtime plane/seq_len values — same proof shape as adamw's
-            # idx = global_tid*width. scores_ptr/dp_ptr/p_ptr/ds_ptr all
-            # share `dtype`, so one alignment covers all four.
-            comptime align = align_of[SIMD[dtype, width]]()
+            # exp/lse, no P store.
             var raw = (
                 (scores_ptr + e0)
                 .load[width=width, alignment=align]()
