@@ -7,6 +7,7 @@ from std.sys import (
     has_apple_gpu_accelerator,
     simd_width_of,
 )
+from std.sys.info import size_of
 from std.time import global_perf_counter_ns
 from std.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
@@ -1383,31 +1384,41 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         # Calculate optimizer sharding parameters
         comptime if Self.WORLD_SIZE > 1:
-            # All zero stages 1/2/3 shard the optimizer parameters.
+            # Round the per-rank shard length up to a multiple of the AdamW
+            # SIMD width. Each rank's optimizer step indexes params/grads at
+            # `rank * optimizer_num_parameters`, and adamw_update issues
+            # `alignment = align_of[SIMD[dtype, width]]` (naturally width
+            # elements) aligned vector loads/stores. If the shard length is
+            # not a multiple of that width, every rank>0 shard offset is
+            # misaligned and the aligned CPU load faults (segfault). Padding
+            # the shard keeps every offset aligned; the extra tail elements
+            # live in the zero-filled padding region of the params/grads
+            # buffers (both sized to padded_num_parameters).
+            #
+            # padded_num_parameters is shard * WORLD_SIZE for EVERY stage
+            # (including 0): the GPU collectives are staged reduce-scatter +
+            # all-gather over equal per-rank slices, so allreduce (stage 0/1)
+            # also needs the buffer length divisible by WORLD_SIZE * width.
+            comptime shard_align = simd_width_of[GPT2_DTYPE]()
+            var base_shard = (
+                self.num_parameters + Self.WORLD_SIZE - 1
+            ) // Self.WORLD_SIZE
+            var comm_shard = (
+                (base_shard + shard_align - 1) // shard_align
+            ) * shard_align
+            self.padded_num_parameters = comm_shard * Self.WORLD_SIZE
+            # Stages 1/2/3 shard the optimizer; stage 0 (DDP) updates all
+            # parameters on every rank.
             if self.zero_ctx.zero_stage >= 1:
-                # Round the per-rank shard length up to a multiple of the AdamW
-                # SIMD width. Each rank's optimizer step indexes params/grads at
-                # `rank * optimizer_num_parameters`, and adamw_update issues
-                # `alignment = align_of[SIMD[dtype, width]]` (naturally width
-                # elements) aligned vector loads/stores. If the shard length is
-                # not a multiple of that width, every rank>0 shard offset is
-                # misaligned and the aligned CPU load faults (segfault). Padding
-                # the shard keeps every offset aligned; the extra tail elements
-                # live in the zero-filled padding region of the params/grads
-                # buffers (both sized to padded_num_parameters).
-                comptime shard_align = simd_width_of[GPT2_DTYPE]()
-                var base_shard = (
-                    self.num_parameters + Self.WORLD_SIZE - 1
-                ) // Self.WORLD_SIZE
-                self.optimizer_num_parameters = (
-                    (base_shard + shard_align - 1) // shard_align
-                ) * shard_align
-                self.padded_num_parameters = (
-                    self.optimizer_num_parameters * Self.WORLD_SIZE
-                )
+                self.optimizer_num_parameters = comm_shard
             else:
                 self.optimizer_num_parameters = self.num_parameters
-                self.padded_num_parameters = self.num_parameters
+            # Multi-GPU staged collectives stage one comm shard through
+            # scratch; size it (and build peer device handles) now that the
+            # shard size is known. No-op on CPU / WORLD_SIZE 1.
+            self.zero_ctx.ensure_comm_setup(
+                comm_shard * size_of[Scalar[GPT2_DTYPE]]()
+            )
         else:
             self.optimizer_num_parameters = self.num_parameters
             self.padded_num_parameters = self.num_parameters
@@ -1805,6 +1816,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.master_memory = rebind_mut_mem[MASTER_DTYPE](
                 self.master_buf.unsafe_ptr().as_unsafe_any_origin()
             )
+            # The master copy shadows THIS RANK's optimizer shard. For sharded
+            # stages (WORLD_SIZE > 1, zero_stage >= 1) that shard lives at
+            # rank * optimizer_num_parameters — seeding from offset 0 would
+            # give every rank rank-0's weights as its master and corrupt all
+            # rank > 0 shards on the first bf16 update. (The last rank's shard
+            # may extend into the zero-filled padding; harmless to copy.)
+            var master_src_offset = 0
+            comptime if Self.WORLD_SIZE > 1:
+                if self.zero_ctx.zero_stage >= 1:
+                    master_src_offset = (
+                        self.zero_ctx.rank * self.optimizer_num_parameters
+                    )
             var host_p = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n)
             var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n)
             self.ctx.enqueue_copy(
@@ -1813,7 +1836,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 ),
                 src_ptr=rebind[
                     UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
-                ](self.params_memory.as_unsafe_any_origin()),
+                ](
+                    (
+                        self.params_memory + master_src_offset
+                    ).as_unsafe_any_origin()
+                ),
                 size=n,
             )
             self.ctx.synchronize()
@@ -3434,17 +3461,29 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx.synchronize()
 
         comptime if Self.WORLD_SIZE > 1:
+            # Reduce gradients across ranks ONLY on the last micro-step of the
+            # gradient-accumulation loop (llm.c semantics). Reducing every
+            # micro-step would be wrong, not just wasteful: the stage-0/1
+            # allreduce is in place, so a second micro-step would accumulate
+            # local grads on top of the already-summed global grads and then
+            # re-sum, multiply-counting earlier contributions.
+            if micro_step != grad_accum_steps - 1:
+                return
             # ZeRO-0 (DDP) and ZeRO-1 use allreduce: full gradient sum is replicated
             # to all ranks (2N communication). ZeRO-1 then reads grads_memory + rank*opt
             # in the optimizer step.
             # ZeRO-2/3 use reduce-scatter: each rank receives only its gradient shard
             # (N communication), which is stored in sharded_grads_memory.
             if self.zero_ctx.zero_stage <= 1:
+                # Padded length: the staged GPU allreduce slices the buffer
+                # into WORLD_SIZE equal SIMD-aligned shards. The padding tail
+                # is zero-filled at allocation and never written by backward,
+                # so reducing it is a harmless no-op.
                 self.zero_ctx.allreduce(
                     rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.grads_memory.as_unsafe_any_origin()
                     ),
-                    self.num_parameters,
+                    self.padded_num_parameters,
                 )
             else:
                 self.zero_ctx.reducescatter(
@@ -3650,10 +3689,34 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         over all `num_parameters` grads), used for gradient clipping and the
         grad-norm z-score. Reuses the llmm.global_norm kernels.
 
-        NOTE: this reduces over the full replicated grads_memory; it does not yet
-        all-reduce the norm across ranks in the multi-GPU sharded case.
+        Multi-rank consistency: after backward() the gradient state differs by
+        stage. ZeRO-0/1 all-reduce, so grads_memory holds the identical global
+        gradient sum on every rank and the local norm IS the global norm.
+        ZeRO-2/3 reduce-scatter, so grads_memory holds each rank's *local,
+        unreduced* gradient — its norm is meaningless for clipping and differs
+        per rank. Instead we take the sum of squares over this rank's REDUCED
+        shard (sharded_grads_memory; the shards tile the full vector), then sum
+        those partials across ranks via the host-side scalar all-reduce. This
+        makes stage-2/3 clipping decisions identical to stage-0/1 (up to fp
+        summation order).
+
+        Normalization: after the cross-rank reduce, grads hold the SUM over
+        ranks while the optimizer applies grad_scale / WORLD_SIZE (i.e. the
+        mean). Returning ||sum|| would make the clip threshold engage
+        WORLD_SIZE times earlier than single-GPU / llm.c (which clips on the
+        mean-grad norm), so divide by WORLD_SIZE: clipping then rescales the
+        effective mean gradient to unit norm exactly like llm.c.
         """
         var n = self.num_parameters
+        var grads_src = self.grads_memory
+        var sharded = False
+        comptime if Self.WORLD_SIZE > 1:
+            if self.zero_ctx.zero_stage >= 2:
+                # optimizer_num_parameters includes the zero-filled padding
+                # tail on the last rank(s); zeros contribute nothing.
+                n = self.optimizer_num_parameters
+                grads_src = self.sharded_grads_memory
+                sharded = True
         comptime width = simd_width_of[GPT2_DTYPE]()
 
         comptime if is_cpu[Self.target]():
@@ -3663,12 +3726,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 rebind[MutKernelPtr[DType.float32]](
                     host_out.as_unsafe_any_origin()
                 ),
-                as_immut_kernel_from_mut[GPT2_DTYPE](self.grads_memory),
+                as_immut_kernel_from_mut[GPT2_DTYPE](grads_src),
                 n,
             )
             var sumsq = host_out[0]
             host_out.free()
-            return sqrt(sumsq)
+            if sharded:
+                sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
+            return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
         else:
             comptime BLOCK_SIZE = 512
             var grid_x = self.grad_norm_grid_x
@@ -3696,7 +3761,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx.enqueue_function(
                 compiled_norm,
                 as_mut_kernel[DType.float32](out_ptr),
-                as_immut_kernel_from_mut[GPT2_DTYPE](self.grads_memory),
+                as_immut_kernel_from_mut[GPT2_DTYPE](grads_src),
                 n,  # count (single slice)
                 n,  # stride (unused with one slice)
                 grid_dim=(grid_x, 1),
@@ -3729,7 +3794,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 size=1,
             )
             self.ctx.synchronize()
-            return sqrt(self.grad_norm_host_buf[0])
+            var sumsq = self.grad_norm_host_buf[0]
+            if sharded:
+                sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
+            return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
 
     def _checkpoint_config(self) -> CheckpointConfig:
         return CheckpointConfig(
@@ -4046,7 +4114,13 @@ def train[
     comptime if is_cpu[target]():
         ctx = DeviceContext(api="cpu")
     else:
-        ctx = DeviceContext()
+        comptime if WORLD_SIZE > 1:
+            # True data parallelism: rank r's model, activations, and
+            # optimizer state live on GPU r. (Multi-rank GPU training is
+            # NVIDIA-only; _try_gpu rejects world_size > 1 on Apple GPUs.)
+            ctx = DeviceContext(device_id=rank)
+        else:
+            ctx = DeviceContext()
 
     var zero_stage = args.zero_stage
 
@@ -4261,19 +4335,27 @@ def train[
                 val_loss += model.mean_loss
             if val_num_batches > 0:
                 val_loss /= Float32(val_num_batches)
+            # Each rank evaluated its own shard of the val stream; average
+            # across ranks (llm.c parity). No-op at WORLD_SIZE == 1.
+            val_loss = Float32(
+                model.zero_ctx.allreduce_scalar(Float64(val_loss))
+                / Float64(WORLD_SIZE)
+            )
             printf0(rank, "val loss " + String(val_loss))
 
-        # Once in a while do model inference to print generated text (rank 0).
-        if (
-            rank == 0
-            and args.sample_every > 0
-            and (step > 0 and step % args.sample_every == 0 or last_step)
+        # Once in a while do model inference to print generated text. ALL
+        # ranks run the generation forwards (like llm.c): at zero_stage >= 3
+        # every forward() begins with a param all-gather, a collective whose
+        # coordinator barriers deadlock if only rank 0 participates. Each rank
+        # samples locally from its own logits; only rank 0 decodes/prints.
+        if args.sample_every > 0 and (
+            step > 0 and step % args.sample_every == 0 or last_step
         ):
             gen_tokens[0] = Scalar[DType.int32](
                 tokenizer.eot_token
             )  # The GPT-2 EOT token kicks off generation.
 
-            print("generating:\n---")
+            printf0(rank, "generating:\n---")
             for t in range(1, gen_max_length):
                 # NOTE: Inference is wasteful here because for each t we recompute all activations between 0 and t.
                 # In a real inference setting we would use a separate code for this anyway.
@@ -4303,9 +4385,10 @@ def train[
                     logits, model.config.vocab_size, coin
                 )
                 gen_tokens[t] = Scalar[DType.int32](next_token)
-                var token_str = tokenizer.decode(next_token)
-                safe_print(token_str)
-            print("\n---")
+                if rank == 0:
+                    var token_str = tokenizer.decode(next_token)
+                    safe_print(token_str)
+            printf0(rank, "\n---")
 
         # Once in a while checkpoint the optimization state (all ranks).
         if (
@@ -4354,6 +4437,12 @@ def train[
             model.backward(grad_accum_steps, micro_step, step)
         model.ctx.synchronize()
         accumulated_loss /= Float32(grad_accum_steps)
+        # Average the loss over ranks so the printed loss covers the whole
+        # global batch (llm.c parity). No-op at WORLD_SIZE == 1.
+        accumulated_loss = Float32(
+            model.zero_ctx.allreduce_scalar(Float64(accumulated_loss))
+            / Float64(WORLD_SIZE)
+        )
 
         var zloss = loss_detector.update(Float64(accumulated_loss))
         var step_learning_rate = learning_rate_scheduler.get_learning_rate(step)
@@ -4665,12 +4754,32 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
                 )
 
         print("GPU detected — training on GPU.")
-        _dispatch_world_size["gpu"](
-            args,
-            rank,
-            world_size,
-            Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
-        )
+        if world_size == 1:
+            _dispatch_world_size["gpu"](
+                args,
+                rank,
+                world_size,
+                Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+            )
+        else:
+            # True N-device data parallelism: one host thread per rank, each
+            # with its own DeviceContext(device_id=rank) (created inside
+            # train()), coordinated through the same barrier/pointer-exchange
+            # struct the CPU multi-rank path uses. The `rank` CLI/env value is
+            # ignored here — all ranks live in this process.
+            var coord_ptr = alloc[CpuCoordinator](1)
+            coord_ptr[] = CpuCoordinator(world_size)
+
+            @parameter
+            def _run_rank(r: Int):
+                try:
+                    _dispatch_world_size["gpu"](args, r, world_size, coord_ptr)
+                except e:
+                    print("Rank", r, "failed:", e)
+
+            sync_parallelize[_run_rank](world_size)
+            coord_ptr[].free()
+            coord_ptr.free()
         return True
     else:
         return False
