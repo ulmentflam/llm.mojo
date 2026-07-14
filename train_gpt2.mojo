@@ -1385,9 +1385,23 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         comptime if Self.WORLD_SIZE > 1:
             # All zero stages 1/2/3 shard the optimizer parameters.
             if self.zero_ctx.zero_stage >= 1:
-                self.optimizer_num_parameters = (
+                # Round the per-rank shard length up to a multiple of the AdamW
+                # SIMD width. Each rank's optimizer step indexes params/grads at
+                # `rank * optimizer_num_parameters`, and adamw_update issues
+                # `alignment = align_of[SIMD[dtype, width]]` (naturally width
+                # elements) aligned vector loads/stores. If the shard length is
+                # not a multiple of that width, every rank>0 shard offset is
+                # misaligned and the aligned CPU load faults (segfault). Padding
+                # the shard keeps every offset aligned; the extra tail elements
+                # live in the zero-filled padding region of the params/grads
+                # buffers (both sized to padded_num_parameters).
+                comptime shard_align = simd_width_of[GPT2_DTYPE]()
+                var base_shard = (
                     self.num_parameters + Self.WORLD_SIZE - 1
                 ) // Self.WORLD_SIZE
+                self.optimizer_num_parameters = (
+                    (base_shard + shard_align - 1) // shard_align
+                ) * shard_align
                 self.padded_num_parameters = (
                     self.optimizer_num_parameters * Self.WORLD_SIZE
                 )
