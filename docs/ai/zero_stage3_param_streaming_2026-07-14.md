@@ -158,10 +158,13 @@ Remove the resident `wte` window (target params-side ≤ ~230 MiB → 2242):
 `make format` (clean), `make lint` (ruff / mojo format --check / pyrefly, exit
 0), `make build` / `build-bf16` / `build-profile` at WORLD_SIZE=4 (the compile
 legs of `make check`), CPU equivalence (6/6) + the new collective test as the
-numerics gate. Note: a full `mojo run tests/test_zero.mojo` pass crossed the
-600 s per-file budget on the first attempt on this box (compile-dominated, the
-same wall-time fluctuation the multi-GPU rewrite doc records for this file);
-it was relaunched with a 1500 s window — see HANDOFF.
+numerics gate. `tests/test_zero.mojo`: **12/12 PASS** including the new
+`test_multi_cpu_allgather_ranges` (0.5 s) — run as a prebuilt binary
+(`mojo build` then execute), because `mojo run` invocations twice crossed a
+600/1500 s timeout inside the *pre-existing* GPU tests
+(`test_sharded_parameter_gather_gpu` reported 1315 s, the CUDA per-rank
+context-init stall the multi-GPU rewrite doc already records for this box);
+compile itself is ~3 s cached.
 
 ## HANDOFF (for the coordinator)
 
@@ -181,16 +184,11 @@ it was relaunched with a 1500 s window — see HANDOFF.
 
 **Remaining (exact next steps):**
 
-1. Confirm the relaunched `tests/test_zero.mojo` run (12 tests incl. the new
-   `test_multi_cpu_allgather_ranges` and the N=2 GPU collective test) exits 0
-   — it was still inside its 1500 s window at handoff; log at the scratchpad's
-   `test_zero2.log`. The first attempt died only on the 600 s timeout
-   (rc=124), with zero test failures printed.
-2. To surface the W4 win: vocab-tiled LM head + indexed encoder gather (design
+1. To surface the W4 win: vocab-tiled LM head + indexed encoder gather (design
    in "Follow-up" above) so the `wte` window is not resident. Alternatively
    measure at W8 (shard halves → params-side 248 MiB < 256) once Track A frees
    GPUs 4–7.
-3. Merge with Track A: this diff touches `forward`/`backward` only at the
+2. Merge with Track A: this diff touches `forward`/`backward` only at the
    layer-loop heads and the post-backward reduce block is untouched; grads
    remain a full buffer, so the in-place reduce-scatter path is exactly as
    Track A found it. `_z3_finalize_params` replaced the identical tails of the
