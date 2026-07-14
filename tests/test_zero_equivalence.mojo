@@ -1,6 +1,6 @@
 from std.testing import assert_almost_equal, assert_true, TestSuite
 from std.sys.info import size_of
-from std.memory import alloc, UnsafePointer, memcpy
+from std.memory import alloc, UnsafePointer
 from std.gpu.host import DeviceContext
 from std.algorithm import sync_parallelize
 from std.python import Python
@@ -21,13 +21,23 @@ def read_to_dtype_pointer[
 ](
     ptr: UnsafePointer[Scalar[T], _], mut file_handle: FileHandle, size: Int
 ) raises -> None:
+    # Element-wise copy, mirroring llmm.io.read_and_copy. A byte-wise memcpy from
+    # `bytes_data.unsafe_ptr()` is unsafe here: rebinding that pointer to an
+    # untracked origin drops the List's lifetime tracking, so `bytes_data` is
+    # freed at its last tracked use (the `.unsafe_ptr()` call) *before* the copy
+    # runs — the allocator then clobbers the first element (magic read back as
+    # garbage). Looping over the List keeps it live across the whole copy.
     var bytes_to_read = size * size_of[T]()
     var bytes_data = file_handle.read_bytes(bytes_to_read)
-    var d = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](ptr)
-    var s = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
-        bytes_data.unsafe_ptr()
-    )
-    memcpy(dest=d, src=s, count=bytes_to_read)
+    if len(bytes_data) < bytes_to_read:
+        raise Error("Failed to read enough bytes from file")
+    var dest = rebind[UnsafePointer[Scalar[T], MutUntrackedOrigin]](ptr)
+    var src_ptr = bytes_data.unsafe_ptr().bitcast[Scalar[T]]()
+    for i in range(size):
+        dest[i] = src_ptr[i]
+    # Keep `bytes_data` live until the copy is done: `src_ptr` does not own it,
+    # so without this the List can be freed mid-loop (see comment above).
+    _ = bytes_data^
 
 
 def setup_test_files() raises:
