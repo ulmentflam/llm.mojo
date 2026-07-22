@@ -710,6 +710,40 @@ MEMORY.md `weak-gates-overrule-nothing`).
 **Source:** FP8 quant-opt C+D validation pass, 2026-07-11 (worktree
 `llmm-fp8-opt`, branch `opt/fp8-kernels`, commit `8cbeff3`).
 
+### G4 — fp8 multi-rank NaN: an upstream launch-machinery race, mitigated only by per-launch synchronization
+
+**What:** fp8 training at world_size > 1 and depth >= ~36 layers NaNs some ranks'
+LOCAL gradients at step 1: exactly ONE corrupted tensor slice per victim rank
+(nanscan: always proj wgrad, preferring layer 27), victim set varies per run,
+clean ranks bit-identical. d12/d24 never reproduced (0/11); d36 fails ~80% at
+ws2. Three adversarially-reviewed fleet rounds (2026-07-22, ~75 agents;
+reports: fp8_nan_hunt_{fleet,round2,round3}_2026-07-22.md) exonerated every
+app-level mechanism — buffer lifetimes (eliminating ALL per-call backward
+allocations changed nothing), amax/scales (encoder saturates; cannot emit NaN),
+quantize-kernel coverage (verified exhaustive), registry/handles/barrier
+(audited, partly by disassembly), peer/UVA (no mappings exist) — and refuted
+every partial serialization: submission mutex (3/10 fail), per-site trailing
+sync (5/10 fail), first-backward rank stagger (4/10 fail).
+
+**Only two things cure it, both per-launch synchronizers:**
+`CUDA_LAUNCH_BLOCKING=1` (10/10 ws2 + 3x ws7 12-step gate green, ~4% cost) and
+`MODULAR_DEBUG=device-sync-mode` (1000+ training steps clean, ~3-5%). A race
+that survives whole-site serialization but dies under per-launch sync lives in
+the launch/argument-staging path of the runtime or guest driver (this box is a
+QEMU/KVM guest with VFIO passthrough), not in this repo. File/track upstream
+with Modular (primary: multi-DeviceContext single-process launch machinery) and
+NVIDIA (secondary: VFIO deep-queue) — evidence and report drafts in the round-3
+document.
+
+**Rule:** any fp8 multi-rank run MUST set one of the two mitigations until the
+upstream fix lands (scripts/ launchers do). The diagnostic comptime flags from
+the hunt (LLMM_FP8_GEMM_MUTEX / LLMM_FP8_BWD_MUTEX / LLMM_FP8_BWD_SYNC_ONLY /
+LLMM_FP8_BWD_EXEC_MUTEX, LLMM_DEBUG_LOCAL_GRADNORM / LLMM_DEBUG_RANK_STAGGER /
+LLMM_DEBUG_TENSOR_NANSCAN) are kept in-tree, comptime-inert when undefined —
+they are the reproducer kit an upstream report needs.
+
+**Source:** fleet rounds 1-3, 2026-07-22/23, this branch.
+
 ## FP8 static-scale calibration (opt/fp8-static-scales branch, speedrun A1/A5/A6)
 
 ### S1 — a delayed-scaling calibration tool that reads `AmaxState.scale` only at the end of the run silently forgets the run's biggest outlier

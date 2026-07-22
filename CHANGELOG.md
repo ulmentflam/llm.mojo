@@ -1,3 +1,14 @@
+- **fp8 multi-rank NaN: root-caused to an upstream launch-machinery race; mitigations
+  shipped** — d36 fp8 at world_size>1 corrupted exactly one deeply-queued backward
+  launch per victim rank (proj wgrad, pref. layer 27). App layer exonerated across
+  three adversarially-reviewed agent-fleet rounds; only per-launch synchronization
+  cures it (`CUDA_LAUNCH_BLOCKING=1` or `MODULAR_DEBUG=device-sync-mode`, ~4%),
+  now required by the fp8 multi-rank launchers. fp8 backward per-call device
+  allocations replaced with persistent per-(site) buffers (hardening + less churn);
+  diagnostic comptime flags and per-rank/per-tensor NaN probes kept in-tree as the
+  upstream reproducer kit. Full evidence: docs/ai/fp8_nan_hunt_*_2026-07-22.md and
+  low_precision_gotchas.md G4. MFU table: added NVIDIA RTX PRO 6000 Blackwell Max-Q
+  (bf16 438.9 / tf32 219.4 TFLOPS dense) — MFU now reports on workstation-max.
 # Changelog
 
 All notable changes to this project will be documented in this file.
