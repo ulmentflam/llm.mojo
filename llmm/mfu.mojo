@@ -73,6 +73,20 @@ comptime ADA_CLOCK = Float32(2520.0)
 comptime GB10_TF32 = Float32(62.5)
 comptime GB10_BF16 = Float32(125.0)
 
+# NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition (GB202, 96GB, 300W).
+# The datasheet headlines 3511 AI TOPS (FP4 with sparsity) => 1755.5 TFLOPS FP4
+# dense. Per-precision dense rates derived from the same Blackwell tensor-core
+# ratios as GB10 (FP4 : FP8 : BF16 : TF32 = 8 : 4 : 2 : 1, dense):
+#   BF16 with fp32 accumulate = 1755.5 / 4 = 438.9 TFLOPS
+#   TF32                      = 1755.5 / 8 = 219.4 TFLOPS
+# Like GB10, a single known part: identity scaling, peaks used directly. The
+# fp8/fp4 builds keep bf16 storage (USE_BF16 stays true), so their MFU is
+# reported against the BF16 peak — the shared denominator that makes MFU
+# directly comparable across precision builds; fp8's GEMM speedup shows up as
+# higher MFU, not a different scale.
+comptime RTX_PRO_6000_BW_MAXQ_TF32 = Float32(219.4)
+comptime RTX_PRO_6000_BW_MAXQ_BF16 = Float32(438.9)
+
 
 def _volta(name: String, nc: Float32, mhz: Float32) -> GPUEntry:
     return GPUEntry(
@@ -214,6 +228,18 @@ def _gpu_db() -> List[GPUEntry]:
     # Identity scaling (cores == new_cores, clock == new_mhz): use the GB10 peaks
     # directly. The driver reports this device as "NVIDIA GB10".
     db.append(GPUEntry("NVIDIA GB10", GB10_TF32, GB10_BF16, 1.0, 1.0, 1.0, 1.0))
+    # Same identity-scaling convention as GB10 (see the constants' comment).
+    db.append(
+        GPUEntry(
+            "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+            RTX_PRO_6000_BW_MAXQ_TF32,
+            RTX_PRO_6000_BW_MAXQ_BF16,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        )
+    )
 
     # ===--- Apple Silicon GPU entries (substring-matched in Pass 2) ---===
     # Ordered Ultra → Max → Pro → base so that the most-specific name is
