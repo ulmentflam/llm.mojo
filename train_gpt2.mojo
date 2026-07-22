@@ -1,4 +1,4 @@
-from std.math import sqrt, ceildiv, isnan, nan, exp, log
+from std.math import sqrt, ceildiv, isnan, isfinite, nan, exp, log
 from std.os import getenv, listdir, makedirs
 from std.os.path import isdir
 from std.sys import (
@@ -9,6 +9,7 @@ from std.sys import (
 )
 from std.sys.info import size_of
 from std.time import global_perf_counter_ns
+from std.ffi import external_call
 from std.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
 from std.sys import get_defined_int, get_defined_string, is_defined
@@ -50,6 +51,7 @@ from llmm.layernorm import (
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
 from llmm.matmul import (
+    fp8_mutex_preseed,
     matmul_fwd,
     matmul_bwd,
     matmul_fwd_lowp,
@@ -152,6 +154,12 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #   LLMM_DISABLE_METAL=1       CPU fallback on Apple GPU (llmm/vendor.mojo).
 #   WORLD_SIZE=<int>           comptime monomorphization value, default 1;
 #                              runtime env WORLD_SIZE must match.
+# Debug (multi-rank gradient probes; inert unless -D defined)
+#   LLMM_DEBUG_LOCAL_GRADNORM=1  per-rank LOCAL grad norm print pre-reduce.
+#   LLMM_DEBUG_TENSOR_NANSCAN=1  per-rank post-backward pre-reduce non-finite
+#                              scan of every parameter-class-per-layer gradient
+#                              slice; prints ALL non-finite slices in backward
+#                              execution order. ZeRO-0/1 (non-bucketing) only.
 # Runtime env vars (read at startup, not -D)
 #   LLMM_USE_CPU=1             force CPU dispatch (raises under bf16-storage
 #                              builds, which includes fp8/fp4).
@@ -386,6 +394,44 @@ struct Parameters:
     comptime proj_bias = 13
     comptime ln_f_gamma = 14
     comptime ln_f_beta = 15
+
+
+def _parameter_name(t: Int) -> StaticString:
+    """Human-readable name of a `Parameters` class index (debug prints)."""
+    if t == Parameters.wte:
+        return "wte"
+    elif t == Parameters.wpe:
+        return "wpe"
+    elif t == Parameters.ln_1_gamma:
+        return "ln_1_gamma"
+    elif t == Parameters.ln_1_beta:
+        return "ln_1_beta"
+    elif t == Parameters.qkv_weight:
+        return "qkv_weight"
+    elif t == Parameters.qkv_bias:
+        return "qkv_bias"
+    elif t == Parameters.attn_proj_weight:
+        return "attn_proj_weight"
+    elif t == Parameters.attn_proj_bias:
+        return "attn_proj_bias"
+    elif t == Parameters.ln_2_gamma:
+        return "ln_2_gamma"
+    elif t == Parameters.ln_2_beta:
+        return "ln_2_beta"
+    elif t == Parameters.fc_weight:
+        return "fc_weight"
+    elif t == Parameters.fc_bias:
+        return "fc_bias"
+    elif t == Parameters.proj_weight:
+        return "proj_weight"
+    elif t == Parameters.proj_bias:
+        return "proj_bias"
+    elif t == Parameters.ln_f_gamma:
+        return "ln_f_gamma"
+    elif t == Parameters.ln_f_beta:
+        return "ln_f_beta"
+    else:
+        return "unknown"
 
 
 struct ParameterTensors[
@@ -3988,6 +4034,25 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # cross-rank gradient sum. The optimizer then reads that shard from
             # grads_memory + rank*opt — identical addressing to ZeRO-1's
             # post-allreduce read, so no separate shard buffer is needed.
+            # -D LLMM_DEBUG_LOCAL_GRADNORM=1: print each rank's LOCAL grad
+            # norm BEFORE the cross-rank reduce — discriminates "a rank's
+            # fp8 backward produced NaN locally" from "the collective
+            # corrupted finite local grads".
+            comptime if is_defined["LLMM_DEBUG_LOCAL_GRADNORM"]():
+                var local_norm = self.calculate_grad_norm()
+                print(
+                    "DEBUG rank",
+                    self.zero_ctx.rank,
+                    "local grad norm pre-reduce:",
+                    local_norm,
+                )
+            # -D LLMM_DEBUG_TENSOR_NANSCAN=1: localize WHICH gradient
+            # tensor is NaN on this rank BEFORE the cross-rank reduce.
+            # Non-bucketing path only — the bucketing early-return above
+            # precedes this, so grads_memory holds the full tensor-major
+            # gradient here.
+            comptime if is_defined["LLMM_DEBUG_TENSOR_NANSCAN"]():
+                self._debug_grad_nanscan(self.zero_ctx.rank, step, micro_step)
             if self.zero_ctx.zero_stage <= 1:
                 # Padded length: the staged GPU allreduce slices the buffer
                 # into WORLD_SIZE equal SIMD-aligned shards. The padding tail
@@ -4334,6 +4399,198 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             if sharded:
                 sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
             return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
+
+    def _debug_grad_nanscan(
+        mut self, rank: Int, step: Int, micro_step: Int
+    ) raises:
+        """-D LLMM_DEBUG_TENSOR_NANSCAN=1 probe: localize WHICH gradient
+        tensor went NaN on this rank, BEFORE the cross-rank reduce.
+
+        Scans grads_memory one parameter-class-per-layer slice at a time
+        with the llmm.global_norm sum-of-squares kernel. Squares are non-
+        negative, so a slice's sumsq is non-finite iff the slice contains
+        a NaN or an Inf/overflowing value (no cancellation can hide it).
+        Prints only when a non-finite slice exists, reporting ALL non-
+        finite slices in backward execution order (LM-head wte; ln_f;
+        layers last->first with per-layer sites proj -> fc -> ln_2 ->
+        attn_proj -> qkv -> ln_1; encoder wpe last) plus the total count.
+        Execution-order position bounds where corruption began: a NaN
+        introduced at one site contaminates only later-executed (earlier-
+        layer) tensors through the d_inp chain, never earlier-executed
+        ones; a count of 1 indicates an isolated weight/bias-grad
+        corruption. "layer -1" (printed @L-1) marks the non-per-layer
+        tensors (wte/wpe/ln_f); wpe non-finite is the chain-reached-
+        encoder sentinel, wte-alone the LM-head-wgrad sentinel.
+
+        Only valid on the non-bucketing path (ZeRO-0/1): bucketing
+        repoints grads.* into the recycled pool, so grads_memory never
+        holds the full tensor-major gradient. backward() returns before
+        the probe site when bucketing is on.
+        """
+        comptime if is_cpu[Self.target]():
+            # The corruption under study is GPU-only; no CPU scan needed.
+            return
+        else:
+            var L = self.config.num_layer
+            # The 12 per-layer classes [ln_1_gamma .. proj_bias].
+            var n_classes = Parameters.proj_bias - Parameters.ln_1_gamma + 1
+            # Slot layout: 0 wte, 1 wpe, 2 ln_f_gamma, 3 ln_f_beta, then
+            # 4 + k*L + layer for per-layer class k = t - ln_1_gamma.
+            var n_slots = 4 + n_classes * L
+
+            # Flat base (prefix sums of param_sizes) — the tensor-major
+            # grads_memory layout point_parameters established.
+            var flat_base = List[Int]()
+            var fb_acc = 0
+            for i in range(len(self.param_sizes)):
+                flat_base.append(fb_acc)
+                fb_acc += self.param_sizes[i]
+
+            # Debug-only path: per-call buffer creation is acceptable —
+            # this runs after backward()'s synchronize, so it cannot
+            # interleave with the kernels under investigation.
+            var out_buf = self.ctx.enqueue_create_buffer[DType.float32](n_slots)
+            var host_buf = self.ctx.enqueue_create_host_buffer[DType.float32](
+                n_slots
+            )
+            out_buf.enqueue_fill(Scalar[DType.float32](0.0))
+            comptime if not HAS_METAL:
+                self.ctx.synchronize()
+            var out_ptr = rebind_mut_mem[DType.float32](
+                out_buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+
+            comptime BLOCK_SIZE = 512
+            comptime width = simd_width_of[GPT2_DTYPE]()
+            # aligned=False: slice bases are element offsets into
+            # grads_memory with no SIMD over-alignment promise; unaligned
+            # loads are always safe and this path is debug-only.
+            comptime scan_kernel = global_norm_squared_gpu[
+                GPT2_DTYPE, BLOCK_SIZE, width, aligned=False
+            ]
+            var compiled_scan = self.ctx.compile_function[scan_kernel]()
+
+            # Whole-tensor classes -> slots 0..3. grid (1,1): the kernel's
+            # out_index is 0, so each launch accumulates into out_ptr+slot.
+            var whole = List[Int]()
+            whole.append(Parameters.wte)
+            whole.append(Parameters.wpe)
+            whole.append(Parameters.ln_f_gamma)
+            whole.append(Parameters.ln_f_beta)
+            for s in range(len(whole)):
+                var t = whole[s]
+                var n = self.param_sizes[t]
+                self.ctx.enqueue_function(
+                    compiled_scan,
+                    as_mut_kernel[DType.float32](out_ptr + s),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](
+                        self.grads_memory + flat_base[t]
+                    ),
+                    n,  # count (single slice)
+                    n,  # stride (unused with one slice)
+                    grid_dim=(1, 1),
+                    block_dim=(BLOCK_SIZE,),
+                )
+
+            # Per-layer classes: ONE launch per class with grid_y = L
+            # slices of stride param_sizes[t]/L; grid_x = 1 makes the
+            # kernel's out_index == block_idx.y == layer, so each layer's
+            # sum lands at out_ptr[4 + k*L + layer], no aggregation pass.
+            for k in range(n_classes):
+                var t = Parameters.ln_1_gamma + k
+                var stride = self.param_sizes[t] // L
+                self.ctx.enqueue_function(
+                    compiled_scan,
+                    as_mut_kernel[DType.float32](out_ptr + 4 + k * L),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](
+                        self.grads_memory + flat_base[t]
+                    ),
+                    stride,  # count per slice
+                    stride,  # slice stride
+                    grid_dim=(1, L),
+                    block_dim=(BLOCK_SIZE,),
+                )
+
+            comptime if not HAS_METAL:
+                self.ctx.synchronize()
+            self._copy_device_to_host[DType.float32](host_buf, out_ptr, n_slots)
+            self.ctx.synchronize()
+
+            # Backward execution order: LM-head wte; ln_f; each layer from
+            # last to first with its sites in backward order; encoder wpe
+            # (wte is tied — its slot covers both contributions).
+            var bwd_sites = List[Int]()
+            bwd_sites.append(Parameters.proj_weight)
+            bwd_sites.append(Parameters.proj_bias)
+            bwd_sites.append(Parameters.fc_weight)
+            bwd_sites.append(Parameters.fc_bias)
+            bwd_sites.append(Parameters.ln_2_gamma)
+            bwd_sites.append(Parameters.ln_2_beta)
+            bwd_sites.append(Parameters.attn_proj_weight)
+            bwd_sites.append(Parameters.attn_proj_bias)
+            bwd_sites.append(Parameters.qkv_weight)
+            bwd_sites.append(Parameters.qkv_bias)
+            bwd_sites.append(Parameters.ln_1_gamma)
+            bwd_sites.append(Parameters.ln_1_beta)
+
+            var order_slot = List[Int]()
+            var order_class = List[Int]()
+            var order_layer = List[Int]()  # -1 = not a per-layer tensor
+            order_slot.append(0)
+            order_class.append(Parameters.wte)
+            order_layer.append(-1)
+            order_slot.append(2)
+            order_class.append(Parameters.ln_f_gamma)
+            order_layer.append(-1)
+            order_slot.append(3)
+            order_class.append(Parameters.ln_f_beta)
+            order_layer.append(-1)
+            for layer in range(L - 1, -1, -1):
+                for si in range(len(bwd_sites)):
+                    var t = bwd_sites[si]
+                    var k = t - Parameters.ln_1_gamma
+                    order_slot.append(4 + k * L + layer)
+                    order_class.append(t)
+                    order_layer.append(layer)
+            order_slot.append(1)
+            order_class.append(Parameters.wpe)
+            order_layer.append(-1)
+
+            # Round-2 §2.7 amendments: (1) `not isfinite` — garbage
+            # operand bytes can decode to Inf or huge-finite values that
+            # overflow to Inf in the sumsq, not only NaN; the claim is
+            # "where non-finiteness appears", not "origin". (2) Print ALL
+            # non-finite slices, not just the first: the tied wte slot
+            # accumulates the LAST-executed encoder contribution, so any
+            # d_inp-chain contamination reaches wte and a first-only
+            # print would report "wte layer -1" and conceal the origin.
+            # Sentinels: `wpe` non-finite => the d_inp chain reached the
+            # encoder backward; `wte` alone (count 1) => isolated LM-head
+            # wgrad corruption.
+            var bad_count = 0
+            var sites = String("")
+            for i in range(len(order_slot)):
+                if not isfinite(host_buf[order_slot[i]]):
+                    bad_count += 1
+                    if sites.byte_length() > 0:
+                        sites += " "
+                    sites += String(_parameter_name(order_class[i]))
+                    sites += "@L"
+                    sites += String(order_layer[i])
+            if bad_count > 0:
+                var msg = String("DEBUG rank ")
+                msg += String(rank)
+                msg += " nonfinite slices "
+                msg += String(bad_count)
+                msg += "/"
+                msg += String(len(order_slot))
+                msg += " | step "
+                msg += String(step)
+                msg += " micro_step "
+                msg += String(micro_step)
+                msg += " | bwd-order: "
+                msg += sites
+                print(msg)
 
     def _checkpoint_config(self) -> CheckpointConfig:
         return CheckpointConfig(
@@ -5046,6 +5303,13 @@ def train[
                 grad_accum_steps,
             )
             accumulated_loss += model.mean_loss
+            # -D LLMM_DEBUG_RANK_STAGGER=1: break rank-lockstep entry into the
+            # FIRST backward (probe: if staggering alone cures the fp8
+            # multi-rank NaN, concurrent first-execution is the arming
+            # condition). ~120ms x rank via usleep, first micro-step only.
+            comptime if is_defined["LLMM_DEBUG_RANK_STAGGER"]():
+                if step == start_step + 1 and micro_step == 0:
+                    _ = external_call["usleep", Int32](UInt32(rank * 120000))
             model.backward(grad_accum_steps, micro_step, step)
         model.ctx.synchronize()
         accumulated_loss /= Float32(grad_accum_steps)
@@ -5336,6 +5600,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
                 except e:
                     print("Rank", rank, "failed:", e)
 
+            fp8_mutex_preseed()
             sync_parallelize[_run_rank](world_size)
             cpu_coord_ptr[].free()
             cpu_coord_ptr.free()
@@ -5389,6 +5654,7 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
                 except e:
                     print("Rank", r, "failed:", e)
 
+            fp8_mutex_preseed()
             sync_parallelize[_run_rank](world_size)
             coord_ptr[].free()
             coord_ptr.free()

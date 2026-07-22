@@ -22,6 +22,80 @@ from std.gpu.memory import AddressSpace
 from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.intrinsics import threadfence, Scope
 from std.atomic import Atomic
+from std.ffi import _get_global_or_null, external_call
+
+
+# -D LLMM_FP8_GEMM_MUTEX=1: serialize fp8 cuBLASLt submission across rank
+# threads (probe for a suspected library-level concurrency defect in the
+# e4m3xe5m2 path; submission is host-side microseconds, execution stays
+# concurrent).
+comptime FP8_GEMM_MUTEX = is_defined["LLMM_FP8_GEMM_MUTEX"]()
+# -D LLMM_FP8_BWD_MUTEX=1: serialize the ENTIRE fp8 backward host-side
+# submission (quantize + amax + both GEMMs) across rank threads — probe for
+# a first-use/init race in the backward kernel path.
+comptime FP8_BWD_MUTEX = is_defined["LLMM_FP8_BWD_MUTEX"]()
+# -D LLMM_FP8_BWD_EXEC_MUTEX=1: like LLMM_FP8_BWD_MUTEX, but the lock is
+# held until a `ctx.synchronize()` at the end of `matmul_bwd_lowp`
+# COMPLETES — i.e. every fp8 backward kernel this call enqueued has
+# finished EXECUTING on the GPU before any other rank may enqueue its own.
+# Round-3 probe: submission-only serialization still failed 3/10 at ws2,
+# so the remaining hypothesis is execution-level cross-device concurrency
+# (fp8 backward kernels physically co-executing on different GPUs, with
+# peer access + UVA mappings live). DIAGNOSTIC ONLY — this serializes real
+# GPU work across ranks (~WORLD_SIZE x the fp8 backward-bundle time, plus
+# a full stream drain per site call); never ship it as a fix.
+comptime FP8_BWD_EXEC_MUTEX = is_defined["LLMM_FP8_BWD_EXEC_MUTEX"]()
+# -D LLMM_FP8_BWD_SYNC_ONLY=1: the `ctx.synchronize()` at the end of
+# `matmul_bwd_lowp` WITHOUT any cross-rank lock. Bounds this rank's async
+# launch run-ahead to one fp8-backward site bundle (~7 kernels) while leaving
+# cross-rank submission AND cross-GPU execution fully concurrent. Round-3
+# discriminator between "cross-GPU execution overlap corrupts" (predicts this
+# still fails) and "per-rank deep-async-queue run-ahead race" (predicts this
+# cures, like CUDA_LAUNCH_BLOCKING=1 10/10 and MODULAR_DEBUG=device-sync-mode
+# 4/4 — both per-rank-only synchronizers that leave cross-GPU overlap intact).
+# If clean, this doubles as the shipping MITIGATION for fp8 WORLD_SIZE>1
+# (measured cost of the far heavier sync-mode was ~4%; this syncs only
+# 144x/micro-step). It is a window-closure mitigation, not a root-cause fix.
+comptime FP8_BWD_SYNC_ONLY = is_defined["LLMM_FP8_BWD_SYNC_ONLY"]()
+
+
+def _fp8_gemm_lock() -> UnsafePointer[Atomic[DType.int32], MutUntrackedOrigin]:
+    """Process-global lock cell for the FP8_*_MUTEX probes. MUST be seeded
+    from a single thread before any concurrency (`fp8_mutex_preseed`, called
+    ahead of `sync_parallelize` in train_gpt2.mojo) — a concurrent first
+    call races the registry insert and can split ranks across two cells.
+    After InsertGlobal, the registry is re-read and its winner adopted so a
+    raced loser at least converges instead of keeping a private cell."""
+    var name = String("LLMM_FP8_GEMM_LOCK")
+    if gp := _get_global_or_null(name):
+        return gp.value().bitcast[Atomic[DType.int32]]()
+    # Atomic[int32] is layout-compatible with a bare int32 cell; allocate
+    # and zero the cell, then hand out Atomic-typed views of it.
+    var p = alloc[Scalar[DType.int32]](1)
+    p[0] = 0
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), p.bitcast[NoneType]()
+    )
+    var winner = _get_global_or_null(name)
+    if winner:
+        var wp = winner.value().bitcast[Scalar[DType.int32]]()
+        if wp != p:
+            p.free()
+        return rebind[UnsafePointer[Atomic[DType.int32], MutUntrackedOrigin]](
+            wp.bitcast[Atomic[DType.int32]]().as_unsafe_any_origin()
+        )
+    return rebind[UnsafePointer[Atomic[DType.int32], MutUntrackedOrigin]](
+        p.bitcast[Atomic[DType.int32]]().as_unsafe_any_origin()
+    )
+
+
+def fp8_mutex_preseed():
+    """Seed the FP8_*_MUTEX lock cell single-threaded, before rank threads
+    exist. No-op beyond the first call."""
+    comptime if FP8_GEMM_MUTEX or FP8_BWD_MUTEX or FP8_BWD_EXEC_MUTEX:
+        _ = _fp8_gemm_lock()
+
+
 from std.sys import size_of
 from std.gpu.host._nvidia_cuda import CUDA
 from _cublas.dtype import DataType
@@ -849,6 +923,14 @@ def lowp_gemm_devscale[
                 b_fp8_scratch, b_ptr, b_scale_ptr, n * k, ctx
             )
 
+    comptime if FP8_GEMM_MUTEX:
+        var lk = _fp8_gemm_lock()
+        while True:
+            var expected = Scalar[DType.int32](0)
+            if lk[].compare_exchange(expected, 1):
+                break
+            _ = external_call["sched_yield", Int32]()
+
     _matmul_cublaslt_fp8[
         a_out_dtype, b_out_dtype, out_dtype, fast_accum=fast_accum
     ](
@@ -863,6 +945,9 @@ def lowp_gemm_devscale[
         accumulate,
         ctx,
     )
+
+    comptime if FP8_GEMM_MUTEX:
+        _fp8_gemm_lock()[].store(0)
 
 
 # ===------------------------------------------------------------------=== #
@@ -3523,27 +3608,43 @@ def matmul_bwd_lowp[
     # `-D LLMM_FP8_STATIC_SCALES=1`, `doutput_state.scale` was seeded once
     # at `Fp8State.__init__` time and never updated — skip the amax
     # reduction + scale-update kernel entirely (comptime-gated).
+    comptime if FP8_BWD_MUTEX or FP8_BWD_EXEC_MUTEX:
+        var lk = _fp8_gemm_lock()
+        while True:
+            var expected = Scalar[DType.int32](0)
+            if lk[].compare_exchange(expected, 1):
+                break
+            _ = external_call["sched_yield", Int32]()
+
+    # Persistent scratch, NOT per-call DeviceBuffers: a per-call buffer's
+    # release is not reliably ordered after consumers enqueued post-borrow
+    # (G2/G3, and the 2026-07-22 multi-rank NaN hunt), so the fp8 backward
+    # keeps NO per-call device allocations. Per-(site) sizes are fixed for
+    # the whole run (B/T/channels invariant); intra-call reuse is safe on
+    # the rank's single in-order stream.
     comptime if not FP8_STATIC_SCALES:
-        var amax_doutput = ctx.enqueue_create_buffer[DType.float32](1)
+        var amax_doutput = persistent_device_buffer[DType.float32](
+            ctx, "FP8_AMAX_DOUT", 1
+        )
         compute_amax[FP8_SPEC, dtype](
-            device_buf_mut_ptr(amax_doutput),
+            amax_doutput,
             d_output_ptr,
             rows * out_channels,
             ctx,
         )
         doutput_state.update_scale[FP8_SPEC.bwd_dtype](
-            kernel_ptr_as_immut(device_buf_mut_ptr(amax_doutput)), ctx
+            kernel_ptr_as_immut(amax_doutput), ctx
         )
 
-    var doutput_fp8_nat = ctx.enqueue_create_buffer[DType.uint8](
-        rows * out_channels
+    var doutput_fp8_nat = persistent_device_buffer[DType.uint8](
+        ctx, String("FP8_BWD_DN_") + String(site), rows * out_channels
     )
-    var doutput_fp8_t = ctx.enqueue_create_buffer[DType.uint8](
-        out_channels * rows
+    var doutput_fp8_t = persistent_device_buffer[DType.uint8](
+        ctx, String("FP8_BWD_DT_") + String(site), out_channels * rows
     )
     quantize_dual_devscale[FP8_SPEC, FP8_SPEC.bwd_dtype, dtype, target](
-        device_buf_mut_ptr(doutput_fp8_nat),
-        device_buf_mut_ptr(doutput_fp8_t),
+        doutput_fp8_nat,
+        doutput_fp8_t,
         d_output_ptr,
         kernel_ptr_as_immut(device_buf_mut_ptr(doutput_state.scale)),
         rows,
@@ -3554,7 +3655,7 @@ def matmul_bwd_lowp[
     matmul_d_input_bwd_lowp[dtype, target, use_gelu](
         d_input_ptr,
         d_output_ptr,
-        device_buf_mut_ptr(doutput_fp8_nat),
+        doutput_fp8_nat,
         weight_ptr,
         pre_gelu_ptr,
         batch_size,
@@ -3570,7 +3671,7 @@ def matmul_bwd_lowp[
     matmul_d_weight_bwd_lowp[dtype, target, accumulate](
         d_weight_ptr,
         d_output_ptr,
-        device_buf_mut_ptr(doutput_fp8_t),
+        doutput_fp8_t,
         input_ptr,
         batch_size,
         seq_len,
@@ -3583,19 +3684,19 @@ def matmul_bwd_lowp[
         ctx,
     )
 
-    # Explicit keep-alive: `doutput_fp8_nat`'s last textual use above is
-    # inside the `matmul_d_input_bwd_lowp` call (before `matmul_d_weight_bwd_
-    # lowp` even runs). Without this, Mojo's destroy-at-last-use could drop
-    # `doutput_fp8_nat`'s `DeviceBuffer` — and, transitively, let its
-    # backing allocation be reclaimed/reused by a scratch buffer one of the
-    # nested calls below allocates — before the dgrad GEMM that reads it
-    # has actually been issued to completion. `DeviceBuffer.__del__`'s
-    # release is itself stream-ordered (per its docstring), but keeping
-    # both buffers referenced through the end of this function removes any
-    # dependency on that guarantee reaching this deep a call chain
-    # correctly. Cheap (a pointer read), not a kernel launch.
-    _ = doutput_fp8_nat.unsafe_ptr()
-    _ = doutput_fp8_t.unsafe_ptr()
+    comptime if FP8_BWD_EXEC_MUTEX or FP8_BWD_SYNC_ONLY:
+        # Drain this rank's stream BEFORE releasing the lock: every fp8
+        # backward kernel enqueued above (quantize_dual + dgrad + wgrad and,
+        # under dynamic scaling, amax/scale-update) must have finished
+        # executing before another rank may start enqueueing its own —
+        # execution-exclusion, not just submission-exclusion. Safe to hold
+        # the lock across this sync: nothing inside `matmul_bwd_lowp`
+        # requires another rank's progress (no collectives / host barriers
+        # in this scope), so the blocked ranks' sched_yield spin cannot
+        # deadlock against the sync.
+        ctx.synchronize()
+    comptime if FP8_BWD_MUTEX or FP8_BWD_EXEC_MUTEX:
+        _fp8_gemm_lock()[].store(0)
 
 
 # ===----------------------------------------------------------------------=== #

@@ -52,7 +52,7 @@ from std.gpu.host import DeviceContext, DeviceBuffer, DeviceAttribute
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.primitives import block
 
-from llmm.memory import MutKernelPtr, ImmutKernelPtr
+from llmm.memory import MutKernelPtr, ImmutKernelPtr, persistent_device_buffer
 from llmm.lowp import PrecisionSpec, ScalingKind
 
 
@@ -253,15 +253,23 @@ def compute_amax[
         var needed_grid = ceildiv(size, BLOCK_SIZE * width)
         var grid_size = max(1, min(max_grid, needed_grid))
 
-        var partial_max = ctx.enqueue_create_buffer[DType.float32](grid_size)
-        var partial_bad = ctx.enqueue_create_buffer[DType.float32](grid_size)
+        # Persistent scratch, NOT per-call DeviceBuffers: a per-call buffer's
+        # release is not reliably ordered after consumers enqueued post-borrow
+        # (G2/G3, and the 2026-07-22 multi-rank NaN hunt). Sized to max_grid,
+        # the per-device ceiling, so every call's grid_size fits.
+        var partial_max = persistent_device_buffer[DType.float32](
+            ctx, "AMAX_PARTIAL_MAX", max_grid
+        )
+        var partial_bad = persistent_device_buffer[DType.float32](
+            ctx, "AMAX_PARTIAL_BAD", max_grid
+        )
 
         comptime partial_kernel = _amax_partial_gpu[in_dtype, BLOCK_SIZE, width]
         var compiled_partial = ctx.compile_function[partial_kernel]()
         ctx.enqueue_function(
             compiled_partial,
-            device_buf_mut_ptr(partial_max),
-            device_buf_mut_ptr(partial_bad),
+            partial_max,
+            partial_bad,
             data,
             size,
             grid_dim=(grid_size,),
@@ -273,8 +281,8 @@ def compute_amax[
         ctx.enqueue_function(
             compiled_aggregate,
             amax_out,
-            device_buf_mut_ptr(partial_max),
-            device_buf_mut_ptr(partial_bad),
+            partial_max,
+            partial_bad,
             grid_size,
             grid_dim=(1,),
             block_dim=(BLOCK_SIZE,),
