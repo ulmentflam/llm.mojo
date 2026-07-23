@@ -909,9 +909,13 @@ build-mojo: | $(PIXI_STAMP)
 # `make lint-c` / `make lint-cuda` directly if first-party C/CUDA is ever added.
 lint: lint-python lint-mojo lint-latex typecheck
 
+# ruff is pinned: unpinned uvx pulls the newest release, whose default
+# rule/format changes can dirty the whole tree mid-merge (0.16.0 did).
+RUFF := uvx ruff@0.15.2
+
 lint-python:
-	@uvx ruff check $(PYTHON_PATHS)
-	@uvx ruff format --check $(PYTHON_PATHS)
+	@$(RUFF) check $(PYTHON_PATHS)
+	@$(RUFF) format --check $(PYTHON_PATHS)
 
 lint-mojo: | $(PIXI_STAMP)
 	@fail=0; \
@@ -978,8 +982,8 @@ lint-latex:
 format: format-python format-mojo format-latex
 
 format-python:
-	@uvx ruff check --fix $(PYTHON_PATHS)
-	@uvx ruff format $(PYTHON_PATHS)
+	@$(RUFF) check --fix $(PYTHON_PATHS)
+	@$(RUFF) format $(PYTHON_PATHS)
 
 format-mojo:
 	@if find $(MOJO_PATHS) -name '*.mojo' -print -quit 2>/dev/null | grep -q .; then \
