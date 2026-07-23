@@ -712,6 +712,13 @@ MEMORY.md `weak-gates-overrule-nothing`).
 
 ### G4 — fp8 multi-rank NaN: an upstream launch-machinery race, mitigated only by per-launch synchronization
 
+**Primary reference: `docs/ai/fp8_multirank_nan_investigation.md`** — the
+consolidated record (all four rounds + the round-4/salvage batteries).
+It supersedes the per-round reports and this entry's details where they
+conflict; notably, `LLMM_FP8_NO_STASH` (dormant-stash elimination) is now the
+cure-class candidate (0/28 solo-protocol, Fisher p ~ 2.7e-5, step-1 ~15.5%
+faster), pending its merge gates (byte-diff probe, ws7 battery).
+
 **What:** fp8 training at world_size > 1 and depth >= ~36 layers NaNs some ranks'
 LOCAL gradients at step 1: exactly ONE corrupted tensor slice per victim rank
 (nanscan: always proj wgrad, preferring layer 27), victim set varies per run,

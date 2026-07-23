@@ -1,3 +1,5 @@
+> **Superseded by `fp8_multirank_nan_investigation.md`, kept as historical record.**
+
 # FP8 multi-rank NaN hunt — fleet synthesis (2026-07-22)
 
 Bug: `-D LLMM_PRECISION=fp8`, GPT-2 d36, multi-rank single-process (7 host

@@ -1,3 +1,5 @@
+> **Superseded by `fp8_multirank_nan_investigation.md`, kept as historical record.**
+
 # fp8 multi-rank NaN hunt — Round 2 synthesis (2026-07-22)
 
 Status: mechanism narrowed to one family but **not yet proven** — the experiment that

@@ -1,3 +1,5 @@
+> **Superseded by `fp8_multirank_nan_investigation.md`, kept as historical record.**
+
 > **AMENDED 2026-07-23** — after adversarial re-validation of two previously
 > unrun probes, several claims below are superseded. Read the final section
 > ("2026-07-23 amendments") before citing this document or filing upstream.

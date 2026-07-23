@@ -1,3 +1,5 @@
+> **Superseded by `fp8_multirank_nan_investigation.md`, kept as historical record.**
+
 # fp8 multi-rank backward race — root cause analysis (2026-07-22)
 
 **Symptom.** fp8 build (`-D LLMM_PRECISION=fp8`), GPT-2 d36, single-process
