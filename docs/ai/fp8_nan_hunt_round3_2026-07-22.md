@@ -1,3 +1,7 @@
+> **AMENDED 2026-07-23** — after adversarial re-validation of two previously
+> unrun probes, several claims below are superseded. Read the final section
+> ("2026-07-23 amendments") before citing this document or filing upstream.
+
 # fp8 multi-rank NaN hunt — Round 3 synthesis (2026-07-22, late)
 
 Status: **mechanism committed** (one level above final attribution), round-3 pivot
@@ -378,3 +382,67 @@ reports), keep nanscan gated, and gate-check per the merge rules
 
 Round-3 logs (scratchpad, session ece34132…): `clb_ws2_logs/`, `stagger10/`,
 `nanscan/`, `logs/{syncmode,fwdonly,d24,d12}_run*.log`.
+
+
+---
+
+## 2026-07-23 amendments (adversarially reviewed; supersede conflicting claims above)
+
+Two probes this document prescribed but round 3 never executed were run
+(ws2 d36, n=10 each, verified-sound pre-seeded lock), and the results plus a
+statistics audit were put through paired adversarial review (evidence lens +
+inference lens). Outcomes:
+
+**Full arm table (the key artifact for upstream engineers):**
+
+| Arm | NaN rate | Fisher vs baseline |
+|---|---|---|
+| baseline (no mitigation) | 8/10 | — |
+| LLMM_FP8_BWD_SYNC_ONLY (per-site drain) | 5/10 | p=0.35 |
+| LLMM_FP8_GEMM_MUTEX (submission, fixed lock) | 4/10 | p=0.17 |
+| whole-backward submission mutex | 3/10 | p=0.07 |
+| LLMM_FP8_BWD_EXEC_MUTEX (execution exclusion + drain) | 3/10 | p=0.07 |
+| CUDA_LAUNCH_BLOCKING=1 | 0/10 | **p=0.0007** |
+| MODULAR_DEBUG=device-sync-mode | 0/4 (+1000 live steps) | — |
+
+**Superseded claims:**
+1. Section 1's "forcing queue depth ~1 (CLB, device-sync-mode, or a per-site
+   stream drain) closes it" — the per-site-drain limb is REFUTED by this
+   document's own pre-registered discriminator (SYNC_ONLY, 5/10 NaN). The
+   window is NOT the fp8-backward launch bundle.
+2. Section 1A/gate-8's "submission mutex 8/10→3/10 p≈0.009 proves
+   host-timing sensitivity" — the p-value was computed against a fixed
+   p=0.8, not the empirical baseline; correct Fisher is p≈0.07. All four
+   partial-serialization arms are statistically indistinguishable from
+   baseline and from each other at n=10 (pooled trend p≈0.03 at most).
+3. Section 5.1's SYNC_ONLY shipping mitigation — FAILED. The only proven
+   mitigations are `CUDA_LAUNCH_BLOCKING=1` (promoted to primary for fp8
+   WORLD_SIZE>1) and `MODULAR_DEBUG=device-sync-mode`.
+4. Section 7 Modular title — must read "cured only by GLOBAL per-launch
+   synchronization; per-site stream drains and cross-rank submission/
+   execution mutexes do not cure." NVIDIA filing promoted toward
+   co-primary: EXEC_MUTEX failing while sibling fp8 activity is excluded
+   within windows raises the multi-context guest-driver/GSP branch
+   independently.
+
+**Strengthened:** the cross-GPU-execution-overlap refutation. EXEC_MUTEX —
+hard mutual exclusion of fp8-backward co-execution, lock held through a full
+stream drain — still fails 3/10.
+
+**Surviving mechanism candidates (undetermined between):** (i) whole-timeline
+per-rank run-ahead, most exposed at the forward-written fp8 operand stashes
+(proj_input WT/IT — written in forward, consumed micro-steps later, never
+synchronized in ANY partial arm; consistent with nanscan's proj-wgrad-only
+signature); (ii) a host-timing collision in shared launch machinery (the
+effect ordering — submission serialization trending below site-granular
+drains — fits this); (iii) a multi-context guest-driver/GSP deep-queue fault
+armed by the sibling CONTEXT's existence rather than its activity.
+
+**Pre-filing discriminator (demanded by both reviewers, ~1 GPU-hour, run
+after the current training completes):** stash-lifecycle checkpoints on the
+plain ws2 binary — isfinite counts on the proj stash (a) after its forward
+write, (b) before wgrad consumption, (c) on the wgrad output, layers 27 and
+3, 10 runs. Bad-at-(a) => forward-window run-ahead (candidate i); good-(a)/
+bad-(b) => struck while dormant => spatial/driver story (candidate iii);
+good-(b)/bad-(c) => rerun under EXEC_MUTEX for the kill shot either way.
+Secondary: -D LLMM_FP8_FWD_SYNC_ONLY (forward-side drain) x10.
