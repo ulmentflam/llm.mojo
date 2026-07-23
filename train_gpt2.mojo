@@ -137,6 +137,9 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #                              Only meaningful with LLMM_FP8_STATIC_SCALES.
 #   LLMM_FP8_FAST_ACCUM=1      cuBLASLt fast accumulation, FORWARD GEMM only;
 #                              dgrad/wgrad always precise. llmm/matmul.mojo.
+#   LLMM_FP8_STASH_LEGACY=1    forward-written transposed fp8 stash (the old
+#                              default) instead of the backward's
+#                              requantize-at-consumption. llmm/matmul.mojo.
 # FP4 (all inert unless LLMM_PRECISION=fp4)
 #   LLMM_FP4_FIRST=<int>       first N blocks stay bf16 (default 2).
 #   LLMM_FP4_LAST=<int>        fp4 range end; default -1 = num_layers-2,

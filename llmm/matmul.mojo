@@ -57,6 +57,21 @@ comptime FP8_BWD_EXEC_MUTEX = is_defined["LLMM_FP8_BWD_EXEC_MUTEX"]()
 # (measured cost of the far heavier sync-mode was ~4%; this syncs only
 # 144x/micro-step). It is a window-closure mitigation, not a root-cause fix.
 comptime FP8_BWD_SYNC_ONLY = is_defined["LLMM_FP8_BWD_SYNC_ONLY"]()
+# fp8 transposed-operand policy. DEFAULT (requantize): forward quantizes
+# natural-layout only (quantize_devscale); matmul_d_input_bwd_lowp /
+# matmul_d_weight_bwd_lowp re-quantize the transposed operand fresh at
+# consumption time (quantize_transpose_devscale), immediately before the
+# consuming GEMM — no long-lived forward-written WT/IT stash, closing the
+# written-in-forward/consumed-micro-step-later exposure at the cost of two
+# extra transpose-quantize kernels per fp8 site per backward. The two
+# paths' results differ deterministically by ~0.3%: a benign
+# allocation-layout execution variant of the backward GEMMs (byte-diff
+# verified operand-identical; see docs/ai/fp8_multirank_nan_investigation.md).
+# -D LLMM_FP8_STASH_LEGACY=1: the old path — forward's
+# quantize_dual_devscale also writes the transposed fp8 stash into
+# lowp_transpose_cache, and dgrad/wgrad consume it a forward-to-backward
+# window later.
+comptime FP8_STASH_LEGACY = is_defined["LLMM_FP8_STASH_LEGACY"]()
 
 
 def _fp8_gemm_lock() -> UnsafePointer[Atomic[DType.int32], MutUntrackedOrigin]:
@@ -1734,12 +1749,14 @@ struct MatmulFwd:
 # (cuBLASLt fp8 has restricted epilogue support).
 
 
-# Dual-output quantize for the weight/input pair shared across the
-# forward/backward boundary: matmul_fwd_lowp's natural-layout quantize and
-# the backward's transposed-layout quantize of the SAME bf16 tensor at the
-# SAME (not-updated-between-fwd-and-bwd) scale are fused into one
-# quantize_dual_devscale call in forward; the transposed copy is cached in a
-# persistent per-(site,layer) buffer that backward reads read-only.
+# Transposed-operand fp8 cache shared across the forward/backward
+# boundary. Default: forward quantizes natural-layout only, and dgrad/
+# wgrad fill this cache themselves at consumption time
+# (quantize_transpose_devscale). -D LLMM_FP8_STASH_LEGACY=1: the
+# natural-layout and transposed-layout quantizes of the SAME bf16 tensor
+# at the SAME (not-updated-between-fwd-and-bwd) scale are fused into one
+# quantize_dual_devscale call in forward, and the transposed copy is
+# stashed here for backward to read read-only.
 #
 # The cache MUST be a persistent_device_buffer (process-global heap cell),
 # NOT a local DeviceBuffer: a local's destroy-at-last-use can drop the buffer
@@ -1747,11 +1764,12 @@ struct MatmulFwd:
 # reproduced race — docs/ai/low_precision_gotchas.md G2). A persistent
 # buffer has no scope-tracked owner, so there is no "last use" to destroy at.
 #
-# forward-writes-then-backward-reads is safe for ANY grad_accum_steps: the
-# training loop runs forward then backward once per micro-step, sequentially,
-# on one stream — a per-(site,layer) buffer written by this micro-step's
-# forward is consumed by this same micro-step's backward before the next
-# forward can overwrite it. site/layer only build the cache's name.
+# forward-writes-then-backward-reads (legacy path) is safe for ANY
+# grad_accum_steps: the training loop runs forward then backward once per
+# micro-step, sequentially, on one stream — a per-(site,layer) buffer
+# written by this micro-step's forward is consumed by this same
+# micro-step's backward before the next forward can overwrite it.
+# site/layer only build the cache's name.
 
 
 @always_inline
@@ -1821,17 +1839,20 @@ def matmul_fwd_lowp[
     (no persistent fp8 weight cache) because the optimizer updates it every
     step.
 
-    Weight AND input are each quantized via `quantize_dual_devscale` — ONE
-    read of the bf16 source producing BOTH
-    the natural-layout fp8 copy (consumed immediately below, by THIS
-    function's own GEMM) and the transposed-layout copy (cached in a
-    persistent `(site, layer)`-keyed buffer via `lowp_transpose_cache`,
-    consumed later this same micro-step by `matmul_d_input_bwd_lowp`'s dgrad
-    (weight-transposed) / `matmul_d_weight_bwd_lowp`'s wgrad
-    (input-transposed) — see the module comment above this function for the
-    full lifetime/ownership design). `site`/`layer` identify this call site
-    for that cache; they carry no other meaning (not used for dispatch, only
-    for building the persistent buffer's name).
+    By default weight AND input are each quantized natural-layout only
+    (`quantize_devscale`) — the backward re-quantizes the transposed
+    copies fresh at consumption time. Under -D LLMM_FP8_STASH_LEGACY=1
+    they are instead quantized via `quantize_dual_devscale` — ONE read of
+    the bf16 source producing BOTH the natural-layout fp8 copy (consumed
+    immediately below, by THIS function's own GEMM) and the
+    transposed-layout copy (cached in a persistent `(site, layer)`-keyed
+    buffer via `lowp_transpose_cache`, consumed later this same micro-step
+    by `matmul_d_input_bwd_lowp`'s dgrad (weight-transposed) /
+    `matmul_d_weight_bwd_lowp`'s wgrad (input-transposed) — see the module
+    comment above this function for the full lifetime/ownership design).
+    `site`/`layer` identify this call site for that cache; they carry no
+    other meaning (not used for dispatch, only for building the persistent
+    buffer's name).
 
     GPU-only (comptime-asserted): fp8 is never instantiated for the `cpu`
     target.
@@ -1882,31 +1903,54 @@ def matmul_fwd_lowp[
         out_channels * in_channels
     )
     var b_scratch = ctx.enqueue_create_buffer[DType.uint8](rows * in_channels)
-    var weight_t = lowp_transpose_cache(
-        ctx, "WT", site, layer, in_channels * out_channels
-    )
-    var input_t = lowp_transpose_cache(
-        ctx, "IT", site, layer, in_channels * rows
-    )
+    comptime if not FP8_STASH_LEGACY:
+        # Default (see the flag comment near the top of this file):
+        # natural-layout quantize ONLY — no transposed stash is written in
+        # forward at all; backward re-quantizes the transposed operands
+        # fresh at consumption time.
+        quantize_devscale[FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target](
+            device_buf_mut_ptr(a_scratch),
+            weight_ptr,
+            kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
+            out_channels * in_channels,
+            ctx,
+        )
+        quantize_devscale[FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target](
+            device_buf_mut_ptr(b_scratch),
+            input_ptr,
+            kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
+            rows * in_channels,
+            ctx,
+        )
+    else:
+        # -D LLMM_FP8_STASH_LEGACY=1: dual-output quantize — the transposed
+        # fp8 copy is stashed here for dgrad/wgrad to consume a
+        # forward-to-backward window later.
+        var weight_t = lowp_transpose_cache(
+            ctx, "WT", site, layer, in_channels * out_channels
+        )
+        var input_t = lowp_transpose_cache(
+            ctx, "IT", site, layer, in_channels * rows
+        )
 
-    quantize_dual_devscale[FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target](
-        device_buf_mut_ptr(a_scratch),
-        weight_t,
-        weight_ptr,
-        kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
-        out_channels,
-        in_channels,
-        ctx,
-    )
-    quantize_dual_devscale[FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target](
-        device_buf_mut_ptr(b_scratch),
-        input_t,
-        input_ptr,
-        kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
-        rows,
-        in_channels,
-        ctx,
-    )
+        quantize_dual_devscale[FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target](
+            device_buf_mut_ptr(a_scratch),
+            weight_t,
+            weight_ptr,
+            kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
+            out_channels,
+            in_channels,
+            ctx,
+        )
+        quantize_dual_devscale[FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target](
+            device_buf_mut_ptr(b_scratch),
+            input_t,
+            input_ptr,
+            kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
+            rows,
+            in_channels,
+            ctx,
+        )
 
     lowp_gemm_devscale[
         FP8_SPEC.fwd_dtype,
@@ -3362,15 +3406,16 @@ def matmul_bwd[
 # and both dgrad and wgrad read the result — see `matmul_bwd_lowp`'s
 # docstring.
 #
-# dgrad/wgrad do not re-quantize weight's/input's transposed fp8 copy
-# themselves — `matmul_fwd_lowp` already produced it this micro-step
-# (dual-output, alongside its own natural-layout quantize) into a persistent
-# `(site, layer)`-keyed cache (`lowp_transpose_cache`), which dgrad/wgrad
-# read read-only via `lowp_gemm_devscale`'s `quantize_a=False`. See the
-# module comment above `matmul_fwd_lowp` for the full lifetime/ownership
-# design and docs/ai/low_precision_gotchas.md G2 for why that cache is a
-# persistent process-global buffer rather than a plain per-call
-# `DeviceBuffer`.
+# By default dgrad/wgrad re-quantize weight's/input's transposed fp8 copy
+# themselves, fresh at consumption time, into the `(site, layer)`-keyed
+# cache buffer (`lowp_transpose_cache`). Under -D LLMM_FP8_STASH_LEGACY=1
+# `matmul_fwd_lowp` already produced it this micro-step (dual-output,
+# alongside its own natural-layout quantize) and dgrad/wgrad only read it.
+# Either way the GEMM consumes the cache via `lowp_gemm_devscale`'s
+# `quantize_a=False`. See the module comment above `matmul_fwd_lowp` for
+# the full lifetime/ownership design and docs/ai/low_precision_gotchas.md
+# G2 for why that cache is a persistent process-global buffer rather than
+# a plain per-call `DeviceBuffer`.
 
 
 def matmul_d_input_bwd_lowp[
@@ -3406,11 +3451,12 @@ def matmul_d_input_bwd_lowp[
     is not read.
 
     `site`/`layer` (see the module comment above `matmul_fwd_lowp`):
-    identify the SAME call site whose forward pass
-    already quantized `weight`'s transposed fp8 copy into a persistent
-    cache this micro-step, via `lowp_transpose_cache` — `weight_ptr` is
-    still accepted only to satisfy `lowp_gemm_devscale`'s uniform signature
-    under `quantize_a=False`; it is not read here.
+    identify this call site's persistent transposed-fp8 cache buffer
+    (`lowp_transpose_cache`). By default this function re-quantizes
+    `weight` into it fresh (`weight_ptr` IS read); under
+    -D LLMM_FP8_STASH_LEGACY=1 the forward already filled it and
+    `weight_ptr` is accepted only to satisfy `lowp_gemm_devscale`'s
+    uniform signature under `quantize_a=False`.
     """
     comptime assert is_gpu[target](), (
         "matmul_d_input_bwd_lowp is GPU-only; low-precision kernels must"
@@ -3423,6 +3469,22 @@ def matmul_d_input_bwd_lowp[
     var weight_t = lowp_transpose_cache(
         ctx, "WT", site, layer, in_channels * out_channels
     )
+    comptime if not FP8_STASH_LEGACY:
+        # Default (see the flag comment near the top of this file): the
+        # forward wrote NO transposed stash — re-quantize weight's
+        # transposed fp8 copy fresh, immediately before the consuming GEMM,
+        # from the same bf16 source at the same (not-updated-since-forward)
+        # scale. `weight_ptr` IS read here on this path.
+        quantize_transpose_devscale[
+            FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target
+        ](
+            weight_t,
+            weight_ptr,
+            kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
+            out_channels,
+            in_channels,
+            ctx,
+        )
 
     lowp_gemm_devscale[
         FP8_SPEC.fwd_dtype,
@@ -3486,11 +3548,12 @@ def matmul_d_weight_bwd_lowp[
     signature under `quantize_b=False` — it is not read.
 
     `site`/`layer` (see the module comment above `matmul_fwd_lowp`):
-    identify the SAME call site whose forward pass
-    already quantized `input`'s transposed fp8 copy into a persistent
-    cache this micro-step, via `lowp_transpose_cache` — `input_ptr` is
-    still accepted only to satisfy `lowp_gemm_devscale`'s uniform signature
-    under `quantize_a=False`; it is not read here.
+    identify this call site's persistent transposed-fp8 cache buffer
+    (`lowp_transpose_cache`). By default this function re-quantizes
+    `input` into it fresh (`input_ptr` IS read); under
+    -D LLMM_FP8_STASH_LEGACY=1 the forward already filled it and
+    `input_ptr` is accepted only to satisfy `lowp_gemm_devscale`'s
+    uniform signature under `quantize_a=False`.
     """
     comptime assert is_gpu[target](), (
         "matmul_d_weight_bwd_lowp is GPU-only; low-precision kernels must"
@@ -3503,6 +3566,22 @@ def matmul_d_weight_bwd_lowp[
     var input_t = lowp_transpose_cache(
         ctx, "IT", site, layer, in_channels * rows
     )
+    comptime if not FP8_STASH_LEGACY:
+        # Default (see the flag comment near the top of this file): the
+        # forward wrote NO transposed stash — re-quantize input's
+        # transposed fp8 copy fresh, immediately before the consuming GEMM,
+        # from the same bf16 source at the same (not-updated-since-forward)
+        # scale. `input_ptr` IS read here on this path.
+        quantize_transpose_devscale[
+            FP8_SPEC, FP8_SPEC.fwd_dtype, dtype, target
+        ](
+            input_t,
+            input_ptr,
+            kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
+            rows,
+            in_channels,
+            ctx,
+        )
 
     lowp_gemm_devscale[
         FP8_SPEC.fwd_dtype,
