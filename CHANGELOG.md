@@ -1,3 +1,45 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased] - 2026-07-24
+
+### Added
+
+- **`zero/` baseline ZeRO configs + `make train-zero`.** DeepSpeed-style root
+  config directory: `zero/zero1.json`/`zero2.json`/`zero3.json` bundle
+  world size, ZeRO stage, precision, and trainer flags (schema in
+  `zero/README.md`); `make train-zero ZERO_CONFIG=zero/zeroN.json` (driving
+  `scripts/train_zero.py`) does the build + run pair in one step. `make train`
+  now forwards `ARGS` like the other train targets.
+
+### Changed
+
+- **Benchmark JSONs moved out of the repo root.** The eight `bench_zero_*.json`
+  results now live in `zero/bench/`; `make benchmark-zero` writes there by
+  default (`BENCH_ZERO_OUT`), `scripts/benchmark_zero.py` creates the directory
+  and its docs/defaults follow. Comment pass alongside: provenance/campaign
+  narrative trimmed to the timeless constraints per the AGENTS.md comment rule.
+
+### Fixed
+
+- **CPU pytest suite segfaults root-caused to an upstream MAX runtime bug.**
+  On Linux, a MAX custom-op execute on CPU calls a NULL function pointer on
+  every runtime worker thread whenever another MAX/AsyncRT process (a trainer)
+  is active on the box; quiet-box runs pass. Full evidence and repro:
+  docs/ai/max_cpu_custom_op_crash_2026-07-24.md. In-repo hardening: the MEF
+  cache now exports only after a model's first successful execute (a crashing
+  compile can no longer poison the cache), and `make test-python` warns when a
+  trainer is running and retries failures twice (`--last-failed`) to absorb
+  one-off flakes. Test parallelism (`-n auto`) is unchanged.
+
+## [Unreleased] - 2026-07-23
+
+### Fixed
+
 - **fp8 multi-rank NaN: root-caused to an upstream launch-machinery race; mitigations
   shipped** — d36 fp8 at world_size>1 corrupted exactly one deeply-queued backward
   launch per victim rank (proj wgrad, pref. layer 27). App layer exonerated across
@@ -9,12 +51,6 @@
   upstream reproducer kit. Full evidence: docs/ai/fp8_nan_hunt_*_2026-07-22.md and
   low_precision_gotchas.md G4. MFU table: added NVIDIA RTX PRO 6000 Blackwell Max-Q
   (bf16 438.9 / tf32 219.4 TFLOPS dense) — MFU now reports on workstation-max.
-# Changelog
-
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased] - 2026-07-13
 

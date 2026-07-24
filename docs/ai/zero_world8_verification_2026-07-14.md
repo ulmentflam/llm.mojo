@@ -177,7 +177,7 @@ buffers are safe). This is a substantial, separate piece of work.
 
 ---
 
-## Benchmark data (`bench_zero_world8.json`)
+## Benchmark data (`zero/bench/bench_zero_world8.json`)
 
 Collected with the new `scripts/benchmark_zero.py` (run-side only; JSON, no
 plotting) via `make benchmark-zero`. Flags held identical across stages:
@@ -217,7 +217,7 @@ curve across all 8 GPUs is blocked on the multi-GPU fix above.
 - `23aed82` test_zero_equivalence: fix read helper that freed its buffer mid-copy
 - `e46888c` zero: skip P2P/signal-buffer setup for single-GPU (N==1) ZeroContext
 - `b1ad5d5` test_zero_equivalence: generalize to any world size; add WORLD_SIZE=8
-- (this doc + `scripts/benchmark_zero.py` + `make benchmark-zero` + `bench_zero_world8.json`)
+- (this doc + `scripts/benchmark_zero.py` + `make benchmark-zero` + `zero/bench/bench_zero_world8.json`)
 
 ## AI use statement
 

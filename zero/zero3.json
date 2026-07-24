@@ -1,0 +1,9 @@
+{
+  "zero_stage": 3,
+  "world_size": 8,
+  "precision": "bf16",
+  "train_flags": {
+    "b": 4,
+    "t": 1024
+  }
+}

@@ -16,17 +16,16 @@ import pytest
 # paid once per kernel-source change, not once per run; warm runs load in
 # milliseconds. Precompiling llmm.mojoc is also lazy and cached there.
 #
-# Parallelism: not worth it — run the suite sequentially. With a warm MEF
-# cache there is nothing left for xdist to parallelize but kernel
-# execution; on a cold cache each compile is already multi-threaded, so
-# workers oversubscribe the cores AND duplicate compiles for any key two
-# workers both touch (each exports its own MEF, so the waste is per-run,
-# not persistent). Measured 2026-06-12 pre-MEF-cache (96 tests, M-series
-# 10-core): sequential 244s; `-n 6 --dist loadfile` 220s at best and
-# slower on a loaded machine; `--dist load` 297s and per-(module, dtype)
-# loadgroup 428s. If you do run parallel anyway, loadfile is the only sane
-# mode; the bridge's prebuilt-package + atomic cache writes keep
-# concurrent workers from corrupting each other.
+# Parallelism: `make test-python` runs `-n auto` — worker processes use the
+# machine's cores and isolate the blast radius of MAX's CPU execute crash
+# (docs/ai/max_cpu_custom_op_crash_2026-07-24.md) to one worker. The
+# trade-off on SMALL-core machines: on a cold cache each MAX compile is
+# already multi-threaded, so workers oversubscribe and duplicate compiles
+# (measured 2026-06-12 pre-MEF-cache, 96 tests, M-series 10-core:
+# sequential 244s; `-n 6 --dist loadfile` 220s at best; `--dist load`
+# 297s). If tuning dist modes, loadfile is the only sane one; the bridge's
+# prebuilt-package + atomic cache writes keep concurrent workers from
+# corrupting each other.
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

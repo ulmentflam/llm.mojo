@@ -433,6 +433,7 @@ def run_custom_op(
 
     key = _signature(kernel_name, args, device, parameters)
     model = _MODEL_CACHE.get(key)
+    pending_mef = None
     if model is None:
         session, model, mef = _load_cached_mef(kernel_name, key, device)
         if model is None or session is None:
@@ -445,7 +446,10 @@ def run_custom_op(
                 # One retry separates that flake from a real signature
                 # mismatch, which fails identically both times.
                 session, model = _compile_model(kernel_name, args, device, parameters)
-            _export_mef(model, mef)
+            # Export only after the first successful execute, so a compile that
+            # crashes at execute (docs/ai/max_cpu_custom_op_crash_2026-07-24.md)
+            # never poisons the cache.
+            pending_mef = mef
         _SESSION_CACHE[key] = session
         _MODEL_CACHE[key] = model
 
@@ -463,6 +467,8 @@ def run_custom_op(
         exec_args.append(buf)
 
     model.execute(*exec_args)
+    if pending_mef is not None:
+        _export_mef(model, pending_mef)
 
     return [
         _from_device_buffer(mutable_buffers[i], a.dtype_name)

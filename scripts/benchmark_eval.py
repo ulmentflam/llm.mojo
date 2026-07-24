@@ -170,11 +170,11 @@ def render(k, n, outpath, info):
 
     # All four data points as bars on one shared categorical axis — a
     # magnitude comparison across named categories reads as a comparison when
-    # every entry is the same mark type. The earlier draft drew llm.c and the
-    # other references as thin axhlines crossing a single bar; two of those
-    # lines (29.9 vs 29.55) were only 0.35pp apart and unreadable, and — more
-    # importantly — a line doesn't read as "a thing being compared" the way a
-    # bar does. llm.c gets its established color from benchmark_train.py's
+    # every entry is the same mark type. Drawing llm.c and the other
+    # references as thin axhlines crossing a single bar does not work: two of
+    # those lines (29.9 vs 29.55) sit only 0.35pp apart and are unreadable,
+    # and — more importantly — a line doesn't read as "a thing being compared"
+    # the way a bar does. llm.c gets its established color from benchmark_train.py's
     # FAMILY_COLORS (same aqua everywhere llm.c appears in this repo's
     # figures); the other two references are muted neutral fills, since
     # they're cited external numbers, not our own (k, n) measurements.

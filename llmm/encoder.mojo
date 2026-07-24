@@ -629,14 +629,14 @@ def wte_backward_gpu_kernel[
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
     # GOTCHA (Metal): access shared memory via .ptr directly — do NOT cast to
-    # AddressSpace.GENERIC. The previous pattern:
+    # AddressSpace.GENERIC. A cast like
     #   rebind[MutKernelPtr[...]](accum_shared.ptr.address_space_cast[GENERIC]())
     # silently returns zeros on Apple GPU: Metal's address-space model keeps
     # threadgroup (shared) memory in a distinct address space and a GENERIC cast
     # corrupts the pointer. Direct .ptr access keeps the pointer in
-    # AddressSpace.SHARED, which Metal resolves correctly.
-    # On Nvidia CUDA shared memory is addressable as GENERIC, so both patterns
-    # compile identically — this change is a no-op there.
+    # AddressSpace.SHARED, which Metal resolves correctly. On Nvidia CUDA
+    # shared memory is addressable as GENERIC, so both patterns compile
+    # identically there.
 
     # All threads zero their slot first so inactive warps don't leave garbage.
     for k in range(width):

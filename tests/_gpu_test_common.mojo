@@ -17,8 +17,8 @@
 # device->host readback -- deadlocks on the GB10 (Mojo 26.5.0.dev2026071006):
 # the second `DeviceContext()` constructor never returns (all threads park in
 # futex_wait, 0% CPU, GPU idle). The training loop only ever uses a single
-# persistent context, so this only ever bit the multi-`DeviceContext()` test
-# pattern here (and in the sibling FP4-campaign tests). Holding one context in
+# persistent context, so this only ever bites the multi-`DeviceContext()`
+# pattern in GPU test files. Holding one context in
 # a process global -- never torn down between tests -- sidesteps it, mirroring
 # the `persistent_device_buffer` global idiom in `llmm/memory.mojo`.
 

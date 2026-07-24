@@ -1454,8 +1454,8 @@ def _layernorm_bwd_fused_gpu[
     aligned: Bool = True,
     # When True, pass 2 additionally seeds the incoming residual-stream
     # gradient (resid_in_ptr) into d_inp1/d_inp2 in the SAME store as the LN
-    # input-gradient accumulate, replacing the separate `residual_grad_
-    # broadcast` kernel launch that used to run before this one. Ignored
+    # input-gradient accumulate, fusing away what would otherwise be a
+    # separate `residual_grad_broadcast` kernel launch. Ignored
     # (resid_in_ptr never read) when False — used for the ln_f call site,
     # which has no incoming residual gradient to seed.
     HAS_RESID_IN: Bool = False,
@@ -2300,10 +2300,10 @@ def layernorm_fused_residual_bwd[
         # (HAS_RESID_IN), and reduces dgamma/dbeta into per-block scratch
         # partials in one sweep; a tiny, fully parallel finalize kernel
         # (_ln_bwd_fused_finalize_gpu) then sums those partials into
-        # d_gamma/d_beta. Together they replace what used to be up to 3 kernels
-        # here (the d_input+broadcast kernel plus the dparam accum/finalize
-        # pair) and, at each train_gpt2.mojo call site, a 4th kernel (the
-        # separate `residual_grad_broadcast` launch).
+        # d_gamma/d_beta. Together they do the work of an unfused sequence of
+        # up to 4 launches (a d_input+broadcast kernel, the dparam
+        # accum/finalize pair, and each train_gpt2.mojo call site's separate
+        # `residual_grad_broadcast`).
         comptime BLOCK_SIZE = 256
         # SM_OVERPROVISION=3: at 72 reg/thread the kernel is register-bound to
         # 3 blocks/SM, so 3*num_sm saturates every SM in one wave. Fewer

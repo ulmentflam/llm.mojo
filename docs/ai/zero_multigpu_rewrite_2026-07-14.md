@@ -158,7 +158,7 @@ healthy one).
 
 ## Benchmark data
 
-`bench_zero_world4.json` (complete, measured post-rewrite on 4 healthy
+`zero/bench/bench_zero_world4.json` (complete, measured post-rewrite on 4 healthy
 GPUs; B=4 T=64, 12 steps):
 
 | Precision | Stage | mean ms/step | tok/s | peak MiB/GPU (delta) |
@@ -188,7 +188,7 @@ Reading the curve honestly:
   full-size param all-gather; z2/z3 replace the allreduce with a
   reduce-scatter and end up ring-equivalent overall.
 
-`bench_zero_world8.json` (partial): fp32 stage 0 measured at 105.1
+`zero/bench/bench_zero_world8.json` (partial): fp32 stage 0 measured at 105.1
 ms/step, 19.5k tok/s, ~3278 MiB/GPU across all 8 GPUs — then the sweep was
 cut short by the GPU fault below. Per-step timings for the other W8
 stages are in the verification table above (from the 10-step runs).

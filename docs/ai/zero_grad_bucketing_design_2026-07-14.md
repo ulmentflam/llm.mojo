@@ -248,7 +248,7 @@ before bucketing (the merged in-place stage-2/3 work made the curve monotone
 z1 = z2 = z3; this change pushes z2/z3 below z1). "peak Δ" is the
 baseline-subtracted peak MiB on the busiest GPU.
 
-**WORLD_SIZE = 2** (`bench_zero_world2.json`):
+**WORLD_SIZE = 2** (`zero/bench/bench_zero_world2.json`):
 
 | prec | stage | mean ms/step | peak Δ MiB | vs z1 |
 |------|-------|--------------|-----------|-------|
@@ -259,7 +259,7 @@ baseline-subtracted peak MiB on the busiest GPU.
 | bf16 | 2 | 51.3 | 2488 | 0 |
 | bf16 | 3 | 51.3 | 2488 | 0 |
 
-**WORLD_SIZE = 3** (`bench_zero_world3.json`):
+**WORLD_SIZE = 3** (`zero/bench/bench_zero_world3.json`):
 
 | prec | stage | mean ms/step | peak Δ MiB | vs z1 |
 |------|-------|--------------|-----------|-------|

@@ -255,7 +255,7 @@ def compute_amax[
 
         # Persistent scratch, NOT per-call DeviceBuffers: a per-call buffer's
         # release is not reliably ordered after consumers enqueued post-borrow
-        # (G2/G3, and the 2026-07-22 multi-rank NaN hunt). Sized to max_grid,
+        # (docs/ai/low_precision_gotchas.md G2/G3). Sized to max_grid,
         # the per-device ceiling, so every call's grid_size fits.
         var partial_max = persistent_device_buffer[DType.float32](
             ctx, "AMAX_PARTIAL_MAX", max_grid

@@ -507,10 +507,10 @@ def _attention_forward_query_row[
     ](state, output_row, log_sum_exp_out, head_dim)
 
 
-# NOTE: The former `_attention_shared_memory_row_pointer` helper was removed:
-# it cast SHARED (threadgroup) pointers to AddressSpace.GENERIC, which Metal
-# AIR silently mis-compiles (loads return 0, stores go to device memory).
-# GPU kernels now index shared LayoutTensors via SHARED-typed pointers.
+# Shared (threadgroup) pointers must stay SHARED-typed: casting them to
+# AddressSpace.GENERIC is silently mis-compiled by Metal AIR (loads return 0,
+# stores go to device memory), so GPU kernels index shared LayoutTensors via
+# SHARED-typed pointers only.
 # See docs/ai/metal_port_gotchas_and_optimizations.md G3.
 
 
@@ -1839,14 +1839,12 @@ def attention_fwd[
         ]
 
         comptime if use_kv_cache:
-            # PERFORMANCE NOTE:
-            # Previously, JIT compilation (device_ctx.compile_function) was run dynamically on every
-            # layer call and training step, adding massive host JIT compiler overhead. To avoid this,
-            # we now query the cache pointer passed from the GPT2 model.
-            #
-            # In the backward pass, threads were also doing heap alloc() and free() inside the thread-block
-            # inner loops, which serialized execution on the GPU. This is now resolved by using
-            # stack-allocated LayoutTensors instead of heap memory.
+            # The compiled kernel comes from the cache pointer the GPT2 model
+            # passes in: JIT-compiling (device_ctx.compile_function) per layer
+            # call would pay host compiler overhead on every training step.
+            # Backward-pass scratch is stack-allocated (LayoutTensors) — heap
+            # alloc()/free() inside the thread-block inner loops serializes
+            # execution on the GPU.
             var addr_fwd = 0
             if cache:
                 addr_fwd = cache.value()[].fwd_addr
@@ -3218,8 +3216,8 @@ def _attention_transpose_planes_gpu[
 ) -> None:
     # Coalesced per-plane transpose of a [num_planes, T, T] buffer using 32×32
     # shared-memory tiles (padded to avoid bank conflicts). Reads a tile
-    # coalesced, writes the transposed tile coalesced — replacing the strided
-    # scatter stores that previously dominated the backward.
+    # coalesced, writes the transposed tile coalesced — a naive strided
+    # scatter store here dominates the backward.
     comptime TILE = TRANSPOSE_TILE
     comptime STRIDE = TILE + 1  # pad to avoid shared-memory bank conflicts
     # Metal fix: use tile.ptr[i] directly to preserve AddressSpace.SHARED.
@@ -4731,7 +4729,8 @@ def attention_bwd_gemm[
     # we transpose the small [T,HD] operands Q and dO (256 KB × 48 = 12 MB each):
     #   dKᵀ[HD,T] = Qᵀ[HD,T] · dS[T,T]  then  dK[T,HD] = (dKᵀ)ᵀ
     #   dVᵀ[HD,T] = dOᵀ[HD,T] · P[T,T]  then  dV[T,HD] = (dVᵀ)ᵀ
-    # Total rect-transpose traffic: 4 × 12 MB ≈ 50 MB (~15× less than the old path).
+    # Total rect-transpose traffic: 4 × 12 MB ≈ 50 MB (~15× less than the
+    # [T,T]-plane transposes).
     # Scratch reuse (same stream, no aliasing): pt_buf → Qᵀ → (reused) dVᵀ;
     # score_buf → dKᵀ; dst_buf → dOᵀ. dS already carries the 1/√d scale.
     var ds_immut = rebind[ImmutKernelPtr[dtype]](ds_buf)
@@ -4883,11 +4882,11 @@ def attention_bwd[
         #   float32  (sizeof=4): Br=8,  Bc=8  → dQ=25 664,  dKV=30 784 bytes ✓
         #   bfloat16 (sizeof=2): Br=8,  Bc=8  → dQ=13 376,  dKV=13 376 bytes ✓
         #
-        # bf16 previously used Br=16 (BLOCK_SIZE_DQ=64, two Metal simdgroups);
-        # that configuration produced intermittently corrupted dQ/dK/dV on
-        # Apple M4 Max (grad norms 1e6–1e14 in training) while the fp32 Br=8
-        # single-simdgroup geometry is fully validated — so bf16 pins to the
-        # same Br=8. See docs/ai/metal_port_gotchas_and_optimizations.md G9, P19.
+        # bf16 must keep Br=8 too: the Br=16 geometry (BLOCK_SIZE_DQ=64, two
+        # Metal simdgroups) produces intermittently corrupted dQ/dK/dV on
+        # Apple M4 Max (grad norms 1e6–1e14 in training), while the Br=8
+        # single-simdgroup geometry is fully validated.
+        # See docs/ai/metal_port_gotchas_and_optimizations.md G9, P19.
         comptime Br = 8
         comptime Bc = 8
         comptime BLOCK_SIZE_DQ = Br * 4

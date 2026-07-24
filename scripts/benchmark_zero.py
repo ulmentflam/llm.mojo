@@ -20,7 +20,7 @@ Example:
     python scripts/benchmark_zero.py \
         --world-size 8 --stages 0,1,2,3 -b 4 -t 64 --steps 12 \
         --fp32-binary build/train_gpt2 \
-        --output bench_zero_world8.json
+        --output zero/bench/bench_zero_world8.json
 
 Each (precision, stage) entry records: stage, precision, world_size, the b/t/d
 flags, mean_step_ms (excluding the first 2 warmup steps), tokens_per_sec,
@@ -151,8 +151,8 @@ def _run_stage(binary, world_size, stage, b, t, d, steps, timeout_s, extra):
     try:
         # NEVER hard-kill a multi-rank run: SIGKILL amputates the ranks'
         # cross-device FREE traffic mid-flight and hangs the GPU's GSP
-        # firmware (Xid 119/120, GPU needs a PF FLR to come back — observed
-        # twice on this host's GPU 1, dmesg 2026-07-14). Escalate gently:
+        # firmware (Xid 119/120; the GPU needs a PF FLR to come back — see
+        # docs/ai/fp8_multirank_nan_investigation.md). Escalate gently:
         # SIGINT, then SIGTERM, then SIGKILL as a last resort.
         popen = subprocess.Popen(
             cmd,
@@ -523,7 +523,7 @@ def main():
         "--val-data",
         default="./data/.tinyshakespeare/tiny_shakespeare_val.bin",
     )
-    ap.add_argument("--output", default="bench_zero_world8.json")
+    ap.add_argument("--output", default="zero/bench/bench_zero_world8.json")
     args = ap.parse_args()
 
     if args.plot:
@@ -592,6 +592,7 @@ def main():
     out_path = args.output
     if not os.path.isabs(out_path):
         out_path = os.path.join(root, out_path)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(doc, f, indent=2)
     print(f"wrote {out_path}", file=sys.stderr)

@@ -2499,8 +2499,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         ):
             self.allocate_activations(batch_size, seq_len)
         else:
-            # Validate activations and gradients are not larger then the prvious allocations.
-            # In the future we could resize and reallocate for now we will just raise an error.
+            # The existing activation/gradient allocations must be able to
+            # hold this batch; growing them would need a resize+reallocate
+            # path, so a larger B or T raises instead.
             if seq_len > self.seq_len or batch_size > self.batch_size:
                 raise Error(
                     "GPT2 error: Sequence length or batch size is larger than"

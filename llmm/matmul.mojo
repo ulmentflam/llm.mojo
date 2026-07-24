@@ -67,7 +67,7 @@ comptime FP8_BWD_SYNC_ONLY = is_defined["LLMM_FP8_BWD_SYNC_ONLY"]()
 # paths' results differ deterministically by ~0.3%: a benign
 # allocation-layout execution variant of the backward GEMMs (byte-diff
 # verified operand-identical; see docs/ai/fp8_multirank_nan_investigation.md).
-# -D LLMM_FP8_STASH_LEGACY=1: the old path — forward's
+# -D LLMM_FP8_STASH_LEGACY=1: the legacy path — forward's
 # quantize_dual_devscale also writes the transposed fp8 stash into
 # lowp_transpose_cache, and dgrad/wgrad consume it a forward-to-backward
 # window later.
@@ -3697,7 +3697,7 @@ def matmul_bwd_lowp[
 
     # Persistent scratch, NOT per-call DeviceBuffers: a per-call buffer's
     # release is not reliably ordered after consumers enqueued post-borrow
-    # (G2/G3, and the 2026-07-22 multi-rank NaN hunt), so the fp8 backward
+    # (docs/ai/low_precision_gotchas.md G2/G3), so the fp8 backward
     # keeps NO per-call device allocations. Per-(site) sizes are fixed for
     # the whole run (B/T/channels invariant); intra-call reuse is safe on
     # the rank's single in-order stream.

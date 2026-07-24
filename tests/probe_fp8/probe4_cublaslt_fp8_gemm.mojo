@@ -285,8 +285,7 @@ def main() raises:
     # m*K+k (and similarly n*K+k for B) — NOT the row-major k*M+m/k*N+n
     # offset a naive read might reach for; getting this backwards silently
     # computes a nonsense (transposed-block) product with ~100% relative
-    # error while cuBLASLt itself runs fine, which is exactly what an
-    # earlier draft of this probe did before this fix.
+    # error while cuBLASLt itself runs fine.
     var host_c_ref = ctx.enqueue_create_host_buffer[DType.float32](M * N)
     for m in range(M):
         for n in range(N):

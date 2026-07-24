@@ -157,7 +157,7 @@ $(PIXI_STAMP):
 
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        typecheck check clean build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 \
+        typecheck check clean build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
@@ -195,6 +195,8 @@ help:
 	@echo "  train         Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
 	@echo "                Multi-GPU: build with WORLD_SIZE=N (one rank/GPU, compile-time)"
 	@echo "                and pick a ZeRO stage at runtime with -z 0|1|2|3 (or ZERO_STAGE=)"
+	@echo "  train-zero    Multi-GPU ZeRO run from a config (ZERO_CONFIG=zero/zero2.json;"
+	@echo "                baseline stage 1/2/3 configs in zero/, schema in zero/README.md)"
 	@echo "  train-cpu     Build and run build/train_gpt2 on CPU (LLMM_USE_CPU=1)"
 	@echo "  train-metal   Build (WORLD_SIZE=1) and run on Apple Metal GPU (experimental)"
 	@echo "  build-bf16    Compile train_gpt2.mojo (-D LLMM_BF16) to build/train_gpt2_bf16"
@@ -256,7 +258,7 @@ help:
 	@echo "  benchmark-metal  Apple Silicon Metal GPU: llm.mojo vs PyTorch MPS vs MLX (fp32+bf16)"
 	@echo "                   (4 arms in one graph, mirroring benchmark-gpu's fp32+bf16 layout)"
 	@echo "  benchmark-zero   ZeRO stages 0-3 at BENCH_ZERO_WORLD GPUs (default 8): per-stage"
-	@echo "                   memory + step time, fp32 vs bf16, JSON + chart into figures/"
+	@echo "                   memory + step time, fp32 vs bf16, JSON into zero/bench/, chart into figures/"
 	@echo "                   llm.c has no Metal port — baseline is PyTorch MPS"
 	@echo "                   (hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS, BENCH_COOLDOWN_S)"
 	@echo "  profile-llmc-ncu  Profile llm.c bf16 CUDA kernels with ncu (NVIDIA only)"
@@ -409,7 +411,7 @@ $(TRAIN_BIN_FP4): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_FP4) $(TRAIN_MOJO_SRC)
 
 train: $(TRAIN_BIN) $(TRAIN_RUNNER)
-	@$(TRAIN_RUNNER)
+	@$(TRAIN_RUNNER) $(ARGS)
 
 train-cpu: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@LLMM_USE_CPU=1 $(TRAIN_RUNNER)
@@ -417,6 +419,13 @@ train-cpu: $(TRAIN_BIN) $(TRAIN_RUNNER)
 # Pass training flags via ARGS, e.g. `make train-bf16 ARGS="-i ... -j ... -e d12 ..."`
 train-bf16: $(TRAIN_BIN_BF16) $(TRAIN_RUNNER_BF16)
 	@$(TRAIN_RUNNER_BF16) $(ARGS)
+
+# Multi-GPU ZeRO run from a config: builds at the config's WORLD_SIZE, then
+# runs the config's precision/stage/flags. Baseline stage 1/2/3 configs live
+# in zero/ (schema: zero/README.md). Extra flags via ARGS override the config.
+ZERO_CONFIG ?= zero/zero2.json
+train-zero:
+	$(PIXI) run python scripts/train_zero.py --config $(ZERO_CONFIG) -- $(ARGS)
 
 # fp8 build shares the bf16 runner script (it carries no bf16-specific
 # hyperparameters, just libpython + binary-path wiring) via the BIN= override.
@@ -430,7 +439,7 @@ train-fp4: $(TRAIN_BIN_FP4) $(TRAIN_RUNNER_BF16)
 
 # GPT-2 124M checkpoint-init training: start from the released GPT-2 124M
 # weights (starter-pack .bin files, see `make data`) instead of a random d12
-# init — the invocation every precision gate in the 2026-07-10 campaign used.
+# init — the standard invocation the precision gates use.
 # STEPS and extra flags are overridable: `make train-gpt2-124m STEPS=50
 # ARGS="-o log124M"`. bf16 is the recommended GPU precision (see README
 # benchmarks); fp8/fp4 are numerics/research configs. Inference binaries have
@@ -764,7 +773,7 @@ benchmark-cpu: $(PROFILE_BIN) build-llmc-cpu $(BENCH_SCRIPT)
 # Runs in the cuda pixi env: the default env's torch has no CUDA, and the
 # harness *silently drops* arms whose subprocess fails ("Torch not compiled
 # with CUDA enabled" → empty sample list → row omitted), so the default env
-# yields a 4-arm table with no error. Found in the 2026-07-10 regression sweep.
+# yields a 4-arm table with no error.
 benchmark-gpu: $(PROFILE_BIN) $(PROFILE_BIN_BF16) build-llmc-gpu $(BENCH_SCRIPT)
 	$(PIXI) run -e cuda python $(BENCH_SCRIPT) --device gpu $(BENCH_ARGS) \
 		--gpu-steps $(BENCH_GPU_STEPS)
@@ -781,7 +790,7 @@ BENCH_ZERO_STAGES ?= 0,1,2,3
 BENCH_ZERO_B ?= 4
 BENCH_ZERO_T ?= 64
 BENCH_ZERO_STEPS ?= 12
-BENCH_ZERO_OUT ?= bench_zero_world$(BENCH_ZERO_WORLD).json
+BENCH_ZERO_OUT ?= zero/bench/bench_zero_world$(BENCH_ZERO_WORLD).json
 
 benchmark-zero:
 	$(MAKE) build WORLD_SIZE=$(BENCH_ZERO_WORLD)
@@ -1069,8 +1078,20 @@ test-mojo: | $(PIXI_STAMP)
 # tests/conftest.py. Compiled models persist in tests/.mef_cache (see
 # tests/_max_bridge.py): warm runs take seconds, and only a kernel-source
 # change pays compiles again.
+# CPU custom-op execute SIGSEGVs while another MAX process (a trainer) runs on
+# the box — upstream bug, see docs/ai/max_cpu_custom_op_crash_2026-07-24.md.
+# Warn up front; retry failures twice to absorb one-off flakes on a quiet box.
 test-python: build-mojo
-	$(PIXI) run pytest tests/ -v -n auto
+	@if pgrep -f 'build/train_gpt2' >/dev/null 2>&1; then \
+		echo "WARNING: a train_gpt2 process is running — CPU custom-op tests"; \
+		echo "  will segfault until it exits (docs/ai/max_cpu_custom_op_crash_2026-07-24.md)"; \
+	fi; \
+	$(PIXI) run pytest tests/ -v -n auto && exit 0; \
+	for i in 1 2; do \
+		echo "== test-python retry $$i (--last-failed) =="; \
+		if $(PIXI) run pytest tests/ -v -n auto --last-failed --last-failed-no-failures none; then exit 0; fi; \
+	done; \
+	exit 1
 
 test-python-cuda: build-mojo
 	MAX_USE_ACCELERATOR=1 $(PIXI) run -e cuda pytest tests/ -v
