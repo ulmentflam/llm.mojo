@@ -78,6 +78,14 @@ make build WORLD_SIZE=8
 scripts/run_train_gpt2.sh -z 2   # ZeRO: 0=DDP, 1=+opt shard, 2=+grad shard, 3=+param shard
 ```
 
+Or launch from one of the baseline stage configs in [`zero/`](zero/README.md)
+(DeepSpeed-style: `zero1.json`/`zero2.json`/`zero3.json`), which handles the
+build + run pair in one step:
+
+```bash
+make train-zero ZERO_CONFIG=zero/zero2.json
+```
+
 To pretrain on FineWeb instead of Tiny Shakespeare, tokenize it first
 (`--streaming` avoids the ~60 GB Arrow materialization on small-disk hosts):
 
@@ -127,7 +135,7 @@ Measured on 4× NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB, PCIe, no P2P), GPT-2
 
 !['ZeRO stage benchmark (WORLD_SIZE=4)'](figures/benchmark_zero_w4_b4_t64_2026-07-14_1711_NVIDIA-RTX-PRO-6000-Blackwell_workstation-max.png)
 
-Each stage now buys additional per-GPU memory. Stage 1's optimizer-state sharding saves 768 MiB in fp32 (1 GiB in bf16, where the fp32 master weights shard too), stage 2's bucketed backward reduction saves another 256 MiB, and stage 3's parameter streaming another 256 MiB. The floor at this model size is the tied `wte` embedding (~150 MiB): it is written at both ends of the backward pass and gathered whole for the LM head, so it stays resident. Vocab-chunking those kernels is the documented follow-up (see [`docs/ai/zero_grad_bucketing_design_2026-07-14.md`](docs/ai/zero_grad_bucketing_design_2026-07-14.md) and [`docs/ai/zero_stage3_param_streaming_2026-07-14.md`](docs/ai/zero_stage3_param_streaming_2026-07-14.md)). The savings trade against step time: stages 2 and 3 pay for their per-layer collectives, with stage 3's just-in-time parameter gathers costing the most. How much that costs depends on the shape. At this tiny benchmark shape the collective overhead is a large fraction of the 50 ms step, but at production shapes (B≥32, T=1024, ~250-470 ms steps) it is a few percent, while activations dominate peak memory there and ZeRO's model-state savings become a small fraction. The stages earn their keep at model scales where state dominates. All stages stay numerically equivalence-gated against the single-GPU baseline (per-parameter match to 1e-5 at world sizes 2 and 8). Reproduce with `make benchmark-zero` (`BENCH_ZERO_WORLD=N`; writes the JSON and renders this chart into `figures/`).
+Each stage now buys additional per-GPU memory. Stage 1's optimizer-state sharding saves 768 MiB in fp32 (1 GiB in bf16, where the fp32 master weights shard too), stage 2's bucketed backward reduction saves another 256 MiB, and stage 3's parameter streaming another 256 MiB. The floor at this model size is the tied `wte` embedding (~150 MiB): it is written at both ends of the backward pass and gathered whole for the LM head, so it stays resident. Vocab-chunking those kernels is the documented follow-up (see [`docs/ai/zero_grad_bucketing_design_2026-07-14.md`](docs/ai/zero_grad_bucketing_design_2026-07-14.md) and [`docs/ai/zero_stage3_param_streaming_2026-07-14.md`](docs/ai/zero_stage3_param_streaming_2026-07-14.md)). The savings trade against step time: stages 2 and 3 pay for their per-layer collectives, with stage 3's just-in-time parameter gathers costing the most. How much that costs depends on the shape. At this tiny benchmark shape the collective overhead is a large fraction of the 50 ms step, but at production shapes (B≥32, T=1024, ~250-470 ms steps) it is a few percent, while activations dominate peak memory there and ZeRO's model-state savings become a small fraction. The stages earn their keep at model scales where state dominates. All stages stay numerically equivalence-gated against the single-GPU baseline (per-parameter match to 1e-5 at world sizes 2 and 8). Reproduce with `make benchmark-zero` (`BENCH_ZERO_WORLD=N`; writes the JSON into `zero/bench/` and renders this chart into `figures/`).
 
 ### Low-precision training (FP8 / NVFP4)
 
@@ -201,6 +209,27 @@ This checkpoint is published on HuggingFace: **[ulmentflam/gpt2-124m-fineweb-moj
 !['HellaSwag Eval Comparison'](figures/hellaswag_eval_2026-07-10_1132_NVIDIA-GB10_DGX-Spark.png)
 
 Run `make benchmark-eval` to reproduce this chart (it runs `make eval` and computes the Wilson CI); pass `--k`/`--n` to `scripts/benchmark_eval.py` directly to re-render from a cached result instead of re-scoring the full 10,042-example split. GPT-2 124M original and GPT-3 Small are included as scale/methodology context, not statistical comparisons. See the script's docstring for why.
+
+### Training-precision comparison: fp8 vs bf16, from scratch at 124M and 774M
+
+To take fp8 beyond benchmark numbers, we trained complete models with it: four from-scratch pretraining runs (GPT-2 124M and 774M, each in bf16 and fp8) on the FineWeb classic 10B-token sample, on a single 7-GPU node (7× RTX PRO 6000 Blackwell Max-Q 96GB, ZeRO-1 data parallel). Within each scale the twins share the identical recipe (same data order, schedule, tokens/step, seed, and hardware), so any delta is attributable to GEMM precision alone:
+
+| Model | Precision | Final val loss | HellaSwag acc_norm | Tokens/s (this box) | Checkpoint |
+|---|---|---|---|---|---|
+| GPT-2 124M | bf16 | 3.2904 | 29.95% (3008/10042) | ~893k | [gpt2-124m-fineweb-mojo](https://huggingface.co/ulmentflam/gpt2-124m-fineweb-mojo)¹ |
+| GPT-2 124M | fp8 | 3.2970 | 30.01% (3014/10042) | ~678k | [gpt2-124m-fineweb-fp8-mojo](https://huggingface.co/ulmentflam/gpt2-124m-fineweb-fp8-mojo) |
+| GPT-2 774M | bf16 | 3.0130 | 36.34% (3649/10042) | ~154k | [gpt2-774m-fineweb-mojo](https://huggingface.co/ulmentflam/gpt2-774m-fineweb-mojo) |
+| GPT-2 774M | fp8 | 2.9967 | 37.06% (3722/10042) | ~102k² | [gpt2-774m-fineweb-fp8-mojo](https://huggingface.co/ulmentflam/gpt2-774m-fineweb-fp8-mojo) |
+
+¹ The published 124M bf16 checkpoint is the earlier single-GB10 run (val 3.2807, HS 29.53%); the 124M bf16 row above is its same-box 7-GPU twin, re-trained so the fp8 comparison is confound-free. ² The 774M fp8 tokens/s figure is not a fair fp8-vs-bf16 comparison: most of that run executed under `MODULAR_DEBUG=device-sync-mode` as a mitigation for a multi-rank corruption bug that was found, root-caused, and properly fixed during the run. See [`docs/ai/fp8_multirank_nan_investigation.md`](docs/ai/fp8_multirank_nan_investigation.md).
+
+The result is that **fp8 training is quality-equivalent to bf16 at both scales**, and the 774M fp8 run even lands slightly ahead on both metrics, within noise. Throughput on this box still favors bf16 at these model sizes; the fp8 quantize/amax overhead isn't amortized until larger GEMMs (see the scaling-sweep discussion under [Benchmarks](#benchmarks)). All four checkpoints are published in the [llm.mojo GPT-2 releases](https://huggingface.co/collections/ulmentflam/llmmojo-gpt-2-releases-6a51009ca7ef4e71b7ad7f2c) collection, each with safetensors plus the raw llm.mojo checkpoint. NVFP4 twins at both scales are training now and will join the comparison.
+
+!['Precision comparison: val loss'](figures/precision_valloss_2026-07-24_NVIDIA-RTX-PRO-6000-Blackwell-Max-Q-Workstation-Edition.png)
+
+!['Precision comparison: HellaSwag'](figures/precision_hellaswag_2026-07-24_NVIDIA-RTX-PRO-6000-Blackwell-Max-Q-Workstation-Edition.png)
+
+Reproduce with `pixi run python scripts/benchmark_precision.py` (parses the runs' train logs and the `make eval` counts; auto-includes new precision arms as their runs finish).
 
 ## Test
 
