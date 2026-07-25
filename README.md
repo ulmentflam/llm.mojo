@@ -210,24 +210,26 @@ This checkpoint is published on HuggingFace: **[ulmentflam/gpt2-124m-fineweb-moj
 
 Run `make benchmark-eval` to reproduce this chart (it runs `make eval` and computes the Wilson CI); pass `--k`/`--n` to `scripts/benchmark_eval.py` directly to re-render from a cached result instead of re-scoring the full 10,042-example split. GPT-2 124M original and GPT-3 Small are included as scale/methodology context, not statistical comparisons. See the script's docstring for why.
 
-### Training-precision comparison: fp8 vs bf16, from scratch at 124M and 774M
+### Training-precision comparison: bf16, fp8, and NVFP4 from scratch at 124M and 774M
 
-To take fp8 beyond benchmark numbers, we trained complete models with it: four from-scratch pretraining runs (GPT-2 124M and 774M, each in bf16 and fp8) on the FineWeb classic 10B-token sample, on a single 7-GPU node (7× RTX PRO 6000 Blackwell Max-Q 96GB, ZeRO-1 data parallel). Within each scale the twins share the identical recipe (same data order, schedule, tokens/step, seed, and hardware), so any delta is attributable to GEMM precision alone:
+To take the low-precision modes beyond benchmark numbers, we trained complete models with them: six from-scratch pretraining runs (GPT-2 124M and 774M, each in bf16, fp8, and NVFP4) on the FineWeb classic 10B-token sample, on a single 7-GPU node (7× RTX PRO 6000 Blackwell Max-Q 96GB, ZeRO-1 data parallel). Within each scale the runs share the identical recipe (same data order, schedule, tokens/step, seed, and hardware), so any delta is attributable to GEMM precision alone:
 
 | Model | Precision | Final val loss | HellaSwag acc_norm | Tokens/s (this box) | Checkpoint |
 |---|---|---|---|---|---|
 | GPT-2 124M | bf16 | 3.2904 | 29.95% (3008/10042) | ~893k | [gpt2-124m-fineweb-mojo](https://huggingface.co/ulmentflam/gpt2-124m-fineweb-mojo)¹ |
 | GPT-2 124M | fp8 | 3.2970 | 30.01% (3014/10042) | ~678k | [gpt2-124m-fineweb-fp8-mojo](https://huggingface.co/ulmentflam/gpt2-124m-fineweb-fp8-mojo) |
+| GPT-2 124M | nvfp4 | 3.3162 | 29.60% (2972/10042) | ~569k | [gpt2-124m-fineweb-nvfp4-mojo](https://huggingface.co/ulmentflam/gpt2-124m-fineweb-nvfp4-mojo) |
 | GPT-2 774M | bf16 | 3.0130 | 36.34% (3649/10042) | ~154k | [gpt2-774m-fineweb-mojo](https://huggingface.co/ulmentflam/gpt2-774m-fineweb-mojo) |
 | GPT-2 774M | fp8 | 2.9967 | 37.06% (3722/10042) | ~102k² | [gpt2-774m-fineweb-fp8-mojo](https://huggingface.co/ulmentflam/gpt2-774m-fineweb-fp8-mojo) |
+| GPT-2 774M | nvfp4 | 3.0228 | 36.27% (3642/10042) | ~120k | [gpt2-774m-fineweb-nvfp4-mojo](https://huggingface.co/ulmentflam/gpt2-774m-fineweb-nvfp4-mojo) |
 
-¹ The published 124M bf16 checkpoint is the earlier single-GB10 run (val 3.2807, HS 29.53%); the 124M bf16 row above is its same-box 7-GPU twin, re-trained so the fp8 comparison is confound-free. ² The 774M fp8 tokens/s figure is not a fair fp8-vs-bf16 comparison: most of that run executed under `MODULAR_DEBUG=device-sync-mode` as a mitigation for a multi-rank corruption bug that was found, root-caused, and properly fixed during the run. See [`docs/ai/fp8_multirank_nan_investigation.md`](docs/ai/fp8_multirank_nan_investigation.md).
+¹ The published 124M bf16 checkpoint is the earlier single-GB10 run (val 3.2807, HS 29.53%); the 124M bf16 row above is its same-box 7-GPU twin, re-trained so the precision comparison is confound-free. ² The 774M fp8 tokens/s figure is not a fair comparison: most of that run executed under `MODULAR_DEBUG=device-sync-mode` as a mitigation for a multi-rank corruption bug that was found, root-caused, and properly fixed during the run. See [`docs/ai/fp8_multirank_nan_investigation.md`](docs/ai/fp8_multirank_nan_investigation.md).
 
-The result is that **fp8 training is quality-equivalent to bf16 at both scales**, and the 774M fp8 run even lands slightly ahead on both metrics, within noise. Throughput on this box still favors bf16 at these model sizes; the fp8 quantize/amax overhead isn't amortized until larger GEMMs (see the scaling-sweep discussion under [Benchmarks](#benchmarks)). All four checkpoints are published in the [llm.mojo GPT-2 releases](https://huggingface.co/collections/ulmentflam/llmmojo-gpt-2-releases-6a51009ca7ef4e71b7ad7f2c) collection, each with safetensors plus the raw llm.mojo checkpoint. NVFP4 twins at both scales are training now and will join the comparison.
+The result is that **fp8 training is quality-equivalent to bf16 at both scales**, and the 774M fp8 run even lands slightly ahead on both metrics, within noise. NVFP4 gives up a small but consistent quality margin at 124M (about 0.8% val loss) and closes to a statistical tie with bf16 at 774M (36.27% vs 36.34% on HellaSwag). Note the fp8 runs quantize every per-block linear GEMM while the NVFP4 recipe quantizes only the middle blocks' MLP forward GEMMs, so the two low-precision arms are not equally aggressive. Throughput on this box still favors bf16 at these model sizes; the quantize/scale overhead isn't amortized until larger GEMMs (see the scaling-sweep discussion under [Benchmarks](#benchmarks)). All six checkpoints are published in the [llm.mojo GPT-2 releases](https://huggingface.co/collections/ulmentflam/llmmojo-gpt-2-releases-6a51009ca7ef4e71b7ad7f2c) collection, each with safetensors plus the raw llm.mojo checkpoint.
 
-!['Precision comparison: val loss'](figures/precision_valloss_2026-07-24_NVIDIA-RTX-PRO-6000-Blackwell-Max-Q-Workstation-Edition.png)
+!['Precision comparison: val loss'](figures/precision_valloss_2026-07-25_NVIDIA-RTX-PRO-6000-Blackwell-Max-Q-Workstation-Edition.png)
 
-!['Precision comparison: HellaSwag'](figures/precision_hellaswag_2026-07-24_NVIDIA-RTX-PRO-6000-Blackwell-Max-Q-Workstation-Edition.png)
+!['Precision comparison: HellaSwag'](figures/precision_hellaswag_2026-07-25_NVIDIA-RTX-PRO-6000-Blackwell-Max-Q-Workstation-Edition.png)
 
 Reproduce with `pixi run python scripts/benchmark_precision.py` (parses the runs' train logs and the `make eval` counts; auto-includes new precision arms as their runs finish).
 

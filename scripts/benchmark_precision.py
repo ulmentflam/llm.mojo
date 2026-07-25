@@ -61,10 +61,10 @@ PRECISION_COLORS = {
 RUNS = (
     ("124M", "bf16", "log124M_fineweb_bf16", (3008, 10042)),
     ("124M", "fp8", "log124M_fineweb_fp8", (3014, 10042)),
-    ("124M", "nvfp4", "log124M_fineweb_nvfp4", None),
+    ("124M", "nvfp4", "log124M_fineweb_nvfp4", (2972, 10042)),
     ("774M", "bf16", "log774M_fineweb", (3649, 10042)),
     ("774M", "fp8", "log774M_fineweb_fp8", (3722, 10042)),
-    ("774M", "nvfp4", "log774M_fineweb_nvfp4", None),
+    ("774M", "nvfp4", "log774M_fineweb_nvfp4", (3642, 10042)),
 )
 
 VAL_RE = re.compile(r"^val loss ([0-9.]+)")
