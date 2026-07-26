@@ -100,6 +100,9 @@ struct EvalDataLoader:
             raise Error("EvalDataLoader error: bad version in " + filename)
         self.num_examples = Int(header_ptr.load(2))
         self.longest_example_bytes = Int(header_ptr.load(3))
+        # Keep the header buffer live past the last header_ptr use; the raw
+        # pointer does not own it (ASAP destruction scribble, see dataloader).
+        _ = header_bytes^
         if self.num_examples < num_processes:
             raise Error(
                 "EvalDataLoader error: fewer examples ("
@@ -187,6 +190,8 @@ struct EvalDataLoader:
         var out = List[UInt16]()
         for i in range(num_u16):
             out.append(raw_ptr.load(i))
+        # Keep the payload buffer live past the copy loop (see header note).
+        _ = raw_bytes^
         return out^
 
     def _next_example(mut self, example_batch_index: Int) raises:

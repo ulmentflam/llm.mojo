@@ -367,18 +367,22 @@ struct SafetensorsFile:
 
         var file = open(self.path, "r")
         var seek_pos = self.data_start + info.offset_begin
-        _ = file.seek(UInt64(seek_pos))
+        _ = file.seek(Int(seek_pos))
         var raw = file.read_bytes(info.num_bytes())
         file.close()
         if len(raw) < info.num_bytes():
             raise Error(
                 "safetensors error: truncated tensor data for '" + name + "'"
             )
-        var src_ptr = raw.unsafe_ptr().bitcast[Scalar[dtype]]()
+        var src_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+            raw.unsafe_ptr()
+        ).bitcast[Scalar[dtype]]()
 
         if transpose_rows < 0:
             for i in range(n):
                 dest.store(i, src_ptr.load(i))
+            # Keep `raw` live past the copy; src_ptr does not own it.
+            _ = raw^
             return
 
         # Source is (transpose_cols, transpose_rows) row-major; write dest as
@@ -401,6 +405,8 @@ struct SafetensorsFile:
                     r * transpose_cols + c,
                     src_ptr.load(c * transpose_rows + r),
                 )
+        # Keep `raw` live past the transpose copy; src_ptr does not own it.
+        _ = raw^
 
 
 # ===----------------------------------------------------------------------=== #

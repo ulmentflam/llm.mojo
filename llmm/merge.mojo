@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from std.sys import simd_width_of
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
@@ -344,7 +344,7 @@ def merge_fwd[
         raise Error("Invalid target")
 
 
-@compiler.register("merge_fwd")
+@register("merge_fwd")
 struct MergeFwd:
     @staticmethod
     def execute[
@@ -437,7 +437,7 @@ def merge_bwd[
         raise Error("Invalid target")
 
 
-@compiler.register("merge_bwd")
+@register("merge_bwd")
 struct MergeBwd:
     @staticmethod
     def execute[

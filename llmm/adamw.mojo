@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from std.algorithm import vectorize
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
@@ -470,7 +470,7 @@ def adamw_update[
 # ===----------------------------------------------------------------------=== #
 
 
-@compiler.register("adamw_update")
+@register("adamw_update")
 struct AdamWUpdate:
     @staticmethod
     def execute[

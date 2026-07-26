@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.math import ceildiv, exp, log
@@ -357,7 +357,7 @@ def fused_classifier[
 # ===----------------------------------------------------------------------=== #
 
 
-@compiler.register("fused_classifier")
+@register("fused_classifier")
 struct FusedClassifier:
     @staticmethod
     def execute[
@@ -408,7 +408,7 @@ struct FusedClassifier:
         )
 
 
-@compiler.register("fused_classifier_fwd")
+@register("fused_classifier_fwd")
 struct FusedClassifierFwd:
     @staticmethod
     def execute[

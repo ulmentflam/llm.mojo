@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from std.sys import simd_width_of
 from std.math import ceildiv, log
 from extensibility import InputTensor
@@ -154,7 +154,7 @@ def crossentropy_ohe_fwd[
         raise Error("Invalid target")
 
 
-@compiler.register("crossentropy_ohe_fwd")
+@register("crossentropy_ohe_fwd")
 struct CrossEntropyOHEFwd:
     @staticmethod
     def execute[
@@ -331,7 +331,7 @@ def crossentropy_ohe_bwd[
         raise Error("Invalid target")
 
 
-@compiler.register("crossentropy_ohe_bwd")
+@register("crossentropy_ohe_bwd")
 struct CrossEntropyOHEBwd:
     @staticmethod
     def execute[

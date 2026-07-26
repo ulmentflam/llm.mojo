@@ -123,7 +123,7 @@ def test_hadamard_known_vector_gpu() raises:
             y_dev.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            x_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            x_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rows,
         k,
@@ -147,7 +147,7 @@ def test_hadamard_known_vector_gpu() raises:
             xr_dev.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            y_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            y_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rows,
         k,
@@ -196,7 +196,7 @@ def test_hadamard_orthogonality_random_gpu() raises:
             y_dev.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            x_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            x_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rows,
         k,
@@ -208,7 +208,7 @@ def test_hadamard_orthogonality_random_gpu() raises:
             xr_dev.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            y_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            y_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rows,
         k,
@@ -270,7 +270,7 @@ def test_hadamard_multi_row_grid_indexing_gpu() raises:
             y_dev.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            x_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            x_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rows,
         k,
@@ -281,7 +281,7 @@ def test_hadamard_multi_row_grid_indexing_gpu() raises:
             xr_dev.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            y_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            y_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rows,
         k,

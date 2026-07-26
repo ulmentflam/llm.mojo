@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host import DeviceAttribute
@@ -280,7 +280,7 @@ def bias_gelu_fwd[
         raise Error("Invalid target")
 
 
-@compiler.register("gelu_fwd")
+@register("gelu_fwd")
 struct GeluFwd:
     @staticmethod
     def execute[
@@ -425,7 +425,7 @@ def gelu_bwd[
         raise Error("Invalid target")
 
 
-@compiler.register("gelu_bwd")
+@register("gelu_bwd")
 struct GeluBwd:
     @staticmethod
     def execute[

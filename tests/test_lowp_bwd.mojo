@@ -120,13 +120,13 @@ def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
     # see the module docstring above).
     _prime_state[FP8_SPEC.fwd_dtype](
         weight_state,
-        weight.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        weight.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         OC * C,
         ctx,
     )
     _prime_state[FP8_SPEC.bwd_dtype](
         doutput_state,
-        d_output.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        d_output.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         ROWS * OC,
         ctx,
     )
@@ -278,13 +278,13 @@ def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
     var doutput_state = AmaxState[FP8_SPEC](ctx)
     _prime_state[FP8_SPEC.fwd_dtype](
         input_state,
-        input.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        input.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         ROWS * C,
         ctx,
     )
     _prime_state[FP8_SPEC.bwd_dtype](
         doutput_state,
-        d_output.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        d_output.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         ROWS * OC,
         ctx,
     )
@@ -440,13 +440,13 @@ def test_matmul_bwd_lowp_end_to_end() raises:
     # only updates doutput_state (see its docstring).
     _prime_state[FP8_SPEC.fwd_dtype](
         input_state,
-        input.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        input.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         ROWS * C,
         ctx,
     )
     _prime_state[FP8_SPEC.fwd_dtype](
         weight_state,
-        weight.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        weight.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         OC * C,
         ctx,
     )
@@ -533,7 +533,7 @@ def test_matmul_bwd_lowp_end_to_end() raises:
 def kernel_ptr_as_immut_bf16(
     buf: DeviceBuffer[DType.bfloat16],
 ) -> ImmutKernelPtr[DType.bfloat16]:
-    return buf.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+    return buf.unsafe_ptr().as_imm().as_unsafe_any_origin()
 
 
 def main() raises:

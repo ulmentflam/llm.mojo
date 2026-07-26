@@ -291,7 +291,7 @@ def _quantize_roundtrip_case[
             tensor_scale_dev.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            x_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            x_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rows,
         k,
@@ -310,8 +310,8 @@ def _quantize_roundtrip_case[
     var host_recon = ctx.enqueue_create_host_buffer[DType.float32](n)
     nvfp4_dequant_reference[BLOCK_ROWS](
         host_recon.unsafe_ptr(),
-        host_q.unsafe_ptr().as_immutable(),
-        host_scale.unsafe_ptr().as_immutable(),
+        host_q.unsafe_ptr().as_imm(),
+        host_scale.unsafe_ptr().as_imm(),
         host_tensor_scale.unsafe_ptr()[0],
         rows,
         k,
@@ -427,7 +427,7 @@ def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
             tscale_transpose.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            x_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            x_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         src_rows,
         src_k,
@@ -444,7 +444,7 @@ def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
             tscale_ref.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            t_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            t_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         src_k,
         src_rows,
@@ -517,7 +517,7 @@ def test_quantize_all_zero_tensor_gpu() raises:
             tensor_scale_dev.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            x_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            x_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rows,
         k,
@@ -579,7 +579,7 @@ def test_quantize_large_outlier_no_overflow_gpu() raises:
             tensor_scale_dev.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            x_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            x_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rows,
         k,
@@ -598,8 +598,8 @@ def test_quantize_large_outlier_no_overflow_gpu() raises:
 
     nvfp4_dequant_reference[1](
         host_recon.unsafe_ptr(),
-        host_q.unsafe_ptr().as_immutable(),
-        host_scale.unsafe_ptr().as_immutable(),
+        host_q.unsafe_ptr().as_imm(),
+        host_scale.unsafe_ptr().as_imm(),
         host_tensor_scale.unsafe_ptr()[0],
         rows,
         k,

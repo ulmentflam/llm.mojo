@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from std.memory import alloc
 from std.sys import simd_width_of, align_of
 from std.gpu.primitives import block, warp
@@ -381,7 +381,7 @@ def layernorm_fwd[
         raise Error("Invalid target")
 
 
-@compiler.register("layernorm_fwd")
+@register("layernorm_fwd")
 struct LayerNormFwd:
     @staticmethod
     def execute[
@@ -992,7 +992,7 @@ def layernorm_fused_residual_fwd[
         raise Error("Invalid target")
 
 
-@compiler.register("layernorm_fused_residual_fwd")
+@register("layernorm_fused_residual_fwd")
 struct LayerNormFusedResidualFwd:
     @staticmethod
     def execute[
@@ -2418,7 +2418,7 @@ def layernorm_fused_residual_bwd[
         raise Error("Invalid target")
 
 
-@compiler.register("layernorm_bwd")
+@register("layernorm_bwd")
 struct LayerNormBwd:
     @staticmethod
     def execute[
@@ -2479,7 +2479,7 @@ struct LayerNormBwd:
         )
 
 
-@compiler.register("layernorm_fused_residual_bwd")
+@register("layernorm_fused_residual_bwd")
 struct LayerNormFusedResidualBwd:
     @staticmethod
     def execute[

@@ -44,9 +44,17 @@ def read_and_copy[
     if len(bytes_read) < bytes_to_read:
         raise Error("Failed to read enough bytes from file")
 
-    var src_ptr = bytes_read.unsafe_ptr().bitcast[Scalar[dtype]]()
+    var src_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        bytes_read.unsafe_ptr()
+    ).bitcast[Scalar[dtype]]()
     for i in range(count):
         dest.store(i, src_ptr.load(i))
+    # Keep `bytes_read` live until the copy is done: the rebind drops the
+    # List's lifetime tracking, so without this ASAP destruction frees the
+    # buffer at the `.unsafe_ptr()` call and the allocator clobbers the
+    # leading bytes (magic number reads back as a heap address). Same fix as
+    # tests/test_zero_equivalence.mojo's read_to_dtype_pointer.
+    _ = bytes_read^
 
 
 # Generic utility to write count elements from a buffer to a FileHandle as raw
@@ -56,4 +64,4 @@ def write_buffer[
     dtype: DType,
 ](mut file: FileHandle, src: MutMemPtr[dtype], count: Int) raises:
     var nbytes = count * get_dtype_size(dtype)
-    file.write_all(Span(ptr=src.bitcast[Byte](), length=nbytes))
+    file.write_all(Span(unsafe_ptr=src.bitcast[Byte](), length=nbytes))

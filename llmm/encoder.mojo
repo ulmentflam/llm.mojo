@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from layout import Layout
 from std.math import ceildiv
 from extensibility import InputTensor
@@ -262,7 +262,7 @@ def encoder_fwd[
         raise Error("Invalid target")
 
 
-@compiler.register("encoder_fwd")
+@register("encoder_fwd")
 struct EncoderFwd:
     @staticmethod
     def execute[
@@ -913,7 +913,7 @@ def encoder_bwd[
         raise Error("Invalid target")
 
 
-@compiler.register("encoder_bwd")
+@register("encoder_bwd")
 struct EncoderBwd:
     @staticmethod
     def execute[

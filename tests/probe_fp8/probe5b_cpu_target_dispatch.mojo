@@ -45,7 +45,7 @@ def main() raises:
 
     _fp8_op[DT, "cpu"](
         y.as_unsafe_any_origin(),
-        x.as_immutable().as_unsafe_any_origin(),
+        x.as_imm().as_unsafe_any_origin(),
         N,
         ctx,
     )

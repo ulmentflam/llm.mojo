@@ -227,6 +227,10 @@ struct DataLoader:
         )
         self.version = header_ptr.load(1)
         self.current_shard_tokens = Int(header_ptr.load(2))
+        # Keep the header buffer live past the last header_ptr use; the raw
+        # pointer does not own it and ASAP destruction otherwise frees it at
+        # the .unsafe_ptr() call (allocator scribble over magic/version).
+        _ = header_bytes^
 
         # Determine token size and format from magic number.
         if self.magic == GPT2_MAGIC:
@@ -347,6 +351,8 @@ struct DataLoader:
             for i in range(B * T):
                 self.inputs.store(i, Int32(ptr_u32.load(i)))
                 self.targets.store(i, Int32(ptr_u32.load(i + 1)))
+        # Keep the token buffer live past the copy loops (see header note).
+        _ = bytes_read^
 
     def next_batch(mut self) raises:
         if self.current_sample_idx >= self.shard_num_samples:

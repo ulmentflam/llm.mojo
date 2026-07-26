@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from layout import Layout, TileTensor
 from layout.tile_layout import row_major
 from std.memory import alloc
@@ -94,9 +94,7 @@ struct KVCache:
         self.att_probs_stride = 0
 
 
-comptime KVCachePtr = UnsafePointer[
-    mut=True, type=KVCache, origin=MutUntrackedOrigin
-]
+comptime KVCachePtr = UnsafePointer[KVCache, MutUntrackedOrigin]
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1602,12 +1600,12 @@ def attention_fwd_gemm[
             cache.value()[].gemm_scores_addr = scores_addr
             cache.value()[].gemm_att_addr = att_addr
 
-    var scores_buf_ptr = UnsafePointer[
-        mut=True, type=BufType, origin=MutUntrackedOrigin
-    ](unsafe_from_address=scores_addr)
-    var att_buf_ptr = UnsafePointer[
-        mut=True, type=BufType, origin=MutUntrackedOrigin
-    ](unsafe_from_address=att_addr)
+    var scores_buf_ptr = UnsafePointer[BufType, MutUntrackedOrigin](
+        unsafe_from_address=scores_addr
+    )
+    var att_buf_ptr = UnsafePointer[BufType, MutUntrackedOrigin](
+        unsafe_from_address=att_addr
+    )
     var scores_base = rebind[MutKernelPtr[dtype]](scores_buf_ptr[].unsafe_ptr())
     var scores_immut = rebind[ImmutKernelPtr[dtype]](
         scores_buf_ptr[].unsafe_ptr()
@@ -1617,9 +1615,9 @@ def attention_fwd_gemm[
     # probs into this layer's slice so the backward can read them (no recompute).
     if cache and cache.value()[].att_probs_addr != 0:
         var c = cache.value()
-        var ap = UnsafePointer[
-            mut=True, type=Scalar[dtype], origin=MutUntrackedOrigin
-        ](unsafe_from_address=c[].att_probs_addr)
+        var ap = UnsafePointer[Scalar[dtype], MutUntrackedOrigin](
+            unsafe_from_address=c[].att_probs_addr
+        )
         att_base = rebind[MutKernelPtr[dtype]](
             ap + c[].att_probs_layer * c[].att_probs_stride
         )
@@ -1862,9 +1860,9 @@ def attention_fwd[
                 if cache:
                     cache.value()[].fwd_addr = addr_fwd
 
-            var casted_ptr = UnsafePointer[
-                mut=True, type=CompiledType, origin=MutUntrackedOrigin
-            ](unsafe_from_address=addr_fwd)
+            var casted_ptr = UnsafePointer[CompiledType, MutUntrackedOrigin](
+                unsafe_from_address=addr_fwd
+            )
             var retrieved = casted_ptr[]
 
             device_ctx.enqueue_function(
@@ -1901,7 +1899,7 @@ def attention_fwd[
         raise Error("Invalid target")
 
 
-@compiler.register("attention_fwd")
+@register("attention_fwd")
 struct AttentionFwd:
     @staticmethod
     def execute[
@@ -2993,7 +2991,7 @@ def _gemm_scratch_buffer[
         var p = alloc[BufType](1)
         p.unsafe_write(buf^)
         out_addr = Int(p)
-    var bp = UnsafePointer[mut=True, type=BufType, origin=MutUntrackedOrigin](
+    var bp = UnsafePointer[BufType, MutUntrackedOrigin](
         unsafe_from_address=out_addr
     )
     return (out_addr, rebind[MutKernelPtr[bdt]](bp[].unsafe_ptr()))
@@ -4097,19 +4095,19 @@ def _attn_gemm_batched_metal[
         for bh in range(BH):
             var a = TileTensor(
                 Span[Scalar[dt], ImmutAnyOrigin](
-                    ptr=a_ptr + bh * a_stride, length=M * K
+                    unsafe_ptr=a_ptr + bh * a_stride, length=M * K
                 ),
                 row_major(M, K),
             )
             var b = TileTensor(
                 Span[Scalar[dt], ImmutAnyOrigin](
-                    ptr=b_ptr + bh * b_stride, length=N * K
+                    unsafe_ptr=b_ptr + bh * b_stride, length=N * K
                 ),
                 row_major(N, K),
             )
             var c = TileTensor(
                 Span[Scalar[dt], MutAnyOrigin](
-                    ptr=c_ptr + bh * c_stride, length=M * N
+                    unsafe_ptr=c_ptr + bh * c_stride, length=M * N
                 ),
                 row_major(M, N),
             )
@@ -4118,19 +4116,19 @@ def _attn_gemm_batched_metal[
         for bh in range(BH):
             var a = TileTensor(
                 Span[Scalar[dt], ImmutAnyOrigin](
-                    ptr=a_ptr + bh * a_stride, length=M * K
+                    unsafe_ptr=a_ptr + bh * a_stride, length=M * K
                 ),
                 row_major(M, K),
             )
             var b = TileTensor(
                 Span[Scalar[dt], ImmutAnyOrigin](
-                    ptr=b_ptr + bh * b_stride, length=K * N
+                    unsafe_ptr=b_ptr + bh * b_stride, length=K * N
                 ),
                 row_major(K, N),
             )
             var c = TileTensor(
                 Span[Scalar[dt], MutAnyOrigin](
-                    ptr=c_ptr + bh * c_stride, length=M * N
+                    unsafe_ptr=c_ptr + bh * c_stride, length=M * N
                 ),
                 row_major(M, N),
             )
@@ -4304,19 +4302,19 @@ def _attn_gemm_batched[
                 Int64(K),
                 UnsafePointer(to=alpha)
                 .bitcast[NoneType]()
-                .as_immutable()
+                .as_imm()
                 .as_unsafe_any_origin(),
-                b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+                b_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
                 _cublas_dt[b_dt](),
                 Int64(lda),
                 Int64(b_stride),
-                a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+                a_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
                 _cublas_dt[a_dt](),
                 Int64(ldb),
                 Int64(a_stride),
                 UnsafePointer(to=beta)
                 .bitcast[NoneType]()
-                .as_immutable()
+                .as_imm()
                 .as_unsafe_any_origin(),
                 c_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
                 _cublas_dt[c_dt](),
@@ -4555,9 +4553,9 @@ def attention_bwd_gemm[
     var use_stored = cache and cache.value()[].att_probs_addr != 0
     if use_stored:
         var c = cache.value()
-        var ap = UnsafePointer[
-            mut=True, type=Scalar[dtype], origin=MutUntrackedOrigin
-        ](unsafe_from_address=c[].att_probs_addr)
+        var ap = UnsafePointer[Scalar[dtype], MutUntrackedOrigin](
+            unsafe_from_address=c[].att_probs_addr
+        )
         var att_slice = ap + c[].att_probs_layer * c[].att_probs_stride
         scores_immut = rebind[ImmutKernelPtr[dtype]](att_slice)
         p_immut = rebind[ImmutKernelPtr[dtype]](att_slice)
@@ -4931,7 +4929,7 @@ def attention_bwd[
                     cache.value()[].bwd_dq_addr = addr_dq
 
             var casted_ptr_dq = UnsafePointer[
-                mut=True, type=CompiledTypeDQ, origin=MutUntrackedOrigin
+                CompiledTypeDQ, MutUntrackedOrigin
             ](unsafe_from_address=addr_dq)
             var retrieved_dq = casted_ptr_dq[]
 
@@ -5004,7 +5002,7 @@ def attention_bwd[
                     cache.value()[].bwd_dkv_addr = addr_dkv
 
             var casted_ptr_dkv = UnsafePointer[
-                mut=True, type=CompiledTypeDKV, origin=MutUntrackedOrigin
+                CompiledTypeDKV, MutUntrackedOrigin
             ](unsafe_from_address=addr_dkv)
             var retrieved_dkv = casted_ptr_dkv[]
 
@@ -5050,7 +5048,7 @@ def attention_bwd[
         raise Error("Invalid target")
 
 
-@compiler.register("attention_bwd")
+@register("attention_bwd")
 struct AttentionBwd:
     @staticmethod
     def execute[

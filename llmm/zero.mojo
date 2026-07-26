@@ -1219,7 +1219,7 @@ struct ShardedParameter[
 
                     var out_tile = TileTensor(
                         Span[Scalar[Self.dtype], MutAnyOrigin](
-                            ptr=rebind[
+                            unsafe_ptr=rebind[
                                 UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
                             ](full_buffer.unsafe_ptr().as_unsafe_any_origin()),
                             length=self.size,
@@ -1235,7 +1235,7 @@ struct ShardedParameter[
                     for i in range(Self.N_GPUS):
                         input_tensors[i] = TileTensor(
                             Span[Scalar[Self.dtype], ImmutAnyOrigin](
-                                ptr=rebind[
+                                unsafe_ptr=rebind[
                                     UnsafePointer[
                                         Scalar[Self.dtype], ImmutAnyOrigin
                                     ]

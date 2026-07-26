@@ -247,8 +247,8 @@ def test_quantize_kernel_matches_manual_encode() raises:
     ctx.synchronize()
     quantize_devscale[FP8_SPEC, DType.float8_e4m3fn, IN_DT, "gpu"](
         dev_out.unsafe_ptr().as_unsafe_any_origin(),
-        dev_in.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        dev_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        dev_in.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+        dev_scale.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         N,
         ctx,
     )
@@ -299,8 +299,8 @@ def test_quantize_kernel_amax_zero() raises:
     ctx.synchronize()
     quantize_devscale[FP8_SPEC, DType.float8_e4m3fn, IN_DT, "gpu"](
         dev_out.unsafe_ptr().as_unsafe_any_origin(),
-        dev_in.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        dev_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        dev_in.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+        dev_scale.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         N,
         ctx,
     )
@@ -343,8 +343,8 @@ def test_quantize_transpose_matches_manual() raises:
     ctx.synchronize()
     quantize_transpose_devscale[FP8_SPEC, DType.float8_e4m3fn, IN_DT, "gpu"](
         dev_out.unsafe_ptr().as_unsafe_any_origin(),
-        dev_in.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        dev_scale.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        dev_in.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+        dev_scale.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         ROWS,
         COLS,
         ctx,
@@ -468,14 +468,14 @@ def _run_lowp_gemm_case[
         transpose_b=transpose_b,
     ](
         dev_d.unsafe_ptr().as_unsafe_any_origin(),
-        dev_a.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        dev_b.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        dev_a.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+        dev_b.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         dev_a_scratch.unsafe_ptr().as_unsafe_any_origin(),
         dev_b_scratch.unsafe_ptr().as_unsafe_any_origin(),
-        dev_s_a.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        dev_sinv_a.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        dev_s_b.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-        dev_sinv_b.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+        dev_s_a.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+        dev_sinv_a.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+        dev_s_b.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+        dev_sinv_b.unsafe_ptr().as_imm().as_unsafe_any_origin(),
         m,
         n,
         k,

@@ -122,10 +122,10 @@ def _run_bwd_site_case(
             d_input_ref.unsafe_ptr().as_unsafe_any_origin(),
             d_weight_ref.unsafe_ptr().as_unsafe_any_origin(),
             d_bias_ref.unsafe_ptr().as_unsafe_any_origin(),
-            dev_doutput.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_input.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_weight.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_pre_gelu.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+            dev_doutput.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_input.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_weight.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_pre_gelu.unsafe_ptr().as_imm().as_unsafe_any_origin(),
             scratch_ref.unsafe_ptr().as_unsafe_any_origin(),
             Int64(rows),
             Int64(1),
@@ -138,10 +138,10 @@ def _run_bwd_site_case(
             d_input_ref.unsafe_ptr().as_unsafe_any_origin(),
             d_weight_ref.unsafe_ptr().as_unsafe_any_origin(),
             d_bias_ref.unsafe_ptr().as_unsafe_any_origin(),
-            dev_doutput.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_input.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_weight.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_pre_gelu.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+            dev_doutput.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_input.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_weight.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_pre_gelu.unsafe_ptr().as_imm().as_unsafe_any_origin(),
             scratch_ref.unsafe_ptr().as_unsafe_any_origin(),
             Int64(rows),
             Int64(1),
@@ -164,10 +164,10 @@ def _run_bwd_site_case(
             d_input_fp4.unsafe_ptr().as_unsafe_any_origin(),
             d_weight_fp4.unsafe_ptr().as_unsafe_any_origin(),
             d_bias_fp4.unsafe_ptr().as_unsafe_any_origin(),
-            dev_doutput.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_input.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_weight.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_pre_gelu.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+            dev_doutput.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_input.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_weight.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_pre_gelu.unsafe_ptr().as_imm().as_unsafe_any_origin(),
             Int64(rows),
             Int64(1),
             Int64(in_channels),
@@ -181,10 +181,10 @@ def _run_bwd_site_case(
             d_input_fp4.unsafe_ptr().as_unsafe_any_origin(),
             d_weight_fp4.unsafe_ptr().as_unsafe_any_origin(),
             d_bias_fp4.unsafe_ptr().as_unsafe_any_origin(),
-            dev_doutput.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_input.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_weight.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
-            dev_pre_gelu.unsafe_ptr().as_immutable().as_unsafe_any_origin(),
+            dev_doutput.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_input.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_weight.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+            dev_pre_gelu.unsafe_ptr().as_imm().as_unsafe_any_origin(),
             Int64(rows),
             Int64(1),
             Int64(in_channels),
@@ -336,10 +336,10 @@ def test_fp4_gemm_accumulate() raises:
             dev_d_fresh.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_a.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_a.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_b.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_b.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[MutKernelPtr[DType.uint8]](
             a_q.unsafe_ptr().as_unsafe_any_origin()
@@ -384,10 +384,10 @@ def test_fp4_gemm_accumulate() raises:
             dev_d_raw_scratch.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_a.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_a.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_b.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_b.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[MutKernelPtr[DType.uint8]](
             a_q.unsafe_ptr().as_unsafe_any_origin()
@@ -529,10 +529,10 @@ def _run_wgrad_rht_case(
             d_weight_ref.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_doutput.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_doutput.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_input.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_input.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[MutKernelPtr[DT]](
             scratch_ref.unsafe_ptr().as_unsafe_any_origin()
@@ -554,10 +554,10 @@ def _run_wgrad_rht_case(
             d_weight_rht.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_doutput.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_doutput.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_input.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_input.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         Int64(rows),
         Int64(1),
@@ -607,10 +607,10 @@ def _run_wgrad_rht_case(
             d_raw_scratch.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_input.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_input.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DT]](
-            dev_doutput.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_doutput.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[MutKernelPtr[DType.uint8]](
             a_q.unsafe_ptr().as_unsafe_any_origin()

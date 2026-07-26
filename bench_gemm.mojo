@@ -201,15 +201,15 @@ def linalg_gemm[
     ctx: DeviceContext,
 ) raises -> None:
     var c = TileTensor(
-        Span[Scalar[dtype], MutAnyOrigin](ptr=c_ptr, length=M * N),
+        Span[Scalar[dtype], MutAnyOrigin](unsafe_ptr=c_ptr, length=M * N),
         row_major(M, N),
     )
     var a = TileTensor(
-        Span[Scalar[dtype], ImmutAnyOrigin](ptr=a_ptr, length=M * K),
+        Span[Scalar[dtype], ImmutAnyOrigin](unsafe_ptr=a_ptr, length=M * K),
         row_major(M, K),
     )
     var b = TileTensor(
-        Span[Scalar[dtype], ImmutAnyOrigin](ptr=b_ptr, length=N * K),
+        Span[Scalar[dtype], ImmutAnyOrigin](unsafe_ptr=b_ptr, length=N * K),
         row_major(N, K),
     )
     matmul[transpose_b=True, target="gpu"](c, a, b, ctx=ctx)
@@ -273,10 +273,10 @@ def run_shape(
     ctx.synchronize()
 
     var a_bf_p = rebind[ImmutKernelPtr[DType.bfloat16]](
-        a_bf.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+        a_bf.unsafe_ptr().as_imm().as_unsafe_any_origin()
     )
     var b_bf_p = rebind[ImmutKernelPtr[DType.bfloat16]](
-        b_bf.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+        b_bf.unsafe_ptr().as_imm().as_unsafe_any_origin()
     )
     var c_lin_p = rebind[MutKernelPtr[DType.bfloat16]](
         c_lin.unsafe_ptr().as_unsafe_any_origin()
@@ -285,10 +285,10 @@ def run_shape(
         c_cand.unsafe_ptr().as_unsafe_any_origin()
     )
     var a_f32_p = rebind[ImmutKernelPtr[DType.float32]](
-        a_f32.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+        a_f32.unsafe_ptr().as_imm().as_unsafe_any_origin()
     )
     var b_f32_p = rebind[ImmutKernelPtr[DType.float32]](
-        b_f32.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+        b_f32.unsafe_ptr().as_imm().as_unsafe_any_origin()
     )
     var c_f32_p = rebind[MutKernelPtr[DType.float32]](
         c_f32.unsafe_ptr().as_unsafe_any_origin()

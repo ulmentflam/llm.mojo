@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from std.memory import alloc
 from extensibility import InputTensor
 from std.sys import simd_width_of, align_of
@@ -279,7 +279,7 @@ def global_norm_squared[
         raise Error("Invalid target")
 
 
-@compiler.register("global_norm_squared")
+@register("global_norm_squared")
 struct GlobalNormSquared:
     @staticmethod
     def execute[

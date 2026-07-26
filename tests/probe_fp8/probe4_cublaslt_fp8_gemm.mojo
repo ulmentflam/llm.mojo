@@ -109,7 +109,7 @@ def _fp8_gemm_tn[
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_TRANSA,
             UnsafePointer(to=transa)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[cublasOperation_t](),
         )
@@ -120,7 +120,7 @@ def _fp8_gemm_tn[
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_TRANSB,
             UnsafePointer(to=transb)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[cublasOperation_t](),
         )
@@ -180,7 +180,7 @@ def _fp8_gemm_tn[
             Preference.MAX_WORKSPACE_BYTES,
             UnsafePointer(to=ws_size)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[Int](),
         )
@@ -219,21 +219,21 @@ def _fp8_gemm_tn[
             desc,
             UnsafePointer(to=alpha)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
-            a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            a_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             a_l,
-            b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            b_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             b_l,
             UnsafePointer(to=beta)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
             c_l,
             d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
-            UnsafePointer(to=heur.algo).as_immutable().as_unsafe_any_origin(),
+            UnsafePointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
             ws.unsafe_ptr().bitcast[NoneType]().as_unsafe_any_origin(),
             ws_size,
             cuda_stream.value()[],

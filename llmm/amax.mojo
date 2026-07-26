@@ -72,7 +72,7 @@ def kernel_ptr_as_immut[
     conversion for the `MutUntrackedOrigin`-flavored `MutMemPtr` instead of
     this file's `MutAnyOrigin`-flavored `MutKernelPtr`.
     """
-    return rebind[ImmutKernelPtr[dtype]](ptr.as_immutable())
+    return rebind[ImmutKernelPtr[dtype]](ptr.as_imm())
 
 
 @always_inline

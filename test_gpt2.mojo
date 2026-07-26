@@ -197,15 +197,23 @@ def read_to_dtype_pointer[
 ](
     ptr: UnsafePointer[Scalar[T], _], mut file_handle: FileHandle, size: Int
 ) raises -> None:
-    # Read directly into the pointer using read_bytes
+    # Element-wise copy with an explicit keep-alive, mirroring
+    # llmm.io.read_and_copy and tests/test_zero_equivalence.mojo. A rebound
+    # pointer drops the List's lifetime tracking, so without the keep-alive
+    # ASAP destruction frees the buffer before the copy and the allocator
+    # clobbers the leading bytes (the debug-state magic read back as a heap
+    # address).
     var bytes_to_read = size * size_of[T]()
     var bytes_data = file_handle.read_bytes(bytes_to_read)
-
-    var d = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](ptr)
-    var s = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+    if len(bytes_data) < bytes_to_read:
+        raise Error("Failed to read enough bytes from file")
+    var dest = rebind[UnsafePointer[Scalar[T], MutUntrackedOrigin]](ptr)
+    var src_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
         bytes_data.unsafe_ptr()
-    )
-    memcpy(dest=d, src=s, count=bytes_to_read)
+    ).bitcast[Scalar[T]]()
+    for i in range(size):
+        dest[i] = src_ptr[i]
+    _ = bytes_data^
 
 
 def run_test[

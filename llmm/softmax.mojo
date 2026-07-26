@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from std.gpu.primitives import block
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
@@ -346,7 +346,7 @@ def softmax_fwd[
         raise Error("Invalid target")
 
 
-@compiler.register("softmax_fwd")
+@register("softmax_fwd")
 struct SoftmaxFwd:
     @staticmethod
     def execute[
@@ -657,7 +657,7 @@ def softmax_bwd[
         raise Error("Invalid target")
 
 
-@compiler.register("softmax_bwd")
+@register("softmax_bwd")
 struct SoftmaxBwd:
     @staticmethod
     def execute[

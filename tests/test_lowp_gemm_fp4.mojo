@@ -156,10 +156,10 @@ def _run_fp4_gemm_case[
         rebind[MutKernelPtr[IN_DT]](dev_d.unsafe_ptr().as_unsafe_any_origin()),
         rebind[MutKernelPtr[IN_DT]](dev_d.unsafe_ptr().as_unsafe_any_origin()),
         rebind[ImmutKernelPtr[IN_DT]](
-            dev_a.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_a.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[IN_DT]](
-            dev_b.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_b.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[MutKernelPtr[DType.uint8]](
             a_q.unsafe_ptr().as_unsafe_any_origin()
@@ -190,10 +190,10 @@ def _run_fp4_gemm_case[
             dev_d_bf16.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            dev_a.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_a.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[DType.bfloat16]](
-            dev_b.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_b.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         m,
         n,
@@ -393,7 +393,7 @@ def test_fp4_rht_quantize_gemm_contract() raises:
             dev_a_rht.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[IN_DT]](
-            dev_a.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_a.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         m,
         k,
@@ -404,7 +404,7 @@ def test_fp4_rht_quantize_gemm_contract() raises:
             dev_b_rht.unsafe_ptr().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[IN_DT]](
-            dev_b.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_b.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         n,
         k,
@@ -429,10 +429,10 @@ def test_fp4_rht_quantize_gemm_contract() raises:
         rebind[MutKernelPtr[IN_DT]](dev_d.unsafe_ptr().as_unsafe_any_origin()),
         rebind[MutKernelPtr[IN_DT]](dev_d.unsafe_ptr().as_unsafe_any_origin()),
         rebind[ImmutKernelPtr[IN_DT]](
-            dev_a_rht.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_a_rht.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[ImmutKernelPtr[IN_DT]](
-            dev_b_rht.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+            dev_b_rht.unsafe_ptr().as_imm().as_unsafe_any_origin()
         ),
         rebind[MutKernelPtr[DType.uint8]](
             a_q.unsafe_ptr().as_unsafe_any_origin()
@@ -593,7 +593,7 @@ def test_sr_nvfp4_quantize_deterministic_under_fixed_seed() raises:
                 tscale_dev.unsafe_ptr().as_unsafe_any_origin()
             ),
             rebind[ImmutKernelPtr[IN_DT]](
-                x_dev.unsafe_ptr().as_immutable().as_unsafe_any_origin()
+                x_dev.unsafe_ptr().as_imm().as_unsafe_any_origin()
             ),
             rows,
             k,

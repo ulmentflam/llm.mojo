@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from std.memory import alloc, stack_allocation
 from std.math import ceildiv
 from layout import Layout, TileTensor
@@ -307,7 +307,7 @@ def _lt_set_op(
             attr,
             UnsafePointer(to=op)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[cublasOperation_t](),
         )
@@ -326,7 +326,7 @@ def _lt_set_fast_accum(desc: cublasLtMatmulDesc_t, enable: Bool) raises:
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_FAST_ACCUM,
             UnsafePointer(to=flag)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[Int8](),
         )
@@ -381,7 +381,7 @@ def _lt_make_pref() raises -> cublasLtMatmulPreference_t:
             Preference.MAX_WORKSPACE_BYTES,
             UnsafePointer(to=ws_size)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[Int](),
         )
@@ -527,7 +527,7 @@ def _matmul_cublaslt[
                     LayoutAttribute.BATCH_COUNT,
                     UnsafePointer(to=bc)
                     .bitcast[NoneType]()
-                    .as_immutable()
+                    .as_imm()
                     .as_unsafe_any_origin(),
                     size_of[Int32](),
                 )
@@ -539,7 +539,7 @@ def _matmul_cublaslt[
                     LayoutAttribute.STRIDED_BATCH_OFFSET,
                     UnsafePointer(to=so)
                     .bitcast[NoneType]()
-                    .as_immutable()
+                    .as_imm()
                     .as_unsafe_any_origin(),
                     size_of[Int64](),
                 )
@@ -561,7 +561,7 @@ def _matmul_cublaslt[
                 cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD,
                 UnsafePointer(to=gelu_ld)
                 .bitcast[NoneType]()
-                .as_immutable()
+                .as_imm()
                 .as_unsafe_any_origin(),
                 size_of[Int64](),
             )
@@ -573,7 +573,7 @@ def _matmul_cublaslt[
                 cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER,
                 UnsafePointer(to=aux)
                 .bitcast[NoneType]()
-                .as_immutable()
+                .as_imm()
                 .as_unsafe_any_origin(),
                 size_of[MutKernelPtr[dtype]](),
             )
@@ -585,7 +585,7 @@ def _matmul_cublaslt[
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_EPILOGUE,
             UnsafePointer(to=epi)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[Int32](),
         )
@@ -599,7 +599,7 @@ def _matmul_cublaslt[
                 cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
                 UnsafePointer(to=bdt)
                 .bitcast[NoneType]()
-                .as_immutable()
+                .as_imm()
                 .as_unsafe_any_origin(),
                 size_of[DataType](),
             )
@@ -611,7 +611,7 @@ def _matmul_cublaslt[
                 cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_BIAS_POINTER,
                 UnsafePointer(to=bias_dev)
                 .bitcast[NoneType]()
-                .as_immutable()
+                .as_imm()
                 .as_unsafe_any_origin(),
                 size_of[ImmutKernelPtr[dtype]](),
             )
@@ -637,21 +637,21 @@ def _matmul_cublaslt[
             desc,
             UnsafePointer(to=alpha)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
-            a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            a_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             a_l,
-            b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            b_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             b_l,
             UnsafePointer(to=beta)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
-            d_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            d_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             c_l,
             d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
-            UnsafePointer(to=heur.algo).as_immutable().as_unsafe_any_origin(),
+            UnsafePointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
             ws,
             _CUBLASLT_WS_BYTES,
             cuda_stream.value()[],
@@ -757,7 +757,7 @@ def _matmul_cublaslt_fp8[
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
             UnsafePointer(to=a_sp)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[ImmutKernelPtr[DType.float32]](),
         )
@@ -769,7 +769,7 @@ def _matmul_cublaslt_fp8[
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
             UnsafePointer(to=b_sp)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[ImmutKernelPtr[DType.float32]](),
         )
@@ -809,21 +809,21 @@ def _matmul_cublaslt_fp8[
             desc,
             UnsafePointer(to=alpha)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
-            a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            a_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             a_l,
-            b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            b_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             b_l,
             UnsafePointer(to=beta)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
-            d_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            d_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             c_l,
             d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
-            UnsafePointer(to=heur.algo).as_immutable().as_unsafe_any_origin(),
+            UnsafePointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
             ws,
             _CUBLASLT_WS_BYTES,
             cuda_stream.value()[],
@@ -950,8 +950,8 @@ def lowp_gemm_devscale[
         a_out_dtype, b_out_dtype, out_dtype, fast_accum=fast_accum
     ](
         d_ptr,
-        a_fp8_scratch.as_immutable(),
-        b_fp8_scratch.as_immutable(),
+        a_fp8_scratch.as_imm(),
+        b_fp8_scratch.as_imm(),
         a_scale_inv_ptr,
         b_scale_inv_ptr,
         m,
@@ -1040,7 +1040,7 @@ def _matmul_cublaslt_fp4[
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
             UnsafePointer(to=scale_mode)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[cublasLtMatmulMatrixScale_t](),
         )
@@ -1051,7 +1051,7 @@ def _matmul_cublaslt_fp4[
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
             UnsafePointer(to=scale_mode)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[cublasLtMatmulMatrixScale_t](),
         )
@@ -1064,7 +1064,7 @@ def _matmul_cublaslt_fp4[
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
             UnsafePointer(to=a_sp)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[ImmutKernelPtr[DType.uint8]](),
         )
@@ -1076,7 +1076,7 @@ def _matmul_cublaslt_fp4[
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
             UnsafePointer(to=b_sp)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
             size_of[ImmutKernelPtr[DType.uint8]](),
         )
@@ -1118,21 +1118,21 @@ def _matmul_cublaslt_fp4[
             desc,
             UnsafePointer(to=alpha)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
-            a_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            a_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             a_l,
-            b_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            b_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             b_l,
             UnsafePointer(to=beta)
             .bitcast[NoneType]()
-            .as_immutable()
+            .as_imm()
             .as_unsafe_any_origin(),
-            d_ptr.bitcast[NoneType]().as_immutable().as_unsafe_any_origin(),
+            d_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             c_l,
             d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
-            UnsafePointer(to=heur.algo).as_immutable().as_unsafe_any_origin(),
+            UnsafePointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
             ws,
             _CUBLASLT_WS_BYTES,
             cuda_stream.value()[],
@@ -1371,10 +1371,10 @@ def lowp_gemm_fp4[
     # happens in the post-scale step below instead.
     _matmul_cublaslt_fp4[out_dtype](
         d_raw_scratch,
-        a_q_scratch.as_immutable(),
-        b_q_scratch.as_immutable(),
-        a_scale_scratch.as_immutable(),
-        b_scale_scratch.as_immutable(),
+        a_q_scratch.as_imm(),
+        b_q_scratch.as_imm(),
+        a_scale_scratch.as_imm(),
+        b_scale_scratch.as_imm(),
         m,
         n,
         k,
@@ -1384,9 +1384,9 @@ def lowp_gemm_fp4[
 
     _nvfp4_post_scale[out_dtype, target, accumulate=accumulate](
         d_ptr,
-        d_raw_scratch.as_immutable(),
-        a_tensor_scale_scratch.as_immutable(),
-        b_tensor_scale_scratch.as_immutable(),
+        d_raw_scratch.as_imm(),
+        a_tensor_scale_scratch.as_imm(),
+        b_tensor_scale_scratch.as_imm(),
         m * n,
         ctx,
         extra_scale,
@@ -1507,19 +1507,19 @@ def matmul_fwd[
 
     var c = TileTensor(
         Span[Scalar[dtype], MutAnyOrigin](
-            ptr=out_ptr, length=rows * out_channels
+            unsafe_ptr=out_ptr, length=rows * out_channels
         ),
         row_major(rows, out_channels),
     )
     var a = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
-            ptr=input_ptr, length=rows * in_channels
+            unsafe_ptr=input_ptr, length=rows * in_channels
         ),
         row_major(rows, in_channels),
     )
     var b = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
-            ptr=weight_ptr, length=out_channels * in_channels
+            unsafe_ptr=weight_ptr, length=out_channels * in_channels
         ),
         row_major(out_channels, in_channels),
     )
@@ -1676,7 +1676,7 @@ def matmul_fwd[
     # accumulation DOES still need its fences — removing those races.)
 
 
-@compiler.register("matmul_fwd")
+@register("matmul_fwd")
 struct MatmulFwd:
     @staticmethod
     def execute[
@@ -2654,19 +2654,19 @@ def matmul_d_input_bwd[
 
     var c_d_input = TileTensor(
         Span[Scalar[dtype], MutAnyOrigin](
-            ptr=d_input_ptr, length=rows * in_channels
+            unsafe_ptr=d_input_ptr, length=rows * in_channels
         ),
         row_major(rows, in_channels),
     )
     var a_d_output = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
-            ptr=d_output_ptr, length=rows * out_channels
+            unsafe_ptr=d_output_ptr, length=rows * out_channels
         ),
         row_major(rows, out_channels),
     )
     var b_weight = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
-            ptr=weight_ptr, length=out_channels * in_channels
+            unsafe_ptr=weight_ptr, length=out_channels * in_channels
         ),
         row_major(out_channels, in_channels),
     )
@@ -3072,19 +3072,19 @@ def matmul_d_weight_bwd[
 
     var c_d_weight = TileTensor(
         Span[Scalar[dtype], MutAnyOrigin](
-            ptr=d_weight_ptr, length=out_channels * in_channels
+            unsafe_ptr=d_weight_ptr, length=out_channels * in_channels
         ),
         row_major(out_channels, in_channels),
     )
     var a_d_output = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
-            ptr=d_output_ptr, length=rows * out_channels
+            unsafe_ptr=d_output_ptr, length=rows * out_channels
         ),
         row_major(rows, out_channels),
     )
     var b_input = TileTensor(
         Span[Scalar[dtype], ImmutAnyOrigin](
-            ptr=input_ptr, length=rows * in_channels
+            unsafe_ptr=input_ptr, length=rows * in_channels
         ),
         row_major(rows, in_channels),
     )
@@ -3153,7 +3153,9 @@ def matmul_d_weight_bwd[
                     # input_T_ptr holds inputᵀ [C, rows] row-major.
                     var a_input_T = TileTensor(
                         Span[Scalar[dtype], ImmutAnyOrigin](
-                            ptr=rebind[ImmutKernelPtr[dtype]](input_T_ptr),
+                            unsafe_ptr=rebind[ImmutKernelPtr[dtype]](
+                                input_T_ptr
+                            ),
                             length=t_in_total,
                         ),
                         row_major(in_channels, rows),
@@ -3166,7 +3168,7 @@ def matmul_d_weight_bwd[
                     )
                     var c_dw_t = TileTensor(
                         Span[Scalar[dtype], MutAnyOrigin](
-                            ptr=dw_t_ptr, length=dw_t_total
+                            unsafe_ptr=dw_t_ptr, length=dw_t_total
                         ),
                         row_major(in_channels, out_channels),
                     )
@@ -3220,7 +3222,7 @@ def matmul_d_weight_bwd[
                     # transpose_ptr holds d_outputᵀ [OC, rows] row-major.
                     var scratch_t_gpu = TileTensor(
                         Span[Scalar[dtype], MutAnyOrigin](
-                            ptr=transpose_ptr, length=out_channels * rows
+                            unsafe_ptr=transpose_ptr, length=out_channels * rows
                         ),
                         row_major(out_channels, rows),
                     )
@@ -3236,7 +3238,7 @@ def matmul_d_weight_bwd[
                         )
                         var c_temp = TileTensor(
                             Span[Scalar[dtype], MutAnyOrigin](
-                                ptr=temp_ptr,
+                                unsafe_ptr=temp_ptr,
                                 length=out_channels * in_channels,
                             ),
                             row_major(out_channels, in_channels),
@@ -3282,7 +3284,7 @@ def matmul_d_weight_bwd[
         ctx.synchronize()
         var scratch_t = TileTensor(
             Span[Scalar[dtype], MutAnyOrigin](
-                ptr=scratch_ptr, length=out_channels * rows
+                unsafe_ptr=scratch_ptr, length=out_channels * rows
             ),
             row_major(out_channels, rows),
         )
@@ -3300,7 +3302,7 @@ def matmul_d_weight_bwd[
             var temp = alloc[Scalar[dtype]](out_channels * in_channels)
             var c_temp = TileTensor(
                 Span[Scalar[dtype], MutAnyOrigin](
-                    ptr=temp.as_unsafe_any_origin(),
+                    unsafe_ptr=temp.as_unsafe_any_origin(),
                     length=out_channels * in_channels,
                 ),
                 row_major(out_channels, in_channels),
@@ -4296,7 +4298,7 @@ def _check_bwd_sizes[
         )
 
 
-@compiler.register("matmul_bwd")
+@register("matmul_bwd")
 struct MatmulBwd:
     @staticmethod
     def execute[

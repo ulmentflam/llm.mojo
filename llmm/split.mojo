@@ -1,4 +1,4 @@
-import compiler
+from extensibility import register
 from std.sys import simd_width_of
 from extensibility import InputTensor
 from std.gpu.host import DeviceContext
@@ -436,7 +436,7 @@ def split_fwd[
         raise Error("Invalid target")
 
 
-@compiler.register("split_fwd")
+@register("split_fwd")
 struct SplitFwd:
     @staticmethod
     def execute[
@@ -572,7 +572,7 @@ def split_bwd[
         raise Error("Invalid target")
 
 
-@compiler.register("split_bwd")
+@register("split_bwd")
 struct SplitBwd:
     @staticmethod
     def execute[
