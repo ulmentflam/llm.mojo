@@ -31,7 +31,9 @@ def read_to_dtype_pointer[
     if len(bytes_data) < bytes_to_read:
         raise Error("Failed to read enough bytes from file")
     var dest = rebind[UnsafePointer[Scalar[T], MutUntrackedOrigin]](ptr)
-    var src_ptr = bytes_data.unsafe_ptr().bitcast[Scalar[T]]()
+    var src_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        bytes_data.unsafe_ptr()
+    ).bitcast[Scalar[T]]()
     for i in range(size):
         dest[i] = src_ptr[i]
     # Keep `bytes_data` live until the copy is done: `src_ptr` does not own it,
