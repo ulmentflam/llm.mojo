@@ -1527,7 +1527,7 @@ def matmul_fwd[
     @parameter
     @always_inline
     def epilogue_with_bias[
-        dtype: DType, width: SIMDSize, *, alignment: Int = 1
+        dtype: DType, width: SIMDLength, *, alignment: Int = 1
     ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
         var offset = idx[0] * out_channels + idx[1]
         var v = (
@@ -1545,7 +1545,7 @@ def matmul_fwd[
     @parameter
     @always_inline
     def epilogue_no_bias[
-        dtype: DType, width: SIMDSize, *, alignment: Int = 1
+        dtype: DType, width: SIMDLength, *, alignment: Int = 1
     ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
         var offset = idx[0] * out_channels + idx[1]
         var v = val.cast[DType.float32]()
@@ -2681,7 +2681,7 @@ def matmul_d_input_bwd[
         @parameter
         @always_inline
         def d_input_epilogue[
-            dtype: DType, width: SIMDSize, *, alignment: Int = 1
+            dtype: DType, width: SIMDLength, *, alignment: Int = 1
         ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
             var offset = idx[0] * in_channels + idx[1]
             var v = val.cast[DType.float32]()
