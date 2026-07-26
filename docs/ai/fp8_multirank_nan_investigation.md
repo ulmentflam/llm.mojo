@@ -429,9 +429,18 @@ interleaved baseline only.
 
 ## 7. Upstream reporting status
 
-**Status: filing PENDING the byte-diff probe outcome.** Draft bodies live in
-the round-3 (§7, post-amendment titles) and round-4 (§6) documents; the arm
-table to attach is §2 + §3 here.
+**Status: FILED (2026-07-26).** The byte-diff probe resolved "stash bytes
+identical at ws1" (see Final findings below), so the round-3/4 framing
+stood: Modular primary, NVIDIA co-primary.
+
+- Modular: [modular/modular#6811](https://github.com/modular/modular/issues/6811)
+  (multi-DeviceContext launch machinery; evidence ladder, dormant-stash
+  causality, repro via `-D LLMM_FP8_STASH_LEGACY=1` on main).
+- NVIDIA: report text ready at `/home/evan/nvidia_fp8_report/nvbug_report.md`
+  (developer-portal form requires interactive login; cross-references #6811).
+
+Draft bodies historically lived in the round-3 (§7, post-amendment titles)
+and round-4 (§6) documents; the arm table attached is §2 + §3 here.
 
 The byte-diff probe (ws1, clean runs: per-site compare of stash bytes at
 consumption vs a fresh requantize) decides the framing:
