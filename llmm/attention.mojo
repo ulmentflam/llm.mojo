@@ -807,17 +807,11 @@ def _attention_gpu_process_key_value_tile_warp[
             state,
         )
 
-        # NOTE: This is a runtime loop (not comptime) on purpose. The Metal GPU
-        # compiler (MetalAIRPass) crashes when the inner KV loop is fully
-        # unrolled at compile-time inside the already-unrolled outer
-        # `comptime for local_row` loop: the resulting function body is too
-        # large for the Metal LLVM/AIR backend and causes an ICE. On NVIDIA
-        # (HAS_CUBLAS=True) the flash-forward kernel is not called at all
-        # (USE_GEMM_ATTENTION=True takes precedence), so removing the unroll
-        # has zero effect on NVIDIA forward performance. The backward kernels
-        # never used comptime-unrolled KV loops and compile fine on both
-        # targets. See docs/ai/metal_port_gotchas_and_optimizations.md G8.
-        for key_column in range(Bc):
+        # Fully unrolled at compile time. The Metal AIR backend ICE that used
+        # to force this to a runtime loop (modular/modular#6768, gotcha G8 in
+        # docs/ai/metal_port_gotchas_and_optimizations.md) is fixed as of the
+        # 2026-07-26 nightly.
+        comptime for key_column in range(Bc):
             var key_index = key_tile_start + key_column
             var is_active_and_valid = (
                 (query_index < seq_len)
