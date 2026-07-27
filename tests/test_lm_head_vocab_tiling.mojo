@@ -642,5 +642,190 @@ def test_bwd_tiled_matches_dense_at_vocab_scale() raises:
     d_w_tiled.free()
 
 
+# ===----------------------------------------------------------------------=== #
+# Multiple tile counts at vocabulary scale.
+#
+# The two tests above pin the DEFAULT tile width (6400 rows, K=8). That is what
+# ships, but it validates exactly one point. Anyone characterising cost as a
+# function of tile count — the memory saving rises with K while GEMM efficiency
+# falls — would otherwise be reading a curve whose every other point has no
+# correctness evidence behind it at all.
+#
+# So this sweeps the tile widths that -D LLMM_LM_HEAD_VOCAB_TILES=2,4,8,16
+# actually produce at V_p=50304, and checks each against the same dense
+# reference. All four are non-divisible, so every one exercises a ragged final
+# tile of a different size:
+#
+#   K=2  -> tile 25216, 2 tiles,  tail 25088
+#   K=4  -> tile 12672, 4 tiles,  tail 12288
+#   K=8  -> tile  6400, 8 tiles,  tail  5504   (the default)
+#   K=16 -> tile  3200, 16 tiles, tail  2304
+#
+# The dense reference and the float64 d_input reference are computed ONCE and
+# reused across all four, which is what keeps this affordable.
+# ===----------------------------------------------------------------------=== #
+
+
+def test_multiple_tile_counts_at_vocab_scale() raises:
+    var ctx = DeviceContext(api="cpu")
+
+    var inp = _alloc(BIG_ROWS * C)
+    var wte = _alloc(BIG_V_P * C)
+    var dlogits = _alloc(BIG_ROWS * BIG_V_P)
+    _fill(inp, BIG_ROWS * C, 21)
+    _fill(wte, BIG_V_P * C, 22)
+    _fill(dlogits, BIG_ROWS * BIG_V_P, 23)
+
+    # ---- dense references, computed once ----
+    var logits_dense = _alloc(BIG_ROWS * BIG_V_P)
+    matmul_fwd[DT, TARGET, use_gelu=False, has_bias=False](
+        as_mut_kernel[DT](logits_dense),
+        as_mut_kernel[DT](logits_dense),
+        as_mut_kernel[DT](inp),
+        as_immut_kernel_from_mut[DT](wte),
+        as_immut_kernel_from_mut[DT](wte),
+        Int64(BIG_ROWS),
+        Int64(1),
+        Int64(C),
+        Int64(BIG_V_P),
+        ctx,
+    )
+
+    var d_inp_dense = _alloc(BIG_ROWS * C)
+    var d_w_dense = _alloc(BIG_V_P * C)
+    var scratch = _alloc(BIG_V_P * BIG_ROWS)
+    matmul_bwd[DT, TARGET, use_gelu=False, has_bias=False](
+        as_mut_kernel[DT](d_inp_dense),
+        as_mut_kernel[DT](d_w_dense),
+        as_mut_kernel[DT](d_w_dense),
+        as_mut_kernel[DT](dlogits),
+        as_mut_kernel[DT](inp),
+        as_immut_kernel_from_mut[DT](wte),
+        as_mut_kernel[DT](d_inp_dense),
+        as_mut_kernel[DT](scratch),
+        Int64(BIG_ROWS),
+        Int64(1),
+        Int64(C),
+        Int64(BIG_V_P),
+        ctx,
+    )
+    ctx.synchronize()
+
+    var tile_widths = [25216, 12672, 6400, 3200]
+    var want_tiles = [2, 4, 8, 16]
+    var want_tail = [25088, 12288, 5504, 2304]
+
+    var logits_tiled = _alloc(BIG_ROWS * BIG_V_P)
+    var d_inp_tiled = _alloc(BIG_ROWS * C)
+    var d_w_tiled = _alloc(BIG_V_P * C)
+
+    for w in range(len(tile_widths)):
+        var tw = tile_widths[w]
+        var label = "tile width " + String(tw)
+
+        # ---------- forward ----------
+        for i in range(BIG_ROWS * BIG_V_P):
+            logits_tiled[i] = 0.0
+        var ntiles = 0
+        var tail = 0
+        var t0 = 0
+        while t0 < BIG_V_P:
+            var oc = min(tw, BIG_V_P - t0)
+            if oc != tw:
+                tail = oc
+            matmul_lm_head_fwd_tile[DT, TARGET](
+                as_mut_kernel[DT](logits_tiled + t0),
+                BIG_V_P,
+                as_immut_kernel_from_mut[DT](inp),
+                as_immut_kernel_from_mut[DT](wte + t0 * C),
+                BIG_ROWS,
+                C,
+                oc,
+                ctx,
+            )
+            ntiles += 1
+            t0 += tw
+        ctx.synchronize()
+
+        assert_true(ntiles == want_tiles[w], label + ": wrong tile count")
+        assert_true(tail == want_tail[w], label + ": wrong ragged tail")
+
+        for i in range(BIG_ROWS * BIG_V_P):
+            assert_almost_equal(logits_tiled[i], logits_dense[i], atol=1e-5)
+
+        # ---------- backward ----------
+        for i in range(BIG_V_P * C):
+            d_w_tiled[i] = 0.0
+        for i in range(BIG_ROWS * C):
+            d_inp_tiled[i] = 0.0
+        t0 = 0
+        var first = True
+        while t0 < BIG_V_P:
+            var oc = min(tw, BIG_V_P - t0)
+            matmul_lm_head_bwd_tile[DT, TARGET](
+                as_mut_kernel[DT](d_inp_tiled),
+                as_mut_kernel[DT](d_w_tiled + t0 * C),
+                as_immut_kernel_from_mut[DT](dlogits + t0),
+                BIG_V_P,
+                as_immut_kernel_from_mut[DT](inp),
+                as_immut_kernel_from_mut[DT](wte + t0 * C),
+                as_mut_kernel[DT](scratch),
+                BIG_ROWS,
+                C,
+                oc,
+                not first,
+                ctx,
+            )
+            first = False
+            t0 += tw
+        ctx.synchronize()
+
+        # d_weight does not reassociate at any tile width.
+        for i in range(BIG_V_P * C):
+            assert_almost_equal(d_w_tiled[i], d_w_dense[i], atol=1e-5)
+
+        # d_input does reassociate, and MORE so at larger K (more partial sums),
+        # so it is checked against float64 truth rather than against the dense
+        # fp32 result. Same bound at every width: if accuracy degraded with tile
+        # count this is where it would show.
+        for r in range(0, BIG_ROWS, 32):
+            for c in range(0, C, 192):
+                var acc = Float64(0.0)
+                var mag = Float64(0.0)
+                for v in range(BIG_V_P):
+                    var prod = Float64(dlogits[r * BIG_V_P + v]) * Float64(
+                        wte[v * C + c]
+                    )
+                    acc += prod
+                    mag += abs(prod)
+                var tol = Float64(5e-5) * mag
+                var got = Float64(d_inp_tiled[r * C + c])
+                assert_true(
+                    abs(got - acc) <= tol,
+                    label
+                    + ": tiled d_input off the float64 reference at ("
+                    + String(r)
+                    + ","
+                    + String(c)
+                    + "): got "
+                    + String(got)
+                    + " want "
+                    + String(acc)
+                    + " tol "
+                    + String(tol),
+                )
+
+    inp.free()
+    wte.free()
+    dlogits.free()
+    logits_dense.free()
+    logits_tiled.free()
+    d_inp_dense.free()
+    d_w_dense.free()
+    d_inp_tiled.free()
+    d_w_tiled.free()
+    scratch.free()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
