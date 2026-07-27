@@ -763,10 +763,31 @@ def test_multi_sharded_parameter_gather_cpu() raises:
 # ===----------------------------------------------------------------------=== #
 
 
+# Every `return False` here announces itself. test_multi_gpu_collectives is
+# the ONLY test in the repo that drives the real GPU collectives (allreduce,
+# reducescatter, allgather, reducescatter_buckets), so when it opts out the
+# suite still reports 13/13 PASS while the collectives went completely
+# untested. A silent skip therefore manufactures a false green: on a 1-GPU
+# box a fully green test_zero.mojo proves nothing about ZeRO's cross-rank
+# paths. Printing the reason is what keeps "green" and "meaningful" from
+# drifting apart — the skip stays a skip (single-GPU boxes are legitimate),
+# but it can no longer be mistaken for coverage.
 def _gpu_multirank_available() raises -> Bool:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_zero.mojo::test_multi_gpu_collectives: no NVIDIA"
+            " GPU accelerator - GPU collectives NOT exercised"
+        )
         return False
     if DeviceContext.number_of_devices() < 2:
+        print(
+            (
+                "SKIP tests/test_zero.mojo::test_multi_gpu_collectives:"
+                " requires >=2 GPUs, found"
+            ),
+            DeviceContext.number_of_devices(),
+            "- GPU collectives NOT exercised",
+        )
         return False
     # A driver-faulted GPU ("GPU requires reset") can shrink the usable
     # ordinal range below number_of_devices(); probe both devices for real.
@@ -781,6 +802,11 @@ def _gpu_multirank_available() raises -> Bool:
         c1.synchronize()
         return True
     except:
+        print(
+            "SKIP tests/test_zero.mojo::test_multi_gpu_collectives: two-device"
+            " probe failed (driver-faulted GPU?) - GPU collectives NOT"
+            " exercised"
+        )
         return False
 
 
