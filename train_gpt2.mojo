@@ -3283,6 +3283,23 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 ](self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()),
                 size=batch_size * seq_len,
             )
+            # The dL/dloss seed above is an ASYNC enqueue_copy, but on CPU the
+            # fused_classifier below reads grad_acts.losses SYNCHRONOUSLY on the
+            # host: fused_classifier_cpu runs under sync_parallelize and never
+            # enters the device queue, so nothing orders it after the copy.
+            # Without this barrier the classifier races the copy, and any row
+            # whose `d_losses_ptr[idx]` read wins sees the buffer's PRE-copy
+            # contents — zero, or uninitialized heap on a freshly allocated
+            # model. That row's dlogits are then garbage, and since dlogits is
+            # the root of the whole backward, EVERY parameter gradient is
+            # corrupted. The loss is unaffected (it is computed from the logits
+            # before the in-place dlogits overwrite), which is what made this so
+            # hard to see: ~1 in 4000 CPU steps, silently wrong gradients.
+            # GPU targets need no barrier — there the copy and the classifier
+            # kernel are both enqueued on this context's stream, so the stream
+            # already orders them.
+            comptime if is_cpu[Self.target]():
+                self.ctx.synchronize()
             fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=True](
                 as_mut_kernel[GPT2_DTYPE](self.acts.logits),
                 as_mut_kernel[StatsDType](self.acts.losses),
