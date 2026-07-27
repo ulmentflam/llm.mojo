@@ -716,6 +716,10 @@ def main():
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
         "host": host,
         "gpu": _gpu_name_raw() or None,
+        # Number of GPUs nvidia-smi ENUMERATES, not the number that work. A
+        # faulted card still enumerates (it just stops answering some queries),
+        # so on a box with dead hardware this over-counts usable devices. Read
+        # it as inventory, not capacity, and pin real runs by UUID.
         "gpu_count": len(_query_gpu_mem_mib()),
         "world_size": args.world_size,
         "flags": {"b": args.b, "t": args.t, "d": args.d, "steps": args.steps},

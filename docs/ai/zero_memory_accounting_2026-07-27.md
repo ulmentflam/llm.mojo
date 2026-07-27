@@ -248,7 +248,21 @@ through that one function.
 
 ## Method (reproducible)
 
-Box: `workstation-max`, 8× NVIDIA RTX PRO 6000 Blackwell Max-Q. Two GPUs pinned
+Box: `workstation-max`, 8× NVIDIA RTX PRO 6000 Blackwell Max-Q **installed, but
+only 7 usable** — physical GPU index 1 is faulted hardware (GSP faults at idle;
+it survived two reseats and a cold power cycle, and is RMA-grade). It is
+independently visible in `nvidia-smi`, which returns `[N/A]` for that card's
+utilization while every other card reports a value.
+
+Two consequences worth stating, because neither is obvious from the data files.
+Nothing in this document is affected — every measurement here ran on physical
+GPUs 5 and 6 — but **a world-size-8 measurement is currently not possible on this
+machine at all**, so any scaling claim at that world size cannot be checked here.
+And the `gpu_count` field in the benchmark JSON is the number of GPUs `nvidia-smi`
+*enumerates*, which is 8; it is not a count of usable devices. Read it as
+inventory, not capacity.
+
+Two GPUs pinned
 **by UUID**, never by index — CUDA renumbers around a faulted card, so an
 ordinal can silently move to different hardware:
 
