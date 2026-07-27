@@ -336,15 +336,15 @@ def render(out_path=None):
     small = load(SRC_SMALL)
     large = load(SRC_LARGE)
 
-    fig = plt.figure(figsize=(15.2, 6.0))
+    fig = plt.figure(figsize=(15.2, 7.1))
     gs = fig.add_gridspec(
         1,
         3,
         width_ratios=[1.15, 1.15, 1.05],
         left=0.052,
         right=0.988,
-        top=0.735,
-        bottom=0.145,
+        top=0.760,
+        bottom=0.205,
         wspace=0.22,
     )
     ax_fp32 = fig.add_subplot(gs[0, 0])
@@ -403,18 +403,25 @@ def render(out_path=None):
     flags = small["flags"]
     fig.text(
         0.5,
-        0.917,
-        "GPT-2 124M · world size 2 · "
+        0.945,
+        # `gpu_count` in the source JSON is how many GPUs nvidia-smi
+        # ENUMERATES, not how many work: physical index 1 is faulted
+        # hardware. Never render it as "N x <gpu>", which would imply the
+        # measurement used them all. It used two, pinned by UUID.
+        f"GPT-2 124M · ZeRO world size {small['world_size']} · "
         f"B={flags['b']} T={flags['t']} per rank · "
-        f"{small['gpu_count']}× {small['gpu']} · "
-        f"{small['host']} · {small['generated'][:10]}",
+        f"{small['generated'][:10]}\n"
+        f"{small['host']} — {small['gpu']} "
+        f"({small['gpu_count']} installed, 7 usable); measured at world "
+        f"size {small['world_size']} on two GPUs pinned by UUID",
         color=TEXT_GRAY,
-        fontsize=9,
+        fontsize=8.8,
         ha="center",
+        va="top",
     )
     fig.text(
         0.5,
-        0.874,
+        0.892,
         "Left & centre: y-axis ticks are the allocator's 256 MiB commit "
         "granularity — every nvidia-smi bar lands exactly on a tick, "
         "every exact-accounting bar does not.",
@@ -429,17 +436,17 @@ def render(out_path=None):
                 facecolor=COLOR_EXACT,
                 edgecolor=TEXT_INK,
                 linewidth=1.1,
-                label="exact in-process accounting (LLMM_MEM_REPORT)",
+                label="exact resident, steady state (LLMM_MEM_REPORT)",
             ),
             Patch(
                 facecolor=COLOR_SMI,
                 edgecolor=TEXT_INK,
                 linewidth=1.1,
-                label="nvidia-smi",
+                label="nvidia-smi peak, sampled during the run",
             ),
         ],
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.845),
+        bbox_to_anchor=(0.5, 0.862),
         frameon=False,
         fontsize=9.2,
         ncol=2,
@@ -449,13 +456,20 @@ def render(out_path=None):
 
     fig.text(
         0.988,
-        0.035,
+        0.012,
         "† logits size comes from the model's activation size table, not "
         "a direct buffer read, and is already counted inside 'all "
         "activations'.\n"
-        "All values measured, per rank (max over 2 ranks). nvidia-smi is a "
-        "peak-during-run delta; exact accounting is read at the steady "
-        "phase. GPU collectives are verified at world size 2 only.",
+        "All values measured, per rank (max OVER the 2 ranks, never summed). "
+        "The two instruments do not share a basis: nvidia-smi is a maximum "
+        "over time (0.25 s sampling, minus a pre-launch baseline),\n"
+        "exact accounting is a single point in time at the steady phase. "
+        "Steady should be the peak here — the allocator never releases a "
+        "committed chunk and every counted buffer is persistent — but that "
+        "is an argument, not a\nverified identity. The collisions this "
+        "figure turns on are between nvidia-smi readings, which do share a "
+        "basis with each other. GPU collectives are verified at world "
+        "size 2 only.",
         color=TEXT_GRAY,
         fontsize=7.2,
         ha="right",

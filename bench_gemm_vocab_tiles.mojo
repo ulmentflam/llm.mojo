@@ -4,11 +4,16 @@ The tied-`wte` de-residency work proposes splitting the LM-head projection
 
     logits[B*T, V_p] = x[B*T, C] @ wte[V_p, C]^T          (transpose_b=True)
 
-into `tiles` column-blocks of width `V_p / tiles`, so that only one
-`[B*T, V_p/tiles]` logits block is resident at a time instead of the whole
-`[B*T, V_p]` tensor. That is the memory win. This file measures the PRICE:
-one big GEMM becomes `tiles` smaller GEMMs, and smaller GEMMs can fall off
-peak.
+into column-blocks, so that only one `[B*T, width]` logits block is resident
+at a time instead of the whole `[B*T, V_p]` tensor. That is the memory win.
+This file measures the PRICE: one big GEMM becomes several smaller ones, and
+smaller GEMMs can fall off peak.
+
+The tile width is NOT an even division of V_p. It comes from the shipped
+head's own rule (`lm_head_tile_rows` below, mirroring `_lm_head_tile_rows`):
+the width is rounded UP to a multiple of 128, so the final tile is ragged
+and the realized tile count can be lower than the knob. Measuring an even
+split would time a decomposition the real head never performs.
 
 Methodology is deliberately copied from `bench_gemm.mojo` -- same
 `linalg.matmul[transpose_b=True, target="gpu"]` call, same warmup/iters
@@ -16,27 +21,33 @@ timing shape, same `2*M*N*K` FLOP count -- so the numbers here are
 comparable with that harness rather than being a new methodology.
 
 What is modelled faithfully and what is not:
-  * FAITHFUL: the output block is allocated ONCE at `[M, V_p/tiles]` and
-    reused across tiles. That is the whole point of tiling, and it is why
-    the tiled arm's logits residency falls as 1/tiles.
+  * FAITHFUL: the tile widths are the shipped head's own, ragged final tile
+    included; and the output block is allocated ONCE at `[M, width]` and
+    reused across tiles, which is why logits residency falls with the tile
+    count.
   * NOT MODELLED: the softmax/cross-entropy consumption of each block, and
-    the backward pass. This measures the projection GEMM only.
+    THE BACKWARD PASS. The shipped head tiles backward too
+    (`matmul_lm_head_bwd_tile` handles d_weight and d_input per tile, with
+    d_input accumulating across tiles), so a forward-only sweep
+    UNDERSTATES the true cost of tiling. Any figure built on this must say
+    so on its face.
 
 This is a SYNTHETIC decomposition benchmark. It does not exercise, and
 cannot vouch for, any particular vocab-tiled LM-head implementation in the
-tree. It does check its own decomposition numerically (`--check` arm below,
+tree. It does check its own decomposition numerically (`check_tiles` below,
 tiled vs untiled at a small M) so that the thing being timed is at least
 known to compute the same product.
 
 Run under the shared GPU lock, pinned to one GPU:
-  CUDA_VISIBLE_DEVICES=<uuid> lockf -t 3600 /tmp/llmm-gpu.lock \
-      pixi run -e cuda mojo run -I . bench_gemm_vocab_tiles.mojo
+  CUDA_VISIBLE_DEVICES=<uuid> flock -w 3600 /tmp/llmm-gpu.lock -c \
+      'pixi run -e cuda mojo run -I . bench_gemm_vocab_tiles.mojo'
+  (flock, not lockf -- this box is Linux.)
 
 Output is machine-readable lines prefixed `RESULT ` / `CHECK ` for
 `scripts/benchmark_vocab_tiles.py` to collect into JSON.
 """
 
-from std.math import sqrt
+from std.math import ceildiv, sqrt
 from std.time import global_perf_counter_ns
 from layout import TileTensor
 from layout.tile_layout import row_major
@@ -49,6 +60,24 @@ from llmm.memory import MutKernelPtr, ImmutKernelPtr
 # GPT-2 124M LM-head shape constants.
 comptime C_MODEL = 768  # embedding width (the GEMM's K)
 comptime V_P = 50304  # padded vocab (the GEMM's full N)
+
+
+fn lm_head_tile_rows(k: Int) -> Int:
+    """Tile width for tile-count knob `k`, matching the shipped LM head.
+
+    This mirrors `_lm_head_tile_rows` exactly. It is NOT an even division of
+    V_p: the width is rounded UP to a multiple of 128, so the last tile is
+    ragged and the REALIZED tile count can be lower than `k`. Measuring an
+    even split instead would time a decomposition the real head never
+    performs -- a ragged final tile is a differently-shaped GEMM and an
+    aligned width may select a different kernel.
+    """
+    if k <= 1:
+        return V_P
+    var t = ceildiv(V_P, k)
+    comptime if V_P >= 128:
+        t = ceildiv(t, 128) * 128
+    return min(max(t, 1), V_P)
 
 
 def linalg_gemm[
@@ -94,7 +123,8 @@ def run_tiles(
     """Time the full LM-head projection split into `tiles` column blocks."""
     comptime K = C_MODEL
     comptime N = V_P
-    var tile_n = N // tiles
+    var tile_n = lm_head_tile_rows(tiles)
+    var ntiles = ceildiv(N, tile_n)
 
     # ---- host operands (fp32 source, cast to bf16 on device) ----
     var a_host = ctx.enqueue_create_host_buffer[DType.float32](M * K)
@@ -138,17 +168,21 @@ def run_tiles(
     )
 
     for _ in range(warmup):
-        for t in range(tiles):
+        for t in range(ntiles):
+            var start = t * tile_n
+            var this_n = min(tile_n, N - start)
             linalg_gemm[DType.bfloat16](
-                c_p, a_p, b_p + (t * tile_n * K), M, tile_n, K, ctx
+                c_p, a_p, b_p + (start * K), M, this_n, K, ctx
             )
     ctx.synchronize()
 
     var t0 = global_perf_counter_ns()
     for _ in range(iters):
-        for t in range(tiles):
+        for t in range(ntiles):
+            var start = t * tile_n
+            var this_n = min(tile_n, N - start)
             linalg_gemm[DType.bfloat16](
-                c_p, a_p, b_p + (t * tile_n * K), M, tile_n, K, ctx
+                c_p, a_p, b_p + (start * K), M, this_n, K, ctx
             )
     ctx.synchronize()
     var ms = Float64(global_perf_counter_ns() - t0) / 1e6 / Float64(iters)
@@ -169,6 +203,8 @@ def run_tiles(
         N,
         " tiles=",
         tiles,
+        " realized_tiles=",
+        ntiles,
         " tile_n=",
         tile_n,
         " ms=",
@@ -192,7 +228,8 @@ def check_tiles(M: Int, tiles: Int, ctx: DeviceContext) raises -> None:
     """
     comptime K = C_MODEL
     comptime N = V_P
-    var tile_n = N // tiles
+    var tile_n = lm_head_tile_rows(tiles)
+    var ntiles = ceildiv(N, tile_n)
 
     var a_host = ctx.enqueue_create_host_buffer[DType.float32](M * K)
     var b_host = ctx.enqueue_create_host_buffer[DType.float32](N * K)
@@ -249,16 +286,18 @@ def check_tiles(M: Int, tiles: Int, ctx: DeviceContext) raises -> None:
     var max_rel = Float32(0)
     var ref_mag = Float32(0)
 
-    for t in range(tiles):
+    for t in range(ntiles):
+        var start = t * tile_n
+        var this_n = min(tile_n, N - start)
         linalg_gemm[DType.bfloat16](
-            c_tile_p, a_p, b_p + (t * tile_n * K), M, tile_n, K, ctx
+            c_tile_p, a_p, b_p + (start * K), M, this_n, K, ctx
         )
         ctx.synchronize()
         c_tile.enqueue_copy_to(tile_host)
         ctx.synchronize()
         for r in range(M):
-            for j in range(tile_n):
-                var want = full_host.unsafe_ptr()[r * N + t * tile_n + j].cast[
+            for j in range(this_n):
+                var want = full_host.unsafe_ptr()[r * N + start + j].cast[
                     DType.float32
                 ]()
                 var got = tile_host.unsafe_ptr()[r * tile_n + j].cast[
@@ -278,6 +317,8 @@ def check_tiles(M: Int, tiles: Int, ctx: DeviceContext) raises -> None:
         N,
         " tiles=",
         tiles,
+        " realized_tiles=",
+        ntiles,
         " tile_n=",
         tile_n,
         " max_abs=",

@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-27
 **Branch:** `zero/figures`
-**Machine:** workstation-max, 8× NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition
+**Machine:** workstation-max — NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition (8 installed, **7 usable**; physical index 1 is faulted hardware that still enumerates). Measurements were taken at world size 2 on two healthy GPUs pinned by UUID, because CUDA renumbers around a faulted card and an ordinal can silently land on different hardware.
 **Method:** rendering only — both published figures draw on data already committed to the tree. Neither runs a GPU.
 
 This page documents the campaign's figure set. It is written for a reader who
@@ -128,7 +128,11 @@ the LLM combined" [CCE].
   proven and the figure does not assert it.
 - **GPU collectives in this tree are verified at world size 2 only**, which is
   exactly the configuration measured here. Extrapolating the stage-2/3 trend to
-  larger world sizes is not covered by that verification.
+  larger world sizes is not covered by that verification — and note that a
+  world-size-8 measurement is **not currently possible on this machine at all**,
+  since only 7 of the 8 installed GPUs work. No claim about how this behaves at
+  larger world size appears anywhere in this campaign's figures, and none should
+  be inferred.
 - The B=4/T=64 values reproduced bit-identically across two runs taken hours
   apart under different box load, which is why differences of tens of MiB are
   quoted without error bars.

@@ -1,6 +1,6 @@
 {
   "figure": "zero_mem_blindness",
-  "rendered": "2026-07-27T03:59:12",
+  "rendered": "2026-07-27T04:09:48",
   "rendered_by": "scripts/figure_zero_blindness.py",
   "provenance": {
     "all_values": "MEASURED - Team M's LLMM_MEM_REPORT baseline plus nvidia-smi sampling. Nothing on this figure is modelled or interpolated.",

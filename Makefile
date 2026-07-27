@@ -165,7 +165,7 @@ $(PIXI_STAMP):
         build-infer build-infer-bf16 build-infer-fp8 data-hellaswag eval eval-cpu benchmark-eval \
         verify-fp8-grads verify-fp8-static-grads calibrate-fp8-scales \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal benchmark-zero \
-        figure-blindness figure-breakeven figures-wte \
+        figure-blindness figure-breakeven figures-wte benchmark-vocab-tiles \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures \
@@ -832,6 +832,21 @@ figure-breakeven:
 	$(PIXI) run python scripts/figure_vocab_breakeven.py
 
 figures-wte: figure-blindness figure-breakeven
+
+# Vocabulary-tiling cost sweep (figure 3). NEEDS A GPU AND A QUIET BOX:
+# the collector refuses to run if `make test`/pytest are live or the load
+# average is above BENCH_TILES_MAX_LOAD, and it records the box conditions
+# before and after so a contended run cannot be published by accident.
+# Pin one healthy GPU by UUID first, e.g.
+#   export CUDA_VISIBLE_DEVICES=GPU-<uuid>
+BENCH_TILES_OUT ?= zero/bench/bench_vocab_tiles.json
+BENCH_TILES_MAX_LOAD ?= 6.0
+
+benchmark-vocab-tiles:
+	$(PIXI) run -e cuda python scripts/benchmark_vocab_tiles.py --run \
+		--output $(BENCH_TILES_OUT) --max-load $(BENCH_TILES_MAX_LOAD)
+	$(PIXI) run python scripts/benchmark_vocab_tiles.py \
+		--plot $(BENCH_TILES_OUT)
 
 # Apple Silicon Metal GPU benchmark: llm.mojo vs PyTorch MPS vs MLX, fp32+bf16.
 # 6 arms in one graph, mirroring how benchmark-gpu combines fp32+bf16 for NVIDIA.
