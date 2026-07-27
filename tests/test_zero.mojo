@@ -1,5 +1,5 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer, memcpy, alloc
+from std.memory import UnsafePointer, alloc
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu.host.info import is_cpu
 from std.sys.info import size_of

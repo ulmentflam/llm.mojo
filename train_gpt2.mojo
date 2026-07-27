@@ -20,7 +20,7 @@ from std.gpu.host import (
     DeviceAttribute,
 )
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.memory import alloc, UnsafePointer, memcpy, memset_zero
+from std.memory import alloc, UnsafePointer, unsafe_memcpy, memset_zero
 
 from llmm.io import read_and_copy
 from llmm.lowp import (
@@ -2508,10 +2508,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     " the previous allocations"
                 )
 
-        memcpy(dest=self.inputs, src=inputs, count=batch_size * seq_len)
+        unsafe_memcpy(dest=self.inputs, src=inputs, count=batch_size * seq_len)
 
         if targets != NULL_INT32_PTR:
-            memcpy(dest=self.targets, src=targets, count=batch_size * seq_len)
+            unsafe_memcpy(
+                dest=self.targets, src=targets, count=batch_size * seq_len
+            )
 
         # On GPU, upload the token/target indices into device-resident buffers.
         # A HostBuffer pointer read from inside a Metal kernel silently yields

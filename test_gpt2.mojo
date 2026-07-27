@@ -3,7 +3,7 @@ from std.time import perf_counter_ns
 from std.sys import exit, argv, has_accelerator
 from std.os import getenv
 from std.sys.info import size_of
-from std.memory import alloc, UnsafePointer, memcpy
+from std.memory import alloc, UnsafePointer
 from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from std.math import sqrt

@@ -9,7 +9,7 @@ from layout.tile_layout import row_major
 from std.algorithm import sync_parallelize
 from std.gpu import block_dim, block_idx, thread_idx
 from layout import TileTensor, TensorLayout
-from std.memory import UnsafePointer, memcpy, alloc
+from std.memory import UnsafePointer, alloc
 from std.gpu.host.info import is_cpu, is_gpu
 from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.sys import has_nvidia_gpu_accelerator
