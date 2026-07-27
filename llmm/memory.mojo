@@ -13,7 +13,7 @@ comptime MutMemPtr[dtype: DType] = UnsafePointer[
     Scalar[dtype], MutUntrackedOrigin
 ]
 comptime ImmutMemPtr[dtype: DType] = UnsafePointer[
-    Scalar[dtype], ImmutUntrackedOrigin
+    Scalar[dtype], ImmUntrackedOrigin
 ]
 
 
