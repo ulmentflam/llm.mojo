@@ -99,9 +99,12 @@ the logits tensor alone is 1,572 MiB. The ~150 MiB this campaign removes is
 **0.8%** of that. Both things are true at once, and the figure is built to let
 a reader hold both.
 
-That the logits term dominates is not a local quirk. Liger reports that "a 256k
-vocabulary size will result in a 16.8 GB logit tensor of bfloat16, causing a
-huge spike in the peak memory usage" [Liger, §3.2], and CCE frames
+That the logits term dominates is not a local quirk. Liger reports that, at a
+batch of 8 and sequence length 4096, "the 256k vocabulary size will result in a
+16.8GB logit tensor of precision bfloat16, causing a huge spike in the peak
+memory usage" [Liger, §3.2 — [ar5iv full
+text](https://ar5iv.labs.arxiv.org/html/2410.10989); the sentence is not on the
+abstract page], and CCE frames
 cross-entropy as consuming "an order of magnitude more memory than the rest of
 the LLM combined" [CCE].
 

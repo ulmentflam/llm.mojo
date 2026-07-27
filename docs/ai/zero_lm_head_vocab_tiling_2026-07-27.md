@@ -361,8 +361,10 @@ text is at <https://ar5iv.labs.arxiv.org/html/1909.08053>.)
 is mechanically the closest published analogue. Its §3.2 FusedLinearCrossEntropy
 chunks the hidden states, projects each chunk, and computes a partial loss per
 chunk so the full logits tensor is never materialized — motivated by memory:
-*"a 256k vocabulary size will result in a 16.8 GB logit tensor of bfloat16,
-causing a huge spike in the peak memory usage."*
+at a batch of 8 and sequence length 4096, *"the 256k vocabulary size will result
+in a 16.8GB logit tensor of precision bfloat16, causing a huge spike in the peak
+memory usage."* (The quote is in the [ar5iv full
+text](https://ar5iv.labs.arxiv.org/html/2410.10989), not the abstract page.)
 
 **Cut Your Losses** (Wijmans et al., 2024, [arXiv:2411.09009](https://arxiv.org/abs/2411.09009))
 frames the same cost — *"cross-entropy... consumes an order of magnitude more
