@@ -38,20 +38,57 @@ struct SpinLock:
 
 
 struct CpuBarrier:
+    """N-thread rendezvous with an abort path.
+
+    THE ABORT FLAG IS NOT OPTIONAL BOOKKEEPING. Without it, one rank failing
+    converts into every other rank hanging forever, which is strictly worse
+    than the original error: the failure that started it is a printed line
+    nobody is reading, and what you observe is a wedged process with idle
+    devices and one spinning core. That is exactly how it presented -- a
+    multi-GPU test appeared to "take 45 minutes" when in fact one rank had
+    raised in its first seconds and its peers were spinning on `wait()` until
+    the harness timeout killed them.
+
+    Any rank that is about to stop participating MUST call `abort()` (see
+    `CpuCoordinator.abort`). Every waiter then raises instead of spinning, so
+    an N-rank failure surfaces as N errors and a non-zero exit rather than
+    silence.
+    """
+
     var counter: Int
     var generation: Atomic[DType.int32]
     var num_threads: Int
     var lock: SpinLock
+    # Sticky: once set it is never cleared. A barrier whose cohort has lost a
+    # member cannot become usable again -- the missing arrival is missing for
+    # every future generation too.
+    var aborted: Atomic[DType.int32]
 
     def __init__(out self, num_threads: Int):
         self.counter = 0
         self.generation = Atomic[DType.int32](0)
         self.num_threads = num_threads
         self.lock = SpinLock()
+        self.aborted = Atomic[DType.int32](0)
 
-    def wait(mut self) -> None:
+    def abort(mut self) -> None:
+        """Release every current and future waiter with an error."""
+        self.aborted.store(1)
+
+    def wait(mut self) raises -> None:
         if self.num_threads <= 1:
             return
+
+        # Checked before arriving as well as inside the spin: a rank that
+        # aborts before its peer even reaches the barrier must still stop that
+        # peer, otherwise the peer arrives, waits, and spins on a cohort that
+        # is already one short.
+        if self.aborted.load() != 0:
+            raise Error(
+                "CpuBarrier: a peer rank aborted before this barrier"
+                " completed. The originating failure was reported by that"
+                " rank; this error only means it never arrived."
+            )
 
         self.lock.lock()
         var gen = self.generation.load()
@@ -63,6 +100,12 @@ struct CpuBarrier:
         else:
             self.lock.unlock()
             while self.generation.load() == gen:
+                if self.aborted.load() != 0:
+                    raise Error(
+                        "CpuBarrier: a peer rank aborted while this rank was"
+                        " waiting. The originating failure was reported by"
+                        " that rank; this error only means it never arrived."
+                    )
                 _ = external_call["sched_yield", Int32]()
 
 
@@ -100,6 +143,19 @@ struct CpuCoordinator:
             num_threads
         )
         self.shared_scalars = alloc[Float64](num_threads)
+
+    def abort(self) -> None:
+        """Stop every rank waiting on this coordinator, with an error.
+
+        Call this from a rank that is about to stop participating -- the
+        `except` arm of a per-rank worker, most importantly. A rank that
+        prints its failure and returns leaves its peers rendezvousing with a
+        cohort that is permanently one short, so they spin until something
+        external kills them. Both barriers are aborted because a rank can be
+        lost between them.
+        """
+        self.barrier1[].abort()
+        self.barrier2[].abort()
 
     def free(self) -> None:
         self.barrier1.free()
@@ -143,7 +199,7 @@ def _allreduce_cpu[
     world_size: Int,
     size: Int,
     coord_ptr: UnsafePointer[CpuCoordinator, MutUntrackedOrigin],
-):
+) raises:
     var sharded = size // world_size
     var output_shard = rebind[UnsafePointer[Scalar[dtype], MutUntrackedOrigin]](
         coord_ptr[].shared_outputs[rank]

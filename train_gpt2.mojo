@@ -6673,6 +6673,12 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
                     )
                 except e:
                     print("Rank", rank, "failed:", e)
+                    # Release the peers. Without this they rendezvous with a
+                    # cohort permanently one short and spin forever: the run
+                    # wedges with idle devices instead of exiting, and the
+                    # failure above is the only trace, in a log nobody is
+                    # tailing. See CpuBarrier's docstring.
+                    cpu_coord_ptr[].abort()
 
             fp8_mutex_preseed()
             sync_parallelize[_run_rank](world_size)
@@ -6727,6 +6733,9 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
                     _dispatch_world_size["gpu"](args, r, world_size, coord_ptr)
                 except e:
                     print("Rank", r, "failed:", e)
+                    # See the CPU path above: a rank that leaves without
+                    # aborting hangs every peer on the next barrier.
+                    coord_ptr[].abort()
 
             fp8_mutex_preseed()
             sync_parallelize[_run_rank](world_size)

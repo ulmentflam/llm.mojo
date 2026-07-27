@@ -16,7 +16,7 @@ from llmm.zero import (
 )
 
 
-from std.testing import TestSuite, assert_almost_equal
+from std.testing import TestSuite, assert_almost_equal, assert_equal
 
 
 # ===----------------------------------------------------------------------=== #
@@ -240,6 +240,69 @@ def test_sharded_parameter_gather_gpu() raises:
 # ===----------------------------------------------------------------------=== #
 # Multi-rank CPU tests using sync_parallelize
 # ===----------------------------------------------------------------------=== #
+
+
+def test_rank_failure_aborts_peers_instead_of_hanging() raises:
+    """A rank that leaves must break its peers out, not strand them forever.
+
+    THIS IS A LIVENESS TEST, and it is the only one in the suite. Every other
+    test here asserts a value; this one asserts that the process reaches the
+    assertion at all. It exists because the failure it guards has no output:
+    `CpuBarrier.wait` used to spin on `sched_yield` with no exit condition
+    besides the arrival it was waiting for, so one rank raising turned into
+    every peer spinning until something external killed the process. The
+    originating error was a printed line nobody was reading; what you actually
+    observed was a wedged job with idle devices and one hot core.
+
+    That shape was live in production, not just in tests: both per-rank
+    handlers in train_gpt2.mojo (the CPU and GPU multi-rank dispatch) caught
+    the exception, printed "Rank N failed", and returned -- leaving the other
+    six ranks of a 7-rank run rendezvousing with a cohort permanently one
+    short.
+
+    Rank 0 here fails deliberately and aborts. Ranks 1-3 must each raise out
+    of `wait()` rather than spin. If this test regresses it does not fail --
+    it hangs, and `make test-mojo` reports it as a per-file timeout.
+
+    VALIDATED BOTH WAYS. With the fix: PASS in 0.241s. With both abort checks
+    in `CpuBarrier.wait` neutered to `if False:` -- the flag still set, just
+    ignored, i.e. the exact pre-fix behaviour -- the rebuilt binary never
+    returns and had to be killed at a 120s cap. That is the whole point of
+    the test: the regression it guards is not a wrong answer, it is no
+    answer.
+    """
+    comptime WORLD_SIZE = 4
+    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
+
+    # Per rank: 1 == returned normally, 2 == raised out of the barrier.
+    var outcome = alloc[Int](WORLD_SIZE)
+    for r in range(WORLD_SIZE):
+        outcome[r] = 0
+
+    @parameter
+    def _run_rank(rank: Int):
+        if rank == 0:
+            # Stand-in for any real per-rank failure: a GPU context that will
+            # not initialise, a kernel that fails to compile, an OOM.
+            cpu_coord_ptr[].abort()
+            outcome[0] = 1
+            return
+        try:
+            cpu_coord_ptr[].barrier1[].wait()
+            outcome[rank] = 1
+        except:
+            outcome[rank] = 2
+
+    sync_parallelize[_run_rank](WORLD_SIZE)
+
+    assert_equal(outcome[0], 1)
+    for r in range(1, WORLD_SIZE):
+        assert_equal(outcome[r], 2)
+
+    cpu_coord_ptr[].free()
+    cpu_coord_ptr.free()
+    outcome.free()
 
 
 def test_multi_cpu_allreduce() raises:
@@ -963,6 +1026,10 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
                 ag_out[rank * size + j] = host[j]
         except e:
             print("multi-gpu rank", rank, "error:", e)
+            # Without this the surviving ranks spin on the next barrier until
+            # the harness timeout kills them, and the real failure -- printed
+            # above, seconds in -- reads as "this test takes 45 minutes".
+            cpu_coord_ptr[].abort()
 
     sync_parallelize[_run_rank](WORLD_SIZE)
 
