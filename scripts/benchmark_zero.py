@@ -94,7 +94,7 @@ def _parse_mem_report(stdout):
     for recs in phases.values():
         recs.sort(key=lambda r: r.get("rank", 0))
 
-    out = {
+    out: "dict[str, object]" = {
         "phases": phases,
         "num_records": len(records),
         "parse_errors": parse_errors,
@@ -128,6 +128,16 @@ def _parse_mem_report(stdout):
         out["driver_used_mib_max"] = max(
             _mib(r.get("driver_used_bytes", 0)) for r in steady
         )
+        # Buffers this configuration does not allocate at all (left at their
+        # 1-element placeholder size), as distinct from ones that are merely
+        # small. Union across ranks, sorted. A name appearing here in an "after"
+        # run but not the "before" means the buffer was eliminated outright —
+        # a qualitatively different result from a shrunk byte count, and one a
+        # size-only diff would render as a meaningless ~4-byte delta.
+        inactive: "set[str]" = set()
+        for r in steady:
+            inactive.update(str(n) for n in r.get("inactive_buffers", []))
+        out["inactive_buffers"] = sorted(inactive)
 
     post = phases.get("post_alloc", [])
     if post:

@@ -1059,6 +1059,38 @@ def _mem_kv(name: StaticString, value: Int) -> String:
     return '"' + String(name) + '":' + String(value)
 
 
+@always_inline
+def _mem_mark[
+    dt: DType
+](mut names: List[String], b: DeviceBuffer[dt], name: StaticString):
+    """Record `name` when `b` is a placeholder rather than a live buffer.
+
+    Every buffer field on `GPT2` is always constructed, so a configuration that
+    does not use one leaves it at the struct's 1-element placeholder size (the
+    codebase's own convention — see the `master_buf` and `grad_pool_buf` field
+    comments). Byte counts alone therefore cannot distinguish "this buffer was
+    eliminated" from "this buffer is genuinely tiny": both read as a handful of
+    bytes. That distinction is not cosmetic. A change that stops allocating a
+    buffer at all is a different result from one that shrinks it, and the report
+    should be able to say so without the reader inferring it from a suspicious
+    4-byte entry.
+    """
+    if len(b) <= 1:
+        names.append(String(name))
+
+
+@always_inline
+def _mem_str_array(names: List[String]) -> String:
+    """A `List[String]` as a JSON array literal."""
+    var s = String("[")
+    for i in range(len(names)):
+        if i > 0:
+            s += ","
+        s += '"' + names[i] + '"'
+    s += "]"
+    return s
+
+
 # `recompute` enables activation (gradient) checkpointing: when True, the
 # per-layer MLP activations fch (pre-GELU) and fch_gelu (post-GELU) are not
 # persisted across the forward/backward boundary. They collapse to a single
@@ -4875,7 +4907,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         expressions that produced them, so this stays honest when a buffer is
         resized elsewhere. Buffers that a given configuration does not use are
         1-element placeholders and show up as a handful of bytes rather than
-        zero; that is real and is reported as-is.
+        zero; that is real and is reported as-is — and `inactive_buffers` names
+        them, so a structural elimination ("this buffer is gone") reads
+        differently from a size change ("this buffer got smaller"). That
+        distinction is what lets an approach which stops allocating a buffer
+        entirely be scored against one that merely shrinks it.
 
         Not counted: host buffers (they are not device memory), transient
         per-step allocations made and dropped inside kernels' call sites, and
@@ -4935,7 +4971,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             driver_total = Int(info[1])
             driver_used = driver_total - Int(info[0])
 
-        var s = String('{"schema":1')
+        var s = String('{"schema":2')
         s += ',"phase":"' + phase + '"'
         s += "," + _mem_kv("rank", self.zero_ctx.rank)
         s += "," + _mem_kv("world_size", Self.WORLD_SIZE)
@@ -4984,6 +5020,32 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         s += "," + _mem_kv("grad_norm_out_buf", b_grad_norm)
         s += "," + _mem_kv("comm_scratch_total", b_comm)
         s += "}"
+
+        # Buffers that this configuration does not allocate at all, as opposed
+        # to allocating small. See `_mem_mark`. A diff that moves a name INTO
+        # this list is reporting a structural elimination, not a size change.
+        var inactive = List[String]()
+        _mem_mark(inactive, self.params_buf, "params_buf")
+        _mem_mark(inactive, self.grads_buf, "grads_buf")
+        _mem_mark(inactive, self.grad_pool_buf, "grad_pool_buf")
+        _mem_mark(inactive, self.grad_shard_buf, "grad_shard_buf")
+        _mem_mark(inactive, self.m_buf, "m_buf")
+        _mem_mark(inactive, self.v_buf, "v_buf")
+        _mem_mark(inactive, self.master_buf, "master_buf")
+        _mem_mark(inactive, self.param_window_buf, "param_window_buf")
+        _mem_mark(inactive, self.embed_window_buf, "embed_window_buf")
+        _mem_mark(inactive, self.acts_buf, "acts_buf")
+        _mem_mark(inactive, self.acts_stats_buf, "acts_stats_buf")
+        _mem_mark(inactive, self.grad_acts_buf, "grad_acts_buf")
+        _mem_mark(inactive, self.grad_acts_stats_buf, "grad_acts_stats_buf")
+        _mem_mark(inactive, self.inputs_dev_buf, "inputs_dev_buf")
+        _mem_mark(inactive, self.targets_dev_buf, "targets_dev_buf")
+        _mem_mark(inactive, self.bucket_info_dev_buf, "bucket_info_dev_buf")
+        _mem_mark(
+            inactive, self.workload_indices_dev_buf, "workload_indices_dev_buf"
+        )
+        _mem_mark(inactive, self.grad_norm_out_buf, "grad_norm_out_buf")
+        s += ',"inactive_buffers":' + _mem_str_array(inactive)
 
         s += "," + _mem_kv("exact_total_bytes", total)
         s += "," + _mem_kv("driver_used_bytes", driver_used)
