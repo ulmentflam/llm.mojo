@@ -72,7 +72,9 @@ def main() -> int:
     if not vals:
         raise SystemExit(f"no val loss lines in {args.run_dir}/train.log")
 
-    m = re.match(r"(\d+)/(\d+) = ([0-9.]+)", args.eval.strip())
+    # Spaces around "/" and "=" are optional: `make eval` emits
+    # "3010 / 10042 = 0.2997411", not the compact form.
+    m = re.match(r"(\d+)\s*/\s*(\d+)\s*=\s*([0-9.]+)", args.eval.strip())
     if not m:
         raise SystemExit(f"could not parse --eval {args.eval!r}")
     k, n = int(m.group(1)), int(m.group(2))
