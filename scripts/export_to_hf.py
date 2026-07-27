@@ -45,6 +45,72 @@ LLM_C_MAGIC = 20240326
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPORT_HF_PY = REPO_ROOT / "third_party" / "llm.c" / "dev" / "eval" / "export_hf.py"
 
+# The four bias tensors produced by `matmul_bias_bwd`, in HF naming. These are
+# checked for non-zeroness on export because a scratch overrun in that kernel
+# once shipped six published checkpoints whose `c_attn`/`c_fc` biases were
+# bit-exactly zero -- never updated by a single optimizer step -- and nothing
+# between the trainer and the Hub noticed
+# (docs/ai/dbias_scratch_overrun_silent_zero_bug.md). GPT-2 initialises biases
+# to exactly 0, so "still zero after training" is decisive rather than
+# suggestive, and upload is the last point at which it is cheap to catch.
+MATMUL_BIAS_SUFFIXES = (
+    "attn.c_attn.bias",
+    "attn.c_proj.bias",
+    "mlp.c_fc.bias",
+    "mlp.c_proj.bias",
+)
+
+
+def verify_export(output: Path) -> bool:
+    """Check an export is loadable, finite, and not silently missing gradients.
+
+    Deliberately CPU-only and dependency-light: it must be runnable while the
+    GPUs are busy training, which is exactly when exports happen.
+    """
+    from safetensors import safe_open
+
+    path = output / "model.safetensors"
+    if not path.is_file():
+        print(f"[verify] FAIL: {path} does not exist")
+        return False
+
+    ok = True
+    with safe_open(path, framework="pt") as f:
+        keys = list(f.keys())
+        nonfinite = []
+        dead = []
+        for k in keys:
+            t = f.get_tensor(k).float()
+            if not t.isfinite().all():
+                nonfinite.append(k)
+            if k.endswith(MATMUL_BIAS_SUFFIXES) and not t.any():
+                dead.append(k)
+
+    print(f"[verify] {len(keys)} tensors in {path}")
+
+    if nonfinite:
+        print(f"[verify] FAIL: {len(nonfinite)} tensor(s) contain NaN/Inf:")
+        for k in nonfinite[:8]:
+            print(f"           {k}")
+        ok = False
+
+    if dead:
+        print(
+            f"[verify] FAIL: {len(dead)} matmul bias tensor(s) are entirely zero,"
+            " i.e. never received a gradient:"
+        )
+        for k in dead[:8]:
+            print(f"           {k}")
+        print(
+            "         See docs/ai/dbias_scratch_overrun_silent_zero_bug.md."
+            " Do NOT publish this checkpoint."
+        )
+        ok = False
+
+    if ok:
+        print("[verify] OK: all tensors finite, all matmul biases trained")
+    return ok
+
 
 def make_llmc_compatible_copy(src: Path, dst: Path) -> None:
     """Copy `src` to `dst`, then patch only the first int32 (the magic
@@ -83,6 +149,19 @@ def main() -> int:
         choices=["bfloat16", "float32"],
         help="dtype to export weights as (passed through to export_hf.py)",
     )
+    parser.add_argument(
+        "--spin",
+        action="store_true",
+        help="run upstream's post-export generation smoke test (needs a free "
+        "CUDA device, accelerate, and flash-attention; off by default)",
+    )
+    parser.add_argument(
+        "--no-verify",
+        dest="verify",
+        action="store_false",
+        help="skip the CPU-side check that the export is finite and its matmul "
+        "biases actually trained",
+    )
     args = parser.parse_args()
 
     if not args.input.is_file():
@@ -106,10 +185,23 @@ def main() -> int:
             str(args.output),
             "--dtype",
             args.dtype,
+            # `spin` is upstream's post-export generation smoke test. It is off
+            # by default here because it needs a free CUDA device, `accelerate`,
+            # and a flash-attention build -- none of which hold while the box is
+            # training, and its absence used to surface as a traceback AFTER a
+            # perfectly good export had already been written. argparse declares
+            # it `type=bool`, so any non-empty string is True and "" is False.
+            "--spin",
+            "1" if args.spin else "",
         ]
         print(f"[export_to_hf] running: {' '.join(cmd)}")
         result = subprocess.run(cmd)
-        return result.returncode
+        if result.returncode != 0:
+            return result.returncode
+
+    if args.verify:
+        return 0 if verify_export(args.output) else 1
+    return 0
 
 
 if __name__ == "__main__":
