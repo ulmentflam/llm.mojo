@@ -146,6 +146,8 @@ Each stage buys additional per-GPU memory. Stage 1's optimizer-state sharding sa
 
 **Read that in proportion.** At production shape the tensors that actually dominate a GPU are `att_probs` (~18 GiB, growing as T²) and `logits` (~6.1 GiB) — 123× and 42× the floor this work removed, and untouched by it. Removing 150 MiB is 0.7% of the footprint there, where activations are 88% of everything on the card. The floor was real and blocked stages 2/3 from doing what they exist to do, but the memory problem is not solved. Full accounting, including the measurement instrument this needed (`nvidia-smi` cannot resolve a 150 MiB change — the allocator commits in 256 MiB chunks) is in [`docs/ai/zero_wte_deresidency_campaign_2026-07-27.md`](docs/ai/zero_wte_deresidency_campaign_2026-07-27.md).
 
+**The logits half of that is now addressable too.** `-D LLMM_LM_HEAD_CHUNKED_CE=1` (default off) replaces the classifier with a two-pass online-softmax cross-entropy that never materializes the full `(B·T, V_p)` tensor: pass 1 folds each vocab tile into a running per-row max and sum-exp, pass 2 recomputes each tile and turns it into that tile's `dlogits` in place. At B=32, T=1024 that takes logits from **6288 MiB to 800 MiB** (196.5 MiB at 64 tiles) for **+6.1%** step time — 5.36 GiB per 26.4 ms. It is opt-in precisely because that is a good trade only when memory is what limits your batch size; both configurations are measured so the exchange rate is visible rather than just the saving. The technique is Liger Kernel's ([arXiv:2410.10989](https://arxiv.org/abs/2410.10989) §3.2), not ours.
+
 !['ZeRO memory: exact accounting vs nvidia-smi'](figures/zero_mem_blindness_w2_b4_t64_2026-07-27_0340_NVIDIA-RTX-PRO-6000-Blackwell_workstation-max.png)
 
 A Megatron-style vocab-*parallel* LM head was evaluated as the alternative and rejected on measured grounds: it wins only below `W/(C+3)` ≈ 51,130 global tokens per micro-step, and we train at 229,376 — a 4.5× communication regression. The world size cancels out of that ratio entirely, so no rank count fixes it. See [`docs/ai/vocab_parallel_lm_head_feasibility_2026-07-27.md`](docs/ai/vocab_parallel_lm_head_feasibility_2026-07-27.md).
@@ -265,8 +267,9 @@ make verify
 ## Development Roadmap
 Future development includes:
 
-1. Activation memory, which now dominates by a wide margin at production shape: chunk the cross-entropy so the `(B·T, V_p)` logits tensor (~6.1 GiB at B=32, T=1024) is never materialized, and re-measure the `att_probs` store-vs-recompute tradeoff (~18 GiB, growing as T²) on CUDA — its own code comment names the trigger condition, and this box now meets it, but the +3.5% cost figure behind the current default was measured on Metal at an 8× smaller batch
-2. Mamba1/Mamba2/Mamba3 architecture and MoE
+1. `att_probs`, now the largest tensor on the card by a wide margin (~18 GiB at B=32, T=1024, growing as T² — **24×** the logits tensor once cross-entropy is chunked). Its own code comment names the trigger condition for switching the store to the per-layer QKᵀ-recompute path already implemented behind `kv_cache.att_probs_addr = 0`, and this box now meets it — but the +3.5% cost figure behind the current default was measured on Metal at an 8× smaller batch, so it needs re-measuring on CUDA at production shape before flipping
+2. Drop the chunked cross-entropy's remaining 196.5 MiB floor, which exists only because generation reads `acts.logits + row·V_p` when it wants a single row; removing it also decouples the saving from `max_seq_len`
+3. Mamba1/Mamba2/Mamba3 architecture and MoE
 
 ## Motivation
 
