@@ -1,9 +1,9 @@
 # De-residenting the tied `wte` embedding: campaign synthesis
 
-*2026-07-27. Six workstreams, README roadmap item 1. This is the overview; §10
-maps every workstream to its own document, and this one links to them rather
-than repeating them. (The row-sparse encoder work of §5 is the one that has no
-standalone write-up, so it is covered here in more detail than the rest.)*
+*2026-07-27. Six workstreams, README roadmap item 1, all six merged as of
+`a78f546`. This is the overview; §10 maps every workstream to its own document
+and records what is and is not verified, and this one links to them rather than
+repeating them.*
 
 The roadmap item reads:
 
@@ -17,9 +17,10 @@ use. It assumes you have read none of the other documents.
 **The short version.** One tensor — GPT-2's token embedding table — was pinning
 two ~150 MiB buffers that no amount of extra GPUs could shrink, because the
 tensor is used twice, in two incompatible ways, and the two uses needed
-different fixes. Both fixes shipped, and the two floors fall to roughly a sixth
-and a seventh of their previous size — though half of that is still behind a
-default-off flag (§10), which this document flags rather than rounds away. A
+different fixes. Both shipped, and the two floors fall to roughly a sixth and a
+seventh of their previous size — with three caveats that §10 states plainly
+rather than rounding away, the largest being that the end-to-end comparison of
+the sparse encoder path against the dense one is written but not yet gated. A
 third approach, the obvious one from the literature, was modelled carefully and
 rejected. And another workstream built the measuring instrument that made any of
 the above provable, because the instrument we started with could not see a
@@ -422,7 +423,7 @@ trusted.
 
 ## 5. The sparse side: a row-sparse encoder gradient
 
-*No standalone document — this section is the write-up.*
+→ [`zero_row_sparse_wte_2026-07-27.md`](zero_row_sparse_wte_2026-07-27.md)
 
 An embedding gradient is naturally sparse. Row *v* of `d_wte` receives gradient
 only if token id *v* appears somewhere in the batch. At `B·T = 32768` tokens
@@ -434,9 +435,10 @@ Two things made the obvious version wrong.
 
 ### 1. Cost: the collectives charge per range, not per byte
 
-The range-based collectives issue **one driver-staged copy per range**, and each
-copy costs a flat ~15 µs regardless of how few bytes it moves. So the same bytes
-cost wildly different amounts depending on how they are described:
+The range-based collectives issue **one driver-staged copy per range, per
+peer**, and each copy costs a flat ~15 µs regardless of how few bytes it moves.
+So the same bytes cost wildly different amounts depending on how they are
+described:
 
 | Description of 32768 rows | Cost |
 | --- | --- |
@@ -450,9 +452,23 @@ gather it
 was replacing — *a slowdown shipped as an optimization*, and it would have
 passed every correctness test in the repo.
 
-The fix is **coalescing**: merge runs of rows separated by fewer than ~290
-rows into one range, accepting some unwanted bytes in exchange for not paying
-another fixed 15 µs. It is the same trade a disk scheduler makes.
+(A caveat on those four timings, since this document insists elsewhere on
+labelling the basis: they are **measured but unlabelled** — no shape, world size
+or precision was recorded with them. The design conclusion rests on the *ratio*,
+which at 277× is far outside anything box contention could explain, not on the
+absolute milliseconds. Take the absolutes as indicative only.)
+
+The fix is **coalescing**: merge two runs of touched rows into one range
+whenever fewer than **256** untouched rows separate them, accepting some
+unwanted bytes in exchange for not paying another fixed 15 µs. It is the same
+trade a disk scheduler makes.
+
+The 256 is `ENC_MERGE_GAP_ROWS` in `llmm/encoder.mojo`, and it is a rounded
+break-even rather than a tuned knob. The collectives sustain ~60 GB/s once
+ranges are large, so 15 µs of fixed overhead buys roughly 900 KB of transfer —
+about 290 rows of 768 fp32 channels. Two runs closer together than that are
+cheaper fetched as one copy than as two. 256 is that ~290 rounded down to a
+power of two.
 
 The general lesson is worth keeping: when a primitive has a large fixed
 per-invocation cost, the *representation* of a request is a first-class
@@ -483,12 +499,22 @@ from the **union** of all ranks' tokens. Every rank then walks an identical list
 because it is a function of shared input.
 
 And because "documented but unenforced" is how this class of bug survives,
-`assert_ranges_agree` now checks it: hash the local range list, sum the hashes
-across ranks, and verify the total equals N × the local hash. A cheap collective
-that converts a silent corruption into a loud error. (The vocab-tiled LM head is
-safe here for a different reason — its tile boundaries are computed from
-`padded_vocab_size` and a compile-time constant, never from batch content, so
-every rank walks the same sequence by construction.)
+`assert_ranges_agree` now checks it. Each rank hashes its own range list to a
+number `h`; the ranks sum both `h` and `h²`; and the check is
+
+```
+N · Σh²  ==  (Σh)²
+```
+
+which by the equality case of the Cauchy–Schwarz inequality holds exactly when
+every `h` is identical. Both sums are the same on every rank, so **every rank
+reaches the same verdict** — which turns out to be the whole point, and the
+first version of this check got it wrong in a way that would have hung the job
+(§9). A cheap collective that converts a silent corruption into a loud error.
+(The vocab-tiled LM head is safe here for a different reason — its tile
+boundaries are computed from `padded_vocab_size` and a compile-time constant,
+never from batch content, so every rank walks the same sequence by
+construction.)
 
 ### What it bought
 
@@ -496,15 +522,31 @@ The `wte` term in the gradient pool drops from **147 MiB to 24 MiB**. With the
 LM-head bucket already at 18.8 MiB and the per-layer bucket at 27.0 MiB, the
 pool's `max()` is no longer set by the embedding at all.
 
-Taking the two workstreams together, against the exact baselines in §2 — noting
-that the second row needs the encoder work, the tiling work *and* the
-default-off
-flag, and so is the one number here that has not been observed end to end:
+That 24 MiB is not a measured outcome — it is a declared constant, and the
+choice is the design's central point rather than an incidental setting:
 
-| Floor | Before | After | |
-| --- | --- | --- | --- |
-| `grad_pool_buf` | 150.375 MiB | ~27 MiB | −82% |
-| `embed_window_buf` | 150.381 MiB | 21.8 MiB | −85% |
+```
+ENC_ROW_CHUNK_ROWS = 8192          # llmm/encoder.mojo
+8192 rows × 768 channels × 4 B  =  25,165,824 B  =  exactly 24.0 MiB
+```
+
+Backward walks the compact gradient in chunks of a **fixed row count**,
+reduce-scattering each chunk, so the pool is bounded by a constant rather than
+by `B·T`. That is what makes the saving shape-independent, and it is the
+non-obvious part. A `B·T`-derived bound looks tempting and would buy nothing
+where it matters: at `B=32, T=1024` the cross-rank *union* of touched rows
+approaches the whole 50304-row vocabulary, so a bound that scales with tokens
+degenerates to the full table exactly at production shape. Sparsity is real at
+small batches and largely illusory at large ones; chunking by a constant is what
+survives both.
+
+Taking the two workstreams together, against the exact baselines in §2. Both
+halves are on `main`; read the status column before quoting the second row:
+
+| Floor | Before | After | | Status |
+| --- | --- | --- | --- | --- |
+| `grad_pool_buf` | 150.375 MiB | ~27 MiB | −82% | merged |
+| `embed_window_buf` | 150.381 MiB | 21.8 MiB | −85% | merged, but needs `LLMM_Z3_WTE_ONDEMAND=1`, which is off by default and has never been run end to end |
 
 ---
 
@@ -875,6 +917,37 @@ corrected their own headline. A correction that helps the option you are arguing
 against is the one most worth surfacing, and the one least likely to surface by
 accident.
 
+### Verified at N=2, asserted for all N — a guard that would have hung
+
+The range guard of §5 is the campaign's best bug, because the *reasoning* that
+blessed the broken version was carefully done and still wrong.
+
+The first version had each rank compare its own hash against the mean of all
+ranks' hashes. The argument for it was that `allreduce_scalar` gives every rank
+the same total, so on a mismatch every rank sees the same mean, and all raise
+together. That argument was checked against the two-rank case and is airtight
+there: with two disagreeing hashes the mean falls strictly between them, so
+**neither** rank equals it and both raise. It looks correct because at N=2 it
+*is* correct.
+
+At three ranks it fails. Hashes `[4, 5, 6]` have mean 5, so the middle rank
+**passes its own check**, proceeds into the collective, and spins on a barrier
+the other two have already abandoned by raising. The guard against a silent
+corruption would itself have become a hang — and only at N≥3, on a box whose
+default test configuration is two ranks.
+
+The fix is the `N · Σh² == (Σh)²` form in §5: both sides are allreduced sums, so
+the verdict is computed from identical inputs on every rank and cannot be
+per-rank at all. It is not a patch on the comparison; it removes the degree of
+freedom the bug lived in.
+
+The transferable part is the shape of the mistake, which is the same one this
+section keeps finding: **a claim verified under one condition and then asserted
+under all of them.** N=2 was not a sloppy check — it was a real proof of a real
+case. The error was generalising from it without testing whether the property
+that made it work (a two-element mean lies strictly between the elements) is a
+property of means or an accident of pairs. It is an accident of pairs.
+
 ### A named class: unlabelled-basis errors
 
 Worth naming because it recurred three times across two workstreams and is
@@ -945,19 +1018,48 @@ afternoon on a shared machine.
 
 ## 10. State of play, and what to read next
 
-**Landed and verified:** the exact memory instrument; the vocab-tiled LM head
-(default on, +0.60% step time, bit-identical through 64 tiles, verified at four
-tile counts, and — now that `make verify-gpu` can run at all — **16/16 gradient
-tensors matching PyTorch at the shipped `K=8`, `dwte` included**); the
-row-sparse coalesced encoder gradient with cross-rank range
-agreement enforced; the `make smoke` subset (~40 s against ~13 min for the full
-gate); the four false-green repairs.
+**Merged and verified:** all six workstreams are on `main` as of `a78f546` —
+the exact memory instrument; the vocab-tiled LM head (default on, +0.60% step
+time, bit-identical through 64 tiles, verified at four tile counts, and — now
+that `make verify-gpu` can run at all — **16/16 gradient tensors matching
+PyTorch at the shipped `K=8`, `dwte` included**); the row-sparse coalesced
+encoder gradient with cross-rank range agreement enforced; the `make smoke`
+subset (~40 s against ~13 min for the full gate); and the five false greens of
+§9, found and closed.
 
-**Landed but not on by default:** `LLMM_Z3_WTE_ONDEMAND=1`, which realizes the
-ZeRO-3 window reduction. It compiles and the code path exists; it was held off
-by default because removing `wte` from the gather window before the encoder can
-fetch its own rows makes `encoder_fwd` read whatever else is in that buffer —
-producing wrong numbers **silently**, the worst available failure mode.
+The encoder half landed with its test **in the gate glob and green** — 5 tests,
+3.4 s, every one driving **divergent per-rank token batches**, which is the case
+no pre-existing test in the repo could reach. Between them they cover row-map
+dedup and the global→compact index mapping, gap coalescing with its capacity
+bound and its overflow rejection, the cross-rank union arriving at
+byte-identical run lists from different per-rank inputs, and
+`assert_ranges_agree` both rejecting divergent lists and accepting agreeing
+ones.
+
+**Three caveats, all still true.**
+
+1. **The end-to-end sparse-vs-dense comparison is not gated.**
+   `test_row_sparse_matches_dense_with_divergent_tokens` exists in the file but
+   is not called from `main()`. So the pieces it alone would exercise —
+   chunk boundaries, the bucket-cursor walk, the biased `dwte` pointer,
+   `include_wpe` on chunk 0, and the tied-weight interaction — are implemented
+   but **unverified**. The blocker is diagnosed, and it is a property of the
+   test harness rather than a logic error: the test drives ranks with
+   `sync_parallelize` while each rank's `wte_backward_cpu` dispatches its own
+   `traced_parallelize` inside, so the nested work items are never picked up
+   (193 threads, one running, 191 parked in `futex_wait_queue`) and the rank
+   never returns while its sibling spins in `CpuBarrier.wait()`. Reproducing it
+   needs the CPU target, multiple ranks and a live coordinator simultaneously;
+   GPU training never calls `wte_backward_cpu`. Worth stating in those terms:
+   this is the *most* load-bearing test of the encoder change and it is the one
+   not running.
+2. **The ZeRO-3 window win needs `LLMM_Z3_WTE_ONDEMAND=1`**, which remains off
+   by default and has never been run end to end. It was held off because
+   removing `wte` from the gather window before the encoder can fetch its own
+   rows makes `encoder_fwd` read whatever else is in that buffer — producing
+   wrong numbers **silently**, the worst available failure mode.
+3. **The encoder half's step-time delta was never measured.** The LM-head half's
+   +0.60% is measured; the encoder half's cost is simply unknown.
 
 **Not measured:** the non-cuBLASLt GPU staging path (this box selects cuBLASLt);
 the `att_probs` recompute cost on CUDA at production shape (§8); anything about
