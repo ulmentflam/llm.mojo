@@ -127,13 +127,19 @@ change: the large-vocabulary output layer costs far more in transient activation
 than in weights, and it costs more the larger your batch is — precisely when you
 are already short of memory.
 
-This is well known. Liger Kernel (arXiv:2410.10989, §3.2) motivates its fused
-linear-cross-entropy kernel with exactly this arithmetic: "Take the Gemma model
-as an example, single GPU training with a batch size of 8 and sequence length of
-4096 ... the 256k vocabulary size will result in a 16.8GB logit tensor of
-precision bfloat16". Cut Your Losses (arXiv:2411.09009) opens with the same
-observation from the other side — that cross-entropy "consumes an order of
-magnitude more memory than the rest of the LLM combined".
+This is well known. Liger Kernel (arXiv:2410.10989, §3.2
+*FusedLinearCrossEntropy*) motivates its kernel with exactly this arithmetic:
+"Take the Gemma model as an example, single GPU training with a batch size of 8
+and sequence length of 4096 ... the 256k vocabulary size will result in a 16.8GB
+logit tensor of precision bfloat16". Cut Your Losses (arXiv:2411.09009) opens
+with the same observation from the other side — that cross-entropy "consumes an
+order of magnitude more memory than the rest of the LLM combined".
+
+*(The Liger sentence is body text and does **not** appear on the arXiv abstract
+page; read it at <https://ar5iv.labs.arxiv.org/html/2410.10989>. The 16.8 GB
+figure is meaningless without the batch-8 / sequence-4096 / 256k-vocabulary
+shape quoted alongside it, which is why that shape is quoted. The Cut Your
+Losses sentence is in its abstract: <https://arxiv.org/abs/2411.09009>.)*
 
 **Say it plainly: chunked cross-entropy is not novel and this document does not
 claim it is.** It is Liger's technique. What is written here is an
@@ -146,7 +152,10 @@ costs and what it buys on this hardware.
 result per piece, which is what happens below. Cut Your Losses uses a different
 mechanism, computing the log-sum-exp on the fly inside a flash-attention-style
 kernel without ever writing logits to memory at all. Same goal, different
-machine. Cite each for its own.)
+machine. Cite each for its own. A third neighbour, Megatron-LM
+(arXiv:1909.08053), also splits the output layer over the vocabulary — but it is
+motivated by **communication** volume under tensor parallelism, not by activation
+memory on one device, so it is not cited here as a memory technique.)
 
 ---
 
@@ -273,8 +282,10 @@ backward collapse into each other.
 
 The first half is right. The second half does not follow, because of what pass 2
 actually needs. Pass 2 needs, per row: the finished `m`, the finished `s`, the
-target index, and `dloss`. That is **three floats and an int per row** — 384 KiB
-at B=32, T=1024. It does *not* need the logits, because it recomputes them.
+target index, and `dloss`. That is **three floats and an int per row** — **384
+KiB at B=32, T=1024, against the 6288 MiB the old design had to keep alive
+across the same boundary**. It does *not* need the logits, because it recomputes
+them.
 
 So the split is:
 
@@ -285,6 +296,19 @@ So the split is:
 The producer and consumer of a `dlogits` tile are indeed fused — both are inside
 backward's tile loop — but the forward/backward contract, gradient accumulation,
 and the `recompute` flag are all untouched.
+
+**This is worth stating plainly because the opposite is on the record.** Phase 1
+identified the in-place `dlogits` write as *the* obstacle to chunking and
+concluded that "LM-head forward and backward stop being separable", touching
+"the forward/backward contract in `train_gpt2.mojo` and ... gradient
+accumulation, the `recompute` flag, and the inference path". That was a
+reasonable reading, and the cost it implied is the main reason phase 2 looked
+expensive. It does not hold. The obstacle dissolves once you notice that a
+`dlogits` tile's consumer was always going to be in backward anyway, so nothing
+has to cross the forward/backward boundary except the summary — and the summary
+is four numbers per row. Of the three things phase 1 expected to be disturbed,
+gradient accumulation and `recompute` are untouched entirely, and the inference
+path needs only a size reserve (§7.2), not a rewrite.
 
 Why is recomputing legal? Because the two inputs to the LM head — `acts.ln_f`
 (the final hidden states) and `params.wte` — are both still resident and both
@@ -540,12 +564,40 @@ reusing the helper. On GPU that costs some vectorization on a kernel that is
 trivial next to the GEMM beside it; the alternative would be constraining tile
 widths, which is a worse trade for a knob users are meant to turn.
 
-This same property is why the CPU test suite cannot use `fused_classifier_cpu`
-as a small-shape oracle: calling it at a test-sized `V_p` that is not a multiple
-of 16 crashes. **This is a pre-existing latent constraint, not a regression, and
-it is unreachable from the trainer** (V_p = 50304 always, and the buffers are
-device allocations). It is recorded here because it is a genuine landmine for
-anyone who tries to unit-test that function directly.
+#### A latent bug this uncovered, for whoever hits it next
+
+The same property is a live landmine in code that predates this change:
+
+> **`fused_classifier_cpu` (and `softmax_fwd_cpu`, and anything else routed
+> through `softmax_phase_1_and_2_cpu`) segfaults when the padded vocabulary is
+> not a multiple of the SIMD width.**
+
+The row reduction issues loads aligned to `align_of[SIMD[float32, W]]()` — 64
+bytes for W = 16 on AVX-512 — at address `row · V_p`. When `V_p` is not a
+multiple of W, odd rows land on a misaligned address and the aligned vector load
+faults. Reproduced directly: a six-row call at V = 29, V_p = 37 dumps core; the
+new chunked kernels on the same data do not.
+
+**It is unreachable from the trainer today** — V_p = 50304 = 16 × 3144, and the
+activation buffers are device allocations — so this is not a regression and not
+on the critical path. It will bite two kinds of person:
+
+1. anyone who picks a **non-standard vocabulary** whose padding lands on a
+   non-multiple of the SIMD width (nothing currently forces V_p to be padded to
+   128, or to anything, at model-construction time), and
+2. anyone who tries to **unit-test that function directly** at a small shape,
+   which is exactly what was attempted here.
+
+Consequence for this work: every reference in
+`tests/test_chunked_cross_entropy.mojo` is float64 rather than a comparison
+against the classifier being replaced. That is the stronger choice anyway — see
+the §9.2 note — but it was forced, not chosen.
+
+The fix, if someone wants it, is to drop the explicit `alignment=` from
+`_softmax_comp_max`'s load, or to require the padded vocabulary be a multiple of
+the SIMD width at construction. Not done here: it is a different file's
+invariant and changing load alignment on the hottest read path in the classifier
+deserves its own measurement.
 
 ### 7.2 Inference still wants the whole row
 
@@ -637,17 +689,23 @@ gradient that accumulates across tiles. All three agree with the baseline to
 four significant figures. **The chunked path reproduces the baseline's agreement
 with PyTorch, it does not merely stay inside a tolerance.**
 
-**A pre-existing failure, stated so it is not misattributed.** That same gate
-also runs a 10-step overfit and compares the loss trajectory against an expected
-list, and **that part fails — identically, on `main`, with this change absent.**
-Verified directly: a clean `main` checkout produces
-`step 0: loss 5.2700095 expected 5.3544273 diff=0.08441782`, digit for digit the
-same as this branch with the flag off *and* with the flag on. Our step-0 loss
-(5.2700095) also agrees with the same file's own forward-loss reference
-(5.2678394) which the gate accepts one line earlier, so the expected trajectory
-looks like the stale artifact. `make verify-gpu` is **not** part of `make check`
-or `make test`; this is flagged for the coordinator as an independent problem,
-not as a result of this work.
+**A note on the loss-trajectory half of that gate, and how it resolved.** When
+this work was first gated, the same gate's 10-step overfit check failed on every
+step — and it failed *identically on a clean `main`* with this change absent
+(`step 0: loss 5.2700095 expected 5.3544273 diff=0.08441782`, digit for digit).
+The diagnosis was that the hardcoded expected trajectory was the stale artifact,
+not the trainer: our step-0 loss agreed with the debug-state file's own
+forward-loss reference (5.2678394) which the gate accepts one line earlier.
+
+That has since been **fixed on `main`** — the expected list is now regenerated
+from PyTorch by a committed `scripts/gen_expected_losses.py` that refuses to emit
+unless step 0 reproduces the debug-state reference. The diagnosis above was
+correct: that script's own header records the same two numbers and notes the
+gate "reported `LOSS MISMATCH` on all ten steps and exited non-zero on *every*
+commit, including baselines predating any of the work it was blamed on."
+
+`main` was merged into this branch before the final gate run, so the results in
+§9.4 are measured against the corrected expectations.
 
 ### 9.2 Unit tests — `tests/test_chunked_cross_entropy.mojo` (new, 10/10 pass)
 
