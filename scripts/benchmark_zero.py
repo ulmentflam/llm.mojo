@@ -138,6 +138,18 @@ def _parse_mem_report(stdout):
         for r in steady:
             inactive.update(str(n) for n in r.get("inactive_buffers", []))
         out["inactive_buffers"] = sorted(inactive)
+        # Individually named activation tensors, already included in
+        # classes.activations — broken out, never added. `logits` is the one that
+        # matters for proportion: it is (B, T, padded_vocab_size) and grows with
+        # the batch, so at production shape it dwarfs the model-proportional
+        # state that ZeRO shards. Reporting a parameter-state saving without it
+        # would be true and misleading at the same time.
+        tensors = {}
+        for name in sorted({k for r in steady for k in r.get("tensors", {}).keys()}):
+            tensors[name] = _mib(
+                max(int(r.get("tensors", {}).get(name, 0)) for r in steady)
+            )
+        out["tensors_mib_max"] = tensors
 
     post = phases.get("post_alloc", [])
     if post:

@@ -1080,6 +1080,26 @@ def _mem_mark[
 
 
 @always_inline
+def _mem_act_bytes[dt: DType](sizes: List[Int], idx: Int) -> Int:
+    """Exact bytes of ONE activation tensor inside the shared activation buffer.
+
+    Activation tensors are not separate allocations — they are slices of one big
+    `acts_buf`, so there is no `DeviceBuffer` to measure and the size has to come
+    from the model's own size table. This is the one place the accounting reads a
+    size table instead of a live buffer; the table is what `point_activations`
+    actually carved the buffer up with, so it is still a description of reality
+    rather than a re-derivation of an allocation expression.
+
+    Returns 0 when the table has not been populated yet — activations are sized
+    on the first forward, so at the `post_alloc` phase there is genuinely nothing
+    to report.
+    """
+    if idx >= len(sizes):
+        return 0
+    return sizes[idx] * size_of[dt]()
+
+
+@always_inline
 def _mem_str_array(names: List[String]) -> String:
     """A `List[String]` as a JSON array literal."""
     var s = String("[")
@@ -4971,7 +4991,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             driver_total = Int(info[1])
             driver_used = driver_total - Int(info[0])
 
-        var s = String('{"schema":2')
+        var s = String('{"schema":3')
         s += ',"phase":"' + phase + '"'
         s += "," + _mem_kv("rank", self.zero_ctx.rank)
         s += "," + _mem_kv("world_size", Self.WORLD_SIZE)
@@ -4981,6 +5001,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         s += "," + _mem_kv("recompute", 1 if Self.recompute else 0)
         s += "," + _mem_kv("batch_size", self.batch_size)
         s += "," + _mem_kv("seq_len", self.seq_len)
+        s += "," + _mem_kv("padded_vocab_size", self.config.padded_vocab_size)
         s += "," + _mem_kv("num_parameters", self.num_parameters)
         s += "," + _mem_kv("padded_num_parameters", self.padded_num_parameters)
         s += "," + _mem_kv(
@@ -5046,6 +5067,35 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
         _mem_mark(inactive, self.grad_norm_out_buf, "grad_norm_out_buf")
         s += ',"inactive_buffers":' + _mem_str_array(inactive)
+
+        # Individually named activation tensors. These are slices of acts_buf,
+        # already counted inside classes.activations — they are broken out, not
+        # added, so do NOT include them in any total.
+        #
+        # `logits` is here because it is the term that actually dominates peak
+        # memory at production shape, and a report that can resolve a 150 MiB
+        # parameter-state change without showing the multi-GiB tensor sitting
+        # next to it invites a true-but-misleading claim. It is (B, T,
+        # padded_vocab_size) in the parameter precision, so it grows linearly in
+        # batch and sequence length while the ZeRO-shardable state does not.
+        var t_logits = _mem_act_bytes[GPT2_DTYPE](
+            self.act_sizes, Activations.logits
+        )
+        var t_logits_grad = _mem_act_bytes[GPT2_DTYPE](
+            self.grad_act_sizes, Activations.logits
+        )
+        var t_att_probs = _mem_act_bytes[GPT2_DTYPE](
+            self.act_sizes, Activations.att_probs
+        )
+        var t_fch_gelu = _mem_act_bytes[GPT2_DTYPE](
+            self.act_sizes, Activations.fch_gelu
+        )
+        s += ',"tensors":{'
+        s += _mem_kv("logits", t_logits)
+        s += "," + _mem_kv("logits_grad", t_logits_grad)
+        s += "," + _mem_kv("att_probs", t_att_probs)
+        s += "," + _mem_kv("fch_gelu", t_fch_gelu)
+        s += "}"
 
         s += "," + _mem_kv("exact_total_bytes", total)
         s += "," + _mem_kv("driver_used_bytes", driver_used)
