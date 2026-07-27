@@ -1,7 +1,9 @@
 from std.memory import alloc
 from std.python import Python
 
-from llmm.sampler import random_permutation
+# llm.c shuffles its dataloader with the mt19937 stream from rand.h (not the
+# xorshift sampler rng), so use the mt19937 port for batch-order parity.
+from llmm.rand import MT19937, random_permutation
 from llmm.memory import ImmutKernelPtr, MutMemPtr
 
 
@@ -86,7 +88,11 @@ struct DataLoader:
 
     # Random shuffle variables.
     var should_shuffle: Bool
-    var shuffle_rng_state: UInt64
+    var shuffle_rng: MT19937
+    # Count of randint32 draws consumed from shuffle_rng. Checkpoints store
+    # this (the mt19937 state itself is 624 words and does not fit the
+    # TrainingState field); restore reseeds and replays this many draws.
+    var shuffle_draws: UInt64
     var shard_indices: List[Int]
     var intra_shard_indices: List[Int]
 
@@ -148,7 +154,8 @@ struct DataLoader:
         self.current_shard_idx = 0
         self.current_sample_idx = 0
         self.should_shuffle = should_shuffle
-        self.shuffle_rng_state = UInt64(RNG_SEED + process_rank)
+        self.shuffle_rng = MT19937(UInt32(RNG_SEED + process_rank))
+        self.shuffle_draws = 0
         self.file_size_bytes = 0
         self.magic = 0
         self.version = 0
@@ -282,14 +289,18 @@ struct DataLoader:
         self.intra_shard_indices = List[Int]()
         for i in range(self.shard_num_samples):
             self.intra_shard_indices.append(i)
-        random_permutation(self.intra_shard_indices, self.shuffle_rng_state)
+        random_permutation(self.intra_shard_indices, self.shuffle_rng)
+        if len(self.intra_shard_indices) > 1:
+            self.shuffle_draws += UInt64(len(self.intra_shard_indices) - 1)
 
     def reset(mut self) raises:
         self.current_shard_idx = 0
         self.current_sample_idx = 0
 
         if self.should_shuffle:
-            random_permutation(self.shard_indices, self.shuffle_rng_state)
+            random_permutation(self.shard_indices, self.shuffle_rng)
+            if len(self.shard_indices) > 1:
+                self.shuffle_draws += UInt64(len(self.shard_indices) - 1)
 
         _ = self._load_shard(self.current_shard_idx)
 

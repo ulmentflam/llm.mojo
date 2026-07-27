@@ -2,7 +2,8 @@ from std.memory import alloc
 
 from llmm.io import read_and_copy, write_buffer
 from llmm.memory import MutMemPtr
-from llmm.dataloader import DataLoader
+from llmm.dataloader import DataLoader, RNG_SEED
+from llmm.rand import MT19937
 
 
 # The on-disk format mirrors Karpathy's llm.c (train_gpt2.cu) so checkpoints are
@@ -382,7 +383,9 @@ def make_training_state(
         use_master_weights=use_master_weights,
         should_shuffle=1 if loader.should_shuffle else 0,
         sampler_rng_state=sampler_rng_state,
-        shuffle_rng_state=loader.shuffle_rng_state,
+        # The mt19937 shuffle state is 624 words and does not fit this u64
+        # field; store the draw count instead and replay it on restore.
+        shuffle_rng_state=loader.shuffle_draws,
         current_shard_idx=loader.current_shard_idx,
         current_sample_idx=loader.current_sample_idx,
     )
@@ -397,13 +400,26 @@ def restore_dataloader_state(
     run would have produced next. The loader must be constructed with the same
     files, batch size, and sequence length as when the state was written.
 
-    Note: for a shuffling loader this restores the RNG state and shard/sample
-    indices and regenerates the intra-shard permutation. The default training
-    loop does not shuffle, in which case resumption is exact.
+    Note: for a shuffling loader, `state.shuffle_rng_state` holds the count
+    of mt19937 draws the original run had consumed. Restoration reseeds the
+    generator, replays the draws that preceded the current shard's intra
+    permutation, then regenerates that permutation, leaving both the batch
+    order and the generator position exact. A checkpoint written by a
+    non-shuffling run (`state.should_shuffle == 0`) has no stream to replay;
+    restoring it into a shuffling loader starts a fresh shuffle stream.
     """
-    loader.shuffle_rng_state = state.shuffle_rng_state
     loader.current_shard_idx = state.current_shard_idx
     _ = loader._load_shard(state.current_shard_idx)
     loader.current_sample_idx = state.current_sample_idx
-    if loader.should_shuffle:
+    if loader.should_shuffle and state.should_shuffle == 1:
+        var intra_draws = UInt64(
+            loader.shard_num_samples - 1
+        ) if loader.shard_num_samples > 1 else UInt64(0)
+        var replay = state.shuffle_rng_state - intra_draws
+        loader.shuffle_rng = MT19937(UInt32(RNG_SEED + loader.process_rank))
+        for _ in range(Int(replay)):
+            _ = loader.shuffle_rng.randint32()
+        loader.shuffle_draws = replay
+        loader._prepare_intra_shard_indices()
+    elif loader.should_shuffle:
         loader._prepare_intra_shard_indices()

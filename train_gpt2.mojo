@@ -5098,7 +5098,11 @@ def train[
     var train_tokens = train_data_pattern
     var val_tokens = args.val_data_pattern
 
-    var train_loader = DataLoader(train_files^, B, T, rank, WORLD_SIZE)
+    # Shuffle the train stream like llm.c's main() does (mt19937, seed 42 +
+    # rank); the val stream stays sequential, also matching llm.c.
+    var train_loader = DataLoader(
+        train_files^, B, T, rank, WORLD_SIZE, should_shuffle=True
+    )
     printf0(rank, "Loaded train tokens from " + train_tokens)
     printf0(rank, "Number of tokens: " + String(train_loader.num_tokens))
     var val_loader = DataLoader(args.val_files.copy(), B, T, rank, WORLD_SIZE)

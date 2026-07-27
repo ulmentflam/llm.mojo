@@ -125,6 +125,23 @@ struct MT19937(Copyable, Movable):
 
 
 # ===----------------------------------------------------------------------=== #
+# Permutation, matching llm.c's random_permutation in rand.h
+# ===----------------------------------------------------------------------=== #
+
+
+def random_permutation(mut arr: List[Int], mut rng: MT19937):
+    """Fisher-Yates over the mt19937 stream, draw-for-draw identical to
+    llm.c's random_permutation(); with the same seed, a shuffled dataloader
+    visits batches in llm.c's exact order."""
+    var n = len(arr)
+    for i in range(n - 1, 0, -1):
+        var j = Int(rng.randint32() % UInt32(i + 1))
+        var tmp = arr[i]
+        arr[i] = arr[j]
+        arr[j] = tmp
+
+
+# ===----------------------------------------------------------------------=== #
 # Gaussian sampling (Box-Muller), matching torch.normal_
 # ===----------------------------------------------------------------------=== #
 
