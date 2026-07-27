@@ -222,8 +222,15 @@ dead. That is the mechanism visible in a single table cell.
 **fp32 was not affected.** `simd_width_of[float32]()` is 16 on this host, so
 `FUSED_ROW_BLOCKS` is 256 and the largest requirement is `256 * 3072 = 786,432`
 — under the old `1<<20` cap. All four tensors were fully non-zero on all six
-steps. The bug was bf16-only, which is precisely the configuration production
-runs use and the one least covered by the fp32-reference test suite.
+steps. So the bug needs bf16 *parameters*, which is precisely what production
+runs use — including the fp8 and nvfp4 recipes, whose parameters stay bf16 —
+and is the configuration least covered by the fp32-reference test suite.
+
+Note the scope of this measurement: it is one binary, one shape, six steps. It
+establishes that the bug breaks a training run. What it did to the runs already
+published is a separate question, answered in
+[What the published checkpoints actually show](#what-the-published-checkpoints-actually-show)
+— and the answer there is not the one this table would lead you to predict.
 
 After the fix, the bf16 run has all four tensors fully non-zero on all six
 steps, and its loss trajectory **diverges from the pre-fix run starting at step
@@ -261,6 +268,75 @@ non-zero float bit pattern on the counters, and the kernel dies.
 
 So the reference batch was small enough that the corruption was silent *twice
 over*: out of bounds, and writing the correct value anyway.
+
+---
+
+## What the published checkpoints actually show
+
+The six-step probe above answers "does this break a training run?" — it does.
+It does **not** answer "what did it do to the runs we already published," and
+extrapolating from one configuration to six real runs turned out to be wrong.
+
+There is a way to check the real runs directly, with no re-run and no
+instrumentation. GPT-2 initialises every bias to exactly `0`
+(`train_gpt2.mojo`: "weights ~ N(0, 0.02), biases 0"), so a bias tensor still
+**bit-exactly zero** after 22,345 optimizer steps demonstrably never received a
+gradient. `scripts/check_checkpoint_biases.py` counts non-zero entries per bias
+tensor in a checkpoint. Run against the six published precision-comparison
+checkpoints:
+
+| Arm | `qkvb` (`3C`) | `attprojb` (`C`) | `fcb` (`4C`) | `fcprojb` (`C`) |
+|---|---|---|---|---|
+| 124M bf16 | **0** / 27,648 | 768 / 9,216 | **0** / 36,864 | 2,304 / 9,216 |
+| 124M fp8 | 27,648 / 27,648 | 9,216 / 9,216 | 36,864 / 36,864 | 9,216 / 9,216 |
+| 124M nvfp4 | **0** / 27,648 | **0** / 9,216 | **0** / 36,864 | 3,072 / 9,216 |
+| 774M bf16 | **0** / 138,240 | 46,080 / 46,080 | **0** / 184,320 | 46,080 / 46,080 |
+| 774M fp8 | 138,240 / 138,240 | 46,080 / 46,080 | 184,320 / 184,320 | 46,080 / 46,080 |
+| 774M nvfp4 | **0** / 138,240 | 46,080 / 46,080 | **0** / 184,320 | 46,080 / 46,080 |
+
+The three layernorm biases (`ln1b`, `ln2b`, `lnfb`) are fully trained in all six
+files. They have their own backward and never reach this kernel, so they are the
+control: whatever went wrong is specific to `matmul_bias_bwd`, and is not a dead
+optimizer or a checkpoint-writer fault.
+
+Three readings, in increasing order of how much they cost us.
+
+**The width threshold is exactly where the arithmetic says it should be.**
+Scratch demand is `FUSED_ROW_BLOCKS × out_channels = 512 × oc`, against the old
+`CAP = 1<<20`. Only `qkvb` (`oc = 3C`) and `fcb` (`oc = 4C`) exceed it — at
+either scale — and those are precisely the two that are dead in every damaged
+arm. The `C`-wide `attprojb`/`fcprojb` fit under the cap and are the two that
+survive. The mechanism predicted the pattern before the pattern was measured.
+
+**The partial columns are a race, not a freeze.** `attprojb` and `fcprojb` do not
+overrun on their own launches, but they share the counter array the wide calls
+have already poisoned, so they die too when the poison happens to reach them.
+`768 / 9,216` is exactly one layer of twelve. Which layers survive *drifts within
+a single run* — the 124M bf16 arm's `fcprojb` has 1,536 non-zero entries at step
+1,000 and 2,304 at step 22,345 — so a handful of layers intermittently got a
+real gradient through. "The biases were frozen" is the right summary of the
+outcome and the wrong description of the mechanism.
+
+**The two fp8 arms are undamaged, and that is the expensive part.** All three
+precisions route their bias gradient through the same bf16 `matmul_bias_bwd`
+(`llmm/matmul.mojo` — the fp8 and fp4 backward wrappers call it unchanged), so
+this is not a code-path difference. An out-of-bounds write lands on whatever the
+allocator placed after the scratch buffer, and in those two builds that was
+evidently not the counters. Neither `MODULAR_DEBUG=device-sync-mode` nor build
+date separates the arms cleanly: the 774M fp8 run set it and the 124M fp8 run did
+not, and both came out clean. The per-arm variation is not currently root-caused
+beyond "allocation layout decides the victim," and it does not need to be — the
+fix removes the write. But it is worth stating plainly, because a bug whose
+damage depends on allocator adjacency can silently corrupt a *different* buffer
+in a build where the counters happen to be somewhere else, and no one would see
+a row of zeros to tip them off.
+
+The consequence for the published work is not that six runs are uniformly
+wrong. It is worse than that: **the arms are damaged differently, so the
+comparison between them is confounded** — fp8 trained its biases, bf16 and
+nvfp4 largely did not, and the headline finding was that fp8 edged out bf16.
+The README's precision comparison has been retracted on that basis and all six
+arms are being re-trained.
 
 ---
 
