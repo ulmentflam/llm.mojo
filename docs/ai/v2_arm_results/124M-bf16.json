@@ -1,0 +1,20 @@
+{
+  "arm": "124M-bf16",
+  "scale": "124M",
+  "precision": "bf16",
+  "run_dir": "/data/llm.mojo/runs/v2/log124M_fineweb_bf16_v2",
+  "hf_repo": "ulmentflam/gpt2-124m-fineweb-mojo",
+  "final_step": 22345,
+  "total_steps": 22345,
+  "final_train_loss": 3.318235,
+  "final_val_loss": 3.2868803,
+  "hellaswag_k": 3010,
+  "hellaswag_n": 10042,
+  "hellaswag_acc": 0.2997410874327823,
+  "hellaswag_ci95": [
+    0.29085822021033725,
+    0.3087771154692538
+  ],
+  "median_ms_per_step": 594.53,
+  "median_tok_per_s": 771577
+}
