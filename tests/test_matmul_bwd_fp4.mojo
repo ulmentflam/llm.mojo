@@ -7,10 +7,19 @@
 #      bf16 `matmul_bwd` at the two FP4-eligible MLP linear shapes (fc, proj),
 #      real GPT-2 124M (d12, channels=768) dimensions and the real B=4/T=1024
 #      row count (rows=4096). Compares `d_input`/`d_weight` (relL2 + cosine,
-#      NaN/Inf-free) and asserts `d_bias` is BIT-IDENTICAL between the two
-#      arms (both paths reuse the same bf16 `matmul_bias_bwd` kernel — the
-#      "bias-grad reuse" design decision — so any divergence there would
-#      flag a wiring bug, not ordinary fp4 quantization noise).
+#      NaN/Inf-free). For `d_bias` it asserts, in this order: (a) every
+#      entry is non-zero and (b) the vector matches a HOST reduction of
+#      `d_output` in relative L2, then (c) that the two arms are
+#      BIT-IDENTICAL (both paths reuse the same bf16 `matmul_bias_bwd`
+#      kernel — the "bias-grad reuse" design decision — so any divergence
+#      there would flag a wiring bug, not ordinary fp4 quantization noise).
+#      (a) and (b) are load-bearing, not belt-and-braces: (c) alone is a
+#      RELATIVE assertion between two arms running the same kernel, so a
+#      fault that zeroes both arms equally passes it by comparing 0 to 0 —
+#      which is exactly what a scratch overrun in `_dbias_fused_gpu` did
+#      for as long as this test existed (docs/ai/
+#      dbias_scratch_overrun_silent_zero_bug.md). The host reduction is the
+#      anchor that makes the comparison mean something.
 #   2. `test_fp4_gemm_accumulate*` — unit tests for the `lowp_gemm_fp4`
 #      accumulate path: a fresh (accumulate=False) GEMM result added to a
 #      known seed value via a SEPARATE accumulate=True call must match
@@ -26,6 +35,7 @@
 # run under `flock -w 10800 /tmp/llmm-gpu.lock -c '...'` (shared GPU).
 # ===----------------------------------------------------------------------=== #
 
+from std.math import sqrt
 from std.memory import UnsafePointer
 from std.random import random_float64, seed
 from std.sys import has_nvidia_gpu_accelerator
@@ -207,7 +217,83 @@ def _run_bwd_site_case(
     d_bias_fp4.enqueue_copy_to(host_d_bias_fp4)
     ctx.synchronize()
 
-    # d_bias: bit-identical (same bf16 matmul_bias_bwd kernel on both arms).
+    # d_bias, part 1: is it RIGHT? This must come before the bit-identity
+    # check below, because bit-identity alone is vacuous -- if the dbias
+    # kernel writes nothing at all, both arms hold a freshly-allocated
+    # (zero) buffer and `assert_equal` happily compares 0 to 0 and passes.
+    # That is not hypothetical: an out-of-bounds scratch store in
+    # `_dbias_fused_gpu` corrupted its arrival counters so no block ever ran
+    # the finalize, `d_bias` came back all-zero on both arms, and this test
+    # passed anyway. So: reduce d_output on the HOST (independent of any
+    # GPU kernel -- this is the test's own input data, never the code's
+    # output) and require the GPU to reproduce it.
+    var cpu_d_bias = ctx.enqueue_create_host_buffer[DType.float32](out_channels)
+    for c in range(out_channels):
+        cpu_d_bias.unsafe_ptr()[c] = Float32(0.0)
+    for r in range(rows):
+        var row = host_doutput.unsafe_ptr() + r * out_channels
+        for c in range(out_channels):
+            cpu_d_bias.unsafe_ptr()[c] += row[c].cast[DType.float32]()
+
+    # Every column is a sum of `rows` random nonzero values, so an exact
+    # zero is not a legitimate outcome -- it means "never written".
+    var nonzero_ref = 0
+    var nonzero_fp4 = 0
+    for i in range(out_channels):
+        if host_d_bias_ref.unsafe_ptr()[i] != Scalar[DT](0):
+            nonzero_ref += 1
+        if host_d_bias_fp4.unsafe_ptr()[i] != Scalar[DT](0):
+            nonzero_fp4 += 1
+    assert_equal(
+        nonzero_ref,
+        out_channels,
+        label
+        + ": bf16 d_bias has only "
+        + String(nonzero_ref)
+        + "/"
+        + String(out_channels)
+        + " nonzero entries -- an all-zero d_bias means the dbias kernel"
+        " never wrote (see _dbias_fused_gpu's finalize protocol), not that"
+        " the gradient is zero",
+    )
+    assert_equal(
+        nonzero_fp4,
+        out_channels,
+        label
+        + ": fp4-arm d_bias has only "
+        + String(nonzero_fp4)
+        + "/"
+        + String(out_channels)
+        + " nonzero entries -- see the bf16-arm message above",
+    )
+
+    # Match the host reduction. Both sides accumulate in fp32; the GPU
+    # rounds to bf16 once at the end (8 mantissa bits, ~0.4% relative), and
+    # the two summation orders differ, so compare in relative L2 rather than
+    # exactly. Measured ~0.002 for both sites; 0.02 is ~10x headroom and
+    # still far tighter than the ~1.0 an all-zero result would produce.
+    var num = Float32(0.0)
+    var den = Float32(0.0)
+    for i in range(out_channels):
+        var got = host_d_bias_ref.unsafe_ptr()[i].cast[DType.float32]()
+        var want = cpu_d_bias.unsafe_ptr()[i]
+        num += (got - want) * (got - want)
+        den += want * want
+    var rel_l2_bias = sqrt(num) / (sqrt(den) + Float32(1e-12))
+    assert_true(
+        rel_l2_bias < Float32(0.02),
+        label
+        + ": d_bias rel_l2 vs host reduction "
+        + String(rel_l2_bias)
+        + " >= 0.02 (host d_bias[0]="
+        + String(cpu_d_bias.unsafe_ptr()[0])
+        + ", gpu d_bias[0]="
+        + String(host_d_bias_ref.unsafe_ptr()[0].cast[DType.float32]())
+        + ")",
+    )
+
+    # d_bias, part 2: bit-identical (same bf16 matmul_bias_bwd kernel on
+    # both arms). Only meaningful now that both are known nonzero + correct.
     for i in range(out_channels):
         assert_equal(
             host_d_bias_ref.unsafe_ptr()[i],

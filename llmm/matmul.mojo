@@ -2201,22 +2201,39 @@ def matmul_bias_bwd_gpu[
     )
 
 
+# Element capacity of the persistent dbias scratch (`_dbias_scratch`).
+#
+# The fused kernel indexes scratch as `by * out_channels + col` with
+# `by < row_blocks`, so the requirement is exactly `row_blocks *
+# out_channels` fp32 elements. HISTORY — this constant used to be a
+# hand-computed `1 << 20`, justified in a comment as "128 row-blocks *
+# 3072 = 393,216, >2x headroom". That arithmetic assumed `width == 8`
+# ("one 128-bit transaction"), but `matmul_bias_bwd` picks the width with
+# `simd_width_of[dtype]()`, which is evaluated for the HOST target, and on
+# a 512-bit-vector (AVX-512) host `simd_width_of[bfloat16]()` is 32 — so
+# the real row-block count is `ROW_BLOCKS * 32 == 512`, and the real
+# requirement for the 4C=3072 MLP bias is 1,572,864 elements, 1.5x OVER
+# the old cap. The overrun stored past the end of DBIAS_SCRATCH into the
+# neighbouring DBIAS_COUNTERS allocation, corrupting the arrival counters
+# so that no block ever satisfied the finalize condition and `d_bias` was
+# silently never written. Hence: derive the bound from the same quantities
+# the launch uses, and enforce it (see the guard in `matmul_bias_bwd`).
+#
+#   ROW_BLOCKS (16)
+#   * 32   max host vector lanes for bf16 (a 512-bit host vector)
+#   * 8192 max supported out_channels (4C for C=2048, past GPT-2 XL's 1600)
+#   = 4,194,304 fp32 = 16 MiB, allocated once per process.
+comptime DBIAS_SCRATCH_CAP = 16 * 32 * 8192
+
+
 def _dbias_scratch(ctx: DeviceContext) raises -> MutKernelPtr[DType.float32]:
     # Persistent fp32 accumulator for the dbias reduction (allocate-once,
     # heap-held via a process global keyed by device id; big enough for any
     # bias width). Zeroed on allocation; the finalize kernel re-zeros it after
-    # each use so successive calls start clean.
-    #
-    # CAP must hold `row_blocks * out_channels` fp32 elements. The
-    # vectorized HAS_CUBLAS fused kernel (`matmul_bias_bwd`) scales
-    # row_blocks up by the vector width (`ROW_BLOCKS * width`, up to 16*8
-    # = 128 for bf16) to keep grid occupancy up after `width`-ing the
-    # column dimension — worst case here is 128 row-blocks * 3072 (the 4C
-    # MLP fc bias) = 393,216 elements (1.5 MiB). 1<<20 leaves >2x headroom
-    # for that plus the portable (Metal) path's unvectorized 16 * 3072.
-    comptime CAP = 1 << 20
+    # each use so successive calls start clean. Capacity and the reasoning
+    # behind it: see `DBIAS_SCRATCH_CAP` above.
     return persistent_device_buffer[DType.float32](
-        ctx, "DBIAS_SCRATCH", CAP, zero=True
+        ctx, "DBIAS_SCRATCH", DBIAS_SCRATCH_CAP, zero=True
     )
 
 
@@ -2315,9 +2332,16 @@ def _dbias_fused_gpu[
     # that block reads the full column back out of scratch and finalizes.
     #
     # VECTORIZED (kernel9-style x128/f128 access): each thread now owns a
-    # contiguous `width`-wide run of output columns (width = one 128-bit
-    # transaction: 4 fp32 lanes or 8 bf16 lanes) instead of a single scalar
-    # column. Adjacent threads own adjacent runs, so a warp's row-load lands
+    # contiguous `width`-wide run of output columns instead of a single
+    # scalar column. CAVEAT ON `width`: the caller derives it from
+    # `simd_width_of[dtype]()`, which is the repo-wide idiom but resolves
+    # against the HOST target — on a 512-bit-vector host that is 32 bf16
+    # lanes, NOT the 8 that llm.c's 128-bit `x128` load uses. The access
+    # pattern is still correct and still fully coalesced at any width, but
+    # do not read "128-bit transaction" into this constant: `row_blocks`
+    # scales with it, and sizing anything against an assumed width of 8 is
+    # what previously overran the scratch (see `DBIAS_SCRATCH_CAP`).
+    # Adjacent threads own adjacent runs, so a warp's row-load lands
     # in one contiguous, fully-coalesced stretch of `d_output` — matching
     # llm.c's `x128 packed_dout = load128(dout + global_oc + idx*OC)` in
     # `matmul_backward_bias_kernel9` (llmc/matmul.cuh:41). The scratch
@@ -2384,12 +2408,42 @@ def _dbias_fused_gpu[
     # single "leader" fence would not publish the other threads' columns.
     threadfence[Scope.GPU]()
 
+    # ...and every thread of THIS block must have finished that store+fence
+    # before thread 0 announces the block's arrival. `threadfence` orders
+    # only the calling thread's own stores; it is not a barrier. Without
+    # this `barrier()`, thread 0 can race ahead and increment the arrival
+    # counter while sibling warps are still storing their columns, so the
+    # block that finalizes may read a half-written column out of scratch and
+    # publish a wrong `d_bias` for it (column 0 would still look right,
+    # since thread 0 fences its own store before signalling — which is
+    # exactly what makes this failure mode so easy to miss).
+    barrier()
+
     var flag = stack_allocation[
         1, DType.int32, address_space=AddressSpace.SHARED
     ]()
     if Int(thread_idx.x) == 0:
         var arrived = Atomic[DType.int32].fetch_add(counters + bx, 1)
-        flag[0] = 1 if arrived == Int32(row_blocks - 1) else 0
+        # Residue, not equality. Each launch adds exactly `row_blocks` to
+        # this slot, so `row_blocks` consecutive tickets cover every residue
+        # mod `row_blocks` exactly once — meaning EXACTLY ONE block takes
+        # the finalize branch no matter what value the counter started at.
+        # A bare `arrived == row_blocks - 1` is only correct when the
+        # counter starts at exactly 0, and it fails SILENTLY when it does
+        # not: no block finalizes, `d_bias` is never written, and nothing
+        # reports an error. Paired with the reset below (which keeps the
+        # counter at 0 and so keeps it far from int32 overflow), this makes
+        # a missed finalize impossible rather than merely unlikely.
+        var is_last = arrived % Int32(row_blocks) == Int32(row_blocks - 1)
+        flag[0] = 1 if is_last else 0
+        if is_last:
+            # Reset for the next call reusing this column-block's slot (next
+            # layer / next grad-accum micro-batch). Every block has already
+            # arrived by definition, so this plain store cannot race a
+            # sibling's fetch_add, and the next launch is ordered after this
+            # one by the stream. Done HERE, before the `col >= out_channels`
+            # early-out below, so no return path can skip it.
+            counters[bx] = 0
     barrier()
     if flag[0] == 0:
         return
@@ -2419,14 +2473,6 @@ def _dbias_fused_gpu[
                 ).cast[dtype]()
             else:
                 d_bias_ptr[c] = total.cast[dtype]()
-
-    # Self-reset: the next call reusing this column-block's counter slot
-    # (next layer / next grad-accum micro-batch) must see 0 again. No
-    # host-side memset between launches (mirrors the scratch buffer, which
-    # `_dbias_accum_gpu`'s comment already notes is fully overwritten, not
-    # zeroed, every call).
-    if Int(thread_idx.x) == 0:
-        counters[bx] = 0
 
 
 @always_inline
@@ -2556,6 +2602,29 @@ def matmul_bias_bwd[
             var fused_block_threads = ceildiv(num_groups, fused_col_blocks)
             comptime FUSED_ROW_BLOCKS = ROW_BLOCKS * width
             var fused_row_tile = ceildiv(rows, FUSED_ROW_BLOCKS)
+            # The kernel stores partials at `by * oc + col` for by <
+            # FUSED_ROW_BLOCKS, so it touches exactly this many fp32
+            # elements of the scratch. Check it: overrunning the scratch
+            # writes into the next allocation (DBIAS_COUNTERS lives there),
+            # which corrupts the arrival counters and makes the kernel
+            # silently skip its finalize — i.e. `d_bias` comes back
+            # untouched with no error anywhere. That is exactly the bug this
+            # guard exists to make impossible; fail loudly instead. Note
+            # FUSED_ROW_BLOCKS depends on the HOST vector width (see
+            # `DBIAS_SCRATCH_CAP`), so this is not a bound you can eyeball
+            # from the kernel's "128-bit transaction" comments.
+            if FUSED_ROW_BLOCKS * oc > DBIAS_SCRATCH_CAP:
+                raise Error(
+                    "matmul_bias_bwd: fused dbias needs "
+                    + String(FUSED_ROW_BLOCKS * oc)
+                    + " fp32 scratch elements (row_blocks "
+                    + String(FUSED_ROW_BLOCKS)
+                    + " x out_channels "
+                    + String(oc)
+                    + ") but DBIAS_SCRATCH_CAP is "
+                    + String(DBIAS_SCRATCH_CAP)
+                    + " -- raise DBIAS_SCRATCH_CAP in llmm/matmul.mojo"
+                )
             var counters = _dbias_counters(device_ctx)
             comptime fused_k = _dbias_fused_gpu[dtype, accumulate, width]
             var fused_c = device_ctx.compile_function[fused_k]()
