@@ -1,0 +1,359 @@
+{
+  "schema": "llm.mojo vocab-parallel LM head communication cost model",
+  "produced_by": "Team V (zero/vocabparallel)",
+  "date": "2026-07-27",
+  "verdict": "NO at production shape",
+  "provenance": {
+    "all_volumes": "MODELLED - closed-form byte counts, no measurement input",
+    "ratio": "MODELLED and BANDWIDTH-INDEPENDENT - both series move bytes over the same links by the same staged-copy mechanism, so any rate cancels",
+    "milliseconds": "NOT INCLUDED in this file on purpose; ms requires a bandwidth anchor. See bandwidth_anchor below.",
+    "bandwidth_anchor": {
+      "value_gib_s_per_rank": 8.8,
+      "status": "UNVERIFIED - derived from a prose docstring at llmm/zero.mojo:257-260 (~75 GB/s aggregate, ~92 ms for the full fp32 gradient allreduce at N=8). The repo contains NO reproducible collective-timing harness. Do NOT present as measured."
+    }
+  },
+  "constants": {
+    "V_p": 50304,
+    "C": 768,
+    "L": 12,
+    "max_T": 1024,
+    "num_parameters": 124475904,
+    "wte_elements": 38633472,
+    "z3_embed_window_elements": 39421440,
+    "note": "volumes are PER RANK, PER MICRO-STEP"
+  },
+  "formulas": {
+    "micro_step": "one forward+backward over one micro-batch; ZeRO-2/3 bucketed reduce-scatter runs per micro-step (train_gpt2.mojo:4020-4024) and the wte all-gather runs per forward (train_gpt2.mojo:2582-2589), so both series share this cadence",
+    "baseline": "2 * W * (N-1)/N   [all-gather z3 embed window + reduce-scatter its gradient]",
+    "vocabparallel": "2 * (N-1) * B*T*C  +  3 * 2*(N-1)/N * N*B*T   [all-gather ln_f + reduce-scatter d_ln_f + 3 per-token all-reduces]",
+    "breakeven": "N*B*T = V_p  (=50304 global tokens per micro-step); vocab-parallel wins strictly below",
+    "caveats": [
+      "Model is OPTIMISTIC for vocab-parallel: it omits the additional forward all-reduce of B*T*C that the vocab-parallel ENCODER requires (Megatron-LM Sec 3, 'an all-reduce (g operator) is required after the input embedding').",
+      "Volumes are ring/reduce-scatter+all-gather equivalent, i.e. 2*(N-1)/N per all-reduce, matching this repo's hand-rolled staged-copy collectives (llmm/zero.mojo:236-264). No P2P on this box.",
+      "Pure bandwidth terms; per-collective latency and barrier costs are NOT modelled. This penalises the SMALL-volume side, so the benchmark-shape win is overstated, not the production-shape loss."
+    ]
+  },
+  "shapes": {
+    "fp32": [
+      {
+        "B": 4,
+        "T": 64,
+        "N": 2,
+        "tokens_per_rank": 256,
+        "global_tokens": 512,
+        "baseline_elements": 39421440.0,
+        "baseline_bytes": 157685760.0,
+        "vocabparallel_elements": 394752.0,
+        "vocabparallel_bytes": 1579008.0,
+        "activation_term_elements": 393216,
+        "scalar_term_elements": 1536.0,
+        "ratio": 0.010013637249172024,
+        "logits_elements_baseline": 12877824,
+        "logits_elements_vocabparallel": 12877824
+      },
+      {
+        "B": 4,
+        "T": 64,
+        "N": 4,
+        "tokens_per_rank": 256,
+        "global_tokens": 1024,
+        "baseline_elements": 59132160.0,
+        "baseline_bytes": 236528640.0,
+        "vocabparallel_elements": 1184256.0,
+        "vocabparallel_bytes": 4737024.0,
+        "activation_term_elements": 1179648,
+        "scalar_term_elements": 4608.0,
+        "ratio": 0.020027274498344048,
+        "logits_elements_baseline": 12877824,
+        "logits_elements_vocabparallel": 12877824
+      },
+      {
+        "B": 4,
+        "T": 64,
+        "N": 7,
+        "tokens_per_rank": 256,
+        "global_tokens": 1792,
+        "baseline_elements": 67579611.42857143,
+        "baseline_bytes": 270318445.71428573,
+        "vocabparallel_elements": 2368512.0,
+        "vocabparallel_bytes": 9474048.0,
+        "activation_term_elements": 2359296,
+        "scalar_term_elements": 9216.0,
+        "ratio": 0.035047730372102084,
+        "logits_elements_baseline": 12877824,
+        "logits_elements_vocabparallel": 12877312
+      },
+      {
+        "B": 4,
+        "T": 64,
+        "N": 8,
+        "tokens_per_rank": 256,
+        "global_tokens": 2048,
+        "baseline_elements": 68987520.0,
+        "baseline_bytes": 275950080.0,
+        "vocabparallel_elements": 2763264.0,
+        "vocabparallel_bytes": 11053056.0,
+        "activation_term_elements": 2752512,
+        "scalar_term_elements": 10752.0,
+        "ratio": 0.040054548996688095,
+        "logits_elements_baseline": 12877824,
+        "logits_elements_vocabparallel": 12877824
+      },
+      {
+        "B": 2,
+        "T": 1024,
+        "N": 7,
+        "tokens_per_rank": 2048,
+        "global_tokens": 14336,
+        "baseline_elements": 67579611.42857143,
+        "baseline_bytes": 270318445.71428573,
+        "vocabparallel_elements": 18948096.0,
+        "vocabparallel_bytes": 75792384.0,
+        "activation_term_elements": 18874368,
+        "scalar_term_elements": 73728.0,
+        "ratio": 0.2803818429768167,
+        "logits_elements_baseline": 103022592,
+        "logits_elements_vocabparallel": 103018496
+      },
+      {
+        "B": 4,
+        "T": 1024,
+        "N": 7,
+        "tokens_per_rank": 4096,
+        "global_tokens": 28672,
+        "baseline_elements": 67579611.42857143,
+        "baseline_bytes": 270318445.71428573,
+        "vocabparallel_elements": 37896192.0,
+        "vocabparallel_bytes": 151584768.0,
+        "activation_term_elements": 37748736,
+        "scalar_term_elements": 147456.0,
+        "ratio": 0.5607636859536334,
+        "logits_elements_baseline": 206045184,
+        "logits_elements_vocabparallel": 206036992
+      },
+      {
+        "B": 8,
+        "T": 1024,
+        "N": 7,
+        "tokens_per_rank": 8192,
+        "global_tokens": 57344,
+        "baseline_elements": 67579611.42857143,
+        "baseline_bytes": 270318445.71428573,
+        "vocabparallel_elements": 75792384.0,
+        "vocabparallel_bytes": 303169536.0,
+        "activation_term_elements": 75497472,
+        "scalar_term_elements": 294912.0,
+        "ratio": 1.1215273719072667,
+        "logits_elements_baseline": 412090368,
+        "logits_elements_vocabparallel": 412073984
+      },
+      {
+        "B": 16,
+        "T": 1024,
+        "N": 7,
+        "tokens_per_rank": 16384,
+        "global_tokens": 114688,
+        "baseline_elements": 67579611.42857143,
+        "baseline_bytes": 270318445.71428573,
+        "vocabparallel_elements": 151584768.0,
+        "vocabparallel_bytes": 606339072.0,
+        "activation_term_elements": 150994944,
+        "scalar_term_elements": 589824.0,
+        "ratio": 2.2430547438145334,
+        "logits_elements_baseline": 824180736,
+        "logits_elements_vocabparallel": 824147968
+      },
+      {
+        "B": 32,
+        "T": 1024,
+        "N": 2,
+        "tokens_per_rank": 32768,
+        "global_tokens": 65536,
+        "baseline_elements": 39421440.0,
+        "baseline_bytes": 157685760.0,
+        "vocabparallel_elements": 50528256.0,
+        "vocabparallel_bytes": 202113024.0,
+        "activation_term_elements": 50331648,
+        "scalar_term_elements": 196608.0,
+        "ratio": 1.281745567894019,
+        "logits_elements_baseline": 1648361472,
+        "logits_elements_vocabparallel": 1648361472
+      },
+      {
+        "B": 32,
+        "T": 1024,
+        "N": 4,
+        "tokens_per_rank": 32768,
+        "global_tokens": 131072,
+        "baseline_elements": 59132160.0,
+        "baseline_bytes": 236528640.0,
+        "vocabparallel_elements": 151584768.0,
+        "vocabparallel_bytes": 606339072.0,
+        "activation_term_elements": 150994944,
+        "scalar_term_elements": 589824.0,
+        "ratio": 2.563491135788038,
+        "logits_elements_baseline": 1648361472,
+        "logits_elements_vocabparallel": 1648361472
+      },
+      {
+        "B": 32,
+        "T": 1024,
+        "N": 7,
+        "tokens_per_rank": 32768,
+        "global_tokens": 229376,
+        "baseline_elements": 67579611.42857143,
+        "baseline_bytes": 270318445.71428573,
+        "vocabparallel_elements": 303169536.0,
+        "vocabparallel_bytes": 1212678144.0,
+        "activation_term_elements": 301989888,
+        "scalar_term_elements": 1179648.0,
+        "ratio": 4.486109487629067,
+        "logits_elements_baseline": 1648361472,
+        "logits_elements_vocabparallel": 1648295936
+      },
+      {
+        "B": 32,
+        "T": 1024,
+        "N": 8,
+        "tokens_per_rank": 32768,
+        "global_tokens": 262144,
+        "baseline_elements": 68987520.0,
+        "baseline_bytes": 275950080.0,
+        "vocabparallel_elements": 353697792.0,
+        "vocabparallel_bytes": 1414791168.0,
+        "activation_term_elements": 352321536,
+        "scalar_term_elements": 1376256.0,
+        "ratio": 5.126982271576076,
+        "logits_elements_baseline": 1648361472,
+        "logits_elements_vocabparallel": 1648361472
+      }
+    ],
+    "bf16": [
+      {
+        "B": 4,
+        "T": 64,
+        "N": 7,
+        "tokens_per_rank": 256,
+        "global_tokens": 1792,
+        "baseline_elements": 67579611.42857143,
+        "baseline_bytes": 135159222.85714287,
+        "vocabparallel_elements": 2368512.0,
+        "vocabparallel_bytes": 4737024.0,
+        "activation_term_elements": 2359296,
+        "scalar_term_elements": 9216.0,
+        "ratio": 0.035047730372102084,
+        "logits_elements_baseline": 12877824,
+        "logits_elements_vocabparallel": 12877312
+      },
+      {
+        "B": 32,
+        "T": 1024,
+        "N": 7,
+        "tokens_per_rank": 32768,
+        "global_tokens": 229376,
+        "baseline_elements": 67579611.42857143,
+        "baseline_bytes": 135159222.85714287,
+        "vocabparallel_elements": 303169536.0,
+        "vocabparallel_bytes": 606339072.0,
+        "activation_term_elements": 301989888,
+        "scalar_term_elements": 1179648.0,
+        "ratio": 4.486109487629067,
+        "logits_elements_baseline": 1648361472,
+        "logits_elements_vocabparallel": 1648295936
+      }
+    ]
+  },
+  "sweep_for_plotting": {
+    "description": "ratio vs global tokens at N=7, for the crossover curve. Ratio is dimensionless and dtype-independent.",
+    "N": 7,
+    "points": [
+      {
+        "global_tokens": 7168,
+        "ratio": 0.14019092148840834,
+        "B": 1,
+        "T": 1024
+      },
+      {
+        "global_tokens": 14336,
+        "ratio": 0.2803818429768167,
+        "B": 2,
+        "T": 1024
+      },
+      {
+        "global_tokens": 21504,
+        "ratio": 0.420572764465225,
+        "B": 3,
+        "T": 1024
+      },
+      {
+        "global_tokens": 28672,
+        "ratio": 0.5607636859536334,
+        "B": 4,
+        "T": 1024
+      },
+      {
+        "global_tokens": 43008,
+        "ratio": 0.84114552893045,
+        "B": 6,
+        "T": 1024
+      },
+      {
+        "global_tokens": 57344,
+        "ratio": 1.1215273719072667,
+        "B": 8,
+        "T": 1024
+      },
+      {
+        "global_tokens": 86016,
+        "ratio": 1.6822910578609,
+        "B": 12,
+        "T": 1024
+      },
+      {
+        "global_tokens": 114688,
+        "ratio": 2.2430547438145334,
+        "B": 16,
+        "T": 1024
+      },
+      {
+        "global_tokens": 172032,
+        "ratio": 3.3645821157218,
+        "B": 24,
+        "T": 1024
+      },
+      {
+        "global_tokens": 229376,
+        "ratio": 4.486109487629067,
+        "B": 32,
+        "T": 1024
+      },
+      {
+        "global_tokens": 344064,
+        "ratio": 6.7291642314436,
+        "B": 48,
+        "T": 1024
+      },
+      {
+        "global_tokens": 458752,
+        "ratio": 8.972218975258134,
+        "B": 64,
+        "T": 1024
+      }
+    ]
+  },
+  "memory": {
+    "note": "vocab-parallel leaves the logits buffer BYTE-IDENTICAL: N*B*T*(V_p/N) = B*T*V_p",
+    "wte_param_residency_MiB": {
+      "baseline_z3_embed_window": 150.380859375,
+      "vocabparallel_N7": 21.053571428571427,
+      "vocabparallel_N8": 18.421875,
+      "tiling_8": 18.421875,
+      "tiling_16": 9.2109375,
+      "tiling_64": 2.302734375
+    },
+    "logits_buffer_MiB_B32_T1024": {
+      "fp32": 6288.0,
+      "bf16": 3144.0
+    }
+  }
+}
