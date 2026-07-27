@@ -294,6 +294,20 @@ def test_input_amax_steady_state_ignores_current_spike_gpu() raises:
          -- full-file summary "4 passed , 1 failed".
       3. llmm/matmul.mojo restored; `git diff --stat llmm/` empty
          afterward.
+      4. Mutation (2) is a real catch, but it trips the setup-assumption
+         guard rather than the substantive assertion -- it proves the test
+         notices a state that stopped advancing, not that it notices a
+         steady state computing the WRONG scale. So a second, sharper
+         mutation was run against the branch itself: `_scale_from_history`
+         (llmm/amax.mojo, `if step < history_len:`) forced to `if True:`,
+         i.e. steady state behaves like warmup and uses this step's own
+         amax. The `step` bookkeeping is untouched and the setup guard
+         passes, so the discriminating assertion is what fires: FAIL --
+         "steady-state input scale 4.172325e-07 != history-derived expected
+         0.013671875 (relative error 0.9999695; this step's own spike amax
+         was 1073741800.0)". 4.17e-07 is exactly `FMT_MAX * MARGIN / 2^30`,
+         the spike-derived value. The four site tests passed in the same
+         run. llmm/amax.mojo restored, diff empty.
     """
     if not has_nvidia_gpu_accelerator():
         return
