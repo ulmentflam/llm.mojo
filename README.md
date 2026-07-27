@@ -8,6 +8,13 @@ This is my port of Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c),
 
 See [llm.c](https://github.com/karpathy/llm.c) for a detailed explanation of the original project.
 
+<img src="docs/bench.gif" width="800" alt="make verify passing the CPU and Metal GPU correctness gates, then a 40-step llm.c-matching training run on Tiny Shakespeare with the loss falling and a generated sample" />
+
+*Real time (2x where marked, M4 Max). `make verify` checks every gradient tensor and a 10-step loss
+trajectory against PyTorch, then `make train ARGS='-x 40 -b 4 -t 64 -l 1e-4 -m 5 -s 40'` reproduces
+llm.c's canonical 40-step run batch-for-batch (same mt19937 shuffle order; val loss 5.3255 → 4.2922
+vs llm.c's 5.3255 → 4.2915).*
+
 > **Note**: This project is based on nightly Mojo 1.0.0b3 release.
 
 ## Installation
@@ -45,7 +52,7 @@ skipped, not fatal, if not found):
 make install
 ```
 
-If you have CUDA available and installed (beyond the scope of this file), use
+If you have CUDA installed (setup is beyond the scope of this file), use
 the CUDA-enabled equivalent instead:
 ```bash
 make install-cuda
@@ -106,7 +113,7 @@ for a full worked example.
 
 Benchmark Results: (NVIDIA DGX Spark)
 
-Average training loop times across llm.mojo, llm.c, and PyTorch, all with matched hyperparameters in an apples-to-apples comparison. llm.c runs OpenMP-enabled with 20 threads. CPU comparisons are float32, and GPU comparisons run both float32 and bfloat16. On Apple Silicon, `make benchmark-metal` runs llm.mojo (Metal GPU) against PyTorch MPS (llm.c has no Metal port, so PyTorch MPS fills in as the baseline). See the [Apple Silicon (Metal GPU)](#apple-silicon-metal-gpu) section for those results.
+Average training loop times across llm.mojo, llm.c, and PyTorch, all with matched hyperparameters. llm.c runs OpenMP-enabled with 20 threads. CPU comparisons are float32, and GPU comparisons run both float32 and bfloat16. On Apple Silicon, `make benchmark-metal` runs llm.mojo (Metal GPU) against PyTorch MPS (llm.c has no Metal port, so PyTorch MPS fills in as the baseline). See the [Apple Silicon (Metal GPU)](#apple-silicon-metal-gpu) section for those results.
 
 ### Single GPU
 
@@ -198,7 +205,7 @@ At the short benchmark length T=64 (same machine, same session), llm.mojo stays 
 
 On Apple Silicon, llm.mojo runs faster than PyTorch's Metal (MPS) path at both sequence lengths, while Apple's own MLX is faster than both. The difference is almost entirely the matmul, which is about 70% of a training step: on Metal, MAX's `linalg.matmul` runs bf16 at only about 1.1× its fp32 speed, while MLX's bf16 uses tensor cores for roughly 2× (see `bench_gemm.mojo` and [`docs/ai/metal_beat_mlx_campaign_2026-07-11.md`](docs/ai/metal_beat_mlx_campaign_2026-07-11.md)).
 
-Run `make benchmark-metal` to reproduce (add `BENCH_T=64` for the short-sequence table). It runs all six arms in one shot (llm.mojo fp32/bf16, PyTorch MPS fp32/bf16, MLX fp32/bf16) with 30 s cooldowns between them (the M4 throttles after about 8 s of sustained GPU load, so these are not optional). Correctness is gated by `make test`, which checks 16 gradient tensors plus the 10-step loss trajectory against PyTorch. The full gotcha catalog (address-space bugs, in-order queue semantics, threadgroup limits, the correctness campaign) is in [`docs/ai/metal_port_gotchas_and_optimizations.md`](docs/ai/metal_port_gotchas_and_optimizations.md), and the benchmarking setup is in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
+Run `make benchmark-metal` to reproduce (add `BENCH_T=64` for the short-sequence table). It runs all six arms in one shot (llm.mojo fp32/bf16, PyTorch MPS fp32/bf16, MLX fp32/bf16) with 30 s cooldowns between them (the M4 throttles after about 8 s of sustained GPU load, so these cooldowns are mandatory). Correctness is gated by `make test`, which checks 16 gradient tensors plus the 10-step loss trajectory against PyTorch. The full gotcha catalog (address-space bugs, in-order queue semantics, threadgroup limits, the correctness campaign) is in [`docs/ai/metal_port_gotchas_and_optimizations.md`](docs/ai/metal_port_gotchas_and_optimizations.md), and the benchmarking setup is in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
 ## Evaluation
 
@@ -208,11 +215,11 @@ This checkpoint is published on HuggingFace: **[ulmentflam/gpt2-124m-fineweb-moj
 
 !['HellaSwag Eval Comparison'](figures/hellaswag_eval_2026-07-10_1132_NVIDIA-GB10_DGX-Spark.png)
 
-Run `make benchmark-eval` to reproduce this chart (it runs `make eval` and computes the Wilson CI); pass `--k`/`--n` to `scripts/benchmark_eval.py` directly to re-render from a cached result instead of re-scoring the full 10,042-example split. GPT-2 124M original and GPT-3 Small are included as scale/methodology context, not statistical comparisons. See the script's docstring for why.
+Run `make benchmark-eval` to reproduce this chart (it runs `make eval` and computes the Wilson CI); pass `--k`/`--n` to `scripts/benchmark_eval.py` directly to re-render from a cached result instead of re-scoring the full 10,042-example split. I include GPT-2 124M original and GPT-3 Small as scale/methodology context, not statistical comparisons. See the script's docstring for why.
 
 ### Training-precision comparison: bf16, fp8, and NVFP4 from scratch at 124M and 774M
 
-To take the low-precision modes beyond benchmark numbers, we trained complete models with them: six from-scratch pretraining runs (GPT-2 124M and 774M, each in bf16, fp8, and NVFP4) on the FineWeb classic 10B-token sample, on a single 7-GPU node (7× RTX PRO 6000 Blackwell Max-Q 96GB, ZeRO-1 data parallel). Within each scale the runs share the identical recipe (same data order, schedule, tokens/step, seed, and hardware), so any delta is attributable to GEMM precision alone:
+To take the low-precision modes beyond benchmark numbers, we trained complete models with them: six from-scratch pretraining runs (GPT-2 124M and 774M, each in bf16, fp8, and NVFP4) on the FineWeb classic 10B-token sample, on a single 7-GPU node (7× RTX PRO 6000 Blackwell Max-Q 96GB, ZeRO-1 data parallel). Within each scale the runs share the identical recipe (same data order, schedule, tokens/step, seed, and hardware), so any delta comes from GEMM precision alone:
 
 | Model | Precision | Final val loss | HellaSwag acc_norm | Tokens/s (this box) | Checkpoint |
 |---|---|---|---|---|---|
@@ -223,9 +230,9 @@ To take the low-precision modes beyond benchmark numbers, we trained complete mo
 | GPT-2 774M | fp8 | 2.9967 | 37.06% (3722/10042) | ~102k² | [gpt2-774m-fineweb-fp8-mojo](https://huggingface.co/ulmentflam/gpt2-774m-fineweb-fp8-mojo) |
 | GPT-2 774M | nvfp4 | 3.0228 | 36.27% (3642/10042) | ~120k | [gpt2-774m-fineweb-nvfp4-mojo](https://huggingface.co/ulmentflam/gpt2-774m-fineweb-nvfp4-mojo) |
 
-¹ The published 124M bf16 checkpoint is the earlier single-GB10 run (val 3.2807, HS 29.53%); the 124M bf16 row above is its same-box 7-GPU twin, re-trained so the precision comparison is confound-free. ² The 774M fp8 tokens/s figure is not a fair comparison: most of that run executed under `MODULAR_DEBUG=device-sync-mode` as a mitigation for a multi-rank corruption bug that was found, root-caused, and properly fixed during the run. See [`docs/ai/fp8_multirank_nan_investigation.md`](docs/ai/fp8_multirank_nan_investigation.md).
+¹ The published 124M bf16 checkpoint is the earlier single-GB10 run (val 3.2807, HS 29.53%); the 124M bf16 row above is its same-box 7-GPU twin, re-trained so the precision comparison is confound-free. ² The 774M fp8 tokens/s figure is not a fair comparison: most of that run executed under `MODULAR_DEBUG=device-sync-mode` as a mitigation for a multi-rank corruption bug I found, root-caused, and fixed during the run. See [`docs/ai/fp8_multirank_nan_investigation.md`](docs/ai/fp8_multirank_nan_investigation.md).
 
-The result is that **fp8 training is quality-equivalent to bf16 at both scales**, and the 774M fp8 run even lands slightly ahead on both metrics, within noise. NVFP4 gives up a small but consistent quality margin at 124M (about 0.8% val loss) and closes to a statistical tie with bf16 at 774M (36.27% vs 36.34% on HellaSwag). Note the fp8 runs quantize every per-block linear GEMM while the NVFP4 recipe quantizes only the middle blocks' MLP forward GEMMs, so the two low-precision arms are not equally aggressive. Throughput on this box still favors bf16 at these model sizes; the quantize/scale overhead isn't amortized until larger GEMMs (see the scaling-sweep discussion under [Benchmarks](#benchmarks)). All six checkpoints are published in the [llm.mojo GPT-2 releases](https://huggingface.co/collections/ulmentflam/llmmojo-gpt-2-releases-6a51009ca7ef4e71b7ad7f2c) collection, each with safetensors plus the raw llm.mojo checkpoint.
+**fp8 training is quality-equivalent to bf16 at both scales**, and the 774M fp8 run even lands slightly ahead on both metrics, within noise. NVFP4 gives up a small but consistent quality margin at 124M (about 0.8% val loss) and closes to a statistical tie with bf16 at 774M (36.27% vs 36.34% on HellaSwag). Note the fp8 runs quantize every per-block linear GEMM while the NVFP4 recipe quantizes only the middle blocks' MLP forward GEMMs, so the two low-precision arms are not equally aggressive. Throughput on this box still favors bf16 at these model sizes; the quantize/scale overhead isn't amortized until larger GEMMs (see the scaling-sweep discussion under [Benchmarks](#benchmarks)). All six checkpoints are published in the [llm.mojo GPT-2 releases](https://huggingface.co/collections/ulmentflam/llmmojo-gpt-2-releases-6a51009ca7ef4e71b7ad7f2c) collection, each with safetensors plus the raw llm.mojo checkpoint.
 
 !['Precision comparison: val loss'](figures/precision_valloss_2026-07-25_NVIDIA-RTX-PRO-6000-Blackwell-Max-Q-Workstation-Edition.png)
 
@@ -259,17 +266,17 @@ Future development includes:
 
 ## Motivation
 
-LLMs in Mojo without the need for PyTorch or CPython. Inspired by Karpathy's [llm.c](https://github.com/karpathy/llm.c), with a focus on proving out the viability of autograd in pure Mojo syntax. The focus is to reproduce GPT-2 and GPT-3 alongside a parallel PyTorch reference in `train_gpt*.py`.
+LLMs in Mojo without needing PyTorch or CPython. Inspired by Karpathy's [llm.c](https://github.com/karpathy/llm.c), with a focus on proving out the viability of autograd in pure Mojo syntax. The goal is to reproduce GPT-2 and GPT-3 alongside a parallel PyTorch reference in `train_gpt*.py`.
 
-A personal goal is to write all kernel and main Python code without any LSPs or LLMs, writing every algorithm (forward and backpropagation) from scratch. I received feedback recently that my "coding and math expertise" is not strong enough, and building out this framework is how I intend to strengthen those skills. Just like writing a compiler, writing the fundamentals of generative models from scratch sharpens both engineering and mathematics.
+A personal goal is to write all kernel and main Python code without any LSPs or LLMs, writing every algorithm (forward and backpropagation) from scratch. I received feedback recently that my "coding and math expertise" needs work, and building out this framework is how I intend to strengthen those skills. Just like writing a compiler, writing the fundamentals of generative models from scratch sharpens both engineering and mathematics.
 
-As part of that goal, I use NVIDIA Nsight and Perfetto for performance analysis and comparison against my PyTorch implementation of GPT-2. As the project evolves, I will include benchmarking results and other insights into the performance comparisons between Mojo, PyTorch, and even Karpathy's C implementation.
+As part of that goal, I use NVIDIA Nsight and Perfetto to analyze performance and compare it against my PyTorch implementation of GPT-2. As the project evolves, I will add benchmarking results and other insights comparing Mojo, PyTorch, and Karpathy's C implementation.
 
-To speed up testing, I used LLMs/AI to help write the test cases and accelerate their runtime. All of the code in `llmm/` and the root directory is written by hand, but the tests have been aided by LSPs and LLMs to accelerate writing them. I also use the formatter and compiler to typecheck, but that has always been the case.
+To speed up testing, I used LLMs/AI to help write the test cases and accelerate their runtime. I wrote all of the code in `llmm/` and the root directory by hand, but LSPs and LLMs helped write the tests. I also use the formatter and compiler to typecheck, as I always have.
 
 ## Agentic Optimizations
 
-After I reached functional success, my kernels were dramatically underperforming Karpathy and PyTorch. I did the initial profiling and caught that attention was the initial bottleneck. After a few attempts at writing a more optimal attention kernel, I decided to bring in AI agents. I started with Google Gemini, and after quickly running out of credits, moved to OpenCode and NVIDIA Nemotron 3 Ultra. When Nemotron 3 struggled for a few days on the optimization, I pivoted to Claude Opus (and more recently Fable), eventually reaching parity in bfloat16 (and later, with TF32 enabled on the fp32 GEMMs plus a round of backward-kernel fusion, pulling ~7% ahead of llm.c in float32 too). The full exploration is documented in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`. My initial results are documented below:
+After I reached functional success, my kernels were badly underperforming Karpathy and PyTorch. I profiled the code first and found attention was the bottleneck. After a few attempts at writing a better attention kernel, I decided to bring in AI agents. I started with Google Gemini, and after quickly running out of credits, moved to OpenCode and NVIDIA Nemotron 3 Ultra. When Nemotron 3 struggled for a few days on the optimization, I pivoted to Claude Opus (and more recently Fable), eventually reaching parity in bfloat16 (and later, with TF32 enabled on the fp32 GEMMs plus a round of backward-kernel fusion, pulling ~7% ahead of llm.c in float32 too). The full exploration is documented in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`. My initial results are documented below:
 
 !['Bad Times'](figures/benchmark_gpu_b4_t1024_2026-06-30_0909_NVIDIA-GB10_DGX-Spark.png)
 
