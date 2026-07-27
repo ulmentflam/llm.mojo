@@ -53,7 +53,14 @@ _MIB = 1024.0 * 1024.0
 
 
 def _mib(nbytes):
-    """Bytes as MiB, rounded to 3 decimals (sub-KiB resolution)."""
+    """Bytes as MiB, rounded to 3 decimals (sub-KiB resolution).
+
+    MiB here is strictly 2**20 bytes, never 10**6. Every `*_mib_*` key in the
+    output uses this basis. Reporting a size in one basis next to a rate in
+    another is a real defect class — it makes a number correct under one reading
+    and wrong under another with the reading unrecorded — so the basis is stated
+    at the source rather than left to a README.
+    """
     return round(nbytes / _MIB, 3)
 
 
@@ -345,6 +352,13 @@ def _run_stage(binary, world_size, stage, b, t, d, steps, timeout_s, extra):
         "tokens_per_step": tokens_per_step,
         "peak_mem_mib_per_gpu_raw": {str(k): v for k, v in sorted(peak.items())},
         "peak_mem_mib_per_gpu_delta": {str(k): v for k, v in sorted(delta.items())},
+        # NOTE the basis, which differs from mem_report's totals: this is a max
+        # OVER TIME (0.25 s sampling during the run) per GPU, then a max ACROSS
+        # GPUs, minus the pre-launch baseline. mem_report's exact_total_mib_max
+        # is a single point-in-time reading at the steady phase, maxed across
+        # ranks only. Both are defensible peaks — every quantity involved is
+        # monotonically non-decreasing during a run — but they are not the same
+        # reduction, and anything plotting them together should say so.
         "peak_mem_mib_max_delta": max(delta.values()) if delta else None,
         "num_gpus_touched": len(touched),
         # Exact, quantization-free companion to peak_mem_mib_* above: what the
@@ -716,6 +730,10 @@ def main():
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
         "host": host,
         "gpu": _gpu_name_raw() or None,
+        # Number of GPUs nvidia-smi ENUMERATES, not the number that work. A
+        # faulted card still enumerates (it just stops answering some queries),
+        # so on a box with dead hardware this over-counts usable devices. Read
+        # it as inventory, not capacity, and pin real runs by UUID.
         "gpu_count": len(_query_gpu_mem_mib()),
         "world_size": args.world_size,
         "flags": {"b": args.b, "t": args.t, "d": args.d, "steps": args.steps},
