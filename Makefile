@@ -1137,6 +1137,29 @@ test-cuda: test-mojo test-python-cuda
 # overran an 1800s cap), so 600s and 1800s were both false failures there.
 # Override per invocation with TEST_FILE_TIMEOUT=<seconds>.
 TEST_FILE_TIMEOUT ?= 2700
+
+# Which GPUs the multi-rank tests may use. Empty (the default) means "all of
+# them", which is right on healthy hardware.
+#
+# Set it when a box has a card that answers a light probe but wedges under
+# real multi-rank load. `tests/test_zero.mojo` maps rank -> device ordinal
+# directly, and CUDA renumbers ordinals into whatever CUDA_VISIBLE_DEVICES
+# lists, so naming the healthy cards here keeps the collectives tests off the
+# bad one. Prefer UUIDs to ordinals: CUDA silently renumbers around a faulted
+# GPU, so an ordinal does not name a fixed piece of hardware.
+#
+# Measured on workstation-max, where GPU 1's GSP firmware crashes under
+# multi-rank load (the same card the training launchers exclude by UUID):
+# test_zero.mojo runs in 3s across three healthy cards, and times out at the
+# 2700s cap when the faulty one is in the set. The failure is a hang, not an
+# error, so without this it costs a full 45-minute gate to discover.
+#
+#   make test TEST_CUDA_VISIBLE_DEVICES=GPU-08f7...,GPU-0fbc...,GPU-8ceb...
+TEST_CUDA_VISIBLE_DEVICES ?=
+ifneq ($(TEST_CUDA_VISIBLE_DEVICES),)
+export CUDA_VISIBLE_DEVICES = $(TEST_CUDA_VISIBLE_DEVICES)
+endif
+
 test-mojo: | $(PIXI_STAMP)
 	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
 		fail=0; \

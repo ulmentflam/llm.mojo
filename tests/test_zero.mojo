@@ -1048,6 +1048,17 @@ def test_multi_gpu_collectives_n3() raises:
     has_nvidia_gpu_accelerator()`, so the WORLD_SIZE=4 tests elsewhere in this
     file cannot cover them -- those exercise the separate CPU path.
 
+    RANK r RUNS ON DEVICE ORDINAL r. On a box with a card that answers a
+    light probe but wedges under real multi-rank load, that walks straight
+    onto it: on workstation-max, whose GPU 1 has crashing GSP firmware, this
+    file runs in 3 s across three healthy cards and HANGS past the 2700 s
+    per-file cap when device 1 is in the set. The probe below cannot see it
+    coming -- allocating a buffer and synchronising is exactly the kind of
+    light touch that card survives. Name the healthy cards via
+    `make test TEST_CUDA_VISIBLE_DEVICES=<uuids>`; CUDA renumbers ordinals
+    into whatever that lists. Use UUIDs, not ordinals, because CUDA silently
+    renumbers around a faulted GPU.
+
     VALIDATED AGAINST THE BUG. Rewriting all six sites to `% 2` (identical
     behaviour at N=2, wrong from N=3 up) and rebuilding: the N=2 test still
     passes and this one never returns -- it HANGS. With the wrong modulus a
