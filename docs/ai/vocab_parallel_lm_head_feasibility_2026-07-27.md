@@ -19,19 +19,23 @@ found along the way that matter more than the original question.
   reaches the **same** memory residency at **1.00x** communication, while
   vocabulary-parallelism reaches it at **1.15x-5.13x**. No member of the
   family is a good trade at production shape.
-- **The break-even is exact and dtype-independent:** vocabulary-parallelism
-  wins **iff `N·B·T < V_p`** — iff *global* tokens per micro-step are below
-  50,304. We train at 229,376. We are **4.486x** on the wrong side.
+- **The break-even depends on one number only: global tokens per micro-step.**
+  The ratio reduces to `global_tokens · (C+3) / W`, in which the world size
+  `N` **cancels** — it enters only through `N·B·T`. Exact crossover:
+  **51,130 global tokens**; the memorable rule of thumb is `N·B·T = V_p`
+  (50,304), low by 1.6%. We train at 229,376 — **4.486x** on the wrong side.
 - **On this codebase the premise fails independently.** At world size 7,
   **four of seven ranks hold zero vocabulary rows**, and shard boundaries land
   mid-row (20259.75 rows).
 - **It is NOT blocked on numerics.** A distributed softmax would meet the 1e-5
   bar; the machinery is already in `llmm/softmax.mojo`. Recording this so the
   right conclusion doesn't get filed under the wrong reason.
-- **Two findings that outlive the question** (Check 4): the campaign's ~150 MiB
-  parameter win sits beside a **multi-GiB activation term that no workstream
-  touches**, and a correction to a claim this document previously made in its
-  own favour.
+- **The finding that outlives the question** (Check 4): the campaign's
+  ~150 MiB parameter win sits beside **multi-GiB activation terms that no
+  workstream in flight touches** — `logits` at 42x it and `att_probs` at 123x.
+- **Two corrections are recorded in-text rather than silently applied**
+  (Check 4), both to claims this document made in its own favour. The pattern
+  they share is worth more than either fix and is named there.
 - **Vocabulary-parallelism is not novel.** It is Megatron-LM's, from 2019
   [Megatron-LM]. The contribution here is evaluating it *inside a ZeRO
   data-parallel trainer* — a setting Megatron does not target.
@@ -182,15 +186,33 @@ Per rank, per micro-step, in elements:
     baseline        = 2 · W · (N-1)/N,        W = 39,421,440
     vocab-parallel  = 2 · (N-1) · B·T·C  +  3 · 2(N-1)/N · N·B·T
 
-Dropping the negligible scalar term, the ratio collapses:
+Keeping the scalar term rather than dropping it, `(N-1)` and `N` both cancel
+and the ratio collapses to something strikingly simple:
 
-    vocab-parallel     2(N-1)·B·T·C        N·B·T·C     N·B·T
-    ──────────────  =  ────────────   =    ───────  ≈  ─────
-    baseline           2W(N-1)/N              W          V_p
+    vocab-parallel     2(N-1)·B·T·(C+3)     N·B·T·(C+3)     global_tokens
+    ──────────────  =  ────────────────  =  ───────────  =  ─────────────
+    baseline             2W(N-1)/N               W              51,130
 
-**Break-even: `N·B·T = V_p`.** Note what is *absent*: bandwidth, dtype, element
-size. Both sides move bytes over the same links by the same mechanism, so all
-of it cancels. **The verdict does not depend on any measured rate.**
+**The world size `N` cancels.** It enters *only* through `N·B·T`. So the
+answer does not depend on how many ranks you have, nor on how the tokens
+divide between batch and sequence length — **only on the total number of
+tokens processed per micro-step across the whole job.** Every shape in the
+accompanying JSON, spanning N = 2, 4, 7 and 8, lies on this one line.
+
+**Exact break-even: 51,130 global tokens per micro-step.** The memorable form
+is `N·B·T = V_p` = 50,304, which is low by 1.6%. Two effects account for the
+gap and they pull opposite ways: the gathered window `W` is `C·(V_p + 1026)`,
+slightly *more* than `V_p·C` because it also carries `wpe` and the final
+LayerNorm (pushes the crossover right); and the `+3` beside `C` is the three
+per-token all-reduces of the distributed softmax (pushes it left). Net +1.6%.
+
+Recording this precisely because it moves the crossover *right*, i.e. it makes
+vocabulary-parallelism look marginally **better** than the rule of thumb —
+consistent with the rest of this model's bias (see below).
+
+Note what is *absent* from the ratio: bandwidth, dtype, and element size. Both
+sides move bytes over the same links by the same mechanism, so all of it
+cancels. **The verdict does not depend on any measured rate.**
 
 | shape | N | baseline | vocab-parallel | ratio |
 |---|---|---|---|---|
@@ -269,6 +291,37 @@ At benchmark shape the ordering reverses for every `g`, consistent with the
 break-even. Same technique, same code, opposite conclusion — driven purely by
 shape.
 
+### N=8 above is illustrative. On this hardware the family is degenerate.
+
+The table uses N=8 because 8 has the divisors that make the *trend* visible.
+**This box cannot run N=8** — it has 8 GPUs installed but physical index 1 is
+dead hardware, so **7 are usable**, and the production world size is 7.
+
+Seven is prime. With equal groups, `g` must divide `N`, so at N=7 the entire
+family is just:
+
+| g | groups | meaning | production ratio |
+|---|---|---|---|
+| 1 | 7 | today's design | 1.00x |
+| 7 | 1 | full vocabulary-parallelism | **4.486x** |
+
+There is no intermediate configuration. Every middle row of the N=8 table —
+the ones where grouped vocabulary-parallelism looked least bad — **does not
+exist at the world size we actually run.** The only non-trivial member
+available is the one Check 1 already rejected.
+
+So the honest reading is that the steelman *generalisation* is what makes the
+argument durable (it shows no `g` is a good trade, on any machine), while on
+*this* machine the question never had more than one answer to begin with.
+Unequal groups (say 3+2+2) are conceivable in principle, but every collective
+in `zero.mojo` assumes a uniform partition (Check 6), so that is another
+re-architecture rather than an escape hatch.
+
+*Recorded because an earlier draft presented the N=8 table without noting it
+is unrunnable here — the same 8-vs-7 assumption that Team M found in their own
+writeup and benchmark output. Worth checking for; it is easy to carry a
+world size from a model into a claim about hardware.*
+
 ## Check 3 — and on this codebase, the premise fails too
 
 Check 2 is the general result. This is the concrete confirmation: the specific
@@ -339,6 +392,16 @@ full because the erroneous version flattered the option this document
 recommends, and a reader who watches a convenient claim vanish silently learns
 nothing.
 
+**A second correction, same reason.** An earlier draft also claimed nobody had
+looked at `att_probs`. That was likewise false — the Store-P tradeoff is
+documented in-code, the recompute alternative is implemented and verified, and
+keeping the store was a measured decision, not an oversight. Both errors have
+the same shape: a claim about *someone else's* work, asserted from absence of
+evidence rather than evidence of absence, in a direction that made this
+document's own narrative tidier. "Nobody has looked at X" is a claim about the
+whole codebase and should be held to the same standard as a claim about a
+number. Corrected in the bullet above.
+
 ### The finding that outlives the original question
 
 Chasing that correction surfaced the real memory picture. At B=32, T=1024,
@@ -365,8 +428,22 @@ Both larger terms are addressable with known recipes:
   recompute at ~+10% step time. The obstacle is that `fused_classifier` writes
   `dlogits` in place into `acts.logits`, and a chunked design has no full
   buffer to write into. *Now commissioned as phase 2 of Team L's workstream.*
-- **`att_probs`** — three times larger still, and as far as this study can
-  tell, nobody has looked at it. Flagged, not investigated.
+- **`att_probs`** — three times larger still. This *has* been looked at, and
+  an earlier draft of this document wrongly said it hadn't (second correction
+  above). The
+  forward stores the softmax probabilities so the backward can avoid
+  recomputing `QKᵀ` ("Store-P"), and the alternative already exists and is
+  correctness-verified: setting `kv_cache.att_probs_addr = 0` takes the true
+  per-layer recompute path (`train_gpt2.mojo:2782-2801`,
+  `llmm/attention.mojo:4547-4562`). Keeping the store was a deliberate,
+  measured decision — **+3.5% step time** to recompute (fp32 736.6→762.9 ms,
+  bf16 587.1→606.8 ms). But that measurement was taken **on Metal at B=4,
+  T=1024**, and no CUDA equivalent appears to exist. The comment names its own
+  trigger condition: *"if T-scaling (att_probs grows as T²) ever makes the
+  store dominate."* At B=32, T=1024 on CUDA — 18,432 MiB, the largest single
+  tensor on the card — that condition is demonstrably met, on hardware and at
+  a batch size 8x larger than where the trade was last evaluated. Re-testing
+  it is one assignment and a rerun.
 
 ## Check 5 — numerics (NOT a blocker)
 
@@ -483,12 +560,52 @@ Stated positively — the technique is sound in its own setting:
 - **Modelled, not measured:** every communication byte count. **The ratio —
   and therefore the verdict — is bandwidth-independent**, because both sides
   move bytes over the same links by the same mechanism. Milliseconds are
-  deliberately omitted; they would require a bandwidth anchor and would not
-  move the crossover.
-- **Not built:** no prototype. The verdict is a "no", so a prototype would
-  have measured a design we do not want. A collective-timing harness
-  (`bench_collectives.mojo`) *was* built, because the repo had none and the
-  ~75 GB/s claim in `llmm/zero.mojo` had never been reproducible.
+  deliberately omitted from the tables; they would require a bandwidth anchor
+  and would not move the crossover.
+- **Measured by this workstream**, with `bench_collectives.mojo` (new; the
+  repo had no collective-timing harness, and the `~75 GB/s` claim in
+  `llmm/zero.mojo` had never been reproducible).
+
+  **What measuring bought, given the verdict is already
+  bandwidth-independent:** it tests the part the verdict *does* rest on — the
+  volume factors. The model says one embed-window round trip moves
+  `2·W·(N-1)/N` = 150.4 MiB per rank at N=2. The measured all-gather +
+  reduce-scatter of that buffer takes 3.715 + 3.841 = 7.556 ms, implying
+  **20.87 GB/s**, against an independently measured plateau of **~21.0 GB/s**
+  — **agreement to 0.6%**. That upgrades the claim from "the algebra is
+  right" to "the algebra predicts wall clock."
+
+  Full sweep, at WORLD_SIZE=2, fp32, min-of-10 after 3 warmup, GPUs pinned by
+  UUID:
+
+  | buffer | allreduce | reducescatter | allgather |
+  |---|---|---|---|
+  | 0.75 MiB | 0.117 ms (6.7 GB/s) | 0.059 ms (6.6) | 0.054 ms (7.2) |
+  | 150.4 MiB (the ZeRO-3 embed window) | 7.411 ms (21.3) | 3.841 ms (20.5) | 3.715 ms (21.2) |
+  | 474.8 MiB (full parameter vector) | 23.650 ms (21.1) | 12.367 ms (20.1) | 11.596 ms (21.5) |
+
+  (Bandwidth here is **decimal GB/s = 10⁹ B/s**, buffers are **MiB = 2²⁰ B**.
+  The emitted JSON names the unit in every key and carries exact integer
+  `buffer_bytes` and `bytes_moved_per_rank`, because the same row reads 21.2
+  or 19.7 depending on convention — a 7.4% gap, larger than several effects
+  this campaign argues about.)
+
+  Per-rank bandwidth plateaus near **~21 GB/s** above ~24 MiB and collapses
+  below ~6 MiB — small collectives are **latency-bound**. This is the
+  asymmetry assumed in Check 1, now measured rather than asserted, and it
+  confirms the benchmark-shape figures are the *optimistic* end for the option
+  being rejected.
+- **Deliberately NOT claimed:** that the `~75 GB/s` / `~92 ms` docstring figure
+  is confirmed or refuted. That figure is for **N=8**; this study could only
+  measure **N=2**, and per-rank bandwidth falls as `N` grows. ~21 GB/s at N=2
+  is *consistent* with ~9.4 GB/s per rank at N=8 without establishing it.
+  Overwriting one unsupported number with a number from a different world size
+  would just relocate the problem. Note also that **this box has 7 usable
+  GPUs, not 8** — physical index 1 is dead hardware — so the N=8 figure is not
+  re-measurable here at all. The docstring now says so, carries the measured
+  N=2 values, and marks the N=8 claim unverified.
+- **Not built:** no prototype of vocabulary-parallelism. The verdict is a
+  "no", so a prototype would have measured a design we do not want.
 
 Machine-readable cost model, including the full grouped-family sweep:
 `docs/ai/data/vocab_parallel_cost_model_2026-07-27.json`.

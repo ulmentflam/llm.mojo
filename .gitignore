@@ -209,3 +209,7 @@ _deps
 # Training run logs and dataset download logs
 logs/
 data/*.log
+
+# Raw stdout from `make benchmark-collectives`; the parsed JSON beside it is
+# the artifact worth keeping.
+zero/bench/*.log

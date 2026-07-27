@@ -11,7 +11,8 @@
       "value_gib_s_per_rank": 8.8,
       "status": "UNVERIFIED - derived from a prose docstring at llmm/zero.mojo:257-260 (~75 GB/s aggregate, ~92 ms for the full fp32 gradient allreduce at N=8). The repo contains NO reproducible collective-timing harness. Do NOT present as measured."
     },
-    "charitable_model_note": "Every modelling choice bends TOWARD vocab-parallelism: per-collective latency/barrier costs are ignored (which penalises the small-volume side, i.e. overstates the benchmark-shape win, not the production-shape loss), and the extra B*T*C forward all-reduce required by a vocab-parallel ENCODER (Megatron-LM Sec 3) is omitted entirely. The option still loses 4.486x at production shape."
+    "charitable_model_note": "Every modelling choice bends TOWARD vocab-parallelism: per-collective latency/barrier costs are ignored (which penalises the small-volume side, i.e. overstates the benchmark-shape win, not the production-shape loss), and the extra B*T*C forward all-reduce required by a vocab-parallel ENCODER (Megatron-LM Sec 3) is omitted entirely. The option still loses 4.486x at production shape.",
+    "hardware": "workstation-max: 8 GPUs installed, 7 usable. Physical index 1 (GPU-e9c166f6-...) is dead hardware (GSP faults at idle). World-size-8 is NOT measurable on this machine, so any N=8 figure here - including the ~75 GB/s docstring claim in llmm/zero.mojo - is modelled or historical, never freshly measured. Measurements in this campaign were taken at N=2."
   },
   "constants": {
     "V_p": 50304,
@@ -474,6 +475,7 @@
         "tiling_same_residency_MiB": 18.421875,
         "tiling_comm_ratio": 1.0
       }
-    ]
+    ],
+    "hardware_caveat": "The g=2/4/8 rows are modelled at N=8 because 8 has the divisors that make the trend visible. THIS BOX CANNOT RUN N=8: 8 GPUs are installed but physical index 1 is dead hardware, so 7 are usable and the production world size is 7. Seven is PRIME, so with equal groups g must divide N and the family at N=7 admits only g=1 (today, 1.00x) and g=7 (full vocab-parallelism, 4.486x). Every intermediate row below - the ones where grouped vocab-parallelism looks least bad - does not exist at the world size we actually run. Unequal groups are conceivable but every collective in zero.mojo assumes a uniform partition, so that is a re-architecture, not an escape hatch."
   }
 }
