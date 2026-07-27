@@ -10,7 +10,8 @@
     "bandwidth_anchor": {
       "value_gib_s_per_rank": 8.8,
       "status": "UNVERIFIED - derived from a prose docstring at llmm/zero.mojo:257-260 (~75 GB/s aggregate, ~92 ms for the full fp32 gradient allreduce at N=8). The repo contains NO reproducible collective-timing harness. Do NOT present as measured."
-    }
+    },
+    "charitable_model_note": "Every modelling choice bends TOWARD vocab-parallelism: per-collective latency/barrier costs are ignored (which penalises the small-volume side, i.e. overstates the benchmark-shape win, not the production-shape loss), and the extra B*T*C forward all-reduce required by a vocab-parallel ENCODER (Megatron-LM Sec 3) is omitted entirely. The option still loses 4.486x at production shape."
   },
   "constants": {
     "V_p": 50304,
@@ -355,5 +356,124 @@
       "fp32": 6288.0,
       "bf16": 3144.0
     }
+  },
+  "steelman_grouped_vocab_parallel": {
+    "description": "Partial vocab-parallelism: partition N ranks into G=N/g groups of g; split the vocabulary across the g members within a group and replicate across groups. g is a free parameter (g=1 is today, g=N is the extreme form). Evaluated so the rejection is not an artifact of only testing the extreme.",
+    "formulas": {
+      "activations": "2*(g-1)*B*T*C",
+      "cross_group_dwte": "2*(G-1)/G * (wte/g)  -- every vocab row is owned by one rank in EVERY group, so its gradient must still be reduced across groups; vanishes only at g=N",
+      "residency": "wte/g"
+    },
+    "finding": "At production shape TILING DOMINATES POINTWISE: for every g, tiling with t=g tiles reaches the identical residency wte/g at 1.00x communication, while grouped vocab-parallelism reaches it at 1.15x (g=2), 2.34x (g=4), 5.13x (g=8). No value of g is a good trade. Tiling also extends past t=N (16, 64 tiles) which vocab-parallelism cannot reach since g<=N.",
+    "rows": [
+      {
+        "shape": "benchmark",
+        "B": 4,
+        "T": 64,
+        "N": 8,
+        "g": 2,
+        "groups": 4,
+        "comm_elements": 29369856.0,
+        "comm_MiB": 112.037109375,
+        "ratio_vs_baseline": 0.42572708802983494,
+        "activation_term_elements": 393216,
+        "cross_group_dwte_elements": 28975104.0,
+        "residency_elements": 19316736.0,
+        "residency_MiB": 73.6875,
+        "tiling_equivalent_tiles": 2,
+        "tiling_same_residency_MiB": 73.6875,
+        "tiling_comm_ratio": 1.0
+      },
+      {
+        "shape": "benchmark",
+        "B": 4,
+        "T": 64,
+        "N": 8,
+        "g": 4,
+        "groups": 2,
+        "comm_elements": 10842624.0,
+        "comm_MiB": 41.361328125,
+        "ratio_vs_baseline": 0.15716790515154044,
+        "activation_term_elements": 1179648,
+        "cross_group_dwte_elements": 9658368.0,
+        "residency_elements": 9658368.0,
+        "residency_MiB": 36.84375,
+        "tiling_equivalent_tiles": 4,
+        "tiling_same_residency_MiB": 36.84375,
+        "tiling_comm_ratio": 1.0
+      },
+      {
+        "shape": "benchmark",
+        "B": 4,
+        "T": 64,
+        "N": 8,
+        "g": 8,
+        "groups": 1,
+        "comm_elements": 2763264.0,
+        "comm_MiB": 10.541015625,
+        "ratio_vs_baseline": 0.040054548996688095,
+        "activation_term_elements": 2752512,
+        "cross_group_dwte_elements": 0.0,
+        "residency_elements": 4829184.0,
+        "residency_MiB": 18.421875,
+        "tiling_equivalent_tiles": 8,
+        "tiling_same_residency_MiB": 18.421875,
+        "tiling_comm_ratio": 1.0
+      },
+      {
+        "shape": "production",
+        "B": 32,
+        "T": 1024,
+        "N": 8,
+        "g": 2,
+        "groups": 4,
+        "comm_elements": 79503360.0,
+        "comm_MiB": 303.28125,
+        "ratio_vs_baseline": 1.152431048398319,
+        "activation_term_elements": 50331648,
+        "cross_group_dwte_elements": 28975104.0,
+        "residency_elements": 19316736.0,
+        "residency_MiB": 73.6875,
+        "tiling_equivalent_tiles": 2,
+        "tiling_same_residency_MiB": 73.6875,
+        "tiling_comm_ratio": 1.0
+      },
+      {
+        "shape": "production",
+        "B": 32,
+        "T": 1024,
+        "N": 8,
+        "g": 4,
+        "groups": 2,
+        "comm_elements": 161243136.0,
+        "comm_MiB": 615.09375,
+        "ratio_vs_baseline": 2.3372797862569925,
+        "activation_term_elements": 150994944,
+        "cross_group_dwte_elements": 9658368.0,
+        "residency_elements": 9658368.0,
+        "residency_MiB": 36.84375,
+        "tiling_equivalent_tiles": 4,
+        "tiling_same_residency_MiB": 36.84375,
+        "tiling_comm_ratio": 1.0
+      },
+      {
+        "shape": "production",
+        "B": 32,
+        "T": 1024,
+        "N": 8,
+        "g": 8,
+        "groups": 1,
+        "comm_elements": 353697792.0,
+        "comm_MiB": 1349.25,
+        "ratio_vs_baseline": 5.126982271576076,
+        "activation_term_elements": 352321536,
+        "cross_group_dwte_elements": 0.0,
+        "residency_elements": 4829184.0,
+        "residency_MiB": 18.421875,
+        "tiling_equivalent_tiles": 8,
+        "tiling_same_residency_MiB": 18.421875,
+        "tiling_comm_ratio": 1.0
+      }
+    ]
   }
 }
