@@ -403,7 +403,8 @@ so each rank could score its vocabulary slice against every rank's tokens.
 
 That comparison was evaluated separately during this campaign and came back
 negative: the ZeRO-3 shard boundary does not align usefully with `wte` rows
-(at 7 ranks, four ranks hold zero vocabulary rows and boundaries land mid-row),
+(at 7 ranks, four of seven ranks hold zero vocabulary rows at all; boundaries
+are additionally fractional at N=4 and N=8, though not at N=7),
 and the activation all-gather only pays when `N·B·T < V_p` — a communication
 regression at production shape. The useful structural statement from that
 analysis is that **under data parallelism, vocab-parallelism minus the

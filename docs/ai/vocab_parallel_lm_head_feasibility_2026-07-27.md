@@ -25,8 +25,15 @@ found along the way that matter more than the original question.
   **51,130 global tokens**; the memorable rule of thumb is `N·B·T = V_p`
   (50,304), low by 1.6%. We train at 229,376 — **4.486x** on the wrong side.
 - **On this codebase the premise fails independently.** At world size 7,
-  **four of seven ranks hold zero vocabulary rows**, and shard boundaries land
-  mid-row (20259.75 rows).
+  **four of seven ranks hold zero vocabulary rows** — `wte` is 31% of the
+  parameter vector, so a flat equal split gives it only the first three shards.
+  (Corrected: an earlier draft added "and boundaries land mid-row (20259.75
+  rows)" here. That is an **N=8** figure. At N=7 the shard is 17,782,272
+  elements = **exactly 23,154 rows**, so every boundary *is* row-aligned; the
+  fractional case arises at N=4 (40519.5) and N=8 (20259.75). The
+  four-of-seven finding stands on its own and does not need it. This is the
+  installed-vs-usable basis error this document itself names, committed inside
+  the document that names it.)
 - **It is NOT blocked on numerics.** A distributed softmax would meet the 1e-5
   bar; the machinery is already in `llmm/softmax.mojo`. Recording this so the
   right conclusion doesn't get filed under the wrong reason.
