@@ -167,7 +167,7 @@ $(PIXI_STAMP):
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal benchmark-zero \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
-        test test-cpu test-cuda test-python test-mojo test-fixtures smoke \
+        test test-cpu test-cuda test-python test-mojo test-fixtures smoke gate \
         verify verify-cpu verify-gpu verify-gpu-tf32 \
         docs docs-clean
 
@@ -1116,6 +1116,30 @@ test-python-cuda: build-mojo
 # MERGE STILL REQUIRES the full `make format lint check test`. Passing smoke
 # is necessary, never sufficient.
 # ---------------------------------------------------------------------------
+# The full merge gate, serialized box-wide by an flock so only one suite runs
+# on the machine at a time. This is a speed measure, not bureaucracy: MAX
+# compiles are already multi-threaded, so concurrent suites oversubscribe the
+# cores rather than pipeline -- four teams each run ~4x slower, and every
+# duration measured on a loaded box is meaningless. Pass/fail survives a loaded
+# box; timings do not.
+#
+# `scripts/llm-mojo-gate.sh status` shows who holds the lock. Note that child
+# processes INHERIT the flock file descriptor, so an orphaned `make test` keeps
+# holding the lock after the runner that started it has died -- `status` scans
+# /proc/*/fd for the processes really holding it instead of trusting the
+# recorded PID. Reclaim from an orphan gracefully (kill -INT, wait, -TERM);
+# never SIGKILL a multi-rank run, it hangs GPU firmware.
+#
+# Zero-install equivalent, identical locking without the holder reporting:
+#     flock /tmp/llm-mojo-gate.lock make test
+#
+# Do NOT lock short targeted runs (`make smoke`, one test file, a GEMM sweep).
+# A lock that is inconvenient is a lock nobody takes.
+GATE_LOCK_RUNNER := scripts/llm-mojo-gate.sh
+
+gate:
+	$(GATE_LOCK_RUNNER) run $(MAKE) format lint check test
+
 SMOKE_PYTEST := tests/test_encoder_equivalence.py \
                 tests/test_matmul_equivalence.py \
                 tests/test_fused_classifier_equivalence.py \
