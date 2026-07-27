@@ -1026,13 +1026,6 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
 
 
 def test_multi_gpu_collectives() raises:
-    """GPU collectives at N=2."""
-    if not _gpu_multirank_available(2):
-        return
-    _run_gpu_collectives[2]()
-
-
-def test_multi_gpu_collectives_n3() raises:
     """GPU collectives at N=3 -- the smallest world size that is not degenerate.
 
     Every staged-copy collective walks its peers as `(self.rank + step) %
@@ -1047,6 +1040,30 @@ def test_multi_gpu_collectives_n3() raises:
     Every one of those six sites is inside `comptime if
     has_nvidia_gpu_accelerator()`, so the WORLD_SIZE=4 tests elsewhere in this
     file cannot cover them -- those exercise the separate CPU path.
+
+    N=3 ONLY, DELIBERATELY. This briefly ran at both N=2 and N=3, and the N=2
+    instantiation was removed as redundant: `ZeroContext` guards every
+    collective with `comptime if Self.N >= 2` and special-cases nothing at
+    N == 2, so N=3 reaches the same branches plus the peer arithmetic N=2
+    cannot distinguish. Keeping it cost a second full instantiation of this
+    function -- `ZeroContext["gpu", N]` and all five collectives, again -- and
+    `ZeroContext`'s world size is a compile-time struct parameter
+    (`struct ZeroContext[target: StaticString, N: Int = 1]`), so two world
+    sizes genuinely means two copies of the generated code. There is no
+    runtime-parameterized version of this test to fold them into without
+    changing production.
+
+    The cost was not marginal: with both instantiations `mojo run` spent 18+
+    minutes compiling this one file, against 1-9 seconds for every other test
+    file in the suite. One instantiation puts it back where it started while
+    strictly improving coverage over the original N=2-only test.
+
+    The trade: a box with exactly 2 GPUs now skips GPU collective coverage
+    entirely, where it used to run at N=2. That is the right call here --
+    an N=2 run is the degenerate case this test exists to stop trusting --
+    but it does mean "green on a 2-GPU box" says nothing about the
+    collectives, and `_gpu_multirank_available` says so out loud when it
+    skips.
 
     RANK r RUNS ON DEVICE ORDINAL r. On a box with a card that answers a
     light probe but wedges under real multi-rank load, that walks straight
@@ -1172,8 +1189,7 @@ def main() raises:
     # Probe BEFORE building the suite: `_gpu_multirank_available` can raise,
     # and a TestSuite must be consumed by `run()` on every path, so it must
     # not be live across a raising call.
-    var multirank_ok = _gpu_multirank_available(2)
-    var multirank_ok_n3 = _gpu_multirank_available(3)
+    var multirank_ok = _gpu_multirank_available(3)
 
     var suite = TestSuite.discover_tests[__functions_in_module()]()
 
@@ -1195,7 +1211,5 @@ def main() raises:
     # has to live here in main() rather than inside the test body.
     if not multirank_ok:
         suite.skip[test_multi_gpu_collectives]()
-    if not multirank_ok_n3:
-        suite.skip[test_multi_gpu_collectives_n3]()
 
     suite^.run()
