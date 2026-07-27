@@ -116,13 +116,19 @@ The gradient then flows two ways out of the LM head — into the hidden states
 batch × sequence:
 
 ```
-B=4,  T=1024:   4096 × 50304 × 4 bytes =   824 MiB
-B=32, T=1024:  32768 × 50304 × 4 bytes =  6288 MiB  ← production shape here
+B=4,  T=1024:   4096 × 50304 × 4 bytes =   824,180,736 B =   786 MiB
+B=32, T=1024:  32768 × 50304 × 4 bytes = 6,593,445,888 B =  6288 MiB  ← production shape here
 ```
 
+(Every "MiB"/"GiB" in this document is binary — 1 MiB = 1048576 B — and every
+figure is given in bytes alongside so it can be checked. That matters here:
+phase 1's writeup reports this same B=4 buffer as "824 MiB", which is the
+decimal megabyte count wearing a binary label. 824,180,736 B is 786 MiB *or*
+824 MB, not 824 MiB.)
+
 Compare that with the thing this whole campaign originally set out to remove:
-the `wte` matrix itself is 50304 × 768 × 4 = **147 MiB**. The *activation* is
-roughly **40×** the *parameter*. That is the asymmetry that motivates this
+the `wte` matrix itself is 50304 × 768 × 4 = 154,533,888 B = **147 MiB**. The
+*activation* is **42.7×** the *parameter*. That is the asymmetry that motivates this
 change: the large-vocabulary output layer costs far more in transient activation
 than in weights, and it costs more the larger your batch is — precisely when you
 are already short of memory.
