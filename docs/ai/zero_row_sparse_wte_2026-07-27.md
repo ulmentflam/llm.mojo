@@ -453,53 +453,60 @@ same discipline the row map itself follows.
 
 This section exists so the gap is recorded rather than discovered later.
 
-`tests/wip_encoder_row_sparse.mojo` is committed but is **deliberately named
-outside the `tests/test_*.mojo` glob**, so `make test-mojo` does not run it. It
-currently **deadlocks** (confirmed: `timeout 480` → exit 124, no test output).
-It is kept out because a hanging test in the glob burns the full
-`TEST_FILE_TIMEOUT` (2700s) and blocks every other team's gate runs, which is a
-worse outcome than a documented gap.
+`tests/test_encoder_row_sparse.mojo` is in the gate glob and green (5 tests,
+~1.5 s). It covers, with **divergent per-rank token batches**:
 
-**Therefore the following are implemented but NOT covered by any gate:**
+- the row map's dedup and global→compact mapping,
+- gap coalescing and its capacity bound, and capacity overflow rejection,
+- the cross-rank **union** (`allreduce_or_host`) — that ranks seeing different
+  tokens converge on byte-identical run lists,
+- `assert_ranges_agree` actually rejecting divergent lists (and accepting
+  agreeing ones).
 
-- The cross-rank bitmap **union** (`allreduce_or_host`) — that ranks with
-  *different* token batches converge on identical row sets.
-- **Gap coalescing** in `build_row_runs`, and its capacity bound.
-- The **row-chunked backward** (`_encoder_backward_row_sparse`): chunk
-  boundaries, the bucket cursor walk, the biased `dwte` pointer, and
-  `include_wpe` firing on chunk 0 only.
-- `assert_ranges_agree` actually rejecting divergent lists.
-- The **tied-weight interaction** — LM-head and encoder contributions landing
-  on the same shard ranges via reduce-scatter linearity.
+**One test remains disabled and is NOT gated:**
+`test_row_sparse_matches_dense_with_divergent_tokens`, the end-to-end
+comparison of the chunked row-sparse gradient against the dense one. It is
+present in the file but not invoked from `main()`. So the following are
+implemented and unverified by any gate: chunk boundaries, the bucket-cursor
+walk, the biased `dwte` pointer, `include_wpe` firing on chunk 0 only, and the
+tied-weight interaction (LM-head and encoder contributions summing on the same
+shard ranges via reduce-scatter linearity).
 
-**What the passing gates do and do not prove.** `test_encoder_equivalence.py`
-(6/6) is *single-rank* at V=256 and touches none of the above.
-`test_zero_equivalence.mojo` (6/6, stages 1/2/3 at world sizes 2 and 8) does
-exercise the row-sparse code path, but it gives **every simulated rank the same
-batch**. That is precisely the case where the union is a no-op: the union
-equals each rank's own set, so no rank ever sees a chunk it did not contribute
-to. It cannot distinguish a correct union from a missing one. Everything above
-requires *divergent per-rank tokens* to reach at all.
+**Why it is disabled: nested parallelism deadlock, not a logic error.**
+Diagnosed by reading `/proc/<pid>/task/*/wchan` on the hung process (stdout
+buffering hides everything, and ptrace/gdb are blocked in this sandbox): 193
+threads, exactly **one** running — the barrier spinner — and **191** parked in
+`futex_wait_queue`. The test drives ranks with `sync_parallelize`, and each
+rank calls `wte_backward_cpu`, which internally dispatches its *own*
+`traced_parallelize`. The nested dispatch's work items are never picked up, so
+the rank never returns, and its sibling spins in `CpuBarrier.wait()` forever.
+Reproduced identically before and after the two fixes in §10 — those were real
+and necessary but not the cause of this hang.
 
-That is not a hypothetical concern. The first end-to-end run of the multi-rank
-test found two real bugs (§10) that the entire existing suite could not reach —
-so the untested surface is known to be a place where bugs actually live, not
-merely a place where they might.
+**Scope of that deadlock — it does not affect production training.** It needs
+CPU-target multi-rank *with* a live `CpuCoordinator`. Real training runs on
+GPU, where `encoder_bwd` dispatches GPU kernels and never calls
+`wte_backward_cpu`. And `test_zero_equivalence.mojo` runs CPU multi-rank
+*without* a coordinator, so its collectives take the no-barrier path. The
+combination is currently reachable only from a test like this one.
 
-**Why the test is hard to finish.** Its failures are invisible by
-construction. A rank raising inside a `sync_parallelize` region returns early
-and never reaches the next barrier, so its peers spin in `CpuBarrier.wait()`
-forever: one core at 100%, no output, no exception text, because the harness's
-output is still buffered. Every debugging cycle therefore costs a full timeout
-and yields no diagnostic. Fixing the two bugs in §10 removed the *known* causes
-without clearing the hang, so at least one further cause remains unidentified.
+**For whoever picks it up:** the fix belongs on the test side — drive the ranks
+without nesting a parallel dispatch inside each rank (e.g. call a
+single-threaded reference for the per-rank gradient rather than
+`wte_backward_cpu`), rather than changing the kernel. Separately, and worth
+doing regardless: make rank failures non-hanging by giving each rank an error
+slot and ensuring every rank reaches every barrier on both paths, so a raise
+inside the parallel region fails loudly instead of stranding its peers.
 
-**The fix, for whoever picks this up.** Do not debug it as-is — first make
-rank failures non-hanging. Give each rank a slot in a shared array, have it
-record its error there instead of propagating, and ensure **every rank reaches
-every barrier unconditionally** on both the success and failure paths. Only
-then will the underlying exception become visible. Then rename the file to
-`tests/test_encoder_row_sparse.mojo` to bring it into the gate glob.
+**What the other green gates do and do not prove.**
+`tests/test_encoder_equivalence.py` (6/6) is *single-rank* at V=256 and touches
+none of the row-sparse machinery. `test_zero_equivalence.mojo` (6/6, stages
+1/2/3 at world sizes 2 and 8) does execute the row-sparse path, but gives
+**every simulated rank the same batch** — precisely the case where the union is
+a no-op, since it then equals each rank's own set and no rank ever sees a chunk
+it did not contribute to. It cannot distinguish a correct union from a missing
+one. That gap is not hypothetical: the first end-to-end run of the multi-rank
+test found two real bugs (§10) the entire existing suite could not reach.
 
 ## AI use statement
 
