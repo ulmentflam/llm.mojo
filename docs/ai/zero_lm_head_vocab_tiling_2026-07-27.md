@@ -577,9 +577,34 @@ closes that:
   in the accumulate flag cannot pass.
 - The smaller cases (`V_p = 37`, tile 8 — also non-divisible) assert
   `ntiles > 1` and compare every element.
+- `test_multiple_tile_counts_at_vocab_scale` sweeps the tile widths that
+  `K = 2, 4, 8, 16` actually produce at `V_p = 50304` — 25216 / 12672 / 6400 /
+  3200 — and checks all four against one dense reference. Every one has a
+  ragged tail, of a *different* size each time (25088 / 12288 / 5504 / 2304),
+  which is the shape of bug that a single divisible tile count would hide. This
+  exists so that a cost-vs-tile-count characterisation has correctness evidence
+  at more than one point on its x-axis.
 - `tests/test_zero_equivalence.mojo` — 6/6 (stages 1/2/3 at world sizes 2 and
   8). Its `V_p = 64` micro-model tiles at 8 rows × 8 tiles, so the sharded
   stages exercise the tiled path too rather than collapsing to one tile.
+
+All 10 tests in `tests/test_lm_head_vocab_tiling.mojo` pass (280 s on CPU).
+
+**Generation.** An LM-head change breaks text generation first, and the default
+gate does not cover it: `make check` never builds `infer_gpt2_bf16`, and even
+after `make build-infer-bf16` all 5 tests in
+`tests/test_infer_gpt2_generation_smoke.py` still **skip**, on a second gate —
+they require a trained checkpoint at `log124M/model_19552.bin`, which does not
+exist anywhere on this machine. That test therefore could not be made to run.
+
+Generation was instead exercised through the trainer's own sampler
+(`-s 1 -g 48`), which walks the same `ln_f` → logits → sample path. Both the
+tiled (`K=8`) and untiled (`K=1`) builds ran it against `gpt2_124M.bin` and
+produced **the same leading tokens**, diverging only several tokens in — the
+signature of sampling from near-identical logits where one fp-level difference
+eventually flips a token. No crash, no NaN, no degenerate output. That is
+positive evidence, but it is weaker than the real smoke test would be, and the
+missing-checkpoint gap is worth closing separately.
 
 **Step time.** K=8 vs K=1, `b=4 t=1024 -z 0`, single GPU, median of steps 2-12,
 two runs each: **56.99 → 57.33 ms/step, +0.60%**. Final losses tracked to within
