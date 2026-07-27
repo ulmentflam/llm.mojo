@@ -255,9 +255,34 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         a small fp32-accumulate add kernel (_add_inplace_gpu).
 
     Traffic per rank is 2*(N-1)/N of the buffer per allreduce — same as a
-    ring — measured ~75 GB/s aggregate on the 8-GPU fp32 GPT-2 gradient
-    (~92 ms), vs. N*(N-1) for comm's naive all-pull fallback (which also
+    ring — vs. N*(N-1) for comm's naive all-pull fallback (which also
     crashes on cross-device raw-pointer copies on this toolchain).
+
+    Measured throughput (reproduce with `make benchmark-collectives`, which
+    builds and runs bench_collectives.mojo; pin GPUs by UUID via
+    BENCH_COLL_GPUS):
+
+      WORLD_SIZE=2, fp32, workstation-max, min-of-10 after 3 warmup:
+        allreduce     474.8 MiB buffer -> 23.65 ms, 21.05 GB/s per rank
+        reducescatter 474.8 MiB buffer -> 12.37 ms, 20.13 GB/s per rank
+        allgather     474.8 MiB buffer -> 11.60 ms, 21.47 GB/s per rank
+      Per-rank bandwidth plateaus near ~21 GB/s above ~24 MiB and falls off
+      sharply below ~6 MiB (0.75 MiB: ~6.7 GB/s), i.e. small collectives are
+      latency-bound, not bandwidth-bound.
+
+    An earlier revision of this docstring claimed "~75 GB/s aggregate on the
+    8-GPU fp32 GPT-2 gradient (~92 ms)". That figure is UNVERIFIED — it had no
+    harness behind it and no one has reproduced it. It is not contradicted
+    either: it implies ~9.4 GB/s per rank at N=8, and per-rank bandwidth is
+    expected to fall as N grows (more peers contending for the same staged
+    copies), so ~21 GB/s at N=2 is consistent with it without confirming it.
+
+    It also cannot be re-measured on this box. Physical GPU index 1 is dead
+    hardware (GSP faults at idle; RMA-grade), so **this machine has 7 usable
+    GPUs, not 8** — do not go looking for the N=8 configuration, it no longer
+    exists here. Settling the original claim needs a genuinely 8-GPU machine:
+    `make benchmark-collectives BENCH_COLL_WORLD=8 BENCH_COLL_GPUS=<8 uuids>`.
+    For a world-size trend on this box, N=2 through N=7 is available.
 
     signal_buffer remains only because the (P2P-only, unusable here)
     comm-based ShardedParameter.gather path reads it; it is a 1-byte dummy.
