@@ -54,6 +54,8 @@ from llmm.matmul import (
     fp8_mutex_preseed,
     matmul_fwd,
     matmul_bwd,
+    matmul_lm_head_fwd_tile,
+    matmul_lm_head_bwd_tile,
     matmul_fwd_lowp,
     matmul_bwd_lowp,
     matmul_fwd_fp4,
@@ -98,6 +100,37 @@ from llmm.vendor import HAS_METAL
 
 
 comptime WORLD_SIZE_DEF = get_defined_int["WORLD_SIZE", 1]()
+
+# -D LLMM_LM_HEAD_VOCAB_TILES=<K>: split the tied-`wte` LM head into K vocab
+# tiles instead of running it as one GEMM over the whole padded vocabulary.
+#
+# `wte` is [V_p, C] — 50304*768 = 147 MiB in fp32 at GPT-2 124M — and it is the
+# single largest tensor in the model. Because the LM head touched all of it at
+# once, it set the floor on the ZeRO-2/3 gradient bucket pool (which had to hold
+# a whole wte gradient) and on the ZeRO-3 embedding gather window. Tiling the
+# vocabulary lets backward reduce-scatter one tile's rows and recycle the pool,
+# and lets ZeRO-3 gather one tile's rows at a time.
+#
+# K=1 restores the exact pre-tiling behavior (single GEMM, no staging, no extra
+# collectives) and is the escape hatch if tiling ever costs more step time than
+# the memory is worth. The tile row count is rounded up to a multiple of 128 for
+# GEMM friendliness whenever V_p >= 128 (V_p=50304=128*393 divides cleanly), so
+# the realized tile count can be lower than K; below 128 rows the tiny-model
+# test configs tile at single-row granularity instead.
+comptime LM_HEAD_VOCAB_TILES = get_defined_int["LLMM_LM_HEAD_VOCAB_TILES", 8]()
+
+# -D LLMM_Z3_WTE_ONDEMAND=1: under ZeRO-3, stop keeping the whole `wte` resident
+# in the per-step embedding gather window and instead gather each LM-head vocab
+# tile's rows on demand, right before the tile's GEMM.
+#
+# This is the other half of the ~150 MiB ZeRO-3 floor, but it is only safe once
+# the ENCODER also stops needing a fully-resident wte (the indexed encoder
+# gather — a separate workstream). Until that lands, `encoder_fwd`/`encoder_bwd`
+# still index arbitrary vocab rows out of `params.wte`, so the default keeps wte
+# resident and the LM head simply addresses tiles inside that resident window at
+# no extra cost. Flipping this on before the encoder change would read garbage
+# embeddings, not fail loudly — do not enable it standalone.
+comptime Z3_WTE_ONDEMAND = is_defined["LLMM_Z3_WTE_ONDEMAND"]()
 
 comptime NUM_PARAMETER_TENSORS = 16
 comptime NUM_ACTIVATION_TENSORS = 26
@@ -1185,6 +1218,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var z3_streaming: Bool
     var param_window_buf: DeviceBuffer[GPT2_DTYPE]
     var embed_window_buf: DeviceBuffer[GPT2_DTYPE]
+    # LM-head vocab-tile gather window, allocated only under
+    # `Z3_WTE_ONDEMAND` (otherwise a 1-element stub): holds one tile's wte rows
+    # while its forward/backward GEMM runs, instead of keeping all V_p rows in
+    # `embed_window_buf` for the whole step.
+    var wte_tile_buf: DeviceBuffer[GPT2_DTYPE]
 
     def __init__(
         out self,
@@ -1270,6 +1308,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.z3_streaming = False
         self.param_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.embed_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.wte_tile_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grad_pool_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
@@ -1543,14 +1582,23 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             layer_win
         )
         var embed_win = (
-            self.param_sizes[Parameters.wte]
-            + self.param_sizes[Parameters.wpe]
+            self.param_sizes[Parameters.wpe]
             + self.param_sizes[Parameters.ln_f_gamma]
             + self.param_sizes[Parameters.ln_f_beta]
         )
+        # wte dominates this window (147 MiB vs 2.4 MiB for wpe+ln_f at GPT-2
+        # 124M). Under Z3_WTE_ONDEMAND it leaves the window entirely and the LM
+        # head gathers one vocab tile at a time; otherwise it stays resident
+        # because the encoder still indexes arbitrary rows out of it.
+        comptime if not Z3_WTE_ONDEMAND:
+            embed_win += self.param_sizes[Parameters.wte]
         self.embed_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             embed_win
         )
+        comptime if Z3_WTE_ONDEMAND:
+            self.wte_tile_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
+                self._lm_head_tile_rows() * self.config.channels
+            )
         self.ctx.synchronize()
 
     def _z3_stream_embed(mut self) raises:
@@ -1559,12 +1607,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         per-layer, so this runs once per forward and the window stays valid
         through the LM head and the whole backward (params do not change until
         `update()`)."""
-        var idxs = [
-            Parameters.wte,
-            Parameters.wpe,
-            Parameters.ln_f_gamma,
-            Parameters.ln_f_beta,
-        ]
+        var idxs = List[Int]()
+        comptime if not Z3_WTE_ONDEMAND:
+            idxs.append(Parameters.wte)
+        idxs.append(Parameters.wpe)
+        idxs.append(Parameters.ln_f_gamma)
+        idxs.append(Parameters.ln_f_beta)
         var dst_offsets = List[Int]()
         var flat_starts = List[Int]()
         var lengths = List[Int]()
@@ -1589,10 +1637,48 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             flat_starts,
             lengths,
         )
-        self.params.wte = wbase + dst_offsets[0]
-        self.params.wpe = wbase + dst_offsets[1]
-        self.params.ln_f_gamma = wbase + dst_offsets[2]
-        self.params.ln_f_beta = wbase + dst_offsets[3]
+        var b = 0
+        comptime if not Z3_WTE_ONDEMAND:
+            self.params.wte = wbase + dst_offsets[0]
+            b = 1
+        self.params.wpe = wbase + dst_offsets[b]
+        self.params.ln_f_gamma = wbase + dst_offsets[b + 1]
+        self.params.ln_f_beta = wbase + dst_offsets[b + 2]
+
+    def _lm_head_wte_tile(
+        mut self, tile_start: Int, tile_rows: Int
+    ) raises -> MutMemPtr[GPT2_DTYPE]:
+        """Address of vocab rows `[tile_start, tile_start+tile_rows)` of `wte`
+        for one LM-head tile GEMM.
+
+        Normally this is plain pointer arithmetic into the resident tensor.
+        Under ZeRO-3 with `Z3_WTE_ONDEMAND` the rows are not resident, so this
+        all-gathers exactly that flat range into `wte_tile_buf` first. The range
+        is a pure function of the tile index, which every rank walks
+        identically, so the collective's range lists stay rank-invariant."""
+        comptime if Z3_WTE_ONDEMAND:
+            if self.z3_streaming:
+                var c = self.config.channels
+                var dst_offsets = [0]
+                var flat_starts = [
+                    self._z3_param_offset(Parameters.wte) + tile_start * c
+                ]
+                var lengths = [tile_rows * c]
+                var tbase = rebind_mut_mem[GPT2_DTYPE](
+                    self.wte_tile_buf.unsafe_ptr().as_unsafe_any_origin()
+                )
+                self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                    self._z3_shard_ptr(),
+                    self.optimizer_num_parameters,
+                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        tbase.as_unsafe_any_origin()
+                    ),
+                    dst_offsets,
+                    flat_starts,
+                    lengths,
+                )
+                return tbase
+        return self.params.wte + tile_start * self.config.channels
 
     def _z3_stream_layer(mut self, layer: Int) raises:
         """Gather transformer `layer`'s 12 tensors into `param_window_buf` and
@@ -2045,6 +2131,28 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         else:
             return False
 
+    def _lm_head_tile_rows(self) -> Int:
+        """Vocab rows in one LM-head tile.
+
+        Derived from `config.padded_vocab_size` and the compile-time
+        `LLMM_LM_HEAD_VOCAB_TILES` only — deliberately NOT from batch_size /
+        seq_len, which are still 0 when `allocate_gradients()` sizes the pool
+        during construction. It is also identical on every rank, which is what
+        makes the per-tile reduce-scatter / all-gather range lists
+        rank-invariant (the collectives apply the caller's offsets to peer
+        buffers, so divergent lists would corrupt silently rather than hang).
+        """
+        var v_p = self.config.padded_vocab_size
+        if LM_HEAD_VOCAB_TILES <= 1:
+            return v_p
+        var t = ceildiv(v_p, LM_HEAD_VOCAB_TILES)
+        if v_p >= 128:
+            t = ceildiv(t, 128) * 128
+        return min(max(t, 1), v_p)
+
+    def _lm_head_num_tiles(self) -> Int:
+        return ceildiv(self.config.padded_vocab_size, self._lm_head_tile_rows())
+
     def _per_layer_pool_elems(self) -> Int:
         """Total element count of one transformer layer's 12 weight-gradient
         tensors (their per-layer strides summed) — the pool footprint of the
@@ -2056,11 +2164,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
     def _grad_pool_elems(self) -> Int:
         """Largest simultaneous gradient bucket: wte+wpe (held together during
-        the encoder backward) vs one transformer layer's 12 tensors."""
+        the encoder backward) vs one LM-head vocab tile vs one transformer
+        layer's 12 tensors."""
         var wte_wpe = (
             self.param_sizes[Parameters.wte] + self.param_sizes[Parameters.wpe]
         )
-        return max(wte_wpe, self._per_layer_pool_elems())
+        # LM-head bucket. Was the full wte (147 MiB at GPT-2 124M); the vocab
+        # tiling reduces it to one tile's rows, reduce-scattered and recycled
+        # per tile. The `wte_wpe` term above belongs to the ENCODER bucket, not
+        # this one, and still dominates until that bucket is shrunk separately.
+        var lm_head = self._lm_head_tile_rows() * self.config.channels
+        return max(max(wte_wpe, lm_head), self._per_layer_pool_elems())
 
     def _zero_grad_pool(mut self, cnt: Int) raises:
         """Zero the first `cnt` elements of the gradient pool before a bucket's
@@ -3022,19 +3136,41 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx,
         )
 
-        # Output Logits (wte has no bias).
-        matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
-            as_mut_kernel[GPT2_DTYPE](self.acts.logits),
-            as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
-            as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
-            as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
-            Int64(batch_size),
-            Int64(seq_len),
-            Int64(channels),
-            Int64(vocab_size_padded),
-            self.ctx,
-        )
+        # Output Logits (wte has no bias). Vocab-tiled: `logits` is row-major
+        # [B*T, V_p], so tile t writes the column slice [t0, t0+oc) with the
+        # full V_p row stride, and reads wte rows [t0, t0+oc) — a contiguous row
+        # range. The reduction axis is `channels`, which tiling does not split,
+        # so the logits are bit-identical to the untiled GEMM.
+        var lm_tile_rows = self._lm_head_tile_rows()
+        if self._lm_head_num_tiles() == 1:
+            matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
+                as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
+                as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
+                as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
+                Int64(batch_size),
+                Int64(seq_len),
+                Int64(channels),
+                Int64(vocab_size_padded),
+                self.ctx,
+            )
+        else:
+            var t0 = 0
+            while t0 < vocab_size_padded:
+                var oc = min(lm_tile_rows, vocab_size_padded - t0)
+                var w_tile = self._lm_head_wte_tile(t0, oc)
+                matmul_lm_head_fwd_tile[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](self.acts.logits + t0),
+                    vocab_size_padded,
+                    as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.ln_f),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](w_tile),
+                    batch_size * seq_len,
+                    channels,
+                    oc,
+                    self.ctx,
+                )
+                t0 += lm_tile_rows
         # Metal: matmul_fwd and fused_classifier are both GPU kernels; the
         # in-order queue sequences them without an explicit sync.
         comptime if not HAS_METAL:
@@ -3276,35 +3412,81 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # encoder_bwd at the end); reduce-scatter linearity lets its two
         # contributions accumulate onto the shard separately so it need not stay
         # resident across the layer loop.
-        if bucketing:
-            self.grads.wte = pool  # pool[0 : wte_size]
-            self._zero_grad_pool(wte_size)
+        var lm_tile_rows = self._lm_head_tile_rows()
+        if self._lm_head_num_tiles() == 1:
+            if bucketing:
+                self.grads.wte = pool  # pool[0 : wte_size]
+                self._zero_grad_pool(wte_size)
 
-        # LM head matmul backward (wte has no bias).
-        matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
-            as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
-            as_mut_kernel[GPT2_DTYPE](self.grads.wte),
-            as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-            as_mut_kernel[GPT2_DTYPE](self.acts.logits),
-            as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
-            as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
-            as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
-            as_mut_kernel[GPT2_DTYPE](self.grad_acts.logits),
-            Int64(batch_size),
-            Int64(seq_len),
-            Int64(channels),
-            Int64(vocab_size_padded),
-            self.ctx,
-        )
+            # LM head matmul backward (wte has no bias).
+            matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
+                as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
+                as_mut_kernel[GPT2_DTYPE](self.grads.wte),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+                as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
+                as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
+                as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
+                as_mut_kernel[GPT2_DTYPE](self.grad_acts.logits),
+                Int64(batch_size),
+                Int64(seq_len),
+                Int64(channels),
+                Int64(vocab_size_padded),
+                self.ctx,
+            )
+
+            if bucketing:
+                var d = List[Int]()
+                d.append(flat_base[Parameters.wte])
+                var po = List[Int]()
+                po.append(0)
+                var ln = List[Int]()
+                ln.append(wte_size)
+                self._reduce_grad_bucket(d, po, ln)
+        else:
+            # Vocab-tiled LM head backward. Each tile owns a contiguous row
+            # range of wte and its gradient, so under bucketing the pool only
+            # ever holds ONE tile (tile_rows*C) instead of all of wte, and each
+            # tile is reduce-scattered onto the shard before the pool is
+            # recycled — reduce-scatter is linear, so the per-tile
+            # contributions sum exactly as the single whole-wte bucket did.
+            # d_ln_f, by contrast, sums over the vocabulary: the first tile
+            # overwrites it and the rest accumulate.
+            var t0 = 0
+            var first = True
+            while t0 < vocab_size_padded:
+                var oc = min(lm_tile_rows, vocab_size_padded - t0)
+                if bucketing:
+                    self.grads.wte = pool  # pool[0 : oc*C], recycled per tile
+                    self._zero_grad_pool(oc * channels)
+                var dw = pool if bucketing else (self.grads.wte + t0 * channels)
+                var w_tile = self._lm_head_wte_tile(t0, oc)
+                matmul_lm_head_bwd_tile[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
+                    as_mut_kernel[GPT2_DTYPE](dw),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.logits + t0),
+                    vocab_size_padded,
+                    as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.ln_f),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](w_tile),
+                    as_mut_kernel[GPT2_DTYPE](self.grad_acts.logits),
+                    batch_size * seq_len,
+                    channels,
+                    oc,
+                    not first,  # accumulate d_ln_f after the first tile
+                    self.ctx,
+                )
+                if bucketing:
+                    var d = List[Int]()
+                    d.append(flat_base[Parameters.wte] + t0 * channels)
+                    var po = List[Int]()
+                    po.append(0)
+                    var ln = List[Int]()
+                    ln.append(oc * channels)
+                    self._reduce_grad_bucket(d, po, ln)
+                first = False
+                t0 += lm_tile_rows
 
         if bucketing:
-            var d = List[Int]()
-            d.append(flat_base[Parameters.wte])
-            var po = List[Int]()
-            po.append(0)
-            var ln = List[Int]()
-            ln.append(wte_size)
-            self._reduce_grad_bucket(d, po, ln)
             # Bucket 2 — ln_f (gamma at pool[0], beta at pool[C]).
             self.grads.ln_f_gamma = pool
             self.grads.ln_f_beta = pool + channels
