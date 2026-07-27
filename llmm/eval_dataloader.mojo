@@ -91,7 +91,9 @@ struct EvalDataLoader:
             raise Error(
                 "EvalDataLoader error: header is too short in file " + filename
             )
-        var header_ptr = header_bytes.unsafe_ptr().bitcast[Int32]()
+        var header_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+            header_bytes.unsafe_ptr()
+        ).bitcast[Int32]()
         var magic = header_ptr.load(0)
         if magic != EVAL_MAGIC:
             raise Error("EvalDataLoader error: bad magic number in " + filename)
@@ -148,7 +150,7 @@ struct EvalDataLoader:
         # llmm/dataloader.mojo — only ever does absolute seeks. Examples are
         # small (bounded by longest_example_bytes), so this costs nothing
         # measurable for a one-shot eval pass.)
-        _ = self.eval_file.seek(UInt64(self.header_bytes))
+        _ = self.eval_file.seek(Int(self.header_bytes))
         for i in range(self.start_example_index):
             _ = self._read_example_payload(i)
         self.current_example_index = self.start_example_index
@@ -163,10 +165,14 @@ struct EvalDataLoader:
         var subheader_bytes = self.eval_file.read_bytes(6)  # 3 * sizeof(uint16)
         if len(subheader_bytes) < 6:
             raise Error("EvalDataLoader error: truncated example sub-header")
-        var subheader_ptr = subheader_bytes.unsafe_ptr().bitcast[UInt16]()
+        var subheader_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+            subheader_bytes.unsafe_ptr()
+        ).bitcast[UInt16]()
         var start_delim = subheader_ptr.load(0)
         var example_bytes = Int(subheader_ptr.load(1))
         var example_index = Int(subheader_ptr.load(2))
+        # Keep the sub-header buffer live past the last subheader_ptr use.
+        _ = subheader_bytes^
         if start_delim != START_EXAMPLE_DELIM:
             raise Error("EvalDataLoader error: bad <START_EXAMPLE> delimiter")
         if example_index != expected_index:
@@ -185,7 +191,9 @@ struct EvalDataLoader:
         var raw_bytes = self.eval_file.read_bytes(payload_bytes)
         if len(raw_bytes) < payload_bytes:
             raise Error("EvalDataLoader error: truncated example payload")
-        var raw_ptr = raw_bytes.unsafe_ptr().bitcast[UInt16]()
+        var raw_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+            raw_bytes.unsafe_ptr()
+        ).bitcast[UInt16]()
         var num_u16 = payload_bytes // 2
         var out = List[UInt16]()
         for i in range(num_u16):

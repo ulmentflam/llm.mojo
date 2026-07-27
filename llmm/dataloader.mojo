@@ -218,7 +218,9 @@ struct DataLoader:
                 + self.files[self.current_shard_idx]
             )
 
-        var header_ptr = header_bytes.unsafe_ptr().bitcast[Int32]()
+        var header_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+            header_bytes.unsafe_ptr()
+        ).bitcast[Int32]()
         self.magic = header_ptr.load(0)
         assert (
             self.magic == GPT2_MAGIC or self.magic == LLAMA3_MAGIC
@@ -332,14 +334,16 @@ struct DataLoader:
         )  # +1 because we need to read one extra token for the targets.
         var bytes_to_read = tokens_to_read * self.token_size
 
-        _ = self.tokens_file.seek(UInt64(current_offset))
+        _ = self.tokens_file.seek(Int(current_offset))
         var bytes_read = self.tokens_file.read_bytes(bytes_to_read)
         if len(bytes_read) < bytes_to_read:
             raise Error(
                 "DataLoader error: Failed to read enough bytes from file"
             )
 
-        var raw_ptr = bytes_read.unsafe_ptr()
+        var raw_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+            bytes_read.unsafe_ptr()
+        )
 
         if self.token_size == 2:
             var ptr_u16 = raw_ptr.bitcast[UInt16]()

@@ -1,4 +1,4 @@
-from std.memory import Span
+from std.collections import Span
 
 from llmm.memory import ImmutKernelPtr, MutMemPtr
 
