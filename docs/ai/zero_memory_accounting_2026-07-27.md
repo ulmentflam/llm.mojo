@@ -424,7 +424,35 @@ in the JSON metadata so `B × T × V_p` can be checked by hand.
 
 **`att_probs` is larger still** — 4608.000 MiB, three times the logits tensor,
 because it goes as `T²` rather than `T`. It is the single largest tensor at this
-shape. Nobody had been looking at it.
+shape.
+
+I initially wrote that nobody had been looking at it. That was wrong, and the
+correction is more useful than the claim was. `train_gpt2.mojo` (the "Store-P"
+comment above the `attention_fwd` call) documents the tradeoff explicitly and
+provides a working escape hatch: setting `kv_cache.att_probs_addr = 0` disables
+the store and takes the true per-layer QKᵀ-recompute backward instead. That path
+is correctness-verified (16/16), and the decision to keep the store was
+deliberate and measured, not an oversight.
+
+What is worth re-examining is narrower and better-founded. The measurement
+behind that decision was **+3.5% step time (fp32 736.6→762.9 ms, bf16
+587.1→606.8 ms) at `-b 4 -t 1024`, on Metal**, where the extra backward GEMM
+costs more than the store saves with the current tensor-core kernels. Two things
+have changed since. The comment names its own trigger condition — "if T-scaling
+(`att_probs` grows as T²) ever makes the store dominate" — and this measurement
+is evidence that condition is now met: at `-b 8 -t 1024` the store is the largest
+single tensor on the card, 4608.000 MiB, and at the `-b 32 -t 1024` training
+shape it scales to ~18 GiB in fp32. And the cost side was measured on Metal at a
+batch 8× smaller; I have found no equivalent CUDA measurement, so whether the
+3.5% figure transfers to this box at production shape is, as far as I can tell,
+simply unknown.
+
+So the honest statement is: this is a known, deliberate, documented tradeoff
+whose *memory* side has now been quantified for the first time, and whose *cost*
+side has not been measured on the hardware and at the shape where the tradeoff
+actually matters. That is a cheap experiment — flip one assignment, rerun — and
+it is a much larger number than anything else in this campaign. I have not run
+it; it is outside this workstream's mandate and I am flagging it, not claiming it.
 
 `logits_grad` is 0 in every row, which is not a bug and is worth stating because
 it looks like one: the GPU backward path deliberately sizes the `logits`, `fch`
