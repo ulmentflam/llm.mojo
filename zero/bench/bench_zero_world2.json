@@ -1,5 +1,5 @@
 {
-  "generated": "2026-07-27T03:19:57",
+  "generated": "2026-07-27T03:40:15",
   "host": "workstation-max",
   "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
   "gpu_count": 8,
@@ -23,18 +23,18 @@
         "steps": 12
       },
       "status": "ok",
-      "mean_step_ms": 37.363,
-      "tokens_per_sec": 13703.396408211333,
+      "mean_step_ms": 37.086,
+      "tokens_per_sec": 13805.748800086285,
       "tokens_per_step": 512,
       "peak_mem_mib_per_gpu_raw": {
-        "0": 2,
+        "0": 820,
         "1": 2,
-        "2": 2,
+        "2": 4,
         "3": 2,
         "4": 2,
         "5": 3770,
         "6": 3770,
-        "7": 1699
+        "7": 2
       },
       "peak_mem_mib_per_gpu_delta": {
         "0": 0,
@@ -52,7 +52,7 @@
         "phases": {
           "post_alloc": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 0,
               "world_size": 2,
@@ -62,6 +62,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 124475904,
@@ -97,12 +98,33 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
               },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
+              },
               "exact_total_bytes": 2489521141,
               "driver_used_bytes": 2684354560,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 1,
               "world_size": 2,
@@ -112,6 +134,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 124475904,
@@ -146,6 +169,27 @@
                 "workload_indices_dev_buf": 4,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
+              },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
               },
               "exact_total_bytes": 2489521141,
               "driver_used_bytes": 2684354560,
@@ -154,7 +198,7 @@
           ],
           "steady": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 0,
               "world_size": 2,
@@ -164,6 +208,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 124475904,
@@ -199,12 +244,25 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
               },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 51511296,
+                "logits_grad": 0,
+                "att_probs": 9437184,
+                "fch_gelu": 37748736
+              },
               "exact_total_bytes": 2931529685,
               "driver_used_bytes": 3221225472,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 1,
               "world_size": 2,
@@ -214,6 +272,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 124475904,
@@ -248,6 +307,19 @@
                 "workload_indices_dev_buf": 1024,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
+              },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 51511296,
+                "logits_grad": 0,
+                "att_probs": 9437184,
+                "fch_gelu": 37748736
               },
               "exact_total_bytes": 2931529685,
               "driver_used_bytes": 3221225472,
@@ -292,23 +364,36 @@
           "workload_indices_dev_buf": 0.001
         },
         "driver_used_mib_max": 3072.0,
+        "inactive_buffers": [
+          "embed_window_buf",
+          "grad_pool_buf",
+          "grad_shard_buf",
+          "master_buf",
+          "param_window_buf"
+        ],
+        "tensors_mib_max": {
+          "att_probs": 9.0,
+          "fch_gelu": 36.0,
+          "logits": 49.125,
+          "logits_grad": 0.0
+        },
         "static_total_mib_max": 2374.192
       },
       "losses": [
         4.797893,
         4.469388,
-        4.666434,
-        4.551178,
-        4.392633,
-        4.261405,
-        4.325287,
-        4.140181,
-        4.076442,
-        4.630091,
-        4.446975,
-        4.391999
+        4.666431,
+        4.551049,
+        4.392678,
+        4.261437,
+        4.325449,
+        4.140241,
+        4.076266,
+        4.630176,
+        4.44721,
+        4.392425
       ],
-      "wall_s": 2.8,
+      "wall_s": 2.9,
       "stderr_tail": ""
     },
     {
@@ -322,18 +407,18 @@
         "steps": 12
       },
       "status": "ok",
-      "mean_step_ms": 47.915,
-      "tokens_per_sec": 10685.589063967442,
+      "mean_step_ms": 47.409,
+      "tokens_per_sec": 10799.637199687822,
       "tokens_per_step": 512,
       "peak_mem_mib_per_gpu_raw": {
-        "0": 2,
+        "0": 820,
         "1": 2,
-        "2": 2,
+        "2": 4,
         "3": 2,
         "4": 2,
         "5": 3258,
         "6": 3258,
-        "7": 1699
+        "7": 2
       },
       "peak_mem_mib_per_gpu_delta": {
         "0": 0,
@@ -351,7 +436,7 @@
         "phases": {
           "post_alloc": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 0,
               "world_size": 2,
@@ -361,6 +446,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -396,12 +482,33 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
               },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
+              },
               "exact_total_bytes": 1991617525,
               "driver_used_bytes": 2147483648,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 1,
               "world_size": 2,
@@ -411,6 +518,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -445,6 +553,27 @@
                 "workload_indices_dev_buf": 4,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
+              },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
               },
               "exact_total_bytes": 1991617525,
               "driver_used_bytes": 2147483648,
@@ -453,7 +582,7 @@
           ],
           "steady": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 0,
               "world_size": 2,
@@ -463,6 +592,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -498,12 +628,25 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
               },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 51511296,
+                "logits_grad": 0,
+                "att_probs": 9437184,
+                "fch_gelu": 37748736
+              },
               "exact_total_bytes": 2433626069,
               "driver_used_bytes": 2684354560,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 1,
               "world_size": 2,
@@ -513,6 +656,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -547,6 +691,19 @@
                 "workload_indices_dev_buf": 1024,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
+              },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 51511296,
+                "logits_grad": 0,
+                "att_probs": 9437184,
+                "fch_gelu": 37748736
               },
               "exact_total_bytes": 2433626069,
               "driver_used_bytes": 2684354560,
@@ -591,6 +748,19 @@
           "workload_indices_dev_buf": 0.001
         },
         "driver_used_mib_max": 2560.0,
+        "inactive_buffers": [
+          "embed_window_buf",
+          "grad_pool_buf",
+          "grad_shard_buf",
+          "master_buf",
+          "param_window_buf"
+        ],
+        "tensors_mib_max": {
+          "att_probs": 9.0,
+          "fch_gelu": 36.0,
+          "logits": 49.125,
+          "logits_grad": 0.0
+        },
         "static_total_mib_max": 1899.354
       },
       "losses": [
@@ -598,16 +768,16 @@
         4.469388,
         4.666428,
         4.551161,
-        4.392789,
-        4.261416,
-        4.325363,
-        4.14013,
-        4.07637,
-        4.630094,
-        4.446898,
-        4.391743
+        4.392808,
+        4.261478,
+        4.325321,
+        4.140107,
+        4.076384,
+        4.630118,
+        4.447079,
+        4.391891
       ],
-      "wall_s": 2.5,
+      "wall_s": 2.7,
       "stderr_tail": ""
     },
     {
@@ -621,18 +791,18 @@
         "steps": 12
       },
       "status": "ok",
-      "mean_step_ms": 44.39,
-      "tokens_per_sec": 11534.129308402793,
+      "mean_step_ms": 44.765,
+      "tokens_per_sec": 11437.506980900258,
       "tokens_per_step": 512,
       "peak_mem_mib_per_gpu_raw": {
-        "0": 2,
+        "0": 820,
         "1": 2,
-        "2": 2,
+        "2": 4,
         "3": 2,
         "4": 2,
         "5": 3002,
         "6": 3002,
-        "7": 1699
+        "7": 2
       },
       "peak_mem_mib_per_gpu_delta": {
         "0": 0,
@@ -650,7 +820,7 @@
         "phases": {
           "post_alloc": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 0,
               "world_size": 2,
@@ -660,6 +830,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -695,12 +866,32 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
               },
+              "inactive_buffers": [
+                "grads_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
+              },
               "exact_total_bytes": 1900345329,
               "driver_used_bytes": 2147483648,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 1,
               "world_size": 2,
@@ -710,6 +901,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -744,6 +936,26 @@
                 "workload_indices_dev_buf": 4,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
+              },
+              "inactive_buffers": [
+                "grads_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
               },
               "exact_total_bytes": 1900345329,
               "driver_used_bytes": 2147483648,
@@ -752,7 +964,7 @@
           ],
           "steady": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 0,
               "world_size": 2,
@@ -762,6 +974,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -797,12 +1010,24 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
               },
+              "inactive_buffers": [
+                "grads_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 51511296,
+                "logits_grad": 0,
+                "att_probs": 9437184,
+                "fch_gelu": 37748736
+              },
               "exact_total_bytes": 2342353873,
               "driver_used_bytes": 2415919104,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 1,
               "world_size": 2,
@@ -812,6 +1037,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -846,6 +1072,18 @@
                 "workload_indices_dev_buf": 1024,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
+              },
+              "inactive_buffers": [
+                "grads_buf",
+                "master_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 51511296,
+                "logits_grad": 0,
+                "att_probs": 9437184,
+                "fch_gelu": 37748736
               },
               "exact_total_bytes": 2342353873,
               "driver_used_bytes": 2415919104,
@@ -890,6 +1128,18 @@
           "workload_indices_dev_buf": 0.001
         },
         "driver_used_mib_max": 2304.0,
+        "inactive_buffers": [
+          "embed_window_buf",
+          "grads_buf",
+          "master_buf",
+          "param_window_buf"
+        ],
+        "tensors_mib_max": {
+          "att_probs": 9.0,
+          "fch_gelu": 36.0,
+          "logits": 49.125,
+          "logits_grad": 0.0
+        },
         "static_total_mib_max": 1812.311
       },
       "losses": [
@@ -898,15 +1148,15 @@
         4.666199,
         4.550995,
         4.392646,
-        4.26137,
-        4.325293,
-        4.139856,
-        4.076544,
-        4.630323,
-        4.446846,
-        4.392078
+        4.261413,
+        4.325407,
+        4.139838,
+        4.076625,
+        4.630291,
+        4.447057,
+        4.392107
       ],
-      "wall_s": 2.4,
+      "wall_s": 2.6,
       "stderr_tail": ""
     },
     {
@@ -920,18 +1170,18 @@
         "steps": 12
       },
       "status": "ok",
-      "mean_step_ms": 58.714,
-      "tokens_per_sec": 8720.237081445652,
+      "mean_step_ms": 59.03099999999999,
+      "tokens_per_sec": 8673.40888685606,
       "tokens_per_step": 512,
       "peak_mem_mib_per_gpu_raw": {
-        "0": 2,
+        "0": 820,
         "1": 2,
-        "2": 2,
+        "2": 4,
         "3": 2,
         "4": 2,
         "5": 3002,
         "6": 3002,
-        "7": 1699
+        "7": 2
       },
       "peak_mem_mib_per_gpu_delta": {
         "0": 0,
@@ -949,7 +1199,7 @@
         "phases": {
           "post_alloc": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 0,
               "world_size": 2,
@@ -959,6 +1209,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -994,12 +1245,30 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
               },
+              "inactive_buffers": [
+                "grads_buf",
+                "master_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
+              },
               "exact_total_bytes": 1837430761,
               "driver_used_bytes": 1879048192,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 1,
               "world_size": 2,
@@ -1009,6 +1278,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1043,6 +1313,24 @@
                 "workload_indices_dev_buf": 4,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
+              },
+              "inactive_buffers": [
+                "grads_buf",
+                "master_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
               },
               "exact_total_bytes": 1837430761,
               "driver_used_bytes": 1879048192,
@@ -1051,7 +1339,7 @@
           ],
           "steady": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 0,
               "world_size": 2,
@@ -1061,6 +1349,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1096,12 +1385,22 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
               },
+              "inactive_buffers": [
+                "grads_buf",
+                "master_buf"
+              ],
+              "tensors": {
+                "logits": 51511296,
+                "logits_grad": 0,
+                "att_probs": 9437184,
+                "fch_gelu": 37748736
+              },
               "exact_total_bytes": 2279439305,
               "driver_used_bytes": 2415919104,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 1,
               "world_size": 2,
@@ -1111,6 +1410,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1145,6 +1445,16 @@
                 "workload_indices_dev_buf": 1024,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 497903617
+              },
+              "inactive_buffers": [
+                "grads_buf",
+                "master_buf"
+              ],
+              "tensors": {
+                "logits": 51511296,
+                "logits_grad": 0,
+                "att_probs": 9437184,
+                "fch_gelu": 37748736
               },
               "exact_total_bytes": 2279439305,
               "driver_used_bytes": 2415919104,
@@ -1189,23 +1499,33 @@
           "workload_indices_dev_buf": 0.001
         },
         "driver_used_mib_max": 2304.0,
+        "inactive_buffers": [
+          "grads_buf",
+          "master_buf"
+        ],
+        "tensors_mib_max": {
+          "att_probs": 9.0,
+          "fch_gelu": 36.0,
+          "logits": 49.125,
+          "logits_grad": 0.0
+        },
         "static_total_mib_max": 1752.311
       },
       "losses": [
         4.797893,
         4.469306,
         4.666199,
-        4.550941,
-        4.392826,
-        4.261833,
-        4.325547,
-        4.139782,
-        4.07645,
-        4.630342,
-        4.44717,
-        4.392439
+        4.550937,
+        4.392787,
+        4.2619,
+        4.325423,
+        4.139837,
+        4.076329,
+        4.630162,
+        4.446966,
+        4.392338
       ],
-      "wall_s": 3.3,
+      "wall_s": 3.6,
       "stderr_tail": ""
     },
     {
@@ -1219,18 +1539,18 @@
         "steps": 12
       },
       "status": "ok",
-      "mean_step_ms": 46.866,
-      "tokens_per_sec": 10924.764221397176,
+      "mean_step_ms": 46.817,
+      "tokens_per_sec": 10936.19838947391,
       "tokens_per_step": 512,
       "peak_mem_mib_per_gpu_raw": {
-        "0": 2,
+        "0": 820,
         "1": 2,
-        "2": 2,
+        "2": 4,
         "3": 2,
         "4": 2,
         "5": 3258,
         "6": 3258,
-        "7": 1699
+        "7": 2
       },
       "peak_mem_mib_per_gpu_delta": {
         "0": 0,
@@ -1248,7 +1568,7 @@
         "phases": {
           "post_alloc": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 0,
               "world_size": 2,
@@ -1258,6 +1578,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 124475904,
@@ -1293,12 +1614,32 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
               },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
+              },
               "exact_total_bytes": 2240569317,
               "driver_used_bytes": 2415919104,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 1,
               "world_size": 2,
@@ -1308,6 +1649,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 124475904,
@@ -1342,6 +1684,26 @@
                 "workload_indices_dev_buf": 4,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
+              },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
               },
               "exact_total_bytes": 2240569317,
               "driver_used_bytes": 2415919104,
@@ -1350,7 +1712,7 @@
           ],
           "steady": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 0,
               "world_size": 2,
@@ -1360,6 +1722,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 124475904,
@@ -1395,12 +1758,24 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
               },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 25755648,
+                "logits_grad": 0,
+                "att_probs": 4718592,
+                "fch_gelu": 18874368
+              },
               "exact_total_bytes": 2461787081,
               "driver_used_bytes": 2684354560,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 1,
               "world_size": 2,
@@ -1410,6 +1785,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 124475904,
@@ -1444,6 +1820,18 @@
                 "workload_indices_dev_buf": 1024,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
+              },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 25755648,
+                "logits_grad": 0,
+                "att_probs": 4718592,
+                "fch_gelu": 18874368
               },
               "exact_total_bytes": 2461787081,
               "driver_used_bytes": 2684354560,
@@ -1488,6 +1876,18 @@
           "workload_indices_dev_buf": 0.001
         },
         "driver_used_mib_max": 2560.0,
+        "inactive_buffers": [
+          "embed_window_buf",
+          "grad_pool_buf",
+          "grad_shard_buf",
+          "param_window_buf"
+        ],
+        "tensors_mib_max": {
+          "att_probs": 4.5,
+          "fch_gelu": 18.0,
+          "logits": 24.562,
+          "logits_grad": 0.0
+        },
         "static_total_mib_max": 2136.773
       },
       "losses": [
@@ -1504,7 +1904,7 @@
         4.455025,
         4.41091
       ],
-      "wall_s": 2.4,
+      "wall_s": 2.6,
       "stderr_tail": ""
     },
     {
@@ -1518,18 +1918,18 @@
         "steps": 12
       },
       "status": "ok",
-      "mean_step_ms": 51.434000000000005,
-      "tokens_per_sec": 9954.50480227087,
+      "mean_step_ms": 51.621,
+      "tokens_per_sec": 9918.444044090584,
       "tokens_per_step": 512,
       "peak_mem_mib_per_gpu_raw": {
-        "0": 2,
+        "0": 820,
         "1": 2,
-        "2": 2,
+        "2": 4,
         "3": 2,
         "4": 2,
         "5": 2490,
         "6": 2490,
-        "7": 1699
+        "7": 2
       },
       "peak_mem_mib_per_gpu_delta": {
         "0": 0,
@@ -1547,7 +1947,7 @@
         "phases": {
           "post_alloc": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 0,
               "world_size": 2,
@@ -1557,6 +1957,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1592,12 +1993,32 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
               },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
+              },
               "exact_total_bytes": 1493713893,
               "driver_used_bytes": 1610612736,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 1,
               "world_size": 2,
@@ -1607,6 +2028,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1641,6 +2063,26 @@
                 "workload_indices_dev_buf": 4,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
+              },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
               },
               "exact_total_bytes": 1493713893,
               "driver_used_bytes": 1610612736,
@@ -1649,7 +2091,7 @@
           ],
           "steady": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 0,
               "world_size": 2,
@@ -1659,6 +2101,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1694,12 +2137,24 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
               },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 25755648,
+                "logits_grad": 0,
+                "att_probs": 4718592,
+                "fch_gelu": 18874368
+              },
               "exact_total_bytes": 1714931657,
               "driver_used_bytes": 1879048192,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 1,
               "world_size": 2,
@@ -1709,6 +2164,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1743,6 +2199,18 @@
                 "workload_indices_dev_buf": 1024,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
+              },
+              "inactive_buffers": [
+                "grad_pool_buf",
+                "grad_shard_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 25755648,
+                "logits_grad": 0,
+                "att_probs": 4718592,
+                "fch_gelu": 18874368
               },
               "exact_total_bytes": 1714931657,
               "driver_used_bytes": 1879048192,
@@ -1787,6 +2255,18 @@
           "workload_indices_dev_buf": 0.001
         },
         "driver_used_mib_max": 1792.0,
+        "inactive_buffers": [
+          "embed_window_buf",
+          "grad_pool_buf",
+          "grad_shard_buf",
+          "param_window_buf"
+        ],
+        "tensors_mib_max": {
+          "att_probs": 4.5,
+          "fch_gelu": 18.0,
+          "logits": 24.562,
+          "logits_grad": 0.0
+        },
         "static_total_mib_max": 1424.517
       },
       "losses": [
@@ -1803,7 +2283,7 @@
         4.455025,
         4.41091
       ],
-      "wall_s": 2.4,
+      "wall_s": 2.7,
       "stderr_tail": ""
     },
     {
@@ -1817,18 +2297,18 @@
         "steps": 12
       },
       "status": "ok",
-      "mean_step_ms": 51.872,
-      "tokens_per_sec": 9870.45033929673,
+      "mean_step_ms": 51.636,
+      "tokens_per_sec": 9915.56278565342,
       "tokens_per_step": 512,
       "peak_mem_mib_per_gpu_raw": {
-        "0": 2,
+        "0": 820,
         "1": 2,
-        "2": 2,
+        "2": 4,
         "3": 2,
         "4": 2,
         "5": 2490,
         "6": 2490,
-        "7": 1699
+        "7": 2
       },
       "peak_mem_mib_per_gpu_delta": {
         "0": 0,
@@ -1846,7 +2326,7 @@
         "phases": {
           "post_alloc": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 0,
               "world_size": 2,
@@ -1856,6 +2336,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1891,12 +2372,31 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
               },
+              "inactive_buffers": [
+                "grads_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
+              },
               "exact_total_bytes": 1448077795,
               "driver_used_bytes": 1610612736,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 1,
               "world_size": 2,
@@ -1906,6 +2406,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1940,6 +2441,25 @@
                 "workload_indices_dev_buf": 4,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
+              },
+              "inactive_buffers": [
+                "grads_buf",
+                "param_window_buf",
+                "embed_window_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
               },
               "exact_total_bytes": 1448077795,
               "driver_used_bytes": 1610612736,
@@ -1948,7 +2468,7 @@
           ],
           "steady": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 0,
               "world_size": 2,
@@ -1958,6 +2478,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -1993,12 +2514,23 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
               },
+              "inactive_buffers": [
+                "grads_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 25755648,
+                "logits_grad": 0,
+                "att_probs": 4718592,
+                "fch_gelu": 18874368
+              },
               "exact_total_bytes": 1669295559,
               "driver_used_bytes": 1879048192,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 1,
               "world_size": 2,
@@ -2008,6 +2540,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -2042,6 +2575,17 @@
                 "workload_indices_dev_buf": 1024,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
+              },
+              "inactive_buffers": [
+                "grads_buf",
+                "param_window_buf",
+                "embed_window_buf"
+              ],
+              "tensors": {
+                "logits": 25755648,
+                "logits_grad": 0,
+                "att_probs": 4718592,
+                "fch_gelu": 18874368
               },
               "exact_total_bytes": 1669295559,
               "driver_used_bytes": 1879048192,
@@ -2086,6 +2630,17 @@
           "workload_indices_dev_buf": 0.001
         },
         "driver_used_mib_max": 1792.0,
+        "inactive_buffers": [
+          "embed_window_buf",
+          "grads_buf",
+          "param_window_buf"
+        ],
+        "tensors_mib_max": {
+          "att_probs": 4.5,
+          "fch_gelu": 18.0,
+          "logits": 24.562,
+          "logits_grad": 0.0
+        },
         "static_total_mib_max": 1380.995
       },
       "losses": [
@@ -2102,7 +2657,7 @@
         4.450745,
         4.414446
       ],
-      "wall_s": 2.3,
+      "wall_s": 2.7,
       "stderr_tail": ""
     },
     {
@@ -2116,18 +2671,18 @@
         "steps": 12
       },
       "status": "ok",
-      "mean_step_ms": 62.04,
-      "tokens_per_sec": 8252.740167633785,
+      "mean_step_ms": 61.224000000000004,
+      "tokens_per_sec": 8362.733568535215,
       "tokens_per_step": 512,
       "peak_mem_mib_per_gpu_raw": {
-        "0": 2,
+        "0": 820,
         "1": 2,
-        "2": 2,
+        "2": 4,
         "3": 2,
         "4": 2,
         "5": 2490,
         "6": 2490,
-        "7": 1699
+        "7": 2
       },
       "peak_mem_mib_per_gpu_delta": {
         "0": 0,
@@ -2145,7 +2700,7 @@
         "phases": {
           "post_alloc": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 0,
               "world_size": 2,
@@ -2155,6 +2710,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -2190,12 +2746,29 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
               },
+              "inactive_buffers": [
+                "grads_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
+              },
               "exact_total_bytes": 1416620511,
               "driver_used_bytes": 1610612736,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "post_alloc",
               "rank": 1,
               "world_size": 2,
@@ -2205,6 +2778,7 @@
               "recompute": 0,
               "batch_size": 0,
               "seq_len": 0,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -2239,6 +2813,23 @@
                 "workload_indices_dev_buf": 4,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
+              },
+              "inactive_buffers": [
+                "grads_buf",
+                "acts_buf",
+                "acts_stats_buf",
+                "grad_acts_buf",
+                "grad_acts_stats_buf",
+                "inputs_dev_buf",
+                "targets_dev_buf",
+                "bucket_info_dev_buf",
+                "workload_indices_dev_buf"
+              ],
+              "tensors": {
+                "logits": 0,
+                "logits_grad": 0,
+                "att_probs": 0,
+                "fch_gelu": 0
               },
               "exact_total_bytes": 1416620511,
               "driver_used_bytes": 1610612736,
@@ -2247,7 +2838,7 @@
           ],
           "steady": [
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 0,
               "world_size": 2,
@@ -2257,6 +2848,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -2292,12 +2884,21 @@
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
               },
+              "inactive_buffers": [
+                "grads_buf"
+              ],
+              "tensors": {
+                "logits": 25755648,
+                "logits_grad": 0,
+                "att_probs": 4718592,
+                "fch_gelu": 18874368
+              },
               "exact_total_bytes": 1637838275,
               "driver_used_bytes": 1879048192,
-              "driver_total_bytes": 92073361408
+              "driver_total_bytes": 91268055040
             },
             {
-              "schema": 1,
+              "schema": 3,
               "phase": "steady",
               "rank": 1,
               "world_size": 2,
@@ -2307,6 +2908,7 @@
               "recompute": 0,
               "batch_size": 4,
               "seq_len": 64,
+              "padded_vocab_size": 50304,
               "num_parameters": 124475904,
               "padded_num_parameters": 124475904,
               "optimizer_num_parameters": 62237952,
@@ -2341,6 +2943,15 @@
                 "workload_indices_dev_buf": 1024,
                 "grad_norm_out_buf": 3008,
                 "comm_scratch_total": 248951809
+              },
+              "inactive_buffers": [
+                "grads_buf"
+              ],
+              "tensors": {
+                "logits": 25755648,
+                "logits_grad": 0,
+                "att_probs": 4718592,
+                "fch_gelu": 18874368
               },
               "exact_total_bytes": 1637838275,
               "driver_used_bytes": 1879048192,
@@ -2385,6 +2996,15 @@
           "workload_indices_dev_buf": 0.001
         },
         "driver_used_mib_max": 1792.0,
+        "inactive_buffers": [
+          "grads_buf"
+        ],
+        "tensors_mib_max": {
+          "att_probs": 4.5,
+          "fch_gelu": 18.0,
+          "logits": 24.562,
+          "logits_grad": 0.0
+        },
         "static_total_mib_max": 1350.995
       },
       "losses": [
@@ -2401,7 +3021,7 @@
         4.450745,
         4.414446
       ],
-      "wall_s": 3.0,
+      "wall_s": 3.2,
       "stderr_tail": ""
     }
   ]

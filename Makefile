@@ -165,6 +165,7 @@ $(PIXI_STAMP):
         build-infer build-infer-bf16 build-infer-fp8 data-hellaswag eval eval-cpu benchmark-eval \
         verify-fp8-grads verify-fp8-static-grads calibrate-fp8-scales \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal benchmark-zero \
+        figure-blindness figure-breakeven figures-wte \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures \
@@ -259,6 +260,9 @@ help:
 	@echo "                   (4 arms in one graph, mirroring benchmark-gpu's fp32+bf16 layout)"
 	@echo "  benchmark-zero   ZeRO stages 0-3 at BENCH_ZERO_WORLD GPUs (default 8): per-stage"
 	@echo "                   memory + step time, fp32 vs bf16, JSON into zero/bench/, chart into figures/"
+	@echo "  figures-wte      tied-wte campaign figures (no GPU, renders committed data):"
+	@echo "                   figure-blindness  exact accounting vs nvidia-smi on the 256 MiB commit grid"
+	@echo "                   figure-breakeven  vocab-parallel communication crossover (modelled)"
 	@echo "                   llm.c has no Metal port — baseline is PyTorch MPS"
 	@echo "                   (hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS, BENCH_COOLDOWN_S)"
 	@echo "  profile-llmc-ncu  Profile llm.c bf16 CUDA kernels with ncu (NVIDIA only)"
@@ -807,6 +811,27 @@ benchmark-zero:
 		--fp32-binary $(TRAIN_BIN) --bf16-binary $(TRAIN_BIN_BF16) \
 		--output $(BENCH_ZERO_OUT)
 	$(PIXI) run python scripts/benchmark_zero.py --plot $(BENCH_ZERO_OUT)
+
+# Campaign figures for the tied-`wte` de-residency work. Both render from
+# data already committed in the tree and run nothing on a GPU, so they are
+# reproducible on any box and safe to run while the GPUs are busy.
+#
+#   figure-blindness  exact in-process accounting vs nvidia-smi across ZeRO
+#                     stages, on the allocator's 256 MiB commit grid
+#                     (measured; source: zero/bench/bench_zero_world2*.json)
+#   figure-breakeven  communication volume, vocab-parallel vs today, against
+#                     global tokens per micro-step
+#                     (modelled; source: docs/ai/data/vocab_parallel_*.json)
+#
+# Each writes figures/<name>.png plus a sidecar <name>.json at the same stem
+# carrying the source data verbatim, per the repo's reproducibility contract.
+figure-blindness:
+	$(PIXI) run python scripts/figure_zero_blindness.py
+
+figure-breakeven:
+	$(PIXI) run python scripts/figure_vocab_breakeven.py
+
+figures-wte: figure-blindness figure-breakeven
 
 # Apple Silicon Metal GPU benchmark: llm.mojo vs PyTorch MPS vs MLX, fp32+bf16.
 # 6 arms in one graph, mirroring how benchmark-gpu combines fp32+bf16 for NVIDIA.
