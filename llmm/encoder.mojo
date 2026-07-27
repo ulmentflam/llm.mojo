@@ -35,6 +35,24 @@ comptime WTE_BUCKET_IDX_SIZE = 4
 comptime WTE_BWD_SIMD_WIDTH = 4
 comptime WTE_C_PER_WARP = 32 * WTE_BWD_SIMD_WIDTH
 
+# Row-sparse wte tuning. Both constants come from a measured sweep of range
+# count vs. collective wall time on 2x RTX PRO 6000 (see
+# docs/ai/zero_row_sparse_wte_2026-07-27.md): the ZeRO collectives issue one
+# driver-staged `enqueue_copy` per range per peer at a fixed ~15 us each, and
+# sustain ~60 GB/s once ranges are large. 15 us of overhead buys ~900 KB of
+# transfer, i.e. ~290 rows of 768 fp32 channels — so two runs separated by
+# fewer than that many absent rows are cheaper gathered together than as two
+# copies. 256 is that break-even, rounded down.
+comptime ENC_MERGE_GAP_ROWS = 256
+# Rows of the compact wte gradient held in the pool at once. The encoder
+# backward walks its rows in chunks of this size, reduce-scattering each, so
+# the pool is bounded by a CONSTANT rather than by B*T. That is what makes the
+# saving shape-independent: at B=32,T=1024 the batch's distinct rows approach
+# the whole 50304-row vocabulary and a B*T-sized bound would save nothing.
+# 8192 rows x 768 channels x 4 B = 24 MiB, which puts the encoder bucket below
+# the per-transformer-layer bucket (~28 MiB) so it stops being the floor.
+comptime ENC_ROW_CHUNK_ROWS = 8192
+
 
 # ===----------------------------------------------------------------------=== #
 # Encoder Forward Helpers
@@ -298,6 +316,139 @@ struct EncoderFwd:
 
 
 # ===----------------------------------------------------------------------=== #
+# Encoder Row Map (row-sparse wte)
+# ===----------------------------------------------------------------------=== #
+#
+# `wte` is 147 MiB at GPT-2 scale (V_p=50304 x C=768) but one micro-step only
+# ever touches the <= B*T rows named by the batch. The row map turns that
+# observation into (a) a compact [n_rows, C] table the encoder reads/writes and
+# (b) a list of flat `wte` sub-ranges the ZeRO collectives move, so ZeRO-2/3
+# never has to materialize the dense tensor.
+#
+# The row set MUST be identical on every rank: `allgather_ranges` and
+# `reducescatter_buckets` are barrier-synchronized and index peers' buffers at
+# shared offsets, so divergent range lists deadlock (and would corrupt the
+# reduction if they did not). Ranks see different tokens, so the caller unions
+# the per-rank presence bitmaps before calling `build_row_runs` — every
+# function below is a pure, deterministic function of the *union* bitmap, which
+# is what makes all ranks agree without further communication.
+
+
+@always_inline
+def bitmap_words(vocab_size: Int) -> Int:
+    """uint32 words needed for a `vocab_size`-bit presence bitmap."""
+    return ceildiv(vocab_size, 32)
+
+
+@always_inline
+def _bitmap_test(bitmap_ptr: ImmutKernelPtr[DType.uint32], idx: Int) -> Bool:
+    var word = bitmap_ptr.load(idx >> 5)
+    return ((word >> Scalar[DType.uint32](idx & 31)) & 1) != 0
+
+
+def build_token_bitmap(
+    inputs_ptr: ImmutKernelPtr[DType.int32],
+    bitmap_ptr: MutKernelPtr[DType.uint32],
+    total_positions: Int,
+    vocab_size: Int,
+) raises -> None:
+    """Set one bit per distinct token id present in this rank's batch."""
+    var words = bitmap_words(vocab_size)
+    for w in range(words):
+        bitmap_ptr.store(w, Scalar[DType.uint32](0))
+    for bt in range(total_positions):
+        var token = Int(inputs_ptr.load(bt))
+        if token < 0 or token >= vocab_size:
+            raise Error("encoder row map: token index out of range")
+        var w = token >> 5
+        bitmap_ptr.store(
+            w,
+            bitmap_ptr.load(w)
+            | (Scalar[DType.uint32](1) << Scalar[DType.uint32](token & 31)),
+        )
+
+
+def build_row_runs(
+    bitmap_ptr: ImmutKernelPtr[DType.uint32],
+    row_of_token_ptr: MutKernelPtr[DType.int32],
+    vocab_size: Int,
+    max_rows: Int,
+    merge_gap_rows: Int,
+    mut run_first: List[Int],
+    mut run_len: List[Int],
+) raises -> Int:
+    """Turn a (union) presence bitmap into coalesced `wte` row runs.
+
+    Emits ascending, disjoint, non-adjacent runs `[run_first[k],
+    run_first[k]+run_len[k])` of *global* row ids and fills `row_of_token_ptr`
+    so that global row `t` inside run `k` maps to compact row
+    `sum(run_len[:k]) + (t - run_first[k])`. Returns the total compact row
+    count.
+
+    Runs separated by a gap of at most `merge_gap_rows` absent rows are merged:
+    each merge trades `gap*C` wasted elements for one fewer `enqueue_copy` in
+    every collective, and the collectives' per-copy fixed cost dominates for
+    small ranges. Merging is capped by the caller's `max_rows` capacity so the
+    result always fits the pre-allocated compact buffers, and the left-to-right
+    greedy pass is a pure function of the bitmap, so every rank derives the
+    identical list.
+
+    `row_of_token_ptr` is only written for rows covered by a run; entries for
+    absent tokens keep stale values and must not be read.
+    """
+    run_first.clear()
+    run_len.clear()
+
+    var present = 0
+    var i = 0
+    var words = bitmap_words(vocab_size)
+    while i < vocab_size:
+        # Skip whole empty words cheaply; vocab is mostly absent per batch.
+        if (i & 31) == 0:
+            var w = i >> 5
+            if w < words and bitmap_ptr.load(w) == 0:
+                i += 32
+                continue
+        if not _bitmap_test(bitmap_ptr, i):
+            i += 1
+            continue
+        var start = i
+        while i < vocab_size and _bitmap_test(bitmap_ptr, i):
+            i += 1
+        run_first.append(start)
+        run_len.append(i - start)
+        present += i - start
+
+    if present > max_rows:
+        raise Error("encoder row map: unique row count exceeds capacity")
+
+    var budget = max_rows - present
+    var merged_first = List[Int]()
+    var merged_len = List[Int]()
+    for k in range(len(run_first)):
+        var last = len(merged_first) - 1
+        if last >= 0:
+            var gap = run_first[k] - (merged_first[last] + merged_len[last])
+            if gap <= merge_gap_rows and gap <= budget:
+                budget -= gap
+                merged_len[last] = merged_len[last] + gap + run_len[k]
+                continue
+        merged_first.append(run_first[k])
+        merged_len.append(run_len[k])
+
+    var num_rows = 0
+    for k in range(len(merged_first)):
+        var first = merged_first[k]
+        for j in range(merged_len[k]):
+            row_of_token_ptr.store(first + j, Scalar[DType.int32](num_rows + j))
+        num_rows += merged_len[k]
+
+    run_first = merged_first^
+    run_len = merged_len^
+    return num_rows
+
+
+# ===----------------------------------------------------------------------=== #
 # Encoder Backward Bucket Builder
 # ===----------------------------------------------------------------------=== #
 
@@ -311,9 +462,18 @@ def build_wte_buckets(
     vocab_size: Int,
     channels: Int,
     bucket_info_capacity: Int,
+    row_of_token_ptr: ImmutKernelPtr[DType.int32],
+    use_row_map: Bool,
 ) raises -> Int:
     """
     Build scatter-add buckets for wte backward from the current token batch.
+
+    With `use_row_map`, each bucket's destination row is the *compact* row
+    `row_of_token_ptr[token]` rather than the global token id, so the backward
+    kernels write a dense `[n_rows, C]` gradient instead of a `[V_p, C]` one.
+    Nothing else changes: buckets are still emitted in ascending row order and
+    still partition disjoint (row, channel-group) cells, so the reduction stays
+    a plain load-add-store and remains bit-reproducible.
     """
     var total_positions = batch_size * seq_len
     var num_channel_groups = ceildiv(channels, WTE_C_PER_WARP)
@@ -350,6 +510,12 @@ def build_wte_buckets(
         if size == 0:
             continue
         var start_idx = offsets[token]
+        # Destination row: compact row under the row map, else the global
+        # token id. `row_of_token` is monotonic in `token`, so buckets stay in
+        # ascending row order either way.
+        var dest_row = Scalar[DType.int32](token)
+        if use_row_map:
+            dest_row = row_of_token_ptr.load(token)
         for g in range(num_channel_groups):
             if num_buckets >= bucket_info_capacity:
                 raise Error(
@@ -358,7 +524,7 @@ def build_wte_buckets(
             var base = num_buckets * WTE_BUCKET_IDX_SIZE
             bucket_info_ptr.store(base + 0, Scalar[DType.int32](start_idx))
             bucket_info_ptr.store(base + 1, Scalar[DType.int32](size))
-            bucket_info_ptr.store(base + 2, Scalar[DType.int32](token))
+            bucket_info_ptr.store(base + 2, dest_row)
             bucket_info_ptr.store(base + 3, Scalar[DType.int32](g))
             num_buckets += 1
 
@@ -463,6 +629,8 @@ def wte_backward_cpu[
     num_buckets: Int,
     channels: Int,
 ) raises -> None:
+    if num_buckets <= 0:
+        return
     var max_workers = parallelism_level()
     var buckets_per_worker = ceildiv(num_buckets, max_workers)
     var num_workers = ceildiv(num_buckets, buckets_per_worker)
@@ -820,24 +988,38 @@ def encoder_bwd[
     seq_len: Int,
     channels: Int,
     ctx: DeviceContext,
+    include_wpe: Bool = True,
 ) capturing raises:
+    # `include_wpe=False` computes only the wte half. The row-sparse encoder
+    # backward calls this once per row-chunk, and dwpe does not depend on the
+    # chunk at all — computing it every chunk would accumulate it N_chunks
+    # times. Chunk 0 takes it; the rest skip it.
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
-        wte_backward_cpu[dtype, width](
-            dwte_ptr,
-            bucket_info_ptr,
-            workload_indices_ptr,
-            dout_ptr,
-            num_buckets,
-            channels,
-        )
-        wpe_backward_cpu[dtype, width](
-            dwpe_ptr,
-            dout_ptr,
-            batch_size,
-            seq_len,
-            channels,
-        )
+        # An empty bucket list is normal, not degenerate: the row-sparse
+        # backward walks the UNION of every rank's rows, so a rank whose batch
+        # contributed nothing to this chunk legitimately has zero buckets and
+        # must still reach the collective with a zeroed pool. Guard it here the
+        # way the GPU path below already does — `wte_backward_cpu` divides by a
+        # worker count derived from `num_buckets`, so falling through with zero
+        # divides by zero.
+        if num_buckets > 0:
+            wte_backward_cpu[dtype, width](
+                dwte_ptr,
+                bucket_info_ptr,
+                workload_indices_ptr,
+                dout_ptr,
+                num_buckets,
+                channels,
+            )
+        if include_wpe:
+            wpe_backward_cpu[dtype, width](
+                dwpe_ptr,
+                dout_ptr,
+                batch_size,
+                seq_len,
+                channels,
+            )
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
         comptime width = 4
@@ -878,7 +1060,7 @@ def encoder_bwd[
                     block_dim=(BLOCK_SIZE,),
                 )
 
-        if seq_len > 0:
+        if seq_len > 0 and include_wpe:
             if aligned:
                 comptime wpe_kernel = wpe_backward_gpu_kernel[
                     dtype, BLOCK_SIZE, width, aligned=True
