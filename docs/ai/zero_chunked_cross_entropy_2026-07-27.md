@@ -695,8 +695,31 @@ past `V` changes the loss by hundreds of nats rather than by rounding.
 
 ### 9.4 Gates
 
-`make format` (zero residual diff), `make lint`, `make check`. Both
+Green: `make format` (zero residual diff), `make lint`, `make check`. Both
 configurations — flag off and flag on — compile with zero compiler diagnostics.
+
+**Outstanding: the full `make test`.** It was not run, because the machine was
+under a load average of 100 at the time and the standing rule is to get
+clearance before starting a suite there. Its two Mojo components were run
+individually and both pass — `tests/test_chunked_cross_entropy.mojo` (10/10) and
+`tests/test_lm_head_vocab_tiling.mojo` (10/10, the regression check on the
+`llmm/matmul.mojo` edit). What remains unrun is `tests/test_zero*.mojo` and the
+Python suite.
+
+The residual risk there is low but not zero, and worth stating precisely: with
+the flag off, every chunked code path is `comptime`-dead, so the default build
+is behaviourally identical to `main`. The one edit that is *not* flag-gated is
+the packed fast path in the two tile GEMMs, and it only engages when the
+caller's leading dimension equals the tile width — which never happens on the
+default path (there the leading dimension is V_p = 50304 and the tile width is
+6400) and does not happen in phase 1's suite either. That suite passing 10/10 is
+the direct evidence for it.
+
+One coverage gap worth recording for whoever maintains the smoke subset:
+`docs/ai/pre_merge_smoke_subset.md` already warns that nothing in it drives the
+LM head at vocabulary scale. This change does not close that gap — the new test
+file is in `make test-mojo` but not in `SMOKE_MOJO`. It runs in 3.2 s, so adding
+it there is cheap if the subset is ever revised.
 
 ---
 
