@@ -24,6 +24,14 @@ Four criteria, ALL must pass for the overall gate to PASS:
       error compounding with depth) is smooth -- this is what actually
       catches a per-site bug that the aggregate envelope (b) would hide.
   (d) no NaN/Inf in either dump.
+  (e) non-triviality: no tensor is all-zero in either dump. (a)-(d) are all
+      RELATIVE -- they ask whether two dumps agree, and a tensor that is
+      all-zero in BOTH scores the best possible value on every one of them
+      (cosine 1.0, relL2 0.0, no depth spike, finite). That is the exact
+      tautology this gate was written to replace, and the exact failure that
+      let a dead bias-gradient kernel ship in six trained checkpoints
+      (docs/ai/dbias_scratch_overrun_silent_zero_bug.md). A dead tensor has
+      to be the loudest result here, not the quietest.
 
 Exits nonzero (1) if any criterion is violated, with a clear per-criterion
 report. Exit 2 on usage/setup errors (missing files, shape mismatch, tensor
@@ -114,13 +122,26 @@ def main():
         cos, rel = cosine_rel_l2(x, y)
         nnan_x = int(np.sum(~np.isfinite(x)))
         nnan_y = int(np.sum(~np.isfinite(y)))
-        rows.append((k, cos, rel, nnan_x, nnan_y, y.size))
+        # Norms are carried through so criterion (e) can distinguish "these two
+        # tensors agree" from "there is nothing here to disagree about".
+        rows.append(
+            (
+                k,
+                cos,
+                rel,
+                nnan_x,
+                nnan_y,
+                y.size,
+                float(np.linalg.norm(x)),
+                float(np.linalg.norm(y)),
+            )
+        )
 
     cosv = np.array([r[1] for r in rows])
     relv = np.array([r[2] for r in rows])
 
     print(f"{'tensor':32s} {'cosine':>9s} {'relL2':>9s} {'flags':>8s}")
-    for k, c, r, nnx, nny, sz in rows:
+    for k, c, r, nnx, nny, sz, nx, ny in rows:
         flags = []
         if c <= COSINE_FLOOR:
             flags.append("COS")
@@ -138,7 +159,9 @@ def main():
     )
 
     # --- Criterion (a): per-tensor cosine floor ---
-    cos_violations = [(k, c) for k, c, r, nnx, nny, sz in rows if c <= COSINE_FLOOR]
+    cos_violations = [
+        (k, c) for k, c, r, nnx, nny, sz, nx, ny in rows if c <= COSINE_FLOOR
+    ]
     crit_a = len(cos_violations) == 0
 
     # --- Criterion (b): relL2 envelope (aggregate) ---
@@ -148,7 +171,7 @@ def main():
 
     # --- Criterion (c): depth-monotonicity within each per-layer class ---
     classes = {}
-    for k, c, r, nnx, nny, sz in rows:
+    for k, c, r, nnx, nny, sz, nx, ny in rows:
         m = LAYER_RE.match(k)
         if m:
             cls, layer = m.group(1), int(m.group(2))
@@ -167,8 +190,28 @@ def main():
     crit_c = len(depth_violations) == 0
 
     # --- Criterion (d): NaN/Inf sentinel ---
-    nonfin_total = sum(nnx + nny for _, _, _, nnx, nny, _ in rows)
+    nonfin_total = sum(nnx + nny for _, _, _, nnx, nny, _, _, _ in rows)
     crit_d = nonfin_total == 0
+
+    # --- Criterion (e): non-triviality ---
+    # Every criterion above is RELATIVE: it asks whether two dumps agree. None
+    # of them can distinguish "these agree" from "there is nothing here to
+    # disagree about". A tensor that is all-zero in BOTH dumps scores the best
+    # possible result on every one of (a)-(d): cosine_rel_l2 returns 1.0 for
+    # cosine (the `nx == ny` branch, taken when both norms are 0) and 0.0 for
+    # relL2 (the `ny > 0` guard falls through to `float(nx)` == 0.0), the depth
+    # check sees 0 <= 2*trend_floor, and zero is finite.
+    #
+    # That is exactly the failure this gate was written to replace. A scratch
+    # overrun left every matmul bias gradient bit-exactly zero for months, and
+    # the test guarding it passed by comparing 0 to 0
+    # (docs/ai/dbias_scratch_overrun_silent_zero_bug.md). A dead tensor must
+    # therefore be the gate's loudest result, not its quietest.
+    empty_ref = [(k, ny) for k, c, r, nnx, nny, sz, nx, ny in rows if ny == 0.0]
+    empty_test = [
+        (k, nx) for k, c, r, nnx, nny, sz, nx, ny in rows if nx == 0.0 and ny > 0.0
+    ]
+    crit_e = not empty_ref and not empty_test
 
     print("\n=== GATE CRITERIA (docs/ai/low_precision_gotchas.md E5) ===")
     print(
@@ -199,14 +242,35 @@ def main():
         f"(d) NaN/Inf sentinel        : {'PASS' if crit_d else 'FAIL'} "
         f"({nonfin_total} nonfinite element(s) total)"
     )
+    print(
+        f"(e) non-triviality          : {'PASS' if crit_e else 'FAIL'} "
+        f"({len(empty_ref)} all-zero reference tensor(s), "
+        f"{len(empty_test)} all-zero test tensor(s))"
+    )
+    if empty_ref:
+        print(
+            "      All-zero in the REFERENCE dump. Criteria (a)-(d) score these"
+            " as a perfect match against anything, so the gate above is blind"
+            " to them. A gradient that is bit-exactly zero after a real step"
+            " never got written:"
+        )
+        for k, _ in empty_ref[:10]:
+            print(f"      {k}")
+    if empty_test:
+        print(
+            "      All-zero in the TEST dump while the reference is non-zero"
+            " -- the test arm produced no gradient at all for:"
+        )
+        for k, _ in empty_test[:10]:
+            print(f"      {k}")
 
-    overall = crit_a and crit_b and crit_c and crit_d
+    overall = crit_a and crit_b and crit_c and crit_d and crit_e
     print(f"\nOVERALL GATE: {'PASS' if overall else 'FAIL'}")
 
     if csv:
         with open(csv, "w") as f:
             f.write("tensor,cosine,relL2,nonfinite_test,nonfinite_ref,size\n")
-            for k, c, r, nnx, nny, sz in rows:
+            for k, c, r, nnx, nny, sz, nx, ny in rows:
                 f.write(f"{k},{c:.6f},{r:.6f},{nnx},{nny},{sz}\n")
         print("wrote", csv)
 
