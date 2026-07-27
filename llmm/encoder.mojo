@@ -336,7 +336,7 @@ struct EncoderFwd:
 
 @always_inline
 def bitmap_words(vocab_size: Int) -> Int:
-    """uint32 words needed for a `vocab_size`-bit presence bitmap."""
+    """Number of uint32 words in a `vocab_size`-bit presence bitmap."""
     return ceildiv(vocab_size, 32)
 
 

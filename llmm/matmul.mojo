@@ -2868,7 +2868,7 @@ def _add_into[
     src_ptr: MutKernelPtr[dtype],
     total: Int,
 ) raises -> None:
-    """dst += src elementwise, f32 math, one rounding at the store."""
+    """Add `src` into `dst` elementwise: f32 math, one rounding at the store."""
     var max_workers = parallelism_level()
     var chunk = ceildiv(total, max_workers)
     var num_workers = ceildiv(total, chunk)

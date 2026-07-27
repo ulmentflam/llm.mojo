@@ -272,7 +272,7 @@ def _add_inplace_gpu[
     src: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     size: Int,
 ) -> None:
-    """dst[i] += src[i], accumulating in fp32 (bf16-safe)."""
+    """Accumulate `src` into `dst` elementwise in fp32 (bf16-safe)."""
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < size:
         var s = (dst + idx).load().cast[DType.float32]() + (
