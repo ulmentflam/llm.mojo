@@ -30,12 +30,13 @@
 from std.random import seed
 from std.sys import has_nvidia_gpu_accelerator
 from std.gpu.host import DeviceContext, DeviceBuffer
-from std.testing import TestSuite
+from std.testing import TestSuite, assert_true
 
 from llmm.lowp import FP8_SPEC, quantize_devscale, quantize_transpose_devscale
 from llmm.amax import (
     AmaxState,
     compute_amax,
+    format_max,
     kernel_ptr_as_immut,
     device_buf_mut_ptr,
 )
@@ -534,6 +535,247 @@ def kernel_ptr_as_immut_bf16(
     buf: DeviceBuffer[DType.bfloat16],
 ) -> ImmutKernelPtr[DType.bfloat16]:
     return buf.unsafe_ptr().as_imm().as_unsafe_any_origin()
+
+
+# ===----------------------------------------------------------------------=== #
+# doutput_state steady state, through the REAL matmul_bwd_lowp wrapper.
+#
+# `test_matmul_bwd_lowp_end_to_end` above calls `matmul_bwd_lowp` exactly
+# ONCE, so `doutput_state.step` is always 0 there (warmup only).
+# `matmul_bwd_lowp` is the ONLY production call site that ever calls
+# `doutput_state.update_scale` -- and it does so via a single, non-paired
+# `update_scale` call (unlike `matmul_fwd_lowp`'s fused `update_scale_pair`
+# for input/weight; see its docstring in llmm/matmul.mojo). A real training
+# run spends >99% of its steps past warmup, in `AmaxState.update_scale`'s
+# steady-state branch (llmm/amax.mojo) -- untested through this entry point
+# until now (only the bare `AmaxState` primitive is covered there,
+# tests/test_amax.mojo).
+#
+# This drives ONE `doutput_state` through 17 real `matmul_bwd_lowp` calls --
+# one more than `FP8_SPEC.amax_history_len == 16` -- with a distinct,
+# exactly-bf16-representable `d_output` magnitude (`2^i`) on each of the
+# first 16 (warmup) calls, then a huge spike (`2^30`) on the 17th.
+# `input`/`weight` (and their `AmaxState`s, primed once beforehand, mirroring
+# `matmul_fwd_lowp` having already run this step) are held fixed across every
+# call, so `doutput_state`'s own ring buffer is the only thing that can
+# explain its scale. `accumulate=False` throughout, to keep this test's
+# assertions solely about `doutput_state.scale` and not entangled with the
+# dbias/dgrad/dweight accumulation behavior `tests/test_dbias_regression.mojo`
+# / `tests/test_matmul_bwd_fp4.mojo` already cover.
+# ===----------------------------------------------------------------------=== #
+
+
+def _read_f32(
+    ctx: DeviceContext, buf: DeviceBuffer[DType.float32]
+) raises -> Float32:
+    var host = ctx.enqueue_create_host_buffer[DType.float32](1)
+    buf.enqueue_copy_to(host)
+    ctx.synchronize()
+    return host.unsafe_ptr()[0]
+
+
+def test_doutput_amax_steady_state_ignores_current_spike_gpu() raises:
+    """See the module comment immediately above for the full rationale.
+
+    After 16 warmup calls, `doutput_state.step == 16` and its history ring
+    buffer holds exactly `{2^0, ..., 2^15}` (asserted below before relying on
+    it). The 17th call's OWN amax is `2^30`, far above everything in that
+    history. Correct (steady-state) behavior derives this call's scale from
+    the PRE-existing history max (`2^15 = 32768`), never from `2^30` -- so
+    the observed scale must land near `format_max(e5m2) / 32768`, and must
+    NOT land anywhere near `format_max(e5m2) / 2^30` (what a warmup-style
+    "use current amax" computation, or a wrapper that silently stopped
+    advancing/updating the state, would produce instead).
+
+    VALIDATED BOTH WAYS (single NVIDIA GPU, shared-GPU flock):
+      1. Unmodified llmm/matmul.mojo: PASS -- full-file run "Summary
+         [ 1809.035 ] 6 tests run: 6 passed , 0 failed , 0 skipped", this
+         test in 5.447s.
+      2. Mutated `matmul_bwd_lowp` (llmm/matmul.mojo, the `comptime if not
+         FP8_STATIC_SCALES:` block guarding the `doutput_state.update_scale`
+         call) to skip that call once `doutput_state.step > 0` -- so every
+         call after the very first silently stops updating `doutput_state`:
+         `step` freezes at 1, its ring buffer never fills past its first
+         slot, and `scale` freezes at call 0's own warmup value forever (the
+         "wrapper skips update_scale when step > 0" bug this file's FIX 2
+         mutation targets). Rebuilt and reran: FAIL -- "AssertionError:
+         doutput_state.step 1 != 16 after 16 warmup calls -- test setup
+         assumption violated" (the setup-assumption assertion below, which
+         caught the frozen-`step` bug immediately). `test_matmul_bwd_lowp_
+         end_to_end` still PASSED in the same run (expected: it calls
+         `matmul_bwd_lowp` only once, so `step == 0` on its only call and
+         the mutation's guard is never false for it) -- full-file summary
+         "5 passed , 1 failed".
+      3. llmm/matmul.mojo restored; `git diff --stat llmm/` empty afterward.
+    """
+    if not has_nvidia_gpu_accelerator():
+        return
+    var ctx = DeviceContext()
+    comptime ROWS = 32
+    comptime C = 64
+    comptime OC = 64
+    comptime H = FP8_SPEC.amax_history_len  # 16
+
+    seed(99887)
+    var input = _random_bf16(ctx, ROWS * C, Float32(1.0))
+    var weight = _random_bf16(ctx, OC * C, Float32(1.0))
+
+    var d_input_lowp = _zeros_bf16(ctx, ROWS * C)
+    var d_weight_lowp = _zeros_bf16(ctx, OC * C)
+    var d_bias_lowp = _zeros_bf16(ctx, OC)
+
+    var input_state = AmaxState[FP8_SPEC](ctx)
+    var weight_state = AmaxState[FP8_SPEC](ctx)
+    var doutput_state = AmaxState[FP8_SPEC](ctx)
+    # Prime input/weight from a prior ("forward-equivalent") update, mirroring
+    # matmul_fwd_lowp having already run this step -- matmul_bwd_lowp itself
+    # only ever updates doutput_state (see its docstring), and these two
+    # states are read-only, held fixed across all 17 calls below.
+    _prime_state[FP8_SPEC.fwd_dtype](
+        input_state,
+        input.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+        ROWS * C,
+        ctx,
+    )
+    _prime_state[FP8_SPEC.fwd_dtype](
+        weight_state,
+        weight.unsafe_ptr().as_imm().as_unsafe_any_origin(),
+        OC * C,
+        ctx,
+    )
+
+    # Persistent (site, layer)-keyed transposed-fp8 caches `matmul_bwd_lowp`
+    # reads -- a dedicated site name so this test's cache entries never
+    # collide with any other test's.
+    comptime site = StaticString("bwd_lowp_steady_state_test")
+    comptime layer = 0
+    var weight_t = lowp_transpose_cache(ctx, "WT", site, layer, C * OC)
+    quantize_transpose_devscale[
+        FP8_SPEC, FP8_SPEC.fwd_dtype, DType.bfloat16, "gpu"
+    ](
+        weight_t,
+        kernel_ptr_as_immut_bf16(weight),
+        kernel_ptr_as_immut(device_buf_mut_ptr(weight_state.scale)),
+        OC,
+        C,
+        ctx,
+    )
+    var input_t = lowp_transpose_cache(ctx, "IT", site, layer, C * ROWS)
+    quantize_transpose_devscale[
+        FP8_SPEC, FP8_SPEC.fwd_dtype, DType.bfloat16, "gpu"
+    ](
+        input_t,
+        kernel_ptr_as_immut_bf16(input),
+        kernel_ptr_as_immut(device_buf_mut_ptr(input_state.scale)),
+        ROWS,
+        C,
+        ctx,
+    )
+
+    var dev_dout = ctx.enqueue_create_buffer[DType.bfloat16](ROWS * OC)
+    var host_dout = ctx.enqueue_create_host_buffer[DType.bfloat16](ROWS * OC)
+    ctx.synchronize()
+
+    for i in range(H):
+        var v = Float32(1 << i)
+        for j in range(ROWS * OC):
+            host_dout.unsafe_ptr()[j] = v.cast[DType.bfloat16]()
+        dev_dout.enqueue_copy_from(host_dout)
+        ctx.synchronize()
+        matmul_bwd_lowp[
+            DType.bfloat16, "gpu", use_gelu=False, accumulate=False
+        ](
+            device_buf_mut_ptr(d_input_lowp),
+            device_buf_mut_ptr(d_weight_lowp),
+            device_buf_mut_ptr(d_bias_lowp),
+            kernel_ptr_as_immut_bf16(dev_dout),
+            kernel_ptr_as_immut_bf16(input),
+            kernel_ptr_as_immut_bf16(weight),
+            kernel_ptr_as_immut_bf16(input),  # dummy pre_gelu (use_gelu=False)
+            Int64(ROWS),
+            Int64(1),
+            Int64(C),
+            Int64(OC),
+            input_state,
+            weight_state,
+            doutput_state,
+            site,
+            layer,
+            ctx,
+        )
+        ctx.synchronize()
+
+    assert_true(
+        doutput_state.step == H,
+        "doutput_state.step "
+        + String(doutput_state.step)
+        + " != "
+        + String(H)
+        + " after "
+        + String(H)
+        + " warmup calls -- test setup assumption violated",
+    )
+
+    # 17th call: d_output's OWN amax this step is a spike (2^30), far above
+    # everything in the history (max 2^(H-1) = 32768).
+    var spike = Float32(1 << 30)
+    for j in range(ROWS * OC):
+        host_dout.unsafe_ptr()[j] = spike.cast[DType.bfloat16]()
+    dev_dout.enqueue_copy_from(host_dout)
+    ctx.synchronize()
+    matmul_bwd_lowp[DType.bfloat16, "gpu", use_gelu=False, accumulate=False](
+        device_buf_mut_ptr(d_input_lowp),
+        device_buf_mut_ptr(d_weight_lowp),
+        device_buf_mut_ptr(d_bias_lowp),
+        kernel_ptr_as_immut_bf16(dev_dout),
+        kernel_ptr_as_immut_bf16(input),
+        kernel_ptr_as_immut_bf16(weight),
+        kernel_ptr_as_immut_bf16(input),
+        Int64(ROWS),
+        Int64(1),
+        Int64(C),
+        Int64(OC),
+        input_state,
+        weight_state,
+        doutput_state,
+        site,
+        layer,
+        ctx,
+    )
+    ctx.synchronize()
+
+    var scale = _read_f32(ctx, doutput_state.scale)
+    var fmt_max = format_max[FP8_SPEC.bwd_dtype]()
+    var history_max = Float32(1 << (H - 1))  # 32768
+    var expected_scale = fmt_max / history_max
+    var warmup_style_scale = fmt_max / spike  # what a still-warmup or
+    # frozen-scale bug would produce instead
+
+    var rel_err = scale - expected_scale
+    if rel_err < Float32(0.0):
+        rel_err = -rel_err
+    rel_err = rel_err / expected_scale
+    assert_true(
+        rel_err < Float32(0.01),
+        "steady-state doutput scale "
+        + String(scale)
+        + " != history-derived expected "
+        + String(expected_scale)
+        + " (relative error "
+        + String(rel_err)
+        + "; this step's own spike amax was "
+        + String(spike)
+        + ")",
+    )
+    assert_true(
+        scale > warmup_style_scale * Float32(1000.0),
+        "steady-state doutput scale "
+        + String(scale)
+        + " is suspiciously close to the warmup/current-amax-based value "
+        + String(warmup_style_scale)
+        + " -- looks like this step's own spike leaked into its own scale"
+        + " (delayed scaling defeated)",
+    )
 
 
 def main() raises:

@@ -348,30 +348,36 @@ def test_quantize_2d_roundtrip_gaussian_gpu() raises:
     assert_true(rel_l2 < 0.35)
 
 
-def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
-    # `nvfp4_quantize_transpose` (backward) must produce
-    # BYTE-IDENTICAL output to materializing the transpose in bf16 host-side
-    # and calling plain `nvfp4_quantize` on it -- both are the SAME
-    # deterministic RNE computation over the SAME set of logical values, just
-    # reached via a different physical memory-read pattern (module docstring
-    # in llmm/nvfp4_quant.mojo, "Transposed quantize" section). A bug in the
-    # `_nvfp4_src_addr` index-swap would show up here as a byte mismatch,
-    # not merely a "somewhat higher error" -- a much sharper signal than the
-    # end-to-end Dgrad/Wgrad GEMM tests (tests/test_matmul_bwd_fp4.mojo),
-    # which could not distinguish a subtly-wrong transpose from ordinary fp4
-    # quantization noise.
-    if not has_nvidia_gpu_accelerator():
-        return
+def _transpose_matches_materialized_case[
+    BLOCK_ROWS: Int
+](src_rows: Int, src_k: Int, rng_seed: UInt32) raises -> None:
+    """Shared body for
+    `test_quantize_transpose_matches_materialized_transpose_gpu`
+    (BLOCK_ROWS=1) and
+    `test_quantize_transpose_matches_materialized_transpose_block16_gpu`
+    (BLOCK_ROWS=16) -- see the former's docstring for why byte-identical
+    comparison against a host-materialized transpose is the check, and the
+    latter's docstring for why BLOCK_ROWS=16 is covered SEPARATELY rather
+    than trusting BLOCK_ROWS=1 to stand in for it.
+
+    `nvfp4_quantize_transpose` (backward) must produce BYTE-IDENTICAL output
+    to materializing the transpose in bf16 host-side and calling plain
+    `nvfp4_quantize` on it -- both are the SAME deterministic RNE computation
+    over the SAME set of logical values, just reached via a different
+    physical memory-read pattern (module docstring in llmm/nvfp4_quant.mojo,
+    "Transposed quantize" section). A bug in the `_nvfp4_src_addr` index-swap
+    would show up here as a byte mismatch, not merely a "somewhat higher
+    error" -- a much sharper signal than the end-to-end Dgrad/Wgrad GEMM
+    tests (tests/test_matmul_bwd_fp4.mojo), which could not distinguish a
+    subtly-wrong transpose from ordinary fp4 quantization noise.
+    """
     var ctx = shared_gpu_ctx()
-    comptime BLOCK_ROWS = 1
     # source [src_rows, src_k]; logical (transposed) output [src_k, src_rows]
     # -- src_rows must be a multiple of 16 (nvfp4_quantize_transpose's
     # docstring: it becomes the logical output's own block-16 axis).
-    var src_rows = 32
-    var src_k = 48
     var n = src_rows * src_k
 
-    var rng = MT19937(UInt32(777))
+    var rng = MT19937(rng_seed)
     var host_src_fp32 = ctx.enqueue_create_host_buffer[DType.float32](n)
     for i in range(n):
         var s = Float32(0.0)
@@ -483,6 +489,55 @@ def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
             host_scale_ref.unsafe_ptr()[i],
             "swizzled e4m3 scale byte mismatch at " + String(i),
         )
+
+
+def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
+    # BLOCK_ROWS=1 (1D 1x16 blocks -- activations/gradients). See
+    # `_transpose_matches_materialized_case`'s docstring for the check
+    # itself.
+    if not has_nvidia_gpu_accelerator():
+        return
+    _transpose_matches_materialized_case[1](32, 48, UInt32(777))
+
+
+def test_quantize_transpose_matches_materialized_transpose_block16_gpu() raises:
+    # BLOCK_ROWS=16 (2D 16x16 blocks -- weights), the granularity production
+    # actually uses for every fp4 backward: `matmul_d_input_bwd_fp4`
+    # (llmm/matmul.mojo) calls `nvfp4_quantize_transpose` with
+    # `a_block_rows=NVFP4_BLOCK` (transpose_a=True) on the weight operand of
+    # every fp4 Dgrad. `_nvfp4_quantize_gpu`'s group-amax reduction
+    # (llmm/nvfp4_quant.mojo) is written as `comptime if BLOCK_ROWS == 1:
+    # amax = local_amax  else: <shared-memory 16-row group max>` -- under
+    # `comptime if`, BLOCK_ROWS=1 never instantiates the `else` branch at
+    # all, so a BLOCK_ROWS=1-only test (as this file had until now) gives
+    # zero coverage of the code path production always runs. Same
+    # weight-shaped source as the BLOCK_ROWS=1 case (32x48; `src_rows=32` is
+    # a multiple of 16 per the kernel docstring) so the only variable
+    # between the two tests is BLOCK_ROWS itself.
+    #
+    # VALIDATED BOTH WAYS (single NVIDIA GPU, shared-GPU flock):
+    #   1. Unmodified llmm/nvfp4_quant.mojo: PASS -- full-file run "Summary
+    #      [ 1694.341 ] 19 tests run: 19 passed , 0 failed , 0 skipped",
+    #      including this test (0.256s) and the BLOCK_ROWS=1 sibling
+    #      (0.236s).
+    #   2. Mutated `_nvfp4_quantize_gpu`'s BLOCK_ROWS!=1 branch (~line 814)
+    #      from the 16-row shared-memory group max back to `amax =
+    #      local_amax` (the per-row-only computation BLOCK_ROWS=1 uses) --
+    #      i.e. reverted the group reduction to what BLOCK_ROWS=1-only
+    #      coverage could not tell apart from correct. Rebuilt and reran:
+    #      FAIL -- "AssertionError: `left == right` comparison failed:
+    #      left: 229  right: 228  reason: packed e2m1 byte mismatch at 8" in
+    #      THIS test; the BLOCK_ROWS=1 sibling test
+    #      (`test_quantize_transpose_matches_materialized_transpose_gpu`)
+    #      still PASSED in the same run (expected: BLOCK_ROWS=1's own code
+    #      path is untouched by this mutation) -- full-file summary "18
+    #      passed , 1 failed". Confirms this test exercises code the old
+    #      BLOCK_ROWS=1-only coverage did not.
+    #   3. llmm/nvfp4_quant.mojo restored; `git diff --stat llmm/` empty
+    #      afterward.
+    if not has_nvidia_gpu_accelerator():
+        return
+    _transpose_matches_materialized_case[16](32, 48, UInt32(778))
 
 
 def test_quantize_all_zero_tensor_gpu() raises:
