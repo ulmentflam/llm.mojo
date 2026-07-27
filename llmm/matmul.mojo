@@ -459,6 +459,9 @@ def _matmul_cublaslt[
     stride_a: Int = 0,
     stride_b: Int = 0,
     stride_d: Int = 0,
+    ld_a: Int = 0,
+    ld_b: Int = 0,
+    ld_d: Int = 0,
 ) raises:
     # General cuBLASLt matmul with fused epilogue, replicating llm.c's
     # matmul_cublaslt. Column-major D[m,n]=op(A)·op(B); the bias (epilogue&4) is
@@ -466,6 +469,16 @@ def _matmul_cublaslt[
     # destroyed per call (algo cached internally); workspace is a persistent
     # global. Epilogue values: BIAS=4, GELU_AUX_BIAS=164, GELU_AUX=160,
     # DGELU=192, DEFAULT=1.
+    #
+    # ld_a/ld_b/ld_d (0 = "packed", i.e. the llm.c default derived from m/n/k)
+    # let a caller point an operand at a *column slice* of a larger row-major
+    # matrix: a row-major [R, LD] matrix's column slice [R, w] starting at
+    # column c is, read column-major, a w x R matrix with leading dimension LD.
+    # The LM-head vocab tiling (matmul_lm_head_*_tile below) is the only user;
+    # every other call site leaves these at 0 and gets byte-identical
+    # descriptors to before. NOTE: the aux/gelu epilogue LD below is still m —
+    # a strided D is only wired up for the epilogue-free (DEFAULT) GEMMs the
+    # LM head uses.
     var handle = _get_global_handle[dtype, Backend.CUBLASLT](ctx)
     var lt = handle._get_cublas()
     var cuda_stream = CUDA(ctx.stream())
@@ -502,16 +515,17 @@ def _matmul_cublaslt[
     # else B(dt,k,n,k); C/D(dt,m,n,m).
     var a_l: cublasLtMatrixLayout_t
     comptime if transA:
-        a_l = _lt_make_layout(dt, k, m, k)
+        a_l = _lt_make_layout(dt, k, m, k if ld_a == 0 else ld_a)
     else:
-        a_l = _lt_make_layout(dt, m, k, m)
+        a_l = _lt_make_layout(dt, m, k, m if ld_a == 0 else ld_a)
     var b_l: cublasLtMatrixLayout_t
     comptime if transB:
-        b_l = _lt_make_layout(dt, n, k, n)
+        b_l = _lt_make_layout(dt, n, k, n if ld_b == 0 else ld_b)
     else:
-        b_l = _lt_make_layout(dt, k, n, k)
-    var c_l = _lt_make_layout(dt, m, n, m)
-    var d_l = _lt_make_layout(dt, m, n, m)
+        b_l = _lt_make_layout(dt, k, n, k if ld_b == 0 else ld_b)
+    var _ldd = m if ld_d == 0 else ld_d
+    var c_l = _lt_make_layout(dt, m, n, _ldd)
+    var d_l = _lt_make_layout(dt, m, n, _ldd)
 
     # Strided-batched (llm.c's attention path): set BATCH_COUNT + per-matrix
     # STRIDED_BATCH_OFFSET on every layout. cuBLASLt's heuristic picks the kernel
@@ -3376,6 +3390,325 @@ def matmul_bwd[
         output_channels,
         ctx,
     )
+
+
+# ===----------------------------------------------------------------------=== #
+# LM-head vocab tiling
+#
+# The tied `wte` tensor is [V_p, C] = 147 MiB at GPT-2 124M's V_p=50304,
+# C=768. Under ZeRO-2/3 that single tensor sets the floor on both the gradient
+# bucket pool and the ZeRO-3 parameter gather window, because the LM head runs
+# as ONE GEMM over the whole vocabulary. Splitting that GEMM into vocab tiles
+# lets the caller hold, gather and reduce-scatter one tile's rows at a time.
+#
+# The obstruction is purely a layout one. `logits`/`dlogits` are row-major
+# [rows, V_p]; a vocab tile is a COLUMN slice, i.e. a submatrix whose leading
+# dimension (V_p) is larger than its width (tile_oc). Every other entry point in
+# this file builds `row_major(rows, out_channels)` — ld == width by
+# construction. So the tile entry points below thread an explicit leading
+# dimension for the logits-side operand:
+#
+#   * cuBLASLt (the production NVIDIA path) takes it natively — the column
+#     slice is zero-copy, just a pointer offset plus `ld_b`/`ld_d`. See the
+#     ld_a/ld_b/ld_d comment on `_matmul_cublaslt`.
+#   * Every other target (CPU, Metal, vendor-neutral GPU) STAGES the tile
+#     through a contiguous scratch buffer and then calls the existing dense
+#     entry points unchanged. That costs one O(rows*tile_oc) copy next to an
+#     O(2*rows*tile_oc*C) GEMM, and it keeps `linalg.matmul`, the Metal
+#     transpose strategies and the CPU add-into-dodge path completely
+#     untouched.
+#
+# The weight side needs no ld at all: wte's tile is a contiguous ROW range
+# [t0, t0+tile_oc) of a row-major [V_p, C] matrix, so it is just `weight + t0*C`
+# with its natural ld == C.
+#
+# None of this is on the path of any other GEMM in the model — the transformer
+# layers keep calling matmul_fwd / matmul_bwd exactly as before.
+# ===----------------------------------------------------------------------=== #
+
+
+def _gpu_col_slice_kernel[
+    dtype: DType,
+    to_strided: Bool,
+](
+    dst: MutKernelPtr[dtype],
+    src: ImmutKernelPtr[dtype],
+    rows: Int,
+    cols: Int,
+    ld: Int,
+) -> None:
+    """Copy between a contiguous [rows, cols] block and a column slice of a
+    row-major matrix with leading dimension `ld` (the slice's base column is
+    folded into the caller's pointer). `to_strided` picks the direction:
+    True scatters contiguous -> strided, False gathers strided -> contiguous.
+    1-D grid, thread i handles element (i/cols, i%cols)."""
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if idx < rows * cols:
+        var r = idx / cols
+        var c = idx % cols
+        comptime if to_strided:
+            dst[r * ld + c] = src[idx]
+        else:
+            dst[idx] = src[r * ld + c]
+
+
+@always_inline
+def _col_slice_copy[
+    dtype: DType,
+    target: StaticString,
+    to_strided: Bool,
+](
+    dst: MutKernelPtr[dtype],
+    src: ImmutKernelPtr[dtype],
+    rows: Int,
+    cols: Int,
+    ld: Int,
+    ctx: DeviceContext,
+) raises -> None:
+    """Host-side dispatcher for `_gpu_col_slice_kernel` with a plain CPU loop
+    on the CPU target."""
+    comptime if is_gpu[target]():
+        comptime BLOCK_SIZE = 256
+        comptime k = _gpu_col_slice_kernel[dtype, to_strided]
+        var compiled = ctx.compile_function[k]()
+        ctx.enqueue_function(
+            compiled,
+            dst,
+            src,
+            rows,
+            cols,
+            ld,
+            grid_dim=(ceildiv(rows * cols, BLOCK_SIZE),),
+            block_dim=(BLOCK_SIZE,),
+        )
+    else:
+        for r in range(rows):
+            for c in range(cols):
+                comptime if to_strided:
+                    dst[r * ld + c] = src[r * cols + c]
+                else:
+                    dst[r * cols + c] = src[r * ld + c]
+
+
+def matmul_lm_head_fwd_tile[
+    dtype: DType,
+    target: StaticString,
+](
+    out_ptr: MutKernelPtr[dtype],
+    out_ld: Int,
+    input_ptr: ImmutKernelPtr[dtype],
+    weight_ptr: ImmutKernelPtr[dtype],
+    rows: Int,
+    in_channels: Int,
+    tile_oc: Int,
+    ctx: DeviceContext,
+) raises -> None:
+    """One vocab tile of the LM-head forward: `out[:, 0:tile_oc] = input @
+    weightᵀ`, where `out_ptr` already points at the tile's first column of a
+    row-major [rows, out_ld] logits matrix and `weight_ptr` at the tile's first
+    row of row-major wte.
+
+    Bias-free and gelu-free by construction (the LM head is a bare tied
+    projection), so there is no epilogue to strand on the strided D.
+
+    Numerically this matches the untiled GEMM: the reduction axis is
+    `in_channels`, which tiling does not touch, so each output element is still
+    one full-length dot product over the same values. (Bitwise equality is not
+    promised — a vendor kernel may block differently for a narrower N — but no
+    sum is reassociated, and at V_p=50304 the tiled and untiled results agree to
+    1e-5 absolute; see tests/test_lm_head_vocab_tiling.mojo.)
+    """
+    comptime if is_gpu[target]() and HAS_CUBLAS:
+        # Same col-major D[m=tile_oc, n=rows] / transA(weight) convention as
+        # matmul_fwd's fused arm, with D's leading dimension widened from
+        # tile_oc to the full logits row stride so the GEMM writes straight
+        # into the column slice.
+        _matmul_cublaslt[dtype, transA=True, transB=False](
+            out_ptr,
+            weight_ptr,
+            input_ptr,
+            weight_ptr,  # dummy (no bias bit)
+            out_ptr,  # dummy aux (no gelu bit)
+            tile_oc,
+            rows,
+            in_channels,
+            Int32(1),  # DEFAULT
+            False,
+            ctx,
+            ld_d=out_ld,
+        )
+    else:
+        # Portable staging: dense GEMM into a contiguous [rows, tile_oc] tile,
+        # then scatter into the strided logits columns.
+        var stage = ctx.enqueue_create_buffer[dtype](rows * tile_oc)
+        var stage_ptr = rebind[MutKernelPtr[dtype]](stage.unsafe_ptr())
+        matmul_fwd[dtype, target, use_gelu=False, has_bias=False](
+            stage_ptr,
+            stage_ptr,  # dummy pre_gelu (use_gelu=False: never stored to)
+            input_ptr,
+            weight_ptr,
+            rebind[ImmutKernelPtr[dtype]](stage_ptr),  # dummy bias
+            Int64(rows),
+            Int64(1),
+            Int64(in_channels),
+            Int64(tile_oc),
+            ctx,
+        )
+        _col_slice_copy[dtype, target, to_strided=True](
+            out_ptr,
+            rebind[ImmutKernelPtr[dtype]](stage_ptr),
+            rows,
+            tile_oc,
+            out_ld,
+            ctx,
+        )
+        ctx.synchronize()
+        _ = stage^
+
+
+def matmul_lm_head_bwd_tile[
+    dtype: DType,
+    target: StaticString,
+](
+    d_input_ptr: MutKernelPtr[dtype],
+    d_weight_ptr: MutKernelPtr[dtype],
+    d_output_ptr: ImmutKernelPtr[dtype],
+    d_output_ld: Int,
+    input_ptr: ImmutKernelPtr[dtype],
+    weight_ptr: ImmutKernelPtr[dtype],
+    scratch_ptr: MutKernelPtr[dtype],
+    rows: Int,
+    in_channels: Int,
+    tile_oc: Int,
+    accumulate_d_input: Bool,
+    ctx: DeviceContext,
+) raises -> None:
+    """One vocab tile of the LM-head backward.
+
+    `d_weight[0:tile_oc, :] = d_output[:, 0:tile_oc]ᵀ @ input` always
+    accumulates (beta=1) — the caller pre-zeroes the destination, exactly as the
+    untiled path does. Its reduction axis is `rows`, untouched by vocab tiling,
+    so no sum is reassociated (measured: agrees with the untiled GEMM to 1e-5
+    absolute at V_p=50304, ~1 ulp on those magnitudes).
+
+    `d_input += d_output[:, 0:tile_oc] @ weight[0:tile_oc, :]` reduces over the
+    vocabulary, which tiling DOES split — hence the runtime `accumulate_d_input`
+    (False on the first tile to overwrite, True afterwards). Splitting the
+    reduction reassociates the sum, so d_input differs from the untiled result
+    by fp rounding only.
+
+    `d_output_ptr` points at the tile's first column of a row-major
+    [rows, d_output_ld] dlogits matrix; `weight_ptr`/`d_weight_ptr` at the
+    tile's first row of row-major wte / its gradient.
+    """
+    comptime if is_gpu[target]() and HAS_CUBLAS:
+        # d_input[C, rows] = weight[C, tile_oc] * d_output[tile_oc, rows], all
+        # col-major, k=tile_oc. Only the d_output operand is strided.
+        _matmul_cublaslt[dtype, transA=False, transB=False](
+            d_input_ptr,
+            weight_ptr,
+            d_output_ptr,
+            weight_ptr,  # dummy (no bias bit)
+            d_input_ptr,  # dummy aux (no gelu bit)
+            in_channels,
+            rows,
+            tile_oc,
+            Int32(1),  # DEFAULT
+            accumulate_d_input,
+            ctx,
+            ld_b=d_output_ld,
+        )
+        # d_weight[C, tile_oc] = input[C, rows] * d_outputᵀ, k=rows. transB
+        # reads d_output as a tile_oc x rows col-major matrix, so its leading
+        # dimension is the full logits row stride.
+        _matmul_cublaslt[dtype, transA=False, transB=True](
+            d_weight_ptr,
+            input_ptr,
+            d_output_ptr,
+            input_ptr,  # dummy (no bias bit)
+            d_weight_ptr,  # dummy aux (no gelu bit)
+            in_channels,
+            tile_oc,
+            rows,
+            Int32(1),  # DEFAULT
+            True,  # caller pre-zeroed; matches the untiled accumulate=True
+            ctx,
+            ld_b=d_output_ld,
+        )
+    else:
+        # Portable staging: gather the strided dlogits tile into a contiguous
+        # [rows, tile_oc] buffer once, then reuse the dense entry points.
+        var stage = ctx.enqueue_create_buffer[dtype](rows * tile_oc)
+        var stage_ptr = rebind[MutKernelPtr[dtype]](stage.unsafe_ptr())
+        _col_slice_copy[dtype, target, to_strided=False](
+            stage_ptr, d_output_ptr, rows, tile_oc, d_output_ld, ctx
+        )
+        ctx.synchronize()
+        var stage_imm = rebind[ImmutKernelPtr[dtype]](stage_ptr)
+
+        if accumulate_d_input:
+            # matmul_d_input_bwd always overwrites d_input, so accumulate by
+            # materializing into a temp and folding in. (Same shape as
+            # matmul_d_weight_bwd's own accumulate dodge.)
+            var tmp = ctx.enqueue_create_buffer[dtype](rows * in_channels)
+            var tmp_ptr = rebind[MutKernelPtr[dtype]](tmp.unsafe_ptr())
+            matmul_d_input_bwd[dtype, target, use_gelu=False](
+                tmp_ptr,
+                stage_imm,
+                weight_ptr,
+                rebind[ImmutKernelPtr[dtype]](tmp_ptr),  # dummy pre_gelu
+                Int64(rows),
+                Int64(1),
+                Int64(in_channels),
+                Int64(tile_oc),
+                ctx,
+            )
+            comptime if is_gpu[target]():
+                comptime ADD_BLOCK = 256
+                var total = rows * in_channels
+                comptime add_k = _gpu_add_into_kernel[dtype]
+                var add_c = ctx.compile_function[add_k]()
+                ctx.enqueue_function(
+                    add_c,
+                    d_input_ptr,
+                    tmp_ptr,
+                    total,
+                    grid_dim=(ceildiv(total, ADD_BLOCK),),
+                    block_dim=(ADD_BLOCK,),
+                )
+            else:
+                comptime simd_width = simd_width_of[DType.float32]()
+                _add_into[dtype, simd_width](
+                    d_input_ptr, tmp_ptr, rows * in_channels
+                )
+            ctx.synchronize()
+            _ = tmp^
+        else:
+            matmul_d_input_bwd[dtype, target, use_gelu=False](
+                d_input_ptr,
+                stage_imm,
+                weight_ptr,
+                rebind[ImmutKernelPtr[dtype]](d_input_ptr),  # dummy pre_gelu
+                Int64(rows),
+                Int64(1),
+                Int64(in_channels),
+                Int64(tile_oc),
+                ctx,
+            )
+
+        matmul_d_weight_bwd[dtype, target, accumulate=True](
+            d_weight_ptr,
+            stage_imm,
+            input_ptr,
+            scratch_ptr,
+            Int64(rows),
+            Int64(1),
+            Int64(in_channels),
+            Int64(tile_oc),
+            ctx,
+        )
+        ctx.synchronize()
+        _ = stage^
 
 
 # fp8 backward — separate sibling entry points (matmul_d_input_bwd_lowp /
