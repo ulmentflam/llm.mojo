@@ -255,9 +255,34 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         a small fp32-accumulate add kernel (_add_inplace_gpu).
 
     Traffic per rank is 2*(N-1)/N of the buffer per allreduce — same as a
-    ring — measured ~75 GB/s aggregate on the 8-GPU fp32 GPT-2 gradient
-    (~92 ms), vs. N*(N-1) for comm's naive all-pull fallback (which also
+    ring — vs. N*(N-1) for comm's naive all-pull fallback (which also
     crashes on cross-device raw-pointer copies on this toolchain).
+
+    Measured throughput (reproduce with `make benchmark-collectives`, which
+    builds and runs bench_collectives.mojo; pin GPUs by UUID via
+    BENCH_COLL_GPUS):
+
+      WORLD_SIZE=2, fp32, workstation-max, min-of-10 after 3 warmup:
+        allreduce     474.8 MiB buffer -> 23.65 ms, 21.05 GB/s per rank
+        reducescatter 474.8 MiB buffer -> 12.37 ms, 20.13 GB/s per rank
+        allgather     474.8 MiB buffer -> 11.60 ms, 21.47 GB/s per rank
+      Per-rank bandwidth plateaus near ~21 GB/s above ~24 MiB and falls off
+      sharply below ~6 MiB (0.75 MiB: ~6.7 GB/s), i.e. small collectives are
+      latency-bound, not bandwidth-bound.
+
+    An earlier revision of this docstring claimed "~75 GB/s aggregate on the
+    8-GPU fp32 GPT-2 gradient (~92 ms)". That figure is UNVERIFIED — it had no
+    harness behind it and no one has reproduced it. It is not contradicted
+    either: it implies ~9.4 GB/s per rank at N=8, and per-rank bandwidth is
+    expected to fall as N grows (more peers contending for the same staged
+    copies), so ~21 GB/s at N=2 is consistent with it without confirming it.
+
+    It also cannot be re-measured on this box. Physical GPU index 1 is dead
+    hardware (GSP faults at idle; RMA-grade), so **this machine has 7 usable
+    GPUs, not 8** — do not go looking for the N=8 configuration, it no longer
+    exists here. Settling the original claim needs a genuinely 8-GPU machine:
+    `make benchmark-collectives BENCH_COLL_WORLD=8 BENCH_COLL_GPUS=<8 uuids>`.
+    For a world-size trend on this box, N=2 through N=7 is available.
 
     signal_buffer remains only because the (P2P-only, unusable here)
     comm-based ShardedParameter.gather path reads it; it is a 1-byte dummy.
@@ -346,6 +371,129 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             total += coord_ptr[].shared_scalars[i]
         coord_ptr[].barrier2[].wait()
         return total
+
+    def assert_ranges_agree(
+        self,
+        what: StaticString,
+        dest_starts: List[Int],
+        pool_offsets: List[Int],
+        lengths: List[Int],
+    ) raises:
+        """Enforce the identical-range-lists invariant of the bucketed
+        collectives.
+
+        `reducescatter_buckets` and `allgather_ranges` both require every rank
+        to pass the same `(dest_starts, pool_offsets, lengths)`. Until now that
+        was documented but unchecked, and violating it does NOT hang: both
+        barriers sit outside the per-range loop, so barrier counts still match.
+        Instead each rank indexes its PEERS' buffers at offsets taken from its
+        OWN list, silently reading the wrong rows — wrong gradients, no crash,
+        and any test that only asserts "it ran" stays green.
+
+        That is a live trap for any caller whose ranges are derived from data
+        rather than from the static parameter layout (the encoder's row map is
+        the first such caller). So: hash the lists, sum the hashes across ranks
+        with the existing host-side scalar reduce, and check the sum equals
+        N x my own hash — which holds iff every rank hashed the same lists.
+        Two host barriers, no device work.
+
+        The verdict MUST be identical on every rank. The obvious test —
+        "does the sum equal N times MY hash?" — is not: a rank whose hash
+        happens to equal the mean passes while the others fail. At N=2 that
+        cannot happen (a disagreement puts the mean strictly between the two,
+        so both fail), but at N=3 with hashes 4/5/6 the middle rank passes,
+        walks into the collective, and spins on a barrier its peers already
+        abandoned by raising. That would turn silent corruption into a hang,
+        which is worse than the error it promises.
+
+        So the check is made symmetric: reduce both sum(h) and sum(h^2), which
+        every rank receives identically, and use the equality case of
+        Cauchy-Schwarz — N*sum(h^2) == sum(h)^2 iff every h is equal. Same
+        inputs on every rank, therefore same verdict, therefore all ranks raise
+        together and none is left waiting.
+
+        The hash is kept to 20 bits so that both h^2 summed over N (<= 8) and
+        sum(h)^2 stay well inside Float64's 53-bit exact integer range, making
+        the comparison exact rather than approximate.
+        """
+        if Self.N == 1 or not self.cpu_coordinator_ptr:
+            return
+        var h = UInt64(len(lengths))
+        for i in range(len(lengths)):
+            h = (h * 1000003 + UInt64(dest_starts[i])) & 0xFFFFF
+            h = (h * 1000003 + UInt64(pool_offsets[i])) & 0xFFFFF
+            h = (h * 1000003 + UInt64(lengths[i])) & 0xFFFFF
+        var mine = Float64(h)
+        var sum_h = self.allreduce_scalar(mine)
+        var sum_h2 = self.allreduce_scalar(mine * mine)
+        if Float64(Self.N) * sum_h2 != sum_h * sum_h:
+            raise Error(
+                String(
+                    "ZeroContext.",
+                    what,
+                    (
+                        ": ranks disagree on the bucket range list. Every rank"
+                        " must pass identical (dest_starts, pool_offsets,"
+                        " lengths); divergent lists silently read peer buffers"
+                        " at the wrong offsets instead of failing. Rank "
+                    ),
+                    self.rank,
+                    " hashed ",
+                    h,
+                    " over ",
+                    len(lengths),
+                    " ranges.",
+                )
+            )
+
+    def allreduce_or_host[
+        dtype: DType
+    ](
+        self,
+        src: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        dst: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        size: Int,
+    ) raises:
+        """Bitwise-OR reduce a small HOST-resident array across all ranks.
+
+        Unlike the other array collectives this one is host-side on *every*
+        target, including GPU builds: ranks are threads in one process
+        (see `CpuCoordinator`), so peers' host buffers are directly
+        addressable and no device staging is involved. It exists for the
+        encoder's per-batch row map, where every rank must agree on the exact
+        same set of `wte` rows before calling `allgather_ranges` /
+        `reducescatter_buckets` — those collectives require identical range
+        lists on all ranks, and each rank sees a different token batch.
+
+        `src` is this rank's presence bitmap and is never written, so peers may
+        read it concurrently; the union lands in `dst` (a distinct buffer). For
+        N == 1 or a missing coordinator (the sequential-rank equivalence
+        harness) this degenerates to a copy, which is the correct union of the
+        one rank that exists.
+        """
+        if Self.N == 1 or not self.cpu_coordinator_ptr:
+            for i in range(size):
+                dst[i] = src[i]
+            return
+        var coord_ptr = _register_and_sync[dtype, MutAnyOrigin, MutAnyOrigin](
+            self.rank, self.cpu_coordinator_ptr, src, src
+        )
+        for i in range(size):
+            dst[i] = src[i]
+        for p in range(Self.N):
+            if p == self.rank:
+                continue
+            var peer = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+                coord_ptr[]
+                .shared_inputs[p]
+                .bitcast[Scalar[dtype]]()
+                .as_unsafe_any_origin()
+            )
+            for i in range(size):
+                dst[i] |= peer[i]
+        # Hold every rank's `src` alive until all peers have finished reading
+        # it, mirroring the trailing barrier of the other collectives.
+        coord_ptr[].barrier2[].wait()
 
     @always_inline
     def _check_scratch[dtype: DType](self, shard_elems: Int) raises:
@@ -722,6 +870,9 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         pool alive across the cross-rank reads and let each rank recycle its
         pool for the next bucket after the call returns.
         """
+        self.assert_ranges_agree(
+            "reducescatter_buckets", dest_starts, pool_offsets, lengths
+        )
         comptime if is_cpu[Self.target]():
             if Self.N == 1:
                 # Single rank: the whole vector is this rank's shard (opt ==
@@ -989,6 +1140,9 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         shard is ever written, so concurrent peer reads are safe; a trailing
         barrier orders this gather against the next collective's slot reuse.
         """
+        self.assert_ranges_agree(
+            "allgather_ranges", dst_offsets, flat_starts, lengths
+        )
         var count = len(lengths)
         comptime if is_cpu[Self.target]():
             if Self.N == 1 or not self.cpu_coordinator_ptr:

@@ -41,7 +41,17 @@ from llmm.checkpointing import (
     make_training_state,
     restore_dataloader_state,
 )
-from llmm.encoder import encoder_fwd, encoder_bwd, build_wte_buckets
+from llmm.encoder import (
+    encoder_fwd,
+    encoder_bwd,
+    build_wte_buckets,
+    build_token_bitmap,
+    build_row_runs,
+    bitmap_words,
+    ENC_MERGE_GAP_ROWS,
+    ENC_ROW_CHUNK_ROWS,
+    WTE_BUCKET_IDX_SIZE,
+)
 from llmm.layernorm import (
     layernorm_fwd,
     layernorm_bwd,
@@ -1216,6 +1226,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # so the wte-backward GPU kernel must read these device copies instead.
     var bucket_info_dev_buf: DeviceBuffer[DType.int32]
     var workload_indices_dev_buf: DeviceBuffer[DType.int32]
+    # Row-sparse wte (encoder half of ZeRO roadmap item 1). Per micro-step the
+    # batch names at most B*T of wte's 50304 rows, so the encoder's gradient
+    # bucket and (under ZeRO-3) its parameter gather move only those rows.
+    # `enc_bitmap_buf` is this rank's token-presence bitmap; `enc_bitmap_union_buf`
+    # is the OR across ranks — the collectives demand identical range lists on
+    # every rank and each rank sees a different batch, so the union is what all
+    # ranks agree on. See llmm/encoder.mojo's "Encoder Row Map" section.
+    var enc_bitmap_buf: HostBuffer[DType.uint32]
+    var enc_bitmap_union_buf: HostBuffer[DType.uint32]
+    var enc_row_of_token_buf: HostBuffer[DType.int32]
     var losses_host_buf: HostBuffer[StatsDType]
     var logits_host_buf: HostBuffer[GPT2_DTYPE]
     # Persistent scratch for calculate_grad_norm's GPU reduction (per-block
@@ -1304,6 +1324,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var workload_indices_dev: MutMemPtr[DType.int32]
     var num_wte_buckets: Int
     var wte_bucket_capacity: Int
+    # Row-sparse wte state, rebuilt every micro-step by build_encoder_buckets.
+    var enc_bitmap: MutMemPtr[DType.uint32]
+    var enc_bitmap_union: MutMemPtr[DType.uint32]
+    var enc_row_of_token: MutMemPtr[DType.int32]
+    var enc_row_sparse: Bool
+    var enc_num_rows: Int
+    var enc_run_first: List[Int]
+    var enc_run_len: List[Int]
     var mean_loss: Float32  # The mean loss for the current forward pass.
     var checkpoint_path: String  # The path to the checkpoint file.
 
@@ -1416,6 +1444,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.num_wte_buckets = 0
         self.wte_bucket_capacity = 0
 
+        var NULL_UINT32_PTR = MutMemPtr[DType.uint32](unsafe_from_address=zero)
+        self.enc_bitmap = NULL_UINT32_PTR
+        self.enc_bitmap_union = NULL_UINT32_PTR
+        self.enc_row_of_token = NULL_INT32_PTR
+        self.enc_row_sparse = False
+        self.enc_num_rows = 0
+        self.enc_run_first = List[Int]()
+        self.enc_run_len = List[Int]()
+
         self.num_parameters = 0
         self.num_activations = 0
         self.num_grads = 0
@@ -1458,6 +1495,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             1
         )
         self.workload_indices_buf = self.ctx.enqueue_create_host_buffer[
+            DType.int32
+        ](1)
+        self.enc_bitmap_buf = self.ctx.enqueue_create_host_buffer[DType.uint32](
+            1
+        )
+        self.enc_bitmap_union_buf = self.ctx.enqueue_create_host_buffer[
+            DType.uint32
+        ](1)
+        self.enc_row_of_token_buf = self.ctx.enqueue_create_host_buffer[
             DType.int32
         ](1)
         self.grad_norm_out_buf = self.ctx.enqueue_create_buffer[DType.float32](
@@ -1547,6 +1593,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.config = parse_model_descriptor(self.checkpoint_path)
             self.allocate_parameters_random()
 
+        # Row-sparse wte rides on the same condition as gradient bucketing
+        # (ZeRO-2/3 at WORLD_SIZE > 1): those are exactly the stages where the
+        # encoder's gradient goes through the pool + reduce-scatter path rather
+        # than a full dense grads buffer. Must be set before
+        # `allocate_gradients` so the pool is sized for a row chunk.
+        self.enc_row_sparse = self._use_bucketing()
         self.allocate_gradients()
 
         # fp8 delayed-scaling state: one AmaxState per GEMM operand site per
@@ -2326,19 +2378,63 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             s += self.param_sizes[i] // self.config.num_layer
         return s
 
+    def _enc_max_rows(self) -> Int:
+        """Worst-case distinct `wte` rows the row map can name in one
+        micro-step. The map is built from the UNION of every rank's batch, so
+        the bound is WORLD_SIZE*B*T rows, capped by the vocabulary. This sizes
+        the row map itself (run lists, compact inputs), not the pool."""
+        var bt = self.batch_size * self.seq_len
+        return min(Self.WORLD_SIZE * bt, self.config.vocab_size)
+
+    def _enc_chunk_rows(self) -> Int:
+        """Rows of compact wte gradient resident in the pool at once.
+
+        The encoder backward walks the batch's rows in chunks of this size and
+        reduce-scatters each chunk, so the pool is bounded by a constant rather
+        than by B*T. That matters because `_enc_max_rows` saturates: at
+        B=32,T=1024 the union across ranks approaches the whole vocabulary and
+        a B*T-derived bound would save nothing. Small shapes still get the
+        tighter bound, since a chunk never needs to exceed the row map."""
+        var cap = ENC_ROW_CHUNK_ROWS
+        if self.batch_size != 0:
+            cap = min(cap, self._enc_max_rows())
+        return min(cap, self.config.vocab_size)
+
+    def _enc_grad_pool_elems(self) -> Int:
+        """Pool footprint of the encoder gradient bucket (Bucket 4): one chunk
+        of row-sparse wte gradient plus dense wpe. Falls back to the dense wte
+        size when row-sparsity is off."""
+        var wpe = self.param_sizes[Parameters.wpe]
+        if not self.enc_row_sparse:
+            return self.param_sizes[Parameters.wte] + wpe
+        return self._enc_chunk_rows() * self.config.channels + wpe
+
     def _grad_pool_elems(self) -> Int:
-        """Largest simultaneous gradient bucket: wte+wpe (held together during
-        the encoder backward) vs one LM-head vocab tile vs one transformer
-        layer's 12 tensors."""
-        var wte_wpe = (
-            self.param_sizes[Parameters.wte] + self.param_sizes[Parameters.wpe]
-        )
-        # LM-head bucket. Was the full wte (147 MiB at GPT-2 124M); the vocab
-        # tiling reduces it to one tile's rows, reduce-scattered and recycled
-        # per tile. The `wte_wpe` term above belongs to the ENCODER bucket, not
-        # this one, and still dominates until that bucket is shrunk separately.
+        """Largest simultaneous gradient bucket: one LM-head vocab tile vs the
+        encoder's row chunk vs one transformer layer's 12 tensors.
+
+        Both halves of the tied-`wte` work have now landed, so neither bucket
+        holds the whole [V_p, C] tensor any more and the old combined
+        `wte + wpe` term is gone. It is not merely dropped, though — each
+        replacement subsumes it on its own fallback path, which is what makes
+        removing it safe:
+
+          * `_lm_head_tile_rows()` returns `V_p` when tiling is off
+            (LLMM_LM_HEAD_VOCAB_TILES <= 1), so the LM-head term is still the
+            full wte in that configuration. Bucket 1 carries no wpe.
+          * `_enc_grad_pool_elems()` returns `wte + wpe` outright when
+            row-sparsity is off, and chunk + wpe when it is on.
+
+        So every previously-reachable configuration still gets a bound at least
+        as large as before, and the floor drops only when both halves are
+        actually active — which is the honest statement of what this campaign
+        bought.
+        """
         var lm_head = self._lm_head_tile_rows() * self.config.channels
-        return max(max(wte_wpe, lm_head), self._per_layer_pool_elems())
+        return max(
+            lm_head,
+            max(self._enc_grad_pool_elems(), self._per_layer_pool_elems()),
+        )
 
     def _zero_grad_pool(mut self, cnt: Int) raises:
         """Zero the first `cnt` elements of the gradient pool before a bucket's
@@ -2373,6 +2469,110 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             ),
             self.optimizer_num_parameters,
         )
+
+    def _encoder_backward_row_sparse(
+        mut self,
+        enc_bucket_info: MutMemPtr[DType.int32],
+        enc_workload_indices: MutMemPtr[DType.int32],
+        flat_wte: Int,
+        flat_wpe: Int,
+        batch_size: Int,
+        seq_len: Int,
+        channels: Int,
+    ) raises:
+        """Encoder gradient bucket over only the rows this batch touched.
+
+        The dense version materializes all 50304 wte rows (147 MiB) to hold the
+        <= B*T rows that are actually non-zero. This walks the compact rows in
+        chunks of `_enc_chunk_rows()` instead, reduce-scattering each chunk
+        before reusing the pool, so peak pool residency is a constant rather
+        than a function of vocabulary size *or* batch size.
+
+        Chunking (rather than one compact bucket) is what makes the saving
+        survive at scale: the row set is the union across ranks, and at
+        B=32,T=1024 that union approaches the whole vocabulary, so a
+        `min(WORLD_SIZE*B*T, V)`-sized bucket would save nothing there.
+
+        Every quantity below — row count, chunk count, chunk boundaries, range
+        lists — derives from the union row map and compile-time constants, so
+        all ranks compute identical lists. That is required, not incidental:
+        see `ZeroContext.assert_ranges_agree`.
+        """
+        var pool = self.grad_pool_memory
+        var wpe_size = self.param_sizes[Parameters.wpe]
+        var chunk_rows = self._enc_chunk_rows()
+        var num_chunks = max(1, ceildiv(self.enc_num_rows, chunk_rows))
+        var bucket_cursor = 0
+
+        for j in range(num_chunks):
+            var row_lo = j * chunk_rows
+            var row_hi = min(row_lo + chunk_rows, self.enc_num_rows)
+            var chunk_elems = (row_hi - row_lo) * channels
+            var first_chunk = j == 0
+
+            # dwpe rides along in chunk 0 only; it does not depend on the row
+            # chunk, so recomputing it per chunk would accumulate it twice.
+            var zero_cnt = chunk_elems
+            if first_chunk:
+                zero_cnt += wpe_size
+            self._zero_grad_pool(zero_cnt)
+            self.grads.wte = pool
+            self.grads.wpe = pool + chunk_elems
+
+            # Buckets come out of build_wte_buckets in ascending compact-row
+            # order, so this chunk's buckets are a contiguous slice and one
+            # forward scan over all chunks visits each bucket once.
+            var bucket_start = bucket_cursor
+            while bucket_cursor < self.num_wte_buckets:
+                var row = Int(
+                    self.bucket_info[bucket_cursor * WTE_BUCKET_IDX_SIZE + 2]
+                )
+                if row >= row_hi:
+                    break
+                bucket_cursor += 1
+
+            # The kernels write row r at dwte_ptr + r*channels using absolute
+            # compact rows, so bias the base pointer down by the chunk's first
+            # row. Every row the kernels touch is >= row_lo, so every address
+            # formed lands inside the pool.
+            encoder_bwd[GPT2_DTYPE, Self.target](
+                as_mut_kernel[GPT2_DTYPE](pool - row_lo * channels),
+                as_mut_kernel[GPT2_DTYPE](self.grads.wpe),
+                as_immut_kernel_from_mut[DType.int32](
+                    enc_bucket_info + bucket_start * WTE_BUCKET_IDX_SIZE
+                ),
+                as_immut_kernel_from_mut[DType.int32](enc_workload_indices),
+                as_immut_kernel_from_mut[GPT2_DTYPE](self.grad_acts.encoded),
+                bucket_cursor - bucket_start,
+                batch_size,
+                seq_len,
+                channels,
+                self.ctx,
+                include_wpe=first_chunk,
+            )
+
+            # Map this chunk's compact rows back to flat `wte` ranges. Compact
+            # row `cum + i` of run k is global row `run_first[k] + i`.
+            var d = List[Int]()
+            var po = List[Int]()
+            var ln = List[Int]()
+            var cum = 0
+            for k in range(len(self.enc_run_first)):
+                var lo = max(cum, row_lo)
+                var hi = min(cum + self.enc_run_len[k], row_hi)
+                if hi > lo:
+                    d.append(
+                        flat_wte
+                        + (self.enc_run_first[k] + (lo - cum)) * channels
+                    )
+                    po.append((lo - row_lo) * channels)
+                    ln.append((hi - lo) * channels)
+                cum += self.enc_run_len[k]
+            if first_chunk:
+                d.append(flat_wpe)
+                po.append(chunk_elems)
+                ln.append(wpe_size)
+            self._reduce_grad_bucket(d, po, ln)
 
     def allocate_gradients(mut self) raises:
         self.grads = ParameterTensors[GPT2_DTYPE]()
@@ -2667,6 +2867,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             DType.int32
         ](B * T)
 
+        # Row-map scratch. All host-side: the row map is derived from the host
+        # copy of the token ids and consumed by host code that builds bucket
+        # rows and collective range lists, so none of it needs to be on device.
+        if self.enc_row_sparse:
+            var bm_words = bitmap_words(self.config.vocab_size)
+            self.enc_bitmap_buf = self.ctx.enqueue_create_host_buffer[
+                DType.uint32
+            ](bm_words)
+            self.enc_bitmap_union_buf = self.ctx.enqueue_create_host_buffer[
+                DType.uint32
+            ](bm_words)
+            self.enc_row_of_token_buf = self.ctx.enqueue_create_host_buffer[
+                DType.int32
+            ](self.config.vocab_size)
+
         self.losses_host_buf = self.ctx.enqueue_create_host_buffer[StatsDType](
             self.batch_size * self.seq_len
         )
@@ -2706,6 +2921,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.workload_indices = rebind_mut_mem[DType.int32](
             self.workload_indices_buf.unsafe_ptr().as_unsafe_any_origin()
         )
+        self.enc_bitmap = rebind_mut_mem[DType.uint32](
+            self.enc_bitmap_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.enc_bitmap_union = rebind_mut_mem[DType.uint32](
+            self.enc_bitmap_union_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.enc_row_of_token = rebind_mut_mem[DType.int32](
+            self.enc_row_of_token_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
         self.bucket_info_dev_buf = self.ctx.enqueue_create_buffer[DType.int32](
             self.wte_bucket_capacity * 4
         )
@@ -2730,6 +2954,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.has_allocated_acts = True
 
     def build_encoder_buckets(mut self, batch_size: Int, seq_len: Int) raises:
+        if self.enc_row_sparse:
+            self._build_encoder_row_map(batch_size, seq_len)
         self.num_wte_buckets = build_wte_buckets(
             as_immut_kernel_from_mut[DType.int32](self.inputs),
             as_mut_kernel[DType.int32](self.bucket_info),
@@ -2739,6 +2965,59 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.config.vocab_size,
             self.config.channels,
             self.wte_bucket_capacity,
+            as_immut_kernel_from_mut[DType.int32](self.enc_row_of_token),
+            self.enc_row_sparse,
+        )
+
+    def _build_encoder_row_map(mut self, batch_size: Int, seq_len: Int) raises:
+        """Derive this micro-step's compact `wte` row set, identically on every
+        rank.
+
+        Three steps, and the middle one is the whole reason this method exists.
+
+        1. Mark the token ids this rank's batch actually uses. An embedding
+           gradient is naturally sparse: a row of `wte` receives gradient only
+           if its token appears in the batch, so B*T positions can touch at
+           most B*T of the 50304 rows.
+
+        2. OR those bitmaps across ranks. Ranks are data-parallel — each reads
+           a different slice of the data — so their token sets genuinely
+           differ. But `reducescatter_buckets` indexes every PEER's pool at
+           offsets taken from the CALLING rank's range list, so ranks holding
+           different lists read each other's gradients at the wrong rows. That
+           does not deadlock (both barriers sit outside the per-range loop); it
+           silently produces wrong gradients. Taking the union here makes the
+           row set rank-invariant before any range list is derived from it,
+           which is what buys the right to call the collective at all.
+
+        3. Turn the union into coalesced runs. Every rank runs the identical
+           deterministic pass over the identical union bitmap, so all ranks
+           agree without any further communication.
+        """
+        var total = batch_size * seq_len
+        build_token_bitmap(
+            as_immut_kernel_from_mut[DType.int32](self.inputs),
+            as_mut_kernel[DType.uint32](self.enc_bitmap),
+            total,
+            self.config.vocab_size,
+        )
+        self.zero_ctx.allreduce_or_host[DType.uint32](
+            rebind[UnsafePointer[Scalar[DType.uint32], MutAnyOrigin]](
+                self.enc_bitmap.as_unsafe_any_origin()
+            ),
+            rebind[UnsafePointer[Scalar[DType.uint32], MutAnyOrigin]](
+                self.enc_bitmap_union.as_unsafe_any_origin()
+            ),
+            bitmap_words(self.config.vocab_size),
+        )
+        self.enc_num_rows = build_row_runs(
+            as_immut_kernel_from_mut[DType.uint32](self.enc_bitmap_union),
+            as_mut_kernel[DType.int32](self.enc_row_of_token),
+            self.config.vocab_size,
+            self._enc_max_rows(),
+            ENC_MERGE_GAP_ROWS,
+            self.enc_run_first,
+            self.enc_run_len,
         )
 
     def forward(
@@ -4490,13 +4769,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self._reduce_grad_bucket(d, po, ln)
 
         # Bucket 4 — wte (encoder contribution, accumulates onto the shard via
-        # reduce-scatter linearity) + wpe. Repoint both into the pool.
-        if bucketing:
-            self.grads.wte = pool  # pool[0 : wte_size]
-            self.grads.wpe = pool + wte_size  # pool[wte_size : +wpe_size]
-            self._zero_grad_pool(wte_size + wpe_size)
-
-        # Encoder backward: scatter token grads into wte, sum position grads into wpe.
+        # reduce-scatter linearity) + wpe.
+        #
         # On GPU (Metal), bucket_info/workload_indices are HostBuffers whose raw
         # pointers read as zeros inside Metal kernels — use device copies uploaded
         # during forward's build_encoder_buckets phase.
@@ -4505,30 +4779,50 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         comptime if is_gpu[Self.target]():
             enc_bucket_info = self.bucket_info_dev
             enc_workload_indices = self.workload_indices_dev
-        encoder_bwd[GPT2_DTYPE, Self.target](
-            as_mut_kernel[GPT2_DTYPE](self.grads.wte),
-            as_mut_kernel[GPT2_DTYPE](self.grads.wpe),
-            as_immut_kernel_from_mut[DType.int32](enc_bucket_info),
-            as_immut_kernel_from_mut[DType.int32](enc_workload_indices),
-            as_immut_kernel_from_mut[GPT2_DTYPE](self.grad_acts.encoded),
-            self.num_wte_buckets,
-            batch_size,
-            seq_len,
-            channels,
-            self.ctx,
-        )
 
-        if bucketing:
-            var d = List[Int]()
-            d.append(flat_base[Parameters.wte])
-            d.append(flat_base[Parameters.wpe])
-            var po = List[Int]()
-            po.append(0)
-            po.append(wte_size)
-            var ln = List[Int]()
-            ln.append(wte_size)
-            ln.append(wpe_size)
-            self._reduce_grad_bucket(d, po, ln)
+        if bucketing and self.enc_row_sparse:
+            self._encoder_backward_row_sparse(
+                enc_bucket_info,
+                enc_workload_indices,
+                flat_base[Parameters.wte],
+                flat_base[Parameters.wpe],
+                batch_size,
+                seq_len,
+                channels,
+            )
+        else:
+            # Dense path: the whole [V_p, C] gradient at once. Used by ZeRO-0/1
+            # (no bucketing — grads.wte is the real gradient buffer) and by
+            # single-rank runs.
+            if bucketing:
+                self.grads.wte = pool  # pool[0 : wte_size]
+                self.grads.wpe = pool + wte_size  # pool[wte_size : +wpe_size]
+                self._zero_grad_pool(wte_size + wpe_size)
+
+            encoder_bwd[GPT2_DTYPE, Self.target](
+                as_mut_kernel[GPT2_DTYPE](self.grads.wte),
+                as_mut_kernel[GPT2_DTYPE](self.grads.wpe),
+                as_immut_kernel_from_mut[DType.int32](enc_bucket_info),
+                as_immut_kernel_from_mut[DType.int32](enc_workload_indices),
+                as_immut_kernel_from_mut[GPT2_DTYPE](self.grad_acts.encoded),
+                self.num_wte_buckets,
+                batch_size,
+                seq_len,
+                channels,
+                self.ctx,
+            )
+
+            if bucketing:
+                var d = List[Int]()
+                d.append(flat_base[Parameters.wte])
+                d.append(flat_base[Parameters.wpe])
+                var po = List[Int]()
+                po.append(0)
+                po.append(wte_size)
+                var ln = List[Int]()
+                ln.append(wte_size)
+                ln.append(wpe_size)
+                self._reduce_grad_bucket(d, po, ln)
 
         # Wait for all GPU backward kernels to finish. Metal's enqueue_copy
         # (device→host) requires the source buffer to be idle; without this

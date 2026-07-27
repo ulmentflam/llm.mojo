@@ -165,9 +165,11 @@ $(PIXI_STAMP):
         build-infer build-infer-bf16 build-infer-fp8 data-hellaswag eval eval-cpu benchmark-eval \
         verify-fp8-grads verify-fp8-static-grads calibrate-fp8-scales \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal benchmark-zero \
+        figure-blindness figure-breakeven figures-wte benchmark-vocab-tiles \
+        benchmark-collectives \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
-        test test-cpu test-cuda test-python test-mojo test-fixtures smoke \
+        test test-cpu test-cuda test-python test-mojo test-fixtures smoke gate \
         verify verify-cpu verify-gpu verify-gpu-tf32 \
         docs docs-clean
 
@@ -259,6 +261,12 @@ help:
 	@echo "                   (4 arms in one graph, mirroring benchmark-gpu's fp32+bf16 layout)"
 	@echo "  benchmark-zero   ZeRO stages 0-3 at BENCH_ZERO_WORLD GPUs (default 8): per-stage"
 	@echo "                   memory + step time, fp32 vs bf16, JSON into zero/bench/, chart into figures/"
+	@echo "  figures-wte      tied-wte campaign figures (no GPU, renders committed data):"
+	@echo "                   figure-blindness  exact accounting vs nvidia-smi on the 256 MiB commit grid"
+	@echo "                   figure-breakeven  vocab-parallel communication crossover (modelled)"
+	@echo "  benchmark-collectives  Time the ZeRO staged-copy collectives (allreduce/allgather/"
+	@echo "                   reducescatter) in isolation over a buffer-size sweep. Needs"
+	@echo "                   BENCH_COLL_WORLD GPUs (default 2); pin them with CUDA_VISIBLE_DEVICES."
 	@echo "                   llm.c has no Metal port — baseline is PyTorch MPS"
 	@echo "                   (hyperparams: BENCH_B, BENCH_T, BENCH_METAL_STEPS, BENCH_COOLDOWN_S)"
 	@echo "  profile-llmc-ncu  Profile llm.c bf16 CUDA kernels with ncu (NVIDIA only)"
@@ -808,6 +816,73 @@ benchmark-zero:
 		--output $(BENCH_ZERO_OUT)
 	$(PIXI) run python scripts/benchmark_zero.py --plot $(BENCH_ZERO_OUT)
 
+# Campaign figures for the tied-`wte` de-residency work. Both render from
+# data already committed in the tree and run nothing on a GPU, so they are
+# reproducible on any box and safe to run while the GPUs are busy.
+#
+#   figure-blindness  exact in-process accounting vs nvidia-smi across ZeRO
+#                     stages, on the allocator's 256 MiB commit grid
+#                     (measured; source: zero/bench/bench_zero_world2*.json)
+#   figure-breakeven  communication volume, vocab-parallel vs today, against
+#                     global tokens per micro-step
+#                     (modelled; source: docs/ai/data/vocab_parallel_*.json)
+#
+# Each writes figures/<name>.png plus a sidecar <name>.json at the same stem
+# carrying the source data verbatim, per the repo's reproducibility contract.
+figure-blindness:
+	$(PIXI) run python scripts/figure_zero_blindness.py
+
+figure-breakeven:
+	$(PIXI) run python scripts/figure_vocab_breakeven.py
+
+figures-wte: figure-blindness figure-breakeven
+
+# Vocabulary-tiling cost sweep (figure 3). NEEDS A GPU AND A QUIET BOX:
+# the collector refuses to run if `make test`/pytest are live or the load
+# average is above BENCH_TILES_MAX_LOAD, and it records the box conditions
+# before and after so a contended run cannot be published by accident.
+# Pin one healthy GPU by UUID first, e.g.
+#   export CUDA_VISIBLE_DEVICES=GPU-<uuid>
+BENCH_TILES_OUT ?= zero/bench/bench_vocab_tiles.json
+BENCH_TILES_MAX_LOAD ?= 6.0
+
+benchmark-vocab-tiles:
+	$(PIXI) run -e cuda python scripts/benchmark_vocab_tiles.py --run \
+		--output $(BENCH_TILES_OUT) --max-load $(BENCH_TILES_MAX_LOAD)
+	$(PIXI) run python scripts/benchmark_vocab_tiles.py \
+		--plot $(BENCH_TILES_OUT)
+# Isolated timing for the ZeRO collectives themselves, as opposed to
+# benchmark-zero (whole training steps) or tests/test_zero.mojo (correctness
+# only). Sweeps fp32 buffer sizes and reports per-op min/median wall time and
+# per-rank effective bandwidth, so the staged-copy cost is a measured number
+# rather than a docstring claim. Pin GPUs by UUID, never by ordinal:
+#   make benchmark-collectives BENCH_COLL_WORLD=2 \
+#       BENCH_COLL_GPUS=GPU-<uuid0>,GPU-<uuid1>
+BENCH_COLL_WORLD ?= 2
+BENCH_COLL_BIN := build/bench_collectives
+BENCH_COLL_GPUS ?=
+BENCH_COLL_OUT ?= zero/bench/bench_collectives_world$(BENCH_COLL_WORLD).json
+
+benchmark-collectives: | $(PIXI_STAMP)
+	@mkdir -p build zero/bench
+	$(PIXI) run mojo build -D WORLD_SIZE=$(BENCH_COLL_WORLD) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(BENCH_COLL_BIN) bench_collectives.mojo
+	@set -e; \
+	export LLMM_BENCH_GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	export LLMM_BENCH_HOST="$$(hostname)"; \
+	export LLMM_BENCH_GENERATED="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	export LLMM_BENCH_GPU_NAME="$$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"; \
+	export LLMM_BENCH_DRIVER="$$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"; \
+	export LLMM_BENCH_COTENANCY="$$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader 2>/dev/null | tr -d ' ' | paste -sd';' -)"; \
+	if [ -n "$(BENCH_COLL_GPUS)" ]; then \
+		echo "==> CUDA_VISIBLE_DEVICES=$(BENCH_COLL_GPUS) $(BENCH_COLL_BIN)"; \
+		CUDA_VISIBLE_DEVICES=$(BENCH_COLL_GPUS) $(BENCH_COLL_BIN) | tee $(BENCH_COLL_OUT).log; \
+	else \
+		echo "==> $(BENCH_COLL_BIN)  (no BENCH_COLL_GPUS set; using all visible GPUs)"; \
+		$(BENCH_COLL_BIN) | tee $(BENCH_COLL_OUT).log; \
+	fi
+	@grep -o 'BENCH_JSON: .*' $(BENCH_COLL_OUT).log | sed 's/^BENCH_JSON: //' > $(BENCH_COLL_OUT) || true
+	@echo "==> wrote $(BENCH_COLL_OUT)"
+
 # Apple Silicon Metal GPU benchmark: llm.mojo vs PyTorch MPS vs MLX, fp32+bf16.
 # 6 arms in one graph, mirroring how benchmark-gpu combines fp32+bf16 for NVIDIA.
 # No llm.c dependency — llm.c has no Metal port; the baselines are PyTorch MPS and
@@ -1122,6 +1197,30 @@ test-python-cuda: build-mojo
 # MERGE STILL REQUIRES the full `make format lint check test`. Passing smoke
 # is necessary, never sufficient.
 # ---------------------------------------------------------------------------
+# The full merge gate, serialized box-wide by an flock so only one suite runs
+# on the machine at a time. This is a speed measure, not bureaucracy: MAX
+# compiles are already multi-threaded, so concurrent suites oversubscribe the
+# cores rather than pipeline -- four teams each run ~4x slower, and every
+# duration measured on a loaded box is meaningless. Pass/fail survives a loaded
+# box; timings do not.
+#
+# `scripts/llm-mojo-gate.sh status` shows who holds the lock. Note that child
+# processes INHERIT the flock file descriptor, so an orphaned `make test` keeps
+# holding the lock after the runner that started it has died -- `status` scans
+# /proc/*/fd for the processes really holding it instead of trusting the
+# recorded PID. Reclaim from an orphan gracefully (kill -INT, wait, -TERM);
+# never SIGKILL a multi-rank run, it hangs GPU firmware.
+#
+# Zero-install equivalent, identical locking without the holder reporting:
+#     flock /tmp/llm-mojo-gate.lock make test
+#
+# Do NOT lock short targeted runs (`make smoke`, one test file, a GEMM sweep).
+# A lock that is inconvenient is a lock nobody takes.
+GATE_LOCK_RUNNER := scripts/llm-mojo-gate.sh
+
+gate:
+	$(GATE_LOCK_RUNNER) run $(MAKE) format lint check test
+
 SMOKE_PYTEST := tests/test_encoder_equivalence.py \
                 tests/test_matmul_equivalence.py \
                 tests/test_fused_classifier_equivalence.py \

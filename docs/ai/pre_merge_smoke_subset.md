@@ -67,8 +67,20 @@ so the target depends on `build-mojo` rather than trusting you to remember.
 The highest-value single item is `tests/test_zero_equivalence.mojo`: it drives
 all three ZeRO stages at two world sizes by simulating ranks sequentially on the
 CPU, so it needs no GPUs at all and still catches most sharding-math errors. It
-uses a deliberately awkward `NUM_PARAMS = 4592`, which is not divisible by 8, so
-the world-size-8 cases exercise shard-length padding rather than the easy path.
+uses a deliberately awkward `NUM_PARAMS = 4592` so the world-size-8 cases
+exercise shard-length padding rather than the easy path.
+
+Note *why* it pads, because the obvious reading is wrong: 4592 **is** divisible
+by 8 (8 x 574). The padding comes from the AdamW SIMD width, not from the world
+size. `train_gpt2.mojo:1908-1913` computes `base_shard = ceil(4592/8) = 574` and
+then rounds it up to a multiple of `simd_width_of[GPT2_DTYPE]()`, giving
+`comm_shard = 576` and `padded_num_parameters = 4608`. That rounding is
+load-bearing: every rank indexes params/grads at `rank * optimizer_num_parameters`
+with naturally-aligned vector loads, so an unrounded shard length misaligns every
+`rank > 0` offset and the aligned CPU load segfaults. The consequence for the
+test is that ranks 0-6 hold 576 real elements each (4032 total) and **rank 7
+holds only 560 of its 576** — the last 16 run into the zero-filled padding
+region. That last-rank short shard is the path being exercised.
 
 ## What smoke does **not** cover
 
@@ -84,9 +96,36 @@ failed, 0 skipped` while the collectives went completely untested. The
 tell-tale, if you look for it, is the per-test timing: it reports
 `PASS [ 0.031 ]` when it opts out versus `PASS [ 330.802 ]` when it genuinely
 runs across 7 GPUs. Nothing in the summary line distinguished those. It now
-prints an explicit `SKIP ... GPU collectives NOT exercised`. **If you are
-changing anything that touches cross-rank behaviour, you need ≥2 GPUs; ask the
-coordinator for a window.**
+prints an explicit `SKIP ... GPU collectives NOT exercised`.
+
+That banner alone was not enough, and the gap is worth recording. It printed
+while the test still counted as a pass, so the summary line — the part most
+people actually read, and the only part a script scrapes — still said
+`13 tests run: 13 passed , 0 failed , 0 skipped`. `0 skipped` was false, and a
+truncated log tail gave you exactly the false green the banner was meant to
+kill.
+
+**The summary now tells the truth**, because `main()` marks the test skipped
+through the framework instead of letting it return early:
+
+```
+SKIP tests/test_zero.mojo::test_multi_gpu_collectives: requires >=2 GPUs, found 1 - GPU collectives NOT exercised
+    SKIP [ 0.001 ] test_multi_gpu_collectives
+Summary [ 900.813 ] 13 tests run: 12 passed , 0 failed , 1 skipped
+```
+
+Two things to know if you touch this. `TestSuite.skip[f]()` takes the test
+function as a **compile-time parameter** and must be called on the suite
+instance before `run()`, so the decision lives in `main()`, not in the test
+body. And the availability probe must happen *before* the suite is
+constructed: it can raise, a `TestSuite` must be consumed by `run()` on every
+path, and a raising call with the suite live fails to compile with
+`'suite' abandoned without being explicitly destroyed`.
+
+The bracket timing remains a useful cross-check (~300-400 ms means the
+collectives really ran, ~0.03 means they did not), but it is no longer the
+*only* signal. **If you are changing anything that touches cross-rank
+behaviour, you need ≥2 GPUs; ask the coordinator for a window.**
 
 **2. Nothing tests the LM head at vocabulary scale.** The LM head is a single
 dense matmul with `output_channels = vocab_size_padded` (50304), called from
@@ -141,6 +180,98 @@ Baseline on `main` @ b3e0a12, warm, quiet box: `test-mojo` 17/17 in 65s (with
 7 GPUs visible), `test-python-cuda` 243 passed / 5 skipped in 617s. The
 617s pytest run is the whole reason this smoke subset exists.
 
+### Take the lock — `make gate`
+
+**Run the full gate through the box-wide lock, always.**
+
+```
+make gate            # format + lint + check + test, serialized box-wide
+```
+
+`make gate` is exactly `format lint check test` wrapped in
+`scripts/llm-mojo-gate.sh`. If you would rather not trust a script, the
+zero-install equivalent locks identically and needs nothing installed:
+
+```
+flock /tmp/llm-mojo-gate.lock make test
+```
+
+This is not bureaucracy. MAX compiles are already multi-threaded, so concurrent
+suites oversubscribe the cores rather than pipeline — four teams each run about
+4x slower and *every duration any of them measures is garbage*. Pass/fail
+survives a loaded box; timings do not. One suite at a time is strictly faster in
+wall-clock terms for everyone. Measured on this box: five concurrent worktrees
+drove load average to **105**. Two runners were verified to serialize correctly,
+the second blocking exactly 9s behind a 12s holder.
+
+`scripts/llm-mojo-gate.sh status` reports who holds it. **Do not lock short
+targeted runs** — `make smoke`, a single test file, a GEMM sweep. A lock that is
+inconvenient is a lock nobody takes.
+
+**`make -n gate` is not a safe dry run.** GNU make executes recipe lines
+containing `$(MAKE)` even under `-n`, so that command really launches the gate
+script and really blocks on the lock. Use `scripts/llm-mojo-gate.sh status` to
+inspect the lock instead.
+
+**The one non-obvious property, which you must not "simplify" away.** `flock`
+holds the lock on an open file descriptor, and **child processes inherit that
+descriptor**. Killing the runner therefore does *not* free the lock while any
+descendant lives: an orphaned `make test` keeps holding it. This is the correct
+semantics — the work really is still running and really should still exclude
+others — but it means the intuition *"the holder died, so the lock is free"* is
+false in precisely the case where you go looking. Confirmed by SIGKILLing a
+holder and watching its child hold the lock for a further 54 seconds. So
+`status` scans `/proc/*/fd` for processes that actually hold the descriptor
+rather than trusting the recorded PID, and an orphan shows up by name and
+working directory instead of looking like a wedged lock.
+
+To reclaim from an orphan, stop it **gracefully** — `kill -INT`, wait, then
+`-TERM`. Never SIGKILL a multi-rank run; a hard kill mid-collective hangs GPU
+firmware on this box. The lock frees when the last holder exits.
+
+### The `verify` battery needs regenerated reference files
+
+`make verify` (`verify-cpu` + `verify-gpu`) and `verify-gpu-tf32` are **not**
+part of `make check` or `make test`, and on a fresh box they do not run at all:
+
+```
+gpt2_124M_debug_state.bin is llm.c's downloaded debug state, which lacks the
+activation tensors this test checks. Regenerate the reference files with:
+pixi run python train_gpt2.py
+```
+
+`test_gpt2.mojo:302` requires header magic **20240520** (version 3), written by
+`train_gpt2.py`. The starter-pack file that `make data` downloads is llm.c's
+activation-free debug state, magic **20240327**. README.md:247 documents the
+regeneration as a one-time step on a fresh clone; it is easy to skip, and every
+worktree symlinks the same file, so skipping it disables the verify battery
+box-wide rather than in one tree. This matters more than it sounds: `verify-gpu`
+is the *only* gate that checks every gradient tensor against PyTorch, so while
+it is unrunnable there is no gradient-level verification of the GPU path at all.
+Check the magic before trusting a green board:
+
+```
+od -An -tu4 -N4 gpt2_124M_debug_state.bin     # want 20240520, not 20240327
+```
+
+Once the reference is in place the whole battery passes — measured on the
+merged LM-head work at the shipped default `LLMM_LM_HEAD_VOCAB_TILES=8`:
+`verify-gpu` 39s, `verify-gpu-tf32` 35s, `verify-cpu` 40s, all exit 0, 16 of 16
+gradient tensors `TENSOR OK` on both GPU paths.
+
+**The 10-step loss trajectory is generated, not hand-maintained.** Regenerate
+it with `pixi run python scripts/gen_expected_losses.py`, never by pasting this
+trainer's own output — that would compare the implementation against itself and
+produce a check that can never fail. The generator asserts that its step 0
+reproduces the loss stored in the debug state exactly, and refuses to emit a
+list otherwise. This is not hypothetical: the previous list came from a script
+at a `/Users/...` path that was never in this repo, claimed step 0 was 5.354
+when the reference file said 5.2678394, and consequently made `make verify-gpu`
+exit 1 on *every* commit for everyone. A gate that fails for a bogus reason is
+at least as harmful as one that passes without testing anything — a permanently
+red gate teaches people to ignore it, and then it cannot warn them when
+something real breaks.
+
 Two practical notes. Cold runs are dominated by Mojo compilation, not by the
 tests: `test_zero.mojo` runs in ~3s warm but was still compiling after 128s from
 cold, which is worth remembering before you conclude something has hung. And do
@@ -170,19 +301,34 @@ symlinking the 1.5G of weights avoids re-downloading them per worktree.
 
 The comment above `TEST_FILE_TIMEOUT ?= 2700` says `test_zero.mojo`
 "legitimately needs ~30 min (13/13 passed at 1773s)". That does not reproduce
-here: 13/13 in ~3-4s warm. Two explanations are consistent with the evidence and
-this document does not pick between them.
+here: 13/13 in ~3-4s warm.
 
-The framework's bracketed figures appear to be **milliseconds** — the observed
-`Summary [ 125.967 ]` for a file that takes 28s of wall time only reconciles if
-the bracket is not seconds — and `test_sharded_parameter_gather_gpu` reports
-`[ 1737.998 ]` against the lore's "1773s", which is a suggestive near-match for a
-units misread. But the original comment also mentions "multi-context teardown
-overran an 1800s cap", which is a *behavioural* observation that a misread alone
-would not produce; a genuinely cold run on an older toolchain, or on a box with
-a driver-faulted GPU inflating CUDA context init, could plausibly have been far
-slower.
+**Settled: the framework's bracketed figures are MILLISECONDS.** Measured
+directly, by building the file ahead-of-time and timing the binary
+(`mojo build -I . -Xlinker -lm tests/test_zero.mojo`; the `-Xlinker -lm` is
+required or the link fails on `sincosf`):
 
-Either way: **do not lower the timeout** (a generous cap costs nothing), and do
-not budget 30 minutes for this file. If it ever does take 30 minutes on this
-box, that is a signal something is wrong, not business as usual.
+```
+Summary [ 714.635 ] 13 tests run: 13 passed , 0 failed , 0 skipped
+Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.99
+```
+
+714.6ms of test time plus ~275ms of process startup is 0.99s of wall clock. As
+seconds the bracket would claim 11.9 minutes for a binary that demonstrably
+exits in under one second. An earlier independent run on a quiet box read
+`Summary [ 376.328 ]` against 0.591s wall — the same ~200-280ms startup offset.
+Two measurements, taken at different box loads, both reconcile as milliseconds
+and neither reconciles as seconds.
+
+That also explains the lore: `test_sharded_parameter_gather_gpu` reports
+`[ 1737.998 ]`, i.e. 1.7 seconds, against the original comment's "1773s". The
+"30 minutes" was a units misread of a number that was always a millisecond
+figure. The same comment's aside about "multi-context teardown overran an 1800s
+cap" is a behavioural claim that no longer has any surviving evidence behind it
+and does not reproduce; treat it as unverified.
+
+The recommendation is unchanged: **do not lower the timeout.** A generous cap
+costs nothing and a wrong-but-safe number is not worth a gate failure to fix.
+But do not budget 30 minutes for this file either — if it ever genuinely takes
+30 minutes on this box, that is a signal something is wrong, not business as
+usual.

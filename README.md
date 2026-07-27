@@ -15,8 +15,6 @@ trajectory against PyTorch, then `make train ARGS='-x 40 -b 4 -t 64 -l 1e-4 -m 5
 llm.c's canonical 40-step run batch-for-batch (same mt19937 shuffle order; val loss 5.3255 → 4.2922
 vs llm.c's 5.3255 → 4.2915).*
 
-> **Note**: This project is based on nightly Mojo 1.0.0b3 release.
-
 ## Installation
 
 ### Step 1: Clone the repository
@@ -132,7 +130,7 @@ Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warm
 
 > **TF32 note**: llm.mojo's fp32 GPU GEMMs now use TF32 tensor cores by default (`CUBLAS_COMPUTE_32F_FAST_TF32`), matching llm.c's fp32 behavior: its fp32 build auto-enables TF32 on any compute-capability-8.0+ GPU, so the fp32 rows above are TF32-vs-TF32. Build with `-D LLMM_NO_TF32=1` to restore strict IEEE fp32 math (that is also what `make verify-gpu` gates on; the default TF32 path has its own gate, `make verify-gpu-tf32`).
 
-> **Backward-kernel note**: the 07-10 afternoon numbers add two backward-pass optimizations on top of TF32: a redesigned fused LN-backward (one register-accumulating kernel plus a block-per-channel finalize, replacing 4 launches per invocation; −6.9 ms fp32 / −3.1 ms bf16 kernel-family time) and a fused, 128-bit-vectorized matmul dbias reduction (−1.5 ms fp32 / −1.0 ms bf16). Both are gated by the full verify battery above.
+> **Backward-kernel note**: the fp32 result above rests on two backward-pass optimizations layered on top of TF32: a redesigned fused LN-backward (one register-accumulating kernel plus a block-per-channel finalize, replacing 4 launches per invocation; −6.9 ms fp32 / −3.1 ms bf16 kernel-family time) and a fused, 128-bit-vectorized matmul dbias reduction (−1.5 ms fp32 / −1.0 ms bf16). Both are gated by the full verify battery above.
 
 ### Multi-GPU (ZeRO stages 0-3)
 
@@ -142,7 +140,15 @@ Measured on 4× NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB, PCIe, no P2P), GPT-2
 
 !['ZeRO stage benchmark (WORLD_SIZE=4)'](figures/benchmark_zero_w4_b4_t64_2026-07-14_1711_NVIDIA-RTX-PRO-6000-Blackwell_workstation-max.png)
 
-Each stage now buys additional per-GPU memory. Stage 1's optimizer-state sharding saves 768 MiB in fp32 (1 GiB in bf16, where the fp32 master weights shard too), stage 2's bucketed backward reduction saves another 256 MiB, and stage 3's parameter streaming another 256 MiB. The floor at this model size is the tied `wte` embedding (~150 MiB): it is written at both ends of the backward pass and gathered whole for the LM head, so it stays resident. Vocab-chunking those kernels is the documented follow-up (see [`docs/ai/zero_grad_bucketing_design_2026-07-14.md`](docs/ai/zero_grad_bucketing_design_2026-07-14.md) and [`docs/ai/zero_stage3_param_streaming_2026-07-14.md`](docs/ai/zero_stage3_param_streaming_2026-07-14.md)). The savings trade against step time: stages 2 and 3 pay for their per-layer collectives, with stage 3's just-in-time parameter gathers costing the most. How much that costs depends on the shape. At this tiny benchmark shape the collective overhead is a large fraction of the 50 ms step, but at production shapes (B≥32, T=1024, ~250-470 ms steps) it is a few percent, while activations dominate peak memory there and ZeRO's model-state savings become a small fraction. The stages earn their keep at model scales where state dominates. All stages stay numerically equivalence-gated against the single-GPU baseline (per-parameter match to 1e-5 at world sizes 2 and 8). Reproduce with `make benchmark-zero` (`BENCH_ZERO_WORLD=N`; writes the JSON into `zero/bench/` and renders this chart into `figures/`).
+Each stage buys additional per-GPU memory. Stage 1's optimizer-state sharding saves 768 MiB in fp32 (1 GiB in bf16, where the fp32 master weights shard too), stage 2's bucketed backward reduction saves another 256 MiB, and stage 3's parameter streaming another 256 MiB. The savings trade against step time: stages 2 and 3 pay for their per-layer collectives, with stage 3's just-in-time parameter gathers costing the most. At this tiny benchmark shape that overhead is a large fraction of the 50 ms step; at production shapes (B≥32, T=1024, ~250-470 ms steps) it is a few percent. Reproduce with `make benchmark-zero` (`BENCH_ZERO_WORLD=N`; writes the JSON into `zero/bench/` and renders this chart into `figures/`).
+
+**The tied `wte` embedding used to floor stages 2/3 at ~150 MiB.** One `[V_p, C]` tensor — 50304 × 768 = 147 MiB in fp32 — is both the token-embedding table and the LM-head weight, so it had two consumers with opposite access patterns: the LM head reads it *densely* as a GEMM weight, the encoder reads it *sparsely* by token-id row lookup. Each needed its own fix. The LM head is now vocab-tiled (`-D LLMM_LM_HEAD_VOCAB_TILES`, default 8), so backward holds and reduce-scatters one tile at a time; the encoder gradient is now row-sparse over a cross-rank union of the tokens actually present. The gradient-bucket pool drops from ~150 MiB to **27 MiB**, at which point `wte` is no longer the binding constraint at all — a transformer layer's 12 tensors are. Cost: **+0.60%** step time. Correctness is gated by `make verify-gpu` at the shipped default, where all 16 gradient tensors match PyTorch, `dwte` included.
+
+**Read that in proportion.** At production shape the tensors that actually dominate a GPU are `att_probs` (~18 GiB, growing as T²) and `logits` (~6.1 GiB) — 123× and 42× the floor this work removed, and untouched by it. Removing 150 MiB is 0.7% of the footprint there, where activations are 88% of everything on the card. The floor was real and blocked stages 2/3 from doing what they exist to do, but the memory problem is not solved. Full accounting, including the measurement instrument this needed (`nvidia-smi` cannot resolve a 150 MiB change — the allocator commits in 256 MiB chunks) is in [`docs/ai/zero_wte_deresidency_campaign_2026-07-27.md`](docs/ai/zero_wte_deresidency_campaign_2026-07-27.md).
+
+!['ZeRO memory: exact accounting vs nvidia-smi'](figures/zero_mem_blindness_w2_b4_t64_2026-07-27_0340_NVIDIA-RTX-PRO-6000-Blackwell_workstation-max.png)
+
+A Megatron-style vocab-*parallel* LM head was evaluated as the alternative and rejected on measured grounds: it wins only below `W/(C+3)` ≈ 51,130 global tokens per micro-step, and we train at 229,376 — a 4.5× communication regression. The world size cancels out of that ratio entirely, so no rank count fixes it. See [`docs/ai/vocab_parallel_lm_head_feasibility_2026-07-27.md`](docs/ai/vocab_parallel_lm_head_feasibility_2026-07-27.md).
 
 ### Low-precision training (FP8 / NVFP4)
 
@@ -158,9 +164,7 @@ Step-time measurement (B=4, T=1024, checkpoint-init tinyshakespeare, 2 rounds wi
 
 The 2026-07-10/11 optimization campaign (coalesced/fused quantize-transpose kernels, persistent fp8 weight-transpose caching, dual-output quantize, fused tiled RHT-prep for NVFP4) cut FP8 from 150.5 to 146.6 ms and NVFP4 from 184.2 to 154.3 ms at this scale. It pays off harder at width: at the 774M-class `d36` config FP8 is now ~12% *faster* than bf16 (0.878×), and NVFP4 reaches parity (1.002×). An optional calibrated static-scales mode (`-D LLMM_FP8_STATIC_SCALES=1`, default off) removes the per-step amax/scale-update kernels entirely. It shaves a further ~1.5% at 124M and ~3% at `d36` (0.853×), at the cost of per-config offline calibration. See the A1 writeup and the final campaign scoreboard in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
-At 124M params, these are numerics/research configs, not throughput wins. The quantized GEMMs themselves are measurably faster than bf16's, since fp8 and fp4 both cut raw GEMM compute time. At this scale, though, that saving is swamped by the quantize/amax/scale overhead (plus the Hadamard transform for NVFP4) around small per-block GEMMs. See the quant-opt and transpose-coalescing writeups in `docs/ai/ai_assisted_optimizations_and_benchmarks.md` and the FP8/FP4 gotcha catalogs. Published FP4/FP8 throughput wins start around ~1B+ parameter models, where the GEMMs are large enough to amortize that fixed overhead.
-
-A batch/width scaling sweep confirms this on-box. At 124M, FP8 stays slower than bf16 across every batch size tested (B up to 64). Scale the model up to the 774M-class `d36` config, though, and it crosses over to being decisively *faster* (0.878× dynamic, 0.853× static after the campaign). Width, not batch, is what closes the gap; see `docs/ai/lowp_scaling_sweep_2026-07-10.md`.
+At 124M params these are numerics/research configs, not throughput wins. The quantized GEMMs themselves are measurably faster than bf16's — fp8 and fp4 both cut raw GEMM compute time — but at this scale that saving is swamped by the quantize/amax/scale overhead (plus the Hadamard transform for NVFP4) around small per-block GEMMs. **Width, not batch, is what closes the gap:** an on-box scaling sweep found FP8 slower than bf16 at every batch size tested (B up to 64) at 124M, while the 774M-class `d36` config crosses over decisively, as the numbers above show. Published FP4/FP8 throughput wins likewise start around ~1B+ parameters, where the GEMMs are large enough to amortize that fixed overhead. See `docs/ai/lowp_scaling_sweep_2026-07-10.md`, plus the quant-opt and transpose-coalescing writeups and the FP8/FP4 gotcha catalogs in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
 ### Single CPU
 
@@ -261,7 +265,7 @@ make verify
 ## Development Roadmap
 Future development includes:
 
-1. ZeRO: de-resident the tied `wte` embedding (vocab-chunked LM head + indexed encoder gather) to push stages 2/3 below the current ~150 MiB floor
+1. Activation memory, which now dominates by a wide margin at production shape: chunk the cross-entropy so the `(B·T, V_p)` logits tensor (~6.1 GiB at B=32, T=1024) is never materialized, and re-measure the `att_probs` store-vs-recompute tradeoff (~18 GiB, growing as T²) on CUDA — its own code comment names the trigger condition, and this box now meets it, but the +3.5% cost figure behind the current default was measured on Metal at an 8× smaller batch
 2. Mamba1/Mamba2/Mamba3 architecture and MoE
 
 ## Motivation

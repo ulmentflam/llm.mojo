@@ -248,7 +248,21 @@ through that one function.
 
 ## Method (reproducible)
 
-Box: `workstation-max`, 8× NVIDIA RTX PRO 6000 Blackwell Max-Q. Two GPUs pinned
+Box: `workstation-max`, 8× NVIDIA RTX PRO 6000 Blackwell Max-Q **installed, but
+only 7 usable** — physical GPU index 1 is faulted hardware (GSP faults at idle;
+it survived two reseats and a cold power cycle, and is RMA-grade). It is
+independently visible in `nvidia-smi`, which returns `[N/A]` for that card's
+utilization while every other card reports a value.
+
+Two consequences worth stating, because neither is obvious from the data files.
+Nothing in this document is affected — every measurement here ran on physical
+GPUs 5 and 6 — but **a world-size-8 measurement is currently not possible on this
+machine at all**, so any scaling claim at that world size cannot be checked here.
+And the `gpu_count` field in the benchmark JSON is the number of GPUs `nvidia-smi`
+*enumerates*, which is 8; it is not a count of usable devices. Read it as
+inventory, not capacity.
+
+Two GPUs pinned
 **by UUID**, never by index — CUDA renumbers around a faulted card, so an
 ordinal can silently move to different hardware:
 
@@ -524,6 +538,39 @@ stages at a fixed shape, and therefore that it cancels in the before/after
 deltas this instrument is used to compute.
 
 ---
+
+## The basis of every number (read before comparing any two)
+
+A number that is correct under one reading and wrong under another, with the
+reading unrecorded, is its own category of defect — call it an **unlabelled-basis
+error**. Mixing MiB (2²⁰) with GB (10⁹); reporting a count that is inventory
+when the reader hears capacity; quoting a min where a median is assumed;
+per-rank where aggregate is assumed. All the same bug, and all invisible in the
+value itself. Three of the four turned up in this campaign in one day.
+
+So, explicitly, for this JSON:
+
+| field | unit | reduction |
+| --- | --- | --- |
+| `peak_mem_mib_max_delta` | MiB = 2²⁰ B | max **over time** (0.25 s sampling), per GPU, then max **across GPUs**, minus a pre-launch baseline |
+| `exact_total_mib_max` | MiB = 2²⁰ B | **single point in time** (the `steady` phase), max **across ranks** only — no temporal reduction |
+| `static_total_mib_max` | MiB = 2²⁰ B | single point in time (`post_alloc`), max across ranks |
+| `classes_mib_max`, `buffers_mib_max`, `tensors_mib_max` | MiB = 2²⁰ B | per key, single point in time (`steady`), max across ranks |
+| `driver_used_mib_max` | MiB = 2²⁰ B | single point in time (`steady`), max across ranks; whole-device, includes co-tenants |
+| `*_bytes*` | bytes | as above, unrounded |
+| `gpu_count` | count | GPUs `nvidia-smi` **enumerates** — inventory, not capacity |
+
+The row that matters: **the two headline numbers do not share a basis.** The
+`nvidia-smi` figure is a temporal peak; the exact figure is a point-in-time
+reading. Putting them on one chart is defensible — both quantities are
+monotonically non-decreasing during a run (the caching allocator never releases,
+and every buffer counted here is persistent), so the `steady` reading should be
+the peak — but it is an argument, not a definition, and I have not independently
+confirmed that `steady` is the maximum. Anyone plotting them together should say
+so rather than let a reader assume both are peaks.
+
+Per-rank, never aggregate: the ranks are symmetric here, so "max across ranks"
+equals either rank's value. Do not multiply by world size.
 
 ## What this does and does not license you to claim
 

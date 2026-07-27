@@ -361,8 +361,10 @@ text is at <https://ar5iv.labs.arxiv.org/html/1909.08053>.)
 is mechanically the closest published analogue. Its §3.2 FusedLinearCrossEntropy
 chunks the hidden states, projects each chunk, and computes a partial loss per
 chunk so the full logits tensor is never materialized — motivated by memory:
-*"a 256k vocabulary size will result in a 16.8 GB logit tensor of bfloat16,
-causing a huge spike in the peak memory usage."*
+at a batch of 8 and sequence length 4096, *"the 256k vocabulary size will result
+in a 16.8GB logit tensor of precision bfloat16, causing a huge spike in the peak
+memory usage."* (The quote is in the [ar5iv full
+text](https://ar5iv.labs.arxiv.org/html/2410.10989), not the abstract page.)
 
 **Cut Your Losses** (Wijmans et al., 2024, [arXiv:2411.09009](https://arxiv.org/abs/2411.09009))
 frames the same cost — *"cross-entropy... consumes an order of magnitude more
@@ -401,7 +403,8 @@ so each rank could score its vocabulary slice against every rank's tokens.
 
 That comparison was evaluated separately during this campaign and came back
 negative: the ZeRO-3 shard boundary does not align usefully with `wte` rows
-(at 7 ranks, four ranks hold zero vocabulary rows and boundaries land mid-row),
+(at 7 ranks, four of seven ranks hold zero vocabulary rows at all; boundaries
+are additionally fractional at N=4 and N=8, though not at N=7),
 and the activation all-gather only pays when `N·B·T < V_p` — a communication
 regression at production shape. The useful structural statement from that
 analysis is that **under data parallelism, vocab-parallelism minus the
