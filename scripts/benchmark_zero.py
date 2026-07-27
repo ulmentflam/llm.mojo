@@ -45,6 +45,99 @@ _STEP_RE = re.compile(
     r"step\s+(\d+)/\d+\s*\|\s*loss\s+([-\d.]+).*?\|\s*([\d.]+)\s*ms\s*\|"
 )
 
+# Prefix the trainer stamps on each rank's exact allocation-accounting line when
+# LLMM_MEM_REPORT is set (see GPT2.print_memory_report in train_gpt2.mojo).
+_MEM_TAG = "[mem-report] "
+
+_MIB = 1024.0 * 1024.0
+
+
+def _mib(nbytes):
+    """Bytes as MiB, rounded to 3 decimals (sub-KiB resolution)."""
+    return round(nbytes / _MIB, 3)
+
+
+def _parse_mem_report(stdout):
+    """Collect the trainer's per-rank exact allocation accounting from stdout.
+
+    Why this exists: ``peak_mem_mib_*`` above comes from ``nvidia-smi``, which
+    reports the CUDA context's *committed* footprint. The DeviceContext caching
+    allocator commits in coarse chunks (~256 MiB on the reference box), so a
+    structural change worth ~150 MiB routinely moves that reading by zero. The
+    trainer knows its own allocation sizes exactly, and emits them per rank as
+    JSON; this parses those lines into a quantization-free breakdown that sits
+    alongside — never replaces — the nvidia-smi numbers.
+
+    Returns a dict with the raw per-rank records grouped by phase
+    (``post_alloc`` = before the first forward, so no activations yet;
+    ``steady`` = after the last step), plus per-class MiB rollups taken as the
+    max across ranks of the ``steady`` phase. Empty ``phases`` simply means the
+    binary predates the accounting or the env var was not set.
+    """
+    records = []
+    parse_errors = 0
+    for line in stdout.splitlines():
+        i = line.find(_MEM_TAG)
+        if i < 0:
+            continue
+        payload = line[i + len(_MEM_TAG) :].strip()
+        try:
+            records.append(json.loads(payload))
+        except json.JSONDecodeError:
+            # Ranks are host threads sharing one stdout, so two lines can
+            # interleave. Count it rather than pretending the run had no data.
+            parse_errors += 1
+
+    phases = {}
+    for rec in records:
+        phases.setdefault(str(rec.get("phase", "unknown")), []).append(rec)
+    for recs in phases.values():
+        recs.sort(key=lambda r: r.get("rank", 0))
+
+    out = {
+        "phases": phases,
+        "num_records": len(records),
+        "parse_errors": parse_errors,
+    }
+
+    steady = phases.get("steady", [])
+    if steady:
+        out["ranks_reporting"] = len(steady)
+        out["exact_total_mib_max"] = max(
+            _mib(r.get("exact_total_bytes", 0)) for r in steady
+        )
+        out["exact_total_bytes_max"] = max(
+            int(r.get("exact_total_bytes", 0)) for r in steady
+        )
+        classes = {}
+        for name in sorted({k for r in steady for k in r.get("classes", {}).keys()}):
+            classes[name] = _mib(
+                max(int(r.get("classes", {}).get(name, 0)) for r in steady)
+            )
+        out["classes_mib_max"] = classes
+        buffers = {}
+        for name in sorted({k for r in steady for k in r.get("buffers", {}).keys()}):
+            buffers[name] = _mib(
+                max(int(r.get("buffers", {}).get(name, 0)) for r in steady)
+            )
+        out["buffers_mib_max"] = buffers
+        # Whole-device driver figure for the same GPU: exact_total plus the CUDA
+        # context and the allocator's uncommitted slack (and any co-tenant
+        # process). The gap against exact_total_mib_max IS the quantization this
+        # instrument exists to see past.
+        out["driver_used_mib_max"] = max(
+            _mib(r.get("driver_used_bytes", 0)) for r in steady
+        )
+
+    post = phases.get("post_alloc", [])
+    if post:
+        # Static (ZeRO-shardable) footprint with activations not yet sized —
+        # the cleanest signal for a params/grads/optimizer-sized change.
+        out["static_total_mib_max"] = max(
+            _mib(r.get("exact_total_bytes", 0)) for r in post
+        )
+    return out
+
 
 def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -100,6 +193,11 @@ def _run_stage(binary, world_size, stage, b, t, d, steps, timeout_s, extra):
     root = _repo_root()
     env = dict(os.environ)
     env["WORLD_SIZE"] = str(world_size)
+    # Ask the trainer for its exact per-rank allocation accounting (two printed
+    # lines per rank; no effect on the training path). Harmless on binaries that
+    # predate it — they ignore the variable and _parse_mem_report finds nothing.
+    if extra.get("mem_report", True):
+        env["LLMM_MEM_REPORT"] = "1"
     # run_train_gpt2.sh execs build/train_gpt2; allow a non-default binary via
     # the BIN override the bf16 runner understands, else call the binary direct.
     cmd = [
@@ -227,6 +325,10 @@ def _run_stage(binary, world_size, stage, b, t, d, steps, timeout_s, extra):
         "peak_mem_mib_per_gpu_delta": {str(k): v for k, v in sorted(delta.items())},
         "peak_mem_mib_max_delta": max(delta.values()) if delta else None,
         "num_gpus_touched": len(touched),
+        # Exact, quantization-free companion to peak_mem_mib_* above: what the
+        # trainer itself allocated, by buffer class, per rank. This is the
+        # instrument that can resolve a sub-256-MiB structural change.
+        "mem_report": _parse_mem_report(stdout),
         "losses": [s["loss"] for s in steps_seen],
         "wall_s": round(wall, 1),
         "stderr_tail": stderr_tail,
@@ -513,6 +615,16 @@ def main():
         default="build/train_gpt2_bf16",
         help="WORLD_SIZE-built bf16 binary, or '' to skip bf16",
     )
+    ap.add_argument(
+        "--no-mem-report",
+        dest="mem_report",
+        action="store_false",
+        help=(
+            "skip the trainer's exact in-process allocation accounting"
+            " (LLMM_MEM_REPORT); the nvidia-smi sampling is unaffected"
+        ),
+    )
+    ap.set_defaults(mem_report=True)
     ap.add_argument("--load-fp32", default="gpt2_124M.bin")
     ap.add_argument("--load-bf16", default="gpt2_124M_bf16.bin")
     ap.add_argument(
@@ -564,12 +676,15 @@ def main():
                     "load": load,
                     "train_data": args.train_data,
                     "val_data": args.val_data,
+                    "mem_report": args.mem_report,
                 },
             )
+            exact = entry["mem_report"].get("exact_total_mib_max")
             print(
                 f"   status={entry['status']} "
                 f"mean_step_ms={entry['mean_step_ms']} "
-                f"peak_mem_delta={entry['peak_mem_mib_max_delta']}",
+                f"peak_mem_delta={entry['peak_mem_mib_max_delta']} "
+                f"exact_mib={exact}",
                 file=sys.stderr,
             )
             results.append(entry)
@@ -586,6 +701,18 @@ def main():
             "Run-side data only (no plotting). mean_step_ms excludes the first"
             " 2 warmup steps. peak_mem_mib_* sampled via nvidia-smi during the"
             " run. Stages with status!='ok' did not train."
+            " mem_report is the trainer's own exact allocation accounting"
+            " (LLMM_MEM_REPORT): byte-precise per-buffer sizes read off the"
+            " live DeviceBuffers, per rank, at two phases — 'post_alloc'"
+            " (params/grads/optimizer/ZeRO-3 windows, before activations are"
+            " sized) and 'steady' (after the last step). Unlike"
+            " peak_mem_mib_*, which nvidia-smi quantizes to the allocator's"
+            " ~256 MiB commit granularity, mem_report resolves changes far"
+            " below that. It counts only device buffers owned by the model"
+            " and the ZeRO context; the cuBLASLt workspace, the"
+            " persistent_device_buffer globals, the KVCache-cached attention"
+            " GEMM scratch, and pinned host buffers are NOT included, so"
+            " exact_total < driver_used always."
         ),
         "results": results,
     }
