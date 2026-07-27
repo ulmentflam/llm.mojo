@@ -289,6 +289,78 @@ def test_dataloader_capture_restore() raises:
     _remove(path)
 
 
+def test_dataloader_capture_restore_shuffled() raises:
+    """The same round trip with shuffling ON -- the path a real run uses.
+
+    `test_dataloader_capture_restore` above builds both loaders with
+    `should_shuffle` left at its default of False, so it only ever exercises
+    the trivial "seek to current_sample_idx" branch of
+    `restore_dataloader_state`. The branch that matters for a real resume --
+    reseeding MT19937 and replaying `shuffle_rng_state - intra_draws` draws so
+    the permutation lands exactly where it left off (llmm/checkpointing.mojo,
+    `if loader.should_shuffle and state.should_shuffle == 1`) -- was never
+    entered by any test.
+
+    That branch is what makes commit 15b8330's batch-order parity with llm.c
+    survive a restart, and this pipeline restarts on every supervisor event.
+    A wrong replay count produces a valid-looking but different batch order
+    after every resume, silently.
+
+    VALIDATED AGAINST THE BUG. Dropping the `- intra_draws` correction from
+    `restore_dataloader_state`'s replay count and rebuilding: this test fails
+    (`left: 56, right: 80` -- the resumed loader lands on a different sample),
+    while `test_dataloader_capture_restore` above still passes, because it
+    never enters the branch at all. `llmm/checkpointing.mojo` was restored and
+    verified byte-identical to HEAD afterwards.
+    """
+    _setup_loader_data()
+
+    var loader = DataLoader(
+        "test_ckpt_loader.bin", batch_size=2, seq_len=4, should_shuffle=True
+    )
+    loader.next_batch()
+    loader.next_batch()
+    loader.next_batch()
+
+    var path = String("test_ckpt_loader_shuffled_state.bin")
+    var state = make_training_state(loader, step=3, sampler_rng_state=UInt64(7))
+    var m = alloc[Float32](1)
+    var v = alloc[Float32](1)
+    m.store(0, 0.0)
+    v.store(0, 0.0)
+    write_state_checkpoint(path, state, m, v, 1)
+
+    # Ground truth: what the ORIGINAL, uninterrupted shuffling loader produces
+    # next. The resumed loader has to reproduce this exactly, which it can only
+    # do by replaying the right number of draws off the same seed.
+    loader.next_batch()
+    var expected_first = loader.inputs.load(0)
+    var expected_last = loader.inputs.load(7)
+
+    var m_out = alloc[Float32](1)
+    var v_out = alloc[Float32](1)
+    var restored = read_state_checkpoint(path, m_out, v_out, 1)
+    assert_equal(restored.step, 3)
+    assert_equal(restored.should_shuffle, 1)
+
+    var resumed = DataLoader(
+        "test_ckpt_loader.bin", batch_size=2, seq_len=4, should_shuffle=True
+    )
+    restore_dataloader_state(resumed, restored)
+    resumed.next_batch()
+
+    assert_equal(resumed.inputs.load(0), expected_first)
+    assert_equal(resumed.inputs.load(7), expected_last)
+
+    m.free()
+    v.free()
+    m_out.free()
+    v_out.free()
+    loader.close()
+    resumed.close()
+    _remove(path)
+
+
 def _cleanup_loader_data():
     _remove("test_ckpt_loader.bin")
 

@@ -80,25 +80,24 @@ def test_bias_correction_t2() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-def test_zero_grad_zero_wd_is_identity() raises:
-    # TODO: allocate params/m/v on a host DeviceContext, run adamw_update_cpu
-    # with grads=0 and weight_decay=0, assert params and v unchanged and m=0.
-    # Pending: pick the simplest CPU-only allocation path for tests.
-    assert_true(True)
-
-
-def test_single_step_matches_handcomputed_adam() raises:
-    # TODO: with weight_decay=0, run one step on n=1, beta1=beta2=0,
-    # and verify param -= lr * grad / (|grad| + eps).  Easy closed form.
-    assert_true(True)
-
-
-def test_trajectory_matches_fixture() raises:
-    # TODO: load tests/fixtures/fp32_small.npz (a numpy .npz is a zip of .npy
-    # files; a small in-Mojo .npy reader keeps this self-contained), step
-    # the optimizer `steps` times, and compare to `trajectory`.
-    # Requires: tests/reference.py dump (run by `make test-fixtures`).
-    assert_true(True)
+# THE OPTIMIZER'S REAL COVERAGE LIVES IN tests/test_adamw_equivalence.py.
+#
+# Three tests used to sit here -- zero-grad identity, a single closed-form Adam
+# step, and a fixture trajectory -- each with a TODO body of `assert_true(True)`.
+# They were honest in their comments and dishonest in their result: three
+# unconditional passes in every `make test-mojo` summary, for a file that never
+# imports `llmm.adamw` at all. An optimizer that ignored its gradient argument
+# outright would not have moved any of them.
+#
+# They are removed rather than left as scaffolds because the property they were
+# meant to check is already checked for real: `test_adamw_equivalence.py` drives
+# the actual kernel through the MAX bridge (`run_custom_op(kernel_name=
+# "adamw_update", ...)` in tests/kernels/adamw.py) against torch.optim.AdamW
+# stepwise, and includes the zero-grad identity case. A green count of 3 here
+# was subtracting from that, not adding to it.
+#
+# What remains below is a genuine unit test of `lerp`, which this file
+# reimplements locally and therefore can meaningfully check.
 
 
 def main() raises:

@@ -773,18 +773,20 @@ def test_multi_sharded_parameter_gather_cpu() raises:
 # no longer be mistaken for coverage: main() marks the test SKIPPED through
 # `TestSuite.skip`, so the summary line reports it as skipped instead of
 # passed, and this banner names the reason for anyone reading full output.
-def _gpu_multirank_available() raises -> Bool:
+def _gpu_multirank_available(need: Int) raises -> Bool:
     if not has_nvidia_gpu_accelerator():
         print(
             "SKIP tests/test_zero.mojo::test_multi_gpu_collectives: no NVIDIA"
             " GPU accelerator - GPU collectives NOT exercised"
         )
         return False
-    if DeviceContext.number_of_devices() < 2:
+    if DeviceContext.number_of_devices() < need:
         print(
             (
                 "SKIP tests/test_zero.mojo::test_multi_gpu_collectives:"
-                " requires >=2 GPUs, found"
+                " requires >="
+                + String(need)
+                + " GPUs, found"
             ),
             DeviceContext.number_of_devices(),
             "- GPU collectives NOT exercised",
@@ -793,26 +795,23 @@ def _gpu_multirank_available() raises -> Bool:
     # A driver-faulted GPU ("GPU requires reset") can shrink the usable
     # ordinal range below number_of_devices(); probe both devices for real.
     try:
-        var c0 = DeviceContext(device_id=0)
-        var c1 = DeviceContext(device_id=1)
-        var b0 = c0.enqueue_create_buffer[DType.float32](4)
-        var b1 = c1.enqueue_create_buffer[DType.float32](4)
-        b0.enqueue_fill(Float32(0.0))
-        b1.enqueue_fill(Float32(0.0))
-        c0.synchronize()
-        c1.synchronize()
+        for d in range(need):
+            var c = DeviceContext(device_id=d)
+            var b = c.enqueue_create_buffer[DType.float32](4)
+            b.enqueue_fill(Float32(0.0))
+            c.synchronize()
         return True
     except:
         print(
-            "SKIP tests/test_zero.mojo::test_multi_gpu_collectives: two-device"
+            "SKIP tests/test_zero.mojo::test_multi_gpu_collectives: device"
             " probe failed (driver-faulted GPU?) - GPU collectives NOT"
             " exercised"
         )
         return False
 
 
-def test_multi_gpu_collectives() raises:
-    """Drive all three staged-copy GPU collectives end to end (N=2).
+def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
+    """Drive all three staged-copy GPU collectives end to end at N ranks.
 
     Exercises per-rank DeviceContext(device_id=rank), coordinator pointer
     exchange, cross-device staged copies, and the fp32-accumulate add
@@ -823,13 +822,13 @@ def test_multi_gpu_collectives() raises:
     minutes and pushed this file past make test-mojo's 600 s per-file
     timeout when the ops were separate tests.
     """
-    if not _gpu_multirank_available():
-        return
-
-    comptime WORLD_SIZE = 2
     comptime DTYPE = DType.float32
     comptime shard = 64
     comptime size = shard * WORLD_SIZE
+    # Rank r contributes (r+1) to every sum, so a reduced element is
+    # sum_{r=1..N} r times the per-index factor. This used to be the
+    # literal 3, which is 1+2 -- N=2 baked into every expectation.
+    comptime RANK_SUM = WORLD_SIZE * (WORLD_SIZE + 1) // 2
 
     var cpu_coord_ptr = alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
@@ -971,14 +970,14 @@ def test_multi_gpu_collectives() raises:
     for r in range(WORLD_SIZE):
         for j in range(size):
             assert_almost_equal[DTYPE](
-                ar_out[r * size + j], Float32(3 * (j + 1)), atol=1e-5
+                ar_out[r * size + j], Float32(RANK_SUM * (j + 1)), atol=1e-5
             )
     # reducescatter: rank r's shard[j] == 3*(r*shard + j + 1).
     for r in range(WORLD_SIZE):
         for j in range(shard):
             assert_almost_equal[DTYPE](
                 rs_shard[r * shard + j],
-                Float32(3 * (r * shard + j + 1)),
+                Float32(RANK_SUM * (r * shard + j + 1)),
                 atol=1e-5,
             )
     # reducescatter_inplace: rank r's OWN slice r holds the reduced sum
@@ -988,9 +987,9 @@ def test_multi_gpu_collectives() raises:
         for k in range(WORLD_SIZE):
             for j in range(shard):
                 var gidx = k * shard + j
-                var expected = Float32(3 * (gidx + 1)) if k == r else Float32(
-                    (r + 1) * (gidx + 1)
-                )
+                var expected = Float32(
+                    RANK_SUM * (gidx + 1)
+                ) if k == r else Float32((r + 1) * (gidx + 1))
                 assert_almost_equal[DTYPE](
                     rs_ip_out[r * size + gidx], expected, atol=1e-5
                 )
@@ -1010,7 +1009,9 @@ def test_multi_gpu_collectives() raises:
         for j in range(shard):
             var f = r * shard + j
             var covered = (f < 32) or (f >= 48 and f < 80)
-            var expected = Float32(3 * (f + 1)) if covered else Float32(0.0)
+            var expected = Float32(RANK_SUM * (f + 1)) if covered else Float32(
+                0.0
+            )
             assert_almost_equal[DTYPE](
                 rsb_shard[r * shard + j], expected, atol=1e-5
             )
@@ -1022,6 +1023,44 @@ def test_multi_gpu_collectives() raises:
     ag_out.free()
     cpu_coord_ptr[].free()
     cpu_coord_ptr.free()
+
+
+def test_multi_gpu_collectives() raises:
+    """GPU collectives at N=2."""
+    if not _gpu_multirank_available(2):
+        return
+    _run_gpu_collectives[2]()
+
+
+def test_multi_gpu_collectives_n3() raises:
+    """GPU collectives at N=3 -- the smallest world size that is not degenerate.
+
+    Every staged-copy collective walks its peers as `(self.rank + step) %
+    Self.N` (llmm/zero.mojo: allreduce, reducescatter, reducescatter_inplace,
+    _reducescatter_buckets_gpu, allgather -- six sites). At N=2 each rank has
+    exactly one peer and `% 2` is indistinguishable from `% Self.N`, so a
+    hardcoded modulus, an off-by-one in the step range, or a peer computed as
+    `(rank + step - 1) % N` all produce identical behaviour and pass. N=3 is
+    the first world size where a rank has two distinct peers in a defined
+    order, so wraparound has somewhere to go wrong. Production runs at 7.
+
+    Every one of those six sites is inside `comptime if
+    has_nvidia_gpu_accelerator()`, so the WORLD_SIZE=4 tests elsewhere in this
+    file cannot cover them -- those exercise the separate CPU path.
+
+    VALIDATED AGAINST THE BUG. Rewriting all six sites to `% 2` (identical
+    behaviour at N=2, wrong from N=3 up) and rebuilding: the N=2 test still
+    passes and this one never returns -- it HANGS. With the wrong modulus a
+    rank waits on a peer that never stages its data, so the failure surfaces
+    as a deadlock rather than an assertion. Killed after 21 minutes; under
+    `make test-mojo` it would surface as the 2700 s per-file timeout, which is
+    a failure and is caught, but is worth knowing in advance so nobody
+    mistakes it for a flake or a slow box. `llmm/zero.mojo` was restored and
+    verified byte-identical to HEAD afterwards.
+    """
+    if not _gpu_multirank_available(3):
+        return
+    _run_gpu_collectives[3]()
 
 
 def test_multi_cpu_allgather_ranges() raises:
@@ -1122,7 +1161,8 @@ def main() raises:
     # Probe BEFORE building the suite: `_gpu_multirank_available` can raise,
     # and a TestSuite must be consumed by `run()` on every path, so it must
     # not be live across a raising call.
-    var multirank_ok = _gpu_multirank_available()
+    var multirank_ok = _gpu_multirank_available(2)
+    var multirank_ok_n3 = _gpu_multirank_available(3)
 
     var suite = TestSuite.discover_tests[__functions_in_module()]()
 
@@ -1144,5 +1184,7 @@ def main() raises:
     # has to live here in main() rather than inside the test body.
     if not multirank_ok:
         suite.skip[test_multi_gpu_collectives]()
+    if not multirank_ok_n3:
+        suite.skip[test_multi_gpu_collectives_n3]()
 
     suite^.run()
