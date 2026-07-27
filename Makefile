@@ -167,7 +167,7 @@ $(PIXI_STAMP):
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal benchmark-zero \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
-        test test-cpu test-cuda test-python test-mojo test-fixtures \
+        test test-cpu test-cuda test-python test-mojo test-fixtures smoke \
         verify verify-cpu verify-gpu verify-gpu-tf32 \
         docs docs-clean
 
@@ -1096,6 +1096,64 @@ test-python: build-mojo
 
 test-python-cuda: build-mojo
 	MAX_USE_ACCELERATOR=1 $(PIXI) run -e cuda pytest tests/ -v
+
+# ---------------------------------------------------------------------------
+# Fast pre-merge smoke subset — for iteration, NOT a merge gate.
+# Rationale, coverage limits, and measured numbers:
+#   docs/ai/pre_merge_smoke_subset.md
+#
+# Targets the LM-head / encoder / ZeRO paths in ~1 min warm, versus ~13 min
+# for the full gate (the full `make test` is dominated by test-python-cuda at
+# 617s / 248 tests). Measured on workstation-max, warm caches:
+#   lint 19s + build-mojo (no-op warm) + mojo ZeRO suites ~11s
+#   + pytest subset 8s (126 tests)  =>  ~40s
+#
+# `build-mojo` is a REAL prerequisite, not a convenience: the pytest bridge
+# consumes kernels from tests/.mef_cache keyed by a source fingerprint, so
+# skipping it would silently test STALE kernels and hand you a false pass on
+# a change you just made to llmm/.
+#
+# MERGE STILL REQUIRES the full `make format lint check test`. Passing smoke
+# is necessary, never sufficient.
+# ---------------------------------------------------------------------------
+SMOKE_PYTEST := tests/test_encoder_equivalence.py \
+                tests/test_matmul_equivalence.py \
+                tests/test_fused_classifier_equivalence.py \
+                tests/test_softmax_equivalence.py \
+                tests/test_crossentropy_equivalence.py \
+                tests/test_global_norm_equivalence.py \
+                tests/test_adamw_equivalence.py
+SMOKE_MOJO := tests/test_zero_equivalence.mojo tests/test_zero.mojo
+
+smoke: lint build-mojo
+	@fail=0; \
+	for f in $(SMOKE_MOJO); do \
+		echo "==> smoke mojo: $$f"; \
+		start=$$(date +%s); \
+		timeout $(TEST_FILE_TIMEOUT) $(PIXI) run mojo run -I . "$$f" || fail=1; \
+		echo "==> $$f done in $$(($$(date +%s) - start))s"; \
+	done; \
+	echo "==> smoke pytest: $(words $(SMOKE_PYTEST)) files (cuda env)"; \
+	MAX_USE_ACCELERATOR=1 $(PIXI) run -e cuda pytest $(SMOKE_PYTEST) -q || fail=1; \
+	echo ""; \
+	echo "-- smoke coverage caveats ------------------------------------------"; \
+	if [ -n "$$CUDA_VISIBLE_DEVICES" ]; then \
+		ngpu=$$(printf '%s' "$$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .); \
+	else \
+		ngpu=$$(nvidia-smi --list-gpus 2>/dev/null | wc -l); \
+	fi; \
+	if [ "$$ngpu" -lt 2 ]; then \
+		echo "  !! $$ngpu GPU visible: test_multi_gpu_collectives DID NOT RUN."; \
+		echo "     Real GPU allreduce/reducescatter/allgather are UNTESTED."; \
+	else \
+		echo "  ok $$ngpu GPUs visible: GPU collectives exercised (world size 2)."; \
+	fi; \
+	echo "  !! No test drives the LM-head matmul at vocab scale (max OC here"; \
+	echo "     is 3072; the LM head runs at ~50304). Vocab tiling is NOT"; \
+	echo "     covered by this subset — add a case if you changed it."; \
+	echo "  !! Encoder cases top out at B=4,T=64,V=256,C=128 — small."; \
+	echo "--------------------------------------------------------------------"; \
+	exit $$fail
 
 test-fixtures:
 	$(PIXI) run python -m tests.reference dump
