@@ -15,8 +15,6 @@ trajectory against PyTorch, then `make train ARGS='-x 40 -b 4 -t 64 -l 1e-4 -m 5
 llm.c's canonical 40-step run batch-for-batch (same mt19937 shuffle order; val loss 5.3255 → 4.2922
 vs llm.c's 5.3255 → 4.2915).*
 
-> **Note**: This project is based on nightly Mojo 1.0.0b3 release.
-
 ## Installation
 
 ### Step 1: Clone the repository
@@ -132,7 +130,7 @@ Official run on the GB10 (B=4, T=1024, 40 steps with the first 5 dropped as warm
 
 > **TF32 note**: llm.mojo's fp32 GPU GEMMs now use TF32 tensor cores by default (`CUBLAS_COMPUTE_32F_FAST_TF32`), matching llm.c's fp32 behavior: its fp32 build auto-enables TF32 on any compute-capability-8.0+ GPU, so the fp32 rows above are TF32-vs-TF32. Build with `-D LLMM_NO_TF32=1` to restore strict IEEE fp32 math (that is also what `make verify-gpu` gates on; the default TF32 path has its own gate, `make verify-gpu-tf32`).
 
-> **Backward-kernel note**: the 07-10 afternoon numbers add two backward-pass optimizations on top of TF32: a redesigned fused LN-backward (one register-accumulating kernel plus a block-per-channel finalize, replacing 4 launches per invocation; −6.9 ms fp32 / −3.1 ms bf16 kernel-family time) and a fused, 128-bit-vectorized matmul dbias reduction (−1.5 ms fp32 / −1.0 ms bf16). Both are gated by the full verify battery above.
+> **Backward-kernel note**: the fp32 result above rests on two backward-pass optimizations layered on top of TF32: a redesigned fused LN-backward (one register-accumulating kernel plus a block-per-channel finalize, replacing 4 launches per invocation; −6.9 ms fp32 / −3.1 ms bf16 kernel-family time) and a fused, 128-bit-vectorized matmul dbias reduction (−1.5 ms fp32 / −1.0 ms bf16). Both are gated by the full verify battery above.
 
 ### Multi-GPU (ZeRO stages 0-3)
 
@@ -158,9 +156,7 @@ Step-time measurement (B=4, T=1024, checkpoint-init tinyshakespeare, 2 rounds wi
 
 The 2026-07-10/11 optimization campaign (coalesced/fused quantize-transpose kernels, persistent fp8 weight-transpose caching, dual-output quantize, fused tiled RHT-prep for NVFP4) cut FP8 from 150.5 to 146.6 ms and NVFP4 from 184.2 to 154.3 ms at this scale. It pays off harder at width: at the 774M-class `d36` config FP8 is now ~12% *faster* than bf16 (0.878×), and NVFP4 reaches parity (1.002×). An optional calibrated static-scales mode (`-D LLMM_FP8_STATIC_SCALES=1`, default off) removes the per-step amax/scale-update kernels entirely. It shaves a further ~1.5% at 124M and ~3% at `d36` (0.853×), at the cost of per-config offline calibration. See the A1 writeup and the final campaign scoreboard in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
-At 124M params, these are numerics/research configs, not throughput wins. The quantized GEMMs themselves are measurably faster than bf16's, since fp8 and fp4 both cut raw GEMM compute time. At this scale, though, that saving is swamped by the quantize/amax/scale overhead (plus the Hadamard transform for NVFP4) around small per-block GEMMs. See the quant-opt and transpose-coalescing writeups in `docs/ai/ai_assisted_optimizations_and_benchmarks.md` and the FP8/FP4 gotcha catalogs. Published FP4/FP8 throughput wins start around ~1B+ parameter models, where the GEMMs are large enough to amortize that fixed overhead.
-
-A batch/width scaling sweep confirms this on-box. At 124M, FP8 stays slower than bf16 across every batch size tested (B up to 64). Scale the model up to the 774M-class `d36` config, though, and it crosses over to being decisively *faster* (0.878× dynamic, 0.853× static after the campaign). Width, not batch, is what closes the gap; see `docs/ai/lowp_scaling_sweep_2026-07-10.md`.
+At 124M params these are numerics/research configs, not throughput wins. The quantized GEMMs themselves are measurably faster than bf16's — fp8 and fp4 both cut raw GEMM compute time — but at this scale that saving is swamped by the quantize/amax/scale overhead (plus the Hadamard transform for NVFP4) around small per-block GEMMs. **Width, not batch, is what closes the gap:** an on-box scaling sweep found FP8 slower than bf16 at every batch size tested (B up to 64) at 124M, while the 774M-class `d36` config crosses over decisively, as the numbers above show. Published FP4/FP8 throughput wins likewise start around ~1B+ parameters, where the GEMMs are large enough to amortize that fixed overhead. See `docs/ai/lowp_scaling_sweep_2026-07-10.md`, plus the quant-opt and transpose-coalescing writeups and the FP8/FP4 gotcha catalogs in `docs/ai/ai_assisted_optimizations_and_benchmarks.md`.
 
 ### Single CPU
 
