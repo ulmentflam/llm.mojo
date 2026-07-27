@@ -1160,13 +1160,49 @@ ifneq ($(TEST_CUDA_VISIBLE_DEVICES),)
 export CUDA_VISIBLE_DEVICES = $(TEST_CUDA_VISIBLE_DEVICES)
 endif
 
+# Build each test to a binary, then run it -- NOT `mojo run`.
+#
+# `mojo run` on tests/test_zero.mojo does not finish: it opens its three GPU
+# contexts and then sits at roughly one spinning core with the GPUs at 0%,
+# until the per-file cap kills it at 2700s. The same file built AOT and
+# executed passes 14/14 in about 3 seconds. Every other test file was 1-9s
+# either way, so this was invisible until a file that hits it appeared.
+#
+# The binary is executed under `$(PIXI) run` rather than bare: tests that use
+# Python interop need the pixi environment at RUNTIME, not just at build time
+# -- test_checkpointing.mojo calls Python.import_module("data.utils") and dies
+# with "No module named 'numpy'" when run outside it.
+#
+# `pixi run` alone is still not enough. `mojo run` puts the environment's lib
+# directory on the dynamic loader's path; a bare AOT binary does not inherit
+# that, so a test that pulls numpy in through Python interop dies at
+# `libmkl_intel_lp64.so.3: cannot open shared object file` -- which is how
+# test_tokenizer.mojo failed on the first cut of this target, having passed
+# under `mojo run` for its whole life. Hence the explicit CONDA_PREFIX/lib
+# prepend, taken from pixi's own activation rather than hardcoded.
+#
+# A compile failure and an assertion failure both fail the suite, but they are
+# reported differently: a file that never built is a different problem from a
+# file whose test failed, and the old target could not tell you which you had.
 test-mojo: | $(PIXI_STAMP)
 	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
 		fail=0; \
+		bindir=$$(mktemp -d -t llmm-test-bins-XXXXXX); \
+		trap 'rm -rf "$$bindir"' EXIT INT TERM; \
 		for f in tests/test_*.mojo; do \
 			echo "==> $$f"; \
 			start=$$(date +%s); \
-			timeout $(TEST_FILE_TIMEOUT) $(PIXI) run mojo run -I . "$$f"; \
+			bin="$$bindir/$$(basename "$$f" .mojo)"; \
+			if ! timeout $(TEST_FILE_TIMEOUT) $(PIXI) run mojo build \
+				$(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o "$$bin" "$$f"; then \
+				end=$$(date +%s); \
+				echo "==> $$f COMPILE FAILED in $$((end - start))s"; \
+				fail=1; \
+				continue; \
+			fi; \
+			timeout $(TEST_FILE_TIMEOUT) $(PIXI) run bash -c \
+				'export LD_LIBRARY_PATH="$$CONDA_PREFIX/lib:$$LD_LIBRARY_PATH"; exec "$$0"' \
+				"$$bin"; \
 			rc=$$?; \
 			end=$$(date +%s); \
 			echo "==> $$f done in $$((end - start))s (exit $$rc)"; \
