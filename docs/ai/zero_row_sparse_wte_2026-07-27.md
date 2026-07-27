@@ -351,6 +351,46 @@ here instead; the follow-up is unblocked the moment the dense window is gone.
 - **The collectives are now guarded** against a silent-corruption class that
   had existed, documented and unenforced, since they were written.
 
+## 9. Verification status
+
+Stated precisely, because "the gates passed" is a claim that should be
+auditable.
+
+**Verified green** at commit `7e441ae`:
+
+- `make format` — clean, no diff.
+- `make lint` — passed (it is also the pre-commit hook; never bypassed).
+- `make check` — passed.
+- `tests/test_zero_equivalence.mojo` — 6/6, stages 1/2/3 at world sizes 2 and 8.
+- `tests/test_zero.mojo` — 13/13. `test_multi_gpu_collectives` was confirmed to
+  have **actually executed** rather than silently skipping: it no-ops and still
+  reports PASS on fewer than two visible GPUs, so it was re-run with a single
+  GPU exported and dropped to a near-zero duration versus a substantial one
+  with two — an on/off discriminator that does not depend on trusting any
+  absolute timing.
+- `make test`'s `test-mojo` phase — all 17 `tests/test_*.mojo` files exit 0.
+- `tests/test_encoder_equivalence.py` — 6/6 (forward and backward, fp32
+  small/large, bf16 small), run in the `cuda` pixi env. This is the gate that
+  most directly exercises this change: `build_wte_buckets` gained two
+  parameters and `encoder_bwd` gained `include_wpe`, so a signature or
+  behavioural regression surfaces here.
+- `make build WORLD_SIZE=2` — compiles clean; `build/train_gpt2` confirmed
+  newer than `encoder.mojo`, `zero.mojo` and `train_gpt2.mojo` at this commit.
+
+**Not verified.** The `test-python-cuda` phase is incomplete: it was aborted
+partway under a box-wide hold on full suites (four concurrent suites had driven
+load average to 65). Roughly 46 of 248 pytest items ran, all passing, but the
+remainder — including several equivalence tests — did not run.
+
+**Timing caveat.** Every wall-clock number gathered during that window is
+contended and is not quoted as a measurement anywhere in this document except
+the collective micro-benchmark of §4, which was taken earlier and should be
+re-confirmed on a quiet box before its *absolute* constant (~15 µs/range) is
+relied upon. The *ratio* it establishes is not in doubt: the K=1 vs
+K=one-range-per-row spread is 250x, far outside anything contention explains,
+so the design conclusion (coalesce aggressively; never emit one range per row)
+stands regardless.
+
 ## AI use statement
 
 Written with AI assistance (Claude Opus agent via Claude Code), directed by
