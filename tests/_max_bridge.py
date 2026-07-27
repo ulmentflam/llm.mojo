@@ -37,8 +37,10 @@ After reading `max.graph.ops.custom` + the production op
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -75,10 +77,24 @@ _PKG_FILENAME = f"llmm{_PKG_SUFFIX}"
 # compiled model exported as MEF reloads in milliseconds with outputs
 # verified bit-identical and symbolic dims intact
 # (~/Workspace/scripts/probe_mef_cache.py), so each compile is paid once
-# per kernel-source change, not once per pytest run. The fingerprint dir
-# name hashes the llmm/*.mojo sources, the MAX version, the mojo binary,
-# and _MEF_SCHEMA: editing a kernel lands in a fresh dir, and stale dirs
-# are pruned. Set LLMM_DISABLE_MEF_CACHE=1 to force full recompiles.
+# per kernel-source change, not once per pytest run.
+#
+# Entries are scoped to what they actually depend on. A MEF is keyed on the
+# transitive `from llmm.X import` closure of the module its kernel is
+# `@register`ed in; the package, which really is built from every module, is
+# keyed on the whole tree. This used to be one directory named after a hash of
+# ALL of llmm/, with every sibling rmtree'd on resolution -- so editing any
+# one kernel discarded every other kernel's compiled graph, and reverting the
+# edit did not bring them back. Measured on a 72-test subset: cold 254s, warm
+# 7.4s, after editing llmm/zero.mojo 7.0s (was a full 254s rebuild, because
+# zero.mojo is in the import closure of none of the kernels the Python suite
+# exercises), after editing llmm/matmul.mojo 142s -- the matmul kernels
+# recompile and the rest stay cached, which is the point.
+#
+# A kernel with no discoverable @register site falls back to hashing the whole
+# tree. Serving a stale MEF would mean the suite silently testing code that is
+# not in the working tree; a needless recompile is merely slow.
+# Set LLMM_DISABLE_MEF_CACHE=1 to force full recompiles.
 # `mojo precompile` output is NOT bit-stable across identical sources
 # (verified), hence hashing sources rather than the package.
 _MEF_CACHE_ROOT = Path(__file__).resolve().parent / ".mef_cache"
@@ -86,20 +102,12 @@ _MEF_SCHEMA = 2  # bump when _compile_model's graph construction changes
 _MEF_CACHE_DIR: "Path | None | Literal[False]" = False  # False = unresolved
 
 
-def _mef_cache_dir() -> "Path | None":
-    """Fingerprint-named cache dir for this kernel-source + toolchain state,
-    or None when disabled / sources unlocatable. Resolved once per process;
-    stale sibling fingerprints are pruned on first resolution."""
-    global _MEF_CACHE_DIR
-    if _MEF_CACHE_DIR is not False:
-        return _MEF_CACHE_DIR
-    _MEF_CACHE_DIR = None
-    if os.environ.get("LLMM_DISABLE_MEF_CACHE"):
-        return None
-    sources = sorted(_SOURCE_KERNELS_DIR.rglob("*.mojo"))
-    if not sources:
-        return None
-    h = hashlib.sha256()
+_IMPORT_RE = re.compile(r"^\s*from\s+llmm\.([A-Za-z_][A-Za-z0-9_]*)\s+import", re.M)
+_REGISTER_RE = re.compile(r'^\s*@register\(\s*"([^"]+)"\s*\)', re.M)
+
+
+def _toolchain_fingerprint(h: "hashlib._Hash") -> None:
+    """Everything that invalidates every artifact regardless of kernel source."""
     h.update(f"schema={_MEF_SCHEMA}".encode())
     try:
         from max import _core
@@ -111,16 +119,112 @@ def _mef_cache_dir() -> "Path | None":
     if mojo:
         st = Path(mojo).resolve().stat()
         h.update(f"mojo={st.st_size}:{st.st_mtime_ns}".encode())
-    for f in sources:
+
+
+@functools.lru_cache(maxsize=1)
+def _kernel_source_map() -> "tuple[dict[str, str], dict[str, frozenset[str]]]":
+    """(kernel name -> module, module -> transitive llmm module closure).
+
+    Modules are `llmm/<name>.mojo` stems. The closure of a module is itself
+    plus every llmm module reachable through `from llmm.X import`, computed to
+    a fixed point. Conservative by construction: a module is only ever
+    ADDED to a closure, never pruned, so an over-broad closure costs a
+    needless recompile while a too-narrow one would serve a stale kernel --
+    and only the second of those is a correctness bug.
+    """
+    kernels: "dict[str, str]" = {}
+    direct: "dict[str, set[str]]" = {}
+    for f in sorted(_SOURCE_KERNELS_DIR.rglob("*.mojo")):
+        mod = f.relative_to(_SOURCE_KERNELS_DIR).with_suffix("").as_posix()
+        text = f.read_text(errors="replace")
+        direct[mod] = {m for m in _IMPORT_RE.findall(text)}
+        for name in _REGISTER_RE.findall(text):
+            kernels[name] = mod
+
+    closure: "dict[str, frozenset[str]]" = {}
+    for mod in direct:
+        seen = {mod}
+        stack = [mod]
+        while stack:
+            cur = stack.pop()
+            for dep in direct.get(cur, ()):  # unknown module => no expansion
+                if dep not in seen:
+                    seen.add(dep)
+                    stack.append(dep)
+        closure[mod] = frozenset(seen)
+    return kernels, closure
+
+
+def _mef_cache_dir() -> "Path | None":
+    """Root of the on-disk artifact cache, or None when disabled.
+
+    Everything under here is content-addressed, so entries for different
+    source states coexist rather than evicting each other. Nothing is pruned
+    on resolution: this used to keep exactly one fingerprint directory and
+    rmtree every sibling, which meant editing a single kernel discarded every
+    other kernel's compiled graph, and reverting the edit did not bring them
+    back.
+    """
+    global _MEF_CACHE_DIR
+    if _MEF_CACHE_DIR is not False:
+        return _MEF_CACHE_DIR
+    _MEF_CACHE_DIR = None
+    if os.environ.get("LLMM_DISABLE_MEF_CACHE"):
+        return None
+    if not any(_SOURCE_KERNELS_DIR.rglob("*.mojo")):
+        return None
+    _MEF_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    _MEF_CACHE_DIR = _MEF_CACHE_ROOT
+    return _MEF_CACHE_DIR
+
+
+@functools.lru_cache(maxsize=None)
+def _kernel_fingerprint(kernel_name: str) -> str:
+    """Hash of only the sources a given kernel's compiled graph depends on.
+
+    A kernel's MEF embeds compiled code from its own module and everything
+    that module imports -- and nothing else. Keying on the whole of `llmm/`,
+    as this used to, meant one edit anywhere invalidated all of them: the
+    observed cost was a pytest phase going from 20s to 581s because
+    `llmm/zero.mojo` changed, though `zero.mojo` is in the import closure of
+    none of the kernels the Python suite exercises.
+
+    FALLS BACK TO THE WHOLE TREE when the kernel has no `@register` site we
+    could find. An unrecognised kernel gets the old, conservative behaviour
+    rather than a guess -- serving a stale MEF would mean the suite silently
+    testing code that is not in the working tree, which is a far worse outcome
+    than a slow run.
+    """
+    kernels, closure = _kernel_source_map()
+    h = hashlib.sha256()
+    _toolchain_fingerprint(h)
+    mod = kernels.get(kernel_name)
+    if mod is None:
+        h.update(b"scope=whole-tree")
+        mods = sorted(
+            f.relative_to(_SOURCE_KERNELS_DIR).with_suffix("").as_posix()
+            for f in _SOURCE_KERNELS_DIR.rglob("*.mojo")
+        )
+    else:
+        h.update(b"scope=closure")
+        mods = sorted(closure.get(mod, {mod}))
+    for m in mods:
+        p = _SOURCE_KERNELS_DIR / f"{m}.mojo"
+        h.update(m.encode())
+        h.update(p.read_bytes() if p.exists() else b"<missing>")
+    return h.hexdigest()[:16]
+
+
+@functools.lru_cache(maxsize=1)
+def _package_fingerprint() -> str:
+    """Hash over ALL of llmm/ -- correct for the package, which is built from
+    every module regardless of which kernel is being compiled."""
+    h = hashlib.sha256()
+    _toolchain_fingerprint(h)
+    for f in sorted(_SOURCE_KERNELS_DIR.rglob("*.mojo")):
         h.update(f.relative_to(_SOURCE_KERNELS_DIR).as_posix().encode())
         h.update(f.read_bytes())
-    cache = _MEF_CACHE_ROOT / h.hexdigest()[:16]
-    cache.mkdir(parents=True, exist_ok=True)
-    for sibling in _MEF_CACHE_ROOT.iterdir():
-        if sibling != cache:
-            shutil.rmtree(sibling, ignore_errors=True)
-    _MEF_CACHE_DIR = cache
-    return cache
+    return h.hexdigest()[:16]
 
 
 def _ensure_packaged(echo_warnings: bool = False) -> Path:
@@ -142,7 +246,8 @@ def _ensure_packaged(echo_warnings: bool = False) -> Path:
     if cache is None:
         target = Path(tempfile.mkdtemp(prefix="llmm_pkg_")) / _PKG_FILENAME
     else:
-        target = cache / _PKG_FILENAME
+        target = cache / f"pkg-{_package_fingerprint()}" / _PKG_FILENAME
+        target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             MOJO_KERNELS_DIR = target
             return target
@@ -370,7 +475,11 @@ def _load_cached_mef(
     if cache is None:
         return None, None, None
     sig = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
-    mef = cache / f"{kernel_name}-{sig}.mef"
+    # Scoped to the kernel's own import closure, so an edit elsewhere in
+    # llmm/ leaves this entry valid instead of discarding every graph.
+    mef_dir = cache / f"mef-{_kernel_fingerprint(kernel_name)}"
+    mef_dir.mkdir(parents=True, exist_ok=True)
+    mef = mef_dir / f"{kernel_name}-{sig}.mef"
     if mef.exists():
         from max.engine import InferenceSession
 

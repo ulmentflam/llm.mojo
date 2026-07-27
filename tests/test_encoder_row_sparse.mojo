@@ -21,6 +21,7 @@ from std.memory import UnsafePointer, alloc
 from std.gpu.host import DeviceContext
 from std.algorithm import sync_parallelize
 from std.math import ceildiv
+from std.bit import pop_count
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 from llmm.zero import ZeroContext, CpuCoordinator
@@ -255,6 +256,10 @@ def test_union_makes_row_lists_rank_invariant() raises:
     var n_rows_out = alloc[Int](N)
     var run_count_out = alloc[Int](N)
     var union_out = alloc[Scalar[DType.uint32]](N * words)
+    # Each rank's own bitmap BEFORE the union. Without this the test can
+    # only compare ranks to each other, and 'every rank ended up with the
+    # same bitmap' is satisfied just as well by broadcasting one rank's.
+    var own_out = alloc[Scalar[DType.uint32]](N * words)
     var first_out = alloc[Int](N * BT * 2)
     var len_out = alloc[Int](N * BT * 2)
 
@@ -288,6 +293,8 @@ def test_union_makes_row_lists_rank_invariant() raises:
                 BT,
                 V,
             )
+            for w in range(words):
+                own_out[rank * words + w] = bm[w]
             z.allreduce_or_host[DType.uint32](
                 UnsafePointer[Scalar[DType.uint32], MutAnyOrigin](
                     bm.as_unsafe_any_origin()
@@ -321,6 +328,9 @@ def test_union_makes_row_lists_rank_invariant() raises:
             row_of.free()
         except e:
             print("row map rank error:", e)
+            # Same hazard as everywhere else ranks rendezvous: leaving
+            # without aborting hangs the peers on the next barrier.
+            coord[].abort()
 
     sync_parallelize[_run_rank](N)
 
@@ -335,9 +345,80 @@ def test_union_makes_row_lists_rank_invariant() raises:
         assert_equal(first_out[k], first_out[BT * 2 + k])
         assert_equal(len_out[k], len_out[BT * 2 + k])
 
+    # CONTENT, not just agreement. Everything above compares rank 0 to rank 1,
+    # and all of it still holds if `allreduce_or_host` broadcast one rank's
+    # bitmap to everyone instead of OR-ing them: the ranks would agree
+    # perfectly while every token exclusive to the other rank silently
+    # vanished from the row map. The bands here are built to overlap only
+    # partially (rank 0 draws from [1000,1600), rank 1 from [1300,1900)), so
+    # each rank has bits the other does not, and the union must contain both
+    # sides' exclusives.
+    var only0 = 0
+    var only1 = 0
+    for w in range(words):
+        var a = UInt32(own_out[0 * words + w])
+        var b = UInt32(own_out[1 * words + w])
+        var u = UInt32(union_out[0 * words + w])
+        # Bits that were set on exactly one rank must survive the union.
+        var excl0 = a & ~b
+        var excl1 = b & ~a
+        assert_equal(
+            Int(excl0 & ~u),
+            0,
+            "union dropped a token present only on rank 0 (word "
+            + String(w)
+            + ") -- the union is not a union",
+        )
+        assert_equal(
+            Int(excl1 & ~u),
+            0,
+            "union dropped a token present only on rank 1 (word "
+            + String(w)
+            + ") -- looks like one rank's bitmap was broadcast rather than"
+            + " OR-ed",
+        )
+        only0 += Int(pop_count(excl0))
+        only1 += Int(pop_count(excl1))
+
+    # Without exclusives on BOTH sides the two assertions above are vacuous:
+    # a broadcast would satisfy them trivially. Pin that the fixture actually
+    # produced a divergent pair.
+    assert_true(
+        only0 > 0,
+        (
+            "fixture produced no rank-0-exclusive tokens; the union content"
+            " assertions above prove nothing"
+        ),
+    )
+    assert_true(
+        only1 > 0,
+        (
+            "fixture produced no rank-1-exclusive tokens; the union content"
+            " assertions above prove nothing"
+        ),
+    )
+
+    # HONEST NOTE ON VALIDATION. Unlike the other regression tests added in
+    # this campaign, these content assertions are NOT backed by a mutation
+    # that the pre-existing assertions miss and these catch. Two were tried:
+    # changing the peer OR to `dst[i] = peer[i]` (last-peer-wins), and having
+    # every rank copy rank 0's registered bitmap. Both fail on the
+    # `n_rows_out[0] == n_rows_out[1]` agreement check above, several lines
+    # before reaching here -- the natural corruptions make ranks DISAGREE,
+    # which the old assertions already caught.
+    #
+    # So the audit finding that motivated this ("a broadcast would pass every
+    # assertion") is weaker than it looked: producing identical-but-wrong
+    # bitmaps on every rank turns out to be hard to do by accident. These
+    # assertions are still worth having -- they close the case by
+    # construction, and the two `only*` guards keep them from going vacuous if
+    # the fixture's bands ever stop overlapping -- but nobody has seen them
+    # fail on a real bug, and that should be said rather than implied.
+
     n_rows_out.free()
     run_count_out.free()
     union_out.free()
+    own_out.free()
     first_out.free()
     len_out.free()
     coord[].free()
