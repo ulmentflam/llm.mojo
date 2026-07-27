@@ -790,6 +790,11 @@ BENCH_ZERO_STAGES ?= 0,1,2,3
 BENCH_ZERO_B ?= 4
 BENCH_ZERO_T ?= 64
 BENCH_ZERO_STEPS ?= 12
+# Per-(precision, stage) wall-clock budget. The default suits the small bench
+# shape; production shapes (e.g. BENCH_ZERO_B=32 BENCH_ZERO_T=1024) need far
+# more — past runs recorded status="timeout" at 400 s purely from this cap, not
+# from a hang. Raise it rather than reading a timeout as a memory result.
+BENCH_ZERO_TIMEOUT ?= 400
 BENCH_ZERO_OUT ?= zero/bench/bench_zero_world$(BENCH_ZERO_WORLD).json
 
 benchmark-zero:
@@ -798,6 +803,7 @@ benchmark-zero:
 	$(PIXI) run python scripts/benchmark_zero.py \
 		--world-size $(BENCH_ZERO_WORLD) --stages $(BENCH_ZERO_STAGES) \
 		-b $(BENCH_ZERO_B) -t $(BENCH_ZERO_T) --steps $(BENCH_ZERO_STEPS) \
+		--timeout $(BENCH_ZERO_TIMEOUT) \
 		--fp32-binary $(TRAIN_BIN) --bf16-binary $(TRAIN_BIN_BF16) \
 		--output $(BENCH_ZERO_OUT)
 	$(PIXI) run python scripts/benchmark_zero.py --plot $(BENCH_ZERO_OUT)

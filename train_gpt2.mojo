@@ -1023,6 +1023,74 @@ def parse_model_descriptor(descriptor: String) raises -> GPT2Config:
     )
 
 
+# ===----------------------------------------------------------------------=== #
+# Exact in-process device-memory accounting (LLMM_MEM_REPORT)
+# ===----------------------------------------------------------------------=== #
+#
+# `nvidia-smi --query-gpu=memory.used` — what scripts/benchmark_zero.py samples —
+# reports the CUDA *context's committed* footprint, which the DeviceContext
+# caching allocator grows in coarse chunks (~256 MiB on this box). A structural
+# change that removes, say, 150 MiB of resident buffers therefore frequently
+# moves that reading by exactly zero: the freed bytes come out of slack inside an
+# already-committed chunk. See docs/ai/zero_stage3_param_streaming_2026-07-14.md
+# and docs/ai/zero_grad_bucketing_design_2026-07-14.md.
+#
+# The trainer, however, knows exactly what it asked for. Every long-lived device
+# allocation is held in a `DeviceBuffer` field, and `len(buf)` is that buffer's
+# element count, so `len(buf) * size_of[dtype]()` is an exact, quantization-free
+# byte count. `GPT2.memory_report_json` sums those by buffer class and emits one
+# machine-readable line per rank. Because it reads the live buffer objects rather
+# than re-deriving sizes, it stays correct automatically when an allocation's
+# size expression changes — that is the whole point of the instrument.
+#
+# Gated on the `LLMM_MEM_REPORT` environment variable so ordinary runs print
+# nothing and pay nothing.
+
+
+@always_inline
+def _mem_bytes[dt: DType](b: DeviceBuffer[dt]) -> Int:
+    """Exact device bytes held by `b`: element count times element size."""
+    return len(b) * size_of[dt]()
+
+
+@always_inline
+def _mem_kv(name: StaticString, value: Int) -> String:
+    """One `"name":value` JSON pair (integers only — no escaping needed)."""
+    return '"' + String(name) + '":' + String(value)
+
+
+@always_inline
+def _mem_mark[
+    dt: DType
+](mut names: List[String], b: DeviceBuffer[dt], name: StaticString):
+    """Record `name` when `b` is a placeholder rather than a live buffer.
+
+    Every buffer field on `GPT2` is always constructed, so a configuration that
+    does not use one leaves it at the struct's 1-element placeholder size (the
+    codebase's own convention — see the `master_buf` and `grad_pool_buf` field
+    comments). Byte counts alone therefore cannot distinguish "this buffer was
+    eliminated" from "this buffer is genuinely tiny": both read as a handful of
+    bytes. That distinction is not cosmetic. A change that stops allocating a
+    buffer at all is a different result from one that shrinks it, and the report
+    should be able to say so without the reader inferring it from a suspicious
+    4-byte entry.
+    """
+    if len(b) <= 1:
+        names.append(String(name))
+
+
+@always_inline
+def _mem_str_array(names: List[String]) -> String:
+    """A `List[String]` as a JSON array literal."""
+    var s = String("[")
+    for i in range(len(names)):
+        if i > 0:
+            s += ","
+        s += '"' + names[i] + '"'
+    s += "]"
+    return s
+
+
 # `recompute` enables activation (gradient) checkpointing: when True, the
 # per-layer MLP activations fch (pre-GELU) and fch_gelu (post-GELU) are not
 # persisted across the forward/backward boundary. They collapse to a single
@@ -4820,6 +4888,183 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.ctx.synchronize()
         return state^
 
+    # ===------------------------------------------------------------------=== #
+    # Exact in-process memory accounting (LLMM_MEM_REPORT)
+    # ===------------------------------------------------------------------=== #
+
+    def memory_report_json(self, phase: String) raises -> String:
+        """This rank's exact device-memory footprint as one JSON object.
+
+        Reports every long-lived `DeviceBuffer` this rank owns, in bytes, both
+        per buffer (`buffers`) and rolled up by class (`classes`), plus the
+        driver's committed figure for the same device (`driver_used_bytes`) for
+        comparison. The gap between `exact_total_bytes` and `driver_used_bytes`
+        is the CUDA context overhead plus the caching allocator's slack — the
+        very quantization that makes an ~150 MiB structural change invisible to
+        `nvidia-smi`. See the module comment above `_mem_bytes`.
+
+        Sizes are read from the live buffer objects, never re-derived from the
+        expressions that produced them, so this stays honest when a buffer is
+        resized elsewhere. Buffers that a given configuration does not use are
+        1-element placeholders and show up as a handful of bytes rather than
+        zero; that is real and is reported as-is — and `inactive_buffers` names
+        them, so a structural elimination ("this buffer is gone") reads
+        differently from a size change ("this buffer got smaller"). That
+        distinction is what lets an approach which stops allocating a buffer
+        entirely be scored against one that merely shrinks it.
+
+        Not counted: host buffers (they are not device memory), transient
+        per-step allocations made and dropped inside kernels' call sites, and
+        the fp8 `AmaxState` scales (fp8 builds only, a few KiB). `driver_used_
+        bytes` does see those, which is part of why both numbers are emitted.
+        """
+        var b_params = _mem_bytes(self.params_buf)
+        var b_grads_full = _mem_bytes(self.grads_buf)
+        var b_grad_pool = _mem_bytes(self.grad_pool_buf)
+        var b_grad_shard = _mem_bytes(self.grad_shard_buf)
+        var b_m = _mem_bytes(self.m_buf)
+        var b_v = _mem_bytes(self.v_buf)
+        var b_master = _mem_bytes(self.master_buf)
+        var b_param_window = _mem_bytes(self.param_window_buf)
+        var b_embed_window = _mem_bytes(self.embed_window_buf)
+        var b_acts = _mem_bytes(self.acts_buf)
+        var b_acts_stats = _mem_bytes(self.acts_stats_buf)
+        var b_grad_acts = _mem_bytes(self.grad_acts_buf)
+        var b_grad_acts_stats = _mem_bytes(self.grad_acts_stats_buf)
+        var b_inputs_dev = _mem_bytes(self.inputs_dev_buf)
+        var b_targets_dev = _mem_bytes(self.targets_dev_buf)
+        var b_bucket_info_dev = _mem_bytes(self.bucket_info_dev_buf)
+        var b_workload_dev = _mem_bytes(self.workload_indices_dev_buf)
+        var b_grad_norm = _mem_bytes(self.grad_norm_out_buf)
+        var b_comm = self.zero_ctx.comm_bytes()
+
+        var c_params = b_params
+        var c_grads = b_grads_full + b_grad_pool + b_grad_shard
+        var c_optimizer = b_m + b_v + b_master
+        var c_z3_windows = b_param_window + b_embed_window
+        var c_activations = (
+            b_acts + b_acts_stats + b_grad_acts + b_grad_acts_stats
+        )
+        var c_index = (
+            b_inputs_dev + b_targets_dev + b_bucket_info_dev + b_workload_dev
+        )
+        var c_scratch = b_grad_norm
+        var c_comm = b_comm
+        var total = (
+            c_params
+            + c_grads
+            + c_optimizer
+            + c_z3_windows
+            + c_activations
+            + c_index
+            + c_scratch
+            + c_comm
+        )
+
+        # Driver-side view of the SAME device, for the quantization comparison.
+        # This is a whole-device figure: it includes the CUDA context and any
+        # co-tenant process, so it is a cross-check, not the headline number.
+        var driver_used = 0
+        var driver_total = 0
+        comptime if is_gpu[Self.target]():
+            var info = self.ctx.get_memory_info()
+            driver_total = Int(info[1])
+            driver_used = driver_total - Int(info[0])
+
+        var s = String('{"schema":2')
+        s += ',"phase":"' + phase + '"'
+        s += "," + _mem_kv("rank", self.zero_ctx.rank)
+        s += "," + _mem_kv("world_size", Self.WORLD_SIZE)
+        s += "," + _mem_kv("zero_stage", self.zero_ctx.zero_stage)
+        s += ',"precision":"' + String(PRECISION) + '"'
+        s += "," + _mem_kv("z3_streaming", 1 if self.z3_streaming else 0)
+        s += "," + _mem_kv("recompute", 1 if Self.recompute else 0)
+        s += "," + _mem_kv("batch_size", self.batch_size)
+        s += "," + _mem_kv("seq_len", self.seq_len)
+        s += "," + _mem_kv("num_parameters", self.num_parameters)
+        s += "," + _mem_kv("padded_num_parameters", self.padded_num_parameters)
+        s += "," + _mem_kv(
+            "optimizer_num_parameters", self.optimizer_num_parameters
+        )
+        s += "," + _mem_kv("grad_pool_elems", self.grad_pool_elems)
+
+        s += ',"classes":{'
+        s += _mem_kv("params", c_params)
+        s += "," + _mem_kv("gradients", c_grads)
+        s += "," + _mem_kv("optimizer", c_optimizer)
+        s += "," + _mem_kv("z3_windows", c_z3_windows)
+        s += "," + _mem_kv("activations", c_activations)
+        s += "," + _mem_kv("index", c_index)
+        s += "," + _mem_kv("scratch", c_scratch)
+        s += "," + _mem_kv("comm", c_comm)
+        s += "}"
+
+        s += ',"buffers":{'
+        s += _mem_kv("params_buf", b_params)
+        s += "," + _mem_kv("grads_buf", b_grads_full)
+        s += "," + _mem_kv("grad_pool_buf", b_grad_pool)
+        s += "," + _mem_kv("grad_shard_buf", b_grad_shard)
+        s += "," + _mem_kv("m_buf", b_m)
+        s += "," + _mem_kv("v_buf", b_v)
+        s += "," + _mem_kv("master_buf", b_master)
+        s += "," + _mem_kv("param_window_buf", b_param_window)
+        s += "," + _mem_kv("embed_window_buf", b_embed_window)
+        s += "," + _mem_kv("acts_buf", b_acts)
+        s += "," + _mem_kv("acts_stats_buf", b_acts_stats)
+        s += "," + _mem_kv("grad_acts_buf", b_grad_acts)
+        s += "," + _mem_kv("grad_acts_stats_buf", b_grad_acts_stats)
+        s += "," + _mem_kv("inputs_dev_buf", b_inputs_dev)
+        s += "," + _mem_kv("targets_dev_buf", b_targets_dev)
+        s += "," + _mem_kv("bucket_info_dev_buf", b_bucket_info_dev)
+        s += "," + _mem_kv("workload_indices_dev_buf", b_workload_dev)
+        s += "," + _mem_kv("grad_norm_out_buf", b_grad_norm)
+        s += "," + _mem_kv("comm_scratch_total", b_comm)
+        s += "}"
+
+        # Buffers that this configuration does not allocate at all, as opposed
+        # to allocating small. See `_mem_mark`. A diff that moves a name INTO
+        # this list is reporting a structural elimination, not a size change.
+        var inactive = List[String]()
+        _mem_mark(inactive, self.params_buf, "params_buf")
+        _mem_mark(inactive, self.grads_buf, "grads_buf")
+        _mem_mark(inactive, self.grad_pool_buf, "grad_pool_buf")
+        _mem_mark(inactive, self.grad_shard_buf, "grad_shard_buf")
+        _mem_mark(inactive, self.m_buf, "m_buf")
+        _mem_mark(inactive, self.v_buf, "v_buf")
+        _mem_mark(inactive, self.master_buf, "master_buf")
+        _mem_mark(inactive, self.param_window_buf, "param_window_buf")
+        _mem_mark(inactive, self.embed_window_buf, "embed_window_buf")
+        _mem_mark(inactive, self.acts_buf, "acts_buf")
+        _mem_mark(inactive, self.acts_stats_buf, "acts_stats_buf")
+        _mem_mark(inactive, self.grad_acts_buf, "grad_acts_buf")
+        _mem_mark(inactive, self.grad_acts_stats_buf, "grad_acts_stats_buf")
+        _mem_mark(inactive, self.inputs_dev_buf, "inputs_dev_buf")
+        _mem_mark(inactive, self.targets_dev_buf, "targets_dev_buf")
+        _mem_mark(inactive, self.bucket_info_dev_buf, "bucket_info_dev_buf")
+        _mem_mark(
+            inactive, self.workload_indices_dev_buf, "workload_indices_dev_buf"
+        )
+        _mem_mark(inactive, self.grad_norm_out_buf, "grad_norm_out_buf")
+        s += ',"inactive_buffers":' + _mem_str_array(inactive)
+
+        s += "," + _mem_kv("exact_total_bytes", total)
+        s += "," + _mem_kv("driver_used_bytes", driver_used)
+        s += "," + _mem_kv("driver_total_bytes", driver_total)
+        s += "}"
+        return s
+
+    def print_memory_report(self, phase: String) raises:
+        """Emit this rank's accounting line when `LLMM_MEM_REPORT` is set.
+
+        Off unless the variable is non-empty, so normal runs are untouched.
+        Every rank prints its own line (ranks are host threads sharing one
+        stdout); the `rank` field is what tells them apart. The `[mem-report] `
+        prefix is the stable handle scripts/benchmark_zero.py greps for.
+        """
+        if getenv("LLMM_MEM_REPORT") == "":
+            return
+        print("[mem-report] " + self.memory_report_json(phase))
+
 
 # ===----------------------------------------------------------------------=== #
 # The Main Training Loop!
@@ -5084,6 +5329,13 @@ def train[
     printf0(rank, _table_row("channels C", String(model.config.channels)))
     printf0(rank, _table_row("num_parameters", String(model.num_parameters)))
     printf0(rank, bar)
+
+    # Exact allocation accounting, phase 1 of 2 (no-op unless LLMM_MEM_REPORT is
+    # set). Here the params/gradients/optimizer/ZeRO-3-window buffers exist but
+    # activations do not (they are sized on the first forward), which is exactly
+    # what isolates the static, ZeRO-shardable footprint from the activation
+    # footprint. The second call, after the training loop, is the steady state.
+    model.print_memory_report("post_alloc")
 
     # Disk checkpointing: -o output_log_dir, -n checkpoint_every, -y resume.
     # The output dir is created in main() before rank threads spawn (even
@@ -5406,6 +5658,13 @@ def train[
             + _ffmt(bias_corrected_ema, 0)
             + " tok/s",
         )
+
+    # Exact allocation accounting, phase 2 of 2 (no-op unless LLMM_MEM_REPORT is
+    # set): steady state, with activations and the ZeRO collective scratches
+    # sized by real steps. `driver_used_bytes` read here is effectively the
+    # run's high-water mark — the DeviceContext caching allocator never returns
+    # a committed chunk, so the driver figure only ever ratchets up.
+    model.print_memory_report("steady")
 
     train_loader.close()
     val_loader.close()

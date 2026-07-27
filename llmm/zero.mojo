@@ -1099,6 +1099,23 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     )
                 self.ctx.synchronize()
 
+    def comm_bytes(self) -> Int:
+        """Exact device bytes held by this rank's collective scratch buffers.
+
+        `comm_scratch` / `comm_scratch2` are the staged-copy landing zones sized
+        by `ensure_comm_setup` (1-byte dummies before that runs, and on CPU /
+        N == 1 builds); `signal_buffer` is a 1-byte dummy kept only for the
+        unused comm-based gather path. All three are `uint8`, so the element
+        count is already the byte count. Read off the live buffers so this stays
+        exact if the scratch sizing changes. Used by the trainer's
+        LLMM_MEM_REPORT accounting; see `GPT2.memory_report_json`.
+        """
+        return (
+            len(self.comm_scratch)
+            + len(self.comm_scratch2)
+            + len(self.signal_buffer)
+        )
+
 
 # ===----------------------------------------------------------------------=== #
 # ShardedParameter for Zero-3 Sharding & Offload
