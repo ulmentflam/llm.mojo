@@ -449,6 +449,58 @@ The general lesson: **any collective-adjacent check must be a function of
 values every rank agrees on, or it becomes a deadlock generator.** That is the
 same discipline the row map itself follows.
 
+## 11. What is NOT tested by the gates, and why
+
+This section exists so the gap is recorded rather than discovered later.
+
+`tests/wip_encoder_row_sparse.mojo` is committed but is **deliberately named
+outside the `tests/test_*.mojo` glob**, so `make test-mojo` does not run it. It
+currently **deadlocks** (confirmed: `timeout 480` → exit 124, no test output).
+It is kept out because a hanging test in the glob burns the full
+`TEST_FILE_TIMEOUT` (2700s) and blocks every other team's gate runs, which is a
+worse outcome than a documented gap.
+
+**Therefore the following are implemented but NOT covered by any gate:**
+
+- The cross-rank bitmap **union** (`allreduce_or_host`) — that ranks with
+  *different* token batches converge on identical row sets.
+- **Gap coalescing** in `build_row_runs`, and its capacity bound.
+- The **row-chunked backward** (`_encoder_backward_row_sparse`): chunk
+  boundaries, the bucket cursor walk, the biased `dwte` pointer, and
+  `include_wpe` firing on chunk 0 only.
+- `assert_ranges_agree` actually rejecting divergent lists.
+- The **tied-weight interaction** — LM-head and encoder contributions landing
+  on the same shard ranges via reduce-scatter linearity.
+
+**What the passing gates do and do not prove.** `test_encoder_equivalence.py`
+(6/6) is *single-rank* at V=256 and touches none of the above.
+`test_zero_equivalence.mojo` (6/6, stages 1/2/3 at world sizes 2 and 8) does
+exercise the row-sparse code path, but it gives **every simulated rank the same
+batch**. That is precisely the case where the union is a no-op: the union
+equals each rank's own set, so no rank ever sees a chunk it did not contribute
+to. It cannot distinguish a correct union from a missing one. Everything above
+requires *divergent per-rank tokens* to reach at all.
+
+That is not a hypothetical concern. The first end-to-end run of the multi-rank
+test found two real bugs (§10) that the entire existing suite could not reach —
+so the untested surface is known to be a place where bugs actually live, not
+merely a place where they might.
+
+**Why the test is hard to finish.** Its failures are invisible by
+construction. A rank raising inside a `sync_parallelize` region returns early
+and never reaches the next barrier, so its peers spin in `CpuBarrier.wait()`
+forever: one core at 100%, no output, no exception text, because the harness's
+output is still buffered. Every debugging cycle therefore costs a full timeout
+and yields no diagnostic. Fixing the two bugs in §10 removed the *known* causes
+without clearing the hang, so at least one further cause remains unidentified.
+
+**The fix, for whoever picks this up.** Do not debug it as-is — first make
+rank failures non-hanging. Give each rank a slot in a shared array, have it
+record its error there instead of propagating, and ensure **every rank reaches
+every barrier unconditionally** on both the success and failure paths. Only
+then will the underlying exception become visible. Then rename the file to
+`tests/test_encoder_row_sparse.mojo` to bring it into the gate glob.
+
 ## AI use statement
 
 Written with AI assistance (Claude Opus agent via Claude Code), directed by
