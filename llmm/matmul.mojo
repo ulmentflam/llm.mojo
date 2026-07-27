@@ -3538,10 +3538,19 @@ def matmul_lm_head_fwd_tile[
             ld_d=out_ld,
         )
     else:
+        # Packed destination (`out_ld == tile_oc`, which is how the chunked
+        # cross-entropy path hands over its per-tile scratch): the staging
+        # buffer and the scatter below would both be identities, so write
+        # straight into the caller's tile.
+        var packed = out_ld == tile_oc
         # Portable staging: dense GEMM into a contiguous [rows, tile_oc] tile,
         # then scatter into the strided logits columns.
-        var stage = ctx.enqueue_create_buffer[dtype](rows * tile_oc)
-        var stage_ptr = rebind[MutKernelPtr[dtype]](stage.unsafe_ptr())
+        var stage = ctx.enqueue_create_buffer[dtype](
+            1 if packed else rows * tile_oc
+        )
+        var stage_ptr = out_ptr if packed else rebind[MutKernelPtr[dtype]](
+            stage.unsafe_ptr()
+        )
         matmul_fwd[dtype, target, use_gelu=False, has_bias=False](
             stage_ptr,
             stage_ptr,  # dummy pre_gelu (use_gelu=False: never stored to)
@@ -3554,14 +3563,15 @@ def matmul_lm_head_fwd_tile[
             Int64(tile_oc),
             ctx,
         )
-        _col_slice_copy[dtype, target, to_strided=True](
-            out_ptr,
-            rebind[ImmutKernelPtr[dtype]](stage_ptr),
-            rows,
-            tile_oc,
-            out_ld,
-            ctx,
-        )
+        if not packed:
+            _col_slice_copy[dtype, target, to_strided=True](
+                out_ptr,
+                rebind[ImmutKernelPtr[dtype]](stage_ptr),
+                rows,
+                tile_oc,
+                out_ld,
+                ctx,
+            )
         ctx.synchronize()
         _ = stage^
 
@@ -3636,15 +3646,24 @@ def matmul_lm_head_bwd_tile[
             ld_b=d_output_ld,
         )
     else:
+        # Packed source (`d_output_ld == tile_oc`): the gather would be an
+        # identity copy, so read the caller's tile in place. This is the
+        # chunked cross-entropy path, whose dlogits tile is contiguous.
+        var packed = d_output_ld == tile_oc
         # Portable staging: gather the strided dlogits tile into a contiguous
         # [rows, tile_oc] buffer once, then reuse the dense entry points.
-        var stage = ctx.enqueue_create_buffer[dtype](rows * tile_oc)
-        var stage_ptr = rebind[MutKernelPtr[dtype]](stage.unsafe_ptr())
-        _col_slice_copy[dtype, target, to_strided=False](
-            stage_ptr, d_output_ptr, rows, tile_oc, d_output_ld, ctx
+        var stage = ctx.enqueue_create_buffer[dtype](
+            1 if packed else rows * tile_oc
         )
-        ctx.synchronize()
-        var stage_imm = rebind[ImmutKernelPtr[dtype]](stage_ptr)
+        var stage_ptr = rebind[MutKernelPtr[dtype]](stage.unsafe_ptr())
+        if not packed:
+            _col_slice_copy[dtype, target, to_strided=False](
+                stage_ptr, d_output_ptr, rows, tile_oc, d_output_ld, ctx
+            )
+            ctx.synchronize()
+        var stage_imm = d_output_ptr if packed else rebind[
+            ImmutKernelPtr[dtype]
+        ](stage_ptr)
 
         if accumulate_d_input:
             # matmul_d_input_bwd always overwrites d_input, so accumulate by

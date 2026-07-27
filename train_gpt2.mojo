@@ -70,7 +70,12 @@ from llmm.global_norm import (
     global_norm_aggregate_gpu,
 )
 from llmm.adamw import adamw_update, AdamWConfig
-from llmm.fused_classifier import fused_classifier
+from llmm.fused_classifier import (
+    fused_classifier,
+    chunked_ce_pass1,
+    chunked_ce_loss,
+    chunked_ce_pass2,
+)
 from llmm.scheduler import LearningRateScheduler
 from llmm.sampler import random_f32, sample_softmax
 from llmm.rand import MT19937, normal_
@@ -118,6 +123,30 @@ comptime WORLD_SIZE_DEF = get_defined_int["WORLD_SIZE", 1]()
 # the realized tile count can be lower than K; below 128 rows the tiny-model
 # test configs tile at single-row granularity instead.
 comptime LM_HEAD_VOCAB_TILES = get_defined_int["LLMM_LM_HEAD_VOCAB_TILES", 8]()
+
+# -D LLMM_LM_HEAD_CHUNKED_CE=1: chunk the cross-entropy so the full
+# `(B*T, V_p)` logits activation never exists.
+#
+# OFF BY DEFAULT, and deliberately so. The vocab tiling above is free — it
+# rearranges GEMMs without changing the work. This is not: it trades roughly
+# +10% step time (one extra full LM-head forward GEMM, to recompute each logits
+# tile in the backward pass) for several GiB of activation memory. That is an
+# excellent deal when memory is what caps your batch size and a poor one when it
+# is not, so it is the operator's call per run. `LLMM_FP8_STATIC_SCALES` is the
+# existing precedent for an opt-in trade of this shape.
+#
+# What it changes: with the flag off, the LM head writes all V_p columns of
+# `acts.logits` and `fused_classifier` overwrites them in place with dlogits
+# (6.1 GiB at B=32, T=1024, fp32). With it on, `acts.logits` shrinks to ONE
+# vocab tile, `(B*T, tile_rows)`, forward folds each tile into a running per-row
+# (max, sum-exp) — the online-softmax recurrence, see llmm/fused_classifier.mojo
+# — and backward recomputes each tile and converts it to dlogits in place before
+# folding it into that tile's d_weight/d_input GEMMs.
+#
+# Requires more than one vocab tile to do anything; at K=1 it is a no-op.
+comptime LM_HEAD_CHUNKED_CE = (
+    get_defined_int["LLMM_LM_HEAD_CHUNKED_CE", 0]() != 0
+)
 
 # -D LLMM_Z3_WTE_ONDEMAND=1: under ZeRO-3, stop keeping the whole `wte` resident
 # in the per-step embedding gather window and instead gather each LM-head vocab
@@ -1311,6 +1340,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # while its forward/backward GEMM runs, instead of keeping all V_p rows in
     # `embed_window_buf` for the whole step.
     var wte_tile_buf: DeviceBuffer[GPT2_DTYPE]
+    # Chunked cross-entropy carry (LM_HEAD_CHUNKED_CE only; a 1-element stub
+    # otherwise). Three fp32 vectors of B*T laid out back to back: the running
+    # per-row softmax max, the running sum-exp, and the target column's logit.
+    # This 3*B*T*4 B = 384 KiB at B=32,T=1024 is the ENTIRE state that has to
+    # survive from forward to backward in place of a 6.1 GiB logits buffer.
+    var ce_stats_buf: DeviceBuffer[DType.float32]
 
     def __init__(
         out self,
@@ -1397,6 +1432,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.param_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.embed_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.wte_tile_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.ce_stats_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.params_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grads_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grad_pool_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
@@ -2241,6 +2277,46 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     def _lm_head_num_tiles(self) -> Int:
         return ceildiv(self.config.padded_vocab_size, self._lm_head_tile_rows())
 
+    def _chunked_ce(self) -> Bool:
+        """Whether this step runs the chunked (two-pass) cross-entropy.
+
+        `LLMM_LM_HEAD_CHUNKED_CE` asks for it; more than one vocab tile is what
+        makes it mean anything. At K=1 the "chunk" would be the whole
+        vocabulary, so the flag degrades to the stock single-pass classifier
+        rather than paying the recompute for nothing."""
+        comptime if LM_HEAD_CHUNKED_CE:
+            return self._lm_head_num_tiles() > 1
+        else:
+            return False
+
+    def _ce_stats_ptr(mut self) -> MutMemPtr[DType.float32]:
+        """Base of the chunked cross-entropy carry: `[m | s | x_target]`, each
+        B*T floats long."""
+        return rebind_mut_mem[DType.float32](
+            self.ce_stats_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+
+    def _logits_elems(self, batch_size: Int, seq_len: Int) -> Int:
+        """Elements to allocate for `acts.logits`.
+
+        Unchunked this is the full `(B*T, V_p)` matrix. Chunked it is one vocab
+        tile, `(B*T, tile_rows)` — EXCEPT that the no-targets forward (the
+        generation/inference path: `train_gpt2 -g`, `infer_gpt2`) still writes
+        and reads all V_p columns of a row, because its callers index
+        `acts.logits + row*V_p`. Those calls run at B=1 with T <= max_seq_len,
+        so reserving `min(B*T, max_seq_len) * V_p` covers every one of them.
+        That reserve is independent of the training batch size — 206 MiB at
+        GPT-2 124M — which is why chunking still pays at B=32 (6.1 GiB down to
+        the larger of one tile and the reserve) and pays nothing at all when
+        B*T <= max_seq_len."""
+        var v_p = self.config.padded_vocab_size
+        var rows = batch_size * seq_len
+        if not self._chunked_ce():
+            return rows * v_p
+        var tile = rows * self._lm_head_tile_rows()
+        var infer_reserve = min(rows, self.config.max_seq_len) * v_p
+        return max(tile, infer_reserve)
+
     def _per_layer_pool_elems(self) -> Int:
         """Total element count of one transformer layer's 12 weight-gradient
         tensors (their per-layer strides summed) — the pool footprint of the
@@ -2481,7 +2557,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.act_sizes[Activations.ln_f] = B * T * C
         self.act_sizes[Activations.ln_f_mean] = B * T
         self.act_sizes[Activations.ln_f_rstd] = B * T
-        self.act_sizes[Activations.logits] = B * T * V_p
+        self.act_sizes[Activations.logits] = self._logits_elems(B, T)
         self.act_sizes[Activations.losses] = B * T
         self.act_sizes[Activations.q] = L * B * T * C
         self.act_sizes[Activations.k] = L * B * T * C
@@ -2560,6 +2636,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.grad_acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](
             stats_size
         )
+        if self._chunked_ce():
+            self.ce_stats_buf = self.ctx.enqueue_create_buffer[DType.float32](
+                3 * B * T
+            )
+            self.ctx.enqueue_memset(self.ce_stats_buf, Float32(0))
 
         self.inputs_buf = self.ctx.enqueue_create_host_buffer[DType.int32](
             self.batch_size * self.seq_len
@@ -3230,7 +3311,73 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # range. The reduction axis is `channels`, which tiling does not split,
         # so the logits are bit-identical to the untiled GEMM.
         var lm_tile_rows = self._lm_head_tile_rows()
-        if self._lm_head_num_tiles() == 1:
+        # Chunked cross-entropy takes over the whole LM head + classifier when
+        # there are targets. Without targets there is no loss to compute and the
+        # caller wants raw logits for every column, so the stock path runs.
+        var chunked_ce = self._chunked_ce() and targets != NULL_INT32_PTR
+        if self._chunked_ce() and targets == NULL_INT32_PTR:
+            # Generation/inference under chunking: the full-width write below
+            # needs the inference reserve `_logits_elems` set aside. Anything
+            # that outgrows it is a bug in that sizing, not a silent overrun.
+            if (
+                batch_size * seq_len * vocab_size_padded
+                > self.act_sizes[Activations.logits]
+            ):
+                raise Error(
+                    "GPT2 error: chunked cross-entropy is on and this"
+                    " no-targets forward needs more logits room than the"
+                    " inference reserve holds"
+                )
+        if chunked_ce:
+            # Two-pass online softmax over vocab tiles. `acts.logits` is now a
+            # single PACKED [B*T, oc] tile, reused by every tile — the full
+            # (B*T, V_p) matrix is never formed. Pass 1 accumulates the running
+            # per-row (max, sum-exp) and the target logit; the loss epilogue and
+            # pass 2 (in backward()) consume those.
+            var rows = batch_size * seq_len
+            var m_ptr = self._ce_stats_ptr()
+            var s_ptr = m_ptr + rows
+            var xt_ptr = m_ptr + 2 * rows
+            var t0 = 0
+            var first = True
+            while t0 < vocab_size_padded:
+                var oc = min(lm_tile_rows, vocab_size_padded - t0)
+                var w_tile = self._lm_head_wte_tile(t0, oc)
+                matmul_lm_head_fwd_tile[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+                    oc,  # packed: the tile IS the buffer
+                    as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.ln_f),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](w_tile),
+                    rows,
+                    channels,
+                    oc,
+                    self.ctx,
+                )
+                # No sync between the GEMM and the reduction: cuBLASLt is bound
+                # to `ctx.stream()` (see `_matmul_cublaslt`) and enqueued
+                # kernels run on that same stream, so the ordering is the
+                # stream's. The one sync this path needs is the shared
+                # `not HAS_METAL` sync after the branch, which guards the
+                # device->host loss copy.
+                chunked_ce_pass1[GPT2_DTYPE, Self.target](
+                    as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.logits),
+                    as_mut_kernel[DType.float32](m_ptr),
+                    as_mut_kernel[DType.float32](s_ptr),
+                    as_mut_kernel[DType.float32](xt_ptr),
+                    as_immut_kernel_from_mut[DType.int32](cls_targets),
+                    rows,
+                    oc,
+                    t0,
+                    # Live vocabulary columns in this tile: everything at or
+                    # past V is the [V, V_p) padding and must not enter the
+                    # softmax reduction.
+                    max(min(oc, vocab_size - t0), 0),
+                    first,
+                    self.ctx,
+                )
+                first = False
+                t0 += lm_tile_rows
+        elif self._lm_head_num_tiles() == 1:
             matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
                 as_mut_kernel[GPT2_DTYPE](self.acts.logits),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
@@ -3283,17 +3430,35 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 ](self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()),
                 size=batch_size * seq_len,
             )
-            fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=True](
-                as_mut_kernel[GPT2_DTYPE](self.acts.logits),
-                as_mut_kernel[StatsDType](self.acts.losses),
-                as_immut_kernel_from_mut[DType.float32](self.grad_acts.losses),
-                as_immut_kernel_from_mut[DType.int32](cls_targets),
-                Int64(batch_size),
-                Int64(seq_len),
-                Int64(vocab_size),
-                Int64(vocab_size_padded),
-                self.ctx,
-            )
+            if chunked_ce:
+                # The tiles already went past in pass 1; all that is left is
+                # the log-softmax epilogue on the finished (max, sum-exp).
+                # dlogits are NOT written here — backward's pass 2 recomputes
+                # each tile and produces them one tile at a time.
+                var rows = batch_size * seq_len
+                var m_ptr = self._ce_stats_ptr()
+                chunked_ce_loss[Self.target](
+                    as_mut_kernel[StatsDType](self.acts.losses),
+                    as_immut_kernel_from_mut[DType.float32](m_ptr),
+                    as_immut_kernel_from_mut[DType.float32](m_ptr + rows),
+                    as_immut_kernel_from_mut[DType.float32](m_ptr + 2 * rows),
+                    rows,
+                    self.ctx,
+                )
+            else:
+                fused_classifier[GPT2_DTYPE, Self.target, write_d_logits=True](
+                    as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+                    as_mut_kernel[StatsDType](self.acts.losses),
+                    as_immut_kernel_from_mut[DType.float32](
+                        self.grad_acts.losses
+                    ),
+                    as_immut_kernel_from_mut[DType.int32](cls_targets),
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(vocab_size),
+                    Int64(vocab_size_padded),
+                    self.ctx,
+                )
 
             # Non-Metal: ensure fused_classifier completes before the
             # device→host copy that follows (no in-order guarantee on CUDA).
@@ -3501,7 +3666,92 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # contributions accumulate onto the shard separately so it need not stay
         # resident across the layer loop.
         var lm_tile_rows = self._lm_head_tile_rows()
-        if self._lm_head_num_tiles() == 1:
+        if self._chunked_ce():
+            # Chunked cross-entropy, pass 2. forward() left only the per-row
+            # (max, sum-exp) behind, so each tile's logits are RECOMPUTED here
+            # (one extra LM-head forward GEMM per step in total), turned into
+            # that tile's dlogits in place, and consumed immediately by the same
+            # tile's d_weight/d_input GEMMs.
+            #
+            # A tile's dlogits are transient, so their producer and consumer had
+            # to fuse — but only with each other, and both live here. forward()
+            # and backward() stay the two separable calls they always were,
+            # because the ONLY thing this pass needs from pass 1 is the per-row
+            # (max, sum-exp) pair, not the logits. Recomputing is legal because
+            # both GEMM inputs — acts.ln_f and params.wte — are unchanged since
+            # forward (parameters do not move until update()).
+            var rows = batch_size * seq_len
+            var m_ptr = self._ce_stats_ptr()
+            var s_ptr = m_ptr + rows
+            var cls_targets = self.targets
+            comptime if is_gpu[Self.target]():
+                cls_targets = self.targets_dev
+            var t0 = 0
+            var first = True
+            while t0 < vocab_size_padded:
+                var oc = min(lm_tile_rows, vocab_size_padded - t0)
+                if bucketing:
+                    self.grads.wte = pool  # pool[0 : oc*C], recycled per tile
+                    self._zero_grad_pool(oc * channels)
+                var dw = pool if bucketing else (self.grads.wte + t0 * channels)
+                var w_tile = self._lm_head_wte_tile(t0, oc)
+
+                # Recompute this tile's logits into the packed scratch. The
+                # inputs (`ln_f`, `wte`) have not changed since forward, so this
+                # reproduces pass 1's values exactly.
+                matmul_lm_head_fwd_tile[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+                    oc,
+                    as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.ln_f),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](w_tile),
+                    rows,
+                    channels,
+                    oc,
+                    self.ctx,
+                )
+                # Same stream-ordering argument as the forward pass: the
+                # recompute GEMM, this conversion, and the backward GEMMs below
+                # are all on `ctx.stream()`, in that order.
+                chunked_ce_pass2[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](self.acts.logits),
+                    as_immut_kernel_from_mut[DType.float32](m_ptr),
+                    as_immut_kernel_from_mut[DType.float32](s_ptr),
+                    as_immut_kernel_from_mut[DType.float32](
+                        self.grad_acts.losses
+                    ),
+                    as_immut_kernel_from_mut[DType.int32](cls_targets),
+                    rows,
+                    oc,
+                    t0,
+                    max(min(oc, vocab_size - t0), 0),
+                    self.ctx,
+                )
+
+                matmul_lm_head_bwd_tile[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
+                    as_mut_kernel[GPT2_DTYPE](dw),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.logits),
+                    oc,  # packed
+                    as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.ln_f),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](w_tile),
+                    as_mut_kernel[GPT2_DTYPE](self.grad_acts.logits),
+                    rows,
+                    channels,
+                    oc,
+                    not first,  # accumulate d_ln_f after the first tile
+                    self.ctx,
+                )
+                if bucketing:
+                    var d = List[Int]()
+                    d.append(flat_base[Parameters.wte] + t0 * channels)
+                    var po = List[Int]()
+                    po.append(0)
+                    var ln = List[Int]()
+                    ln.append(oc * channels)
+                    self._reduce_grad_bucket(d, po, ln)
+                first = False
+                t0 += lm_tile_rows
+        elif self._lm_head_num_tiles() == 1:
             if bucketing:
                 self.grads.wte = pool  # pool[0 : wte_size]
                 self._zero_grad_pool(wte_size)
@@ -5133,6 +5383,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var b_acts_stats = _mem_bytes(self.acts_stats_buf)
         var b_grad_acts = _mem_bytes(self.grad_acts_buf)
         var b_grad_acts_stats = _mem_bytes(self.grad_acts_stats_buf)
+        var b_ce_stats = _mem_bytes(self.ce_stats_buf)
         var b_inputs_dev = _mem_bytes(self.inputs_dev_buf)
         var b_targets_dev = _mem_bytes(self.targets_dev_buf)
         var b_bucket_info_dev = _mem_bytes(self.bucket_info_dev_buf)
@@ -5145,7 +5396,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var c_optimizer = b_m + b_v + b_master
         var c_z3_windows = b_param_window + b_embed_window
         var c_activations = (
-            b_acts + b_acts_stats + b_grad_acts + b_grad_acts_stats
+            b_acts + b_acts_stats + b_grad_acts + b_grad_acts_stats + b_ce_stats
         )
         var c_index = (
             b_inputs_dev + b_targets_dev + b_bucket_info_dev + b_workload_dev
@@ -5216,6 +5467,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         s += "," + _mem_kv("acts_stats_buf", b_acts_stats)
         s += "," + _mem_kv("grad_acts_buf", b_grad_acts)
         s += "," + _mem_kv("grad_acts_stats_buf", b_grad_acts_stats)
+        s += "," + _mem_kv("ce_stats_buf", b_ce_stats)
         s += "," + _mem_kv("inputs_dev_buf", b_inputs_dev)
         s += "," + _mem_kv("targets_dev_buf", b_targets_dev)
         s += "," + _mem_kv("bucket_info_dev_buf", b_bucket_info_dev)
@@ -5241,6 +5493,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         _mem_mark(inactive, self.acts_stats_buf, "acts_stats_buf")
         _mem_mark(inactive, self.grad_acts_buf, "grad_acts_buf")
         _mem_mark(inactive, self.grad_acts_stats_buf, "grad_acts_stats_buf")
+        _mem_mark(inactive, self.ce_stats_buf, "ce_stats_buf")
         _mem_mark(inactive, self.inputs_dev_buf, "inputs_dev_buf")
         _mem_mark(inactive, self.targets_dev_buf, "targets_dev_buf")
         _mem_mark(inactive, self.bucket_info_dev_buf, "bucket_info_dev_buf")
