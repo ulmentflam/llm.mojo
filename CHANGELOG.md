@@ -26,6 +26,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **bf16 bias gradients were silently always zero (scratch overrun in the fused
+  dbias kernel).** `matmul_bias_bwd` sized its row-block count from
+  `simd_width_of[dtype]()`, which resolves against the **host** target — 32 for
+  bf16 on an AVX-512 box, not the 8 every nearby comment assumed. That made
+  `FUSED_ROW_BLOCKS` 512 instead of 128, so `_dbias_fused_gpu` stored up to
+  1,572,864 fp32 partials into a `DBIAS_SCRATCH` capped at 1,048,576. The
+  overrun landed on `DBIAS_COUNTERS`, which begins at exactly `scratch_end + 0`
+  bytes, corrupting the arrival counters so no block ever satisfied
+  `arrived == row_blocks - 1` and `d_bias` was never written — no error, no
+  NaN. In a real bf16 `train_gpt2` run at `-b 4 -t 1024`, all four bias
+  gradients were identically zero on every step; fp32 was unaffected (width 16
+  fits), and the `B=4, T=64` reference batch masked it because the
+  out-of-bounds stores were all zeros at that row count. Fixed by deriving
+  `DBIAS_SCRATCH_CAP` from the quantities that actually size the launch and
+  refusing to launch if the requirement exceeds it; the arrival test is now a
+  residue rather than an equality (exactly one block finalizes regardless of
+  the counter's starting value), the counter self-reset moved above the
+  `col >= out_channels` early-return so no exit path can skip it, and a missing
+  `barrier()` between the scratch stores and the arrival signal was added.
+  `tests/test_matmul_bwd_fp4.mojo` compared its two arms only for bit-identity,
+  so it passed by comparing `0 == 0`; it now reduces `d_output` on the host and
+  requires `d_bias` to be non-zero and to match. Full evidence:
+  docs/ai/dbias_scratch_overrun_silent_zero_bug.md.
+
 - **CPU pytest suite segfaults root-caused to an upstream MAX runtime bug.**
   On Linux, a MAX custom-op execute on CPU calls a NULL function pointer on
   every runtime worker thread whenever another MAX/AsyncRT process (a trainer)
