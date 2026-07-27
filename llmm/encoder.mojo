@@ -629,6 +629,8 @@ def wte_backward_cpu[
     num_buckets: Int,
     channels: Int,
 ) raises -> None:
+    if num_buckets <= 0:
+        return
     var max_workers = parallelism_level()
     var buckets_per_worker = ceildiv(num_buckets, max_workers)
     var num_workers = ceildiv(num_buckets, buckets_per_worker)
@@ -994,14 +996,22 @@ def encoder_bwd[
     # times. Chunk 0 takes it; the rest skip it.
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
-        wte_backward_cpu[dtype, width](
-            dwte_ptr,
-            bucket_info_ptr,
-            workload_indices_ptr,
-            dout_ptr,
-            num_buckets,
-            channels,
-        )
+        # An empty bucket list is normal, not degenerate: the row-sparse
+        # backward walks the UNION of every rank's rows, so a rank whose batch
+        # contributed nothing to this chunk legitimately has zero buckets and
+        # must still reach the collective with a zeroed pool. Guard it here the
+        # way the GPU path below already does — `wte_backward_cpu` divides by a
+        # worker count derived from `num_buckets`, so falling through with zero
+        # divides by zero.
+        if num_buckets > 0:
+            wte_backward_cpu[dtype, width](
+                dwte_ptr,
+                bucket_info_ptr,
+                workload_indices_ptr,
+                dout_ptr,
+                num_buckets,
+                channels,
+            )
         if include_wpe:
             wpe_backward_cpu[dtype, width](
                 dwpe_ptr,

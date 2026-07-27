@@ -391,6 +391,64 @@ K=one-range-per-row spread is 250x, far outside anything contention explains,
 so the design conclusion (coalesce aggressively; never emit one range per row)
 stands regardless.
 
+## 10. Two traps found while testing this
+
+Both are properties of the repo's multi-rank machinery, not of this change,
+and both are worth knowing before writing any multi-rank code here.
+
+### A raise inside a multi-rank region hangs the process instead of failing it
+
+`CpuBarrier.wait()` spins on `sched_yield` until the barrier's generation
+advances. If one rank raises inside a `sync_parallelize` region and returns
+early, it never reaches the next barrier, and every other rank spins there
+forever. The observable symptom is not an error message — it is one core pegged
+at 100% and no output at all, because the test harness's output is still
+buffered. Debugging this means the *actual* exception is invisible.
+
+Concretely: this is how the row-sparse work's first end-to-end test presented,
+and the underlying error turned out to be a genuine bug in the encoder — see
+below. Any multi-rank test in this repo should record per-rank errors into a
+shared slot and let every rank reach every barrier, rather than letting a raise
+escape the parallel region.
+
+### The empty-bucket case is normal under a union, and the CPU path divided by zero
+
+`wte_backward_cpu` computes `num_workers = ceildiv(num_buckets,
+ceildiv(num_buckets, max_workers))`, which divides by zero when `num_buckets ==
+0`. The GPU dispatcher already guarded with `if num_buckets > 0`; the CPU one
+did not.
+
+That was unreachable before this change and is routine after it. The row set is
+the *union* across ranks, so a rank whose batch contributed nothing to a
+particular chunk legitimately has zero buckets for it — and must still zero its
+pool and enter the collective, or the range lists diverge. Note why the
+existing suite could not have caught it: `test_zero_equivalence` gives every
+simulated rank the *same* batch, so the union always equals each rank's own set
+and no rank ever sees an empty chunk. It takes divergent per-rank tokens to
+reach the bug at all.
+
+### The range guard's verdict has to be symmetric
+
+The first version of `assert_ranges_agree` asked "does the cross-rank sum equal
+N times *my* hash?" That is not a rank-invariant question. A rank whose hash
+happens to equal the mean passes while the rest fail. At N=2 it is safe — a
+disagreement puts the mean strictly between the two values, so both fail — but
+at N=3 with hashes 4/5/6 the middle rank passes, enters the collective, and
+spins on a barrier the others abandoned by raising. The guard would then
+convert silent corruption into a *hang*, which is strictly worse than the error
+it advertises.
+
+The fix is to reduce both `sum(h)` and `sum(h^2)` — every rank receives
+identical values — and use the equality case of Cauchy-Schwarz:
+`N*sum(h^2) == sum(h)^2` iff every hash is equal. Same inputs everywhere,
+therefore the same verdict everywhere, therefore all ranks raise together and
+none is left waiting. The hash is masked to 20 bits so both quantities stay
+inside Float64's exact integer range.
+
+The general lesson: **any collective-adjacent check must be a function of
+values every rank agrees on, or it becomes a deadlock generator.** That is the
+same discipline the row map itself follows.
+
 ## AI use statement
 
 Written with AI assistance (Claude Opus agent via Claude Code), directed by

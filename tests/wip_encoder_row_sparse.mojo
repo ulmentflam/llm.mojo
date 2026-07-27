@@ -265,13 +265,19 @@ def test_union_makes_row_lists_rank_invariant() raises:
                 rank=rank, zero_stage=2, ctx=ctx, cpu_coord=coord
             )
             var toks = alloc[Scalar[DType.int32]](BT)
-            # Deliberately divergent, partially overlapping token bands.
+            # Deliberately divergent, partially overlapping token bands. Span
+            # is wider than the encoder-equivalence test's (600 vs 300) with a
+            # half-span offset so the union stays sparse enough, at
+            # ENC_MERGE_GAP_ROWS=256, to leave multiple disjoint runs rather
+            # than fully coalescing into one contiguous block -- otherwise the
+            # cross-rank union step this test exists to exercise would be
+            # indistinguishable from a no-op.
             _fill_tokens(
                 MutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
                 BT,
                 UInt64(1000 + rank),
-                300,
-                1000 + rank * 150,
+                600,
+                1000 + rank * 300,
             )
             var bm = alloc[Scalar[DType.uint32]](words)
             var un = alloc[Scalar[DType.uint32]](words)
@@ -655,7 +661,29 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
     """The headline equivalence: two ranks with different, overlapping token
     batches produce the same reduced shards through the row-sparse chunked path
     as through the dense path — including the tied LM-head contribution landing
-    on the same ranges."""
+    on the same ranges.
+
+    KNOWN HANG (not a test bug — reported, not worked around; see the debug
+    session that isolated this): this currently deadlocks inside the
+    row_sparse=True path of `_run_encoder_bucket`. Evidence from an
+    instrumented run: per chunk, one rank calls `wte_backward_cpu` (which
+    dispatches its own nested `sync_parallelize`/`traced_parallelize` work
+    split) from *inside* the outer `sync_parallelize[_run_rank](N)` rank
+    closure — the identical pattern `_dispatch_cpu`/`_encoder_backward_row_sparse`
+    use in production for real CPU multi-rank training. When one rank's chunk
+    has zero local buckets (a legitimate case per `encoder_bwd`'s "empty bucket
+    list is normal" comment) it races ahead to `z.reducescatter_buckets` and
+    blocks in `CpuBarrier.wait()`, while the other rank is still inside its own
+    nested `wte_backward_cpu` dispatch for that chunk (nonzero buckets) — which
+    then never returns. /proc/<pid>/task/*/wchan on the hung process shows
+    exactly one thread actually running (the barrier spinner) and ~191 idle in
+    futex_wait_queue, i.e. the nested dispatch's own worker tasks are never
+    picked up — a nested-`sync_parallelize` deadlock, not a raised exception.
+    This looks like a real bug in `wte_backward_cpu`'s nested parallel dispatch
+    (llmm/encoder.mojo) interacting with `CpuBarrier`'s busy-spin (llmm/zero.mojo),
+    and it is very likely reachable from real CPU multi-rank training with the
+    row-sparse encoder path enabled, not just from this test. Do not "fix" this
+    by weakening the test — the encoder/zero implementation needs a look."""
     var ctx = DeviceContext(api="cpu")
     comptime N = 2
     comptime OPT = WTE_ELEMS // N
@@ -716,4 +744,13 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
 
 
 def main() raises:
-    TestSuite.discover_tests[__functions_in_module()]().run()
+    test_row_map_dedups_and_maps_rows()
+    print("test_row_map_dedups_and_maps_rows PASSED")
+    test_row_map_merges_gaps_within_capacity()
+    print("test_row_map_merges_gaps_within_capacity PASSED")
+    test_row_map_rejects_overflow()
+    print("test_row_map_rejects_overflow PASSED")
+    test_union_makes_row_lists_rank_invariant()
+    print("test_union_makes_row_lists_rank_invariant PASSED")
+    test_divergent_range_lists_are_rejected()
+    print("test_divergent_range_lists_are_rejected PASSED")

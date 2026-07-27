@@ -372,19 +372,36 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         N x my own hash — which holds iff every rank hashed the same lists.
         Two host barriers, no device work.
 
-        The hash is kept to 40 bits so that N (<= 8) copies of it sum exactly
-        in a Float64, making the comparison exact rather than approximate.
+        The verdict MUST be identical on every rank. The obvious test —
+        "does the sum equal N times MY hash?" — is not: a rank whose hash
+        happens to equal the mean passes while the others fail. At N=2 that
+        cannot happen (a disagreement puts the mean strictly between the two,
+        so both fail), but at N=3 with hashes 4/5/6 the middle rank passes,
+        walks into the collective, and spins on a barrier its peers already
+        abandoned by raising. That would turn silent corruption into a hang,
+        which is worse than the error it promises.
+
+        So the check is made symmetric: reduce both sum(h) and sum(h^2), which
+        every rank receives identically, and use the equality case of
+        Cauchy-Schwarz — N*sum(h^2) == sum(h)^2 iff every h is equal. Same
+        inputs on every rank, therefore same verdict, therefore all ranks raise
+        together and none is left waiting.
+
+        The hash is kept to 20 bits so that both h^2 summed over N (<= 8) and
+        sum(h)^2 stay well inside Float64's 53-bit exact integer range, making
+        the comparison exact rather than approximate.
         """
         if Self.N == 1 or not self.cpu_coordinator_ptr:
             return
         var h = UInt64(len(lengths))
         for i in range(len(lengths)):
-            h = (h * 1000003 + UInt64(dest_starts[i])) & 0xFFFFFFFFFF
-            h = (h * 1000003 + UInt64(pool_offsets[i])) & 0xFFFFFFFFFF
-            h = (h * 1000003 + UInt64(lengths[i])) & 0xFFFFFFFFFF
+            h = (h * 1000003 + UInt64(dest_starts[i])) & 0xFFFFF
+            h = (h * 1000003 + UInt64(pool_offsets[i])) & 0xFFFFF
+            h = (h * 1000003 + UInt64(lengths[i])) & 0xFFFFF
         var mine = Float64(h)
-        var total = self.allreduce_scalar(mine)
-        if total != mine * Float64(Self.N):
+        var sum_h = self.allreduce_scalar(mine)
+        var sum_h2 = self.allreduce_scalar(mine * mine)
+        if Float64(Self.N) * sum_h2 != sum_h * sum_h:
             raise Error(
                 String(
                     "ZeroContext.",
