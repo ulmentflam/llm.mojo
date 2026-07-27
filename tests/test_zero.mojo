@@ -769,9 +769,10 @@ def test_multi_sharded_parameter_gather_cpu() raises:
 # suite still reports 13/13 PASS while the collectives went completely
 # untested. A silent skip therefore manufactures a false green: on a 1-GPU
 # box a fully green test_zero.mojo proves nothing about ZeRO's cross-rank
-# paths. Printing the reason is what keeps "green" and "meaningful" from
-# drifting apart — the skip stays a skip (single-GPU boxes are legitimate),
-# but it can no longer be mistaken for coverage.
+# paths. The skip stays a skip (single-GPU boxes are legitimate), but it can
+# no longer be mistaken for coverage: main() marks the test SKIPPED through
+# `TestSuite.skip`, so the summary line reports it as skipped instead of
+# passed, and this banner names the reason for anyone reading full output.
 def _gpu_multirank_available() raises -> Bool:
     if not has_nvidia_gpu_accelerator():
         print(
@@ -1118,4 +1119,30 @@ def test_multi_cpu_allgather_ranges() raises:
 
 
 def main() raises:
-    TestSuite.discover_tests[__functions_in_module()]().run()
+    # Probe BEFORE building the suite: `_gpu_multirank_available` can raise,
+    # and a TestSuite must be consumed by `run()` on every path, so it must
+    # not be live across a raising call.
+    var multirank_ok = _gpu_multirank_available()
+
+    var suite = TestSuite.discover_tests[__functions_in_module()]()
+
+    # Mark the GPU-collectives test SKIPPED, rather than letting it return
+    # early and be counted as a pass.
+    #
+    # Printing a banner (as this file did previously) helps a human reading the
+    # full output and does nothing for the far more common case: someone
+    # reading the last line, or a script scraping it. That line used to say
+    # `13 tests run: 13 passed , 0 failed , 0 skipped` on a one-GPU box -- and
+    # `0 skipped` was simply false. This is the only test in the repo that
+    # drives real GPU allreduce / reducescatter / allgather /
+    # reducescatter_buckets, so a green summary there meant "ZeRO's cross-rank
+    # paths were never touched", which is exactly the false green the banner
+    # was meant to kill.
+    #
+    # `TestSuite.skip[f]()` takes the test function as a compile-time parameter
+    # and must be called on the suite instance before `run()`, so the decision
+    # has to live here in main() rather than inside the test body.
+    if not multirank_ok:
+        suite.skip[test_multi_gpu_collectives]()
+
+    suite^.run()

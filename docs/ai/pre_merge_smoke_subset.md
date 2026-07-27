@@ -98,22 +98,34 @@ tell-tale, if you look for it, is the per-test timing: it reports
 runs across 7 GPUs. Nothing in the summary line distinguished those. It now
 prints an explicit `SKIP ... GPU collectives NOT exercised`.
 
-**That fix is a banner, not a status change — keep reading the timing.** Verified
-on `bc19072` (which includes `df6b7bf`) with 1 GPU visible: the loud SKIP line
-does print, but the test still registers as a pass and the tally is still clean.
+That banner alone was not enough, and the gap is worth recording. It printed
+while the test still counted as a pass, so the summary line — the part most
+people actually read, and the only part a script scrapes — still said
+`13 tests run: 13 passed , 0 failed , 0 skipped`. `0 skipped` was false, and a
+truncated log tail gave you exactly the false green the banner was meant to
+kill.
+
+**The summary now tells the truth**, because `main()` marks the test skipped
+through the framework instead of letting it return early:
 
 ```
 SKIP tests/test_zero.mojo::test_multi_gpu_collectives: requires >=2 GPUs, found 1 - GPU collectives NOT exercised
-    PASS [ 0.036 ] test_multi_gpu_collectives
-Summary [ 714.635 ] 13 tests run: 13 passed , 0 failed , 0 skipped
+    SKIP [ 0.001 ] test_multi_gpu_collectives
+Summary [ 900.813 ] 13 tests run: 12 passed , 0 failed , 1 skipped
 ```
 
-`13 passed, 0 failed, 0 skipped` is still what a summary-only reader sees, and
-`0 skipped` is still false. Anyone scraping the summary line, or reading a
-truncated log tail, gets the same false green as before. **The reliable tell
-remains the bracket: ~300-400 (ms) means the collectives ran, ~0.03 means they
-did not.** **If you are changing anything that touches cross-rank behaviour, you
-need ≥2 GPUs; ask the coordinator for a window.**
+Two things to know if you touch this. `TestSuite.skip[f]()` takes the test
+function as a **compile-time parameter** and must be called on the suite
+instance before `run()`, so the decision lives in `main()`, not in the test
+body. And the availability probe must happen *before* the suite is
+constructed: it can raise, a `TestSuite` must be consumed by `run()` on every
+path, and a raising call with the suite live fails to compile with
+`'suite' abandoned without being explicitly destroyed`.
+
+The bracket timing remains a useful cross-check (~300-400 ms means the
+collectives really ran, ~0.03 means they did not), but it is no longer the
+*only* signal. **If you are changing anything that touches cross-rank
+behaviour, you need ≥2 GPUs; ask the coordinator for a window.**
 
 **2. Nothing tests the LM head at vocabulary scale.** The LM head is a single
 dense matmul with `output_channels = vocab_size_padded` (50304), called from
@@ -196,6 +208,11 @@ the second blocking exactly 9s behind a 12s holder.
 targeted runs** — `make smoke`, a single test file, a GEMM sweep. A lock that is
 inconvenient is a lock nobody takes.
 
+**`make -n gate` is not a safe dry run.** GNU make executes recipe lines
+containing `$(MAKE)` even under `-n`, so that command really launches the gate
+script and really blocks on the lock. Use `scripts/llm-mojo-gate.sh status` to
+inspect the lock instead.
+
 **The one non-obvious property, which you must not "simplify" away.** `flock`
 holds the lock on an open file descriptor, and **child processes inherit that
 descriptor**. Killing the runner therefore does *not* free the lock while any
@@ -236,6 +253,24 @@ Check the magic before trusting a green board:
 ```
 od -An -tu4 -N4 gpt2_124M_debug_state.bin     # want 20240520, not 20240327
 ```
+
+Once the reference is in place the whole battery passes — measured on the
+merged LM-head work at the shipped default `LLMM_LM_HEAD_VOCAB_TILES=8`:
+`verify-gpu` 39s, `verify-gpu-tf32` 35s, `verify-cpu` 40s, all exit 0, 16 of 16
+gradient tensors `TENSOR OK` on both GPU paths.
+
+**The 10-step loss trajectory is generated, not hand-maintained.** Regenerate
+it with `pixi run python scripts/gen_expected_losses.py`, never by pasting this
+trainer's own output — that would compare the implementation against itself and
+produce a check that can never fail. The generator asserts that its step 0
+reproduces the loss stored in the debug state exactly, and refuses to emit a
+list otherwise. This is not hypothetical: the previous list came from a script
+at a `/Users/...` path that was never in this repo, claimed step 0 was 5.354
+when the reference file said 5.2678394, and consequently made `make verify-gpu`
+exit 1 on *every* commit for everyone. A gate that fails for a bogus reason is
+at least as harmful as one that passes without testing anything — a permanently
+red gate teaches people to ignore it, and then it cannot warn them when
+something real breaks.
 
 Two practical notes. Cold runs are dominated by Mojo compilation, not by the
 tests: `test_zero.mojo` runs in ~3s warm but was still compiling after 128s from
