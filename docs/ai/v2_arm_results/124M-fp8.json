@@ -1,0 +1,20 @@
+{
+  "arm": "124M-fp8",
+  "scale": "124M",
+  "precision": "fp8",
+  "run_dir": "/data/llm.mojo/runs/v2/log124M_fineweb_fp8_v2",
+  "hf_repo": "ulmentflam/gpt2-124m-fineweb-fp8-mojo",
+  "final_step": 22345,
+  "total_steps": 22345,
+  "final_train_loss": 3.329021,
+  "final_val_loss": 3.2982988,
+  "hellaswag_k": 3000,
+  "hellaswag_n": 10042,
+  "hellaswag_acc": 0.29874526986656047,
+  "hellaswag_ci95": [
+    0.28987131711381897,
+    0.30777314504851505
+  ],
+  "median_ms_per_step": 830.66,
+  "median_tok_per_s": 551020
+}
