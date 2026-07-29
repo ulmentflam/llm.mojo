@@ -1,0 +1,20 @@
+{
+  "arm": "124M-nvfp4",
+  "scale": "124M",
+  "precision": "nvfp4",
+  "run_dir": "/data/llm.mojo/runs/v2/log124M_fineweb_nvfp4_v2",
+  "hf_repo": "ulmentflam/gpt2-124m-fineweb-nvfp4-mojo",
+  "final_step": 22345,
+  "total_steps": 22345,
+  "final_train_loss": 3.344524,
+  "final_val_loss": 3.3135452,
+  "hellaswag_k": 2982,
+  "hellaswag_n": 10042,
+  "hellaswag_acc": 0.2969527982473611,
+  "hellaswag_ci95": [
+    0.28809501898369266,
+    0.3059658708475785
+  ],
+  "median_ms_per_step": 706.72,
+  "median_tok_per_s": 649137
+}
