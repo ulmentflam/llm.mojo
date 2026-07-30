@@ -614,6 +614,22 @@ calibrate-fp8-scales: $(CALIBRATE_BIN_FP8)
 # Override on the command line, e.g. `make eval CHECKPOINT=log124M/model_5000.bin`.
 CHECKPOINT ?= log124M/model_19552.bin
 EVAL_BIN := data/.hellaswag/hellaswag_val.bin
+
+# EVAL_B DOES NOT SCALE. The default suits GPT-2 124M; a d36/C=1280 774M
+# checkpoint at EVAL_B=64 asks for ~87.6 GB of activations and dies with
+# CUDA_ERROR_OUT_OF_MEMORY on a 96 GB card. EVAL_B=16 also fails. Measured
+# working value for 774M on this box: **EVAL_B=4** (scored 3741/10042).
+#
+#   make eval CHECKPOINT=<774M ckpt> EVAL_B=4
+#
+# Batch size does not change the score -- HellaSwag accuracy is per-example
+# and deterministic -- so the only cost of a smaller batch is wall clock.
+# Keep it a multiple of 4: the loader packs the 4 candidate completions of
+# each example into the batch.
+#
+# The ceiling is lower than pure inference implies because the inference path
+# still allocates activation GRADIENTS it never uses (1.7e9 elements even at
+# EVAL_B=4). Worth removing; until then, size EVAL_B against that.
 EVAL_B ?= 64
 EVAL_T ?= 512
 
