@@ -73,6 +73,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is deliberately left alone: it exists because unpinned ruff releases have
   dirtied the whole tree mid-merge (0.16.0 did), and 0.16.2 is now current.
 
+### Fixed
+
+- **`wte_backward_cpu` left `dwte` zero on CPU targets where `WARP_SIZE` is not
+  GPU warp geometry** (reported in
+  [PR #3](https://github.com/ulmentflam/llm.mojo/pull/3), hit on Apple Silicon /
+  macOS). Bucket metadata is emitted against `WTE_C_PER_WARP` (128), and the
+  test's reference builder hardcodes the same 128, but the CPU consumer
+  re-derived the span as `WARP_SIZE * simd_width_of[dtype]()`. The GPU kernel
+  uses that same expression correctly, but only because on a GPU target it
+  evaluates to exactly `32 * WTE_BWD_SIMD_WIDTH == 128`; the CPU path inherited
+  the expression without the property that makes it true. Wrong on every
+  platform, but only wrong in *result* when the stride comes out smaller: on
+  x86-64 it is 32 * 16 = 512, which still tiles `[0, channels)` exactly once and
+  merely leaves one bucket doing all the work, while a stride of 0 writes
+  nothing at all. Two gaps hid it: `make test` on a GPU box runs
+  `test-python-cuda` and never touches the CPU custom-op path, and every encoder
+  case had `channels <= 128`, so `channel_group` was always 0 and any wrong
+  stride cancelled at `c_base == 0`. Adds a `channels=256` case for the
+  multi-group path, which passes on x86 either way and is honest coverage rather
+  than a regression test here. Full analysis:
+  docs/ai/wte_backward_cpu_channel_span_bug.md.
+
 ### Removed
 
 - **71 unused imports across 38 files**, exposed once the `UnsafePointer` ->

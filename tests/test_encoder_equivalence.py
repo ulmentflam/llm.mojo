@@ -46,6 +46,19 @@ CASES: tuple[Case, ...] = (
         dtype="float32",
         seed=43,
     ),
+    # channels > WTE_C_PER_WARP (128), so the bucket builder emits more than one
+    # channel group per token. Every other case here is <= 128 and therefore
+    # only ever exercises channel_group == 0, where a wrong channel span still
+    # lands at c_base == 0 and the bug cancels.
+    Case(
+        "fp32_multi_channel_group",
+        batch_size=2,
+        seq_len=8,
+        vocab_size=32,
+        channels=256,
+        dtype="float32",
+        seed=45,
+    ),
     # BF16 small test case
     Case(
         "bf16_small",

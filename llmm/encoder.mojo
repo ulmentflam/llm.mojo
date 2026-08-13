@@ -672,7 +672,7 @@ def wte_backward_cpu[
             var token_idx = Int(info[2])
             var channel_group = Int(info[3])
 
-            var c_per_warp = WARP_SIZE * width
+            var c_per_warp = WTE_C_PER_WARP
             var c_base = channel_group * c_per_warp
 
             var c_end = min(c_base + c_per_warp, channels)
