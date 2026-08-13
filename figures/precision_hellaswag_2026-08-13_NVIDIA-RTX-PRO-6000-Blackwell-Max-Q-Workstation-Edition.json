@@ -1,0 +1,81 @@
+{
+  "hardware": {
+    "date": "2026-08-13 03:32:39",
+    "date_display": "August 13th, 2026",
+    "host": "workstation-max",
+    "os": "Linux-6.8.0-137-generic-x86_64-with-glibc2.39",
+    "cpu": "AMD EPYC 9475F 48-Core Processor",
+    "cores": "192",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "platform": "linux-x86_64"
+  },
+  "source": "docs/ai/v2_arm_results/*.json",
+  "runs": [
+    {
+      "scale": "124M",
+      "precision": "bf16",
+      "final_val_loss": 3.2868803,
+      "steps": 92,
+      "complete": true,
+      "eval_kn": [
+        3010,
+        10042
+      ]
+    },
+    {
+      "scale": "124M",
+      "precision": "fp8",
+      "final_val_loss": 3.2982988,
+      "steps": 91,
+      "complete": true,
+      "eval_kn": [
+        3000,
+        10042
+      ]
+    },
+    {
+      "scale": "124M",
+      "precision": "nvfp4",
+      "final_val_loss": 3.3135452,
+      "steps": 93,
+      "complete": true,
+      "eval_kn": [
+        2982,
+        10042
+      ]
+    },
+    {
+      "scale": "774M",
+      "precision": "bf16",
+      "final_val_loss": 2.9858644,
+      "steps": 93,
+      "complete": true,
+      "eval_kn": [
+        3741,
+        10042
+      ]
+    },
+    {
+      "scale": "774M",
+      "precision": "fp8",
+      "final_val_loss": 2.9877052,
+      "steps": 91,
+      "complete": true,
+      "eval_kn": [
+        3783,
+        10042
+      ]
+    },
+    {
+      "scale": "774M",
+      "precision": "nvfp4",
+      "final_val_loss": 3.0128138,
+      "steps": 91,
+      "complete": true,
+      "eval_kn": [
+        3665,
+        10042
+      ]
+    }
+  ]
+}

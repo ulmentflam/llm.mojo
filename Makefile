@@ -157,7 +157,7 @@ $(PIXI_STAMP):
 
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        typecheck check compile-rest clean build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
+        typecheck check compile-rest clean figures figure-precision build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
@@ -193,6 +193,7 @@ help:
 	@echo "Quality gates:"
 	@echo "  check         Run lint (incl. typecheck), build-mojo, build train_gpt2, build-profile, compile-rest"
 	@echo "  compile-rest  Compile-only pass over the benches/tools no other target builds"
+	@echo "  figures       Regenerate every data-derived figure (no GPU needed; see Makefile)"
 	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
 	@echo "  build-train   Alias for build"
 	@echo "  train         Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
@@ -887,6 +888,31 @@ figure-breakeven:
 	$(PIXI) run python scripts/figure_vocab_breakeven.py
 
 figures-wte: figure-blindness figure-breakeven
+
+# Precision comparison (val loss + HellaSwag), rendered from
+# docs/ai/v2_arm_results/*.json, the same records that generate the README
+# table, so a figure can never disagree with the table above it.
+figure-precision:
+	$(PIXI) run python scripts/benchmark_precision.py
+
+# Regenerate every figure that is DERIVED from recorded data. Deterministic and
+# safe to run anywhere: no GPU, no benchmark, no quiet box. Re-run after any
+# change to the underlying records and commit the .png + .json sidecar together.
+#
+# The measurement figures are deliberately NOT here, because they are the
+# measurements: benchmark_{cpu,gpu,metal}, benchmark-zero, benchmark-vocab-tiles
+# and hellaswag_eval only mean anything when produced by their own targets on
+# the specific box named in the figure's filename and sidecar. Re-rendering them
+# from stale data would silently relabel someone else's hardware as yours.
+#
+# Idempotence differs by script and it is worth knowing which you are running.
+# figure-precision overwrites a date-stamped name, so re-running replaces the
+# same file. figure-breakeven stamps HH:MM into its filename, so every run mints
+# a NEW png+json pair and leaves the previous one orphaned; delete the old pair
+# when you re-render it. figure-blindness rewrites only the `rendered`
+# timestamp in its sidecar when the data has not changed, which shows up as
+# diff noise worth reverting rather than committing.
+figures: figure-precision figures-wte
 
 # Vocabulary-tiling cost sweep (figure 3). NEEDS A GPU AND A QUIET BOX:
 # the collector refuses to run if `make test`/pytest are live or the load

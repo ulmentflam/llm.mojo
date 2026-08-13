@@ -25,6 +25,8 @@ Usage:
 """
 
 import os
+import glob
+import json
 import re
 import sys
 
@@ -44,7 +46,7 @@ from scripts.benchmark_train import (
 
 matplotlib.use("Agg")
 
-RUNS_ROOT = "/data/llm.mojo/runs"
+RUNS_ROOT = "/data/llm.mojo/runs/v2"
 
 # Fixed per-precision hues (never cycled, never reassigned): bf16 wears the
 # llm.mojo family blue from benchmark_train.py (it is the baseline precision);
@@ -58,14 +60,37 @@ PRECISION_COLORS = {
 
 # (scale label, precision, run dir, HellaSwag (k, n) from `make eval` — None
 # until the eval has been run, which also skips the run in the eval figure.)
-RUNS = (
-    ("124M", "bf16", "log124M_fineweb_bf16", (3008, 10042)),
-    ("124M", "fp8", "log124M_fineweb_fp8", (3014, 10042)),
-    ("124M", "nvfp4", "log124M_fineweb_nvfp4", (2972, 10042)),
-    ("774M", "bf16", "log774M_fineweb", (3649, 10042)),
-    ("774M", "fp8", "log774M_fineweb_fp8", (3722, 10042)),
-    ("774M", "nvfp4", "log774M_fineweb_nvfp4", (3642, 10042)),
+#
+# Read from docs/ai/v2_arm_results/*.json, the same records that generate the
+# README table, so a figure can never disagree with the table it sits under.
+# The v1 arms these replaced are retracted; see
+# docs/ai/v1_precision_table_retraction.md.
+ARM_RESULTS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "docs",
+    "ai",
+    "v2_arm_results",
 )
+
+
+def _load_runs():
+    runs = []
+    for path in sorted(glob.glob(os.path.join(ARM_RESULTS, "*.json"))):
+        d = json.load(open(path))
+        runs.append(
+            (
+                d["scale"],
+                d["precision"],
+                os.path.basename(d["run_dir"]),
+                (d["hellaswag_k"], d["hellaswag_n"]),
+            )
+        )
+    order = {"bf16": 0, "fp8": 1, "nvfp4": 2}
+    runs.sort(key=lambda r: (0 if r[0] == "124M" else 1, order.get(r[1], 9)))
+    return tuple(runs)
+
+
+RUNS = _load_runs()
 
 VAL_RE = re.compile(r"^val loss ([0-9.]+)")
 STEP_RE = re.compile(r"^step (\d+)/(\d+)")
@@ -301,6 +326,33 @@ def main():
     render_hellaswag(
         runs, hw, os.path.join(FIGURES, f"precision_hellaswag_{stamp}_{gpu_slug}.png")
     )
+    # Sidecar carrying the source data verbatim, per the repo's figure
+    # reproducibility contract (see the `figures` target in the Makefile).
+    for stem in ("precision_valloss", "precision_hellaswag"):
+        sidecar = os.path.join(FIGURES, f"{stem}_{stamp}_{gpu_slug}.json")
+        with open(sidecar, "w") as fh:
+            json.dump(
+                {
+                    "hardware": hw,
+                    "source": "docs/ai/v2_arm_results/*.json",
+                    "runs": [
+                        {
+                            "scale": r["scale"],
+                            "precision": r["precision"],
+                            "final_val_loss": r["losses"][-1]
+                            if r.get("losses")
+                            else None,
+                            "steps": len(r["steps"]),
+                            "complete": r["complete"],
+                            "eval_kn": r["eval_kn"],
+                        }
+                        for r in runs
+                    ],
+                },
+                fh,
+                indent=2,
+            )
+        print(f"wrote {sidecar}")
 
 
 if __name__ == "__main__":
