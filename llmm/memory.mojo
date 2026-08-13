@@ -1,6 +1,7 @@
 from std.ffi import _get_global_or_null, external_call
 from max.gpu.host import DeviceContext
-from std.memory import UnsafePointer, alloc
+from std.memory import UnsafePointer
+from std.memory.alloc import unsafe_alloc
 
 
 # ===----------------------------------------------------------------------=== #
@@ -12,11 +13,11 @@ from std.memory import UnsafePointer, alloc
 def heap_alloc[T: AnyType](count: Int) -> Pointer[T, MutUntrackedOrigin]:
     """Raw heap allocation of `count` `T`s, freed with `.unsafe_free()`.
 
-    The single call site of the deprecated count-based `alloc` in this repo.
-    See docs/ai/mojo_1_0_migration.md for why it cannot be migrated to the
-    `Layout`-based replacement yet.
+    The whole repo allocates through here, so moving to the `Layout`-based
+    `alloc`/`Allocation` ownership model is a change to this one function.
+    See docs/ai/mojo_1_0_migration.md.
     """
-    return alloc[T](count)
+    return unsafe_alloc[T](count)
 
 
 # ===----------------------------------------------------------------------=== #

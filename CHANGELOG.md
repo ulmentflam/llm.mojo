@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     change, since the mixed arithmetic in the bodies would not compile.
   - **`InlineArray` lost `ImplicitlyCopyable`**, so `ZeroContext.get_rank_sigs_any`
     returns by transfer (`^`) rather than by implicit copy.
-- **Deprecation warnings cleared: 1803 -> 190.** `UnsafePointer` -> `Pointer`,
+- **Deprecation warnings cleared: 1803 -> 0.** `UnsafePointer` -> `Pointer`,
   `load`/`store`/`bitcast`/`free` -> `unsafe_*`, positional `ptr[i]` ->
   `ptr[unsafe_offset=i]`, pointer `+`/`-`/`+=` -> `unsafe_offset`, and
   `__del__` -> `__deinit__`. Driven by
@@ -58,17 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `layernorm`/`matmul`/`attention`/`gelu` live in functions no single binary
   instantiates. Also fixed the tree's last `fn` (removed in 1.0) in
   `bench_gemm_vocab_tiles.mojo`; `make compile-rest` above now covers it.
-  **The implicit-walrus deprecation is deliberately NOT fixed.** Applying the
-  compiler's suggested `if var gp := ...` to the three `_get_global_or_null`
-  call sites SIGSEGVs the MAX compiler whenever a custom op is built against
-  them, taking out the whole `test-python-cuda` suite at
+  The implicit-walrus sites are hoisted (`var cached = ...` then `if cached:`)
+  rather than annotated: the compiler's suggested `if var gp := ...` SIGSEGVs
+  the MAX compiler whenever a custom op is built against those modules, which
+  took out the whole `test-python-cuda` suite at
   `test_attention_equivalence.py` while `make build`, `make lint` and every
-  mojo test file stayed green. The sites now carry a comment saying so.
-  Of the 190 remaining, 5 are those walrus sites and 185 are
-  `alloc`-without-`Layout`: the suggested
-  `unsafe_alloc` does not exist in 1.0.0, and the real replacement returns an
-  owning `Allocation[T]` instead of a raw pointer, so it is a lifetime refactor
-  rather than a rename and is left for its own pass.
+  mojo test file stayed green. The `alloc` sites all route through one
+  `heap_alloc` wrapper in `llmm/memory.mojo` calling `unsafe_alloc`, which
+  lives in the `std.memory.alloc` MODULE rather than the `std.memory` package
+  that re-exports `alloc`. That import path is the whole reason it looked
+  absent. The wrapper is now the entire migration surface for adopting the
+  `Layout`/`Allocation` ownership model later.
 - **`uv` updated 0.11.28 -> 0.12.3.** The `uvx ruff@0.15.2` pin in `lint-python`
   is deliberately left alone: it exists because unpinned ruff releases have
   dirtied the whole tree mid-merge (0.16.0 did), and 0.16.2 is now current.

@@ -135,8 +135,7 @@ list at all.
 
 ## Clearing the deprecation warnings
 
-1803 warnings across the tree, down to 190 (185 `alloc` plus the 5 walrus
-sites below). The rewrite is
+1803 warnings across the tree, down to **zero**. The rewrite is
 driven by **the compiler's own coordinates**, not by regex: `p + i` and `a + b`
 are indistinguishable textually, but every warning carries `file:line:col`
 pointing at the exact token, and for operators the underline art delimits both
@@ -220,20 +219,43 @@ Two lessons: **a compiler's suggested fix is a suggestion, not a proof**, and a
 warning cleanup needs the same gate as a semantic change, because "it still
 compiles" covers none of the paths that build kernels at runtime.
 
-**The other category deliberately left: 185 `alloc` sites.** The warning suggests
-`unsafe_alloc` "as a temporary migration step", but no such symbol exists in
-1.0.0 (not in `std.memory`, not as a `Pointer` static method). The real
-replacement is a different function:
+**The 185 `alloc` sites, and two wrong turns worth recording.** The warning
+suggests `unsafe_alloc` "as a temporary migration step". Importing that from
+`std.memory` fails with "package 'memory' does not contain 'unsafe_alloc'",
+which is easy to read as "the symbol does not exist". It does exist, in the
+**module** `std.memory.alloc` rather than the package that re-exports `alloc`:
 
 ```mojo
-def alloc[type: AnyType, /](count: Int, *, alignment: Int) -> Pointer[type, MutUntrackedOrigin]   # deprecated
-def alloc[T: AnyType, /](layout: Layout[T], /) -> Allocation[T]                                   # replacement
+from std.memory.alloc import unsafe_alloc     # count-based, not deprecated
 ```
 
-It returns an owning `Allocation[T]`, not a raw pointer. This codebase manages
-those lifetimes by hand (explicit `.unsafe_free()` at matched sites), so
-switching is an ownership refactor where a mechanical rename produces
-double-frees, not a rename. Left for a deliberate pass with its own testing.
+The second wrong turn was concluding that the real replacement was unusable.
+`alloc(Layout[T](count=n))` returns an owning `Allocation[T]`, and probing it
+for `unsafe_ptr`, `span`, `data`, indexing and `release` made every probe fail,
+which looked like an API with no accessors. The probes were failing for an
+unrelated reason: `Allocation` is an *explicitly destroyed* type, so a probe
+that allocates without calling `dealloc(a^)` does not compile no matter which
+method it tests. Written correctly it is perfectly usable, and it does NOT free
+on destruction, so the double-free risk that argument rested on was imaginary:
+
+```mojo
+var a = alloc(Layout[Scalar[DType.float32]](count=4))
+var p = a.unsafe_ptr()      # also unsafe_span(), unsafe_leak(), into_managed()
+dealloc(a^)
+```
+
+Lesson: a probe that reports "absent" for every name is evidence about the
+probe, not about the API. Check one name you are *sure* exists before trusting
+a sweep of negatives.
+
+All 156 call sites route through one `heap_alloc` wrapper in `llmm/memory.mojo`,
+which calls `unsafe_alloc`. That is what takes the tree to **zero** warnings.
+The wrapper is also the whole migration surface: adopting the `Layout`/
+`Allocation` ownership model properly is a change to that one function plus the
+lifetimes of whoever holds the result, rather than a 185-site refactor. Nothing
+blocks it technically; it is deferred because this codebase frees by hand at
+sites far from the allocation (struct fields, process globals), so the value of
+the owning handle only appears once those lifetimes move with it.
 
 Separately, `fn` has been **removed** in 1.0 (`'fn' has been removed; use 'def'
 instead`). Exactly one survived here, in `bench_gemm_vocab_tiles.mojo`, because
@@ -288,7 +310,10 @@ Note when reading `test-mojo` output that the bracketed per-suite timings are
 
 ## What was deliberately NOT done
 
-- **The 185 `alloc` sites.** See above: an ownership refactor, not a rename.
+- **The `Layout`/`Allocation` ownership model.** The tree is warning-free via
+  `unsafe_alloc`, which is the sanctioned migration step, not the destination.
+  Adopting the owning handle properly means moving allocation lifetimes to
+  match, and it is confined to `heap_alloc`. See above.
 - **`uvx ruff@0.15.2` bump.** 0.16.2 is current, but the pin is load-bearing:
   unpinned ruff has dirtied the whole tree mid-merge before (0.16.0 did).
   Bumping it is a formatting decision, not an environment fix.
