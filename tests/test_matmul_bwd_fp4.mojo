@@ -36,10 +36,9 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.math import sqrt
-from std.memory import UnsafePointer
 from std.random import random_float64, seed
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true, assert_equal
 
 from llmm.matmul import (
@@ -70,13 +69,13 @@ from _lowp_test_common import pseudo_gaussian_fill, cosine_and_rel_l2
 
 
 def _fill_random(
-    ptr: UnsafePointer[Scalar[DType.bfloat16], MutUntrackedOrigin],
+    ptr: Pointer[Scalar[DType.bfloat16], MutUntrackedOrigin],
     numel: Int,
     scale: Float32,
 ) -> None:
     for i in range(numel):
         var v = Float32((random_float64() * 2.0 - 1.0)) * scale
-        ptr[i] = v.cast[DType.bfloat16]()
+        ptr[unsafe_offset=i] = v.cast[DType.bfloat16]()
 
 
 def _run_bwd_site_case(
@@ -229,20 +228,22 @@ def _run_bwd_site_case(
     # output) and require the GPU to reproduce it.
     var cpu_d_bias = ctx.enqueue_create_host_buffer[DType.float32](out_channels)
     for c in range(out_channels):
-        cpu_d_bias.unsafe_ptr()[c] = Float32(0.0)
+        cpu_d_bias.unsafe_ptr()[unsafe_offset=c] = Float32(0.0)
     for r in range(rows):
-        var row = host_doutput.unsafe_ptr() + r * out_channels
+        var row = host_doutput.unsafe_ptr().unsafe_offset(r * out_channels)
         for c in range(out_channels):
-            cpu_d_bias.unsafe_ptr()[c] += row[c].cast[DType.float32]()
+            cpu_d_bias.unsafe_ptr()[unsafe_offset=c] += row[
+                unsafe_offset=c
+            ].cast[DType.float32]()
 
     # Every column is a sum of `rows` random nonzero values, so an exact
     # zero is not a legitimate outcome -- it means "never written".
     var nonzero_ref = 0
     var nonzero_fp4 = 0
     for i in range(out_channels):
-        if host_d_bias_ref.unsafe_ptr()[i] != Scalar[DT](0):
+        if host_d_bias_ref.unsafe_ptr()[unsafe_offset=i] != Scalar[DT](0):
             nonzero_ref += 1
-        if host_d_bias_fp4.unsafe_ptr()[i] != Scalar[DT](0):
+        if host_d_bias_fp4.unsafe_ptr()[unsafe_offset=i] != Scalar[DT](0):
             nonzero_fp4 += 1
     assert_equal(
         nonzero_ref,
@@ -275,8 +276,10 @@ def _run_bwd_site_case(
     var num = Float32(0.0)
     var den = Float32(0.0)
     for i in range(out_channels):
-        var got = host_d_bias_ref.unsafe_ptr()[i].cast[DType.float32]()
-        var want = cpu_d_bias.unsafe_ptr()[i]
+        var got = host_d_bias_ref.unsafe_ptr()[unsafe_offset=i].cast[
+            DType.float32
+        ]()
+        var want = cpu_d_bias.unsafe_ptr()[unsafe_offset=i]
         num += (got - want) * (got - want)
         den += want * want
     var rel_l2_bias = sqrt(num) / (sqrt(den) + Float32(1e-12))
@@ -286,9 +289,11 @@ def _run_bwd_site_case(
         + ": d_bias rel_l2 vs host reduction "
         + String(rel_l2_bias)
         + " >= 0.02 (host d_bias[0]="
-        + String(cpu_d_bias.unsafe_ptr()[0])
+        + String(cpu_d_bias.unsafe_ptr()[unsafe_offset=0])
         + ", gpu d_bias[0]="
-        + String(host_d_bias_ref.unsafe_ptr()[0].cast[DType.float32]())
+        + String(
+            host_d_bias_ref.unsafe_ptr()[unsafe_offset=0].cast[DType.float32]()
+        )
         + ")",
     )
 
@@ -296,8 +301,8 @@ def _run_bwd_site_case(
     # both arms). Only meaningful now that both are known nonzero + correct.
     for i in range(out_channels):
         assert_equal(
-            host_d_bias_ref.unsafe_ptr()[i],
-            host_d_bias_fp4.unsafe_ptr()[i],
+            host_d_bias_ref.unsafe_ptr()[unsafe_offset=i],
+            host_d_bias_fp4.unsafe_ptr()[unsafe_offset=i],
             label
             + ": d_bias diverged at "
             + String(i)
@@ -458,7 +463,7 @@ def test_fp4_gemm_accumulate() raises:
     comptime SEED_VAL = Float32(2.0)
     var host_seed = ctx.enqueue_create_host_buffer[DT](m * n)
     for i in range(m * n):
-        host_seed.unsafe_ptr()[i] = SEED_VAL.cast[DT]()
+        host_seed.unsafe_ptr()[unsafe_offset=i] = SEED_VAL.cast[DT]()
     var dev_d_acc = ctx.enqueue_create_buffer[DT](m * n)
     dev_d_acc.enqueue_copy_from(host_seed)
     var dev_d_raw_scratch = ctx.enqueue_create_buffer[DT](m * n)
@@ -508,8 +513,10 @@ def test_fp4_gemm_accumulate() raises:
 
     var max_abs_diff = Float32(0.0)
     for i in range(m * n):
-        var fresh = host_fresh.unsafe_ptr()[i].cast[DType.float32]()
-        var acc = host_acc.unsafe_ptr()[i].cast[DType.float32]()
+        var fresh = host_fresh.unsafe_ptr()[unsafe_offset=i].cast[
+            DType.float32
+        ]()
+        var acc = host_acc.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
         assert_true(acc == acc, "accumulate: NaN at " + String(i))
         var want = SEED_VAL + fresh
         var diff = acc - want
@@ -550,7 +557,7 @@ def test_fp4_gemm_accumulate() raises:
 
 def _make_outlier_bf16(
     mut rng: MT19937,
-    ptr: UnsafePointer[Scalar[DType.bfloat16], MutUntrackedOrigin],
+    ptr: Pointer[Scalar[DType.bfloat16], MutUntrackedOrigin],
     numel: Int,
     std: Float32,
 ) -> None:
@@ -561,8 +568,8 @@ def _make_outlier_bf16(
     pseudo_gaussian_fill[DType.bfloat16](rng, ptr, numel, std)
     var i = 0
     while i < numel:
-        var v = ptr[i].cast[DType.float32]() * Float32(100.0)
-        ptr[i] = v.cast[DType.bfloat16]()
+        var v = ptr[unsafe_offset=i].cast[DType.float32]() * Float32(100.0)
+        ptr[unsafe_offset=i] = v.cast[DType.bfloat16]()
         i += 1000
 
 

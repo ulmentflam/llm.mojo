@@ -1,5 +1,5 @@
 from std.algorithm import vectorize
-from std.gpu.memory import CacheOperation, load as gpu_cache_load
+from max.gpu.memory import CacheOperation, load as gpu_cache_load
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 
@@ -134,25 +134,33 @@ def layout_copy[
     # swept together, not compared at width=1.
     comptime if backward:
         comptime if streaming:
-            (dst_ptr + src_flat_index).store[width=width, non_temporal=True](
+            (dst_ptr.unsafe_offset(src_flat_index)).unsafe_store[
+                width=width, non_temporal=True
+            ](
                 gpu_cache_load[
                     width=width, cache_policy=CacheOperation.STREAMING
-                ](src_ptr + dst_flat_index)
+                ](src_ptr.unsafe_offset(dst_flat_index))
             )
         else:
-            (dst_ptr + src_flat_index).store(
-                (src_ptr + dst_flat_index).load[width=width]()
+            (dst_ptr.unsafe_offset(src_flat_index)).unsafe_store(
+                (src_ptr.unsafe_offset(dst_flat_index)).unsafe_load[
+                    width=width
+                ]()
             )
     else:
         comptime if streaming:
-            (dst_ptr + dst_flat_index).store[width=width, non_temporal=True](
+            (dst_ptr.unsafe_offset(dst_flat_index)).unsafe_store[
+                width=width, non_temporal=True
+            ](
                 gpu_cache_load[
                     width=width, cache_policy=CacheOperation.STREAMING
-                ](src_ptr + src_flat_index)
+                ](src_ptr.unsafe_offset(src_flat_index))
             )
         else:
-            (dst_ptr + dst_flat_index).store(
-                (src_ptr + src_flat_index).load[width=width]()
+            (dst_ptr.unsafe_offset(dst_flat_index)).unsafe_store(
+                (src_ptr.unsafe_offset(src_flat_index)).unsafe_load[
+                    width=width
+                ]()
             )
 
 

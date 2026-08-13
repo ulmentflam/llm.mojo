@@ -54,13 +54,13 @@ def sample_softmax(
 ) -> Int:
     var norm: Float64 = 0.0
     for i in range(n):
-        norm += Float64(exp(logits_ptr[i].cast[DType.float32]()))
+        norm += Float64(exp(logits_ptr[unsafe_offset=i].cast[DType.float32]()))
 
     coin = Float32(Float64(coin) * norm)
 
     var cdf: Float32 = 0.0
     for i in range(n):
-        cdf += exp(logits_ptr[i].cast[DType.float32]())
+        cdf += exp(logits_ptr[unsafe_offset=i].cast[DType.float32]())
         if coin < cdf:
             return i
     return n - 1  # in case of rounding errors

@@ -30,15 +30,10 @@
 # line).
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import bitcast, UnsafePointer
-from std.math import isnan, isinf, nan, inf, ceildiv
+from std.memory import bitcast
+from std.math import isnan, nan, inf, ceildiv
 from std.sys import has_nvidia_gpu_accelerator
-from std.testing import (
-    TestSuite,
-    assert_true,
-    assert_equal,
-    assert_almost_equal,
-)
+from std.testing import TestSuite, assert_true, assert_equal
 
 from llmm.rng_device import (
     rng_key,
@@ -358,7 +353,7 @@ def test_rng_u32_device_matches_host() raises:
         dev_out.unsafe_ptr(),
         seed,
         stream,
-        N,
+        Int64(N),
         grid_dim=(num_blocks,),
         block_dim=(BLOCK_SIZE,),
     )
@@ -369,7 +364,7 @@ def test_rng_u32_device_matches_host() raises:
     var mismatches = 0
     for i in range(N):
         var want = rng_u32(seed, UInt64(i), stream)
-        if host_out.unsafe_ptr()[i] != want:
+        if host_out.unsafe_ptr()[unsafe_offset=i] != want:
             mismatches += 1
     assert_equal(mismatches, 0)
 
@@ -388,7 +383,9 @@ def test_sr_cast_device_matches_host_and_is_deterministic() raises:
     for i in range(N):
         # A mix of magnitudes/signs so this exercises more than one exponent
         # bucket (denormal-adjacent through large values).
-        host_x.unsafe_ptr()[i] = (Float32(i) - Float32(N // 2)) * 0.0173
+        host_x.unsafe_ptr()[unsafe_offset=i] = (
+            Float32(i) - Float32(N // 2)
+        ) * 0.0173
 
     var dev_x = ctx.enqueue_create_buffer[DType.float32](N)
     dev_x.enqueue_copy_from(host_x)
@@ -406,7 +403,7 @@ def test_sr_cast_device_matches_host_and_is_deterministic() raises:
         dev_x.unsafe_ptr(),
         seed,
         stream,
-        N,
+        Int64(N),
         grid_dim=(num_blocks,),
         block_dim=(BLOCK_SIZE,),
     )
@@ -416,7 +413,7 @@ def test_sr_cast_device_matches_host_and_is_deterministic() raises:
         dev_x.unsafe_ptr(),
         seed,
         stream,
-        N,
+        Int64(N),
         grid_dim=(num_blocks,),
         block_dim=(BLOCK_SIZE,),
     )
@@ -430,12 +427,14 @@ def test_sr_cast_device_matches_host_and_is_deterministic() raises:
     var det_mismatches = 0
     var host_ref_mismatches = 0
     for i in range(N):
-        var a = host_out_a.unsafe_ptr()[i]
-        var b = host_out_b.unsafe_ptr()[i]
+        var a = host_out_a.unsafe_ptr()[unsafe_offset=i]
+        var b = host_out_b.unsafe_ptr()[unsafe_offset=i]
         if a != b:
             det_mismatches += 1
         var want = _bf16_bits(
-            sr_cast_bf16(host_x.unsafe_ptr()[i], seed, UInt64(i), stream)
+            sr_cast_bf16(
+                host_x.unsafe_ptr()[unsafe_offset=i], seed, UInt64(i), stream
+            )
         )
         if a != want:
             host_ref_mismatches += 1

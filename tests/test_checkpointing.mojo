@@ -39,7 +39,7 @@ def _tiny_config() -> CheckpointConfig:
 
 def _fill_pattern(ptr: MutMemPtr[DType.float32], n: Int, scale: Float32):
     for i in range(n):
-        ptr.store(i, Float32(i) * scale - 1.0)
+        ptr.unsafe_store(i, Float32(i) * scale - 1.0)
 
 
 def _remove(path: String):
@@ -95,10 +95,12 @@ def test_model_checkpoint_roundtrip() raises:
     var read_header = read_model_checkpoint(path, restored, n)
     assert_equal(read_header.config == config, True)
     for i in range(n):
-        assert_almost_equal(restored.load(i), params.load(i), atol=0.0)
+        assert_almost_equal(
+            restored.unsafe_load(i), params.unsafe_load(i), atol=0.0
+        )
 
-    params.free()
-    restored.free()
+    params.unsafe_free()
+    restored.unsafe_free()
     _remove(path)
 
 
@@ -111,8 +113,8 @@ def test_model_checkpoint_bad_magic() raises:
     var m = alloc[Float32](4)
     var v = alloc[Float32](4)
     for i in range(4):
-        m.store(i, 1.0)
-        v.store(i, 2.0)
+        m.unsafe_store(i, 1.0)
+        v.unsafe_store(i, 2.0)
     var state = TrainingState(0, 1, 0, 0, 0, 0, 0, 0, 0)
     write_state_checkpoint(path, state, m, v, 4)
 
@@ -124,9 +126,9 @@ def test_model_checkpoint_bad_magic() raises:
         raised = True
     assert_equal(raised, True)
 
-    m.free()
-    v.free()
-    out.free()
+    m.unsafe_free()
+    v.unsafe_free()
+    out.unsafe_free()
     _remove(path)
 
 
@@ -146,8 +148,8 @@ def test_model_checkpoint_buffer_too_small() raises:
         raised = True
     assert_equal(raised, True)
 
-    params.free()
-    out.free()
+    params.unsafe_free()
+    out.unsafe_free()
     _remove(path)
 
 
@@ -196,13 +198,13 @@ def test_state_checkpoint_roundtrip() raises:
 
     # Moment payloads.
     for i in range(n):
-        assert_almost_equal(m_out.load(i), m.load(i), atol=0.0)
-        assert_almost_equal(v_out.load(i), v.load(i), atol=0.0)
+        assert_almost_equal(m_out.unsafe_load(i), m.unsafe_load(i), atol=0.0)
+        assert_almost_equal(v_out.unsafe_load(i), v.unsafe_load(i), atol=0.0)
 
-    m.free()
-    v.free()
-    m_out.free()
-    v_out.free()
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
     _remove(path)
 
 
@@ -224,9 +226,9 @@ def test_state_checkpoint_bad_magic() raises:
         raised = True
     assert_equal(raised, True)
 
-    params.free()
-    m_out.free()
-    v_out.free()
+    params.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
     _remove(path)
 
 
@@ -258,14 +260,14 @@ def test_dataloader_capture_restore() raises:
     # the round-trip exercises the on-disk header fields, not just the struct.
     var m = alloc[Float32](1)
     var v = alloc[Float32](1)
-    m.store(0, 0.0)
-    v.store(0, 0.0)
+    m.unsafe_store(0, 0.0)
+    v.unsafe_store(0, 0.0)
     write_state_checkpoint(path, state, m, v, 1)
 
     # What batch would the original loader produce next?
     loader.next_batch()
-    var expected_first = loader.inputs.load(0)
-    var expected_last = loader.inputs.load(7)
+    var expected_first = loader.inputs.unsafe_load(0)
+    var expected_last = loader.inputs.unsafe_load(7)
 
     var m_out = alloc[Float32](1)
     var v_out = alloc[Float32](1)
@@ -277,13 +279,13 @@ def test_dataloader_capture_restore() raises:
     restore_dataloader_state(resumed, restored)
     resumed.next_batch()
 
-    assert_equal(resumed.inputs.load(0), expected_first)
-    assert_equal(resumed.inputs.load(7), expected_last)
+    assert_equal(resumed.inputs.unsafe_load(0), expected_first)
+    assert_equal(resumed.inputs.unsafe_load(7), expected_last)
 
-    m.free()
-    v.free()
-    m_out.free()
-    v_out.free()
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
     loader.close()
     resumed.close()
     _remove(path)
@@ -326,16 +328,16 @@ def test_dataloader_capture_restore_shuffled() raises:
     var state = make_training_state(loader, step=3, sampler_rng_state=UInt64(7))
     var m = alloc[Float32](1)
     var v = alloc[Float32](1)
-    m.store(0, 0.0)
-    v.store(0, 0.0)
+    m.unsafe_store(0, 0.0)
+    v.unsafe_store(0, 0.0)
     write_state_checkpoint(path, state, m, v, 1)
 
     # Ground truth: what the ORIGINAL, uninterrupted shuffling loader produces
     # next. The resumed loader has to reproduce this exactly, which it can only
     # do by replaying the right number of draws off the same seed.
     loader.next_batch()
-    var expected_first = loader.inputs.load(0)
-    var expected_last = loader.inputs.load(7)
+    var expected_first = loader.inputs.unsafe_load(0)
+    var expected_last = loader.inputs.unsafe_load(7)
 
     var m_out = alloc[Float32](1)
     var v_out = alloc[Float32](1)
@@ -349,13 +351,13 @@ def test_dataloader_capture_restore_shuffled() raises:
     restore_dataloader_state(resumed, restored)
     resumed.next_batch()
 
-    assert_equal(resumed.inputs.load(0), expected_first)
-    assert_equal(resumed.inputs.load(7), expected_last)
+    assert_equal(resumed.inputs.unsafe_load(0), expected_first)
+    assert_equal(resumed.inputs.unsafe_load(7), expected_last)
 
-    m.free()
-    v.free()
-    m_out.free()
-    v_out.free()
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
     loader.close()
     resumed.close()
     _remove(path)

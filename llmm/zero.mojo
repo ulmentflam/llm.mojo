@@ -5,13 +5,11 @@ from std.math import ceildiv
 from comm import Signal, MAX_GPUS
 from comm.allgather import allgather
 from std.collections import InlineArray
-from layout.tile_layout import row_major
-from std.algorithm import sync_parallelize
 from std.gpu import block_dim, block_idx, thread_idx
 from layout import TileTensor, TensorLayout
 from std.memory import UnsafePointer, alloc
-from std.gpu.host.info import is_cpu, is_gpu
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from std.gpu.host.info import is_cpu
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.sys import has_nvidia_gpu_accelerator
 
 
@@ -119,27 +117,27 @@ struct CpuCoordinator:
     address and pull via cross-device staged copies).
     """
 
-    var barrier1: UnsafePointer[CpuBarrier, MutUntrackedOrigin]
-    var barrier2: UnsafePointer[CpuBarrier, MutUntrackedOrigin]
-    var shared_inputs: UnsafePointer[
-        UnsafePointer[UInt8, MutUntrackedOrigin], MutUntrackedOrigin
+    var barrier1: Pointer[CpuBarrier, MutUntrackedOrigin]
+    var barrier2: Pointer[CpuBarrier, MutUntrackedOrigin]
+    var shared_inputs: Pointer[
+        Pointer[UInt8, MutUntrackedOrigin], MutUntrackedOrigin
     ]
-    var shared_outputs: UnsafePointer[
-        UnsafePointer[UInt8, MutUntrackedOrigin], MutUntrackedOrigin
+    var shared_outputs: Pointer[
+        Pointer[UInt8, MutUntrackedOrigin], MutUntrackedOrigin
     ]
     # One Float64 slot per rank for host-side scalar reductions (loss
     # averaging, global grad-norm partial sums across shards).
-    var shared_scalars: UnsafePointer[Float64, MutUntrackedOrigin]
+    var shared_scalars: Pointer[Float64, MutUntrackedOrigin]
 
     def __init__(out self, num_threads: Int):
         self.barrier1 = alloc[CpuBarrier](1)
         self.barrier1[] = CpuBarrier(num_threads)
         self.barrier2 = alloc[CpuBarrier](1)
         self.barrier2[] = CpuBarrier(num_threads)
-        self.shared_inputs = alloc[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        self.shared_inputs = alloc[Pointer[UInt8, MutUntrackedOrigin]](
             num_threads
         )
-        self.shared_outputs = alloc[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        self.shared_outputs = alloc[Pointer[UInt8, MutUntrackedOrigin]](
             num_threads
         )
         self.shared_scalars = alloc[Float64](num_threads)
@@ -158,11 +156,11 @@ struct CpuCoordinator:
         self.barrier2[].abort()
 
     def free(self) -> None:
-        self.barrier1.free()
-        self.barrier2.free()
-        self.shared_inputs.free()
-        self.shared_outputs.free()
-        self.shared_scalars.free()
+        self.barrier1.unsafe_free()
+        self.barrier2.unsafe_free()
+        self.shared_inputs.unsafe_free()
+        self.shared_outputs.unsafe_free()
+        self.shared_scalars.unsafe_free()
 
 
 @always_inline
@@ -170,23 +168,21 @@ def _register_and_sync[
     dtype: DType, in_origin: Origin, out_origin: Origin
 ](
     rank: Int,
-    cpu_coordinator_ptr: Optional[
-        UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
-    ],
-    input_ptr: UnsafePointer[Scalar[dtype], in_origin],
-    output_ptr: UnsafePointer[Scalar[dtype], out_origin],
-) raises -> UnsafePointer[CpuCoordinator, MutUntrackedOrigin]:
+    cpu_coordinator_ptr: Optional[Pointer[CpuCoordinator, MutUntrackedOrigin]],
+    input_ptr: Pointer[Scalar[dtype], in_origin],
+    output_ptr: Pointer[Scalar[dtype], out_origin],
+) raises -> Pointer[CpuCoordinator, MutUntrackedOrigin]:
     if not cpu_coordinator_ptr:
         raise Error(
             "ZeroContext: cpu_coordinator_ptr must be provided for world_size >"
             " 1 on CPU"
         )
     var coord_ptr = cpu_coordinator_ptr.value()
-    coord_ptr[].shared_inputs[rank] = rebind[
-        UnsafePointer[UInt8, MutUntrackedOrigin]
+    coord_ptr[].shared_inputs[unsafe_offset=rank] = rebind[
+        Pointer[UInt8, MutUntrackedOrigin]
     ](input_ptr)
-    coord_ptr[].shared_outputs[rank] = rebind[
-        UnsafePointer[UInt8, MutUntrackedOrigin]
+    coord_ptr[].shared_outputs[unsafe_offset=rank] = rebind[
+        Pointer[UInt8, MutUntrackedOrigin]
     ](output_ptr)
     coord_ptr[].barrier1[].wait()
     return coord_ptr
@@ -198,18 +194,18 @@ def _allreduce_cpu[
     rank: Int,
     world_size: Int,
     size: Int,
-    coord_ptr: UnsafePointer[CpuCoordinator, MutUntrackedOrigin],
+    coord_ptr: Pointer[CpuCoordinator, MutUntrackedOrigin],
 ) raises:
     var sharded = size // world_size
-    var output_shard = rebind[UnsafePointer[Scalar[dtype], MutUntrackedOrigin]](
-        coord_ptr[].shared_outputs[rank]
+    var output_shard = rebind[Pointer[Scalar[dtype], MutUntrackedOrigin]](
+        coord_ptr[].shared_outputs[unsafe_offset=rank]
     )
     var offset = rank * sharded
     _reducescatter_cpu[dtype](
         rank,
         world_size,
         sharded,
-        (output_shard + offset).as_unsafe_any_origin(),
+        (output_shard.unsafe_offset(offset)).as_unsafe_any_origin(),
         coord_ptr,
     )
 
@@ -225,18 +221,18 @@ def _reducescatter_cpu[
     rank: Int,
     world_size: Int,
     sharded_size: Int,
-    output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    coord_ptr: UnsafePointer[CpuCoordinator, MutUntrackedOrigin],
+    output_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    coord_ptr: Pointer[CpuCoordinator, MutUntrackedOrigin],
 ):
     var offset = rank * sharded_size
     for j in range(sharded_size):
         var sum_val = Scalar[dtype](0.0)
         for k in range(world_size):
             var k_input_ptr = rebind[
-                UnsafePointer[Scalar[dtype], MutUntrackedOrigin]
-            ](coord_ptr[].shared_inputs[k])
-            sum_val += k_input_ptr[offset + j]
-        output_ptr[j] = sum_val
+                Pointer[Scalar[dtype], MutUntrackedOrigin]
+            ](coord_ptr[].shared_inputs[unsafe_offset=k])
+            sum_val += k_input_ptr[unsafe_offset=offset + j]
+        output_ptr[unsafe_offset=j] = sum_val
 
 
 @always_inline
@@ -246,18 +242,20 @@ def _allgather_cpu[
     rank: Int,
     world_size: Int,
     sharded_size: Int,
-    coord_ptr: UnsafePointer[CpuCoordinator, MutUntrackedOrigin],
+    coord_ptr: Pointer[CpuCoordinator, MutUntrackedOrigin],
 ):
     var offset = rank * sharded_size
     for k in range(world_size):
-        var k_output_ptr = rebind[
-            UnsafePointer[Scalar[dtype], MutUntrackedOrigin]
-        ](coord_ptr[].shared_outputs[k])
-        var my_input_ptr = rebind[
-            UnsafePointer[Scalar[dtype], MutUntrackedOrigin]
-        ](coord_ptr[].shared_inputs[rank])
+        var k_output_ptr = rebind[Pointer[Scalar[dtype], MutUntrackedOrigin]](
+            coord_ptr[].shared_outputs[unsafe_offset=k]
+        )
+        var my_input_ptr = rebind[Pointer[Scalar[dtype], MutUntrackedOrigin]](
+            coord_ptr[].shared_inputs[unsafe_offset=rank]
+        )
         for j in range(sharded_size):
-            k_output_ptr[offset + j] = my_input_ptr[offset + j]
+            k_output_ptr[unsafe_offset=offset + j] = my_input_ptr[
+                unsafe_offset=offset + j
+            ]
 
 
 # ===----------------------------------------------------------------------=== #
@@ -268,17 +266,18 @@ def _allgather_cpu[
 def _add_inplace_gpu[
     dtype: DType
 ](
-    dst: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    size: Int,
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
+    src: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    size_arg: Int64,
 ) -> None:
     """Accumulate `src` into `dst` elementwise in fp32 (bf16-safe)."""
+    var size = Int(size_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < size:
-        var s = (dst + idx).load().cast[DType.float32]() + (
-            src + idx
-        ).load().cast[DType.float32]()
-        (dst + idx).store(s.cast[dtype]())
+        var s = (dst.unsafe_offset(idx)).unsafe_load().cast[DType.float32]() + (
+            src.unsafe_offset(idx)
+        ).unsafe_load().cast[DType.float32]()
+        (dst.unsafe_offset(idx)).unsafe_store(s.cast[dtype]())
 
 
 comptime _ADD_BLOCK = 256
@@ -349,7 +348,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
     var ctx: DeviceContext
     var signal_buffer: DeviceBuffer[DType.uint8]
     var cpu_coordinator_ptr: Optional[
-        UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
+        Pointer[CpuCoordinator, MutUntrackedOrigin]
     ]
     # Multi-GPU staged-copy state (empty / 1-byte until ensure_comm_setup runs
     # on an NVIDIA GPU target with N >= 2).
@@ -367,8 +366,8 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         zero_stage: Int,
         ctx: DeviceContext,
         cpu_coord: Optional[
-            UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
-        ] = Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+            Pointer[CpuCoordinator, MutUntrackedOrigin]
+        ] = Optional[Pointer[CpuCoordinator, MutUntrackedOrigin]](),
     ) raises:
         self.rank = rank
         self.zero_stage = zero_stage
@@ -420,11 +419,11 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         if Self.N == 1 or not self.cpu_coordinator_ptr:
             return v
         var coord_ptr = self.cpu_coordinator_ptr.value()
-        coord_ptr[].shared_scalars[self.rank] = v
+        coord_ptr[].shared_scalars[unsafe_offset=self.rank] = v
         coord_ptr[].barrier1[].wait()
         var total = Float64(0.0)
         for i in range(Self.N):
-            total += coord_ptr[].shared_scalars[i]
+            total += coord_ptr[].shared_scalars[unsafe_offset=i]
         coord_ptr[].barrier2[].wait()
         return total
 
@@ -506,8 +505,8 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         dtype: DType
     ](
         self,
-        src: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-        dst: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        src: Pointer[Scalar[dtype], MutAnyOrigin],
+        dst: Pointer[Scalar[dtype], MutAnyOrigin],
         size: Int,
     ) raises:
         """Bitwise-OR reduce a small HOST-resident array across all ranks.
@@ -529,24 +528,24 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         """
         if Self.N == 1 or not self.cpu_coordinator_ptr:
             for i in range(size):
-                dst[i] = src[i]
+                dst[unsafe_offset=i] = src[unsafe_offset=i]
             return
         var coord_ptr = _register_and_sync[dtype, MutAnyOrigin, MutAnyOrigin](
             self.rank, self.cpu_coordinator_ptr, src, src
         )
         for i in range(size):
-            dst[i] = src[i]
+            dst[unsafe_offset=i] = src[unsafe_offset=i]
         for p in range(Self.N):
             if p == self.rank:
                 continue
-            var peer = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            var peer = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                 coord_ptr[]
-                .shared_inputs[p]
-                .bitcast[Scalar[dtype]]()
+                .shared_inputs[unsafe_offset=p]
+                .unsafe_bitcast[Scalar[dtype]]()
                 .as_unsafe_any_origin()
             )
             for i in range(size):
-                dst[i] |= peer[i]
+                dst[unsafe_offset=i] |= peer[unsafe_offset=i]
         # Hold every rank's `src` alive until all peers have finished reading
         # it, mirroring the trailing barrier of the other collectives.
         coord_ptr[].barrier2[].wait()
@@ -559,24 +558,26 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                 " ensure_comm_setup(max_shard_bytes) before GPU collectives"
             )
 
-    def signal_ptr(self) -> UnsafePointer[Signal, MutUntrackedOrigin]:
-        return rebind[UnsafePointer[Signal, MutUntrackedOrigin]](
+    def signal_ptr(self) -> Pointer[Signal, MutUntrackedOrigin]:
+        return rebind[Pointer[Signal, MutUntrackedOrigin]](
             self.signal_buffer.unsafe_ptr()
         )
 
     def get_rank_sigs_any(
         self,
-    ) -> InlineArray[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS]:
+    ) -> InlineArray[Pointer[Signal, MutAnyOrigin], MAX_GPUS]:
         var rank_sigs_any = InlineArray[
-            UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS
+            Pointer[Signal, MutAnyOrigin], MAX_GPUS
         ](uninitialized=True)
         for i in range(MAX_GPUS):
-            rank_sigs_any[i] = (self.signal_ptr() + i).as_unsafe_any_origin()
-        return rank_sigs_any
+            rank_sigs_any[i] = (
+                self.signal_ptr().unsafe_offset(i)
+            ).as_unsafe_any_origin()
+        return rank_sigs_any^
 
     def allreduce[
         dtype: DType
-    ](self, ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin], size: Int,) raises:
+    ](self, ptr: Pointer[Scalar[dtype], MutAnyOrigin], size: Int,) raises:
         comptime if is_cpu[Self.target]():
             if Self.N == 1:
                 return
@@ -614,29 +615,27 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
 
                     # Phase 1: reduce every rank's slice[rank] into my
                     # slice[rank].
-                    var scr = rebind[
-                        UnsafePointer[Scalar[dtype], MutAnyOrigin]
-                    ](
+                    var scr = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                         self.comm_scratch.unsafe_ptr()
-                        .bitcast[Scalar[dtype]]()
+                        .unsafe_bitcast[Scalar[dtype]]()
                         .as_unsafe_any_origin()
                     )
                     comptime add_k = _add_inplace_gpu[dtype]
                     var compiled_add = self.ctx.compile_function[add_k]()
-                    var my_slice = ptr + self.rank * shard
+                    var my_slice = ptr.unsafe_offset(self.rank * shard)
                     for step in range(1, Self.N):
                         var p = (self.rank + step) % Self.N
                         var peer_base = rebind[
-                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                            Pointer[Scalar[dtype], MutAnyOrigin]
                         ](
                             coord_ptr[]
-                            .shared_inputs[p]
-                            .bitcast[Scalar[dtype]]()
+                            .shared_inputs[unsafe_offset=p]
+                            .unsafe_bitcast[Scalar[dtype]]()
                             .as_unsafe_any_origin()
                         )
                         var src_view = DeviceBuffer[dtype](
                             self.peer_ctxs[p],
-                            peer_base + self.rank * shard,
+                            peer_base.unsafe_offset(self.rank * shard),
                             shard,
                             owning=False,
                         )
@@ -649,10 +648,10 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                         self.ctx.enqueue_function(
                             compiled_add,
                             my_slice,
-                            rebind[
-                                UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
-                            ](scr.as_unsafe_any_origin()),
-                            shard,
+                            rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
+                                scr.as_unsafe_any_origin()
+                            ),
+                            Int64(shard),
                             grid_dim=(ceildiv(shard, _ADD_BLOCK), 1),
                             block_dim=(_ADD_BLOCK,),
                         )
@@ -663,21 +662,24 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     for step in range(1, Self.N):
                         var p = (self.rank + step) % Self.N
                         var peer_base = rebind[
-                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                            Pointer[Scalar[dtype], MutAnyOrigin]
                         ](
                             coord_ptr[]
-                            .shared_inputs[p]
-                            .bitcast[Scalar[dtype]]()
+                            .shared_inputs[unsafe_offset=p]
+                            .unsafe_bitcast[Scalar[dtype]]()
                             .as_unsafe_any_origin()
                         )
                         var src_view = DeviceBuffer[dtype](
                             self.peer_ctxs[p],
-                            peer_base + p * shard,
+                            peer_base.unsafe_offset(p * shard),
                             shard,
                             owning=False,
                         )
                         var dst_view = DeviceBuffer[dtype](
-                            self.ctx, ptr + p * shard, shard, owning=False
+                            self.ctx,
+                            ptr.unsafe_offset(p * shard),
+                            shard,
+                            owning=False,
                         )
                         self.ctx.enqueue_copy(
                             dst_buf=dst_view, src_buf=src_view
@@ -694,14 +696,14 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         dtype: DType
     ](
         self,
-        input_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-        output_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        input_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+        output_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         sharded_size: Int,
     ) raises:
         comptime if is_cpu[Self.target]():
             if Self.N == 1:
                 for j in range(sharded_size):
-                    output_ptr[j] = input_ptr[j]
+                    output_ptr[unsafe_offset=j] = input_ptr[unsafe_offset=j]
                 return
             if not self.cpu_coordinator_ptr:
                 return
@@ -740,20 +742,16 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     # Own slice seeds the accumulator (same-device copy).
                     self.ctx.enqueue_copy(
                         dst_ptr=output_ptr,
-                        src_ptr=rebind[
-                            UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
-                        ](
+                        src_ptr=rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
                             (
-                                input_ptr + self.rank * shard
+                                input_ptr.unsafe_offset(self.rank * shard)
                             ).as_unsafe_any_origin()
                         ),
                         size=shard,
                     )
-                    var scr = rebind[
-                        UnsafePointer[Scalar[dtype], MutAnyOrigin]
-                    ](
+                    var scr = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                         self.comm_scratch.unsafe_ptr()
-                        .bitcast[Scalar[dtype]]()
+                        .unsafe_bitcast[Scalar[dtype]]()
                         .as_unsafe_any_origin()
                     )
                     comptime add_k = _add_inplace_gpu[dtype]
@@ -761,16 +759,16 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     for step in range(1, Self.N):
                         var p = (self.rank + step) % Self.N
                         var peer_base = rebind[
-                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                            Pointer[Scalar[dtype], MutAnyOrigin]
                         ](
                             coord_ptr[]
-                            .shared_inputs[p]
-                            .bitcast[Scalar[dtype]]()
+                            .shared_inputs[unsafe_offset=p]
+                            .unsafe_bitcast[Scalar[dtype]]()
                             .as_unsafe_any_origin()
                         )
                         var src_view = DeviceBuffer[dtype](
                             self.peer_ctxs[p],
-                            peer_base + self.rank * shard,
+                            peer_base.unsafe_offset(self.rank * shard),
                             shard,
                             owning=False,
                         )
@@ -783,10 +781,10 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                         self.ctx.enqueue_function(
                             compiled_add,
                             output_ptr,
-                            rebind[
-                                UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
-                            ](scr.as_unsafe_any_origin()),
-                            shard,
+                            rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
+                                scr.as_unsafe_any_origin()
+                            ),
+                            Int64(shard),
                             grid_dim=(ceildiv(shard, _ADD_BLOCK), 1),
                             block_dim=(_ADD_BLOCK,),
                         )
@@ -800,7 +798,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
 
     def reducescatter_inplace[
         dtype: DType
-    ](self, ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin], size: Int,) raises:
+    ](self, ptr: Pointer[Scalar[dtype], MutAnyOrigin], size: Int,) raises:
         """In-place reduce-scatter: rank r's shard [r*shard, (r+1)*shard) of
         `ptr` is overwritten with the cross-rank SUM of that slice; every other
         slice is left holding this rank's local (unreduced) contribution.
@@ -826,7 +824,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                 self.rank,
                 Self.N,
                 shard,
-                (ptr + self.rank * shard).as_unsafe_any_origin(),
+                (ptr.unsafe_offset(self.rank * shard)).as_unsafe_any_origin(),
                 coord_ptr,
             )
             coord_ptr[].barrier2[].wait()
@@ -844,29 +842,27 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                         dtype, MutAnyOrigin, MutAnyOrigin
                     ](self.rank, self.cpu_coordinator_ptr, ptr, ptr)
 
-                    var scr = rebind[
-                        UnsafePointer[Scalar[dtype], MutAnyOrigin]
-                    ](
+                    var scr = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                         self.comm_scratch.unsafe_ptr()
-                        .bitcast[Scalar[dtype]]()
+                        .unsafe_bitcast[Scalar[dtype]]()
                         .as_unsafe_any_origin()
                     )
                     comptime add_k = _add_inplace_gpu[dtype]
                     var compiled_add = self.ctx.compile_function[add_k]()
-                    var my_slice = ptr + self.rank * shard
+                    var my_slice = ptr.unsafe_offset(self.rank * shard)
                     for step in range(1, Self.N):
                         var p = (self.rank + step) % Self.N
                         var peer_base = rebind[
-                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                            Pointer[Scalar[dtype], MutAnyOrigin]
                         ](
                             coord_ptr[]
-                            .shared_inputs[p]
-                            .bitcast[Scalar[dtype]]()
+                            .shared_inputs[unsafe_offset=p]
+                            .unsafe_bitcast[Scalar[dtype]]()
                             .as_unsafe_any_origin()
                         )
                         var src_view = DeviceBuffer[dtype](
                             self.peer_ctxs[p],
-                            peer_base + self.rank * shard,
+                            peer_base.unsafe_offset(self.rank * shard),
                             shard,
                             owning=False,
                         )
@@ -879,10 +875,10 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                         self.ctx.enqueue_function(
                             compiled_add,
                             my_slice,
-                            rebind[
-                                UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
-                            ](scr.as_unsafe_any_origin()),
-                            shard,
+                            rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
+                                scr.as_unsafe_any_origin()
+                            ),
+                            Int64(shard),
                             grid_dim=(ceildiv(shard, _ADD_BLOCK), 1),
                             block_dim=(_ADD_BLOCK,),
                         )
@@ -898,11 +894,11 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         dtype: DType
     ](
         self,
-        pool_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        pool_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         dest_starts: List[Int],
         pool_offsets: List[Int],
         lengths: List[Int],
-        shard_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        shard_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         opt: Int,
     ) raises:
         """Bucketed reduce-scatter for ZeRO-2/3 backward gradient bucketing.
@@ -937,7 +933,9 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     var d = dest_starts[b]
                     var po = pool_offsets[b]
                     for j in range(lengths[b]):
-                        shard_ptr[d + j] += pool_ptr[po + j]
+                        shard_ptr[unsafe_offset=d + j] += pool_ptr[
+                            unsafe_offset=po + j
+                        ]
                 return
             if not self.cpu_coordinator_ptr:
                 # N > 1 with no coordinator (the sequential-rank equivalence
@@ -953,7 +951,9 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     var f0 = max(d, lo)
                     var f1 = min(d + lengths[b], hi)
                     for f in range(f0, f1):
-                        shard_ptr[f - lo] += pool_ptr[po + (f - d)]
+                        shard_ptr[unsafe_offset=f - lo] += pool_ptr[
+                            unsafe_offset=po + (f - d)
+                        ]
                 return
             var coord_ptr = _register_and_sync[
                 dtype, MutAnyOrigin, MutAnyOrigin
@@ -971,10 +971,10 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     var sum_val = Scalar[dtype](0.0)
                     for k in range(Self.N):
                         var k_pool = rebind[
-                            UnsafePointer[Scalar[dtype], MutUntrackedOrigin]
-                        ](coord_ptr[].shared_inputs[k])
-                        sum_val += k_pool[po + (f - d)]
-                    shard_ptr[f - lo] += sum_val
+                            Pointer[Scalar[dtype], MutUntrackedOrigin]
+                        ](coord_ptr[].shared_inputs[unsafe_offset=k])
+                        sum_val += k_pool[unsafe_offset=po + (f - d)]
+                    shard_ptr[unsafe_offset=f - lo] += sum_val
             coord_ptr[].barrier2[].wait()
         else:
             comptime if Self.N >= 2:
@@ -997,11 +997,11 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         dtype: DType
     ](
         self,
-        pool_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        pool_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         dest_starts: List[Int],
         pool_offsets: List[Int],
         lengths: List[Int],
-        shard_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        shard_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         opt: Int,
     ) raises:
         """Staged-copy GPU path for `reducescatter_buckets`.
@@ -1027,14 +1027,14 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             self.rank, self.cpu_coordinator_ptr, pool_ptr, shard_ptr
         )
 
-        var acc = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+        var acc = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
             self.comm_scratch.unsafe_ptr()
-            .bitcast[Scalar[dtype]]()
+            .unsafe_bitcast[Scalar[dtype]]()
             .as_unsafe_any_origin()
         )
-        var stg = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+        var stg = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
             self.comm_scratch2.unsafe_ptr()
-            .bitcast[Scalar[dtype]]()
+            .unsafe_bitcast[Scalar[dtype]]()
             .as_unsafe_any_origin()
         )
         comptime add_k = _add_inplace_gpu[dtype]
@@ -1053,24 +1053,22 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             # Seed accumulator with my own pool slice (same-device copy).
             self.ctx.enqueue_copy(
                 dst_ptr=acc,
-                src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
-                    (pool_ptr + my_pool_off).as_unsafe_any_origin()
+                src_ptr=rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
+                    (pool_ptr.unsafe_offset(my_pool_off)).as_unsafe_any_origin()
                 ),
                 size=seg,
             )
             for step in range(1, Self.N):
                 var p = (self.rank + step) % Self.N
-                var peer_base = rebind[
-                    UnsafePointer[Scalar[dtype], MutAnyOrigin]
-                ](
+                var peer_base = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                     coord_ptr[]
-                    .shared_inputs[p]
-                    .bitcast[Scalar[dtype]]()
+                    .shared_inputs[unsafe_offset=p]
+                    .unsafe_bitcast[Scalar[dtype]]()
                     .as_unsafe_any_origin()
                 )
                 var src_view = DeviceBuffer[dtype](
                     self.peer_ctxs[p],
-                    peer_base + my_pool_off,
+                    peer_base.unsafe_offset(my_pool_off),
                     seg,
                     owning=False,
                 )
@@ -1081,21 +1079,21 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                 self.ctx.enqueue_function(
                     compiled_add,
                     acc,
-                    rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+                    rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
                         stg.as_unsafe_any_origin()
                     ),
-                    seg,
+                    Int64(seg),
                     grid_dim=(ceildiv(seg, _ADD_BLOCK), 1),
                     block_dim=(_ADD_BLOCK,),
                 )
             # Accumulate the reduced slice into my shard: shard[f0-lo] += acc.
             self.ctx.enqueue_function(
                 compiled_add,
-                shard_ptr + (f0 - lo),
-                rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+                shard_ptr.unsafe_offset((f0 - lo)),
+                rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
                     acc.as_unsafe_any_origin()
                 ),
-                seg,
+                Int64(seg),
                 grid_dim=(ceildiv(seg, _ADD_BLOCK), 1),
                 block_dim=(_ADD_BLOCK,),
             )
@@ -1106,7 +1104,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         dtype: DType
     ](
         self,
-        ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         sharded_size: Int,
     ) raises:
         comptime if is_cpu[Self.target]():
@@ -1140,21 +1138,24 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     for step in range(1, Self.N):
                         var p = (self.rank + step) % Self.N
                         var peer_base = rebind[
-                            UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                            Pointer[Scalar[dtype], MutAnyOrigin]
                         ](
                             coord_ptr[]
-                            .shared_inputs[p]
-                            .bitcast[Scalar[dtype]]()
+                            .shared_inputs[unsafe_offset=p]
+                            .unsafe_bitcast[Scalar[dtype]]()
                             .as_unsafe_any_origin()
                         )
                         var src_view = DeviceBuffer[dtype](
                             self.peer_ctxs[p],
-                            peer_base + p * shard,
+                            peer_base.unsafe_offset(p * shard),
                             shard,
                             owning=False,
                         )
                         var dst_view = DeviceBuffer[dtype](
-                            self.ctx, ptr + p * shard, shard, owning=False
+                            self.ctx,
+                            ptr.unsafe_offset(p * shard),
+                            shard,
+                            owning=False,
                         )
                         self.ctx.enqueue_copy(
                             dst_buf=dst_view, src_buf=src_view
@@ -1171,9 +1172,9 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         dtype: DType
     ](
         self,
-        shard_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        shard_base: Pointer[Scalar[dtype], MutAnyOrigin],
         shard_size: Int,
-        dst_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+        dst_base: Pointer[Scalar[dtype], MutAnyOrigin],
         dst_offsets: List[Int],
         flat_starts: List[Int],
         lengths: List[Int],
@@ -1205,9 +1206,9 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                 # Single rank owns the whole vector at local offset 0.
                 for i in range(count):
                     var fs = flat_starts[i]
-                    var d = dst_base + dst_offsets[i]
+                    var d = dst_base.unsafe_offset(dst_offsets[i])
                     for j in range(lengths[i]):
-                        d[j] = shard_base[fs + j]
+                        d[unsafe_offset=j] = shard_base[unsafe_offset=fs + j]
                 return
             var coord_ptr = _register_and_sync[
                 dtype, MutAnyOrigin, MutAnyOrigin
@@ -1215,24 +1216,24 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             for i in range(count):
                 var fs = flat_starts[i]
                 var ln = lengths[i]
-                var d = dst_base + dst_offsets[i]
+                var d = dst_base.unsafe_offset(dst_offsets[i])
                 for p in range(Self.N):
                     var lo = max(fs, p * shard_size)
                     var hi = min(fs + ln, (p + 1) * shard_size)
                     if hi <= lo:
                         continue
-                    var peer = rebind[
-                        UnsafePointer[Scalar[dtype], MutAnyOrigin]
-                    ](
+                    var peer = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                         coord_ptr[]
-                        .shared_inputs[p]
-                        .bitcast[Scalar[dtype]]()
+                        .shared_inputs[unsafe_offset=p]
+                        .unsafe_bitcast[Scalar[dtype]]()
                         .as_unsafe_any_origin()
                     )
                     var d_off = lo - fs
                     var s_off = lo - p * shard_size
                     for j in range(hi - lo):
-                        d[d_off + j] = peer[s_off + j]
+                        d[unsafe_offset=d_off + j] = peer[
+                            unsafe_offset=s_off + j
+                        ]
             coord_ptr[].barrier2[].wait()
         else:
             comptime if Self.N >= 2:
@@ -1254,33 +1255,37 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                             if hi <= lo:
                                 continue
                             var n = hi - lo
-                            var d = dst_base + dst_offsets[i] + (lo - fs)
+                            var d = (
+                                dst_base.unsafe_offset(dst_offsets[i])
+                            ).unsafe_offset((lo - fs))
                             if p == self.rank:
                                 self.ctx.enqueue_copy(
                                     dst_ptr=d,
                                     src_ptr=rebind[
-                                        UnsafePointer[
-                                            Scalar[dtype], ImmutAnyOrigin
-                                        ]
+                                        Pointer[Scalar[dtype], ImmutAnyOrigin]
                                     ](
                                         (
-                                            shard_base + (lo - p * shard_size)
+                                            shard_base.unsafe_offset(
+                                                (lo - p * shard_size)
+                                            )
                                         ).as_unsafe_any_origin()
                                     ),
                                     size=n,
                                 )
                             else:
                                 var peer_base = rebind[
-                                    UnsafePointer[Scalar[dtype], MutAnyOrigin]
+                                    Pointer[Scalar[dtype], MutAnyOrigin]
                                 ](
                                     coord_ptr[]
-                                    .shared_inputs[p]
-                                    .bitcast[Scalar[dtype]]()
+                                    .shared_inputs[unsafe_offset=p]
+                                    .unsafe_bitcast[Scalar[dtype]]()
                                     .as_unsafe_any_origin()
                                 )
                                 var src_view = DeviceBuffer[dtype](
                                     self.peer_ctxs[p],
-                                    peer_base + (lo - p * shard_size),
+                                    peer_base.unsafe_offset(
+                                        (lo - p * shard_size)
+                                    ),
                                     n,
                                     owning=False,
                                 )
@@ -1301,10 +1306,12 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                 # N == 1 GPU: own buffer holds the whole vector at offset 0.
                 for i in range(count):
                     self.ctx.enqueue_copy(
-                        dst_ptr=dst_base + dst_offsets[i],
-                        src_ptr=rebind[
-                            UnsafePointer[Scalar[dtype], ImmutAnyOrigin]
-                        ]((shard_base + flat_starts[i]).as_unsafe_any_origin()),
+                        dst_ptr=dst_base.unsafe_offset(dst_offsets[i]),
+                        src_ptr=rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
+                            (
+                                shard_base.unsafe_offset(flat_starts[i])
+                            ).as_unsafe_any_origin()
+                        ),
                         size=lengths[i],
                     )
                 self.ctx.synchronize()
@@ -1382,7 +1389,7 @@ struct ShardedParameter[
         self,
         zero_ctx: ZeroContext[Self.target, Self.N_GPUS],
         all_sharded_buffers: InlineArray[
-            UnsafePointer[Scalar[Self.dtype], MutUntrackedOrigin], Self.N_GPUS
+            Pointer[Scalar[Self.dtype], MutUntrackedOrigin], Self.N_GPUS
         ],
         in_tensor_layout: in_layout,
         out_tensor_layout: out_layout,
@@ -1396,7 +1403,7 @@ struct ShardedParameter[
                 var dest_ptr = full_buffer.unsafe_ptr()
                 var src_ptr = all_sharded_buffers[0]
                 for j in range(self.size):
-                    dest_ptr[j] = src_ptr[j]
+                    dest_ptr[unsafe_offset=j] = src_ptr[unsafe_offset=j]
                 return full_buffer
             if not zero_ctx.cpu_coordinator_ptr:
                 return full_buffer
@@ -1414,21 +1421,23 @@ struct ShardedParameter[
             var offset = zero_ctx.rank * self.sharded_size
             for k in range(Self.N_GPUS):
                 var k_output_ptr = rebind[
-                    UnsafePointer[Scalar[Self.dtype], MutUntrackedOrigin]
-                ](coord_ptr[].shared_outputs[k])
+                    Pointer[Scalar[Self.dtype], MutUntrackedOrigin]
+                ](coord_ptr[].shared_outputs[unsafe_offset=k])
                 var my_input_ptr = rebind[
-                    UnsafePointer[Scalar[Self.dtype], MutUntrackedOrigin]
-                ](coord_ptr[].shared_inputs[zero_ctx.rank])
+                    Pointer[Scalar[Self.dtype], MutUntrackedOrigin]
+                ](coord_ptr[].shared_inputs[unsafe_offset=zero_ctx.rank])
                 for j in range(self.sharded_size):
-                    k_output_ptr[offset + j] = my_input_ptr[j]
+                    k_output_ptr[unsafe_offset=offset + j] = my_input_ptr[
+                        unsafe_offset=j
+                    ]
             coord_ptr[].barrier2[].wait()
         else:
             comptime if Self.N_GPUS == 1:
                 var dest_ptr = rebind[
-                    UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+                    Pointer[Scalar[Self.dtype], MutAnyOrigin]
                 ](full_buffer.unsafe_ptr().as_unsafe_any_origin())
                 var src_ptr = rebind[
-                    UnsafePointer[Scalar[Self.dtype], ImmutAnyOrigin]
+                    Pointer[Scalar[Self.dtype], ImmutAnyOrigin]
                 ](all_sharded_buffers[0].as_unsafe_any_origin())
                 zero_ctx.ctx.enqueue_copy(
                     dst_ptr=dest_ptr,
@@ -1447,7 +1456,7 @@ struct ShardedParameter[
                     var out_tile = TileTensor(
                         Span[Scalar[Self.dtype], MutAnyOrigin](
                             unsafe_ptr=rebind[
-                                UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+                                Pointer[Scalar[Self.dtype], MutAnyOrigin]
                             ](full_buffer.unsafe_ptr().as_unsafe_any_origin()),
                             length=self.size,
                         ),
@@ -1463,9 +1472,7 @@ struct ShardedParameter[
                         input_tensors[i] = TileTensor(
                             Span[Scalar[Self.dtype], ImmutAnyOrigin](
                                 unsafe_ptr=rebind[
-                                    UnsafePointer[
-                                        Scalar[Self.dtype], ImmutAnyOrigin
-                                    ]
+                                    Pointer[Scalar[Self.dtype], ImmutAnyOrigin]
                                 ](
                                     all_sharded_buffers[
                                         i
@@ -1478,11 +1485,11 @@ struct ShardedParameter[
                         output_tensors[i] = out_tile
 
                     var rank_sigs_any = InlineArray[
-                        UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS
+                        Pointer[Signal, MutAnyOrigin], MAX_GPUS
                     ](uninitialized=True)
                     for i in range(MAX_GPUS):
                         rank_sigs_any[i] = (
-                            zero_ctx.signal_ptr() + i
+                            zero_ctx.signal_ptr().unsafe_offset(i)
                         ).as_unsafe_any_origin()
 
                     allgather[

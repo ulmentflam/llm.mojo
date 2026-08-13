@@ -157,7 +157,7 @@ $(PIXI_STAMP):
 
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        typecheck check clean build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
+        typecheck check compile-rest clean build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
@@ -191,7 +191,8 @@ help:
 	@echo "        (build/lint/check self-heal a stale env automatically)."
 	@echo ""
 	@echo "Quality gates:"
-	@echo "  check         Run lint (incl. typecheck), build-mojo, build train_gpt2, and build-profile"
+	@echo "  check         Run lint (incl. typecheck), build-mojo, build train_gpt2, build-profile, compile-rest"
+	@echo "  compile-rest  Compile-only pass over the benches/tools no other target builds"
 	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
 	@echo "  build-train   Alias for build"
 	@echo "  train         Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
@@ -365,7 +366,41 @@ install-hooks:
 		echo "  note: pre-commit is not in the pixi env yet — run 'make install' (or 'pixi install')."; \
 	fi
 
-check: lint build-mojo build build-profile
+check: lint build-mojo build build-profile compile-rest
+
+# Every first-party .mojo entrypoint that nothing else in the gate compiles.
+#
+# This exists because Mojo 1.0 removed `fn`, and the tree's last `fn` sat
+# undetected in bench_gemm_vocab_tiles.mojo through a full green gate: `check`
+# builds train_gpt2 and profile_gpt2, `test-mojo` builds tests/test_*.mojo, and
+# between them the benches, the calibration tool, the gradient dumper, the
+# inference binary and the reference checker are compiled by NOTHING. A
+# toolchain break in any of them is invisible until someone runs that tool by
+# hand, which for a bench is typically months later.
+#
+# Compile-only (-o /dev/null): these have no tests, and the point is to prove
+# they still build. calibrate_fp8_scales.mojo is listed separately because it
+# `comptime assert`s its precision and cannot build without the fp8 define.
+#
+# tests/probe_fp8/ is deliberately NOT covered: those are investigation
+# artifacts recording what the toolchain could not do at the time (see their
+# RESULTS.md), and probe1_dtype / probe3_max_gemm_fp8 / probe4*_cublaslt_* do
+# not compile ON PURPOSE. Gating on them would mean a red board by design.
+COMPILE_ONLY_MOJO := bench_collectives.mojo bench_gemm.mojo \
+                     bench_gemm_vocab_tiles.mojo dump_grads_gpt2.mojo \
+                     infer_gpt2.mojo test_gpt2.mojo
+
+compile-rest: | $(PIXI_STAMP)
+	@fail=0; \
+	for f in $(COMPILE_ONLY_MOJO); do \
+		echo "==> compile-only: $$f"; \
+		$(PIXI) run mojo build $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) \
+			-o /dev/null "$$f" || fail=1; \
+	done; \
+	echo "==> compile-only: calibrate_fp8_scales.mojo (-D LLMM_PRECISION=fp8)"; \
+	$(PIXI) run mojo build -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) \
+		$(MOJO_LINK_FLAGS) -o /dev/null calibrate_fp8_scales.mojo || fail=1; \
+	exit $$fail
 
 # Compiles the GPT-2 training binary. MOJO_PYTHON_LIBRARY must be set because
 # DataLoader uses Python glob; pixi run supplies the Modular std/toolchain env.

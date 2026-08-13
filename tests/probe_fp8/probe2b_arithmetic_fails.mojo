@@ -12,7 +12,7 @@
 # RESULTS.md) — this is a general GPU fp8-elementwise-compute gap, not
 # specific to e4m3, scalar-vs-SIMD, or this particular expression.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import block_dim, block_idx, thread_idx
 from std.sys import has_nvidia_gpu_accelerator
 
@@ -20,8 +20,9 @@ from std.sys import has_nvidia_gpu_accelerator
 def _mini_kernel(
     out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     x_ptr: UnsafePointer[Scalar[DType.float8_e4m3fn], ImmutAnyOrigin],
-    n: Int,
+    n_arg: Int64,
 ) -> None:
+    var n = Int(n_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < n:
         var x = x_ptr[idx].cast[DType.float32]()
@@ -42,7 +43,7 @@ def main() raises:
         compiled,
         dev_out.unsafe_ptr(),
         dev_in.unsafe_ptr(),
-        N,
+        Int64(N),
         grid_dim=(1,),
         block_dim=(32,),
     )

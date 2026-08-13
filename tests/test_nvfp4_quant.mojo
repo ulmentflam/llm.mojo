@@ -266,9 +266,9 @@ def _quantize_roundtrip_case[
 
     var host_bf16 = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
     for i in range(n):
-        host_bf16.unsafe_ptr()[i] = host_fp32.unsafe_ptr()[i].cast[
-            DType.bfloat16
-        ]()
+        host_bf16.unsafe_ptr()[unsafe_offset=i] = host_fp32.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.bfloat16]()
 
     var x_dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     x_dev.enqueue_copy_from(host_bf16)
@@ -312,7 +312,7 @@ def _quantize_roundtrip_case[
         host_recon.unsafe_ptr(),
         host_q.unsafe_ptr().as_imm(),
         host_scale.unsafe_ptr().as_imm(),
-        host_tensor_scale.unsafe_ptr()[0],
+        host_tensor_scale.unsafe_ptr()[unsafe_offset=0],
         rows,
         k,
     )
@@ -320,8 +320,8 @@ def _quantize_roundtrip_case[
     var sq_err = Float64(0.0)
     var sq_ref = Float64(0.0)
     for i in range(n):
-        var orig = Float64(host_fp32.unsafe_ptr()[i])
-        var got = Float64(host_recon.unsafe_ptr()[i])
+        var orig = Float64(host_fp32.unsafe_ptr()[unsafe_offset=i])
+        var got = Float64(host_recon.unsafe_ptr()[unsafe_offset=i])
         var e = got - orig
         sq_err += e * e
         sq_ref += orig * orig
@@ -383,12 +383,12 @@ def _transpose_matches_materialized_case[
         var s = Float32(0.0)
         for _ in range(12):
             s += rng.randfloat32()
-        host_src_fp32.unsafe_ptr()[i] = (s - 6.0) * Float32(1.0)
+        host_src_fp32.unsafe_ptr()[unsafe_offset=i] = (s - 6.0) * Float32(1.0)
     var host_src_bf16 = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
     for i in range(n):
-        host_src_bf16.unsafe_ptr()[i] = host_src_fp32.unsafe_ptr()[i].cast[
-            DType.bfloat16
-        ]()
+        host_src_bf16.unsafe_ptr()[
+            unsafe_offset=i
+        ] = host_src_fp32.unsafe_ptr()[unsafe_offset=i].cast[DType.bfloat16]()
 
     # Materialize the transpose host-side: T[i,j] = src[j,i], T is
     # [src_k, src_rows] row-major.
@@ -396,8 +396,8 @@ def _transpose_matches_materialized_case[
     for i in range(src_k):
         for j in range(src_rows):
             host_t_bf16.unsafe_ptr()[
-                i * src_rows + j
-            ] = host_src_bf16.unsafe_ptr()[j * src_k + i]
+                unsafe_offset=i * src_rows + j
+            ] = host_src_bf16.unsafe_ptr()[unsafe_offset=j * src_k + i]
 
     var x_dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     x_dev.enqueue_copy_from(host_src_bf16)
@@ -475,18 +475,19 @@ def _transpose_matches_materialized_case[
     ctx.synchronize()
 
     assert_equal(
-        host_tscale_transpose.unsafe_ptr()[0], host_tscale_ref.unsafe_ptr()[0]
+        host_tscale_transpose.unsafe_ptr()[unsafe_offset=0],
+        host_tscale_ref.unsafe_ptr()[unsafe_offset=0],
     )
     for i in range(q_size):
         assert_equal(
-            host_q_transpose.unsafe_ptr()[i],
-            host_q_ref.unsafe_ptr()[i],
+            host_q_transpose.unsafe_ptr()[unsafe_offset=i],
+            host_q_ref.unsafe_ptr()[unsafe_offset=i],
             "packed e2m1 byte mismatch at " + String(i),
         )
     for i in range(scale_size):
         assert_equal(
-            host_scale_transpose.unsafe_ptr()[i],
-            host_scale_ref.unsafe_ptr()[i],
+            host_scale_transpose.unsafe_ptr()[unsafe_offset=i],
+            host_scale_ref.unsafe_ptr()[unsafe_offset=i],
             "swizzled e4m3 scale byte mismatch at " + String(i),
         )
 
@@ -550,7 +551,9 @@ def test_quantize_all_zero_tensor_gpu() raises:
 
     var host_bf16 = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
     for i in range(n):
-        host_bf16.unsafe_ptr()[i] = Float32(0.0).cast[DType.bfloat16]()
+        host_bf16.unsafe_ptr()[unsafe_offset=i] = Float32(0.0).cast[
+            DType.bfloat16
+        ]()
     var x_dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     x_dev.enqueue_copy_from(host_bf16)
 
@@ -587,9 +590,9 @@ def test_quantize_all_zero_tensor_gpu() raises:
     ctx.synchronize()
 
     # No div-by-zero/NaN fallback: tensor_scale falls back to 1.0.
-    assert_equal(host_tensor_scale.unsafe_ptr()[0], Float32(1.0))
+    assert_equal(host_tensor_scale.unsafe_ptr()[unsafe_offset=0], Float32(1.0))
     for i in range(q_size):
-        var byte = host_q.unsafe_ptr()[i]
+        var byte = host_q.unsafe_ptr()[unsafe_offset=i]
         assert_equal(Int(unpack_e2m1x2_lo(byte)) & 0x7, 0)
         assert_equal(Int(unpack_e2m1x2_hi(byte)) & 0x7, 0)
 
@@ -604,15 +607,15 @@ def test_quantize_large_outlier_no_overflow_gpu() raises:
 
     var host_fp32 = ctx.enqueue_create_host_buffer[DType.float32](n)
     for i in range(n):
-        host_fp32.unsafe_ptr()[i] = 0.001
+        host_fp32.unsafe_ptr()[unsafe_offset=i] = 0.001
     # One extreme outlier drives a huge block amax.
-    host_fp32.unsafe_ptr()[0] = 1.0e6
+    host_fp32.unsafe_ptr()[unsafe_offset=0] = 1.0e6
 
     var host_bf16 = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
     for i in range(n):
-        host_bf16.unsafe_ptr()[i] = host_fp32.unsafe_ptr()[i].cast[
-            DType.bfloat16
-        ]()
+        host_bf16.unsafe_ptr()[unsafe_offset=i] = host_fp32.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.bfloat16]()
     var x_dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     x_dev.enqueue_copy_from(host_bf16)
 
@@ -655,13 +658,13 @@ def test_quantize_large_outlier_no_overflow_gpu() raises:
         host_recon.unsafe_ptr(),
         host_q.unsafe_ptr().as_imm(),
         host_scale.unsafe_ptr().as_imm(),
-        host_tensor_scale.unsafe_ptr()[0],
+        host_tensor_scale.unsafe_ptr()[unsafe_offset=0],
         rows,
         k,
     )
 
     for i in range(n):
-        var v = host_recon.unsafe_ptr()[i]
+        var v = host_recon.unsafe_ptr()[unsafe_offset=i]
         assert_true(v == v)  # not NaN
         assert_true(v > -1.0e8 and v < 1.0e8)  # not +/-inf-ish
 

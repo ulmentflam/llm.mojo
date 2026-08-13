@@ -2,9 +2,8 @@ from extensibility import register
 from layout import Layout
 from std.math import ceildiv
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
-from std.gpu.host import DeviceAttribute
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
 from std.sys import simd_width_of, align_of
 from std.gpu.host.info import is_cpu, is_gpu
 from layout.layout_tensor import LayoutTensor
@@ -12,15 +11,9 @@ from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
 from std.runtime.asyncrt import parallelism_level
-from std.algorithm import vectorize, sync_parallelize
-from std.gpu import (
-    barrier,
-    block_dim,
-    block_idx,
-    grid_dim,
-    thread_idx,
-    WARP_SIZE,
-)
+from std.algorithm import vectorize
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx, WARP_SIZE
+from max.gpu import barrier
 
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
@@ -77,13 +70,19 @@ def _encoder_fwd_vector_slice[
     # unaligned default.
     comptime if aligned:
         comptime align = align_of[SIMD[dtype, width]]()
-        var wte_val = (wte_row_ptr + c).load[width=width, alignment=align]()
-        var wpe_val = (wpe_row_ptr + c).load[width=width, alignment=align]()
-        (out_row_ptr + c).store[width=width, alignment=align](wte_val + wpe_val)
+        var wte_val = (wte_row_ptr.unsafe_offset(c)).unsafe_load[
+            width=width, alignment=align
+        ]()
+        var wpe_val = (wpe_row_ptr.unsafe_offset(c)).unsafe_load[
+            width=width, alignment=align
+        ]()
+        (out_row_ptr.unsafe_offset(c)).unsafe_store[
+            width=width, alignment=align
+        ](wte_val + wpe_val)
     else:
-        var wte_val = (wte_row_ptr + c).load[width=width]()
-        var wpe_val = (wpe_row_ptr + c).load[width=width]()
-        (out_row_ptr + c).store(wte_val + wpe_val)
+        var wte_val = (wte_row_ptr.unsafe_offset(c)).unsafe_load[width=width]()
+        var wpe_val = (wpe_row_ptr.unsafe_offset(c)).unsafe_load[width=width]()
+        (out_row_ptr.unsafe_offset(c)).unsafe_store(wte_val + wpe_val)
 
 
 def encoder_fwd_cpu[
@@ -111,11 +110,11 @@ def encoder_fwd_cpu[
         for local_row in range(count_row):
             var bt = base_row + local_row
             var t = bt % seq_len
-            var ix = Int((inp_ptr + bt).load())
+            var ix = Int((inp_ptr.unsafe_offset(bt)).unsafe_load())
 
-            var out_row = out_ptr + bt * channels
-            var wte_row = wte_ptr + ix * channels
-            var wpe_row = wpe_ptr + t * channels
+            var out_row = out_ptr.unsafe_offset(bt * channels)
+            var wte_row = wte_ptr.unsafe_offset(ix * channels)
+            var wpe_row = wpe_ptr.unsafe_offset(t * channels)
 
             @always_inline
             def _simd[simd_w: Int](c: Int) {out_row, wte_row, wpe_row}:
@@ -151,7 +150,7 @@ def encoder_fwd_gpu_kernel[
     var bt = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var t = bt % seq_len
-    var ix = Int((inp_ptr + bt).load())
+    var ix = Int((inp_ptr.unsafe_offset(bt)).unsafe_load())
 
     comptime if aligned:
         var c_base = Int(block_idx.y) * Int(block_dim.x) * width
@@ -162,17 +161,17 @@ def encoder_fwd_gpu_kernel[
 
         if c + width <= channels:
             _encoder_fwd_vector_slice[dtype, width, aligned=True](
-                out_ptr + bt * channels,
-                wte_ptr + ix * channels,
-                wpe_ptr + t * channels,
+                out_ptr.unsafe_offset(bt * channels),
+                wte_ptr.unsafe_offset(ix * channels),
+                wpe_ptr.unsafe_offset(t * channels),
                 c,
             )
         else:
             for i in range(c, channels):
                 _encoder_fwd_vector_slice[dtype, 1](
-                    out_ptr + bt * channels,
-                    wte_ptr + ix * channels,
-                    wpe_ptr + t * channels,
+                    out_ptr.unsafe_offset(bt * channels),
+                    wte_ptr.unsafe_offset(ix * channels),
+                    wpe_ptr.unsafe_offset(t * channels),
                     i,
                 )
     else:
@@ -180,9 +179,9 @@ def encoder_fwd_gpu_kernel[
         if c >= channels:
             return
         _encoder_fwd_vector_slice[dtype, 1](
-            out_ptr + bt * channels,
-            wte_ptr + ix * channels,
-            wpe_ptr + t * channels,
+            out_ptr.unsafe_offset(bt * channels),
+            wte_ptr.unsafe_offset(ix * channels),
+            wpe_ptr.unsafe_offset(t * channels),
             c,
         )
 
@@ -197,9 +196,11 @@ def encoder_fwd_gpu[
     inp_ptr: ImmutKernelPtr[DType.int32],
     wte_ptr: ImmutKernelPtr[dtype],
     wpe_ptr: ImmutKernelPtr[dtype],
-    seq_len: Int,
-    channels: Int,
+    seq_len_arg: Int64,
+    channels_arg: Int64,
 ) -> None:
+    var seq_len = Int(seq_len_arg)
+    var channels = Int(channels_arg)
     encoder_fwd_gpu_kernel[dtype, width, aligned=aligned](
         out_ptr, inp_ptr, wte_ptr, wpe_ptr, seq_len, channels
     )
@@ -254,8 +255,8 @@ def encoder_fwd[
                 inp_ptr,
                 wte_ptr,
                 wpe_ptr,
-                seq_len,
-                channels,
+                Int64(seq_len),
+                Int64(channels),
                 grid_dim=(grid_x, grid_y),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -271,8 +272,8 @@ def encoder_fwd[
                 inp_ptr,
                 wte_ptr,
                 wpe_ptr,
-                seq_len,
-                channels,
+                Int64(seq_len),
+                Int64(channels),
                 grid_dim=(grid_x, grid_y_u),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -342,7 +343,7 @@ def bitmap_words(vocab_size: Int) -> Int:
 
 @always_inline
 def _bitmap_test(bitmap_ptr: ImmutKernelPtr[DType.uint32], idx: Int) -> Bool:
-    var word = bitmap_ptr.load(idx >> 5)
+    var word = bitmap_ptr.unsafe_load(idx >> 5)
     return ((word >> Scalar[DType.uint32](idx & 31)) & 1) != 0
 
 
@@ -355,15 +356,15 @@ def build_token_bitmap(
     """Set one bit per distinct token id present in this rank's batch."""
     var words = bitmap_words(vocab_size)
     for w in range(words):
-        bitmap_ptr.store(w, Scalar[DType.uint32](0))
+        bitmap_ptr.unsafe_store(w, Scalar[DType.uint32](0))
     for bt in range(total_positions):
-        var token = Int(inputs_ptr.load(bt))
+        var token = Int(inputs_ptr.unsafe_load(bt))
         if token < 0 or token >= vocab_size:
             raise Error("encoder row map: token index out of range")
         var w = token >> 5
-        bitmap_ptr.store(
+        bitmap_ptr.unsafe_store(
             w,
-            bitmap_ptr.load(w)
+            bitmap_ptr.unsafe_load(w)
             | (Scalar[DType.uint32](1) << Scalar[DType.uint32](token & 31)),
         )
 
@@ -406,7 +407,7 @@ def build_row_runs(
         # Skip whole empty words cheaply; vocab is mostly absent per batch.
         if (i & 31) == 0:
             var w = i >> 5
-            if w < words and bitmap_ptr.load(w) == 0:
+            if w < words and bitmap_ptr.unsafe_load(w) == 0:
                 i += 32
                 continue
         if not _bitmap_test(bitmap_ptr, i):
@@ -440,7 +441,9 @@ def build_row_runs(
     for k in range(len(merged_first)):
         var first = merged_first[k]
         for j in range(merged_len[k]):
-            row_of_token_ptr.store(first + j, Scalar[DType.int32](num_rows + j))
+            row_of_token_ptr.unsafe_store(
+                first + j, Scalar[DType.int32](num_rows + j)
+            )
         num_rows += merged_len[k]
 
     run_first = merged_first^
@@ -483,7 +486,7 @@ def build_wte_buckets(
         counts.append(0)
 
     for bt in range(total_positions):
-        var token = Int(inputs_ptr.load(bt))
+        var token = Int(inputs_ptr.unsafe_load(bt))
         if token < 0 or token >= vocab_size:
             raise Error("encoder bucket build: token index out of range")
         counts[token] = counts[token] + 1
@@ -499,9 +502,9 @@ def build_wte_buckets(
         cursors.append(offsets[token])
 
     for bt in range(total_positions):
-        var token = Int(inputs_ptr.load(bt))
+        var token = Int(inputs_ptr.unsafe_load(bt))
         var idx = cursors[token]
-        workload_indices_ptr.store(idx, Scalar[DType.int32](bt))
+        workload_indices_ptr.unsafe_store(idx, Scalar[DType.int32](bt))
         cursors[token] = idx + 1
 
     var num_buckets = 0
@@ -515,17 +518,19 @@ def build_wte_buckets(
         # ascending row order either way.
         var dest_row = Scalar[DType.int32](token)
         if use_row_map:
-            dest_row = row_of_token_ptr.load(token)
+            dest_row = row_of_token_ptr.unsafe_load(token)
         for g in range(num_channel_groups):
             if num_buckets >= bucket_info_capacity:
                 raise Error(
                     "encoder bucket build: bucket_info capacity exceeded"
                 )
             var base = num_buckets * WTE_BUCKET_IDX_SIZE
-            bucket_info_ptr.store(base + 0, Scalar[DType.int32](start_idx))
-            bucket_info_ptr.store(base + 1, Scalar[DType.int32](size))
-            bucket_info_ptr.store(base + 2, dest_row)
-            bucket_info_ptr.store(base + 3, Scalar[DType.int32](g))
+            bucket_info_ptr.unsafe_store(
+                base + 0, Scalar[DType.int32](start_idx)
+            )
+            bucket_info_ptr.unsafe_store(base + 1, Scalar[DType.int32](size))
+            bucket_info_ptr.unsafe_store(base + 2, dest_row)
+            bucket_info_ptr.unsafe_store(base + 3, Scalar[DType.int32](g))
             num_buckets += 1
 
     return num_buckets
@@ -560,20 +565,32 @@ def _accumulate_token_gradients[
     comptime if aligned:
         comptime align = align_of[SIMD[dtype, width]]()
         while item < bucket_size:
-            var bt = Int((workload_indices_ptr + start_idx + item).load())
+            var bt = Int(
+                (
+                    (
+                        workload_indices_ptr.unsafe_offset(start_idx)
+                    ).unsafe_offset(item)
+                ).unsafe_load()
+            )
             var dout_val = (
-                (dout_ptr + bt * channels + c)
-                .load[width=width, alignment=align]()
+                ((dout_ptr.unsafe_offset(bt * channels)).unsafe_offset(c))
+                .unsafe_load[width=width, alignment=align]()
                 .cast[DType.float32]()
             )
             accum += dout_val
             item += step_size
     else:
         while item < bucket_size:
-            var bt = Int((workload_indices_ptr + start_idx + item).load())
+            var bt = Int(
+                (
+                    (
+                        workload_indices_ptr.unsafe_offset(start_idx)
+                    ).unsafe_offset(item)
+                ).unsafe_load()
+            )
             var dout_val = (
-                (dout_ptr + bt * channels + c)
-                .load[width=width]()
+                ((dout_ptr.unsafe_offset(bt * channels)).unsafe_offset(c))
+                .unsafe_load[width=width]()
                 .cast[DType.float32]()
             )
             accum += dout_val
@@ -598,18 +615,22 @@ def _write_dwte_accumulation[
     comptime if aligned:
         comptime align = align_of[SIMD[dtype, width]]()
         var prev_dwte = (
-            (dwte_ptr + dwte_offset)
-            .load[width=width, alignment=align]()
+            (dwte_ptr.unsafe_offset(dwte_offset))
+            .unsafe_load[width=width, alignment=align]()
             .cast[DType.float32]()
         )
-        (dwte_ptr + dwte_offset).store[width=width, alignment=align](
-            (prev_dwte + accum).cast[dtype]()
-        )
+        (dwte_ptr.unsafe_offset(dwte_offset)).unsafe_store[
+            width=width, alignment=align
+        ]((prev_dwte + accum).cast[dtype]())
     else:
         var prev_dwte = (
-            (dwte_ptr + dwte_offset).load[width=width]().cast[DType.float32]()
+            (dwte_ptr.unsafe_offset(dwte_offset))
+            .unsafe_load[width=width]()
+            .cast[DType.float32]()
         )
-        (dwte_ptr + dwte_offset).store((prev_dwte + accum).cast[dtype]())
+        (dwte_ptr.unsafe_offset(dwte_offset)).unsafe_store(
+            (prev_dwte + accum).cast[dtype]()
+        )
 
 
 # ===----------------------------------------------------------------------=== #
@@ -643,9 +664,9 @@ def wte_backward_cpu[
         for local in range(count):
             var bucket_idx = base + local
 
-            var info = (bucket_info_ptr + bucket_idx * BUCKET_IDX_SIZE).load[
-                width=BUCKET_IDX_SIZE
-            ]()
+            var info = (
+                bucket_info_ptr.unsafe_offset(bucket_idx * BUCKET_IDX_SIZE)
+            ).unsafe_load[width=BUCKET_IDX_SIZE]()
             var start_idx = Int(info[0])
             var size = Int(info[1])
             var token_idx = Int(info[2])
@@ -717,7 +738,7 @@ def wpe_backward_cpu[
 
         for local_t in range(count_t):
             var t = base_t + local_t
-            var dwpe_row = dwpe_ptr + t * channels
+            var dwpe_row = dwpe_ptr.unsafe_offset(t * channels)
 
             @always_inline
             def _simd[
@@ -726,16 +747,24 @@ def wpe_backward_cpu[
                 var accum = SIMD[DType.float32, simd_w](0.0)
                 for b in range(batch_size):
                     var dout_val = (
-                        (dout_ptr + (b * seq_len + t) * channels + c)
-                        .load[width=simd_w]()
+                        (
+                            dout_ptr.unsafe_offset(
+                                (b * seq_len + t) * channels
+                            ).unsafe_offset(c)
+                        )
+                        .unsafe_load[width=simd_w]()
                         .cast[DType.float32]()
                     )
                     accum += dout_val
 
                 var prev_dwpe = (
-                    (dwpe_row + c).load[width=simd_w]().cast[DType.float32]()
+                    (dwpe_row.unsafe_offset(c))
+                    .unsafe_load[width=simd_w]()
+                    .cast[DType.float32]()
                 )
-                (dwpe_row + c).store((prev_dwpe + accum).cast[dtype]())
+                (dwpe_row.unsafe_offset(c)).unsafe_store(
+                    (prev_dwpe + accum).cast[dtype]()
+                )
 
             vectorize[width, unroll_factor=4](channels, _simd)
 
@@ -753,8 +782,9 @@ def wte_backward_gpu_kernel[
     bucket_info_ptr: ImmutKernelPtr[DType.int32],
     workload_indices_ptr: ImmutKernelPtr[DType.int32],
     dout_ptr: ImmutKernelPtr[dtype],
-    channels: Int,
+    channels_arg: Int64,
 ) -> None:
+    var channels = Int(channels_arg)
     # `aligned` (comptime): True is the production fast path — requires
     # channels % width == 0 (checked on the host), which makes
     # bt*channels + c / token_idx*channels + c provably width-aligned. False
@@ -768,7 +798,9 @@ def wte_backward_gpu_kernel[
     var lane_id = tid % WARP_SIZE
     var c_per_warp = WARP_SIZE * width
 
-    var info = (bucket_info_ptr + bucket * 4).load[width=4]()
+    var info = (bucket_info_ptr.unsafe_offset(bucket * 4)).unsafe_load[
+        width=4
+    ]()
     var start_idx = Int(info[0])
     var bucket_size = Int(info[1])
     var token_idx = Int(info[2])
@@ -808,7 +840,7 @@ def wte_backward_gpu_kernel[
 
     # All threads zero their slot first so inactive warps don't leave garbage.
     for k in range(width):
-        accum_shared.ptr[tid * width + k] = 0.0
+        accum_shared.ptr[unsafe_offset=tid * width + k] = 0.0
 
     if c_valid and active:
         comptime if aligned:
@@ -826,36 +858,46 @@ def wte_backward_gpu_kernel[
                     step_size=num_warps,
                 )
                 for k in range(width):
-                    accum_shared.ptr[tid * width + k] = accum[k]
+                    accum_shared.ptr[unsafe_offset=tid * width + k] = accum[k]
             else:
                 var accum = SIMD[DType.float32, width](0.0)
                 var item = warp_id
                 while item < bucket_size:
                     var bt = Int(
-                        (workload_indices_ptr + start_idx + item).load()
+                        (
+                            workload_indices_ptr.unsafe_offset(
+                                start_idx
+                            ).unsafe_offset(item)
+                        ).unsafe_load()
                     )
                     for k in range(channels - c):
-                        var val = dout_ptr[bt * channels + c + k].cast[
-                            DType.float32
-                        ]()
+                        var val = dout_ptr[
+                            unsafe_offset=bt * channels + c + k
+                        ].cast[DType.float32]()
                         accum[k] += val
                     item += num_warps
                 for k in range(width):
-                    accum_shared.ptr[tid * width + k] = accum[k]
+                    accum_shared.ptr[unsafe_offset=tid * width + k] = accum[k]
         else:
             var accum = SIMD[DType.float32, width](0.0)
             var lanes = min(width, channels - c)
             var item = warp_id
             while item < bucket_size:
-                var bt = Int((workload_indices_ptr + start_idx + item).load())
+                var bt = Int(
+                    (
+                        workload_indices_ptr.unsafe_offset(
+                            start_idx
+                        ).unsafe_offset(item)
+                    ).unsafe_load()
+                )
                 for k in range(lanes):
-                    var val = dout_ptr[bt * channels + c + k].cast[
-                        DType.float32
-                    ]()
+                    var val = dout_ptr[
+                        unsafe_offset=bt * channels + c + k
+                    ].cast[DType.float32]()
                     accum[k] += val
                 item += num_warps
             for k in range(width):
-                accum_shared.ptr[tid * width + k] = accum[k]
+                accum_shared.ptr[unsafe_offset=tid * width + k] = accum[k]
 
     barrier()
 
@@ -866,7 +908,9 @@ def wte_backward_gpu_kernel[
                 var partner_tid = w * WARP_SIZE + lane_id
                 var val = SIMD[DType.float32, width](0.0)
                 for k in range(width):
-                    val[k] = accum_shared.ptr[partner_tid * width + k]
+                    val[k] = accum_shared.ptr[
+                        unsafe_offset=partner_tid * width + k
+                    ]
                 final_accum += val
 
         comptime if aligned:
@@ -878,18 +922,18 @@ def wte_backward_gpu_kernel[
                 )
             else:
                 for k in range(channels - c):
-                    var prev_dwte = dwte_ptr[token_idx * channels + c + k].cast[
-                        DType.float32
-                    ]()
-                    dwte_ptr[token_idx * channels + c + k] = (
+                    var prev_dwte = dwte_ptr[
+                        unsafe_offset=token_idx * channels + c + k
+                    ].cast[DType.float32]()
+                    dwte_ptr[unsafe_offset=token_idx * channels + c + k] = (
                         prev_dwte + final_accum[k]
                     ).cast[dtype]()
         else:
             for k in range(min(width, channels - c)):
-                var prev_dwte = dwte_ptr[token_idx * channels + c + k].cast[
-                    DType.float32
-                ]()
-                dwte_ptr[token_idx * channels + c + k] = (
+                var prev_dwte = dwte_ptr[
+                    unsafe_offset=token_idx * channels + c + k
+                ].cast[DType.float32]()
+                dwte_ptr[unsafe_offset=token_idx * channels + c + k] = (
                     prev_dwte + final_accum[k]
                 ).cast[dtype]()
 
@@ -903,10 +947,13 @@ def wpe_backward_gpu_kernel[
 ](
     dwpe_ptr: MutKernelPtr[dtype],
     dout_ptr: ImmutKernelPtr[dtype],
-    batch_size: Int,
-    seq_len: Int,
-    channels: Int,
+    batch_size_arg: Int64,
+    seq_len_arg: Int64,
+    channels_arg: Int64,
 ) -> None:
+    var batch_size = Int(batch_size_arg)
+    var seq_len = Int(seq_len_arg)
+    var channels = Int(channels_arg)
     # GPU-only kernel (no shared CPU helper): c = tile_base + tid*width is
     # provably width-aligned (tile_base a multiple of c_per_block=BLOCK_SIZE*
     # width). `aligned` (comptime): True additionally requires
@@ -930,33 +977,41 @@ def wpe_backward_gpu_kernel[
                 var accum = SIMD[DType.float32, width](0.0)
                 for b in range(batch_size):
                     var dout_val = (
-                        (dout_ptr + (b * seq_len + t) * channels + c)
-                        .load[width=width, alignment=align]()
+                        (
+                            dout_ptr.unsafe_offset(
+                                (b * seq_len + t) * channels
+                            ).unsafe_offset(c)
+                        )
+                        .unsafe_load[width=width, alignment=align]()
                         .cast[DType.float32]()
                     )
                     accum += dout_val
 
                 var offset = t * channels + c
                 var prev_dwpe = (
-                    (dwpe_ptr + offset)
-                    .load[width=width, alignment=align]()
+                    (dwpe_ptr.unsafe_offset(offset))
+                    .unsafe_load[width=width, alignment=align]()
                     .cast[DType.float32]()
                 )
-                (dwpe_ptr + offset).store[width=width, alignment=align](
-                    (prev_dwpe + accum).cast[dtype]()
-                )
+                (dwpe_ptr.unsafe_offset(offset)).unsafe_store[
+                    width=width, alignment=align
+                ]((prev_dwpe + accum).cast[dtype]())
             else:
                 for col in range(c, channels):
                     var accum = Scalar[DType.float32](0.0)
                     for b in range(batch_size):
                         var dout_val = dout_ptr[
-                            (b * seq_len + t) * channels + col
+                            unsafe_offset=(b * seq_len + t) * channels + col
                         ].cast[DType.float32]()
                         accum += dout_val
 
                     var offset = t * channels + col
-                    var prev_dwpe = dwpe_ptr[offset].cast[DType.float32]()
-                    dwpe_ptr[offset] = (prev_dwpe + accum).cast[dtype]()
+                    var prev_dwpe = dwpe_ptr[unsafe_offset=offset].cast[
+                        DType.float32
+                    ]()
+                    dwpe_ptr[unsafe_offset=offset] = (prev_dwpe + accum).cast[
+                        dtype
+                    ]()
     else:
         for tile_base in range(0, channels, BLOCK_SIZE):
             var col = tile_base + tid
@@ -965,13 +1020,13 @@ def wpe_backward_gpu_kernel[
             var accum = Scalar[DType.float32](0.0)
             for b in range(batch_size):
                 var dout_val = dout_ptr[
-                    (b * seq_len + t) * channels + col
+                    unsafe_offset=(b * seq_len + t) * channels + col
                 ].cast[DType.float32]()
                 accum += dout_val
 
             var offset = t * channels + col
-            var prev_dwpe = dwpe_ptr[offset].cast[DType.float32]()
-            dwpe_ptr[offset] = (prev_dwpe + accum).cast[dtype]()
+            var prev_dwpe = dwpe_ptr[unsafe_offset=offset].cast[DType.float32]()
+            dwpe_ptr[unsafe_offset=offset] = (prev_dwpe + accum).cast[dtype]()
 
 
 def encoder_bwd[
@@ -1040,7 +1095,7 @@ def encoder_bwd[
                     bucket_info_ptr,
                     workload_indices_ptr,
                     dout_ptr,
-                    channels,
+                    Int64(channels),
                     grid_dim=(num_buckets,),
                     block_dim=(BLOCK_SIZE,),
                 )
@@ -1055,7 +1110,7 @@ def encoder_bwd[
                     bucket_info_ptr,
                     workload_indices_ptr,
                     dout_ptr,
-                    channels,
+                    Int64(channels),
                     grid_dim=(num_buckets,),
                     block_dim=(BLOCK_SIZE,),
                 )
@@ -1070,9 +1125,9 @@ def encoder_bwd[
                     wpe_compiled,
                     dwpe_ptr,
                     dout_ptr,
-                    batch_size,
-                    seq_len,
-                    channels,
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
                     grid_dim=(seq_len,),
                     block_dim=(BLOCK_SIZE,),
                 )
@@ -1085,9 +1140,9 @@ def encoder_bwd[
                     wpe_compiled_u,
                     dwpe_ptr,
                     dout_ptr,
-                    batch_size,
-                    seq_len,
-                    channels,
+                    Int64(batch_size),
+                    Int64(seq_len),
+                    Int64(channels),
                     grid_dim=(seq_len,),
                     block_dim=(BLOCK_SIZE,),
                 )

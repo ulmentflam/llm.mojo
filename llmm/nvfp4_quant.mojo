@@ -125,11 +125,12 @@ descriptive-only.
 from std.collections import InlineArray
 from std.math import ceildiv
 from std.sys import get_defined_int
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu.host.info import is_gpu
-from std.gpu.primitives import block
-from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.memory import AddressSpace
+from max.gpu.primitives import block
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from layout import Layout
 from layout.layout_tensor import LayoutTensor
 
@@ -481,21 +482,22 @@ def _nvfp4_amax_partial_gpu[
 ](
     out_ptr: MutKernelPtr[DType.float32],
     x_ptr: ImmutKernelPtr[dtype],
-    n: Int,
+    n_arg: Int64,
 ) -> None:
+    var n = Int(n_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     var grid_stride = Int(block_dim.x * grid_dim.x)
     var local_max = Float32(0.0)
     var i = idx
     while i < n:
-        var v = x_ptr[i].cast[DType.float32]()
+        var v = x_ptr[unsafe_offset=i].cast[DType.float32]()
         var av = v if v >= 0.0 else -v
         if av > local_max:
             local_max = av
         i += grid_stride
     var block_max = block.max[block_size=BLOCK_SIZE](local_max)
     if Int(thread_idx.x) == 0:
-        out_ptr[Int(block_idx.x)] = block_max
+        out_ptr[unsafe_offset=Int(block_idx.x)] = block_max
 
 
 @always_inline
@@ -504,22 +506,23 @@ def _nvfp4_amax_aggregate_gpu[
 ](
     scale_out_ptr: MutKernelPtr[DType.float32],
     partial_ptr: ImmutKernelPtr[DType.float32],
-    grid_size: Int,
+    grid_size_arg: Int64,
 ) -> None:
+    var grid_size = Int(grid_size_arg)
     var tid = Int(thread_idx.x)
     var local_max = Float32(0.0)
     var idx = tid
     while idx < grid_size:
-        var v = partial_ptr[idx]
+        var v = partial_ptr[unsafe_offset=idx]
         if v > local_max:
             local_max = v
         idx += BLOCK_SIZE
     var total_max = block.max[block_size=BLOCK_SIZE](local_max)
     if tid == 0:
         if total_max > 0.0:
-            scale_out_ptr[0] = total_max / (E4M3_MAX * E2M1_MAX)
+            scale_out_ptr[unsafe_offset=0] = total_max / (E4M3_MAX * E2M1_MAX)
         else:
-            scale_out_ptr[0] = 1.0
+            scale_out_ptr[unsafe_offset=0] = 1.0
 
 
 def nvfp4_compute_tensor_scale[
@@ -549,7 +552,7 @@ def nvfp4_compute_tensor_scale[
             compiled_partial,
             partial.unsafe_ptr(),
             x_ptr,
-            n,
+            Int64(n),
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )
@@ -560,7 +563,7 @@ def nvfp4_compute_tensor_scale[
             compiled_agg,
             scale_out_ptr,
             partial.unsafe_ptr(),
-            num_blocks,
+            Int64(num_blocks),
             grid_dim=(1,),
             block_dim=(BLOCK_SIZE,),
         )
@@ -608,23 +611,29 @@ def _nvfp4_quantize_gpu[
     scale_ptr: MutKernelPtr[DType.uint8],
     x_ptr: ImmutKernelPtr[dtype],
     tensor_scale_ptr: MutKernelPtr[DType.float32],
-    rows: Int,
-    k: Int,
-    tile_rows: Int,  # ceildiv(rows, BLOCK_ROWS) -- row-TILE count, not the
+    rows_arg: Int64,
+    k_arg: Int64,
+    tile_rows_arg: Int64,  # ceildiv(rows, BLOCK_ROWS) -- row-TILE count, not the
     # physical scale-buffer row count (see nvfp4_scale_buffer_size).
-    k_blocks: Int,
-    n_col_tiles: Int,
+    k_blocks_arg: Int64,
+    n_col_tiles_arg: Int64,
     sr_seed: UInt64,
     sr_stream: UInt64,
-    sr_step: Int,
+    sr_step_arg: Int64,
 ) -> None:
+    var rows = Int(rows_arg)
+    var k = Int(k_arg)
+    var tile_rows = Int(tile_rows_arg)
+    var k_blocks = Int(k_blocks_arg)
+    var n_col_tiles = Int(n_col_tiles_arg)
+    var sr_step = Int(sr_step_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     var total = tile_rows * k_blocks
     if idx >= total:
         return
     var br = idx // k_blocks
     var kb = idx % k_blocks
-    var tensor_scale = tensor_scale_ptr[0]
+    var tensor_scale = tensor_scale_ptr[unsafe_offset=0]
 
     # 1. block amax over the BLOCK_ROWS x 16 tile.
     var amax = Float32(0.0)
@@ -636,9 +645,9 @@ def _nvfp4_quantize_gpu[
             var kidx = kb * NVFP4_BLOCK + kk
             if kidx >= k:
                 continue
-            var v = x_ptr[_nvfp4_src_addr[TRANSPOSE](r, kidx, rows, k)].cast[
-                DType.float32
-            ]()
+            var v = x_ptr[
+                unsafe_offset=_nvfp4_src_addr[TRANSPOSE](r, kidx, rows, k)
+            ].cast[DType.float32]()
             var av = v if v >= 0.0 else -v
             if av > amax:
                 amax = av
@@ -668,7 +677,7 @@ def _nvfp4_quantize_gpu[
         if r >= rows:
             continue
         var soff = nvfp4_scale_swizzle_offset(r, kb, n_col_tiles)
-        scale_ptr[soff] = sc_code
+        scale_ptr[unsafe_offset=soff] = sc_code
 
     # 3. quantize + pack elements. k is always a multiple of NVFP4_BLOCK
     # (enforced by the host wrapper), hence even, so r*k is always even and
@@ -684,9 +693,9 @@ def _nvfp4_quantize_gpu[
             if k0 >= k:
                 break
             var v0 = (
-                x_ptr[_nvfp4_src_addr[TRANSPOSE](r, k0, rows, k)].cast[
-                    DType.float32
-                ]()
+                x_ptr[
+                    unsafe_offset=_nvfp4_src_addr[TRANSPOSE](r, k0, rows, k)
+                ].cast[DType.float32]()
                 / sc_val
             )
             var c0: UInt8
@@ -700,9 +709,9 @@ def _nvfp4_quantize_gpu[
             var k1 = k0 + 1
             if k1 < k and kk + 1 < NVFP4_BLOCK:
                 var v1 = (
-                    x_ptr[_nvfp4_src_addr[TRANSPOSE](r, k1, rows, k)].cast[
-                        DType.float32
-                    ]()
+                    x_ptr[
+                        unsafe_offset=_nvfp4_src_addr[TRANSPOSE](r, k1, rows, k)
+                    ].cast[DType.float32]()
                     / sc_val
                 )
                 comptime if round_mode == ROUND_MODE_STOCHASTIC:
@@ -711,7 +720,7 @@ def _nvfp4_quantize_gpu[
                     c1 = encode_e2m1[round_mode](v1, rand1)
                 else:
                     c1 = encode_e2m1[round_mode](v1)
-            q_ptr[(r * k + k0) // 2] = pack_e2m1x2(c0, c1)
+            q_ptr[unsafe_offset=(r * k + k0) // 2] = pack_e2m1x2(c0, c1)
             kk += 2
 
 
@@ -726,12 +735,12 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     scale_ptr: MutKernelPtr[DType.uint8],
     x_ptr: ImmutKernelPtr[dtype],  # physical [k, rows] row-major SOURCE
     tensor_scale_ptr: MutKernelPtr[DType.float32],
-    rows: Int,  # LOGICAL output rows == source's trailing/contiguous axis
-    k: Int,  # LOGICAL output k == source's leading axis
-    n_col_tiles: Int,
+    rows_arg: Int64,  # LOGICAL output rows == source's trailing/contiguous axis
+    k_arg: Int64,  # LOGICAL output k == source's leading axis
+    n_col_tiles_arg: Int64,
     sr_seed: UInt64,
     sr_stream: UInt64,
-    sr_step: Int,
+    sr_step_arg: Int64,
 ) -> None:
     """Coalesced-read counterpart of `_nvfp4_quantize_gpu[TRANSPOSE=True]`,
     whose naive read pattern is ~3x slower than the natural
@@ -774,6 +783,10 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     survive to quantize); this register-per-row design keeps all threads
     active.
     """
+    var rows = Int(rows_arg)
+    var k = Int(k_arg)
+    var n_col_tiles = Int(n_col_tiles_arg)
+    var sr_step = Int(sr_step_arg)
     var kb = Int(block_idx.x)
     var r = Int(block_idx.y) * BLOCK_SIZE + Int(thread_idx.x)
     var in_bounds = r < rows
@@ -797,7 +810,7 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     for kk in range(NVFP4_BLOCK):
         var v = Float32(0.0)
         if in_bounds:
-            v = x_ptr[(k0 + kk) * rows + r].cast[DType.float32]()
+            v = x_ptr[unsafe_offset=(k0 + kk) * rows + r].cast[DType.float32]()
         vals[kk] = v
         var av = v if v >= 0.0 else -v
         if av > local_amax:
@@ -812,12 +825,12 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     comptime if BLOCK_ROWS == 1:
         amax = local_amax
     else:
-        amax_sh.ptr[Int(thread_idx.x)] = local_amax
+        amax_sh.ptr[unsafe_offset=Int(thread_idx.x)] = local_amax
         barrier()
         var g0 = (Int(thread_idx.x) // BLOCK_ROWS) * BLOCK_ROWS
         var m = Float32(0.0)
         for i in range(BLOCK_ROWS):
-            var v = amax_sh.ptr[g0 + i]
+            var v = amax_sh.ptr[unsafe_offset=g0 + i]
             if v > m:
                 m = v
         amax = m
@@ -825,7 +838,7 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     if not in_bounds:
         return
 
-    var tensor_scale = tensor_scale_ptr[0]
+    var tensor_scale = tensor_scale_ptr[unsafe_offset=0]
 
     # 3. block scale (identical formula to `_nvfp4_quantize_gpu`).
     var block_scale_raw: Float32
@@ -837,7 +850,9 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     var sc_val = decode_e4m3(sc_code) * tensor_scale
     if sc_val <= 0.0:
         sc_val = 1.0
-    scale_ptr[nvfp4_scale_swizzle_offset(r, kb, n_col_tiles)] = sc_code
+    scale_ptr[
+        unsafe_offset=nvfp4_scale_swizzle_offset(r, kb, n_col_tiles)
+    ] = sc_code
 
     # 4. quantize + pack from registers (same per-element math and packed-
     # byte addresses as `_nvfp4_quantize_gpu`).
@@ -860,7 +875,7 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
             c1 = encode_e2m1[round_mode](v1, rand1)
         else:
             c1 = encode_e2m1[round_mode](v1)
-        q_ptr[(r * k + k0_idx) // 2] = pack_e2m1x2(c0, c1)
+        q_ptr[unsafe_offset=(r * k + k0_idx) // 2] = pack_e2m1x2(c0, c1)
         kk += 2
 
 
@@ -925,12 +940,12 @@ def _nvfp4_quantize_impl[
                 scale_ptr,
                 x_ptr,
                 tensor_scale_ptr,
-                rows,
-                k,
-                n_col_tiles,
+                Int64(rows),
+                Int64(k),
+                Int64(n_col_tiles),
                 sr_seed,
                 sr_stream,
-                sr_step,
+                Int64(sr_step),
                 grid_dim=(k_blocks, ceildiv(rows, BLOCK_SIZE)),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -949,14 +964,14 @@ def _nvfp4_quantize_impl[
                 scale_ptr,
                 x_ptr,
                 tensor_scale_ptr,
-                rows,
-                k,
-                tile_rows,
-                k_blocks,
-                n_col_tiles,
+                Int64(rows),
+                Int64(k),
+                Int64(tile_rows),
+                Int64(k_blocks),
+                Int64(n_col_tiles),
                 sr_seed,
                 sr_stream,
-                sr_step,
+                Int64(sr_step),
                 grid_dim=(num_blocks,),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -1114,7 +1129,9 @@ def nvfp4_dequant_reference[
             var soff = nvfp4_scale_swizzle_offset(
                 br * BLOCK_ROWS, kb, n_col_tiles
             )
-            var sc_val = decode_e4m3(scale_ptr[soff]) * tensor_scale
+            var sc_val = (
+                decode_e4m3(scale_ptr[unsafe_offset=soff]) * tensor_scale
+            )
             for rr in range(BLOCK_ROWS):
                 var r = br * BLOCK_ROWS + rr
                 if r >= rows:
@@ -1123,10 +1140,12 @@ def nvfp4_dequant_reference[
                     var kidx = kb * NVFP4_BLOCK + kk
                     if kidx >= k:
                         continue
-                    var byte = q_ptr[(r * k + kidx) // 2]
+                    var byte = q_ptr[unsafe_offset=(r * k + kidx) // 2]
                     var nib: UInt8
                     if kidx % 2 == 0:
                         nib = unpack_e2m1x2_lo(byte)
                     else:
                         nib = unpack_e2m1x2_hi(byte)
-                    out_ptr[r * k + kidx] = decode_e2m1(nib) * sc_val
+                    out_ptr[unsafe_offset=r * k + kidx] = (
+                        decode_e2m1(nib) * sc_val
+                    )

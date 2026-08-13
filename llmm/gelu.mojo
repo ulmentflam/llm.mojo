@@ -1,7 +1,6 @@
 from extensibility import register
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext
-from std.gpu.host import DeviceAttribute
+from max.gpu.host import DeviceContext
 from std.sys import simd_width_of, align_of
 from std.math import sqrt, ceildiv, tanh, pi
 from std.gpu.host.info import is_cpu, is_gpu
@@ -9,7 +8,7 @@ from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
 from std.runtime.asyncrt import parallelism_level
-from std.algorithm import vectorize, sync_parallelize
+from std.algorithm import vectorize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.profiler import traced_parallelize
@@ -64,16 +63,20 @@ def _gelu_fwd[
     comptime if aligned:
         comptime align = align_of[SIMD[dtype, width]]()
         var x = (
-            (x_ptr + idx)
-            .load[width=width, alignment=align]()
+            (x_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width, alignment=align]()
             .cast[DType.float32]()
         )
-        (out_ptr + idx).store[width=width, alignment=align](
+        (out_ptr.unsafe_offset(idx)).unsafe_store[width=width, alignment=align](
             gelu(x).cast[dtype]()
         )
     else:
-        var x = (x_ptr + idx).load[width=width]().cast[DType.float32]()
-        (out_ptr + idx).store(gelu(x).cast[dtype]())
+        var x = (
+            (x_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width]()
+            .cast[DType.float32]()
+        )
+        (out_ptr.unsafe_offset(idx)).unsafe_store(gelu(x).cast[dtype]())
 
 
 def gelu_fwd_gpu[
@@ -82,8 +85,9 @@ def gelu_fwd_gpu[
 ](
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
-    num_params: Int,
+    num_params_arg: Int64,
 ) -> None:
+    var num_params = Int(num_params_arg)
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
     if idx + width <= num_params:
         _gelu_fwd[dtype, width, aligned=True](idx, out_ptr, x_ptr)
@@ -148,7 +152,7 @@ def gelu_fwd[
             compiled,
             output.unsafe_ptr(),
             x.unsafe_ptr(),
-            x.size(),
+            Int64(x.size()),
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )
@@ -183,9 +187,11 @@ def _bias_gelu_kernel_vec[
     out_ptr: MutKernelPtr[dtype],
     pre_gelu_ptr: MutKernelPtr[dtype],
     bias_ptr: ImmutKernelPtr[dtype],
-    rows: Int,
-    out_channels: Int,
+    rows_arg: Int64,
+    out_channels_arg: Int64,
 ) -> None:
+    var rows = Int(rows_arg)
+    var out_channels = Int(out_channels_arg)
     # 2D grid following the encoder_fwd_gpu_kernel convention:
     #   grid_dim = (rows, num_col_tiles),  block_dim = (BLOCK_SIZE,)
     #   block_idx.x = row,  block_idx.y = column-tile
@@ -201,32 +207,51 @@ def _bias_gelu_kernel_vec[
     var i_base = row * out_channels + col_base
     if col_base + vec <= out_channels:
         # Full vector: all vec elements are within the row.
-        var v = (out_ptr + i_base).load[width=vec]().cast[DType.float32]()
+        var v = (
+            (out_ptr.unsafe_offset(i_base))
+            .unsafe_load[width=vec]()
+            .cast[DType.float32]()
+        )
         comptime if has_bias:
             v = (
                 v
-                + (bias_ptr + col_base).load[width=vec]().cast[DType.float32]()
+                + (bias_ptr.unsafe_offset(col_base))
+                .unsafe_load[width=vec]()
+                .cast[DType.float32]()
             )
         comptime if use_gelu:
-            (pre_gelu_ptr + i_base).store(v.cast[dtype]())
-            (out_ptr + i_base).store(gelu[DType.float32, vec](v).cast[dtype]())
+            (pre_gelu_ptr.unsafe_offset(i_base)).unsafe_store(v.cast[dtype]())
+            (out_ptr.unsafe_offset(i_base)).unsafe_store(
+                gelu[DType.float32, vec](v).cast[dtype]()
+            )
         else:
-            (out_ptr + i_base).store(v.cast[dtype]())
+            (out_ptr.unsafe_offset(i_base)).unsafe_store(v.cast[dtype]())
     else:
         # Tail: fewer than vec columns remain before the row boundary.
         # Guarded generically; never reached when out_channels % vec == 0
         # (all real OC values — 768, 2304, 3072 — are divisible by 8).
         for k in range(out_channels - col_base):
-            var v = (out_ptr + i_base + k)[].cast[DType.float32]()
+            var v = ((out_ptr.unsafe_offset(i_base)).unsafe_offset(k))[].cast[
+                DType.float32
+            ]()
             comptime if has_bias:
-                v = v + (bias_ptr + col_base + k)[].cast[DType.float32]()
+                v = (
+                    v
+                    + (
+                        (bias_ptr.unsafe_offset(col_base)).unsafe_offset(k)
+                    )[].cast[DType.float32]()
+                )
             comptime if use_gelu:
-                (pre_gelu_ptr + i_base + k)[] = v.cast[dtype]()
-                (out_ptr + i_base + k)[] = gelu[DType.float32, 1](v).cast[
+                (
+                    (pre_gelu_ptr.unsafe_offset(i_base)).unsafe_offset(k)
+                )[] = v.cast[dtype]()
+                ((out_ptr.unsafe_offset(i_base)).unsafe_offset(k))[] = gelu[
+                    DType.float32, 1
+                ](v).cast[dtype]()
+            else:
+                ((out_ptr.unsafe_offset(i_base)).unsafe_offset(k))[] = v.cast[
                     dtype
                 ]()
-            else:
-                (out_ptr + i_base + k)[] = v.cast[dtype]()
 
 
 def bias_gelu_fwd[
@@ -245,14 +270,21 @@ def bias_gelu_fwd[
     var n = rows * out_channels
     comptime if is_cpu[target]():
         for i in range(n):
-            var v = out_ptr[i].cast[DType.float32]()
+            var v = out_ptr[unsafe_offset=i].cast[DType.float32]()
             comptime if has_bias:
-                v = v + bias_ptr[i % out_channels].cast[DType.float32]()
+                v = (
+                    v
+                    + bias_ptr[unsafe_offset=i % out_channels].cast[
+                        DType.float32
+                    ]()
+                )
             comptime if use_gelu:
-                pre_gelu_ptr[i] = v.cast[dtype]()
-                out_ptr[i] = gelu[DType.float32, 1](v).cast[dtype]()
+                pre_gelu_ptr[unsafe_offset=i] = v.cast[dtype]()
+                out_ptr[unsafe_offset=i] = gelu[DType.float32, 1](v).cast[
+                    dtype
+                ]()
             else:
-                out_ptr[i] = v.cast[dtype]()
+                out_ptr[unsafe_offset=i] = v.cast[dtype]()
     elif is_gpu[target]():
         # Vectorized 2D-grid dispatch: rows × column-tiles, each thread
         # handles `VEC` contiguous columns.  Eliminates the per-element
@@ -271,8 +303,8 @@ def bias_gelu_fwd[
             out_ptr,
             pre_gelu_ptr,
             bias_ptr,
-            rows,
-            out_channels,
+            Int64(rows),
+            Int64(out_channels),
             grid_dim=(rows, num_col_tiles),
             block_dim=(BLOCK_SIZE,),
         )
@@ -333,16 +365,20 @@ def _gelu_bwd[
     comptime if aligned:
         comptime align = align_of[SIMD[dtype, width]]()
         var x = (
-            (x_ptr + idx)
-            .load[width=width, alignment=align]()
+            (x_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width, alignment=align]()
             .cast[DType.float32]()
         )
-        (out_ptr + idx).store[width=width, alignment=align](
+        (out_ptr.unsafe_offset(idx)).unsafe_store[width=width, alignment=align](
             gelu_grad(x).cast[dtype]()
         )
     else:
-        var x = (x_ptr + idx).load[width=width]().cast[DType.float32]()
-        (out_ptr + idx).store(gelu_grad(x).cast[dtype]())
+        var x = (
+            (x_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width]()
+            .cast[DType.float32]()
+        )
+        (out_ptr.unsafe_offset(idx)).unsafe_store(gelu_grad(x).cast[dtype]())
 
 
 def gelu_bwd_gpu[
@@ -351,8 +387,9 @@ def gelu_bwd_gpu[
 ](
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
-    num_params: Int,
+    num_params_arg: Int64,
 ) -> None:
+    var num_params = Int(num_params_arg)
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
     if idx + width <= num_params:
         _gelu_bwd[dtype, width, aligned=True](idx, out_ptr, x_ptr)
@@ -417,7 +454,7 @@ def gelu_bwd[
             compiled,
             output.unsafe_ptr(),
             x.unsafe_ptr(),
-            x.size(),
+            Int64(x.size()),
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )

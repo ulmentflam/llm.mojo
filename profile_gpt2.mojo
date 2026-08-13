@@ -1,9 +1,9 @@
 from std.os import getenv
 from std.sys import argv, exit, has_accelerator
 from std.gpu.host.info import is_cpu
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import global_perf_counter_ns
-from std.memory import alloc, UnsafePointer
+from std.memory import alloc
 
 from llmm.memory import MutMemPtr
 from llmm.profiler import (
@@ -98,8 +98,8 @@ def run_profile[
     var x = alloc[Scalar[DType.int32]](B * T)
     var y = alloc[Scalar[DType.int32]](B * T)
     for i in range(B * T):
-        x[i] = Int32(i % vocab_size)
-        y[i] = Int32(i % vocab_size)
+        x[unsafe_offset=i] = Int32(i % vocab_size)
+        y[unsafe_offset=i] = Int32(i % vocab_size)
     var x_ptr = rebind[MutMemPtr[DType.int32]](x)
     var y_ptr = rebind[MutMemPtr[DType.int32]](y)
 
@@ -177,8 +177,8 @@ def run_profile[
 
     thread_trace_end(tpath)
     prof.close()
-    x.free()
-    y.free()
+    x.unsafe_free()
+    y.unsafe_free()
 
 
 def main() raises -> None:

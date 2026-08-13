@@ -21,10 +21,9 @@
 # run under `flock -w 10800 /tmp/llmm-gpu.lock -c '...'` (shared GPU).
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import UnsafePointer
 from std.random import random_float64, seed
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true
 
 from llmm.lowp import (
@@ -50,7 +49,7 @@ from _lowp_test_common import _host_gemm_ref, cosine_and_rel_l2
 
 def _bits_of_fp8[dtype: DType](x: Scalar[dtype]) -> UInt8:
     var v = x
-    return UnsafePointer(to=v).bitcast[UInt8]()[]
+    return Pointer(to=v).unsafe_bitcast[UInt8]()[]
 
 
 # ===----------------------------------------------------------------------=== #
@@ -227,7 +226,7 @@ def test_quantize_kernel_matches_manual_encode() raises:
             )  # fp8-subnormal-ish
         else:
             v = Float32((random_float64() * 2.0 - 1.0) * 4.0)  # normal range
-        host_in.unsafe_ptr()[i] = v.cast[IN_DT]()
+        host_in.unsafe_ptr()[unsafe_offset=i] = v.cast[IN_DT]()
         host_ref.append(
             v.cast[IN_DT]().cast[DType.float32]()
         )  # bf16-rounded reference input
@@ -241,7 +240,7 @@ def test_quantize_kernel_matches_manual_encode() raises:
     # Host-computed scale uploaded into a 1-element device buffer (the
     # devscale contract).
     var host_scale = ctx.enqueue_create_host_buffer[DType.float32](1)
-    host_scale.unsafe_ptr()[0] = SCALE
+    host_scale.unsafe_ptr()[unsafe_offset=0] = SCALE
     var dev_scale = ctx.enqueue_create_buffer[DType.float32](1)
     dev_scale.enqueue_copy_from(host_scale)
     ctx.synchronize()
@@ -261,7 +260,7 @@ def test_quantize_kernel_matches_manual_encode() raises:
     var mismatches = 0
     for i in range(N):
         var expected = encode_e4m3(host_ref[i] * SCALE)
-        var got = host_out.unsafe_ptr()[i]
+        var got = host_out.unsafe_ptr()[unsafe_offset=i]
         if expected != got:
             mismatches += 1
     assert_true(
@@ -286,14 +285,14 @@ def test_quantize_kernel_amax_zero() raises:
     comptime IN_DT = DType.bfloat16
     var host_in = ctx.enqueue_create_host_buffer[IN_DT](N)
     for i in range(N):
-        host_in.unsafe_ptr()[i] = Float32(0.0).cast[IN_DT]()
+        host_in.unsafe_ptr()[unsafe_offset=i] = Float32(0.0).cast[IN_DT]()
     var dev_in = ctx.enqueue_create_buffer[IN_DT](N)
     dev_in.enqueue_copy_from(host_in)
     var dev_out = ctx.enqueue_create_buffer[DType.uint8](N)
     ctx.synchronize()
 
     var host_scale = ctx.enqueue_create_host_buffer[DType.float32](1)
-    host_scale.unsafe_ptr()[0] = Float32(1.0)
+    host_scale.unsafe_ptr()[unsafe_offset=0] = Float32(1.0)
     var dev_scale = ctx.enqueue_create_buffer[DType.float32](1)
     dev_scale.enqueue_copy_from(host_scale)
     ctx.synchronize()
@@ -310,7 +309,7 @@ def test_quantize_kernel_amax_zero() raises:
     ctx.synchronize()
     for i in range(N):
         assert_true(
-            host_out.unsafe_ptr()[i] == UInt8(0),
+            host_out.unsafe_ptr()[unsafe_offset=i] == UInt8(0),
             "amax=0 quantize produced a nonzero byte at " + String(i),
         )
 
@@ -328,7 +327,7 @@ def test_quantize_transpose_matches_manual() raises:
     seed(42)
     for i in range(n):
         var v = Float32((random_float64() * 2.0 - 1.0) * 3.0)
-        host_in.unsafe_ptr()[i] = v.cast[IN_DT]()
+        host_in.unsafe_ptr()[unsafe_offset=i] = v.cast[IN_DT]()
 
     var dev_in = ctx.enqueue_create_buffer[IN_DT](n)
     dev_in.enqueue_copy_from(host_in)
@@ -337,7 +336,7 @@ def test_quantize_transpose_matches_manual() raises:
 
     comptime SCALE = Float32(10.0)
     var host_scale = ctx.enqueue_create_host_buffer[DType.float32](1)
-    host_scale.unsafe_ptr()[0] = SCALE
+    host_scale.unsafe_ptr()[unsafe_offset=0] = SCALE
     var dev_scale = ctx.enqueue_create_buffer[DType.float32](1)
     dev_scale.enqueue_copy_from(host_scale)
     ctx.synchronize()
@@ -357,9 +356,11 @@ def test_quantize_transpose_matches_manual() raises:
     var mismatches = 0
     for r in range(ROWS):
         for c in range(COLS):
-            var src = host_in.unsafe_ptr()[r * COLS + c].cast[DType.float32]()
+            var src = host_in.unsafe_ptr()[unsafe_offset=r * COLS + c].cast[
+                DType.float32
+            ]()
             var expected = encode_e4m3(src * SCALE)
-            var got = host_out.unsafe_ptr()[c * ROWS + r]
+            var got = host_out.unsafe_ptr()[unsafe_offset=c * ROWS + r]
             if expected != got:
                 mismatches += 1
     assert_true(
@@ -403,12 +404,16 @@ def _run_lowp_gemm_case[
     seed(2026)
     for i in range(a_n):
         var v = Float32((random_float64() * 2.0 - 1.0)) * in_scale
-        host_a.unsafe_ptr()[i] = v.cast[IN_DT]()
-        host_a_ref.unsafe_ptr()[i] = v.cast[IN_DT]().cast[DType.float32]()
+        host_a.unsafe_ptr()[unsafe_offset=i] = v.cast[IN_DT]()
+        host_a_ref.unsafe_ptr()[unsafe_offset=i] = v.cast[IN_DT]().cast[
+            DType.float32
+        ]()
     for i in range(b_n):
         var v = Float32((random_float64() * 2.0 - 1.0)) * in_scale
-        host_b.unsafe_ptr()[i] = v.cast[IN_DT]()
-        host_b_ref.unsafe_ptr()[i] = v.cast[IN_DT]().cast[DType.float32]()
+        host_b.unsafe_ptr()[unsafe_offset=i] = v.cast[IN_DT]()
+        host_b_ref.unsafe_ptr()[unsafe_offset=i] = v.cast[IN_DT]().cast[
+            DType.float32
+        ]()
 
     var dev_a = ctx.enqueue_create_buffer[IN_DT](a_n)
     var dev_b = ctx.enqueue_create_buffer[IN_DT](b_n)
@@ -424,12 +429,12 @@ def _run_lowp_gemm_case[
     # well-scaled single-tensor case).
     var amax_a = Float32(0.0)
     for i in range(a_n):
-        var av = abs(host_a_ref.unsafe_ptr()[i])
+        var av = abs(host_a_ref.unsafe_ptr()[unsafe_offset=i])
         if av > amax_a:
             amax_a = av
     var amax_b = Float32(0.0)
     for i in range(b_n):
-        var bv = abs(host_b_ref.unsafe_ptr()[i])
+        var bv = abs(host_b_ref.unsafe_ptr()[unsafe_offset=i])
         if bv > amax_b:
             amax_b = bv
     var scale_a = E4M3_MAX / (amax_a + Float32(1e-12))
@@ -442,16 +447,16 @@ def _run_lowp_gemm_case[
     # kept in sync as `lowp_gemm_devscale`'s docstring requires.
     var host_s_a = ctx.enqueue_create_host_buffer[DType.float32](1)
     var host_s_b = ctx.enqueue_create_host_buffer[DType.float32](1)
-    host_s_a.unsafe_ptr()[0] = scale_a
-    host_s_b.unsafe_ptr()[0] = scale_b
+    host_s_a.unsafe_ptr()[unsafe_offset=0] = scale_a
+    host_s_b.unsafe_ptr()[unsafe_offset=0] = scale_b
     var dev_s_a = ctx.enqueue_create_buffer[DType.float32](1)
     var dev_s_b = ctx.enqueue_create_buffer[DType.float32](1)
     dev_s_a.enqueue_copy_from(host_s_a)
     dev_s_b.enqueue_copy_from(host_s_b)
     var host_sinv_a = ctx.enqueue_create_host_buffer[DType.float32](1)
     var host_sinv_b = ctx.enqueue_create_host_buffer[DType.float32](1)
-    host_sinv_a.unsafe_ptr()[0] = scale_inv_a
-    host_sinv_b.unsafe_ptr()[0] = scale_inv_b
+    host_sinv_a.unsafe_ptr()[unsafe_offset=0] = scale_inv_a
+    host_sinv_b.unsafe_ptr()[unsafe_offset=0] = scale_inv_b
     var dev_sinv_a = ctx.enqueue_create_buffer[DType.float32](1)
     var dev_sinv_b = ctx.enqueue_create_buffer[DType.float32](1)
     dev_sinv_a.enqueue_copy_from(host_sinv_a)

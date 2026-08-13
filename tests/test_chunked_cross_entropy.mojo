@@ -44,7 +44,7 @@
 from std.testing import assert_almost_equal, assert_true, TestSuite
 from std.memory import alloc
 from std.math import ceildiv, exp, log
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from llmm.memory import MutMemPtr, as_mut_kernel, as_immut_kernel_from_mut
 from llmm.fused_classifier import (
@@ -70,7 +70,7 @@ def _alloc(n: Int) -> MutMemPtr[DT]:
     var p = alloc[Scalar[DT]](n)
     var q = rebind[MutMemPtr[DT]](p.as_unsafe_any_origin())
     for i in range(n):
-        q[i] = 0.0
+        q[unsafe_offset=i] = 0.0
     return q
 
 
@@ -78,7 +78,7 @@ def _alloc_i32(n: Int) -> MutMemPtr[DType.int32]:
     var p = alloc[Scalar[DType.int32]](n)
     var q = rebind[MutMemPtr[DType.int32]](p.as_unsafe_any_origin())
     for i in range(n):
-        q[i] = 0
+        q[unsafe_offset=i] = 0
     return q
 
 
@@ -89,9 +89,9 @@ def _fill_logits(p: MutMemPtr[DT], seed: Int) -> None:
     for r in range(ROWS):
         for c in range(V_P):
             if c >= V:
-                p[r * V_P + c] = 1000.0
+                p[unsafe_offset=r * V_P + c] = 1000.0
             else:
-                p[r * V_P + c] = (
+                p[unsafe_offset=r * V_P + c] = (
                     Float32((r * 13 + c * 7 + seed * 5) % 19) - 9.0
                 ) * 0.41
 
@@ -109,18 +109,20 @@ def _ref_max_sum_f64(
     the chunked fp32 path is measured against."""
     var m = Float64(-1.0e300)
     for c in range(V):
-        var x = Float64(logits[row * V_P + c])
+        var x = Float64(logits[unsafe_offset=row * V_P + c])
         if x > m:
             m = x
     var s = Float64(0.0)
     for c in range(V):
-        s += exp(Float64(logits[row * V_P + c]) - m)
+        s += exp(Float64(logits[unsafe_offset=row * V_P + c]) - m)
     return (m, s)
 
 
 def _ref_loss_f64(logits: MutMemPtr[DT], row: Int, target: Int) -> Float64:
     var ms = _ref_max_sum_f64(logits, row)
-    return log(ms[1]) + ms[0] - Float64(logits[row * V_P + target])
+    return (
+        log(ms[1]) + ms[0] - Float64(logits[unsafe_offset=row * V_P + target])
+    )
 
 
 def _ref_dlogit_f64(
@@ -131,7 +133,7 @@ def _ref_dlogit_f64(
     if col >= V:
         return Float64(0.0)
     var ms = _ref_max_sum_f64(logits, row)
-    var p = exp(Float64(logits[row * V_P + col]) - ms[0]) / ms[1]
+    var p = exp(Float64(logits[unsafe_offset=row * V_P + col]) - ms[0]) / ms[1]
     var ind = Float64(1.0) if col == target else Float64(0.0)
     return (p - ind) * d_loss
 
@@ -168,7 +170,9 @@ def _run_chunked(
         var oc = min(tile, V_P - t0)
         for r in range(ROWS):
             for c in range(oc):
-                tile_buf[r * oc + c] = logits[r * V_P + t0 + c]
+                tile_buf[unsafe_offset=r * oc + c] = logits[
+                    unsafe_offset=r * V_P + t0 + c
+                ]
         chunked_ce_pass1[DT, TARGET](
             as_immut_kernel_from_mut[DT](tile_buf),
             as_mut_kernel[DT](m),
@@ -202,7 +206,9 @@ def _run_chunked(
         var oc = min(tile, V_P - t0)
         for r in range(ROWS):
             for c in range(oc):
-                tile_buf[r * oc + c] = logits[r * V_P + t0 + c]
+                tile_buf[unsafe_offset=r * oc + c] = logits[
+                    unsafe_offset=r * V_P + t0 + c
+                ]
         chunked_ce_pass2[DT, TARGET](
             as_mut_kernel[DT](tile_buf),
             as_immut_kernel_from_mut[DT](m),
@@ -217,13 +223,15 @@ def _run_chunked(
         )
         for r in range(ROWS):
             for c in range(oc):
-                dlogits_out[r * V_P + t0 + c] = tile_buf[r * oc + c]
+                dlogits_out[unsafe_offset=r * V_P + t0 + c] = tile_buf[
+                    unsafe_offset=r * oc + c
+                ]
         t0 += tile
 
-    m.free()
-    s.free()
-    xt.free()
-    tile_buf.free()
+    m.unsafe_free()
+    s.unsafe_free()
+    xt.unsafe_free()
+    tile_buf.unsafe_free()
     return taken
 
 
@@ -277,10 +285,10 @@ def test_loss_matches_float64_log_sum_exp() raises:
     # column, and two arbitrary.
     var picks = [0, 8, 15, 17, 28, 22]
     for r in range(ROWS):
-        targets[r] = Int32(picks[r])
+        targets[unsafe_offset=r] = Int32(picks[r])
     var d_losses = _alloc(ROWS)
     for r in range(ROWS):
-        d_losses[r] = 0.125 + 0.03 * Float32(r)
+        d_losses[unsafe_offset=r] = 0.125 + 0.03 * Float32(r)
 
     var losses = _alloc(ROWS)
     var dlogits = _alloc(ROWS * V_P)
@@ -293,16 +301,16 @@ def test_loss_matches_float64_log_sum_exp() raises:
         # Loss here is ~3.4 and the terms are O(4), so there is no catastrophic
         # cancellation and a direct fp32-vs-float64 comparison is meaningful.
         assert_almost_equal(
-            Float64(losses[r]),
-            _ref_loss_f64(logits, r, Int(targets[r])),
+            Float64(losses[unsafe_offset=r]),
+            _ref_loss_f64(logits, r, Int(targets[unsafe_offset=r])),
             atol=1e-5,
         )
 
-    logits.free()
-    targets.free()
-    d_losses.free()
-    losses.free()
-    dlogits.free()
+    logits.unsafe_free()
+    targets.unsafe_free()
+    d_losses.unsafe_free()
+    losses.unsafe_free()
+    dlogits.unsafe_free()
 
 
 def test_late_max_forces_the_rescale() raises:
@@ -317,13 +325,13 @@ def test_late_max_forces_the_rescale() raises:
     _fill_logits(logits, 11)
     var spike_col = 27  # last live tile is [24, 29)
     for r in range(ROWS):
-        logits[r * V_P + spike_col] = 14.0 + Float32(r)
+        logits[unsafe_offset=r * V_P + spike_col] = 14.0 + Float32(r)
     var targets = _alloc_i32(ROWS)
     for r in range(ROWS):
-        targets[r] = Int32(r)  # every target in the FIRST tile
+        targets[unsafe_offset=r] = Int32(r)  # every target in the FIRST tile
     var d_losses = _alloc(ROWS)
     for r in range(ROWS):
-        d_losses[r] = 0.25
+        d_losses[unsafe_offset=r] = 0.25
 
     var losses = _alloc(ROWS)
     var dlogits = _alloc(ROWS * V_P)
@@ -333,16 +341,16 @@ def test_late_max_forces_the_rescale() raises:
     assert_true(taken > 1, "test must exercise more than one tile")
     for r in range(ROWS):
         assert_almost_equal(
-            Float64(losses[r]),
-            _ref_loss_f64(logits, r, Int(targets[r])),
+            Float64(losses[unsafe_offset=r]),
+            _ref_loss_f64(logits, r, Int(targets[unsafe_offset=r])),
             atol=1e-4,
         )
 
-    logits.free()
-    targets.free()
-    d_losses.free()
-    losses.free()
-    dlogits.free()
+    logits.unsafe_free()
+    targets.unsafe_free()
+    d_losses.unsafe_free()
+    losses.unsafe_free()
+    dlogits.unsafe_free()
 
 
 def test_early_max_needs_no_rescale() raises:
@@ -354,13 +362,15 @@ def test_early_max_needs_no_rescale() raises:
     var logits = _alloc(ROWS * V_P)
     _fill_logits(logits, 5)
     for r in range(ROWS):
-        logits[r * V_P + 2] = 12.0 + 0.5 * Float32(r)
+        logits[unsafe_offset=r * V_P + 2] = 12.0 + 0.5 * Float32(r)
     var targets = _alloc_i32(ROWS)
     for r in range(ROWS):
-        targets[r] = Int32(24 + r % 5)  # every target in the LAST live tile
+        targets[unsafe_offset=r] = Int32(
+            24 + r % 5
+        )  # every target in the LAST live tile
     var d_losses = _alloc(ROWS)
     for r in range(ROWS):
-        d_losses[r] = 1.0 / Float32(ROWS)
+        d_losses[unsafe_offset=r] = 1.0 / Float32(ROWS)
 
     var losses = _alloc(ROWS)
     var dlogits = _alloc(ROWS * V_P)
@@ -370,16 +380,16 @@ def test_early_max_needs_no_rescale() raises:
     assert_true(taken > 1, "test must exercise more than one tile")
     for r in range(ROWS):
         assert_almost_equal(
-            Float64(losses[r]),
-            _ref_loss_f64(logits, r, Int(targets[r])),
+            Float64(losses[unsafe_offset=r]),
+            _ref_loss_f64(logits, r, Int(targets[unsafe_offset=r])),
             atol=1e-5,
         )
 
-    logits.free()
-    targets.free()
-    d_losses.free()
-    losses.free()
-    dlogits.free()
+    logits.unsafe_free()
+    targets.unsafe_free()
+    d_losses.unsafe_free()
+    losses.unsafe_free()
+    dlogits.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -395,10 +405,10 @@ def test_dlogits_match_float64_reference_everywhere() raises:
     var targets = _alloc_i32(ROWS)
     var picks = [0, 8, 15, 24, 28, 9]
     for r in range(ROWS):
-        targets[r] = Int32(picks[r])
+        targets[unsafe_offset=r] = Int32(picks[r])
     var d_losses = _alloc(ROWS)
     for r in range(ROWS):
-        d_losses[r] = 0.07 * Float32(r + 1)
+        d_losses[unsafe_offset=r] = 0.07 * Float32(r + 1)
 
     var losses = _alloc(ROWS)
     var dlogits = _alloc(ROWS * V_P)
@@ -413,18 +423,22 @@ def test_dlogits_match_float64_reference_everywhere() raises:
     for r in range(ROWS):
         for c in range(V_P):
             assert_almost_equal(
-                Float64(dlogits[r * V_P + c]),
+                Float64(dlogits[unsafe_offset=r * V_P + c]),
                 _ref_dlogit_f64(
-                    logits, r, c, Int(targets[r]), Float64(d_losses[r])
+                    logits,
+                    r,
+                    c,
+                    Int(targets[unsafe_offset=r]),
+                    Float64(d_losses[unsafe_offset=r]),
                 ),
                 atol=1e-6,
             )
 
-    logits.free()
-    targets.free()
-    d_losses.free()
-    losses.free()
-    dlogits.free()
+    logits.unsafe_free()
+    targets.unsafe_free()
+    d_losses.unsafe_free()
+    losses.unsafe_free()
+    dlogits.unsafe_free()
 
 
 def test_dlogits_padding_is_exactly_zero() raises:
@@ -436,10 +450,10 @@ def test_dlogits_padding_is_exactly_zero() raises:
     _fill_logits(logits, 2)
     var targets = _alloc_i32(ROWS)
     for r in range(ROWS):
-        targets[r] = Int32(r * 4)
+        targets[unsafe_offset=r] = Int32(r * 4)
     var d_losses = _alloc(ROWS)
     for r in range(ROWS):
-        d_losses[r] = 0.5
+        d_losses[unsafe_offset=r] = 0.5
 
     var losses = _alloc(ROWS)
     var dlogits = _alloc(ROWS * V_P)
@@ -450,15 +464,15 @@ def test_dlogits_padding_is_exactly_zero() raises:
     for r in range(ROWS):
         for c in range(V, V_P):
             assert_true(
-                dlogits[r * V_P + c] == Float32(0.0),
+                dlogits[unsafe_offset=r * V_P + c] == Float32(0.0),
                 "dlogits must be exactly zero on the padding columns",
             )
 
-    logits.free()
-    targets.free()
-    d_losses.free()
-    losses.free()
-    dlogits.free()
+    logits.unsafe_free()
+    targets.unsafe_free()
+    d_losses.unsafe_free()
+    losses.unsafe_free()
+    dlogits.unsafe_free()
 
 
 def test_dlogits_sum_to_zero_per_row() raises:
@@ -473,10 +487,10 @@ def test_dlogits_sum_to_zero_per_row() raises:
     var targets = _alloc_i32(ROWS)
     var picks = [3, 8, 16, 23, 24, 28]
     for r in range(ROWS):
-        targets[r] = Int32(picks[r])
+        targets[unsafe_offset=r] = Int32(picks[r])
     var d_losses = _alloc(ROWS)
     for r in range(ROWS):
-        d_losses[r] = 0.31
+        d_losses[unsafe_offset=r] = 0.31
 
     var losses = _alloc(ROWS)
     var dlogits = _alloc(ROWS * V_P)
@@ -487,14 +501,14 @@ def test_dlogits_sum_to_zero_per_row() raises:
     for r in range(ROWS):
         var acc = Float64(0.0)
         for c in range(V_P):
-            acc += Float64(dlogits[r * V_P + c])
+            acc += Float64(dlogits[unsafe_offset=r * V_P + c])
         assert_almost_equal(acc, Float64(0.0), atol=1e-6)
 
-    logits.free()
-    targets.free()
-    d_losses.free()
-    losses.free()
-    dlogits.free()
+    logits.unsafe_free()
+    targets.unsafe_free()
+    d_losses.unsafe_free()
+    losses.unsafe_free()
+    dlogits.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -512,10 +526,10 @@ def test_tile_width_one_still_works() raises:
     _fill_logits(logits, 17)
     var targets = _alloc_i32(ROWS)
     for r in range(ROWS):
-        targets[r] = Int32((r * 5 + 1) % V)
+        targets[unsafe_offset=r] = Int32((r * 5 + 1) % V)
     var d_losses = _alloc(ROWS)
     for r in range(ROWS):
-        d_losses[r] = 0.19
+        d_losses[unsafe_offset=r] = 0.19
 
     var losses = _alloc(ROWS)
     var dlogits = _alloc(ROWS * V_P)
@@ -523,21 +537,21 @@ def test_tile_width_one_still_works() raises:
     assert_true(taken == V_P, "expected one tile per column")
     for r in range(ROWS):
         assert_almost_equal(
-            Float64(losses[r]),
-            _ref_loss_f64(logits, r, Int(targets[r])),
+            Float64(losses[unsafe_offset=r]),
+            _ref_loss_f64(logits, r, Int(targets[unsafe_offset=r])),
             atol=1e-5,
         )
         for c in range(V, V_P):
             assert_true(
-                dlogits[r * V_P + c] == Float32(0.0),
+                dlogits[unsafe_offset=r * V_P + c] == Float32(0.0),
                 "padding must stay zero at tile width 1",
             )
 
-    logits.free()
-    targets.free()
-    d_losses.free()
-    losses.free()
-    dlogits.free()
+    logits.unsafe_free()
+    targets.unsafe_free()
+    d_losses.unsafe_free()
+    losses.unsafe_free()
+    dlogits.unsafe_free()
 
 
 def test_all_padding_tile_is_absorbed() raises:
@@ -551,10 +565,10 @@ def test_all_padding_tile_is_absorbed() raises:
     _fill_logits(logits, 23)
     var targets = _alloc_i32(ROWS)
     for r in range(ROWS):
-        targets[r] = Int32(r)
+        targets[unsafe_offset=r] = Int32(r)
     var d_losses = _alloc(ROWS)
     for r in range(ROWS):
-        d_losses[r] = 0.4
+        d_losses[unsafe_offset=r] = 0.4
 
     var losses = _alloc(ROWS)
     var dlogits = _alloc(ROWS * V_P)
@@ -565,21 +579,21 @@ def test_all_padding_tile_is_absorbed() raises:
     assert_true(30 >= V, "the last tile must start past V for this test")
     for r in range(ROWS):
         assert_almost_equal(
-            Float64(losses[r]),
-            _ref_loss_f64(logits, r, Int(targets[r])),
+            Float64(losses[unsafe_offset=r]),
+            _ref_loss_f64(logits, r, Int(targets[unsafe_offset=r])),
             atol=1e-5,
         )
         for c in range(V, V_P):
             assert_true(
-                dlogits[r * V_P + c] == Float32(0.0),
+                dlogits[unsafe_offset=r * V_P + c] == Float32(0.0),
                 "padding must stay zero across an all-padding tile",
             )
 
-    logits.free()
-    targets.free()
-    d_losses.free()
-    losses.free()
-    dlogits.free()
+    logits.unsafe_free()
+    targets.unsafe_free()
+    d_losses.unsafe_free()
+    losses.unsafe_free()
+    dlogits.unsafe_free()
 
 
 def main() raises:

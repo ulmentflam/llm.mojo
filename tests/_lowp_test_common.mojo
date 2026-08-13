@@ -16,10 +16,9 @@
 # per file.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import UnsafePointer
 from std.math import sqrt
 from std.random import random_float64
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.testing import assert_true
 
 from llmm.rand import MT19937
@@ -41,9 +40,9 @@ from llmm.rand import MT19937
 def _host_gemm_ref[
     transpose_a: Bool, transpose_b: Bool
 ](
-    a_host: UnsafePointer[Float32, MutUntrackedOrigin],
-    b_host: UnsafePointer[Float32, MutUntrackedOrigin],
-    out_host: UnsafePointer[Float32, MutUntrackedOrigin],
+    a_host: Pointer[Float32, MutUntrackedOrigin],
+    b_host: Pointer[Float32, MutUntrackedOrigin],
+    out_host: Pointer[Float32, MutUntrackedOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -54,16 +53,16 @@ def _host_gemm_ref[
             for p in range(k):
                 var av: Float32
                 comptime if transpose_a:
-                    av = a_host[p * m + i]
+                    av = a_host[unsafe_offset=p * m + i]
                 else:
-                    av = a_host[i * k + p]
+                    av = a_host[unsafe_offset=i * k + p]
                 var bv: Float32
                 comptime if transpose_b:
-                    bv = b_host[p * n + j]
+                    bv = b_host[unsafe_offset=p * n + j]
                 else:
-                    bv = b_host[j * k + p]
+                    bv = b_host[unsafe_offset=j * k + p]
                 acc += av * bv
-            out_host[j * m + i] = acc
+            out_host[unsafe_offset=j * m + i] = acc
 
 
 # ===----------------------------------------------------------------------=== #
@@ -108,8 +107,8 @@ def cosine_and_rel_l2(
     var norm_got = Float32(0.0)
     var norm_want = Float32(0.0)
     for i in range(n):
-        var g = host_got.unsafe_ptr()[i].cast[DType.float32]()
-        var w = host_want.unsafe_ptr()[i].cast[DType.float32]()
+        var g = host_got.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
+        var w = host_want.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
         assert_true(g == g, label + ": NaN in fp8 output at " + String(i))
         assert_true(
             g > Float32(-1e30) and g < Float32(1e30),
@@ -136,8 +135,8 @@ def cosine_and_rel_l2[
     GotDT: DType = DType.float32,
     WantDT: DType = DType.float32,
 ](
-    got: UnsafePointer[Scalar[GotDT], MutUntrackedOrigin],
-    want: UnsafePointer[Scalar[WantDT], MutUntrackedOrigin],
+    got: Pointer[Scalar[GotDT], MutUntrackedOrigin],
+    want: Pointer[Scalar[WantDT], MutUntrackedOrigin],
     n: Int,
     label: String,
     mut rel_l2_out: Float32,
@@ -152,8 +151,8 @@ def cosine_and_rel_l2[
     var norm_got = Float32(0.0)
     var norm_want = Float32(0.0)
     for i in range(n):
-        var g = got[i].cast[DType.float32]()
-        var w = want[i].cast[DType.float32]()
+        var g = got[unsafe_offset=i].cast[DType.float32]()
+        var w = want[unsafe_offset=i].cast[DType.float32]()
         assert_true(g == g, label + ": NaN at " + String(i))
         assert_true(
             g > Float32(-1e30) and g < Float32(1e30),
@@ -186,7 +185,7 @@ def pseudo_gaussian_fill[
     DT: DType = DType.float32,
 ](
     mut rng: MT19937,
-    data: UnsafePointer[Scalar[DT], MutUntrackedOrigin],
+    data: Pointer[Scalar[DT], MutUntrackedOrigin],
     numel: Int,
     std: Float32,
     mean: Float32 = 0.0,
@@ -195,7 +194,7 @@ def pseudo_gaussian_fill[
         var s = Float32(0.0)
         for _ in range(12):
             s += rng.randfloat32()
-        data[i] = ((s - 6.0) * std + mean).cast[DT]()
+        data[unsafe_offset=i] = ((s - 6.0) * std + mean).cast[DT]()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -210,7 +209,7 @@ def random_bf16(
     var host = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
     for i in range(n):
         var v = Float32((random_float64() * 2.0 - 1.0)) * scale
-        host.unsafe_ptr()[i] = v.cast[DType.bfloat16]()
+        host.unsafe_ptr()[unsafe_offset=i] = v.cast[DType.bfloat16]()
     var dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     dev.enqueue_copy_from(host)
     ctx.synchronize()
@@ -222,7 +221,7 @@ def zeros_bf16(
 ) raises -> DeviceBuffer[DType.bfloat16]:
     var host = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
     for i in range(n):
-        host.unsafe_ptr()[i] = Float32(0.0).cast[DType.bfloat16]()
+        host.unsafe_ptr()[unsafe_offset=i] = Float32(0.0).cast[DType.bfloat16]()
     var dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     dev.enqueue_copy_from(host)
     ctx.synchronize()
@@ -247,7 +246,7 @@ def make_bf16_tensor(
     var n = len(values)
     var host = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
     for i in range(n):
-        host.unsafe_ptr()[i] = values[i].cast[DType.bfloat16]()
+        host.unsafe_ptr()[unsafe_offset=i] = values[i].cast[DType.bfloat16]()
     var dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     dev.enqueue_copy_from(host)
     ctx.synchronize()

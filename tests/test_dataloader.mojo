@@ -65,33 +65,33 @@ def test_dataloader_gpt2() raises:
     # Row 1: [5, 6, 7, 8]
     loader.next_batch()
 
-    assert_equal(loader.inputs.load(0), 0)
-    assert_equal(loader.inputs.load(1), 1)
-    assert_equal(loader.inputs.load(2), 2)
-    assert_equal(loader.inputs.load(3), 3)
-    assert_equal(loader.inputs.load(4), 4)
-    assert_equal(loader.inputs.load(5), 5)
-    assert_equal(loader.inputs.load(6), 6)
-    assert_equal(loader.inputs.load(7), 7)
+    assert_equal(loader.inputs.unsafe_load(0), 0)
+    assert_equal(loader.inputs.unsafe_load(1), 1)
+    assert_equal(loader.inputs.unsafe_load(2), 2)
+    assert_equal(loader.inputs.unsafe_load(3), 3)
+    assert_equal(loader.inputs.unsafe_load(4), 4)
+    assert_equal(loader.inputs.unsafe_load(5), 5)
+    assert_equal(loader.inputs.unsafe_load(6), 6)
+    assert_equal(loader.inputs.unsafe_load(7), 7)
 
-    assert_equal(loader.targets.load(0), 1)
-    assert_equal(loader.targets.load(1), 2)
-    assert_equal(loader.targets.load(2), 3)
-    assert_equal(loader.targets.load(3), 4)
-    assert_equal(loader.targets.load(4), 5)
-    assert_equal(loader.targets.load(5), 6)
-    assert_equal(loader.targets.load(6), 7)
-    assert_equal(loader.targets.load(7), 8)
+    assert_equal(loader.targets.unsafe_load(0), 1)
+    assert_equal(loader.targets.unsafe_load(1), 2)
+    assert_equal(loader.targets.unsafe_load(2), 3)
+    assert_equal(loader.targets.unsafe_load(3), 4)
+    assert_equal(loader.targets.unsafe_load(4), 5)
+    assert_equal(loader.targets.unsafe_load(5), 6)
+    assert_equal(loader.targets.unsafe_load(6), 7)
+    assert_equal(loader.targets.unsafe_load(7), 8)
 
     # Second batch (advances by batch_size * seq_len = 8 tokens)
     # inputs should be:
     # Row 0: [8, 9, 10, 11]
     # Row 1: [12, 13, 14, 15]
     loader.next_batch()
-    assert_equal(loader.inputs.load(0), 8)
-    assert_equal(loader.inputs.load(7), 15)
-    assert_equal(loader.targets.load(0), 9)
-    assert_equal(loader.targets.load(7), 16)
+    assert_equal(loader.inputs.unsafe_load(0), 8)
+    assert_equal(loader.inputs.unsafe_load(7), 15)
+    assert_equal(loader.targets.unsafe_load(0), 9)
+    assert_equal(loader.targets.unsafe_load(7), 16)
 
 
 def test_dataloader_llama3() raises:
@@ -108,19 +108,19 @@ def test_dataloader_llama3() raises:
     # Row 2: [4, 5]
     loader.next_batch()
 
-    assert_equal(loader.inputs.load(0), 0)
-    assert_equal(loader.inputs.load(1), 1)
-    assert_equal(loader.inputs.load(2), 2)
-    assert_equal(loader.inputs.load(3), 3)
-    assert_equal(loader.inputs.load(4), 4)
-    assert_equal(loader.inputs.load(5), 5)
+    assert_equal(loader.inputs.unsafe_load(0), 0)
+    assert_equal(loader.inputs.unsafe_load(1), 1)
+    assert_equal(loader.inputs.unsafe_load(2), 2)
+    assert_equal(loader.inputs.unsafe_load(3), 3)
+    assert_equal(loader.inputs.unsafe_load(4), 4)
+    assert_equal(loader.inputs.unsafe_load(5), 5)
 
-    assert_equal(loader.targets.load(0), 1)
-    assert_equal(loader.targets.load(1), 2)
-    assert_equal(loader.targets.load(2), 3)
-    assert_equal(loader.targets.load(3), 4)
-    assert_equal(loader.targets.load(4), 5)
-    assert_equal(loader.targets.load(5), 6)
+    assert_equal(loader.targets.unsafe_load(0), 1)
+    assert_equal(loader.targets.unsafe_load(1), 2)
+    assert_equal(loader.targets.unsafe_load(2), 3)
+    assert_equal(loader.targets.unsafe_load(3), 4)
+    assert_equal(loader.targets.unsafe_load(4), 5)
+    assert_equal(loader.targets.unsafe_load(5), 6)
 
 
 def test_dataloader_shuffle() raises:
@@ -138,7 +138,7 @@ def test_dataloader_shuffle() raises:
 
     # Verify that the values loaded are within [0, 100]
     for i in range(6):
-        var val = loader.inputs.load(i)
+        var val = loader.inputs.unsafe_load(i)
         assert_equal(val >= 0 and val < 100, True)
 
 
@@ -152,29 +152,29 @@ def test_dataloader_shards() raises:
 
     # Sample 0
     loader.next_batch()
-    assert_equal(loader.inputs.load(0), 0)
-    assert_equal(loader.inputs.load(5), 5)
+    assert_equal(loader.inputs.unsafe_load(0), 0)
+    assert_equal(loader.inputs.unsafe_load(5), 5)
 
     # Sample 1
     loader.next_batch()
-    assert_equal(loader.inputs.load(0), 6)
-    assert_equal(loader.inputs.load(5), 11)
+    assert_equal(loader.inputs.unsafe_load(0), 6)
+    assert_equal(loader.inputs.unsafe_load(5), 11)
 
     # Sample 2
     loader.next_batch()
-    assert_equal(loader.inputs.load(0), 12)
-    assert_equal(loader.inputs.load(5), 17)
+    assert_equal(loader.inputs.unsafe_load(0), 12)
+    assert_equal(loader.inputs.unsafe_load(5), 17)
 
     # Next batch should trigger auto-advance to shard 1
     loader.next_batch()
     assert_equal(loader.current_shard_idx, 1)
-    assert_equal(loader.inputs.load(0), 100)
-    assert_equal(loader.inputs.load(5), 105)
+    assert_equal(loader.inputs.unsafe_load(0), 100)
+    assert_equal(loader.inputs.unsafe_load(5), 105)
 
     # Shard 1, Sample 1
     loader.next_batch()
-    assert_equal(loader.inputs.load(0), 106)
-    assert_equal(loader.inputs.load(5), 111)
+    assert_equal(loader.inputs.unsafe_load(0), 106)
+    assert_equal(loader.inputs.unsafe_load(5), 111)
 
 
 def test_dataloader_distributed() raises:
@@ -206,24 +206,24 @@ def test_dataloader_distributed() raises:
     loader_rank1.next_batch()
 
     # Rank 0 inputs: [0, 1, 2, 3]
-    assert_equal(loader_rank0.inputs.load(0), 0)
-    assert_equal(loader_rank0.inputs.load(3), 3)
+    assert_equal(loader_rank0.inputs.unsafe_load(0), 0)
+    assert_equal(loader_rank0.inputs.unsafe_load(3), 3)
 
     # Rank 1 inputs: [4, 5, 6, 7]
-    assert_equal(loader_rank1.inputs.load(0), 4)
-    assert_equal(loader_rank1.inputs.load(3), 7)
+    assert_equal(loader_rank1.inputs.unsafe_load(0), 4)
+    assert_equal(loader_rank1.inputs.unsafe_load(3), 7)
 
     # Batch 1
     loader_rank0.next_batch()
     loader_rank1.next_batch()
 
     # Rank 0 inputs: [8, 9, 10, 11]
-    assert_equal(loader_rank0.inputs.load(0), 8)
-    assert_equal(loader_rank0.inputs.load(3), 11)
+    assert_equal(loader_rank0.inputs.unsafe_load(0), 8)
+    assert_equal(loader_rank0.inputs.unsafe_load(3), 11)
 
     # Rank 1 inputs: [12, 13, 14, 15]
-    assert_equal(loader_rank1.inputs.load(0), 12)
-    assert_equal(loader_rank1.inputs.load(3), 15)
+    assert_equal(loader_rank1.inputs.unsafe_load(0), 12)
+    assert_equal(loader_rank1.inputs.unsafe_load(3), 15)
 
 
 def main() raises:

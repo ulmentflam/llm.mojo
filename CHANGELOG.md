@@ -5,6 +5,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-08-11
+
+### Added
+
+- **`make compile-rest`, closing a gate hole that hid a toolchain break.** Mojo
+  1.0 removed `fn`, and the tree's last `fn` survived a full green gate inside
+  `bench_gemm_vocab_tiles.mojo` because nothing compiled that file: `check`
+  builds train_gpt2 and profile_gpt2, `test-mojo` builds `tests/test_*.mojo`,
+  and between them the benches, the calibration tool, the gradient dumper, the
+  inference binary and the reference checker were compiled by NOTHING. The new
+  target compiles all seven (calibrate needs `-D LLMM_PRECISION=fp8` for its
+  `comptime assert`) and is wired into `check`. Verified against the bug it
+  exists for: re-introducing the `fn` makes it exit non-zero.
+  `tests/probe_fp8/` is deliberately excluded, since several of those probes
+  record what the toolchain *could not* do and do not compile on purpose.
+
+### Changed
+
+- **Migrated to Mojo 1.0.0 stable.** `pixi.toml` now tracks the `max` channel
+  (`mojo = "1.0.0.*"`) instead of `max-nightly`/`1.0.0b3.*`; nightly has already
+  moved on to `1.1.0.dev*`, and a language that has committed to stability is no
+  longer worth chasing daily. Three breaking changes had to be worked through,
+  none of which the deprecation warnings covered:
+  - **Accelerator APIs moved from `std` to a new `max` Mojo package**, but
+    per-symbol rather than per-module, so the split has to be memorised rather
+    than pattern-matched: `DeviceContext`/`DeviceBuffer`/`HostBuffer`/
+    `DeviceAttribute`, `barrier`, `AddressSpace`, `primitives.block` and
+    `sync_parallelize` moved to `max.*`, while `block_idx`/`block_dim`/
+    `grid_dim`/`thread_idx`/`WARP_SIZE`, `primitives.warp`, `intrinsics`,
+    `gpu.host.info` and `vectorize` stayed in `std.*`. 52 files.
+  - **`Int`/`UInt` no longer conform to `DevicePassable`**, so no GPU kernel may
+    take one. Marshalling keys off the *argument* type, not the parameter type,
+    so both sides move: 61 kernels across 19 files widened 142 parameters to
+    `Int64`/`UInt64` and restore the `Int` local in one line
+    (`var n = Int(n_arg)`), leaving every kernel body's 64-bit index arithmetic
+    byte-for-byte unchanged, and 88 of the tree's 102 `enqueue_function` sites
+    wrap the matching positional argument. There is no implicit
+    `Int`<->`Int64` conversion, which is why the parameter type alone could not
+    change, since the mixed arithmetic in the bodies would not compile.
+  - **`InlineArray` lost `ImplicitlyCopyable`**, so `ZeroContext.get_rank_sigs_any`
+    returns by transfer (`^`) rather than by implicit copy.
+- **Deprecation warnings cleared: 1803 -> 190.** `UnsafePointer` -> `Pointer`,
+  `load`/`store`/`bitcast`/`free` -> `unsafe_*`, positional `ptr[i]` ->
+  `ptr[unsafe_offset=i]`, pointer `+`/`-`/`+=` -> `unsafe_offset`, and
+  `__del__` -> `__deinit__`. Driven by
+  the compiler's `file:line:col` diagnostics rather than regex, since `p + i`
+  and `a + b` are textually identical and only the compiler knows which is a
+  pointer. Note that warnings are emitted per *instantiation*, so a census must
+  cover `build-mojo` (which compiles the whole `llmm` package through the MAX
+  bridge) and not just `build` plus the test files: ~115 sites in
+  `layernorm`/`matmul`/`attention`/`gelu` live in functions no single binary
+  instantiates. Also fixed the tree's last `fn` (removed in 1.0) in
+  `bench_gemm_vocab_tiles.mojo`; `make compile-rest` above now covers it.
+  **The implicit-walrus deprecation is deliberately NOT fixed.** Applying the
+  compiler's suggested `if var gp := ...` to the three `_get_global_or_null`
+  call sites SIGSEGVs the MAX compiler whenever a custom op is built against
+  them, taking out the whole `test-python-cuda` suite at
+  `test_attention_equivalence.py` while `make build`, `make lint` and every
+  mojo test file stayed green. The sites now carry a comment saying so.
+  Of the 190 remaining, 5 are those walrus sites and 185 are
+  `alloc`-without-`Layout`: the suggested
+  `unsafe_alloc` does not exist in 1.0.0, and the real replacement returns an
+  owning `Allocation[T]` instead of a raw pointer, so it is a lifetime refactor
+  rather than a rename and is left for its own pass.
+- **`uv` updated 0.11.28 -> 0.12.3.** The `uvx ruff@0.15.2` pin in `lint-python`
+  is deliberately left alone: it exists because unpinned ruff releases have
+  dirtied the whole tree mid-merge (0.16.0 did), and 0.16.2 is now current.
+
+### Removed
+
+- **71 unused imports across 38 files**, exposed once the `UnsafePointer` ->
+  `Pointer` rename left the old spellings imported but unreferenced.
+  `llmm/__init__.mojo` is untouched: it is a pure re-export surface, so every
+  import there is "unused" by construction and dropping them would delete the
+  package's public API.
+
 ## [Unreleased] - 2026-07-24
 
 ### Added

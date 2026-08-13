@@ -75,10 +75,9 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.math import sqrt
-from std.memory import UnsafePointer
 from std.random import random_float64, seed
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true
 
 from llmm.matmul import matmul_bias_bwd
@@ -99,13 +98,13 @@ comptime REPEATS = 8
 
 
 def _fill_random(
-    ptr: UnsafePointer[Scalar[DT], MutUntrackedOrigin],
+    ptr: Pointer[Scalar[DT], MutUntrackedOrigin],
     numel: Int,
     scale: Float32,
 ) -> None:
     for i in range(numel):
         var v = Float32((random_float64() * 2.0 - 1.0)) * scale
-        ptr[i] = v.cast[DT]()
+        ptr[unsafe_offset=i] = v.cast[DT]()
 
 
 def _run_dbias_case(label: String, rows: Int, out_channels: Int) raises -> None:
@@ -136,18 +135,20 @@ def _run_dbias_case(label: String, rows: Int, out_channels: Int) raises -> None:
     var host_ref = ctx.enqueue_create_host_buffer[DType.float32](out_channels)
     ctx.synchronize()
     for c in range(out_channels):
-        host_ref.unsafe_ptr()[c] = Float32(0.0)
+        host_ref.unsafe_ptr()[unsafe_offset=c] = Float32(0.0)
     for r in range(rows):
-        var row = host_doutput.unsafe_ptr() + r * out_channels
+        var row = host_doutput.unsafe_ptr().unsafe_offset(r * out_channels)
         for c in range(out_channels):
-            host_ref.unsafe_ptr()[c] += row[c].cast[DType.float32]()
+            host_ref.unsafe_ptr()[unsafe_offset=c] += row[unsafe_offset=c].cast[
+                DType.float32
+            ]()
 
     # Every column is a sum of `rows` random non-zero values; an exactly-zero
     # entry in the reference would make the "not trivially zero" assertion
     # below vacuous, so establish that it cannot happen before relying on it.
     for c in range(out_channels):
         assert_true(
-            host_ref.unsafe_ptr()[c] != Float32(0.0),
+            host_ref.unsafe_ptr()[unsafe_offset=c] != Float32(0.0),
             label
             + ": host reference column "
             + String(c)
@@ -164,7 +165,9 @@ def _run_dbias_case(label: String, rows: Int, out_channels: Int) raises -> None:
         # would inherit whatever the previous iteration left behind and look
         # like it had produced a correct result.
         for c in range(out_channels):
-            host_d_bias.unsafe_ptr()[c] = Float32(-12345.0).cast[DT]()
+            host_d_bias.unsafe_ptr()[unsafe_offset=c] = Float32(-12345.0).cast[
+                DT
+            ]()
         dev_d_bias.enqueue_copy_from(host_d_bias)
         ctx.synchronize()
 
@@ -188,7 +191,7 @@ def _run_dbias_case(label: String, rows: Int, out_channels: Int) raises -> None:
         # of a failure should see that named rather than inferred from an L2.
         var nonzero = 0
         for c in range(out_channels):
-            if host_d_bias.unsafe_ptr()[c] != Scalar[DT](0):
+            if host_d_bias.unsafe_ptr()[unsafe_offset=c] != Scalar[DT](0):
                 nonzero += 1
         assert_true(
             nonzero == out_channels,
@@ -209,8 +212,10 @@ def _run_dbias_case(label: String, rows: Int, out_channels: Int) raises -> None:
         var num = Float32(0.0)
         var den = Float32(0.0)
         for c in range(out_channels):
-            var got = host_d_bias.unsafe_ptr()[c].cast[DType.float32]()
-            var want = host_ref.unsafe_ptr()[c]
+            var got = host_d_bias.unsafe_ptr()[unsafe_offset=c].cast[
+                DType.float32
+            ]()
+            var want = host_ref.unsafe_ptr()[unsafe_offset=c]
             num += (got - want) * (got - want)
             den += want * want
         var rel_l2 = sqrt(num) / (sqrt(den) + Float32(1e-12))
@@ -222,9 +227,11 @@ def _run_dbias_case(label: String, rows: Int, out_channels: Int) raises -> None:
             + " >= 0.02"
             + suffix
             + " (host[0]="
-            + String(host_ref.unsafe_ptr()[0])
+            + String(host_ref.unsafe_ptr()[unsafe_offset=0])
             + ", gpu[0]="
-            + String(host_d_bias.unsafe_ptr()[0].cast[DType.float32]())
+            + String(
+                host_d_bias.unsafe_ptr()[unsafe_offset=0].cast[DType.float32]()
+            )
             + ")",
         )
 

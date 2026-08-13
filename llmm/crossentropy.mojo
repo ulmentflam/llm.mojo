@@ -1,9 +1,7 @@
 from extensibility import register
-from std.sys import simd_width_of
 from std.math import ceildiv, log
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext
-from std.algorithm import sync_parallelize
+from max.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -37,14 +35,14 @@ def _crossentropy_ohe_fwd[
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp
 ) -> None:
-    var target_idx = Int(targets_ptr[idx])
+    var target_idx = Int(targets_ptr[unsafe_offset=idx])
     # offset idx*Vp + target_idx; idx == b*T+t here
     # Int(vocab_size_padded) is load-bearing: without it the offset math
     # falls back to a deprecated implicit Int -> Int64 conversion.
-    var prob = probs_ptr[idx * Int(vocab_size_padded) + target_idx].cast[
-        DType.float32
-    ]()
-    losses_ptr[idx] = -log(prob)
+    var prob = probs_ptr[
+        unsafe_offset=idx * Int(vocab_size_padded) + target_idx
+    ].cast[DType.float32]()
+    losses_ptr[unsafe_offset=idx] = -log(prob)
 
 
 def crossentropy_ohe_fwd_cpu[
@@ -215,12 +213,12 @@ def _crossentropy_ohe_bwd[
     seq_len: Int64,  # Our T
     vocab_size_padded: Int64,  # Our Vp — only used as row stride here
 ) -> None:
-    var target_idx = Int(targets_ptr[idx])
+    var target_idx = Int(targets_ptr[unsafe_offset=idx])
     var target_offset = idx * Int(vocab_size_padded) + target_idx
-    var prob = probs_ptr[target_offset].cast[DType.float32]()
-    var d_loss = d_losses_ptr[idx].cast[DType.float32]()
+    var prob = probs_ptr[unsafe_offset=target_offset].cast[DType.float32]()
+    var d_loss = d_losses_ptr[unsafe_offset=idx].cast[DType.float32]()
     var d_prob = -d_loss / prob
-    d_probs_ptr[target_offset] = d_prob.cast[dtype]()
+    d_probs_ptr[unsafe_offset=target_offset] = d_prob.cast[dtype]()
 
 
 def crossentropy_ohe_bwd_cpu[

@@ -112,33 +112,33 @@ struct Tokenizer:
         var header = alloc[Int32](HEADER_SIZE)
         read_and_copy[DType.int32](file, header, HEADER_SIZE)
 
-        var magic = Int(header.load(0))
+        var magic = Int(header.unsafe_load(0))
         if magic != TOKENIZER_MAGIC and magic != TOKENIZER_MAGIC_LEGACY:
-            header.free()
+            header.unsafe_free()
             raise Error(
                 "Tokenizer error: bad magic number in header: " + String(magic)
             )
 
-        var version = Int(header.load(1))
-        self.vocab_size = Int(header.load(2))
+        var version = Int(header.unsafe_load(1))
+        self.vocab_size = Int(header.unsafe_load(2))
 
         if version == 1:
             if self.vocab_size != GPT2_VOCAB_SIZE:
-                header.free()
+                header.unsafe_free()
                 raise Error(
                     "Tokenizer error: unexpected vocab size for version 1: "
                     + String(self.vocab_size)
                 )
             self.eot_token = GPT2_EOT_TOKEN
         elif version == 2:
-            self.eot_token = Int(header.load(3))
+            self.eot_token = Int(header.unsafe_load(3))
         else:
-            header.free()
+            header.unsafe_free()
             raise Error(
                 "Tokenizer error: bad version in header: " + String(version)
             )
 
-        header.free()
+        header.unsafe_free()
 
         self.token_table = List[String]()
         self.token_table.reserve(self.vocab_size)

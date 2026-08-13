@@ -21,9 +21,8 @@
 # run under `flock -w 10800 /tmp/llmm-gpu.lock -c '...'` (shared GPU).
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import UnsafePointer
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true, assert_equal
 
 from llmm.rand import MT19937
@@ -55,9 +54,9 @@ from _lowp_test_common import pseudo_gaussian_fill, cosine_and_rel_l2
 # comparing (tests/test_lowp_gemm.mojo's `_host_gemm_ref` uses the identical
 # convention; ported here rather than imported since it is file-local there).
 def _host_gemm_ref(
-    a_host: UnsafePointer[Float32, MutUntrackedOrigin],
-    b_host: UnsafePointer[Float32, MutUntrackedOrigin],
-    out_host: UnsafePointer[Float32, MutUntrackedOrigin],
+    a_host: Pointer[Float32, MutUntrackedOrigin],
+    b_host: Pointer[Float32, MutUntrackedOrigin],
+    out_host: Pointer[Float32, MutUntrackedOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -66,16 +65,19 @@ def _host_gemm_ref(
         for j in range(n):
             var acc = Float32(0.0)
             for p in range(k):
-                acc += a_host[i * k + p] * b_host[j * k + p]
-            out_host[j * m + i] = acc
+                acc += (
+                    a_host[unsafe_offset=i * k + p]
+                    * b_host[unsafe_offset=j * k + p]
+                )
+            out_host[unsafe_offset=j * m + i] = acc
 
 
 @always_inline
 def _assert_finite(
-    d: UnsafePointer[Float32, MutUntrackedOrigin], n: Int, label: String
+    d: Pointer[Float32, MutUntrackedOrigin], n: Int, label: String
 ) raises:
     for i in range(n):
-        var v = d[i]
+        var v = d[unsafe_offset=i]
         assert_true(v == v, label + ": NaN at " + String(i))
         assert_true(
             v > Float32(-1e30) and v < Float32(1e30),
@@ -125,13 +127,13 @@ def _run_fp4_gemm_case[
     var host_a_ref = ctx.enqueue_create_host_buffer[DType.float32](a_n)
     var host_b_ref = ctx.enqueue_create_host_buffer[DType.float32](b_n)
     for i in range(a_n):
-        var bf = host_a_f32.unsafe_ptr()[i].cast[IN_DT]()
-        host_a_bf16.unsafe_ptr()[i] = bf
-        host_a_ref.unsafe_ptr()[i] = bf.cast[DType.float32]()
+        var bf = host_a_f32.unsafe_ptr()[unsafe_offset=i].cast[IN_DT]()
+        host_a_bf16.unsafe_ptr()[unsafe_offset=i] = bf
+        host_a_ref.unsafe_ptr()[unsafe_offset=i] = bf.cast[DType.float32]()
     for i in range(b_n):
-        var bf = host_b_f32.unsafe_ptr()[i].cast[IN_DT]()
-        host_b_bf16.unsafe_ptr()[i] = bf
-        host_b_ref.unsafe_ptr()[i] = bf.cast[DType.float32]()
+        var bf = host_b_f32.unsafe_ptr()[unsafe_offset=i].cast[IN_DT]()
+        host_b_bf16.unsafe_ptr()[unsafe_offset=i] = bf
+        host_b_ref.unsafe_ptr()[unsafe_offset=i] = bf.cast[DType.float32]()
 
     var dev_a = ctx.enqueue_create_buffer[IN_DT](a_n)
     var dev_b = ctx.enqueue_create_buffer[IN_DT](b_n)
@@ -211,10 +213,12 @@ def _run_fp4_gemm_case[
     var host_got = ctx.enqueue_create_host_buffer[DType.float32](m * n)
     var host_got_bf16 = ctx.enqueue_create_host_buffer[DType.float32](m * n)
     for i in range(m * n):
-        host_got.unsafe_ptr()[i] = host_d.unsafe_ptr()[i].cast[DType.float32]()
-        host_got_bf16.unsafe_ptr()[i] = host_d_bf16.unsafe_ptr()[i].cast[
-            DType.float32
-        ]()
+        host_got.unsafe_ptr()[unsafe_offset=i] = host_d.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.float32]()
+        host_got_bf16.unsafe_ptr()[unsafe_offset=i] = host_d_bf16.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.float32]()
 
     var host_ref = ctx.enqueue_create_host_buffer[DType.float32](m * n)
     _host_gemm_ref(
@@ -372,13 +376,13 @@ def test_fp4_rht_quantize_gemm_contract() raises:
     var host_a_ref = ctx.enqueue_create_host_buffer[DType.float32](m * k)
     var host_b_ref = ctx.enqueue_create_host_buffer[DType.float32](n * k)
     for i in range(m * k):
-        var bf = host_a_f32.unsafe_ptr()[i].cast[IN_DT]()
-        host_a_bf16.unsafe_ptr()[i] = bf
-        host_a_ref.unsafe_ptr()[i] = bf.cast[DType.float32]()
+        var bf = host_a_f32.unsafe_ptr()[unsafe_offset=i].cast[IN_DT]()
+        host_a_bf16.unsafe_ptr()[unsafe_offset=i] = bf
+        host_a_ref.unsafe_ptr()[unsafe_offset=i] = bf.cast[DType.float32]()
     for i in range(n * k):
-        var bf = host_b_f32.unsafe_ptr()[i].cast[IN_DT]()
-        host_b_bf16.unsafe_ptr()[i] = bf
-        host_b_ref.unsafe_ptr()[i] = bf.cast[DType.float32]()
+        var bf = host_b_f32.unsafe_ptr()[unsafe_offset=i].cast[IN_DT]()
+        host_b_bf16.unsafe_ptr()[unsafe_offset=i] = bf
+        host_b_ref.unsafe_ptr()[unsafe_offset=i] = bf.cast[DType.float32]()
 
     var dev_a = ctx.enqueue_create_buffer[IN_DT](m * k)
     var dev_b = ctx.enqueue_create_buffer[IN_DT](n * k)
@@ -465,7 +469,9 @@ def test_fp4_rht_quantize_gemm_contract() raises:
 
     var host_got = ctx.enqueue_create_host_buffer[DType.float32](m * n)
     for i in range(m * n):
-        host_got.unsafe_ptr()[i] = host_d.unsafe_ptr()[i].cast[DType.float32]()
+        host_got.unsafe_ptr()[unsafe_offset=i] = host_d.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.float32]()
 
     var host_ref = ctx.enqueue_create_host_buffer[DType.float32](m * n)
     _host_gemm_ref(
@@ -478,7 +484,9 @@ def test_fp4_rht_quantize_gemm_contract() raises:
     )
     var host_ref_scaled = ctx.enqueue_create_host_buffer[DType.float32](m * n)
     for i in range(m * n):
-        host_ref_scaled.unsafe_ptr()[i] = host_ref.unsafe_ptr()[i] * 16.0
+        host_ref_scaled.unsafe_ptr()[unsafe_offset=i] = (
+            host_ref.unsafe_ptr()[unsafe_offset=i] * 16.0
+        )
 
     var rel_l2 = Float32(0.0)
     var cosine = Float32(0.0)
@@ -568,7 +576,9 @@ def test_sr_nvfp4_quantize_deterministic_under_fixed_seed() raises:
     ctx.synchronize()
     var host_bf16 = ctx.enqueue_create_host_buffer[IN_DT](n)
     for i in range(n):
-        host_bf16.unsafe_ptr()[i] = host_f32.unsafe_ptr()[i].cast[IN_DT]()
+        host_bf16.unsafe_ptr()[unsafe_offset=i] = host_f32.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[IN_DT]()
     var x_dev = ctx.enqueue_create_buffer[IN_DT](n)
     x_dev.enqueue_copy_from(host_bf16)
     ctx.synchronize()
@@ -606,9 +616,9 @@ def test_sr_nvfp4_quantize_deterministic_under_fixed_seed() raises:
         scale_dev.enqueue_copy_to(host_scale)
         ctx.synchronize()
         for i in range(q_size):
-            qs.append(host_q.unsafe_ptr()[i])
+            qs.append(host_q.unsafe_ptr()[unsafe_offset=i])
         for i in range(scale_size):
-            ss.append(host_scale.unsafe_ptr()[i])
+            ss.append(host_scale.unsafe_ptr()[unsafe_offset=i])
 
     var q1 = List[UInt8](capacity=q_size)
     var s1 = List[UInt8](capacity=scale_size)

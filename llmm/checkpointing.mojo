@@ -169,21 +169,21 @@ def write_model_checkpoint[
 
     var header = alloc[Int32](CHECKPOINT_HEADER_SIZE)
     for i in range(CHECKPOINT_HEADER_SIZE):
-        header.store(i, Int32(0))
-    header.store(0, Int32(MODEL_MAGIC))
-    header.store(1, Int32(resolved_version))
-    header.store(2, Int32(config.max_seq_len))
-    header.store(3, Int32(config.vocab_size))
-    header.store(4, Int32(config.num_layer))
-    header.store(5, Int32(config.num_heads))
-    header.store(6, Int32(config.channels))
-    header.store(7, Int32(config.padded_vocab_size))
+        header.unsafe_store(i, Int32(0))
+    header.unsafe_store(0, Int32(MODEL_MAGIC))
+    header.unsafe_store(1, Int32(resolved_version))
+    header.unsafe_store(2, Int32(config.max_seq_len))
+    header.unsafe_store(3, Int32(config.vocab_size))
+    header.unsafe_store(4, Int32(config.num_layer))
+    header.unsafe_store(5, Int32(config.num_heads))
+    header.unsafe_store(6, Int32(config.channels))
+    header.unsafe_store(7, Int32(config.padded_vocab_size))
 
     var file = open(path, "w")
     write_buffer[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
     write_buffer[dtype](file, params, num_parameters)
     file.close()
-    header.free()
+    header.unsafe_free()
 
 
 def read_model_header(mut file: FileHandle) raises -> ModelHeader:
@@ -191,30 +191,30 @@ def read_model_header(mut file: FileHandle) raises -> ModelHeader:
     var header = alloc[Int32](CHECKPOINT_HEADER_SIZE)
     read_and_copy[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
 
-    var magic = Int(header.load(0))
-    var version = Int(header.load(1))
+    var magic = Int(header.unsafe_load(0))
+    var version = Int(header.unsafe_load(1))
     if magic != MODEL_MAGIC:
-        header.free()
+        header.unsafe_free()
         raise Error(
             "Checkpoint error: bad model magic number in header: "
             + String(magic)
         )
     if version != VERSION_FP32 and version != VERSION_BF16:
-        header.free()
+        header.unsafe_free()
         raise Error(
             "Checkpoint error: unsupported model version in header: "
             + String(version)
         )
 
     var config = CheckpointConfig(
-        max_seq_len=Int(header.load(2)),
-        vocab_size=Int(header.load(3)),
-        num_layer=Int(header.load(4)),
-        num_heads=Int(header.load(5)),
-        channels=Int(header.load(6)),
-        padded_vocab_size=Int(header.load(7)),
+        max_seq_len=Int(header.unsafe_load(2)),
+        vocab_size=Int(header.unsafe_load(3)),
+        num_layer=Int(header.unsafe_load(4)),
+        num_heads=Int(header.unsafe_load(5)),
+        channels=Int(header.unsafe_load(6)),
+        padded_vocab_size=Int(header.unsafe_load(7)),
     )
-    header.free()
+    header.unsafe_free()
     return ModelHeader(config^, version)
 
 
@@ -282,29 +282,29 @@ def write_state_checkpoint[
     """
     var header = alloc[Int32](CHECKPOINT_HEADER_SIZE)
     for i in range(CHECKPOINT_HEADER_SIZE):
-        header.store(i, Int32(0))
-    header.store(0, Int32(STATE_MAGIC))
-    header.store(1, Int32(STATE_VERSION))
-    header.store(2, Int32(state.num_processes))
-    header.store(3, Int32(state.process_rank))
-    header.store(4, Int32(state.use_master_weights))
-    header.store(5, Int32(state.should_shuffle))
-    header.store(10, Int32(state.step))
+        header.unsafe_store(i, Int32(0))
+    header.unsafe_store(0, Int32(STATE_MAGIC))
+    header.unsafe_store(1, Int32(STATE_VERSION))
+    header.unsafe_store(2, Int32(state.num_processes))
+    header.unsafe_store(3, Int32(state.process_rank))
+    header.unsafe_store(4, Int32(state.use_master_weights))
+    header.unsafe_store(5, Int32(state.should_shuffle))
+    header.unsafe_store(10, Int32(state.step))
 
     # 64-bit fields share the same buffer; an aligned UInt64 view writes pairs
     # of Int32 slots (index k => slots 2k, 2k+1), matching llm.c's byte offsets.
-    var u64_view = header.bitcast[UInt64]()
-    u64_view.store(10, state.sampler_rng_state)  # slots 20-21
-    u64_view.store(11, state.shuffle_rng_state)  # slots 22-23
-    u64_view.store(15, UInt64(state.current_shard_idx))  # slots 30-31
-    u64_view.store(16, UInt64(state.current_sample_idx))  # slots 32-33
+    var u64_view = header.unsafe_bitcast[UInt64]()
+    u64_view.unsafe_store(10, state.sampler_rng_state)  # slots 20-21
+    u64_view.unsafe_store(11, state.shuffle_rng_state)  # slots 22-23
+    u64_view.unsafe_store(15, UInt64(state.current_shard_idx))  # slots 30-31
+    u64_view.unsafe_store(16, UInt64(state.current_sample_idx))  # slots 32-33
 
     var file = open(path, "w")
     write_buffer[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
     write_buffer[dtype](file, m_memory, shard_num_parameters)
     write_buffer[dtype](file, v_memory, shard_num_parameters)
     file.close()
-    header.free()
+    header.unsafe_free()
 
 
 def read_state_header(mut file: FileHandle) raises -> TrainingState:
@@ -312,34 +312,34 @@ def read_state_header(mut file: FileHandle) raises -> TrainingState:
     var header = alloc[Int32](CHECKPOINT_HEADER_SIZE)
     read_and_copy[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
 
-    var magic = Int(header.load(0))
-    var version = Int(header.load(1))
+    var magic = Int(header.unsafe_load(0))
+    var version = Int(header.unsafe_load(1))
     if magic != STATE_MAGIC:
-        header.free()
+        header.unsafe_free()
         raise Error(
             "Checkpoint error: bad state magic number in header: "
             + String(magic)
         )
     if version != STATE_VERSION:
-        header.free()
+        header.unsafe_free()
         raise Error(
             "Checkpoint error: unsupported state version in header: "
             + String(version)
         )
 
-    var u64_view = header.bitcast[UInt64]()
+    var u64_view = header.unsafe_bitcast[UInt64]()
     var state = TrainingState(
-        step=Int(header.load(10)),
-        num_processes=Int(header.load(2)),
-        process_rank=Int(header.load(3)),
-        use_master_weights=Int(header.load(4)),
-        should_shuffle=Int(header.load(5)),
-        sampler_rng_state=u64_view.load(10),
-        shuffle_rng_state=u64_view.load(11),
-        current_shard_idx=Int(u64_view.load(15)),
-        current_sample_idx=Int(u64_view.load(16)),
+        step=Int(header.unsafe_load(10)),
+        num_processes=Int(header.unsafe_load(2)),
+        process_rank=Int(header.unsafe_load(3)),
+        use_master_weights=Int(header.unsafe_load(4)),
+        should_shuffle=Int(header.unsafe_load(5)),
+        sampler_rng_state=u64_view.unsafe_load(10),
+        shuffle_rng_state=u64_view.unsafe_load(11),
+        current_shard_idx=Int(u64_view.unsafe_load(15)),
+        current_sample_idx=Int(u64_view.unsafe_load(16)),
     )
-    header.free()
+    header.unsafe_free()
     return state^
 
 

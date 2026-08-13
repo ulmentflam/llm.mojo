@@ -3,7 +3,7 @@ from std.memory import alloc
 from std.sys import is_defined
 from std.ffi import external_call
 from std.time import global_perf_counter_ns
-from std.algorithm import sync_parallelize
+from max.algorithm import sync_parallelize
 
 
 # Per-thread CPU trace, written directly as Perfetto/Chrome-trace JSON.
@@ -113,10 +113,10 @@ def traced_parallelize[
 
         @parameter
         def _timed_worker(i: Int) raises:
-            tids[i] = current_thread_id()
-            starts[i] = global_perf_counter_ns()
+            tids[unsafe_offset=i] = current_thread_id()
+            starts[unsafe_offset=i] = global_perf_counter_ns()
             work_fn(i)
-            ends[i] = global_perf_counter_ns()
+            ends[unsafe_offset=i] = global_perf_counter_ns()
 
         sync_parallelize[_timed_worker](num_workers)
 
@@ -124,12 +124,19 @@ def traced_parallelize[
         # is written sequentially — no cross-thread contention on the handle.
         var f = open(path, "a")
         for i in range(num_workers):
-            f.write(_trace_event(String(label), starts[i], ends[i], tids[i]))
+            f.write(
+                _trace_event(
+                    String(label),
+                    starts[unsafe_offset=i],
+                    ends[unsafe_offset=i],
+                    tids[unsafe_offset=i],
+                )
+            )
         f.close()
 
-        starts.free()
-        ends.free()
-        tids.free()
+        starts.unsafe_free()
+        ends.unsafe_free()
+        tids.unsafe_free()
 
 
 # Escape the characters that are not legal inside a JSON string literal. Trace

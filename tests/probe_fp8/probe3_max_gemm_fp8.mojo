@@ -22,9 +22,9 @@
 # (raw cuBLASLt FFI, which never asks Mojo to materialize an fp8 SIMD
 # value in arithmetic).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import has_nvidia_gpu_accelerator
-from layout import Layout, TileTensor
+from layout import TileTensor
 from layout.tile_layout import row_major
 from linalg.matmul import matmul
 

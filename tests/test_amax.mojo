@@ -14,7 +14,7 @@
 # `flock -w 10800 /tmp/llmm-gpu.lock -c 'pixi run mojo run -I . tests/test_amax.mojo'`.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.sys import has_nvidia_gpu_accelerator
 from std.math import isnan, isinf
 from std.testing import (
@@ -48,14 +48,14 @@ def _read_f32(
     var host = ctx.enqueue_create_host_buffer[DType.float32](1)
     buf.enqueue_copy_to(host)
     ctx.synchronize()
-    return host.unsafe_ptr()[0]
+    return host.unsafe_ptr()[unsafe_offset=0]
 
 
 def _write_f32(
     ctx: DeviceContext, buf: DeviceBuffer[DType.float32], val: Float32
 ) raises -> None:
     var host = ctx.enqueue_create_host_buffer[DType.float32](1)
-    host.unsafe_ptr()[0] = val
+    host.unsafe_ptr()[unsafe_offset=0] = val
     buf.enqueue_copy_from(host)
     ctx.synchronize()
 
@@ -66,7 +66,7 @@ def _make_fp32_tensor(
     var n = len(values)
     var host = ctx.enqueue_create_host_buffer[DType.float32](n)
     for i in range(n):
-        host.unsafe_ptr()[i] = values[i]
+        host.unsafe_ptr()[unsafe_offset=i] = values[i]
     var dev = ctx.enqueue_create_buffer[DType.float32](n)
     dev.enqueue_copy_from(host)
     ctx.synchronize()
@@ -188,9 +188,11 @@ def test_compute_amax_large_tensor() raises:
     comptime n = 200_000
     var host = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
     for i in range(n):
-        host.unsafe_ptr()[i] = Float32(0.0).cast[DType.bfloat16]()
+        host.unsafe_ptr()[unsafe_offset=i] = Float32(0.0).cast[DType.bfloat16]()
     # Plant the true max at an arbitrary, non-block-aligned interior index.
-    host.unsafe_ptr()[123457] = Float32(-42.0).cast[DType.bfloat16]()
+    host.unsafe_ptr()[unsafe_offset=123457] = Float32(-42.0).cast[
+        DType.bfloat16
+    ]()
     var dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     dev.enqueue_copy_from(host)
     ctx.synchronize()

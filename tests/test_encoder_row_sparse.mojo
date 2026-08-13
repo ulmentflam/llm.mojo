@@ -17,9 +17,9 @@ across ranks first, and these tests exercise precisely that: the existing
 pass even if the union were omitted entirely.
 """
 
-from std.memory import UnsafePointer, alloc
-from std.gpu.host import DeviceContext
-from std.algorithm import sync_parallelize
+from std.memory import alloc
+from max.gpu.host import DeviceContext
+from max.algorithm import sync_parallelize
 from std.math import ceildiv
 from std.bit import pop_count
 
@@ -35,12 +35,7 @@ from llmm.encoder import (
     WTE_BUCKET_IDX_SIZE,
 )
 
-from std.testing import (
-    TestSuite,
-    assert_almost_equal,
-    assert_equal,
-    assert_true,
-)
+from std.testing import assert_almost_equal, assert_equal, assert_true
 
 
 # Realistic vocabulary: the sparsity argument is meaningless at the V=256 of
@@ -72,13 +67,17 @@ def _fill_tokens(
     """
     var s = seed
     for i in range(n):
-        ptr.store(i, Scalar[DType.int32](base + Int(_lcg(s) % UInt64(span))))
+        ptr.unsafe_store(
+            i, Scalar[DType.int32](base + Int(_lcg(s) % UInt64(span)))
+        )
 
 
 def _fill_dout(ptr: MutKernelPtr[DType.float32], n: Int, seed: UInt64) -> None:
     var s = seed
     for i in range(n):
-        ptr.store(i, Scalar[DType.float32](Int(_lcg(s) % 2000)) * 0.001 - 1.0)
+        ptr.unsafe_store(
+            i, Scalar[DType.float32](Int(_lcg(s) % 2000)) * 0.001 - 1.0
+        )
 
 
 # ===----------------------------------------------------------------------=== #
@@ -97,7 +96,7 @@ def test_row_map_dedups_and_maps_rows() raises:
     # 5 is repeated 3x, 40 twice; distinct ids are {5, 6, 20, 40}.
     var vals = [5, 40, 5, 20, 6, 40, 5, 20]
     for i in range(8):
-        toks[i] = Scalar[DType.int32](vals[i])
+        toks[unsafe_offset=i] = Scalar[DType.int32](vals[i])
 
     build_token_bitmap(
         ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
@@ -128,14 +127,14 @@ def test_row_map_dedups_and_maps_rows() raises:
     assert_equal(run_first[2], 40)
     assert_equal(run_len[2], 1)
     # Compact rows are assigned in ascending global-row order.
-    assert_equal(Int(row_of[5]), 0)
-    assert_equal(Int(row_of[6]), 1)
-    assert_equal(Int(row_of[20]), 2)
-    assert_equal(Int(row_of[40]), 3)
+    assert_equal(Int(row_of[unsafe_offset=5]), 0)
+    assert_equal(Int(row_of[unsafe_offset=6]), 1)
+    assert_equal(Int(row_of[unsafe_offset=20]), 2)
+    assert_equal(Int(row_of[unsafe_offset=40]), 3)
 
-    bm.free()
-    row_of.free()
-    toks.free()
+    bm.unsafe_free()
+    row_of.unsafe_free()
+    toks.unsafe_free()
 
 
 def test_row_map_merges_gaps_within_capacity() raises:
@@ -146,9 +145,9 @@ def test_row_map_merges_gaps_within_capacity() raises:
     var bm = alloc[Scalar[DType.uint32]](words)
     var row_of = alloc[Scalar[DType.int32]](SMALL_V)
     var toks = alloc[Scalar[DType.int32]](3)
-    toks[0] = 1
-    toks[1] = 5
-    toks[2] = 40
+    toks[unsafe_offset=0] = 1
+    toks[unsafe_offset=1] = 5
+    toks[unsafe_offset=2] = 40
     build_token_bitmap(
         ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
         MutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
@@ -176,9 +175,9 @@ def test_row_map_merges_gaps_within_capacity() raises:
     assert_equal(run_len[1], 1)
     assert_equal(n_rows, 6)
     # Rows swallowed by a merge still get valid, contiguous compact indices.
-    assert_equal(Int(row_of[1]), 0)
-    assert_equal(Int(row_of[5]), 4)
-    assert_equal(Int(row_of[40]), 5)
+    assert_equal(Int(row_of[unsafe_offset=1]), 0)
+    assert_equal(Int(row_of[unsafe_offset=5]), 4)
+    assert_equal(Int(row_of[unsafe_offset=40]), 5)
 
     # With zero budget nothing merges.
     var rf2 = List[Int]()
@@ -195,9 +194,9 @@ def test_row_map_merges_gaps_within_capacity() raises:
     assert_equal(n2, 3)
     assert_equal(len(rf2), 3)
 
-    bm.free()
-    row_of.free()
-    toks.free()
+    bm.unsafe_free()
+    row_of.unsafe_free()
+    toks.unsafe_free()
 
 
 def test_row_map_rejects_overflow() raises:
@@ -208,7 +207,7 @@ def test_row_map_rejects_overflow() raises:
     var row_of = alloc[Scalar[DType.int32]](SMALL_V)
     var toks = alloc[Scalar[DType.int32]](10)
     for i in range(10):
-        toks[i] = Scalar[DType.int32](i * 3)
+        toks[unsafe_offset=i] = Scalar[DType.int32](i * 3)
     build_token_bitmap(
         ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
         MutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
@@ -231,9 +230,9 @@ def test_row_map_rejects_overflow() raises:
     except:
         raised = True
     assert_true(raised, "expected capacity overflow to raise")
-    bm.free()
-    row_of.free()
-    toks.free()
+    bm.unsafe_free()
+    row_of.unsafe_free()
+    toks.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -294,12 +293,12 @@ def test_union_makes_row_lists_rank_invariant() raises:
                 V,
             )
             for w in range(words):
-                own_out[rank * words + w] = bm[w]
+                own_out[unsafe_offset=rank * words + w] = bm[unsafe_offset=w]
             z.allreduce_or_host[DType.uint32](
-                UnsafePointer[Scalar[DType.uint32], MutAnyOrigin](
+                Pointer[Scalar[DType.uint32], MutAnyOrigin](
                     bm.as_unsafe_any_origin()
                 ),
-                UnsafePointer[Scalar[DType.uint32], MutAnyOrigin](
+                Pointer[Scalar[DType.uint32], MutAnyOrigin](
                     un.as_unsafe_any_origin()
                 ),
                 words,
@@ -315,17 +314,17 @@ def test_union_makes_row_lists_rank_invariant() raises:
                 rf,
                 rl,
             )
-            n_rows_out[rank] = n
-            run_count_out[rank] = len(rf)
+            n_rows_out[unsafe_offset=rank] = n
+            run_count_out[unsafe_offset=rank] = len(rf)
             for w in range(words):
-                union_out[rank * words + w] = un[w]
+                union_out[unsafe_offset=rank * words + w] = un[unsafe_offset=w]
             for k in range(len(rf)):
-                first_out[rank * BT * 2 + k] = rf[k]
-                len_out[rank * BT * 2 + k] = rl[k]
-            toks.free()
-            bm.free()
-            un.free()
-            row_of.free()
+                first_out[unsafe_offset=rank * BT * 2 + k] = rf[k]
+                len_out[unsafe_offset=rank * BT * 2 + k] = rl[k]
+            toks.unsafe_free()
+            bm.unsafe_free()
+            un.unsafe_free()
+            row_of.unsafe_free()
         except e:
             print("row map rank error:", e)
             # Same hazard as everywhere else ranks rendezvous: leaving
@@ -334,16 +333,23 @@ def test_union_makes_row_lists_rank_invariant() raises:
 
     sync_parallelize[_run_rank](N)
 
-    assert_equal(n_rows_out[0], n_rows_out[1])
-    assert_equal(run_count_out[0], run_count_out[1])
-    assert_true(run_count_out[0] > 1, "expected a fragmented row set")
+    assert_equal(n_rows_out[unsafe_offset=0], n_rows_out[unsafe_offset=1])
+    assert_equal(run_count_out[unsafe_offset=0], run_count_out[unsafe_offset=1])
+    assert_true(
+        run_count_out[unsafe_offset=0] > 1, "expected a fragmented row set"
+    )
     for w in range(words):
         assert_equal(
-            Int(union_out[0 * words + w]), Int(union_out[1 * words + w])
+            Int(union_out[unsafe_offset=0 * words + w]),
+            Int(union_out[unsafe_offset=1 * words + w]),
         )
-    for k in range(run_count_out[0]):
-        assert_equal(first_out[k], first_out[BT * 2 + k])
-        assert_equal(len_out[k], len_out[BT * 2 + k])
+    for k in range(run_count_out[unsafe_offset=0]):
+        assert_equal(
+            first_out[unsafe_offset=k], first_out[unsafe_offset=BT * 2 + k]
+        )
+        assert_equal(
+            len_out[unsafe_offset=k], len_out[unsafe_offset=BT * 2 + k]
+        )
 
     # CONTENT, not just agreement. Everything above compares rank 0 to rank 1,
     # and all of it still holds if `allreduce_or_host` broadcast one rank's
@@ -356,9 +362,9 @@ def test_union_makes_row_lists_rank_invariant() raises:
     var only0 = 0
     var only1 = 0
     for w in range(words):
-        var a = UInt32(own_out[0 * words + w])
-        var b = UInt32(own_out[1 * words + w])
-        var u = UInt32(union_out[0 * words + w])
+        var a = UInt32(own_out[unsafe_offset=0 * words + w])
+        var b = UInt32(own_out[unsafe_offset=1 * words + w])
+        var u = UInt32(union_out[unsafe_offset=0 * words + w])
         # Bits that were set on exactly one rank must survive the union.
         var excl0 = a & ~b
         var excl1 = b & ~a
@@ -415,14 +421,14 @@ def test_union_makes_row_lists_rank_invariant() raises:
     # the fixture's bands ever stop overlapping -- but nobody has seen them
     # fail on a real bug, and that should be said rather than implied.
 
-    n_rows_out.free()
-    run_count_out.free()
-    union_out.free()
-    own_out.free()
-    first_out.free()
-    len_out.free()
+    n_rows_out.unsafe_free()
+    run_count_out.unsafe_free()
+    union_out.unsafe_free()
+    own_out.unsafe_free()
+    first_out.unsafe_free()
+    len_out.unsafe_free()
     coord[].free()
-    coord.free()
+    coord.unsafe_free()
 
 
 def test_divergent_range_lists_are_rejected() raises:
@@ -435,8 +441,8 @@ def test_divergent_range_lists_are_rejected() raises:
     var coord = alloc[CpuCoordinator](1)
     coord[] = CpuCoordinator(N)
     var raised_count = alloc[Int](N)
-    raised_count[0] = 0
-    raised_count[1] = 0
+    raised_count[unsafe_offset=0] = 0
+    raised_count[unsafe_offset=1] = 0
 
     @parameter
     def _run_rank(rank: Int):
@@ -456,18 +462,18 @@ def test_divergent_range_lists_are_rejected() raises:
             try:
                 z.assert_ranges_agree("reducescatter_buckets", d, po, ln)
             except:
-                raised_count[rank] = 1
+                raised_count[unsafe_offset=rank] = 1
         except e:
             print("divergent range list rank error:", e)
 
     sync_parallelize[_run_rank](N)
-    assert_equal(raised_count[0], 1)
-    assert_equal(raised_count[1], 1)
+    assert_equal(raised_count[unsafe_offset=0], 1)
+    assert_equal(raised_count[unsafe_offset=1], 1)
 
     # Agreeing lists must pass cleanly.
     var ok = alloc[Int](N)
-    ok[0] = 0
-    ok[1] = 0
+    ok[unsafe_offset=0] = 0
+    ok[unsafe_offset=1] = 0
 
     @parameter
     def _run_ok(rank: Int):
@@ -483,20 +489,20 @@ def test_divergent_range_lists_are_rejected() raises:
             ln.append(OPT)
             try:
                 z.assert_ranges_agree("reducescatter_buckets", d, po, ln)
-                ok[rank] = 1
+                ok[unsafe_offset=rank] = 1
             except:
-                ok[rank] = 0
+                ok[unsafe_offset=rank] = 0
         except e:
             print("divergent range list ok-rank error:", e)
 
     sync_parallelize[_run_ok](N)
-    assert_equal(ok[0], 1)
-    assert_equal(ok[1], 1)
+    assert_equal(ok[unsafe_offset=0], 1)
+    assert_equal(ok[unsafe_offset=1], 1)
 
-    raised_count.free()
-    ok.free()
+    raised_count.unsafe_free()
+    ok.unsafe_free()
     coord[].free()
-    coord.free()
+    coord.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -508,10 +514,10 @@ def _run_encoder_bucket[
     row_sparse: Bool
 ](
     ctx: DeviceContext,
-    coord: UnsafePointer[CpuCoordinator, MutUntrackedOrigin],
+    coord: Pointer[CpuCoordinator, MutUntrackedOrigin],
     n_ranks: Int,
     chunk_rows: Int,
-    shards_out: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    shards_out: Pointer[Scalar[DType.float32], MutAnyOrigin],
     opt: Int,
 ) raises:
     """Drive one encoder gradient bucket to completion on `n_ranks` threads and
@@ -545,7 +551,7 @@ def _run_encoder_bucket[
             )
             var shard = alloc[Scalar[DType.float32]](opt)
             for i in range(opt):
-                shard[i] = 0.0
+                shard[unsafe_offset=i] = 0.0
 
             var cap = BT * ceildiv(C, 128)
             var binfo = alloc[Scalar[DType.int32]](cap * WTE_BUCKET_IDX_SIZE)
@@ -558,7 +564,7 @@ def _run_encoder_bucket[
             # reduce-scatter linearity.
             var lm = alloc[Scalar[DType.float32]](WTE_ELEMS)
             for i in range(WTE_ELEMS):
-                lm[i] = Scalar[DType.float32]((i % 7) - 3) * 0.25
+                lm[unsafe_offset=i] = Scalar[DType.float32]((i % 7) - 3) * 0.25
             var dl = List[Int]()
             var dpo = List[Int]()
             var dln = List[Int]()
@@ -566,18 +572,18 @@ def _run_encoder_bucket[
             dpo.append(0)
             dln.append(WTE_ELEMS)
             z.reducescatter_buckets[DType.float32](
-                UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+                Pointer[Scalar[DType.float32], MutAnyOrigin](
                     lm.as_unsafe_any_origin()
                 ),
                 dl,
                 dpo,
                 dln,
-                UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+                Pointer[Scalar[DType.float32], MutAnyOrigin](
                     shard.as_unsafe_any_origin()
                 ),
                 opt,
             )
-            lm.free()
+            lm.unsafe_free()
 
             comptime if not row_sparse:
                 var nb = build_wte_buckets(
@@ -594,7 +600,7 @@ def _run_encoder_bucket[
                 )
                 var pool = alloc[Scalar[DType.float32]](WTE_ELEMS)
                 for i in range(WTE_ELEMS):
-                    pool[i] = 0.0
+                    pool[unsafe_offset=i] = 0.0
                 wte_backward_cpu[DType.float32, 4](
                     MutKernelPtr[DType.float32](pool.as_unsafe_any_origin()),
                     ImmutKernelPtr[DType.int32](binfo.as_unsafe_any_origin()),
@@ -610,18 +616,18 @@ def _run_encoder_bucket[
                 po.append(0)
                 ln.append(WTE_ELEMS)
                 z.reducescatter_buckets[DType.float32](
-                    UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+                    Pointer[Scalar[DType.float32], MutAnyOrigin](
                         pool.as_unsafe_any_origin()
                     ),
                     d,
                     po,
                     ln,
-                    UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+                    Pointer[Scalar[DType.float32], MutAnyOrigin](
                         shard.as_unsafe_any_origin()
                     ),
                     opt,
                 )
-                pool.free()
+                pool.unsafe_free()
             else:
                 var words = bitmap_words(V)
                 var bm = alloc[Scalar[DType.uint32]](words)
@@ -633,10 +639,10 @@ def _run_encoder_bucket[
                     V,
                 )
                 z.allreduce_or_host[DType.uint32](
-                    UnsafePointer[Scalar[DType.uint32], MutAnyOrigin](
+                    Pointer[Scalar[DType.uint32], MutAnyOrigin](
                         bm.as_unsafe_any_origin()
                     ),
-                    UnsafePointer[Scalar[DType.uint32], MutAnyOrigin](
+                    Pointer[Scalar[DType.uint32], MutAnyOrigin](
                         un.as_unsafe_any_origin()
                     ),
                     words,
@@ -672,20 +678,24 @@ def _run_encoder_bucket[
                     var row_hi = min(row_lo + chunk_rows, n_rows)
                     var chunk_elems = (row_hi - row_lo) * C
                     for i in range(chunk_elems):
-                        pool[i] = 0.0
+                        pool[unsafe_offset=i] = 0.0
                     var bstart = cursor
                     while cursor < nb:
-                        var r = Int(binfo[cursor * WTE_BUCKET_IDX_SIZE + 2])
+                        var r = Int(
+                            binfo[
+                                unsafe_offset=cursor * WTE_BUCKET_IDX_SIZE + 2
+                            ]
+                        )
                         if r >= row_hi:
                             break
                         cursor += 1
                     wte_backward_cpu[DType.float32, 4](
-                        MutKernelPtr[DType.float32](pool.as_unsafe_any_origin())
-                        - row_lo * C,
+                        MutKernelPtr[DType.float32](
+                            pool.as_unsafe_any_origin()
+                        ).unsafe_offset(-(row_lo * C)),
                         ImmutKernelPtr[DType.int32](
                             binfo.as_unsafe_any_origin()
-                        )
-                        + bstart * WTE_BUCKET_IDX_SIZE,
+                        ).unsafe_offset(bstart * WTE_BUCKET_IDX_SIZE),
                         ImmutKernelPtr[DType.int32](
                             widx.as_unsafe_any_origin()
                         ),
@@ -708,30 +718,32 @@ def _run_encoder_bucket[
                             ln.append((hi - lo) * C)
                         cum += rl[k]
                     z.reducescatter_buckets[DType.float32](
-                        UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+                        Pointer[Scalar[DType.float32], MutAnyOrigin](
                             pool.as_unsafe_any_origin()
                         ),
                         d,
                         po,
                         ln,
-                        UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+                        Pointer[Scalar[DType.float32], MutAnyOrigin](
                             shard.as_unsafe_any_origin()
                         ),
                         opt,
                     )
-                pool.free()
-                bm.free()
-                un.free()
+                pool.unsafe_free()
+                bm.unsafe_free()
+                un.unsafe_free()
 
             for i in range(opt):
-                shards_out[rank * opt + i] = shard[i]
+                shards_out[unsafe_offset=rank * opt + i] = shard[
+                    unsafe_offset=i
+                ]
 
-            toks.free()
-            dout.free()
-            shard.free()
-            binfo.free()
-            widx.free()
-            row_of.free()
+            toks.unsafe_free()
+            dout.unsafe_free()
+            shard.unsafe_free()
+            binfo.unsafe_free()
+            widx.unsafe_free()
+            row_of.unsafe_free()
         except e:
             print("encoder bucket rank error:", e)
 
@@ -774,15 +786,15 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
     var dense = alloc[Scalar[DType.float32]](N * OPT)
     var sparse = alloc[Scalar[DType.float32]](N * OPT)
     for i in range(N * OPT):
-        dense[i] = 0.0
-        sparse[i] = 0.0
+        dense[unsafe_offset=i] = 0.0
+        sparse[unsafe_offset=i] = 0.0
 
     _run_encoder_bucket[False](
         ctx,
         coord,
         N,
         0,
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+        Pointer[Scalar[DType.float32], MutAnyOrigin](
             dense.as_unsafe_any_origin()
         ),
         OPT,
@@ -795,7 +807,7 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
         coord,
         N,
         64,
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+        Pointer[Scalar[DType.float32], MutAnyOrigin](
             sparse.as_unsafe_any_origin()
         ),
         OPT,
@@ -803,25 +815,32 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
 
     var diffs = 0
     for i in range(N * OPT):
-        if dense[i] != sparse[i]:
+        if dense[unsafe_offset=i] != sparse[unsafe_offset=i]:
             diffs += 1
             if diffs < 5:
-                print("mismatch at", i, dense[i], sparse[i])
-        assert_almost_equal[DType.float32](sparse[i], dense[i], atol=1e-5)
+                print(
+                    "mismatch at",
+                    i,
+                    dense[unsafe_offset=i],
+                    sparse[unsafe_offset=i],
+                )
+        assert_almost_equal[DType.float32](
+            sparse[unsafe_offset=i], dense[unsafe_offset=i], atol=1e-5
+        )
     assert_equal(diffs, 0)
 
     # Sanity: the gradient must not be trivially zero everywhere, or the
     # comparison above would be vacuous.
     var nonzero = 0
     for i in range(N * OPT):
-        if dense[i] != 0.0:
+        if dense[unsafe_offset=i] != 0.0:
             nonzero += 1
     assert_true(nonzero > 0, "dense reference gradient was all zeros")
 
-    dense.free()
-    sparse.free()
+    dense.unsafe_free()
+    sparse.unsafe_free()
     coord[].free()
-    coord.free()
+    coord.unsafe_free()
 
 
 def main() raises:

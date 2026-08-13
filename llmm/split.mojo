@@ -1,9 +1,9 @@
 from extensibility import register
 from std.sys import simd_width_of
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
-from std.algorithm import vectorize, sync_parallelize
+from std.algorithm import vectorize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -54,44 +54,72 @@ def _split_planes[
 ) -> None:
     comptime if backward:
         if num_splits >= 1 and Int(plane0) != 0:
-            (qkv_ptr + token_layout_src_flat_index).store(
-                (plane0 + head_layout_dst_flat_index).load[width=width]()
+            (qkv_ptr.unsafe_offset(token_layout_src_flat_index)).unsafe_store(
+                (plane0.unsafe_offset(head_layout_dst_flat_index)).unsafe_load[
+                    width=width
+                ]()
             )
         if num_splits >= 2 and Int(plane1) != 0:
-            (qkv_ptr + token_layout_src_flat_index + channels).store(
-                (plane1 + head_layout_dst_flat_index).load[width=width]()
+            (
+                qkv_ptr.unsafe_offset(
+                    token_layout_src_flat_index
+                ).unsafe_offset(channels)
+            ).unsafe_store(
+                (plane1.unsafe_offset(head_layout_dst_flat_index)).unsafe_load[
+                    width=width
+                ]()
             )
         if num_splits >= 3 and Int(plane2) != 0:
-            (qkv_ptr + token_layout_src_flat_index + 2 * channels).store(
-                (plane2 + head_layout_dst_flat_index).load[width=width]()
+            (
+                (
+                    qkv_ptr.unsafe_offset(token_layout_src_flat_index)
+                ).unsafe_offset(2 * channels)
+            ).unsafe_store(
+                (plane2.unsafe_offset(head_layout_dst_flat_index)).unsafe_load[
+                    width=width
+                ]()
             )
         if num_splits >= 4 and Int(plane3) != 0:
-            (qkv_ptr + token_layout_src_flat_index + 3 * channels).store(
-                (plane3 + head_layout_dst_flat_index).load[width=width]()
+            (
+                (
+                    qkv_ptr.unsafe_offset(token_layout_src_flat_index)
+                ).unsafe_offset(3 * channels)
+            ).unsafe_store(
+                (plane3.unsafe_offset(head_layout_dst_flat_index)).unsafe_load[
+                    width=width
+                ]()
             )
     else:
         var src_immut = rebind[ImmutKernelPtr[dtype]](qkv_ptr)
         if num_splits >= 1 and Int(dst0) != 0:
-            (dst0 + head_layout_dst_flat_index).store(
-                (src_immut + token_layout_src_flat_index).load[width=width]()
+            (dst0.unsafe_offset(head_layout_dst_flat_index)).unsafe_store(
+                (
+                    src_immut.unsafe_offset(token_layout_src_flat_index)
+                ).unsafe_load[width=width]()
             )
         if num_splits >= 2 and Int(dst1) != 0:
-            (dst1 + head_layout_dst_flat_index).store(
-                (src_immut + token_layout_src_flat_index + channels).load[
-                    width=width
-                ]()
+            (dst1.unsafe_offset(head_layout_dst_flat_index)).unsafe_store(
+                (
+                    src_immut.unsafe_offset(
+                        token_layout_src_flat_index
+                    ).unsafe_offset(channels)
+                ).unsafe_load[width=width]()
             )
         if num_splits >= 3 and Int(dst2) != 0:
-            (dst2 + head_layout_dst_flat_index).store(
-                (src_immut + token_layout_src_flat_index + 2 * channels).load[
-                    width=width
-                ]()
+            (dst2.unsafe_offset(head_layout_dst_flat_index)).unsafe_store(
+                (
+                    (
+                        src_immut.unsafe_offset(token_layout_src_flat_index)
+                    ).unsafe_offset(2 * channels)
+                ).unsafe_load[width=width]()
             )
         if num_splits >= 4 and Int(dst3) != 0:
-            (dst3 + head_layout_dst_flat_index).store(
-                (src_immut + token_layout_src_flat_index + 3 * channels).load[
-                    width=width
-                ]()
+            (dst3.unsafe_offset(head_layout_dst_flat_index)).unsafe_store(
+                (
+                    (
+                        src_immut.unsafe_offset(token_layout_src_flat_index)
+                    ).unsafe_offset(3 * channels)
+                ).unsafe_load[width=width]()
             )
 
 

@@ -112,7 +112,7 @@ def test_hadamard_known_vector_gpu() raises:
 
     var host_x = ctx.enqueue_create_host_buffer[DType.bfloat16](k)
     for i in range(k):
-        host_x.unsafe_ptr()[i] = x[i].cast[DType.bfloat16]()
+        host_x.unsafe_ptr()[unsafe_offset=i] = x[i].cast[DType.bfloat16]()
     var x_dev = ctx.enqueue_create_buffer[DType.bfloat16](k)
     x_dev.enqueue_copy_from(host_x)
     var y_dev = ctx.enqueue_create_buffer[DType.bfloat16](k)
@@ -136,7 +136,7 @@ def test_hadamard_known_vector_gpu() raises:
     ctx.synchronize()
 
     for i in range(k):
-        var got = host_y.unsafe_ptr()[i].cast[DType.float32]()
+        var got = host_y.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
         assert_almost_equal[DType.float32](got, expected_y[i], atol=1e-2)
 
     # Inverse recovers x exactly (all values fit bf16 exactly).
@@ -160,7 +160,7 @@ def test_hadamard_known_vector_gpu() raises:
     ctx.synchronize()
 
     for i in range(k):
-        var got = host_xr.unsafe_ptr()[i].cast[DType.float32]()
+        var got = host_xr.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
         assert_almost_equal[DType.float32](got, x[i], atol=1e-2)
 
 
@@ -183,7 +183,7 @@ def test_hadamard_orthogonality_random_gpu() raises:
     for i in range(n):
         var u = rng.randfloat32()  # [0, 1)
         var v = (u - 0.5) * 6.0  # roughly [-3, 3)
-        host_x.unsafe_ptr()[i] = v.cast[DType.bfloat16]()
+        host_x.unsafe_ptr()[unsafe_offset=i] = v.cast[DType.bfloat16]()
 
     var x_dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     x_dev.enqueue_copy_from(host_x)
@@ -224,8 +224,8 @@ def test_hadamard_orthogonality_random_gpu() raises:
 
     # Orthogonality: inverse(fwd(x)) == x to bf16 precision.
     for i in range(n):
-        var orig = host_x.unsafe_ptr()[i].cast[DType.float32]()
-        var back = host_xr.unsafe_ptr()[i].cast[DType.float32]()
+        var orig = host_x.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
+        var back = host_xr.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
         assert_almost_equal[DType.float32](back, orig, atol=0.05, rtol=0.02)
 
     # Energy preservation per 16-block: sum(y_block^2) == 16*sum(x_block^2).
@@ -236,8 +236,12 @@ def test_hadamard_orthogonality_random_gpu() raises:
             var ey = Float32(0.0)
             for kk in range(HADAMARD_BLOCK):
                 var idx = r * k + kb * HADAMARD_BLOCK + kk
-                var xv = host_x.unsafe_ptr()[idx].cast[DType.float32]()
-                var yv = host_y.unsafe_ptr()[idx].cast[DType.float32]()
+                var xv = host_x.unsafe_ptr()[unsafe_offset=idx].cast[
+                    DType.float32
+                ]()
+                var yv = host_y.unsafe_ptr()[unsafe_offset=idx].cast[
+                    DType.float32
+                ]()
                 ex += xv * xv
                 ey += yv * yv
             assert_almost_equal[DType.float32](
@@ -258,7 +262,9 @@ def test_hadamard_multi_row_grid_indexing_gpu() raises:
 
     var host_x = ctx.enqueue_create_host_buffer[DType.bfloat16](n)
     for i in range(n):
-        host_x.unsafe_ptr()[i] = Float32(i % 7 - 3).cast[DType.bfloat16]()
+        host_x.unsafe_ptr()[unsafe_offset=i] = Float32(i % 7 - 3).cast[
+            DType.bfloat16
+        ]()
     var x_dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
     x_dev.enqueue_copy_from(host_x)
     var y_dev = ctx.enqueue_create_buffer[DType.bfloat16](n)
@@ -294,8 +300,8 @@ def test_hadamard_multi_row_grid_indexing_gpu() raises:
     ctx.synchronize()
 
     for i in range(n):
-        var orig = host_x.unsafe_ptr()[i].cast[DType.float32]()
-        var back = host_xr.unsafe_ptr()[i].cast[DType.float32]()
+        var orig = host_x.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
+        var back = host_xr.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
         assert_almost_equal[DType.float32](back, orig, atol=0.05, rtol=0.02)
 
 

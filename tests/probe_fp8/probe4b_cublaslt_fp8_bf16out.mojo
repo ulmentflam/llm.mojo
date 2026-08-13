@@ -27,8 +27,8 @@
 from std.memory import UnsafePointer
 from std.sys import size_of
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUDA
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA
 from _cublas.dtype import DataType
 from _cublas.cublas import cublasOperation_t, ComputeType, check_cublas_error
 from _cublas.cublaslt import (

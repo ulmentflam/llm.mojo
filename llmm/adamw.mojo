@@ -1,7 +1,7 @@
 from extensibility import register
 from std.algorithm import vectorize
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import fma, sqrt, ceildiv
 from std.sys import simd_width_of, align_of, is_defined, get_defined_int
 from std.gpu.host.info import is_cpu, is_gpu
@@ -127,33 +127,39 @@ def _adamw_update[
     comptime align_f = align_of[SIMD[DType.float32, width]]()
     var grad = (
         config.grad_scale
-        * (grads_ptr + idx)
-        .load[width=width, alignment=align_d]()
+        * (grads_ptr.unsafe_offset(idx))
+        .unsafe_load[width=width, alignment=align_d]()
         .cast[DType.float32]()
     )
-    var m = (m_ptr + idx).load[width=width, alignment=align_f]()
-    var v = (v_ptr + idx).load[width=width, alignment=align_f]()
+    var m = (m_ptr.unsafe_offset(idx)).unsafe_load[
+        width=width, alignment=align_f
+    ]()
+    var v = (v_ptr.unsafe_offset(idx)).unsafe_load[
+        width=width, alignment=align_f
+    ]()
 
     # First moment (momentum), then bias-corrected to m_hat. The correction is a
     # width-1 scalar; broadcast it so the in-place op matches widths on CPU.
     m = lerp(grad, m, config.beta1)
-    (m_ptr + idx).store[width=width, alignment=align_f](m)
+    (m_ptr.unsafe_offset(idx)).unsafe_store[width=width, alignment=align_f](m)
     m /= SIMD[DType.float32, width](beta1_correction)
 
     # Second moment (RMSProp), then bias-corrected to v_hat.
     v = lerp(grad * grad, v, config.beta2)
-    (v_ptr + idx).store[width=width, alignment=align_f](v)
+    (v_ptr.unsafe_offset(idx)).unsafe_store[width=width, alignment=align_f](v)
     v /= SIMD[DType.float32, width](beta2_correction)
 
     # The current weight comes from the master copy when we keep one, otherwise
     # the params are already fp32-equivalent and serve as their own master.
     var old_param: SIMD[DType.float32, width]
     if has_master:
-        old_param = (master_ptr + idx).load[width=width, alignment=align_f]()
+        old_param = (master_ptr.unsafe_offset(idx)).unsafe_load[
+            width=width, alignment=align_f
+        ]()
     else:
         old_param = (
-            (params_ptr + idx)
-            .load[width=width, alignment=align_d]()
+            (params_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width, alignment=align_d]()
             .cast[DType.float32]()
         )
 
@@ -191,15 +197,17 @@ def _adamw_update[
             sr_param[lane] = sr_cast_bf16(
                 param[lane], SR_MASTER_SEED, counter, SR_MASTER_STREAM
             )
-        (params_ptr + idx).store[width=width, alignment=align_d](
-            sr_param.cast[dtype]()
-        )
+        (params_ptr.unsafe_offset(idx)).unsafe_store[
+            width=width, alignment=align_d
+        ](sr_param.cast[dtype]())
     else:
-        (params_ptr + idx).store[width=width, alignment=align_d](
-            param.cast[dtype]()
-        )
+        (params_ptr.unsafe_offset(idx)).unsafe_store[
+            width=width, alignment=align_d
+        ](param.cast[dtype]())
     if has_master:
-        (master_ptr + idx).store[width=width, alignment=align_f](param)
+        (master_ptr.unsafe_offset(idx)).unsafe_store[
+            width=width, alignment=align_f
+        ](param)
 
 
 def adamw_update_cpu[
@@ -314,7 +322,7 @@ def adamw_update_gpu[
     dtype: DType,
     width: Int = 4,
 ](
-    num_params: Int,
+    num_params_arg: Int64,
     params_ptr: MutKernelPtr[dtype],
     grads_ptr: ImmutKernelPtr[dtype],
     master_ptr: MutKernelPtr[DType.float32],
@@ -333,6 +341,7 @@ def adamw_update_gpu[
     beta2_correction: Scalar[DType.float32],
     t: UInt32,
 ) -> None:
+    var num_params = Int(num_params_arg)
     var config = AdamWConfig(
         learning_rate=learning_rate,
         beta1=beta1,
@@ -442,7 +451,7 @@ def adamw_update[
         var compiled = dev_ctx.compile_function[gpu_kernel]()
         dev_ctx.enqueue_function(
             compiled,
-            num_params,
+            Int64(num_params),
             params_ptr,
             grads_ptr,
             master_ptr,

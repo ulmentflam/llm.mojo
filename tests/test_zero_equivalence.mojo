@@ -1,12 +1,10 @@
-from std.testing import assert_almost_equal, assert_true, TestSuite
+from std.testing import assert_almost_equal, TestSuite
 from std.sys.info import size_of
-from std.memory import alloc, UnsafePointer
-from std.gpu.host import DeviceContext
-from std.algorithm import sync_parallelize
+from std.memory import alloc
+from max.gpu.host import DeviceContext
 from std.python import Python
 
 from llmm.memory import MutMemPtr
-from llmm.zero import ZeroContext, CpuCoordinator
 
 from train_gpt2 import GPT2, GPT2_DTYPE
 
@@ -18,7 +16,7 @@ comptime T = 8
 def read_to_dtype_pointer[
     T: DType
 ](
-    ptr: UnsafePointer[Scalar[T], _], mut file_handle: FileHandle, size: Int
+    ptr: Pointer[Scalar[T], _], mut file_handle: FileHandle, size: Int
 ) raises -> None:
     # Element-wise copy, mirroring llmm.io.read_and_copy. A byte-wise memcpy from
     # `bytes_data.unsafe_ptr()` is unsafe here: rebinding that pointer to an
@@ -30,12 +28,12 @@ def read_to_dtype_pointer[
     var bytes_data = file_handle.read_bytes(bytes_to_read)
     if len(bytes_data) < bytes_to_read:
         raise Error("Failed to read enough bytes from file")
-    var dest = rebind[UnsafePointer[Scalar[T], MutUntrackedOrigin]](ptr)
-    var src_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+    var dest = rebind[Pointer[Scalar[T], MutUntrackedOrigin]](ptr)
+    var src_ptr = rebind[Pointer[UInt8, MutUntrackedOrigin]](
         bytes_data.unsafe_ptr()
-    ).bitcast[Scalar[T]]()
+    ).unsafe_bitcast[Scalar[T]]()
     for i in range(size):
-        dest[i] = src_ptr[i]
+        dest[unsafe_offset=i] = src_ptr[unsafe_offset=i]
     # Keep `bytes_data` live until the copy is done: `src_ptr` does not own it,
     # so without this the List can be freed mid-loop (see comment above).
     _ = bytes_data^
@@ -111,16 +109,16 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
     var state_file = open("gpt2_tiny_debug_state.bin", "r")
     var state_header = alloc[Int32](256)
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
-    if state_header[0] != 20240520:
+    if state_header[unsafe_offset=0] != 20240520:
         state_file.close()
-        state_header.free()
+        state_header.unsafe_free()
         raise Error("Bad magic model file")
 
-    var file_B: Int = Int(state_header[2])
-    var file_T: Int = Int(state_header[3])
+    var file_B: Int = Int(state_header[unsafe_offset=2])
+    var file_T: Int = Int(state_header[unsafe_offset=3])
     if file_B != B or file_T != T:
         state_file.close()
-        state_header.free()
+        state_header.unsafe_free()
         raise Error("Dimension mismatch in state file")
 
     var x = alloc[SIMD[DType.int32, 1]](B * T)
@@ -128,7 +126,7 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
     read_to_dtype_pointer[DType.int32](x, state_file, B * T)
     read_to_dtype_pointer[DType.int32](y, state_file, B * T)
     state_file.close()
-    state_header.free()
+    state_header.unsafe_free()
 
     # 2. Run baseline (zero_stage = 0, WORLD_SIZE = 1)
     var ctx = DeviceContext(api="cpu")
@@ -170,13 +168,13 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
         baseline_model.params_buf.enqueue_copy_to(host_out_baseline)
         ctx.synchronize()
         for i in range(NUM_PARAMS):
-            baseline_params[i] = host_out_baseline.unsafe_ptr()[i].cast[
-                DType.float32
-            ]()
+            baseline_params[unsafe_offset=i] = host_out_baseline.unsafe_ptr()[
+                unsafe_offset=i
+            ].cast[DType.float32]()
     except e:
-        x.free()
-        y.free()
-        baseline_params.free()
+        x.unsafe_free()
+        y.unsafe_free()
+        baseline_params.unsafe_free()
         raise Error("Baseline execution failed")
 
     # 3. Simulate the N ranks one at a time. GPT2 is not Movable (so it can't
@@ -224,14 +222,18 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
         # the full replicated grads buffer, scaled in place as before.
         if stage >= 2:
             for i in range(shard):
-                model.grad_shard_memory[i] = model.grad_shard_memory[
-                    i
-                ] * Scalar[GPT2_DTYPE](N)
+                model.grad_shard_memory[
+                    unsafe_offset=i
+                ] = model.grad_shard_memory[unsafe_offset=i] * Scalar[
+                    GPT2_DTYPE
+                ](
+                    N
+                )
         else:
             for i in range(NUM_PARAMS):
-                model.grads_memory[i] = model.grads_memory[i] * Scalar[
-                    GPT2_DTYPE
-                ](N)
+                model.grads_memory[unsafe_offset=i] = model.grads_memory[
+                    unsafe_offset=i
+                ] * Scalar[GPT2_DTYPE](N)
 
         model.update(
             t=1,
@@ -249,14 +251,16 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
         try:
             for i in range(ln):
                 assert_almost_equal(
-                    model.params_memory[off + i].cast[DType.float32](),
-                    baseline_params[off + i],
+                    model.params_memory[unsafe_offset=off + i].cast[
+                        DType.float32
+                    ](),
+                    baseline_params[unsafe_offset=off + i],
                     atol=1e-5,
                 )
         except e:
-            x.free()
-            y.free()
-            baseline_params.free()
+            x.unsafe_free()
+            y.unsafe_free()
+            baseline_params.unsafe_free()
             raise Error(
                 "Equivalence check failed at rank "
                 + String(r)
@@ -264,9 +268,9 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
                 + String(e)
             )
 
-    x.free()
-    y.free()
-    baseline_params.free()
+    x.unsafe_free()
+    y.unsafe_free()
+    baseline_params.unsafe_free()
 
 
 def test_zero_stage1_equivalence_w2() raises:

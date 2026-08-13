@@ -2,16 +2,16 @@ from extensibility import register
 from std.memory import alloc
 from extensibility import InputTensor
 from std.sys import simd_width_of, align_of
-from std.math import sqrt, ceildiv, max, fma
+from std.math import ceildiv, max
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
 from std.runtime.asyncrt import parallelism_level
-from std.algorithm import vectorize, sync_parallelize
-from std.gpu.host import DeviceContext, DeviceAttribute
+from std.algorithm import vectorize
+from max.gpu.host import DeviceContext, DeviceAttribute
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.primitives import block
+from max.gpu.primitives import block
 
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
@@ -34,13 +34,11 @@ def _zero_gpu(
     idx: Int,
     ptr: MutKernelPtr[DType.float32],
 ) -> None:
-    (ptr + idx).store(0.0)
+    (ptr.unsafe_offset(idx)).unsafe_store(0.0)
 
 
-def zero_gpu(
-    ptr: MutKernelPtr[DType.float32],
-    size: Int,
-) -> None:
+def zero_gpu(ptr: MutKernelPtr[DType.float32], size_arg: Int64) -> None:
+    var size = Int(size_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < size:
         _zero_gpu(idx, ptr)
@@ -68,19 +66,19 @@ def global_norm_squared_cpu[
     def _worker(w: Int):
         var base = w * chunk
         var count = min(chunk, num_params - base)
-        var worker_partial = partials + w
-        worker_partial[0] = 0.0
+        var worker_partial = partials.unsafe_offset(w)
+        worker_partial[unsafe_offset=0] = 0.0
 
         @always_inline
         def _simd[
             w_width: Int,
         ](local: Int) {data_ptr, base, worker_partial}:
             var val = (
-                (data_ptr + base + local)
-                .load[width=w_width]()
+                (data_ptr.unsafe_offset(base).unsafe_offset(local))
+                .unsafe_load[width=w_width]()
                 .cast[DType.float32]()
             )
-            worker_partial[0] += (val * val).reduce_add()
+            worker_partial[unsafe_offset=0] += (val * val).reduce_add()
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
@@ -88,10 +86,10 @@ def global_norm_squared_cpu[
 
     var total_sum = Scalar[DType.float32](0.0)
     for w in range(num_workers):
-        total_sum += partials[w]
+        total_sum += partials[unsafe_offset=w]
 
-    out_ptr[0] += total_sum
-    partials.free()
+    out_ptr[unsafe_offset=0] += total_sum
+    partials.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -131,19 +129,21 @@ def _global_norm_squared_for_range_gpu[
         if idx + width <= count:
             comptime if aligned:
                 var val = (
-                    (data_ptr + idx)
-                    .load[width=width, alignment=align]()
+                    (data_ptr.unsafe_offset(idx))
+                    .unsafe_load[width=width, alignment=align]()
                     .cast[DType.float32]()
                 )
                 accumulator += val * val
             else:
                 var val = (
-                    (data_ptr + idx).load[width=width]().cast[DType.float32]()
+                    (data_ptr.unsafe_offset(idx))
+                    .unsafe_load[width=width]()
+                    .cast[DType.float32]()
                 )
                 accumulator += val * val
         else:
             for j in range(idx, count):
-                var val = data_ptr[j].cast[DType.float32]()
+                var val = data_ptr[unsafe_offset=j].cast[DType.float32]()
                 accumulator_tail += val * val
         idx += grid_width
 
@@ -161,31 +161,34 @@ def global_norm_squared_gpu[
 ](
     out_ptr: MutKernelPtr[DType.float32],
     data_ptr: ImmutKernelPtr[dtype],
-    count: Int,
-    stride: Int,
+    count_arg: Int64,
+    stride_arg: Int64,
 ) -> None:
+    var count = Int(count_arg)
+    var stride = Int(stride_arg)
     var tid = Int(thread_idx.x)
     var block_sum = _global_norm_squared_for_range_gpu[
         dtype, BLOCK_SIZE, width, aligned=aligned
-    ](data_ptr + Int(block_idx.y) * stride, count, tid)
+    ](data_ptr.unsafe_offset(Int(block_idx.y) * stride), count, tid)
     if tid == 0:
         var out_index = Int(block_idx.y * grid_dim.x + block_idx.x)
-        out_ptr[out_index] += block_sum
+        out_ptr[unsafe_offset=out_index] += block_sum
 
 
 def global_norm_aggregate_gpu[
     BLOCK_SIZE: Int,
-](out_ptr: MutKernelPtr[DType.float32], grid_size: Int,) -> None:
+](out_ptr: MutKernelPtr[DType.float32], grid_size_arg: Int64) -> None:
+    var grid_size = Int(grid_size_arg)
     var tid = Int(thread_idx.x)
     var block_sum = Scalar[DType.float32](0.0)
     var idx = tid
     while idx < grid_size:
-        block_sum += out_ptr[idx]
+        block_sum += out_ptr[unsafe_offset=idx]
         idx += BLOCK_SIZE
 
     var total_sum = block.sum[block_size=BLOCK_SIZE](block_sum)
     if tid == 0:
-        out_ptr[0] = total_sum
+        out_ptr[unsafe_offset=0] = total_sum
 
 
 def global_norm_squared[
@@ -203,7 +206,7 @@ def global_norm_squared[
     comptime width = simd_width_of[dtype]()
     comptime if is_cpu[target]():
         if reset != 0:
-            output.unsafe_ptr()[0] = 0.0
+            output.unsafe_ptr()[unsafe_offset=0] = 0.0
         global_norm_squared_cpu[dtype, width](
             output.unsafe_ptr(), data.unsafe_ptr(), data.size()
         )
@@ -220,7 +223,7 @@ def global_norm_squared[
             device_ctx.enqueue_function(
                 compiled_zero,
                 output.unsafe_ptr(),
-                Int(max_num_block_sums),
+                Int64(max_num_block_sums),
                 grid_dim=(num_zero_blocks,),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -245,8 +248,8 @@ def global_norm_squared[
                 compiled_norm,
                 output.unsafe_ptr(),
                 data.unsafe_ptr(),
-                count,
-                Int(stride),
+                Int64(count),
+                Int64(stride),
                 grid_dim=(grid_x, grid_y),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -259,8 +262,8 @@ def global_norm_squared[
                 compiled_norm_u,
                 output.unsafe_ptr(),
                 data.unsafe_ptr(),
-                count,
-                Int(stride),
+                Int64(count),
+                Int64(stride),
                 grid_dim=(grid_x, grid_y),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -271,7 +274,7 @@ def global_norm_squared[
         device_ctx.enqueue_function(
             compiled_aggregate,
             output.unsafe_ptr(),
-            grid_size_actual,
+            Int64(grid_size_actual),
             grid_dim=(1,),
             block_dim=(BLOCK_SIZE,),
         )

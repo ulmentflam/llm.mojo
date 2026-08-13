@@ -57,14 +57,12 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.sys import argv
-from std.memory import alloc, UnsafePointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
-from llmm.memory import MutMemPtr
 from llmm.lowp import FP8_SPEC
 from llmm.amax import AmaxState
 
-from train_gpt2 import GPT2, GPT2_DTYPE, PRECISION
+from train_gpt2 import GPT2, PRECISION
 from llmm.dataloader import DataLoader
 
 
@@ -74,10 +72,10 @@ def _read_scale(
     """One-element device->host readback of `state.scale`."""
     var host_buf = ctx.enqueue_create_host_buffer[DType.float32](1)
     ctx.enqueue_copy(
-        dst_ptr=rebind[UnsafePointer[Scalar[DType.float32], MutAnyOrigin]](
+        dst_ptr=rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
             host_buf.unsafe_ptr().as_unsafe_any_origin()
         ),
-        src_ptr=rebind[UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]](
+        src_ptr=rebind[Pointer[Scalar[DType.float32], ImmutAnyOrigin]](
             state.scale.unsafe_ptr().as_unsafe_any_origin()
         ),
         size=1,

@@ -4,7 +4,7 @@
 # compiles and runs fine. Contrast with probe2b, which is identical except
 # for one extra `+ 1.0` on the fp32 value — that one fails GPU codegen.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import block_dim, block_idx, thread_idx
 from std.sys import has_nvidia_gpu_accelerator
 
@@ -12,8 +12,9 @@ from std.sys import has_nvidia_gpu_accelerator
 def _mini_kernel(
     out_ptr: UnsafePointer[Scalar[DType.float8_e4m3fn], MutAnyOrigin],
     x_ptr: UnsafePointer[Scalar[DType.float8_e4m3fn], ImmutAnyOrigin],
-    n: Int,
+    n_arg: Int64,
 ) -> None:
+    var n = Int(n_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < n:
         var x = x_ptr[idx].cast[DType.float32]()
@@ -33,7 +34,7 @@ def main() raises:
         compiled,
         dev_out.unsafe_ptr(),
         dev_in.unsafe_ptr(),
-        N,
+        Int64(N),
         grid_dim=(1,),
         block_dim=(32,),
     )

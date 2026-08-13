@@ -5,7 +5,7 @@ from layout import Layout, TileTensor
 from layout.layout_tensor import LayoutTensor
 from linalg.matmul import matmul
 from std.sys import simd_width_of, get_defined_int, is_defined
-from std.gpu.primitives import block
+from max.gpu.primitives import block
 from linalg.matmul.vendor import blas
 from std.utils.index import IndexList
 from extensibility import InputTensor
@@ -17,9 +17,10 @@ from extensibility.managed_tensor_slice import (
 )
 from std.runtime.asyncrt import parallelism_level
 from std.algorithm import vectorize
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
-from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import barrier
 from std.gpu.intrinsics import threadfence, Scope
 from std.atomic import Atomic
 from std.ffi import _get_global_or_null, external_call
@@ -74,7 +75,7 @@ comptime FP8_BWD_SYNC_ONLY = is_defined["LLMM_FP8_BWD_SYNC_ONLY"]()
 comptime FP8_STASH_LEGACY = is_defined["LLMM_FP8_STASH_LEGACY"]()
 
 
-def _fp8_gemm_lock() -> UnsafePointer[Atomic[DType.int32], MutUntrackedOrigin]:
+def _fp8_gemm_lock() -> Pointer[Atomic[DType.int32], MutUntrackedOrigin]:
     """Process-global lock cell for the FP8_*_MUTEX probes. MUST be seeded
     from a single thread before any concurrency (`fp8_mutex_preseed`, called
     ahead of `sync_parallelize` in train_gpt2.mojo) — a concurrent first
@@ -82,25 +83,27 @@ def _fp8_gemm_lock() -> UnsafePointer[Atomic[DType.int32], MutUntrackedOrigin]:
     After InsertGlobal, the registry is re-read and its winner adopted so a
     raced loser at least converges instead of keeping a private cell."""
     var name = String("LLMM_FP8_GEMM_LOCK")
+    # Keep the implicit binding: `if var gp := ...` SIGSEGVs the MAX
+    # compiler here. See llmm/memory.mojo for the full note.
     if gp := _get_global_or_null(name):
-        return gp.value().bitcast[Atomic[DType.int32]]()
+        return gp.value().unsafe_bitcast[Atomic[DType.int32]]()
     # Atomic[int32] is layout-compatible with a bare int32 cell; allocate
     # and zero the cell, then hand out Atomic-typed views of it.
     var p = alloc[Scalar[DType.int32]](1)
-    p[0] = 0
+    p[unsafe_offset=0] = 0
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), p.bitcast[NoneType]()
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
     )
     var winner = _get_global_or_null(name)
     if winner:
-        var wp = winner.value().bitcast[Scalar[DType.int32]]()
+        var wp = winner.value().unsafe_bitcast[Scalar[DType.int32]]()
         if wp != p:
-            p.free()
-        return rebind[UnsafePointer[Atomic[DType.int32], MutUntrackedOrigin]](
-            wp.bitcast[Atomic[DType.int32]]().as_unsafe_any_origin()
+            p.unsafe_free()
+        return rebind[Pointer[Atomic[DType.int32], MutUntrackedOrigin]](
+            wp.unsafe_bitcast[Atomic[DType.int32]]().as_unsafe_any_origin()
         )
-    return rebind[UnsafePointer[Atomic[DType.int32], MutUntrackedOrigin]](
-        p.bitcast[Atomic[DType.int32]]().as_unsafe_any_origin()
+    return rebind[Pointer[Atomic[DType.int32], MutUntrackedOrigin]](
+        p.unsafe_bitcast[Atomic[DType.int32]]().as_unsafe_any_origin()
     )
 
 
@@ -112,7 +115,7 @@ def fp8_mutex_preseed():
 
 
 from std.sys import size_of
-from std.gpu.host._nvidia_cuda import CUDA
+from max.gpu.host._nvidia_cuda import CUDA
 from _cublas.dtype import DataType
 from _cublas.cublas import cublasOperation_t, ComputeType, check_cublas_error
 from _cublas.cublaslt import (
@@ -235,26 +238,46 @@ def _matmul_bias_act_gpu[
     # single contiguous load.
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
     if idx + width <= num_params:
-        var v = (raw_ptr + idx).load[width=width]().cast[DType.float32]()
+        var v = (
+            (raw_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width]()
+            .cast[DType.float32]()
+        )
         comptime if has_bias:
             var col = idx % out_channels
-            v += (bias_ptr + col).load[width=width]().cast[DType.float32]()
+            v += (
+                (bias_ptr.unsafe_offset(col))
+                .unsafe_load[width=width]()
+                .cast[DType.float32]()
+            )
         comptime if use_gelu:
-            (pre_gelu_ptr + idx).store(v.cast[dtype]())
-            (out_ptr + idx).store(gelu[DType.float32, width](v).cast[dtype]())
+            (pre_gelu_ptr.unsafe_offset(idx)).unsafe_store(v.cast[dtype]())
+            (out_ptr.unsafe_offset(idx)).unsafe_store(
+                gelu[DType.float32, width](v).cast[dtype]()
+            )
         else:
-            (out_ptr + idx).store(v.cast[dtype]())
+            (out_ptr.unsafe_offset(idx)).unsafe_store(v.cast[dtype]())
     elif idx < num_params:
         for i in range(idx, num_params):
-            var v = (raw_ptr + i).load[width=1]().cast[DType.float32]()
+            var v = (
+                (raw_ptr.unsafe_offset(i))
+                .unsafe_load[width=1]()
+                .cast[DType.float32]()
+            )
             comptime if has_bias:
                 var col = i % out_channels
-                v += (bias_ptr + col).load[width=1]().cast[DType.float32]()
+                v += (
+                    (bias_ptr.unsafe_offset(col))
+                    .unsafe_load[width=1]()
+                    .cast[DType.float32]()
+                )
             comptime if use_gelu:
-                (pre_gelu_ptr + i).store(v.cast[dtype]())
-                (out_ptr + i).store(gelu[DType.float32, 1](v).cast[dtype]())
+                (pre_gelu_ptr.unsafe_offset(i)).unsafe_store(v.cast[dtype]())
+                (out_ptr.unsafe_offset(i)).unsafe_store(
+                    gelu[DType.float32, 1](v).cast[dtype]()
+                )
             else:
-                (out_ptr + i).store(v.cast[dtype]())
+                (out_ptr.unsafe_offset(i)).unsafe_store(v.cast[dtype]())
 
 
 def _cublaslt_workspace(
@@ -267,7 +290,7 @@ def _cublaslt_workspace(
     var p = persistent_device_buffer[DType.uint8](
         ctx, "CUBLASLT_WS", _CUBLASLT_WS_BYTES
     )
-    return p.bitcast[NoneType]().as_unsafe_any_origin()
+    return p.unsafe_bitcast[NoneType]().as_unsafe_any_origin()
 
 
 @always_inline
@@ -305,8 +328,8 @@ def _lt_set_op(
         cublasLtMatmulDescSetAttribute(
             desc,
             attr,
-            UnsafePointer(to=op)
-            .bitcast[NoneType]()
+            Pointer(to=op)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[cublasOperation_t](),
@@ -324,8 +347,8 @@ def _lt_set_fast_accum(desc: cublasLtMatmulDesc_t, enable: Bool) raises:
         cublasLtMatmulDescSetAttribute(
             desc,
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_FAST_ACCUM,
-            UnsafePointer(to=flag)
-            .bitcast[NoneType]()
+            Pointer(to=flag)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[Int8](),
@@ -355,7 +378,7 @@ def _lt_make_layout(
     var lay = cublasLtMatrixLayout_t()
     check_cublas_error(
         cublasLtMatrixLayoutCreate(
-            UnsafePointer(to=lay).as_unsafe_any_origin(),
+            Pointer(to=lay).as_unsafe_any_origin(),
             dt,
             UInt64(rows),
             UInt64(cols),
@@ -370,17 +393,15 @@ def _lt_make_pref() raises -> cublasLtMatmulPreference_t:
     workspace size (`_CUBLASLT_WS_BYTES`)."""
     var pref = cublasLtMatmulPreference_t()
     check_cublas_error(
-        cublasLtMatmulPreferenceCreate(
-            UnsafePointer(to=pref).as_unsafe_any_origin()
-        )
+        cublasLtMatmulPreferenceCreate(Pointer(to=pref).as_unsafe_any_origin())
     )
     var ws_size = _CUBLASLT_WS_BYTES
     check_cublas_error(
         cublasLtMatmulPreferenceSetAttribute(
             pref,
             Preference.MAX_WORKSPACE_BYTES,
-            UnsafePointer(to=ws_size)
-            .bitcast[NoneType]()
+            Pointer(to=ws_size)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[Int](),
@@ -412,8 +433,8 @@ def _lt_pick_algo(
             d_l,
             pref,
             1,
-            UnsafePointer(to=heur).as_unsafe_any_origin(),
-            UnsafePointer(to=cnt).as_unsafe_any_origin(),
+            Pointer(to=heur).as_unsafe_any_origin(),
+            Pointer(to=cnt).as_unsafe_any_origin(),
         )
     )
     if cnt == 0:
@@ -499,7 +520,7 @@ def _matmul_cublaslt[
     var desc = cublasLtMatmulDesc_t()
     check_cublas_error(
         cublasLtMatmulDescCreate(
-            UnsafePointer(to=desc).as_unsafe_any_origin(),
+            Pointer(to=desc).as_unsafe_any_origin(),
             compute_type,
             DataType.R_32F,
         )
@@ -539,8 +560,8 @@ def _matmul_cublaslt[
                 cublasLtMatrixLayoutSetAttribute(
                     lay,
                     LayoutAttribute.BATCH_COUNT,
-                    UnsafePointer(to=bc)
-                    .bitcast[NoneType]()
+                    Pointer(to=bc)
+                    .unsafe_bitcast[NoneType]()
                     .as_imm()
                     .as_unsafe_any_origin(),
                     size_of[Int32](),
@@ -551,8 +572,8 @@ def _matmul_cublaslt[
                 cublasLtMatrixLayoutSetAttribute(
                     lay,
                     LayoutAttribute.STRIDED_BATCH_OFFSET,
-                    UnsafePointer(to=so)
-                    .bitcast[NoneType]()
+                    Pointer(to=so)
+                    .unsafe_bitcast[NoneType]()
                     .as_imm()
                     .as_unsafe_any_origin(),
                     size_of[Int64](),
@@ -573,8 +594,8 @@ def _matmul_cublaslt[
             cublasLtMatmulDescSetAttribute(
                 desc,
                 cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD,
-                UnsafePointer(to=gelu_ld)
-                .bitcast[NoneType]()
+                Pointer(to=gelu_ld)
+                .unsafe_bitcast[NoneType]()
                 .as_imm()
                 .as_unsafe_any_origin(),
                 size_of[Int64](),
@@ -585,8 +606,8 @@ def _matmul_cublaslt[
             cublasLtMatmulDescSetAttribute(
                 desc,
                 cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER,
-                UnsafePointer(to=aux)
-                .bitcast[NoneType]()
+                Pointer(to=aux)
+                .unsafe_bitcast[NoneType]()
                 .as_imm()
                 .as_unsafe_any_origin(),
                 size_of[MutKernelPtr[dtype]](),
@@ -597,8 +618,8 @@ def _matmul_cublaslt[
         cublasLtMatmulDescSetAttribute(
             desc,
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_EPILOGUE,
-            UnsafePointer(to=epi)
-            .bitcast[NoneType]()
+            Pointer(to=epi)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[Int32](),
@@ -611,8 +632,8 @@ def _matmul_cublaslt[
             cublasLtMatmulDescSetAttribute(
                 desc,
                 cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
-                UnsafePointer(to=bdt)
-                .bitcast[NoneType]()
+                Pointer(to=bdt)
+                .unsafe_bitcast[NoneType]()
                 .as_imm()
                 .as_unsafe_any_origin(),
                 size_of[DataType](),
@@ -623,8 +644,8 @@ def _matmul_cublaslt[
             cublasLtMatmulDescSetAttribute(
                 desc,
                 cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-                UnsafePointer(to=bias_dev)
-                .bitcast[NoneType]()
+                Pointer(to=bias_dev)
+                .unsafe_bitcast[NoneType]()
                 .as_imm()
                 .as_unsafe_any_origin(),
                 size_of[ImmutKernelPtr[dtype]](),
@@ -649,23 +670,23 @@ def _matmul_cublaslt[
         cublasLtMatmul(
             lt,
             desc,
-            UnsafePointer(to=alpha)
-            .bitcast[NoneType]()
+            Pointer(to=alpha)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
-            a_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            a_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             a_l,
-            b_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            b_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             b_l,
-            UnsafePointer(to=beta)
-            .bitcast[NoneType]()
+            Pointer(to=beta)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
-            d_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            d_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             c_l,
-            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            d_ptr.unsafe_bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
-            UnsafePointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
+            Pointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
             ws,
             _CUBLASLT_WS_BYTES,
             cuda_stream.value()[],
@@ -750,7 +771,7 @@ def _matmul_cublaslt_fp8[
     var desc = cublasLtMatmulDesc_t()
     check_cublas_error(
         cublasLtMatmulDescCreate(
-            UnsafePointer(to=desc).as_unsafe_any_origin(),
+            Pointer(to=desc).as_unsafe_any_origin(),
             ComputeType.COMPUTE_32F,
             DataType.R_32F,
         )
@@ -769,8 +790,8 @@ def _matmul_cublaslt_fp8[
         cublasLtMatmulDescSetAttribute(
             desc,
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-            UnsafePointer(to=a_sp)
-            .bitcast[NoneType]()
+            Pointer(to=a_sp)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[ImmutKernelPtr[DType.float32]](),
@@ -781,8 +802,8 @@ def _matmul_cublaslt_fp8[
         cublasLtMatmulDescSetAttribute(
             desc,
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-            UnsafePointer(to=b_sp)
-            .bitcast[NoneType]()
+            Pointer(to=b_sp)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[ImmutKernelPtr[DType.float32]](),
@@ -821,23 +842,23 @@ def _matmul_cublaslt_fp8[
         cublasLtMatmul(
             lt,
             desc,
-            UnsafePointer(to=alpha)
-            .bitcast[NoneType]()
+            Pointer(to=alpha)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
-            a_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            a_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             a_l,
-            b_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            b_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             b_l,
-            UnsafePointer(to=beta)
-            .bitcast[NoneType]()
+            Pointer(to=beta)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
-            d_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            d_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             c_l,
-            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            d_ptr.unsafe_bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
-            UnsafePointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
+            Pointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
             ws,
             _CUBLASLT_WS_BYTES,
             cuda_stream.value()[],
@@ -1035,7 +1056,7 @@ def _matmul_cublaslt_fp4[
     var desc = cublasLtMatmulDesc_t()
     check_cublas_error(
         cublasLtMatmulDescCreate(
-            UnsafePointer(to=desc).as_unsafe_any_origin(),
+            Pointer(to=desc).as_unsafe_any_origin(),
             ComputeType.COMPUTE_32F,
             DataType.R_32F,
         )
@@ -1052,8 +1073,8 @@ def _matmul_cublaslt_fp4[
         cublasLtMatmulDescSetAttribute(
             desc,
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
-            UnsafePointer(to=scale_mode)
-            .bitcast[NoneType]()
+            Pointer(to=scale_mode)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[cublasLtMatmulMatrixScale_t](),
@@ -1063,8 +1084,8 @@ def _matmul_cublaslt_fp4[
         cublasLtMatmulDescSetAttribute(
             desc,
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
-            UnsafePointer(to=scale_mode)
-            .bitcast[NoneType]()
+            Pointer(to=scale_mode)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[cublasLtMatmulMatrixScale_t](),
@@ -1076,8 +1097,8 @@ def _matmul_cublaslt_fp4[
         cublasLtMatmulDescSetAttribute(
             desc,
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-            UnsafePointer(to=a_sp)
-            .bitcast[NoneType]()
+            Pointer(to=a_sp)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[ImmutKernelPtr[DType.uint8]](),
@@ -1088,8 +1109,8 @@ def _matmul_cublaslt_fp4[
         cublasLtMatmulDescSetAttribute(
             desc,
             cublasLtMatmulDescAttributes_t.CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-            UnsafePointer(to=b_sp)
-            .bitcast[NoneType]()
+            Pointer(to=b_sp)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             size_of[ImmutKernelPtr[DType.uint8]](),
@@ -1130,23 +1151,23 @@ def _matmul_cublaslt_fp4[
         cublasLtMatmul(
             lt,
             desc,
-            UnsafePointer(to=alpha)
-            .bitcast[NoneType]()
+            Pointer(to=alpha)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
-            a_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            a_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             a_l,
-            b_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            b_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             b_l,
-            UnsafePointer(to=beta)
-            .bitcast[NoneType]()
+            Pointer(to=beta)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
-            d_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            d_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             c_l,
-            d_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+            d_ptr.unsafe_bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
-            UnsafePointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
+            Pointer(to=heur.algo).as_imm().as_unsafe_any_origin(),
             ws,
             _CUBLASLT_WS_BYTES,
             cuda_stream.value()[],
@@ -1183,16 +1204,21 @@ def _nvfp4_post_scale_gpu[
     raw_ptr: ImmutKernelPtr[out_dtype],
     a_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
     b_tensor_scale_ptr: ImmutKernelPtr[DType.float32],
-    n: Int,
+    n_arg: Int64,
     extra_scale: Float32,
 ) -> None:
+    var n = Int(n_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < n:
-        var s = a_tensor_scale_ptr[0] * b_tensor_scale_ptr[0] * extra_scale
-        var v = raw_ptr[idx].cast[DType.float32]() * s
+        var s = (
+            a_tensor_scale_ptr[unsafe_offset=0]
+            * b_tensor_scale_ptr[unsafe_offset=0]
+            * extra_scale
+        )
+        var v = raw_ptr[unsafe_offset=idx].cast[DType.float32]() * s
         comptime if accumulate:
-            v = v + d_ptr[idx].cast[DType.float32]()
-        d_ptr[idx] = v.cast[out_dtype]()
+            v = v + d_ptr[unsafe_offset=idx].cast[DType.float32]()
+        d_ptr[unsafe_offset=idx] = v.cast[out_dtype]()
 
 
 def _nvfp4_post_scale[
@@ -1219,7 +1245,7 @@ def _nvfp4_post_scale[
         raw_ptr,
         a_tensor_scale_ptr,
         b_tensor_scale_ptr,
-        n,
+        Int64(n),
         extra_scale,
         grid_dim=(num_blocks,),
         block_dim=(BLOCK_SIZE,),
@@ -1463,7 +1489,7 @@ def _launch_gelu_fwd_gpu[
         compiled,
         out_ptr,
         x_ptr,
-        num_params,
+        Int64(num_params),
         grid_dim=(num_blocks,),
         block_dim=(BLOCK_SIZE,),
     )
@@ -1491,7 +1517,7 @@ def _launch_matmul_gelu_backward_scaling_gpu[
         compiled,
         d_input_ptr,
         pre_gelu_ptr,
-        num_params,
+        Int64(num_params),
         grid_dim=(num_blocks,),
         block_dim=(BLOCK_SIZE,),
     )
@@ -1546,15 +1572,19 @@ def matmul_fwd[
         var offset = idx[0] * out_channels + idx[1]
         var v = (
             val.cast[DType.float32]()
-            + (bias_ptr + idx[1]).load[width=width]().cast[DType.float32]()
+            + (bias_ptr.unsafe_offset(idx[1]))
+            .unsafe_load[width=width]()
+            .cast[DType.float32]()
         )
         comptime if use_gelu:
-            (pre_gelu_ptr + offset).store(v.cast[elem_dtype]())
-            (out_ptr + offset).store(
+            (pre_gelu_ptr.unsafe_offset(offset)).unsafe_store(
+                v.cast[elem_dtype]()
+            )
+            (out_ptr.unsafe_offset(offset)).unsafe_store(
                 gelu[DType.float32, width](v).cast[elem_dtype]()
             )
         else:
-            (out_ptr + offset).store(v.cast[elem_dtype]())
+            (out_ptr.unsafe_offset(offset)).unsafe_store(v.cast[elem_dtype]())
 
     @parameter
     @always_inline
@@ -1564,12 +1594,14 @@ def matmul_fwd[
         var offset = idx[0] * out_channels + idx[1]
         var v = val.cast[DType.float32]()
         comptime if use_gelu:
-            (pre_gelu_ptr + offset).store(v.cast[elem_dtype]())
-            (out_ptr + offset).store(
+            (pre_gelu_ptr.unsafe_offset(offset)).unsafe_store(
+                v.cast[elem_dtype]()
+            )
+            (out_ptr.unsafe_offset(offset)).unsafe_store(
                 gelu[DType.float32, width](v).cast[elem_dtype]()
             )
         else:
-            (out_ptr + offset).store(v.cast[elem_dtype]())
+            (out_ptr.unsafe_offset(offset)).unsafe_store(v.cast[elem_dtype]())
 
     # Vendor-neutral matmul with the fused bias/gelu epilogue lambdas: used
     # on the CPU target only (linalg applies the epilogue inline; there is no
@@ -2133,8 +2165,9 @@ def _matmul_bias_bwd_gpu[
             var accumulator = SIMD[DType.float32, width](0.0)
             for r in range(tid, rows, BLOCK_SIZE):
                 accumulator += (
-                    (d_output_ptr + r * out_channels + base)
-                    .load[width=width]()
+                    d_output_ptr.unsafe_offset(r * out_channels)
+                    .unsafe_offset(base)
+                    .unsafe_load[width=width]()
                     .cast[DType.float32]()
                 )
             var tile_sum = SIMD[DType.float32, width](0.0)
@@ -2143,31 +2176,37 @@ def _matmul_bias_bwd_gpu[
             if tid == 0:
                 comptime if accumulate:
                     var previous = (
-                        (d_bias_ptr + base)
-                        .load[width=width]()
+                        (d_bias_ptr.unsafe_offset(base))
+                        .unsafe_load[width=width]()
                         .cast[DType.float32]()
                     )
-                    (d_bias_ptr + base).store(
+                    (d_bias_ptr.unsafe_offset(base)).unsafe_store(
                         (previous + tile_sum).cast[dtype]()
                     )
                 else:
-                    (d_bias_ptr + base).store(tile_sum.cast[dtype]())
+                    (d_bias_ptr.unsafe_offset(base)).unsafe_store(
+                        tile_sum.cast[dtype]()
+                    )
         else:
             # Ragged edge of the last tile, scalar steps. Loop bounds depend
             # only on `base`, so every thread reaches block.sum uniformly.
             for c in range(base, out_channels):
                 var accumulator = Scalar[DType.float32](0.0)
                 for r in range(tid, rows, BLOCK_SIZE):
-                    accumulator += d_output_ptr[r * out_channels + c].cast[
-                        DType.float32
-                    ]()
+                    accumulator += d_output_ptr[
+                        unsafe_offset=r * out_channels + c
+                    ].cast[DType.float32]()
                 var col_sum = block.sum[block_size=BLOCK_SIZE](accumulator)
                 if tid == 0:
                     comptime if accumulate:
-                        var previous = d_bias_ptr[c].cast[DType.float32]()
-                        d_bias_ptr[c] = (previous + col_sum).cast[dtype]()
+                        var previous = d_bias_ptr[unsafe_offset=c].cast[
+                            DType.float32
+                        ]()
+                        d_bias_ptr[unsafe_offset=c] = (previous + col_sum).cast[
+                            dtype
+                        ]()
                     else:
-                        d_bias_ptr[c] = col_sum.cast[dtype]()
+                        d_bias_ptr[unsafe_offset=c] = col_sum.cast[dtype]()
 
 
 def matmul_bias_bwd_gpu[
@@ -2258,10 +2297,13 @@ def _dbias_accum_gpu[
 ](
     scratch: MutKernelPtr[DType.float32],
     d_output_ptr: ImmutKernelPtr[dtype],
-    rows: Int,
-    out_channels: Int,
-    row_tile: Int,
+    rows_arg: Int64,
+    out_channels_arg: Int64,
+    row_tile_arg: Int64,
 ) -> None:
+    var rows = Int(rows_arg)
+    var out_channels = Int(out_channels_arg)
+    var row_tile = Int(row_tile_arg)
     # dbias[c] += sum over a row-chunk of dOutput[:, c]. One thread per column
     # (adjacent threads → adjacent columns → COALESCED reads), and grid.y splits
     # the row reduction so occupancy stays high even for small OC. Each block
@@ -2275,11 +2317,13 @@ def _dbias_accum_gpu[
     var r1 = min(r0 + row_tile, rows)
     var acc = Scalar[DType.float32](0.0)
     for r in range(r0, r1):
-        acc += d_output_ptr[r * out_channels + col].cast[DType.float32]()
+        acc += d_output_ptr[unsafe_offset=r * out_channels + col].cast[
+            DType.float32
+        ]()
     # Write this row-block's partial (no atomics — a contention-free write to a
     # [row_blocks, OC] scratch, reduced by the finalize pass). Matches llm.c's
     # kernel9 buffer+reduce approach.
-    scratch[by * out_channels + col] = acc
+    scratch[unsafe_offset=by * out_channels + col] = acc
 
 
 def _dbias_finalize_gpu[
@@ -2288,20 +2332,22 @@ def _dbias_finalize_gpu[
 ](
     d_bias_ptr: MutKernelPtr[dtype],
     scratch: MutKernelPtr[DType.float32],
-    out_channels: Int,
-    row_blocks: Int,
+    out_channels_arg: Int64,
+    row_blocks_arg: Int64,
 ) -> None:
+    var out_channels = Int(out_channels_arg)
+    var row_blocks = Int(row_blocks_arg)
     var col = Int(block_idx.x * block_dim.x + thread_idx.x)
     if col < out_channels:
         var v = Scalar[DType.float32](0.0)
         for by in range(row_blocks):
-            v += scratch[by * out_channels + col]
+            v += scratch[unsafe_offset=by * out_channels + col]
         comptime if accumulate:
-            d_bias_ptr[col] = (d_bias_ptr[col].cast[DType.float32]() + v).cast[
-                dtype
-            ]()
+            d_bias_ptr[unsafe_offset=col] = (
+                d_bias_ptr[unsafe_offset=col].cast[DType.float32]() + v
+            ).cast[dtype]()
         else:
-            d_bias_ptr[col] = v.cast[dtype]()
+            d_bias_ptr[unsafe_offset=col] = v.cast[dtype]()
 
 
 def _dbias_fused_gpu[
@@ -2313,11 +2359,15 @@ def _dbias_fused_gpu[
     scratch: MutKernelPtr[DType.float32],
     counters: MutKernelPtr[DType.int32],
     d_output_ptr: ImmutKernelPtr[dtype],
-    rows: Int,
-    out_channels: Int,
-    row_tile: Int,
-    row_blocks: Int,
+    rows_arg: Int64,
+    out_channels_arg: Int64,
+    row_tile_arg: Int64,
+    row_blocks_arg: Int64,
 ) -> None:
+    var rows = Int(rows_arg)
+    var out_channels = Int(out_channels_arg)
+    var row_tile = Int(row_tile_arg)
+    var row_blocks = Int(row_blocks_arg)
     # NVIDIA-only (HAS_CUBLAS-gated): matmul_backward_bias_kernel9-style fused
     # dbias reduction — one launch per call site instead of the accum+finalize
     # pair above. Same partial layout as `_dbias_accum_gpu`
@@ -2384,11 +2434,17 @@ def _dbias_fused_gpu[
             var acc = SIMD[DType.float32, width](0.0)
             for r in range(r0, r1):
                 acc += (
-                    (d_output_ptr + r * out_channels + col)
-                    .load[width=width]()
+                    (
+                        d_output_ptr.unsafe_offset(
+                            r * out_channels
+                        ).unsafe_offset(col)
+                    )
+                    .unsafe_load[width=width]()
                     .cast[DType.float32]()
                 )
-            (scratch + by * out_channels + col).store(acc)
+            (
+                scratch.unsafe_offset(by * out_channels).unsafe_offset(col)
+            ).unsafe_store(acc)
         else:
             # Ragged tail (oc % width != 0): this thread owns the final
             # <width columns. Reduce them one at a time — a width-wide
@@ -2398,10 +2454,10 @@ def _dbias_fused_gpu[
             for c in range(col, out_channels):
                 var acc = Scalar[DType.float32](0.0)
                 for r in range(r0, r1):
-                    acc += d_output_ptr[r * out_channels + c].cast[
-                        DType.float32
-                    ]()
-                scratch[by * out_channels + c] = acc
+                    acc += d_output_ptr[
+                        unsafe_offset=r * out_channels + c
+                    ].cast[DType.float32]()
+                scratch[unsafe_offset=by * out_channels + c] = acc
 
     # Every thread that may have written above must fence its own write —
     # __threadfence() only orders the calling thread's prior stores, so a
@@ -2423,7 +2479,9 @@ def _dbias_fused_gpu[
         1, DType.int32, address_space=AddressSpace.SHARED
     ]()
     if Int(thread_idx.x) == 0:
-        var arrived = Atomic[DType.int32].fetch_add(counters + bx, 1)
+        var arrived = Atomic[DType.int32].fetch_add(
+            counters.unsafe_offset(bx), 1
+        )
         # Residue, not equality. Each launch adds exactly `row_blocks` to
         # this slot, so `row_blocks` consecutive tickets cover every residue
         # mod `row_blocks` exactly once — meaning EXACTLY ONE block takes
@@ -2435,7 +2493,7 @@ def _dbias_fused_gpu[
         # counter at 0 and so keeps it far from int32 overflow), this makes
         # a missed finalize impossible rather than merely unlikely.
         var is_last = arrived % Int32(row_blocks) == Int32(row_blocks - 1)
-        flag[0] = 1 if is_last else 0
+        flag[unsafe_offset=0] = 1 if is_last else 0
         if is_last:
             # Reset for the next call reusing this column-block's slot (next
             # layer / next grad-accum micro-batch). Every block has already
@@ -2443,9 +2501,9 @@ def _dbias_fused_gpu[
             # sibling's fetch_add, and the next launch is ordered after this
             # one by the stream. Done HERE, before the `col >= out_channels`
             # early-out below, so no return path can skip it.
-            counters[bx] = 0
+            counters[unsafe_offset=bx] = 0
     barrier()
-    if flag[0] == 0:
+    if flag[unsafe_offset=0] == 0:
         return
     if col >= out_channels:
         return
@@ -2453,26 +2511,32 @@ def _dbias_fused_gpu[
     if col + width <= out_channels:
         var total = SIMD[DType.float32, width](0.0)
         for rb in range(row_blocks):
-            total += (scratch + rb * out_channels + col).load[width=width]()
+            total += (
+                scratch.unsafe_offset(rb * out_channels).unsafe_offset(col)
+            ).unsafe_load[width=width]()
         comptime if accumulate:
             var previous = (
-                (d_bias_ptr + col).load[width=width]().cast[DType.float32]()
+                (d_bias_ptr.unsafe_offset(col))
+                .unsafe_load[width=width]()
+                .cast[DType.float32]()
             )
-            (d_bias_ptr + col).store((previous + total).cast[dtype]())
+            (d_bias_ptr.unsafe_offset(col)).unsafe_store(
+                (previous + total).cast[dtype]()
+            )
         else:
-            (d_bias_ptr + col).store(total.cast[dtype]())
+            (d_bias_ptr.unsafe_offset(col)).unsafe_store(total.cast[dtype]())
     else:
         # Ragged-tail finalize — scalar, mirroring the scalar accum above.
         for c in range(col, out_channels):
             var total = Scalar[DType.float32](0.0)
             for rb in range(row_blocks):
-                total += scratch[rb * out_channels + c]
+                total += scratch[unsafe_offset=rb * out_channels + c]
             comptime if accumulate:
-                d_bias_ptr[c] = (
-                    d_bias_ptr[c].cast[DType.float32]() + total
+                d_bias_ptr[unsafe_offset=c] = (
+                    d_bias_ptr[unsafe_offset=c].cast[DType.float32]() + total
                 ).cast[dtype]()
             else:
-                d_bias_ptr[c] = total.cast[dtype]()
+                d_bias_ptr[unsafe_offset=c] = total.cast[dtype]()
 
 
 @always_inline
@@ -2504,17 +2568,23 @@ def matmul_bias_bwd_cpu[
             for r in range(rows):
                 var offset = r * out_channels + idx
                 accumulator += (
-                    (d_output_ptr + offset)
-                    .load[width=w]()
+                    (d_output_ptr.unsafe_offset(offset))
+                    .unsafe_load[width=w]()
                     .cast[DType.float32]()
                 )
             comptime if accumulate:
                 var previous = (
-                    (d_bias_ptr + idx).load[width=w]().cast[DType.float32]()
+                    (d_bias_ptr.unsafe_offset(idx))
+                    .unsafe_load[width=w]()
+                    .cast[DType.float32]()
                 )
-                (d_bias_ptr + idx).store((previous + accumulator).cast[dtype]())
+                (d_bias_ptr.unsafe_offset(idx)).unsafe_store(
+                    (previous + accumulator).cast[dtype]()
+                )
             else:
-                (d_bias_ptr + idx).store(accumulator.cast[dtype]())
+                (d_bias_ptr.unsafe_offset(idx)).unsafe_store(
+                    accumulator.cast[dtype]()
+                )
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
@@ -2634,10 +2704,10 @@ def matmul_bias_bwd[
                 scratch,
                 counters,
                 d_output_ptr,
-                rows,
-                oc,
-                fused_row_tile,
-                FUSED_ROW_BLOCKS,
+                Int64(rows),
+                Int64(oc),
+                Int64(fused_row_tile),
+                Int64(FUSED_ROW_BLOCKS),
                 grid_dim=(fused_col_blocks, FUSED_ROW_BLOCKS),
                 block_dim=(fused_block_threads,),
             )
@@ -2651,9 +2721,9 @@ def matmul_bias_bwd[
                 accum_c,
                 scratch,
                 d_output_ptr,
-                rows,
-                oc,
-                row_tile,
+                Int64(rows),
+                Int64(oc),
+                Int64(row_tile),
                 grid_dim=(col_blocks, ROW_BLOCKS),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -2663,8 +2733,8 @@ def matmul_bias_bwd[
                 fin_c,
                 d_bias_ptr,
                 scratch,
-                oc,
-                ROW_BLOCKS,
+                Int64(oc),
+                Int64(ROW_BLOCKS),
                 grid_dim=(col_blocks,),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -2681,12 +2751,18 @@ def _matmul_gelu_backward_scaling[
     d_input_ptr: MutKernelPtr[dtype],
     pre_gelu_ptr: ImmutKernelPtr[dtype],
 ) -> None:
-    var dy = (d_input_ptr + idx).load[width=width]().cast[DType.float32]()
+    var dy = (
+        (d_input_ptr.unsafe_offset(idx))
+        .unsafe_load[width=width]()
+        .cast[DType.float32]()
+    )
     var pre_gelu = (
-        (pre_gelu_ptr + idx).load[width=width]().cast[DType.float32]()
+        (pre_gelu_ptr.unsafe_offset(idx))
+        .unsafe_load[width=width]()
+        .cast[DType.float32]()
     )
     var scaled = dy * gelu_grad[DType.float32, width](pre_gelu)
-    (d_input_ptr + idx).store(scaled.cast[dtype]())
+    (d_input_ptr.unsafe_offset(idx)).unsafe_store(scaled.cast[dtype]())
 
 
 def matmul_gelu_backward_scaling_gpu[
@@ -2695,8 +2771,9 @@ def matmul_gelu_backward_scaling_gpu[
 ](
     d_input_ptr: MutKernelPtr[dtype],
     pre_gelu_ptr: ImmutKernelPtr[dtype],
-    num_params: Int,
+    num_params_arg: Int64,
 ) -> None:
+    var num_params = Int(num_params_arg)
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
     if idx + width <= num_params:
         _matmul_gelu_backward_scaling[dtype, width](
@@ -2769,12 +2846,14 @@ def matmul_d_input_bwd[
             var offset = idx[0] * in_channels + idx[1]
             var v = val.cast[DType.float32]()
             var pre_gelu = (
-                (pre_gelu_ptr + offset)
-                .load[width=width]()
+                (pre_gelu_ptr.unsafe_offset(offset))
+                .unsafe_load[width=width]()
                 .cast[DType.float32]()
             )
             v *= gelu_grad[DType.float32, width](pre_gelu)
-            (d_input_ptr + offset).store(v.cast[elem_dtype]())
+            (d_input_ptr.unsafe_offset(offset)).unsafe_store(
+                v.cast[elem_dtype]()
+            )
 
         comptime if use_gelu:
             matmul[
@@ -2883,9 +2962,17 @@ def _add_into[
             w_: Int,
         ](local: Int) {dst_ptr, src_ptr, base}:
             var idx = base + local
-            var a = (dst_ptr + idx).load[width=w_]().cast[DType.float32]()
-            var b = (src_ptr + idx).load[width=w_]().cast[DType.float32]()
-            (dst_ptr + idx).store((a + b).cast[dtype]())
+            var a = (
+                (dst_ptr.unsafe_offset(idx))
+                .unsafe_load[width=w_]()
+                .cast[DType.float32]()
+            )
+            var b = (
+                (src_ptr.unsafe_offset(idx))
+                .unsafe_load[width=w_]()
+                .cast[DType.float32]()
+            )
+            (dst_ptr.unsafe_offset(idx)).unsafe_store((a + b).cast[dtype]())
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
@@ -2897,19 +2984,23 @@ def _gpu_transpose_kernel[
 ](
     dst: MutKernelPtr[dtype],
     src: ImmutKernelPtr[dtype],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
 ) -> None:
     """Transpose src[rows, cols] (row-major) into dst[cols, rows] (row-major).
     Used on Apple Metal to materialise d_outputᵀ[OC, rows] into the scratch
     buffer so `linalg.matmul.matmul(transpose_b=False)` can compute
     d_weight[OC, C] = scratch[OC, rows] @ input[rows, C].
     1-D grid: thread i handles element (i/cols, i%cols)."""
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < rows * cols:
         var r = idx / cols
         var c = idx % cols
-        dst[c * rows + r] = src[idx]  # src[idx] == src[r*cols + c]
+        dst[unsafe_offset=c * rows + r] = src[
+            unsafe_offset=idx
+        ]  # src[idx] == src[r*cols + c]
 
 
 def _rht_transpose_tiled_kernel[
@@ -2918,8 +3009,8 @@ def _rht_transpose_tiled_kernel[
 ](
     dst: MutKernelPtr[dtype],
     src: ImmutKernelPtr[dtype],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
 ) -> None:
     """Coalesced 32x32-shared-memory-tile transpose of `src[rows, cols]`
     (row-major) into `dst[cols, rows]` (row-major) with `llmm/hadamard.mojo`'s
@@ -2963,6 +3054,8 @@ def _rht_transpose_tiled_kernel[
     store). Out-of-tile SMEM slots are zero-filled in phase 1 so the
     shuffles stay NaN-free regardless.
     """
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
     comptime TILE = 32
     comptime STRIDE = TILE + 1  # 33 — avoids shared-memory bank conflicts
     var tile = LayoutTensor[
@@ -2995,10 +3088,10 @@ def _rht_transpose_tiled_kernel[
             var gc = tile_c + tx
             var lv: Scalar[dtype]
             if gr < rows and gc < cols:
-                lv = src[gr * cols + gc]
+                lv = src[unsafe_offset=gr * cols + gc]
             else:
                 lv = Scalar[dtype](0)
-            tile.ptr[r * STRIDE + tx] = lv
+            tile.ptr[unsafe_offset=r * STRIDE + tx] = lv
             r += ROW_STEP
         barrier()
 
@@ -3011,7 +3104,7 @@ def _rht_transpose_tiled_kernel[
         while r < TILE:
             var gc = tile_c + r  # dst row index (src col)
             var gr = tile_r + tx  # dst col index (src row)
-            var v = tile.ptr[tx * STRIDE + r].cast[
+            var v = tile.ptr[unsafe_offset=tx * STRIDE + r].cast[
                 DType.float32
             ]() * hadamard_sign(tx & 15)
             var p = shuffle_xor(v, UInt32(1))
@@ -3023,7 +3116,7 @@ def _rht_transpose_tiled_kernel[
             p = shuffle_xor(v, UInt32(8))
             v = (p - v) if (tx & 8) != 0 else (v + p)
             if gc < cols and gr < rows:
-                dst[gc * rows + gr] = v.cast[dtype]()
+                dst[unsafe_offset=gc * rows + gr] = v.cast[dtype]()
             r += ROW_STEP
         barrier()
 
@@ -3032,15 +3125,17 @@ def _rht_transpose_tiled_kernel[
 
 def _gpu_add_into_kernel[
     dtype: DType
-](dst: MutKernelPtr[dtype], src: MutKernelPtr[dtype], total: Int,) -> None:
+](dst: MutKernelPtr[dtype], src: MutKernelPtr[dtype], total_arg: Int64) -> None:
     """Elementwise dst[i] += src[i] with fp32 accumulation.
     Used on Apple Metal to fold a freshly-computed d_weight GEMM result into
     the running gradient accumulator (beta=1 path, avoiding the epilogue-
     reads-overwritten-C double-count that the CPU branch guards against)."""
+    var total = Int(total_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < total:
-        dst[idx] = (
-            dst[idx].cast[DType.float32]() + src[idx].cast[DType.float32]()
+        dst[unsafe_offset=idx] = (
+            dst[unsafe_offset=idx].cast[DType.float32]()
+            + src[unsafe_offset=idx].cast[DType.float32]()
         ).cast[dtype]()
 
 
@@ -3051,8 +3146,8 @@ def _gpu_transpose_add_into_kernel[
 ](
     dst: MutKernelPtr[dtype],  # d_weight[OC, C] row-major
     src: MutKernelPtr[dtype],  # d_weight_T[C, OC] row-major (read-only here)
-    C_: Int,
-    OC_: Int,
+    C_arg: Int64,
+    OC_arg: Int64,
 ) -> None:
     """Tiled shared-memory transpose-fold src[C,OC] into dst[OC,C].
 
@@ -3069,6 +3164,8 @@ def _gpu_transpose_add_into_kernel[
     accumulate=False: dst[oc*C+c]  = src[c*OC+oc]           (overwrite)
     accumulate=True:  dst[oc*C+c] += src[c*OC+oc]  (fp32 accumulation)
     """
+    var C_ = Int(C_arg)
+    var OC_ = Int(OC_arg)
     comptime TILE = 32
     comptime STRIDE = TILE + 1  # 33 — avoids shared-memory bank conflicts
     var tile = LayoutTensor[
@@ -3101,7 +3198,9 @@ def _gpu_transpose_add_into_kernel[
             var gr = tile_c + r  # global C  index (src row)
             var goc = tile_oc + tx  # global OC index (src col)
             if gr < C_ and goc < OC_:
-                tile.ptr[r * STRIDE + tx] = src[gr * OC_ + goc]
+                tile.ptr[unsafe_offset=r * STRIDE + tx] = src[
+                    unsafe_offset=gr * OC_ + goc
+                ]
             r += ROW_STEP
         barrier()
 
@@ -3113,13 +3212,16 @@ def _gpu_transpose_add_into_kernel[
             var goc = tile_oc + r  # global OC index (dst row)
             var gc = tile_c + tx  # global C  index (dst col)
             if goc < OC_ and gc < C_:
-                var v = tile.ptr[tx * STRIDE + r].cast[DType.float32]()
+                var v = tile.ptr[unsafe_offset=tx * STRIDE + r].cast[
+                    DType.float32
+                ]()
                 comptime if accumulate:
-                    dst[goc * C_ + gc] = (
-                        dst[goc * C_ + gc].cast[DType.float32]() + v
+                    dst[unsafe_offset=goc * C_ + gc] = (
+                        dst[unsafe_offset=goc * C_ + gc].cast[DType.float32]()
+                        + v
                     ).cast[dtype]()
                 else:
-                    dst[goc * C_ + gc] = v.cast[dtype]()
+                    dst[unsafe_offset=goc * C_ + gc] = v.cast[dtype]()
             r += ROW_STEP
         barrier()
 
@@ -3228,8 +3330,8 @@ def matmul_d_weight_bwd[
                         t_c,
                         input_T_ptr,
                         input_ptr,
-                        rows,
-                        in_channels,
+                        Int64(rows),
+                        Int64(in_channels),
                         grid_dim=(ceildiv(t_in_total, _TRANS_BLOCK),),
                         block_dim=(_TRANS_BLOCK,),
                     )
@@ -3272,8 +3374,8 @@ def matmul_d_weight_bwd[
                         tadd_c,
                         d_weight_ptr,
                         dw_t_ptr,
-                        in_channels,
-                        out_channels,
+                        Int64(in_channels),
+                        Int64(out_channels),
                         grid_dim=(tadd_tiles,),
                         block_dim=(_TRANS_BLOCK,),
                     )
@@ -3297,8 +3399,8 @@ def matmul_d_weight_bwd[
                         t_c,
                         transpose_ptr,
                         d_output_ptr,
-                        rows,
-                        out_channels,
+                        Int64(rows),
+                        Int64(out_channels),
                         grid_dim=(ceildiv(t_total, _TRANS_BLOCK),),
                         block_dim=(_TRANS_BLOCK,),
                     )
@@ -3337,7 +3439,7 @@ def matmul_d_weight_bwd[
                             add_c,
                             d_weight_ptr,
                             temp_ptr,
-                            a_total,
+                            Int64(a_total),
                             grid_dim=(ceildiv(a_total, _ADD_BLOCK),),
                             block_dim=(_ADD_BLOCK,),
                         )
@@ -3372,10 +3474,10 @@ def matmul_d_weight_bwd[
             row_major(out_channels, rows),
         )
         var perms = alloc[Scalar[DType.int]](2)
-        perms[0] = 1
-        perms[1] = 0
+        perms[unsafe_offset=0] = 1
+        perms[unsafe_offset=1] = 0
         transpose(scratch_t, a_d_output, perms)
-        perms.free()
+        perms.unsafe_free()
 
         comptime if accumulate:
             # NOT an epilogue += : on the f32 Apple Accelerate path the
@@ -3399,7 +3501,7 @@ def matmul_d_weight_bwd[
                 rebind[MutKernelPtr[dtype]](temp.as_unsafe_any_origin()),
                 out_channels * in_channels,
             )
-            temp.free()
+            temp.unsafe_free()
         else:
             matmul[transpose_b=False, target=target](
                 c_d_weight, scratch_t, b_input, ctx=ctx
@@ -3502,23 +3604,26 @@ def _gpu_col_slice_kernel[
 ](
     dst: MutKernelPtr[dtype],
     src: ImmutKernelPtr[dtype],
-    rows: Int,
-    cols: Int,
-    ld: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    ld_arg: Int64,
 ) -> None:
     """Copy between a contiguous [rows, cols] block and a column slice of a
     row-major matrix with leading dimension `ld` (the slice's base column is
     folded into the caller's pointer). `to_strided` picks the direction:
     True scatters contiguous -> strided, False gathers strided -> contiguous.
     1-D grid, thread i handles element (i/cols, i%cols)."""
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var ld = Int(ld_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < rows * cols:
         var r = idx / cols
         var c = idx % cols
         comptime if to_strided:
-            dst[r * ld + c] = src[idx]
+            dst[unsafe_offset=r * ld + c] = src[unsafe_offset=idx]
         else:
-            dst[idx] = src[r * ld + c]
+            dst[unsafe_offset=idx] = src[unsafe_offset=r * ld + c]
 
 
 @always_inline
@@ -3544,9 +3649,9 @@ def _col_slice_copy[
             compiled,
             dst,
             src,
-            rows,
-            cols,
-            ld,
+            Int64(rows),
+            Int64(cols),
+            Int64(ld),
             grid_dim=(ceildiv(rows * cols, BLOCK_SIZE),),
             block_dim=(BLOCK_SIZE,),
         )
@@ -3554,9 +3659,13 @@ def _col_slice_copy[
         for r in range(rows):
             for c in range(cols):
                 comptime if to_strided:
-                    dst[r * ld + c] = src[r * cols + c]
+                    dst[unsafe_offset=r * ld + c] = src[
+                        unsafe_offset=r * cols + c
+                    ]
                 else:
-                    dst[r * cols + c] = src[r * ld + c]
+                    dst[unsafe_offset=r * cols + c] = src[
+                        unsafe_offset=r * ld + c
+                    ]
 
 
 def matmul_lm_head_fwd_tile[
@@ -3760,7 +3869,7 @@ def matmul_lm_head_bwd_tile[
                     add_c,
                     d_input_ptr,
                     tmp_ptr,
-                    total,
+                    Int64(total),
                     grid_dim=(ceildiv(total, ADD_BLOCK),),
                     block_dim=(ADD_BLOCK,),
                 )
@@ -4354,8 +4463,8 @@ def _rht_transpose_prep[
         t_compiled,
         scratch_ptr,
         src_ptr,
-        rows,
-        cols,
+        Int64(rows),
+        Int64(cols),
         grid_dim=(tiles,),
         block_dim=(BLOCK_SIZE,),
     )

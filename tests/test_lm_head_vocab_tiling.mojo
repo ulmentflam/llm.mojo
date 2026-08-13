@@ -36,7 +36,7 @@
 from std.testing import assert_almost_equal, assert_true, TestSuite
 from std.memory import alloc
 from std.math import ceildiv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.python import Python
 
 from llmm.memory import MutMemPtr, as_mut_kernel, as_immut_kernel_from_mut
@@ -66,14 +66,14 @@ comptime TILE = 8
 def _fill(p: MutMemPtr[DT], n: Int, seed: Int) -> None:
     for i in range(n):
         var x = Float32((i * 37 + seed * 17) % 23) - 11.0
-        p[i] = x * 0.037
+        p[unsafe_offset=i] = x * 0.037
 
 
 def _alloc(n: Int) -> MutMemPtr[DT]:
     var p = alloc[Scalar[DT]](n)
     var q = rebind[MutMemPtr[DT]](p.as_unsafe_any_origin())
     for i in range(n):
-        q[i] = 0.0
+        q[unsafe_offset=i] = 0.0
     return q
 
 
@@ -375,10 +375,10 @@ def test_fwd_tiled_matches_dense() raises:
     while t0 < V_P:
         var oc = min(TILE, V_P - t0)
         matmul_lm_head_fwd_tile[DT, TARGET](
-            as_mut_kernel[DT](tiled + t0),
+            as_mut_kernel[DT](tiled.unsafe_offset(t0)),
             V_P,
             as_immut_kernel_from_mut[DT](inp),
-            as_immut_kernel_from_mut[DT](wte + t0 * C),
+            as_immut_kernel_from_mut[DT](wte.unsafe_offset(t0 * C)),
             ROWS,
             C,
             oc,
@@ -394,12 +394,14 @@ def test_fwd_tiled_matches_dense() raises:
     # still one full-length dot product: this is an exact-match check, not a
     # tolerance check.
     for i in range(ROWS * V_P):
-        assert_almost_equal(tiled[i], dense[i], atol=1e-6)
+        assert_almost_equal(
+            tiled[unsafe_offset=i], dense[unsafe_offset=i], atol=1e-6
+        )
 
-    inp.free()
-    wte.free()
-    dense.free()
-    tiled.free()
+    inp.unsafe_free()
+    wte.unsafe_free()
+    dense.unsafe_free()
+    tiled.unsafe_free()
 
 
 def test_fwd_tiled_writes_every_column() raises:
@@ -415,16 +417,16 @@ def test_fwd_tiled_writes_every_column() raises:
     comptime POISON = Float32(-12345.0)
     var out = _alloc(ROWS * V_P)
     for i in range(ROWS * V_P):
-        out[i] = POISON
+        out[unsafe_offset=i] = POISON
 
     var t0 = 0
     while t0 < V_P:
         var oc = min(TILE, V_P - t0)
         matmul_lm_head_fwd_tile[DT, TARGET](
-            as_mut_kernel[DT](out + t0),
+            as_mut_kernel[DT](out.unsafe_offset(t0)),
             V_P,
             as_immut_kernel_from_mut[DT](inp),
-            as_immut_kernel_from_mut[DT](wte + t0 * C),
+            as_immut_kernel_from_mut[DT](wte.unsafe_offset(t0 * C)),
             ROWS,
             C,
             oc,
@@ -435,13 +437,13 @@ def test_fwd_tiled_writes_every_column() raises:
 
     for i in range(ROWS * V_P):
         assert_true(
-            out[i] != POISON,
+            out[unsafe_offset=i] != POISON,
             "logit " + String(i) + " was never written by the tile loop",
         )
 
-    inp.free()
-    wte.free()
-    out.free()
+    inp.unsafe_free()
+    wte.unsafe_free()
+    out.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -493,11 +495,11 @@ def test_bwd_tiled_matches_dense() raises:
         var oc = min(TILE, V_P - t0)
         matmul_lm_head_bwd_tile[DT, TARGET](
             as_mut_kernel[DT](d_inp_tiled),
-            as_mut_kernel[DT](d_w_tiled + t0 * C),
-            as_immut_kernel_from_mut[DT](dlogits + t0),
+            as_mut_kernel[DT](d_w_tiled.unsafe_offset(t0 * C)),
+            as_immut_kernel_from_mut[DT](dlogits.unsafe_offset(t0)),
             V_P,
             as_immut_kernel_from_mut[DT](inp),
-            as_immut_kernel_from_mut[DT](wte + t0 * C),
+            as_immut_kernel_from_mut[DT](wte.unsafe_offset(t0 * C)),
             as_mut_kernel[DT](scratch_tiled),
             ROWS,
             C,
@@ -515,22 +517,28 @@ def test_bwd_tiled_matches_dense() raises:
     # d_weight reduces over `rows` only — vocab tiling never splits that sum,
     # so every wte gradient row is computed by the same dot products as dense.
     for i in range(V_P * C):
-        assert_almost_equal(d_w_tiled[i], d_w_dense[i], atol=1e-6)
+        assert_almost_equal(
+            d_w_tiled[unsafe_offset=i], d_w_dense[unsafe_offset=i], atol=1e-6
+        )
 
     # d_input reduces over the vocabulary, which tiling DOES split, so the sum
     # is reassociated across tiles. Close, not identical.
     for i in range(ROWS * C):
-        assert_almost_equal(d_inp_tiled[i], d_inp_dense[i], atol=1e-5)
+        assert_almost_equal(
+            d_inp_tiled[unsafe_offset=i],
+            d_inp_dense[unsafe_offset=i],
+            atol=1e-5,
+        )
 
-    inp.free()
-    wte.free()
-    dlogits.free()
-    d_inp_dense.free()
-    d_w_dense.free()
-    scratch_dense.free()
-    d_inp_tiled.free()
-    d_w_tiled.free()
-    scratch_tiled.free()
+    inp.unsafe_free()
+    wte.unsafe_free()
+    dlogits.unsafe_free()
+    d_inp_dense.unsafe_free()
+    d_w_dense.unsafe_free()
+    scratch_dense.unsafe_free()
+    d_inp_tiled.unsafe_free()
+    d_w_tiled.unsafe_free()
+    scratch_tiled.unsafe_free()
 
 
 def test_bwd_d_input_accumulates_across_tiles() raises:
@@ -559,11 +567,11 @@ def test_bwd_d_input_accumulates_across_tiles() raises:
         var oc = min(TILE, V_P - t0)
         matmul_lm_head_bwd_tile[DT, TARGET](
             as_mut_kernel[DT](accumulated),
-            as_mut_kernel[DT](d_w + t0 * C),
-            as_immut_kernel_from_mut[DT](dlogits + t0),
+            as_mut_kernel[DT](d_w.unsafe_offset(t0 * C)),
+            as_immut_kernel_from_mut[DT](dlogits.unsafe_offset(t0)),
             V_P,
             as_immut_kernel_from_mut[DT](inp),
-            as_immut_kernel_from_mut[DT](wte + t0 * C),
+            as_immut_kernel_from_mut[DT](wte.unsafe_offset(t0 * C)),
             as_mut_kernel[DT](scratch),
             ROWS,
             C,
@@ -582,11 +590,11 @@ def test_bwd_d_input_accumulates_across_tiles() raises:
     var last_only = _alloc(ROWS * C)
     matmul_lm_head_bwd_tile[DT, TARGET](
         as_mut_kernel[DT](last_only),
-        as_mut_kernel[DT](d_w2 + last_start * C),
-        as_immut_kernel_from_mut[DT](dlogits + last_start),
+        as_mut_kernel[DT](d_w2.unsafe_offset(last_start * C)),
+        as_immut_kernel_from_mut[DT](dlogits.unsafe_offset(last_start)),
         V_P,
         as_immut_kernel_from_mut[DT](inp),
-        as_immut_kernel_from_mut[DT](wte + last_start * C),
+        as_immut_kernel_from_mut[DT](wte.unsafe_offset(last_start * C)),
         as_mut_kernel[DT](scratch),
         ROWS,
         C,
@@ -598,7 +606,10 @@ def test_bwd_d_input_accumulates_across_tiles() raises:
 
     var differs = False
     for i in range(ROWS * C):
-        if abs(accumulated[i] - last_only[i]) > 1e-6:
+        if (
+            abs(accumulated[unsafe_offset=i] - last_only[unsafe_offset=i])
+            > 1e-6
+        ):
             differs = True
     assert_true(
         differs,
@@ -608,14 +619,14 @@ def test_bwd_d_input_accumulates_across_tiles() raises:
         ),
     )
 
-    inp.free()
-    wte.free()
-    dlogits.free()
-    d_w.free()
-    d_w2.free()
-    scratch.free()
-    accumulated.free()
-    last_only.free()
+    inp.unsafe_free()
+    wte.unsafe_free()
+    dlogits.unsafe_free()
+    d_w.unsafe_free()
+    d_w2.unsafe_free()
+    scratch.unsafe_free()
+    accumulated.unsafe_free()
+    last_only.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -683,10 +694,10 @@ def test_fwd_tiled_matches_dense_at_vocab_scale() raises:
         if oc != BIG_TILE:
             ragged = oc
         matmul_lm_head_fwd_tile[DT, TARGET](
-            as_mut_kernel[DT](tiled + t0),
+            as_mut_kernel[DT](tiled.unsafe_offset(t0)),
             BIG_V_P,
             as_immut_kernel_from_mut[DT](inp),
-            as_immut_kernel_from_mut[DT](wte + t0 * C),
+            as_immut_kernel_from_mut[DT](wte.unsafe_offset(t0 * C)),
             BIG_ROWS,
             C,
             oc,
@@ -700,12 +711,14 @@ def test_fwd_tiled_matches_dense_at_vocab_scale() raises:
     assert_true(ragged == 5504, "expected a ragged 5504-row final tile")
 
     for i in range(BIG_ROWS * BIG_V_P):
-        assert_almost_equal(tiled[i], dense[i], atol=1e-5)
+        assert_almost_equal(
+            tiled[unsafe_offset=i], dense[unsafe_offset=i], atol=1e-5
+        )
 
-    inp.free()
-    wte.free()
-    dense.free()
-    tiled.free()
+    inp.unsafe_free()
+    wte.unsafe_free()
+    dense.unsafe_free()
+    tiled.unsafe_free()
 
 
 def test_bwd_tiled_matches_dense_at_vocab_scale() raises:
@@ -752,11 +765,11 @@ def test_bwd_tiled_matches_dense_at_vocab_scale() raises:
             ragged = oc
         matmul_lm_head_bwd_tile[DT, TARGET](
             as_mut_kernel[DT](d_inp_tiled),
-            as_mut_kernel[DT](d_w_tiled + t0 * C),
-            as_immut_kernel_from_mut[DT](dlogits + t0),
+            as_mut_kernel[DT](d_w_tiled.unsafe_offset(t0 * C)),
+            as_immut_kernel_from_mut[DT](dlogits.unsafe_offset(t0)),
             BIG_V_P,
             as_immut_kernel_from_mut[DT](inp),
-            as_immut_kernel_from_mut[DT](wte + t0 * C),
+            as_immut_kernel_from_mut[DT](wte.unsafe_offset(t0 * C)),
             as_mut_kernel[DT](scratch),
             BIG_ROWS,
             C,
@@ -777,7 +790,9 @@ def test_bwd_tiled_matches_dense_at_vocab_scale() raises:
     # absolute check even at |d_w| ~ 1e2. Covers the ragged final tile's 5504
     # rows too, since the loop runs to V_p.
     for i in range(BIG_V_P * C):
-        assert_almost_equal(d_w_tiled[i], d_w_dense[i], atol=1e-5)
+        assert_almost_equal(
+            d_w_tiled[unsafe_offset=i], d_w_dense[unsafe_offset=i], atol=1e-5
+        )
 
     # The check just above only proves `d_w_tiled` and `d_w_dense` agree with
     # EACH OTHER. Both arms compute d_weight through the exact same
@@ -828,9 +843,9 @@ def test_bwd_tiled_matches_dense_at_vocab_scale() raises:
             var acc = Float64(0.0)
             var mag = Float64(0.0)
             for r in range(BIG_ROWS):
-                var prod = Float64(dlogits[r * BIG_V_P + v]) * Float64(
-                    inp[r * C + c]
-                )
+                var prod = Float64(
+                    dlogits[unsafe_offset=r * BIG_V_P + v]
+                ) * Float64(inp[unsafe_offset=r * C + c])
                 acc += prod
                 mag += abs(prod)
             d_w_total_samples += 1
@@ -841,8 +856,8 @@ def test_bwd_tiled_matches_dense_at_vocab_scale() raises:
             # mirrors the d_input bound below (sqrt(128) * fp32 eps is smaller
             # still, so this leaves ample margin without hiding a real error).
             var tol = Float64(5e-5) * mag + Float64(1e-6)
-            var got_t = Float64(d_w_tiled[v * C + c])
-            var got_d = Float64(d_w_dense[v * C + c])
+            var got_t = Float64(d_w_tiled[unsafe_offset=v * C + c])
+            var got_d = Float64(d_w_dense[unsafe_offset=v * C + c])
             assert_true(
                 abs(got_t - acc) <= tol,
                 (
@@ -914,16 +929,16 @@ def test_bwd_tiled_matches_dense_at_vocab_scale() raises:
             var acc = Float64(0.0)
             var mag = Float64(0.0)
             for v in range(BIG_V_P):
-                var prod = Float64(dlogits[r * BIG_V_P + v]) * Float64(
-                    wte[v * C + c]
-                )
+                var prod = Float64(
+                    dlogits[unsafe_offset=r * BIG_V_P + v]
+                ) * Float64(wte[unsafe_offset=v * C + c])
                 acc += prod
                 mag += abs(prod)
             # sqrt(50304) * fp32 eps ~ 2.7e-5; 5e-5 leaves margin without
             # letting a real error through.
             var tol = Float64(5e-5) * mag
-            var got_t = Float64(d_inp_tiled[r * C + c])
-            var got_d = Float64(d_inp_dense[r * C + c])
+            var got_t = Float64(d_inp_tiled[unsafe_offset=r * C + c])
+            var got_d = Float64(d_inp_dense[unsafe_offset=r * C + c])
             assert_true(
                 abs(got_t - acc) <= tol,
                 (
@@ -955,14 +970,14 @@ def test_bwd_tiled_matches_dense_at_vocab_scale() raises:
                 ),
             )
 
-    inp.free()
-    wte.free()
-    dlogits.free()
-    d_inp_dense.free()
-    d_w_dense.free()
-    scratch.free()
-    d_inp_tiled.free()
-    d_w_tiled.free()
+    inp.unsafe_free()
+    wte.unsafe_free()
+    dlogits.unsafe_free()
+    d_inp_dense.unsafe_free()
+    d_w_dense.unsafe_free()
+    scratch.unsafe_free()
+    d_inp_tiled.unsafe_free()
+    d_w_tiled.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1048,7 +1063,7 @@ def test_multiple_tile_counts_at_vocab_scale() raises:
 
         # ---------- forward ----------
         for i in range(BIG_ROWS * BIG_V_P):
-            logits_tiled[i] = 0.0
+            logits_tiled[unsafe_offset=i] = 0.0
         var ntiles = 0
         var tail = 0
         var t0 = 0
@@ -1057,10 +1072,10 @@ def test_multiple_tile_counts_at_vocab_scale() raises:
             if oc != tw:
                 tail = oc
             matmul_lm_head_fwd_tile[DT, TARGET](
-                as_mut_kernel[DT](logits_tiled + t0),
+                as_mut_kernel[DT](logits_tiled.unsafe_offset(t0)),
                 BIG_V_P,
                 as_immut_kernel_from_mut[DT](inp),
-                as_immut_kernel_from_mut[DT](wte + t0 * C),
+                as_immut_kernel_from_mut[DT](wte.unsafe_offset(t0 * C)),
                 BIG_ROWS,
                 C,
                 oc,
@@ -1074,24 +1089,28 @@ def test_multiple_tile_counts_at_vocab_scale() raises:
         assert_true(tail == want_tail[w], label + ": wrong ragged tail")
 
         for i in range(BIG_ROWS * BIG_V_P):
-            assert_almost_equal(logits_tiled[i], logits_dense[i], atol=1e-5)
+            assert_almost_equal(
+                logits_tiled[unsafe_offset=i],
+                logits_dense[unsafe_offset=i],
+                atol=1e-5,
+            )
 
         # ---------- backward ----------
         for i in range(BIG_V_P * C):
-            d_w_tiled[i] = 0.0
+            d_w_tiled[unsafe_offset=i] = 0.0
         for i in range(BIG_ROWS * C):
-            d_inp_tiled[i] = 0.0
+            d_inp_tiled[unsafe_offset=i] = 0.0
         t0 = 0
         var first = True
         while t0 < BIG_V_P:
             var oc = min(tw, BIG_V_P - t0)
             matmul_lm_head_bwd_tile[DT, TARGET](
                 as_mut_kernel[DT](d_inp_tiled),
-                as_mut_kernel[DT](d_w_tiled + t0 * C),
-                as_immut_kernel_from_mut[DT](dlogits + t0),
+                as_mut_kernel[DT](d_w_tiled.unsafe_offset(t0 * C)),
+                as_immut_kernel_from_mut[DT](dlogits.unsafe_offset(t0)),
                 BIG_V_P,
                 as_immut_kernel_from_mut[DT](inp),
-                as_immut_kernel_from_mut[DT](wte + t0 * C),
+                as_immut_kernel_from_mut[DT](wte.unsafe_offset(t0 * C)),
                 as_mut_kernel[DT](scratch),
                 BIG_ROWS,
                 C,
@@ -1105,7 +1124,11 @@ def test_multiple_tile_counts_at_vocab_scale() raises:
 
         # d_weight does not reassociate at any tile width.
         for i in range(BIG_V_P * C):
-            assert_almost_equal(d_w_tiled[i], d_w_dense[i], atol=1e-5)
+            assert_almost_equal(
+                d_w_tiled[unsafe_offset=i],
+                d_w_dense[unsafe_offset=i],
+                atol=1e-5,
+            )
 
         # As in test_bwd_tiled_matches_dense_at_vocab_scale, the check just
         # above proves only that d_w_tiled and d_w_dense agree with EACH
@@ -1124,16 +1147,16 @@ def test_multiple_tile_counts_at_vocab_scale() raises:
                 var acc = Float64(0.0)
                 var mag = Float64(0.0)
                 for r in range(BIG_ROWS):
-                    var prod = Float64(dlogits[r * BIG_V_P + v]) * Float64(
-                        inp[r * C + c]
-                    )
+                    var prod = Float64(
+                        dlogits[unsafe_offset=r * BIG_V_P + v]
+                    ) * Float64(inp[unsafe_offset=r * C + c])
                     acc += prod
                     mag += abs(prod)
                 d_w_total_w += 1
                 if abs(acc) > 1e-6:
                     d_w_nonzero_w += 1
                 var tol = Float64(5e-5) * mag + Float64(1e-6)
-                var got = Float64(d_w_tiled[v * C + c])
+                var got = Float64(d_w_tiled[unsafe_offset=v * C + c])
                 assert_true(
                     abs(got - acc) <= tol,
                     label
@@ -1164,13 +1187,13 @@ def test_multiple_tile_counts_at_vocab_scale() raises:
                 var acc = Float64(0.0)
                 var mag = Float64(0.0)
                 for v in range(BIG_V_P):
-                    var prod = Float64(dlogits[r * BIG_V_P + v]) * Float64(
-                        wte[v * C + c]
-                    )
+                    var prod = Float64(
+                        dlogits[unsafe_offset=r * BIG_V_P + v]
+                    ) * Float64(wte[unsafe_offset=v * C + c])
                     acc += prod
                     mag += abs(prod)
                 var tol = Float64(5e-5) * mag
-                var got = Float64(d_inp_tiled[r * C + c])
+                var got = Float64(d_inp_tiled[unsafe_offset=r * C + c])
                 assert_true(
                     abs(got - acc) <= tol,
                     label
@@ -1186,16 +1209,16 @@ def test_multiple_tile_counts_at_vocab_scale() raises:
                     + String(tol),
                 )
 
-    inp.free()
-    wte.free()
-    dlogits.free()
-    logits_dense.free()
-    logits_tiled.free()
-    d_inp_dense.free()
-    d_w_dense.free()
-    d_inp_tiled.free()
-    d_w_tiled.free()
-    scratch.free()
+    inp.unsafe_free()
+    wte.unsafe_free()
+    dlogits.unsafe_free()
+    logits_dense.unsafe_free()
+    logits_tiled.unsafe_free()
+    d_inp_dense.unsafe_free()
+    d_w_dense.unsafe_free()
+    d_inp_tiled.unsafe_free()
+    d_w_tiled.unsafe_free()
+    scratch.unsafe_free()
 
 
 def main() raises:

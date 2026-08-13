@@ -1,5 +1,5 @@
 from std.ffi import _get_global_or_null, external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer, alloc
 
 
@@ -9,32 +9,26 @@ from std.memory import UnsafePointer, alloc
 
 
 # Owned heap / HostBuffer — safe in struct fields (GPU-target builds reject AnyOrigin).
-comptime MutMemPtr[dtype: DType] = UnsafePointer[
-    Scalar[dtype], MutUntrackedOrigin
-]
-comptime ImmutMemPtr[dtype: DType] = UnsafePointer[
-    Scalar[dtype], ImmUntrackedOrigin
-]
+comptime MutMemPtr[dtype: DType] = Pointer[Scalar[dtype], MutUntrackedOrigin]
+comptime ImmutMemPtr[dtype: DType] = Pointer[Scalar[dtype], ImmUntrackedOrigin]
 
 
 # llmm kernel / tensor API — interoperates with InputTensor.unsafe_ptr().
-comptime MutKernelPtr[dtype: DType] = UnsafePointer[Scalar[dtype], MutAnyOrigin]
-comptime ImmutKernelPtr[dtype: DType] = UnsafePointer[
-    Scalar[dtype], ImmutAnyOrigin
-]
+comptime MutKernelPtr[dtype: DType] = Pointer[Scalar[dtype], MutAnyOrigin]
+comptime ImmutKernelPtr[dtype: DType] = Pointer[Scalar[dtype], ImmutAnyOrigin]
 
 
 @always_inline
 def rebind_mut_mem[
     dtype: DType
-](ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],) -> MutMemPtr[dtype]:
+](ptr: Pointer[Scalar[dtype], MutAnyOrigin],) -> MutMemPtr[dtype]:
     return rebind[MutMemPtr[dtype]](ptr)
 
 
 @always_inline
 def rebind_immut_mem[
     dtype: DType
-](ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],) -> ImmutMemPtr[dtype]:
+](ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],) -> ImmutMemPtr[dtype]:
     return rebind[ImmutMemPtr[dtype]](ptr)
 
 
@@ -84,8 +78,14 @@ def persistent_device_buffer[
     """
     comptime BufType = type_of(ctx.enqueue_create_buffer[dtype](1))
     var name = String("LLMM_") + name_suffix + String("_") + String(ctx.id())
+    # Mojo 1.0 deprecates this implicit binding and suggests `if var gp := ...`.
+    # Do NOT apply it here: `gp` aliases a pointer into the process-global
+    # buffer cache, and the owned `var` spelling SIGSEGVs the MAX compiler when
+    # a custom op is built against this module (it took down the whole
+    # test-python-cuda suite at tests/test_attention_equivalence.py). The three
+    # `_get_global_or_null` call sites keep the deprecation warning on purpose.
     if gp := _get_global_or_null(name):
-        var p = gp.value().bitcast[BufType]()
+        var p = gp.value().unsafe_bitcast[BufType]()
         var cached_count = len(p[])
         if count > cached_count:
             raise Error(
@@ -106,6 +106,6 @@ def persistent_device_buffer[
     var hp = alloc[BufType](1)
     hp.unsafe_write(buf^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), hp.bitcast[NoneType]()
+        StringSlice(name), hp.unsafe_bitcast[NoneType]()
     )
     return rebind[MutKernelPtr[dtype]](hp[].unsafe_ptr())

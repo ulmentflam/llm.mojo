@@ -52,7 +52,7 @@ from std.time import global_perf_counter_ns
 from layout import TileTensor
 from layout.tile_layout import row_major
 from linalg.matmul import matmul
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
@@ -62,7 +62,7 @@ comptime C_MODEL = 768  # embedding width (the GEMM's K)
 comptime V_P = 50304  # padded vocab (the GEMM's full N)
 
 
-fn lm_head_tile_rows(k: Int) -> Int:
+def lm_head_tile_rows(k: Int) -> Int:
     """Tile width for tile-count knob `k`, matching the shipped LM head.
 
     This mirrors `_lm_head_tile_rows` exactly. It is NOT an even division of
@@ -133,19 +133,19 @@ def run_tiles(
     var scale = 1.0 / sqrt(Float32(K))
     var st: UInt64 = 0x243F6A8885A308D3 + UInt64(M * 131 + N * 17 + K)
     for i in range(M * K):
-        a_host.unsafe_ptr()[i] = _lcg(st) * scale
+        a_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
     for i in range(N * K):
-        b_host.unsafe_ptr()[i] = _lcg(st) * scale
+        b_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
 
     var a_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](M * K)
     var b_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](N * K)
     ctx.synchronize()
     for i in range(M * K):
-        a_bf_host.unsafe_ptr()[i] = a_host.unsafe_ptr()[i].cast[
+        a_bf_host.unsafe_ptr()[unsafe_offset=i] = a_host.unsafe_ptr()[unsafe_offset=i].cast[
             DType.bfloat16
         ]()
     for i in range(N * K):
-        b_bf_host.unsafe_ptr()[i] = b_host.unsafe_ptr()[i].cast[
+        b_bf_host.unsafe_ptr()[unsafe_offset=i] = b_host.unsafe_ptr()[unsafe_offset=i].cast[
             DType.bfloat16
         ]()
 
@@ -172,7 +172,7 @@ def run_tiles(
             var start = t * tile_n
             var this_n = min(tile_n, N - start)
             linalg_gemm[DType.bfloat16](
-                c_p, a_p, b_p + (start * K), M, this_n, K, ctx
+                c_p, a_p, b_p.unsafe_offset((start * K)), M, this_n, K, ctx
             )
     ctx.synchronize()
 
@@ -182,7 +182,7 @@ def run_tiles(
             var start = t * tile_n
             var this_n = min(tile_n, N - start)
             linalg_gemm[DType.bfloat16](
-                c_p, a_p, b_p + (start * K), M, this_n, K, ctx
+                c_p, a_p, b_p.unsafe_offset((start * K)), M, this_n, K, ctx
             )
     ctx.synchronize()
     var ms = Float64(global_perf_counter_ns() - t0) / 1e6 / Float64(iters)
@@ -237,19 +237,19 @@ def check_tiles(M: Int, tiles: Int, ctx: DeviceContext) raises -> None:
     var scale = 1.0 / sqrt(Float32(K))
     var st: UInt64 = 0x243F6A8885A308D3 + UInt64(M * 131 + N * 17 + K)
     for i in range(M * K):
-        a_host.unsafe_ptr()[i] = _lcg(st) * scale
+        a_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
     for i in range(N * K):
-        b_host.unsafe_ptr()[i] = _lcg(st) * scale
+        b_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
 
     var a_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](M * K)
     var b_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](N * K)
     ctx.synchronize()
     for i in range(M * K):
-        a_bf_host.unsafe_ptr()[i] = a_host.unsafe_ptr()[i].cast[
+        a_bf_host.unsafe_ptr()[unsafe_offset=i] = a_host.unsafe_ptr()[unsafe_offset=i].cast[
             DType.bfloat16
         ]()
     for i in range(N * K):
-        b_bf_host.unsafe_ptr()[i] = b_host.unsafe_ptr()[i].cast[
+        b_bf_host.unsafe_ptr()[unsafe_offset=i] = b_host.unsafe_ptr()[unsafe_offset=i].cast[
             DType.bfloat16
         ]()
 
@@ -290,17 +290,17 @@ def check_tiles(M: Int, tiles: Int, ctx: DeviceContext) raises -> None:
         var start = t * tile_n
         var this_n = min(tile_n, N - start)
         linalg_gemm[DType.bfloat16](
-            c_tile_p, a_p, b_p + (start * K), M, this_n, K, ctx
+            c_tile_p, a_p, b_p.unsafe_offset((start * K)), M, this_n, K, ctx
         )
         ctx.synchronize()
         c_tile.enqueue_copy_to(tile_host)
         ctx.synchronize()
         for r in range(M):
             for j in range(this_n):
-                var want = full_host.unsafe_ptr()[r * N + start + j].cast[
+                var want = full_host.unsafe_ptr()[unsafe_offset=r * N + start + j].cast[
                     DType.float32
                 ]()
-                var got = tile_host.unsafe_ptr()[r * tile_n + j].cast[
+                var got = tile_host.unsafe_ptr()[unsafe_offset=r * tile_n + j].cast[
                     DType.float32
                 ]()
                 var d = abs(got - want)

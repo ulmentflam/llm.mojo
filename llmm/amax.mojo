@@ -48,9 +48,9 @@
 from std.memory import UnsafePointer
 from std.math import ceildiv, isnan, isinf, nan
 from std.sys import simd_width_of
-from std.gpu.host import DeviceContext, DeviceBuffer, DeviceAttribute
+from max.gpu.host import DeviceContext, DeviceBuffer, DeviceAttribute
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.primitives import block
+from max.gpu.primitives import block
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr, persistent_device_buffer
 from llmm.lowp import PrecisionSpec, ScalingKind
@@ -134,8 +134,9 @@ def _amax_partial_gpu[
     partial_max_ptr: MutKernelPtr[DType.float32],
     partial_bad_ptr: MutKernelPtr[DType.float32],
     data_ptr: ImmutKernelPtr[dtype],
-    count: Int,
+    count_arg: Int64,
 ) -> None:
+    var count = Int(count_arg)
     # Deliberately unaligned SIMD loads (no `alignment=` hint) — this is a
     # reduction over a possibly ragged/odd-stride slice (a GEMM operand
     # transient, not a fixed-shape buffer this file controls), and asserting
@@ -155,7 +156,11 @@ def _amax_partial_gpu[
     var idx = index
     while idx < count:
         if idx + width <= count:
-            var val = (data_ptr + idx).load[width=width]().cast[DType.float32]()
+            var val = (
+                (data_ptr.unsafe_offset(idx))
+                .unsafe_load[width=width]()
+                .cast[DType.float32]()
+            )
             var is_bad = isnan(val) | isinf(val)
             var abs_val = abs(val)
             # NaN-infectious max (see module docstring): zero out bad lanes
@@ -177,7 +182,7 @@ def _amax_partial_gpu[
             )
         else:
             for j in range(idx, count):
-                var v = data_ptr[j].cast[DType.float32]()
+                var v = data_ptr[unsafe_offset=j].cast[DType.float32]()
                 if isnan(v) or isinf(v):
                     local_bad_tail = 1.0
                 else:
@@ -192,8 +197,8 @@ def _amax_partial_gpu[
 
     if Int(thread_idx.x) == 0:
         var out_index = Int(block_idx.x)
-        partial_max_ptr[out_index] = block_max_val
-        partial_bad_ptr[out_index] = block_bad_val
+        partial_max_ptr[unsafe_offset=out_index] = block_max_val
+        partial_bad_ptr[unsafe_offset=out_index] = block_bad_val
 
 
 def _amax_aggregate_gpu[
@@ -202,21 +207,24 @@ def _amax_aggregate_gpu[
     amax_out_ptr: MutKernelPtr[DType.float32],
     partial_max_ptr: MutKernelPtr[DType.float32],
     partial_bad_ptr: MutKernelPtr[DType.float32],
-    grid_size: Int,
+    grid_size_arg: Int64,
 ) -> None:
+    var grid_size = Int(grid_size_arg)
     var tid = Int(thread_idx.x)
     var local_max = Scalar[DType.float32](0.0)
     var local_bad = Scalar[DType.float32](0.0)
     var idx = tid
     while idx < grid_size:
-        local_max = max(local_max, partial_max_ptr[idx])
-        local_bad = max(local_bad, partial_bad_ptr[idx])
+        local_max = max(local_max, partial_max_ptr[unsafe_offset=idx])
+        local_bad = max(local_bad, partial_bad_ptr[unsafe_offset=idx])
         idx += BLOCK_SIZE
 
     var total_max = block.max[block_size=BLOCK_SIZE](local_max)
     var total_bad = block.max[block_size=BLOCK_SIZE](local_bad)
     if tid == 0:
-        amax_out_ptr[0] = nan[DType.float32]() if total_bad > 0.5 else total_max
+        amax_out_ptr[unsafe_offset=0] = (
+            nan[DType.float32]() if total_bad > 0.5 else total_max
+        )
 
 
 def compute_amax[
@@ -271,7 +279,7 @@ def compute_amax[
             partial_max,
             partial_bad,
             data,
-            size,
+            Int64(size),
             grid_dim=(grid_size,),
             block_dim=(BLOCK_SIZE,),
         )
@@ -283,7 +291,7 @@ def compute_amax[
             amax_out,
             partial_max,
             partial_bad,
-            grid_size,
+            Int64(grid_size),
             grid_dim=(1,),
             block_dim=(BLOCK_SIZE,),
         )
@@ -309,7 +317,7 @@ def _amax_state_init_gpu[
 ) -> None:
     var tid = Int(thread_idx.x)
     if tid < history_len:
-        history_ptr[tid] = 0.0
+        history_ptr[unsafe_offset=tid] = 0.0
     if tid == 0:
         # static_scale > 0 seeds scale/scale_inv from a calibrated constant;
         # under LLMM_FP8_STATIC_SCALES this init is the ONLY write
@@ -317,11 +325,11 @@ def _amax_state_init_gpu[
         # static_scale <= 0 (default -1.0) = dynamic path: placeholder
         # 1.0/1.0, not valid until the first update_scale.
         if static_scale > Float32(0.0):
-            scale_ptr[0] = static_scale
-            scale_inv_ptr[0] = Float32(1.0) / static_scale
+            scale_ptr[unsafe_offset=0] = static_scale
+            scale_inv_ptr[unsafe_offset=0] = Float32(1.0) / static_scale
         else:
-            scale_ptr[0] = 1.0
-            scale_inv_ptr[0] = 1.0
+            scale_ptr[unsafe_offset=0] = 1.0
+            scale_inv_ptr[unsafe_offset=0] = 1.0
 
 
 @always_inline
@@ -362,7 +370,7 @@ def _scale_from_history[
         var m = Float32(0.0)
         var bad = False
         for i in range(history_len):
-            var h = history_ptr[i]
+            var h = history_ptr[unsafe_offset=i]
             if isnan(h) or isinf(h):
                 bad = True
             else:
@@ -379,15 +387,15 @@ def _scale_from_history[
     else:
         scale = (fmt_max * margin_mult) / amax_for_scale
 
-    scale_ptr[0] = scale
-    scale_inv_ptr[0] = Float32(1.0) / scale
+    scale_ptr[unsafe_offset=0] = scale
+    scale_inv_ptr[unsafe_offset=0] = Float32(1.0) / scale
 
     # Push this step's amax into the ring buffer *after* computing the
     # scale above, so future (post-warmup) calls see it but this call's own
     # scale never does — this is what makes the ring buffer hold "prior
     # steps" relative to whichever call is currently deriving a scale from
     # it.
-    history_ptr[step % history_len] = amax_current
+    history_ptr[unsafe_offset=step % history_len] = amax_current
 
 
 def _update_scale_gpu[
@@ -397,11 +405,12 @@ def _update_scale_gpu[
     scale_ptr: MutKernelPtr[DType.float32],
     scale_inv_ptr: MutKernelPtr[DType.float32],
     amax_current_ptr: ImmutKernelPtr[DType.float32],
-    step: Int,
+    step_arg: Int64,
     margin_mult: Float32,
     fmt_max: Float32,
 ) -> None:
-    var amax_current = amax_current_ptr[0]
+    var step = Int(step_arg)
+    var amax_current = amax_current_ptr[unsafe_offset=0]
     _scale_from_history[history_len](
         history_ptr,
         scale_ptr,
@@ -542,7 +551,7 @@ struct AmaxState[spec: PrecisionSpec](Movable):
                 device_buf_mut_ptr(self.scale),
                 device_buf_mut_ptr(self.scale_inv),
                 amax_current,
-                self.step,
+                Int64(self.step),
                 MARGIN_MULT,
                 FMT_MAX,
                 grid_dim=(1,),
@@ -577,10 +586,11 @@ def _update_scale_pair_gpu[
     scale1_ptr: MutKernelPtr[DType.float32],
     scale_inv1_ptr: MutKernelPtr[DType.float32],
     amax_current1_ptr: ImmutKernelPtr[DType.float32],
-    step: Int,
+    step_arg: Int64,
     margin_mult: Float32,
     fmt_max: Float32,
 ) -> None:
+    var step = Int(step_arg)
     # One block per state (block_dim=(1,), so each block is already a
     # single thread — no thread_idx guard needed, matching `_update_scale_
     # gpu`'s own single-thread-block style). block_idx.x selects which
@@ -593,7 +603,7 @@ def _update_scale_pair_gpu[
     var scale_inv_ptr = scale_inv1_ptr if is_second else scale_inv0_ptr
     var amax_current_ptr = amax_current1_ptr if is_second else amax_current0_ptr
 
-    var amax_current = amax_current_ptr[0]
+    var amax_current = amax_current_ptr[unsafe_offset=0]
     _scale_from_history[history_len](
         history_ptr,
         scale_ptr,
@@ -657,7 +667,7 @@ def update_scale_pair[
             device_buf_mut_ptr(state1.scale),
             device_buf_mut_ptr(state1.scale_inv),
             amax_current1,
-            state0.step,
+            Int64(state0.step),
             MARGIN_MULT,
             FMT_MAX,
             grid_dim=(2,),

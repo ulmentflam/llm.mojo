@@ -1,16 +1,16 @@
 from extensibility import register
-from std.gpu.primitives import block
+from max.gpu.primitives import block
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import fma, ceildiv, exp
-from std.gpu.host import DeviceAttribute
+from max.gpu.host import DeviceAttribute
 from std.sys import simd_width_of, align_of
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
 from std.runtime.asyncrt import parallelism_level
-from std.algorithm import vectorize, sync_parallelize
+from std.algorithm import vectorize
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.profiler import traced_parallelize
@@ -44,8 +44,8 @@ def _softmax_comp_max[
     # can't prove it (Vp is runtime). This is the classifier's biggest read path.
     comptime align = align_of[SIMD[dtype, width]]()
     var x = (
-        (logits_ptr + idx)
-        .load[width=width, alignment=align]()
+        (logits_ptr.unsafe_offset(idx))
+        .unsafe_load[width=width, alignment=align]()
         .cast[DType.float32]()
     )
     var new_m = max(m, x)
@@ -122,11 +122,15 @@ def _softmax_fwd_cpu[
         # elements with wide loads/stores; the broadcasts are built at w so
         # the tail instantiations (w < width) stay correct.
         var base = idx * vocab_size_padded + local
-        var x = (logits_ptr + base).load[width=w]().cast[DType.float32]()
+        var x = (
+            (logits_ptr.unsafe_offset(base))
+            .unsafe_load[width=w]()
+            .cast[DType.float32]()
+        )
         var p = exp(x - SIMD[DType.float32, w](m_row)) * SIMD[DType.float32, w](
             inv_s
         )
-        (probs_ptr + base).store[width=w](p.cast[dtype]())
+        (probs_ptr.unsafe_offset(base)).unsafe_store[width=w](p.cast[dtype]())
 
     vectorize[width, unroll_factor=UNROLL](vocab_size, _normalize)
 
@@ -258,19 +262,19 @@ def _softmax_fwd_gpu[
             if lane_base + width <= vocab_size:
                 var base = row * vocab_size_padded + lane_base
                 var x = (
-                    (logits_ptr + base)
-                    .load[width=width, alignment=align]()
+                    (logits_ptr.unsafe_offset(base))
+                    .unsafe_load[width=width, alignment=align]()
                     .cast[DType.float32]()
                 )
-                (probs_ptr + base).store[width=width, alignment=align](
-                    (exp(x - m_vec) * inv_s_vec).cast[dtype]()
-                )
+                (probs_ptr.unsafe_offset(base)).unsafe_store[
+                    width=width, alignment=align
+                ]((exp(x - m_vec) * inv_s_vec).cast[dtype]())
             elif lane_base < vocab_size:
                 for i in range(lane_base, vocab_size):
-                    var x = logits_ptr[row * vocab_size_padded + i].cast[
-                        DType.float32
-                    ]()
-                    probs_ptr[row * vocab_size_padded + i] = (
+                    var x = logits_ptr[
+                        unsafe_offset=row * vocab_size_padded + i
+                    ].cast[DType.float32]()
+                    probs_ptr[unsafe_offset=row * vocab_size_padded + i] = (
                         exp(x - m_row) * inv_s
                     ).cast[dtype]()
 
@@ -405,21 +409,27 @@ def _softmax_dot[
     comptime if aligned:
         comptime align = align_of[SIMD[dtype, width]]()
         var d_prob = (
-            (d_probs_ptr + idx)
-            .load[width=width, alignment=align]()
+            (d_probs_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width, alignment=align]()
             .cast[DType.float32]()
         )
         var prob = (
-            (probs_ptr + idx)
-            .load[width=width, alignment=align]()
+            (probs_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width, alignment=align]()
             .cast[DType.float32]()
         )
         accumulator = fma(prob, d_prob, accumulator)
     else:
         var d_prob = (
-            (d_probs_ptr + idx).load[width=width]().cast[DType.float32]()
+            (d_probs_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width]()
+            .cast[DType.float32]()
         )
-        var prob = (probs_ptr + idx).load[width=width]().cast[DType.float32]()
+        var prob = (
+            (probs_ptr.unsafe_offset(idx))
+            .unsafe_load[width=width]()
+            .cast[DType.float32]()
+        )
         accumulator = fma(prob, d_prob, accumulator)
 
 
@@ -469,11 +479,21 @@ def _softmax_bwd_cpu[
         vocab_size_padded,
     }:
         var base = idx * vocab_size_padded + local
-        var p = (probs_ptr + base).load[width=w]().cast[DType.float32]()
-        var g = (d_probs_ptr + base).load[width=w]().cast[DType.float32]()
+        var p = (
+            (probs_ptr.unsafe_offset(base))
+            .unsafe_load[width=w]()
+            .cast[DType.float32]()
+        )
+        var g = (
+            (d_probs_ptr.unsafe_offset(base))
+            .unsafe_load[width=w]()
+            .cast[DType.float32]()
+        )
         # NOTE: This could use an fma chain, but the compiler should be smart enough to do it.
         var d = p * (g - SIMD[DType.float32, w](dot))
-        (d_logits_ptr + base).store[width=w](d.cast[dtype]())
+        (d_logits_ptr.unsafe_offset(base)).unsafe_store[width=w](
+            d.cast[dtype]()
+        )
 
     vectorize[width, unroll_factor=UNROLL](vocab_size, _d_logits)
 
@@ -559,26 +579,28 @@ def _softmax_bwd_gpu[
             if lane_base + width <= vocab_size:
                 var base = row * vocab_size_padded + lane_base
                 var p = (
-                    (probs_ptr + base)
-                    .load[width=width, alignment=align]()
+                    (probs_ptr.unsafe_offset(base))
+                    .unsafe_load[width=width, alignment=align]()
                     .cast[DType.float32]()
                 )
                 var g = (
-                    (d_probs_ptr + base)
-                    .load[width=width, alignment=align]()
+                    (d_probs_ptr.unsafe_offset(base))
+                    .unsafe_load[width=width, alignment=align]()
                     .cast[DType.float32]()
                 )
                 var d = p * (g - dot_vec)
-                (d_logits_ptr + base).store[width=width, alignment=align](
-                    d.cast[dtype]()
-                )
+                (d_logits_ptr.unsafe_offset(base)).unsafe_store[
+                    width=width, alignment=align
+                ](d.cast[dtype]())
             elif lane_base < vocab_size:
                 for i in range(lane_base, vocab_size):
                     var base = row * vocab_size_padded + i
-                    var p = probs_ptr[base].cast[DType.float32]()
-                    var g = d_probs_ptr[base].cast[DType.float32]()
+                    var p = probs_ptr[unsafe_offset=base].cast[DType.float32]()
+                    var g = d_probs_ptr[unsafe_offset=base].cast[
+                        DType.float32
+                    ]()
                     var d = p * (g - dot_row)
-                    d_logits_ptr[base] = d.cast[dtype]()
+                    d_logits_ptr[unsafe_offset=base] = d.cast[dtype]()
 
 
 def softmax_bwd_gpu[

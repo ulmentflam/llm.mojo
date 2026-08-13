@@ -151,12 +151,12 @@ def _normal_fill_16(
 ):
     """In-place Box-Muller over a window of 16 uniforms -> 16 gaussians."""
     for t in range(8):
-        var u1 = Float32(1.0) - data[t]
-        var u2 = data[t + 8]
+        var u1 = Float32(1.0) - data[unsafe_offset=t]
+        var u2 = data[unsafe_offset=t + 8]
         var radius = sqrt(Float32(-2.0) * log(u1 + BOX_MULLER_EPSILON))
         var theta = Float32(Float64(2.0) * Float64(pi) * Float64(u2))
-        data[t] = radius * cos(theta) * std + mean
-        data[t + 8] = radius * sin(theta) * std + mean
+        data[unsafe_offset=t] = radius * cos(theta) * std + mean
+        data[unsafe_offset=t + 8] = radius * sin(theta) * std + mean
 
 
 def normal_(
@@ -169,16 +169,16 @@ def normal_(
     """Fill `data[0:numel]` with N(mean, std**2), matching torch's `normal_`."""
     if numel >= 16:
         for t in range(numel):
-            data[t] = rng.randfloat32()
+            data[unsafe_offset=t] = rng.randfloat32()
         var i = 0
         while i < numel - 15:
-            _normal_fill_16(data + i, mean, std)
+            _normal_fill_16(data.unsafe_offset(i), mean, std)
             i += 16
         if numel % 16 != 0:
             # Recompute the final 16 values (they overlap the last full block).
-            var tail = data + (numel - 16)
+            var tail = data.unsafe_offset((numel - 16))
             for j in range(16):
-                tail[j] = rng.randfloat32()
+                tail[unsafe_offset=j] = rng.randfloat32()
             _normal_fill_16(tail, mean, std)
     else:
         # numel < 16 draws float64 uniforms two-at-a-time (one cos, one sin).
@@ -186,7 +186,9 @@ def normal_(
         var next_sample = Float64(0.0)
         for t in range(numel):
             if has_next:
-                data[t] = Float32(next_sample * Float64(std) + Float64(mean))
+                data[unsafe_offset=t] = Float32(
+                    next_sample * Float64(std) + Float64(mean)
+                )
                 has_next = False
                 continue
             var u1 = Float32(rng.randfloat64())
@@ -197,4 +199,4 @@ def normal_(
             var theta = Float32(Float64(2.0) * Float64(pi) * Float64(u1))
             next_sample = Float64(radius * sin(theta))
             has_next = True
-            data[t] = radius * cos(theta) * std + mean
+            data[unsafe_offset=t] = radius * cos(theta) * std + mean

@@ -1,8 +1,8 @@
 from extensibility import register
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ceildiv, exp, log
-from std.gpu.host import DeviceAttribute
+from max.gpu.host import DeviceAttribute
 from std.sys import simd_width_of, align_of
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
@@ -10,9 +10,10 @@ from extensibility.managed_tensor_slice import (
 )
 from std.sys._assembly import inlined_assembly
 from std.runtime.asyncrt import parallelism_level
-from std.algorithm import vectorize, sync_parallelize
-from std.gpu import barrier, block_idx, grid_dim, thread_idx
-from std.gpu.primitives import block
+from std.algorithm import vectorize
+from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import barrier
+from max.gpu.primitives import block
 
 from llmm.vendor import HAS_CUBLAS
 from llmm.profiler import traced_parallelize
@@ -93,7 +94,7 @@ def _fused_classifier_cpu[
     vocab_size_padded: Int,  # Our Vp, padding is garbage
 ) -> None:
     var base = idx * vocab_size_padded
-    var target_idx = Int(targets_ptr[idx])
+    var target_idx = Int(targets_ptr[unsafe_offset=idx])
 
     var stats = softmax_phase_1_and_2_cpu[dtype, width](
         idx, logits_ptr, vocab_size, vocab_size_padded
@@ -102,11 +103,11 @@ def _fused_classifier_cpu[
     var s_row = stats[1]
 
     # NOTE: Loss in log-softmax form, and BEFORE the in-place overwrite below.
-    var x_t = logits_ptr[base + target_idx].cast[DType.float32]()
-    losses_ptr[idx] = log(s_row) + m_row - x_t
+    var x_t = logits_ptr[unsafe_offset=base + target_idx].cast[DType.float32]()
+    losses_ptr[unsafe_offset=idx] = log(s_row) + m_row - x_t
 
     comptime if write_d_logits:
-        var d_loss = d_losses_ptr[idx]
+        var d_loss = d_losses_ptr[unsafe_offset=idx]
         var inv_s = Scalar[DType.float32](1) / s_row
 
         @always_inline
@@ -118,11 +119,15 @@ def _fused_classifier_cpu[
             # wide load then store to the same location is safe
             # sequentially.
             var p_idx = base + local
-            var x = (logits_ptr + p_idx).load[width=w]().cast[DType.float32]()
+            var x = (
+                (logits_ptr.unsafe_offset(p_idx))
+                .unsafe_load[width=w]()
+                .cast[DType.float32]()
+            )
             var p = exp(x - SIMD[DType.float32, w](m_row)) * SIMD[
                 DType.float32, w
             ](inv_s)
-            (logits_ptr + p_idx).store[width=w](
+            (logits_ptr.unsafe_offset(p_idx)).unsafe_store[width=w](
                 (p * SIMD[DType.float32, w](d_loss)).cast[dtype]()
             )
 
@@ -130,11 +135,13 @@ def _fused_classifier_cpu[
 
         # x_t is saved above, so we can compute the one-hot fix op here.
         var p_t = exp(x_t - m_row) * inv_s
-        logits_ptr[base + target_idx] = ((p_t - 1.0) * d_loss).cast[dtype]()
+        logits_ptr[unsafe_offset=base + target_idx] = (
+            (p_t - 1.0) * d_loss
+        ).cast[dtype]()
 
         # Zero the padded tail so the backward matmul reads zeros.
         for i in range(vocab_size, vocab_size_padded):
-            logits_ptr[base + i] = Scalar[dtype](0)
+            logits_ptr[unsafe_offset=base + i] = Scalar[dtype](0)
 
 
 def fused_classifier_cpu[
@@ -200,7 +207,7 @@ def _fused_classifier_gpu[
     # every thread must take the same trip.
     for row in range(block_row, num_rows, stride):
         var base = row * vocab_size_padded
-        var target_idx = Int(targets_ptr[row])
+        var target_idx = Int(targets_ptr[unsafe_offset=row])
 
         var stats = softmax_phase_1_and_2_gpu[dtype, BLOCK_SIZE, width](
             row, tid, logits_ptr, vocab_size, vocab_size_padded
@@ -211,14 +218,16 @@ def _fused_classifier_gpu[
         # Loss in log-softmax form, single thread. NOTE: assigns, where
         # llm.c accumulates with -=; this matches crossentropy_ohe_fwd.
         if tid == 0:
-            var x_t = logits_ptr[base + target_idx].cast[DType.float32]()
-            losses_ptr[row] = log(s_row) + m_row - x_t
+            var x_t = logits_ptr[unsafe_offset=base + target_idx].cast[
+                DType.float32
+            ]()
+            losses_ptr[unsafe_offset=row] = log(s_row) + m_row - x_t
 
         comptime if write_d_logits:
             # barrier() matches __syncthreads() in Karpathy's kernel
             barrier()
 
-            var d_loss = d_losses_ptr[row]
+            var d_loss = d_losses_ptr[unsafe_offset=row]
             var inv_s = Scalar[DType.float32](1) / s_row
             var m_vec = SIMD[DType.float32, width](m_row)
             var inv_s_vec = SIMD[DType.float32, width](inv_s)
@@ -229,8 +238,12 @@ def _fused_classifier_gpu[
                 var lane_base = tile_base + tid * width
                 if lane_base + width <= vocab_size:
                     var x = (
-                        (logits_ptr + base + lane_base)
-                        .load[width=width, alignment=align]()
+                        (
+                            (logits_ptr.unsafe_offset(base)).unsafe_offset(
+                                lane_base
+                            )
+                        )
+                        .unsafe_load[width=width, alignment=align]()
                         .cast[DType.float32]()
                     )
                     var p = _classifier_exp(x - m_vec) * inv_s_vec
@@ -241,25 +254,29 @@ def _fused_classifier_gpu[
                     ):
                         var k = target_idx - lane_base
                         d[k] = d[k] - d_loss
-                    (logits_ptr + base + lane_base).store[
-                        width=width, alignment=align
-                    ](d.cast[dtype]())
+                    (
+                        logits_ptr.unsafe_offset(base).unsafe_offset(lane_base)
+                    ).unsafe_store[width=width, alignment=align](
+                        d.cast[dtype]()
+                    )
                 elif lane_base < vocab_size:
                     # Ragged edge of the last tile: scalar steps, same
                     # uniform-trip-count rule as the softmax kernels.
                     for i in range(lane_base, vocab_size):
-                        var x = logits_ptr[base + i].cast[DType.float32]()
+                        var x = logits_ptr[unsafe_offset=base + i].cast[
+                            DType.float32
+                        ]()
                         var p = exp(x - m_row) * inv_s
                         var ind = Scalar[DType.float32](
                             1.0
                         ) if i == target_idx else Scalar[DType.float32](0.0)
-                        logits_ptr[base + i] = ((p - ind) * d_loss).cast[
-                            dtype
-                        ]()
+                        logits_ptr[unsafe_offset=base + i] = (
+                            (p - ind) * d_loss
+                        ).cast[dtype]()
 
             # Zero the padded tail so the backward matmul reads zeros.
             for i in range(vocab_size + tid, vocab_size_padded, BLOCK_SIZE):
-                logits_ptr[base + i] = Scalar[dtype](0)
+                logits_ptr[unsafe_offset=base + i] = Scalar[dtype](0)
 
 
 def fused_classifier_gpu[
@@ -457,25 +474,28 @@ def chunked_ce_pass1_cpu[
             var m_tile = Scalar[DType.float32].MIN_FINITE
             var s_tile = Scalar[DType.float32](0)
             for c in range(valid_cols):
-                var x = tile_ptr[base + c].cast[DType.float32]()
+                var x = tile_ptr[unsafe_offset=base + c].cast[DType.float32]()
                 var nm = max(m_tile, x)
                 s_tile = s_tile * exp(m_tile - nm) + exp(x - nm)
                 m_tile = nm
             if first:
-                m_ptr[row] = m_tile
-                s_ptr[row] = s_tile
-                xt_ptr[row] = Scalar[DType.float32](0)
+                m_ptr[unsafe_offset=row] = m_tile
+                s_ptr[unsafe_offset=row] = s_tile
+                xt_ptr[unsafe_offset=row] = Scalar[DType.float32](0)
             else:
                 var merged = _chunk_merge(
-                    m_ptr[row], s_ptr[row], m_tile, s_tile
+                    m_ptr[unsafe_offset=row],
+                    s_ptr[unsafe_offset=row],
+                    m_tile,
+                    s_tile,
                 )
-                m_ptr[row] = merged[0]
-                s_ptr[row] = merged[1]
-            var t = Int(targets_ptr[row])
+                m_ptr[unsafe_offset=row] = merged[0]
+                s_ptr[unsafe_offset=row] = merged[1]
+            var t = Int(targets_ptr[unsafe_offset=row])
             if t >= tile_start and t < tile_start + valid_cols:
-                xt_ptr[row] = tile_ptr[row * tile_ld + (t - tile_start)].cast[
-                    DType.float32
-                ]()
+                xt_ptr[unsafe_offset=row] = tile_ptr[
+                    unsafe_offset=row * tile_ld + (t - tile_start)
+                ].cast[DType.float32]()
 
     traced_parallelize["chunked_ce_pass1", _worker](num_workers)
 
@@ -489,12 +509,17 @@ def chunked_ce_pass1_gpu[
     s_ptr: MutKernelPtr[DType.float32],
     xt_ptr: MutKernelPtr[DType.float32],
     targets_ptr: ImmutKernelPtr[DType.int32],
-    num_rows: Int,
-    tile_ld: Int,
-    tile_start: Int,
-    valid_cols: Int,
-    first: Int,
+    num_rows_arg: Int64,
+    tile_ld_arg: Int64,
+    tile_start_arg: Int64,
+    valid_cols_arg: Int64,
+    first_arg: Int64,
 ) -> None:
+    var num_rows = Int(num_rows_arg)
+    var tile_ld = Int(tile_ld_arg)
+    var tile_start = Int(tile_start_arg)
+    var valid_cols = Int(valid_cols_arg)
+    var first = Int(first_arg)
     var tid = Int(thread_idx.x)
     # One block per row, grid-strided. `block.max`/`block.sum` synchronize the
     # whole block, so every thread must take the same number of trips — the
@@ -507,7 +532,7 @@ def chunked_ce_pass1_gpu[
         var m_t = Scalar[DType.float32].MIN_FINITE
         var s_t = Scalar[DType.float32](0)
         for c in range(tid, valid_cols, BLOCK_SIZE):
-            var x = tile_ptr[base + c].cast[DType.float32]()
+            var x = tile_ptr[unsafe_offset=base + c].cast[DType.float32]()
             var nm = max(m_t, x)
             s_t = s_t * exp(m_t - nm) + exp(x - nm)
             m_t = nm
@@ -518,20 +543,23 @@ def chunked_ce_pass1_gpu[
 
         if tid == 0:
             if first != 0:
-                m_ptr[row] = m_tile
-                s_ptr[row] = s_tile
-                xt_ptr[row] = Scalar[DType.float32](0)
+                m_ptr[unsafe_offset=row] = m_tile
+                s_ptr[unsafe_offset=row] = s_tile
+                xt_ptr[unsafe_offset=row] = Scalar[DType.float32](0)
             else:
                 var merged = _chunk_merge(
-                    m_ptr[row], s_ptr[row], m_tile, s_tile
+                    m_ptr[unsafe_offset=row],
+                    s_ptr[unsafe_offset=row],
+                    m_tile,
+                    s_tile,
                 )
-                m_ptr[row] = merged[0]
-                s_ptr[row] = merged[1]
-            var t = Int(targets_ptr[row])
+                m_ptr[unsafe_offset=row] = merged[0]
+                s_ptr[unsafe_offset=row] = merged[1]
+            var t = Int(targets_ptr[unsafe_offset=row])
             if t >= tile_start and t < tile_start + valid_cols:
-                xt_ptr[row] = tile_ptr[base + (t - tile_start)].cast[
-                    DType.float32
-                ]()
+                xt_ptr[unsafe_offset=row] = tile_ptr[
+                    unsafe_offset=base + (t - tile_start)
+                ].cast[DType.float32]()
 
 
 def chunked_ce_pass1[
@@ -589,11 +617,11 @@ def chunked_ce_pass1[
             s_ptr,
             xt_ptr,
             targets_ptr,
-            num_rows,
-            tile_ld,
-            tile_start,
-            valid_cols,
-            1 if first else 0,
+            Int64(num_rows),
+            Int64(tile_ld),
+            Int64(tile_start),
+            Int64(valid_cols),
+            Int64(1 if first else 0),
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )
@@ -613,11 +641,16 @@ def chunked_ce_loss_gpu[
     m_ptr: ImmutKernelPtr[DType.float32],
     s_ptr: ImmutKernelPtr[DType.float32],
     xt_ptr: ImmutKernelPtr[DType.float32],
-    num_rows: Int,
+    num_rows_arg: Int64,
 ) -> None:
+    var num_rows = Int(num_rows_arg)
     var idx = Int(block_idx.x) * BLOCK_SIZE + Int(thread_idx.x)
     if idx < num_rows:
-        losses_ptr[idx] = log(s_ptr[idx]) + m_ptr[idx] - xt_ptr[idx]
+        losses_ptr[unsafe_offset=idx] = (
+            log(s_ptr[unsafe_offset=idx])
+            + m_ptr[unsafe_offset=idx]
+            - xt_ptr[unsafe_offset=idx]
+        )
 
 
 def chunked_ce_loss[
@@ -634,7 +667,11 @@ def chunked_ce_loss[
     `_fused_classifier_*` evaluates once it has the row's (max, sum-exp)."""
     comptime if is_cpu[target]():
         for i in range(num_rows):
-            losses_ptr[i] = log(s_ptr[i]) + m_ptr[i] - xt_ptr[i]
+            losses_ptr[unsafe_offset=i] = (
+                log(s_ptr[unsafe_offset=i])
+                + m_ptr[unsafe_offset=i]
+                - xt_ptr[unsafe_offset=i]
+            )
     elif is_gpu[target]():
         comptime BLOCK_SIZE = 256
         var device_ctx = ctx
@@ -646,7 +683,7 @@ def chunked_ce_loss[
             m_ptr,
             s_ptr,
             xt_ptr,
-            num_rows,
+            Int64(num_rows),
             grid_dim=(ceildiv(num_rows, BLOCK_SIZE),),
             block_dim=(BLOCK_SIZE,),
         )
@@ -683,21 +720,23 @@ def chunked_ce_pass2_cpu[
         for local in range(count):
             var row = lo + local
             var base = row * tile_ld
-            var m_row = m_ptr[row]
-            var inv_s = Scalar[DType.float32](1) / s_ptr[row]
-            var d_loss = d_losses_ptr[row]
-            var tgt = Int(targets_ptr[row])
+            var m_row = m_ptr[unsafe_offset=row]
+            var inv_s = Scalar[DType.float32](1) / s_ptr[unsafe_offset=row]
+            var d_loss = d_losses_ptr[unsafe_offset=row]
+            var tgt = Int(targets_ptr[unsafe_offset=row])
             for c in range(valid_cols):
-                var x = tile_ptr[base + c].cast[DType.float32]()
+                var x = tile_ptr[unsafe_offset=base + c].cast[DType.float32]()
                 var p = exp(x - m_row) * inv_s
                 var ind = Scalar[DType.float32](
                     1.0
                 ) if tile_start + c == tgt else Scalar[DType.float32](0.0)
-                tile_ptr[base + c] = ((p - ind) * d_loss).cast[dtype]()
+                tile_ptr[unsafe_offset=base + c] = ((p - ind) * d_loss).cast[
+                    dtype
+                ]()
             # Padding columns [V, V_p) must read as exactly zero in the
             # backward GEMMs, same guarantee the single-pass classifier gives.
             for c in range(valid_cols, tile_ld):
-                tile_ptr[base + c] = Scalar[dtype](0)
+                tile_ptr[unsafe_offset=base + c] = Scalar[dtype](0)
 
     traced_parallelize["chunked_ce_pass2", _worker](num_workers)
 
@@ -711,29 +750,33 @@ def chunked_ce_pass2_gpu[
     s_ptr: ImmutKernelPtr[DType.float32],
     d_losses_ptr: ImmutKernelPtr[DType.float32],
     targets_ptr: ImmutKernelPtr[DType.int32],
-    num_rows: Int,
-    tile_ld: Int,
-    tile_start: Int,
-    valid_cols: Int,
+    num_rows_arg: Int64,
+    tile_ld_arg: Int64,
+    tile_start_arg: Int64,
+    valid_cols_arg: Int64,
 ) -> None:
+    var num_rows = Int(num_rows_arg)
+    var tile_ld = Int(tile_ld_arg)
+    var tile_start = Int(tile_start_arg)
+    var valid_cols = Int(valid_cols_arg)
     var tid = Int(thread_idx.x)
     for row in range(Int(block_idx.x), num_rows, Int(grid_dim.x)):
         var base = row * tile_ld
-        var m_row = m_ptr[row]
-        var inv_s = Scalar[DType.float32](1) / s_ptr[row]
-        var d_loss = d_losses_ptr[row]
-        var tgt = Int(targets_ptr[row])
+        var m_row = m_ptr[unsafe_offset=row]
+        var inv_s = Scalar[DType.float32](1) / s_ptr[unsafe_offset=row]
+        var d_loss = d_losses_ptr[unsafe_offset=row]
+        var tgt = Int(targets_ptr[unsafe_offset=row])
         for c in range(tid, tile_ld, BLOCK_SIZE):
             if c < valid_cols:
-                var x = tile_ptr[base + c].cast[DType.float32]()
+                var x = tile_ptr[unsafe_offset=base + c].cast[DType.float32]()
                 var p = _classifier_exp[1](x - m_row) * inv_s
                 var d = p * d_loss
                 if tile_start + c == tgt:
                     d = d - d_loss
-                tile_ptr[base + c] = d.cast[dtype]()
+                tile_ptr[unsafe_offset=base + c] = d.cast[dtype]()
             else:
                 # Padding columns [V, V_p) — exactly zero, as above.
-                tile_ptr[base + c] = Scalar[dtype](0)
+                tile_ptr[unsafe_offset=base + c] = Scalar[dtype](0)
 
 
 def chunked_ce_pass2[
@@ -787,10 +830,10 @@ def chunked_ce_pass2[
             s_ptr,
             d_losses_ptr,
             targets_ptr,
-            num_rows,
-            tile_ld,
-            tile_start,
-            valid_cols,
+            Int64(num_rows),
+            Int64(tile_ld),
+            Int64(tile_start),
+            Int64(valid_cols),
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )

@@ -29,7 +29,7 @@
 
 from std.random import seed
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.testing import TestSuite, assert_true
 
 from llmm.lowp import FP8_SPEC, quantize_devscale, quantize_transpose_devscale
@@ -571,7 +571,7 @@ def _read_f32(
     var host = ctx.enqueue_create_host_buffer[DType.float32](1)
     buf.enqueue_copy_to(host)
     ctx.synchronize()
-    return host.unsafe_ptr()[0]
+    return host.unsafe_ptr()[unsafe_offset=0]
 
 
 def test_doutput_amax_steady_state_ignores_current_spike_gpu() raises:
@@ -679,7 +679,7 @@ def test_doutput_amax_steady_state_ignores_current_spike_gpu() raises:
     for i in range(H):
         var v = Float32(1 << i)
         for j in range(ROWS * OC):
-            host_dout.unsafe_ptr()[j] = v.cast[DType.bfloat16]()
+            host_dout.unsafe_ptr()[unsafe_offset=j] = v.cast[DType.bfloat16]()
         dev_dout.enqueue_copy_from(host_dout)
         ctx.synchronize()
         matmul_bwd_lowp[
@@ -720,7 +720,7 @@ def test_doutput_amax_steady_state_ignores_current_spike_gpu() raises:
     # everything in the history (max 2^(H-1) = 32768).
     var spike = Float32(1 << 30)
     for j in range(ROWS * OC):
-        host_dout.unsafe_ptr()[j] = spike.cast[DType.bfloat16]()
+        host_dout.unsafe_ptr()[unsafe_offset=j] = spike.cast[DType.bfloat16]()
     dev_dout.enqueue_copy_from(host_dout)
     ctx.synchronize()
     matmul_bwd_lowp[DType.bfloat16, "gpu", use_gelu=False, accumulate=False](

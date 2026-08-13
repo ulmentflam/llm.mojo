@@ -91,17 +91,17 @@ struct EvalDataLoader:
             raise Error(
                 "EvalDataLoader error: header is too short in file " + filename
             )
-        var header_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        var header_ptr = rebind[Pointer[UInt8, MutUntrackedOrigin]](
             header_bytes.unsafe_ptr()
-        ).bitcast[Int32]()
-        var magic = header_ptr.load(0)
+        ).unsafe_bitcast[Int32]()
+        var magic = header_ptr.unsafe_load(0)
         if magic != EVAL_MAGIC:
             raise Error("EvalDataLoader error: bad magic number in " + filename)
-        var version = header_ptr.load(1)
+        var version = header_ptr.unsafe_load(1)
         if version != EVAL_VERSION:
             raise Error("EvalDataLoader error: bad version in " + filename)
-        self.num_examples = Int(header_ptr.load(2))
-        self.longest_example_bytes = Int(header_ptr.load(3))
+        self.num_examples = Int(header_ptr.unsafe_load(2))
+        self.longest_example_bytes = Int(header_ptr.unsafe_load(3))
         # Keep the header buffer live past the last header_ptr use; the raw
         # pointer does not own it (ASAP destruction scribble, see dataloader).
         _ = header_bytes^
@@ -165,12 +165,12 @@ struct EvalDataLoader:
         var subheader_bytes = self.eval_file.read_bytes(6)  # 3 * sizeof(uint16)
         if len(subheader_bytes) < 6:
             raise Error("EvalDataLoader error: truncated example sub-header")
-        var subheader_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        var subheader_ptr = rebind[Pointer[UInt8, MutUntrackedOrigin]](
             subheader_bytes.unsafe_ptr()
-        ).bitcast[UInt16]()
-        var start_delim = subheader_ptr.load(0)
-        var example_bytes = Int(subheader_ptr.load(1))
-        var example_index = Int(subheader_ptr.load(2))
+        ).unsafe_bitcast[UInt16]()
+        var start_delim = subheader_ptr.unsafe_load(0)
+        var example_bytes = Int(subheader_ptr.unsafe_load(1))
+        var example_index = Int(subheader_ptr.unsafe_load(2))
         # Keep the sub-header buffer live past the last subheader_ptr use.
         _ = subheader_bytes^
         if start_delim != START_EXAMPLE_DELIM:
@@ -191,13 +191,13 @@ struct EvalDataLoader:
         var raw_bytes = self.eval_file.read_bytes(payload_bytes)
         if len(raw_bytes) < payload_bytes:
             raise Error("EvalDataLoader error: truncated example payload")
-        var raw_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        var raw_ptr = rebind[Pointer[UInt8, MutUntrackedOrigin]](
             raw_bytes.unsafe_ptr()
-        ).bitcast[UInt16]()
+        ).unsafe_bitcast[UInt16]()
         var num_u16 = payload_bytes // 2
         var out = List[UInt16]()
         for i in range(num_u16):
-            out.append(raw_ptr.load(i))
+            out.append(raw_ptr.unsafe_load(i))
         # Keep the payload buffer live past the copy loop (see header note).
         _ = raw_bytes^
         return out^
@@ -213,7 +213,7 @@ struct EvalDataLoader:
         var label = Int(buf[0])
         if label < 0 or label >= ASSUMED_NUM_COMPLETIONS:
             raise Error("EvalDataLoader error: label out of range")
-        self.label[example_batch_index] = Int32(label)
+        self.label[unsafe_offset=example_batch_index] = Int32(label)
 
         var num_completions = Int(buf[1])
         if num_completions != ASSUMED_NUM_COMPLETIONS:
@@ -236,7 +236,7 @@ struct EvalDataLoader:
         for c in range(num_completions):
             var row = batch_dim_offset + c
             for i in range(context_length):
-                self.inputs[row * T + i] = Int32(buf[3 + i])
+                self.inputs[unsafe_offset=row * T + i] = Int32(buf[3 + i])
 
         # Completions follow the context in each row; targets are inputs
         # shifted left by one (standard next-token prediction), and mask=1
@@ -252,9 +252,11 @@ struct EvalDataLoader:
                 )
             for i in range(completion_length):
                 var tok = Int32(buf[cursor + 1 + i])
-                self.inputs[row * T + context_length + i] = tok
-                self.targets[row * T + context_length + i - 1] = tok
-                self.mask[row * T + context_length + i - 1] = 1
+                self.inputs[unsafe_offset=row * T + context_length + i] = tok
+                self.targets[
+                    unsafe_offset=row * T + context_length + i - 1
+                ] = tok
+                self.mask[unsafe_offset=row * T + context_length + i - 1] = 1
             cursor += 1 + completion_length
 
         self.current_example_index += 1
@@ -263,7 +265,7 @@ struct EvalDataLoader:
         var B = self.batch_size
         var T = self.seq_len
         for i in range(B * T):
-            self.mask[i] = 0
+            self.mask[unsafe_offset=i] = 0
         for i in range(self.can_fit_examples):
             if self.current_example_index >= self.end_example_index:
                 break  # This process has exhausted its work.
@@ -275,16 +277,16 @@ struct EvalDataLoader:
         except:
             pass
 
-    def __del__(deinit self):
+    def __deinit__(deinit self):
         try:
             self.eval_file.close()
         except:
             pass
         if self.has_allocated:
-            self.inputs.free()
-            self.targets.free()
-            self.mask.free()
-            self.label.free()
+            self.inputs.unsafe_free()
+            self.targets.unsafe_free()
+            self.mask.unsafe_free()
+            self.label.unsafe_free()
 
 
 def eval_stat_correct(
@@ -308,9 +310,9 @@ def eval_stat_correct(
             var total_loss = Float32(0.0)
             var count = 0
             for t in range(T):
-                if loader.mask[row * T + t] != 0:
+                if loader.mask[unsafe_offset=row * T + t] != 0:
                     active = True
-                    total_loss += losses[row * T + t]
+                    total_loss += losses[unsafe_offset=row * T + t]
                     count += 1
             var avg_loss = Float32(0.0)
             if count > 0:
@@ -318,6 +320,6 @@ def eval_stat_correct(
             if c == 0 or avg_loss < min_loss:
                 min_loss = avg_loss
                 min_loss_index = c
-        if active and min_loss_index == Int(loader.label[i]):
+        if active and min_loss_index == Int(loader.label[unsafe_offset=i]):
             correct += 1
     return correct

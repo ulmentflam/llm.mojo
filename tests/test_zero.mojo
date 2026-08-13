@@ -1,13 +1,11 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer, alloc
-from std.gpu.host import DeviceContext, DeviceBuffer
-from std.gpu.host.info import is_cpu
+from std.memory import alloc
+from max.gpu.host import DeviceContext
 from std.sys.info import size_of
-from std.sys import has_accelerator, has_nvidia_gpu_accelerator
-from std.algorithm import sync_parallelize
+from std.sys import has_nvidia_gpu_accelerator
+from max.algorithm import sync_parallelize
 from layout.tile_layout import row_major
 
-from llmm.memory import MutMemPtr
 
 from llmm.zero import (
     ZeroContext,
@@ -41,15 +39,15 @@ def test_single_cpu_allreduce() raises:
     var host_in_ptr = host_in.unsafe_ptr()
     var host_out_ptr = host_out.unsafe_ptr()
     for i in range(size):
-        host_in_ptr[i] = 4.2
-        host_out_ptr[i] = 0.0
+        host_in_ptr[unsafe_offset=i] = 4.2
+        host_out_ptr[unsafe_offset=i] = 0.0
 
     var buf = ctx.enqueue_create_buffer[DTYPE](size)
     buf.enqueue_copy_from(host_in)
     ctx.synchronize()
 
     z_ctx.allreduce[DTYPE](
-        rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+        rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
             buf.unsafe_ptr().as_unsafe_any_origin()
         ),
         size,
@@ -60,7 +58,9 @@ def test_single_cpu_allreduce() raises:
     ctx.synchronize()
 
     for i in range(size):
-        assert_almost_equal[DTYPE](host_out_ptr[i], 4.2, atol=1e-6)
+        assert_almost_equal[DTYPE](
+            host_out_ptr[unsafe_offset=i], 4.2, atol=1e-6
+        )
 
 
 def test_single_cpu_reducescatter() raises:
@@ -80,8 +80,8 @@ def test_single_cpu_reducescatter() raises:
     var host_in_ptr = host_in.unsafe_ptr()
     var host_out_ptr = host_out.unsafe_ptr()
     for i in range(size):
-        host_in_ptr[i] = 1.5
-        host_out_ptr[i] = 0.0
+        host_in_ptr[unsafe_offset=i] = 1.5
+        host_out_ptr[unsafe_offset=i] = 0.0
 
     var in_buf = ctx.enqueue_create_buffer[DTYPE](size)
     var out_buf = ctx.enqueue_create_buffer[DTYPE](size)
@@ -91,10 +91,10 @@ def test_single_cpu_reducescatter() raises:
     ctx.synchronize()
 
     z_ctx.reducescatter[DTYPE](
-        rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+        rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
             in_buf.unsafe_ptr().as_unsafe_any_origin()
         ),
-        rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+        rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
             out_buf.unsafe_ptr().as_unsafe_any_origin()
         ),
         size,
@@ -105,7 +105,9 @@ def test_single_cpu_reducescatter() raises:
     ctx.synchronize()
 
     for i in range(size):
-        assert_almost_equal[DTYPE](host_out_ptr[i], 1.5, atol=1e-6)
+        assert_almost_equal[DTYPE](
+            host_out_ptr[unsafe_offset=i], 1.5, atol=1e-6
+        )
 
 
 def test_single_cpu_allgather() raises:
@@ -125,15 +127,15 @@ def test_single_cpu_allgather() raises:
     var host_in_ptr = host_in.unsafe_ptr()
     var host_out_ptr = host_out.unsafe_ptr()
     for i in range(size):
-        host_in_ptr[i] = 8.8
-        host_out_ptr[i] = 0.0
+        host_in_ptr[unsafe_offset=i] = 8.8
+        host_out_ptr[unsafe_offset=i] = 0.0
 
     var buf = ctx.enqueue_create_buffer[DTYPE](size)
     buf.enqueue_copy_from(host_in)
     ctx.synchronize()
 
     z_ctx.allgather[DTYPE](
-        rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+        rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
             buf.unsafe_ptr().as_unsafe_any_origin()
         ),
         size,
@@ -144,7 +146,9 @@ def test_single_cpu_allgather() raises:
     ctx.synchronize()
 
     for i in range(size):
-        assert_almost_equal[DTYPE](host_out_ptr[i], 8.8, atol=1e-6)
+        assert_almost_equal[DTYPE](
+            host_out_ptr[unsafe_offset=i], 8.8, atol=1e-6
+        )
 
 
 def test_sharded_parameter_gather_cpu() raises:
@@ -163,15 +167,15 @@ def test_sharded_parameter_gather_cpu() raises:
     var host_in_ptr = host_in.unsafe_ptr()
     var host_out_ptr = host_out.unsafe_ptr()
     for i in range(size):
-        host_in_ptr[i] = 7.5
-        host_out_ptr[i] = 0.0
+        host_in_ptr[unsafe_offset=i] = 7.5
+        host_out_ptr[unsafe_offset=i] = 0.0
 
     var param = ShardedParameter[DTYPE, 1, "cpu"](size, ctx)
     param.sharded_buffer.enqueue_copy_from(host_in)
     ctx.synchronize()
 
     var all_sharded = InlineArray[
-        UnsafePointer[Scalar[DTYPE], MutUntrackedOrigin], 1
+        Pointer[Scalar[DTYPE], MutUntrackedOrigin], 1
     ](uninitialized=True)
     all_sharded[0] = param.sharded_buffer.unsafe_ptr().unsafe_origin_cast[
         MutUntrackedOrigin
@@ -188,7 +192,9 @@ def test_sharded_parameter_gather_cpu() raises:
     ctx.synchronize()
 
     for i in range(size):
-        assert_almost_equal[DTYPE](host_out_ptr[i], 7.5, atol=1e-6)
+        assert_almost_equal[DTYPE](
+            host_out_ptr[unsafe_offset=i], 7.5, atol=1e-6
+        )
 
 
 def test_sharded_parameter_gather_gpu() raises:
@@ -209,15 +215,15 @@ def test_sharded_parameter_gather_gpu() raises:
     var host_in_ptr = host_in.unsafe_ptr()
     var host_out_ptr = host_out.unsafe_ptr()
     for i in range(size):
-        host_in_ptr[i] = 9.9
-        host_out_ptr[i] = 0.0
+        host_in_ptr[unsafe_offset=i] = 9.9
+        host_out_ptr[unsafe_offset=i] = 0.0
 
     var param = ShardedParameter[DTYPE, 1, "gpu"](size, ctx)
     param.sharded_buffer.enqueue_copy_from(host_in)
     ctx.synchronize()
 
     var all_sharded = InlineArray[
-        UnsafePointer[Scalar[DTYPE], MutUntrackedOrigin], 1
+        Pointer[Scalar[DTYPE], MutUntrackedOrigin], 1
     ](uninitialized=True)
     all_sharded[0] = param.sharded_buffer.unsafe_ptr().unsafe_origin_cast[
         MutUntrackedOrigin
@@ -234,7 +240,9 @@ def test_sharded_parameter_gather_gpu() raises:
     ctx.synchronize()
 
     for i in range(size):
-        assert_almost_equal[DTYPE](host_out_ptr[i], 9.9, atol=1e-6)
+        assert_almost_equal[DTYPE](
+            host_out_ptr[unsafe_offset=i], 9.9, atol=1e-6
+        )
 
 
 # ===----------------------------------------------------------------------=== #
@@ -278,7 +286,7 @@ def test_rank_failure_aborts_peers_instead_of_hanging() raises:
     # Per rank: 1 == returned normally, 2 == raised out of the barrier.
     var outcome = alloc[Int](WORLD_SIZE)
     for r in range(WORLD_SIZE):
-        outcome[r] = 0
+        outcome[unsafe_offset=r] = 0
 
     @parameter
     def _run_rank(rank: Int):
@@ -286,23 +294,23 @@ def test_rank_failure_aborts_peers_instead_of_hanging() raises:
             # Stand-in for any real per-rank failure: a GPU context that will
             # not initialise, a kernel that fails to compile, an OOM.
             cpu_coord_ptr[].abort()
-            outcome[0] = 1
+            outcome[unsafe_offset=0] = 1
             return
         try:
             cpu_coord_ptr[].barrier1[].wait()
-            outcome[rank] = 1
+            outcome[unsafe_offset=rank] = 1
         except:
-            outcome[rank] = 2
+            outcome[unsafe_offset=rank] = 2
 
     sync_parallelize[_run_rank](WORLD_SIZE)
 
-    assert_equal(outcome[0], 1)
+    assert_equal(outcome[unsafe_offset=0], 1)
     for r in range(1, WORLD_SIZE):
-        assert_equal(outcome[r], 2)
+        assert_equal(outcome[unsafe_offset=r], 2)
 
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
-    outcome.free()
+    cpu_coord_ptr.unsafe_free()
+    outcome.unsafe_free()
 
 
 def test_multi_cpu_allreduce() raises:
@@ -319,8 +327,8 @@ def test_multi_cpu_allreduce() raises:
 
     for r in range(WORLD_SIZE):
         for i in range(size):
-            rank_inputs[r * size + i] = Float32(r + 1)
-            rank_outputs[r * size + i] = 0.0
+            rank_inputs[unsafe_offset=r * size + i] = Float32(r + 1)
+            rank_outputs[unsafe_offset=r * size + i] = 0.0
 
     @parameter
     def _run_rank(rank: Int):
@@ -332,18 +340,20 @@ def test_multi_cpu_allreduce() raises:
                 cpu_coord=cpu_coord_ptr,
             )
 
-            var input_ptr = rank_inputs + rank * size
-            var output_ptr = rank_outputs + rank * size
+            var input_ptr = rank_inputs.unsafe_offset(rank * size)
+            var output_ptr = rank_outputs.unsafe_offset(rank * size)
 
             var buf = ctx.enqueue_create_buffer[DTYPE](size)
             var host_in = ctx.enqueue_create_host_buffer[DTYPE](size)
             for j in range(size):
-                host_in.unsafe_ptr()[j] = input_ptr[j]
+                host_in.unsafe_ptr()[unsafe_offset=j] = input_ptr[
+                    unsafe_offset=j
+                ]
             buf.enqueue_copy_from(host_in)
             ctx.synchronize()
 
             z_ctx.allreduce[DTYPE](
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     buf.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 size,
@@ -355,7 +365,9 @@ def test_multi_cpu_allreduce() raises:
             ctx.synchronize()
 
             for j in range(size):
-                output_ptr[j] = host_out.unsafe_ptr()[j]
+                output_ptr[unsafe_offset=j] = host_out.unsafe_ptr()[
+                    unsafe_offset=j
+                ]
 
         except e:
             print("allreduce rank error:", e)
@@ -365,13 +377,13 @@ def test_multi_cpu_allreduce() raises:
     for r in range(WORLD_SIZE):
         for i in range(size):
             assert_almost_equal[DTYPE](
-                rank_outputs[r * size + i], 10.0, atol=1e-6
+                rank_outputs[unsafe_offset=r * size + i], 10.0, atol=1e-6
             )
 
-    rank_inputs.free()
-    rank_outputs.free()
+    rank_inputs.unsafe_free()
+    rank_outputs.unsafe_free()
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
+    cpu_coord_ptr.unsafe_free()
 
 
 def test_multi_cpu_reducescatter() raises:
@@ -389,9 +401,9 @@ def test_multi_cpu_reducescatter() raises:
 
     for r in range(WORLD_SIZE):
         for i in range(size):
-            rank_inputs[r * size + i] = Float32(r + 1)
+            rank_inputs[unsafe_offset=r * size + i] = Float32(r + 1)
         for i in range(sharded_size):
-            rank_outputs[r * sharded_size + i] = 0.0
+            rank_outputs[unsafe_offset=r * sharded_size + i] = 0.0
 
     @parameter
     def _run_rank(rank: Int):
@@ -403,23 +415,25 @@ def test_multi_cpu_reducescatter() raises:
                 cpu_coord=cpu_coord_ptr,
             )
 
-            var input_ptr = rank_inputs + rank * size
-            var output_ptr = rank_outputs + rank * sharded_size
+            var input_ptr = rank_inputs.unsafe_offset(rank * size)
+            var output_ptr = rank_outputs.unsafe_offset(rank * sharded_size)
 
             var in_buf = ctx.enqueue_create_buffer[DTYPE](size)
             var out_buf = ctx.enqueue_create_buffer[DTYPE](sharded_size)
 
             var host_in = ctx.enqueue_create_host_buffer[DTYPE](size)
             for j in range(size):
-                host_in.unsafe_ptr()[j] = input_ptr[j]
+                host_in.unsafe_ptr()[unsafe_offset=j] = input_ptr[
+                    unsafe_offset=j
+                ]
             in_buf.enqueue_copy_from(host_in)
             ctx.synchronize()
 
             z_ctx.reducescatter[DTYPE](
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     in_buf.unsafe_ptr().as_unsafe_any_origin()
                 ),
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     out_buf.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 sharded_size,
@@ -431,7 +445,9 @@ def test_multi_cpu_reducescatter() raises:
             ctx.synchronize()
 
             for j in range(sharded_size):
-                output_ptr[j] = host_out.unsafe_ptr()[j]
+                output_ptr[unsafe_offset=j] = host_out.unsafe_ptr()[
+                    unsafe_offset=j
+                ]
 
         except e:
             print("reducescatter rank error:", e)
@@ -441,13 +457,15 @@ def test_multi_cpu_reducescatter() raises:
     for r in range(WORLD_SIZE):
         for i in range(sharded_size):
             assert_almost_equal[DTYPE](
-                rank_outputs[r * sharded_size + i], 10.0, atol=1e-6
+                rank_outputs[unsafe_offset=r * sharded_size + i],
+                10.0,
+                atol=1e-6,
             )
 
-    rank_inputs.free()
-    rank_outputs.free()
+    rank_inputs.unsafe_free()
+    rank_outputs.unsafe_free()
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
+    cpu_coord_ptr.unsafe_free()
 
 
 def test_multi_cpu_reducescatter_inplace() raises:
@@ -470,7 +488,7 @@ def test_multi_cpu_reducescatter_inplace() raises:
     var rank_bufs = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
     for r in range(WORLD_SIZE):
         for i in range(size):
-            rank_bufs[r * size + i] = Float32(r + 1)
+            rank_bufs[unsafe_offset=r * size + i] = Float32(r + 1)
 
     @parameter
     def _run_rank(rank: Int):
@@ -482,16 +500,18 @@ def test_multi_cpu_reducescatter_inplace() raises:
                 cpu_coord=cpu_coord_ptr,
             )
 
-            var host_ptr = rank_bufs + rank * size
+            var host_ptr = rank_bufs.unsafe_offset(rank * size)
             var buf = ctx.enqueue_create_buffer[DTYPE](size)
             var host_in = ctx.enqueue_create_host_buffer[DTYPE](size)
             for j in range(size):
-                host_in.unsafe_ptr()[j] = host_ptr[j]
+                host_in.unsafe_ptr()[unsafe_offset=j] = host_ptr[
+                    unsafe_offset=j
+                ]
             buf.enqueue_copy_from(host_in)
             ctx.synchronize()
 
             z_ctx.reducescatter_inplace[DTYPE](
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     buf.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 size,
@@ -502,7 +522,9 @@ def test_multi_cpu_reducescatter_inplace() raises:
             buf.enqueue_copy_to(host_out)
             ctx.synchronize()
             for j in range(size):
-                host_ptr[j] = host_out.unsafe_ptr()[j]
+                host_ptr[unsafe_offset=j] = host_out.unsafe_ptr()[
+                    unsafe_offset=j
+                ]
 
         except e:
             print("reducescatter_inplace rank error:", e)
@@ -515,14 +537,14 @@ def test_multi_cpu_reducescatter_inplace() raises:
             var expected = Float32(10.0) if k == r else Float32(r + 1)
             for i in range(sharded_size):
                 assert_almost_equal[DTYPE](
-                    rank_bufs[r * size + k * sharded_size + i],
+                    rank_bufs[unsafe_offset=r * size + k * sharded_size + i],
                     expected,
                     atol=1e-6,
                 )
 
-    rank_bufs.free()
+    rank_bufs.unsafe_free()
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
+    cpu_coord_ptr.unsafe_free()
 
 
 def test_multi_cpu_reducescatter_buckets() raises:
@@ -564,7 +586,7 @@ def test_multi_cpu_reducescatter_buckets() raises:
 
     var rank_shards = alloc[Scalar[DTYPE]](WORLD_SIZE * opt)
     for i in range(WORLD_SIZE * opt):
-        rank_shards[i] = 0.0
+        rank_shards[unsafe_offset=i] = 0.0
 
     @parameter
     def _run_rank(rank: Int):
@@ -577,7 +599,7 @@ def test_multi_cpu_reducescatter_buckets() raises:
             # pool element value == (rank+1) * (global_flat_index + 1)
             for b in range(len(dest)):
                 for j in range(lens[b]):
-                    host_pool.unsafe_ptr()[poff[b] + j] = Float32(
+                    host_pool.unsafe_ptr()[unsafe_offset=poff[b] + j] = Float32(
                         (rank + 1) * (dest[b] + j + 1)
                     )
             pool.enqueue_copy_from(host_pool)
@@ -586,13 +608,13 @@ def test_multi_cpu_reducescatter_buckets() raises:
             ctx.synchronize()
 
             z_ctx.reducescatter_buckets[DTYPE](
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     pool.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 dest,
                 poff,
                 lens,
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     shard.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 opt,
@@ -602,7 +624,9 @@ def test_multi_cpu_reducescatter_buckets() raises:
             shard.enqueue_copy_to(host_shard)
             ctx.synchronize()
             for j in range(opt):
-                rank_shards[rank * opt + j] = host_shard.unsafe_ptr()[j]
+                rank_shards[
+                    unsafe_offset=rank * opt + j
+                ] = host_shard.unsafe_ptr()[unsafe_offset=j]
         except e:
             print("reducescatter_buckets rank error:", e)
 
@@ -622,12 +646,12 @@ def test_multi_cpu_reducescatter_buckets() raises:
                 0.0
             )
             assert_almost_equal[DTYPE](
-                rank_shards[r * opt + j], expected, atol=1e-4
+                rank_shards[unsafe_offset=r * opt + j], expected, atol=1e-4
             )
 
-    rank_shards.free()
+    rank_shards.unsafe_free()
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
+    cpu_coord_ptr.unsafe_free()
 
 
 def test_multi_cpu_allgather() raises:
@@ -645,9 +669,9 @@ def test_multi_cpu_allgather() raises:
 
     for r in range(WORLD_SIZE):
         for i in range(sharded_size):
-            rank_inputs[r * sharded_size + i] = Float32(r + 1)
+            rank_inputs[unsafe_offset=r * sharded_size + i] = Float32(r + 1)
         for i in range(size):
-            rank_outputs[r * size + i] = 0.0
+            rank_outputs[unsafe_offset=r * size + i] = 0.0
 
     @parameter
     def _run_rank(rank: Int):
@@ -659,22 +683,24 @@ def test_multi_cpu_allgather() raises:
                 cpu_coord=cpu_coord_ptr,
             )
 
-            var input_ptr = rank_inputs + rank * sharded_size
-            var output_ptr = rank_outputs + rank * size
+            var input_ptr = rank_inputs.unsafe_offset(rank * sharded_size)
+            var output_ptr = rank_outputs.unsafe_offset(rank * size)
 
             var buf = ctx.enqueue_create_buffer[DTYPE](size)
             var host_in = ctx.enqueue_create_host_buffer[DTYPE](size)
             for j in range(size):
-                host_in.unsafe_ptr()[j] = 0.0
+                host_in.unsafe_ptr()[unsafe_offset=j] = 0.0
             var offset = rank * sharded_size
             for j in range(sharded_size):
-                host_in.unsafe_ptr()[offset + j] = input_ptr[j]
+                host_in.unsafe_ptr()[unsafe_offset=offset + j] = input_ptr[
+                    unsafe_offset=j
+                ]
 
             buf.enqueue_copy_from(host_in)
             ctx.synchronize()
 
             z_ctx.allgather[DTYPE](
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     buf.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 sharded_size,
@@ -686,7 +712,9 @@ def test_multi_cpu_allgather() raises:
             ctx.synchronize()
 
             for j in range(size):
-                output_ptr[j] = host_out.unsafe_ptr()[j]
+                output_ptr[unsafe_offset=j] = host_out.unsafe_ptr()[
+                    unsafe_offset=j
+                ]
 
         except e:
             print("allgather rank error:", e)
@@ -699,7 +727,9 @@ def test_multi_cpu_allgather() raises:
             for i in range(sharded_size):
                 if (
                     abs(
-                        Float64(rank_outputs[r * size + offset + i])
+                        Float64(
+                            rank_outputs[unsafe_offset=r * size + offset + i]
+                        )
                         - Float64(k + 1)
                     )
                     > 1e-6
@@ -712,20 +742,20 @@ def test_multi_cpu_allgather() raises:
                         "index",
                         offset + i,
                         "got",
-                        rank_outputs[r * size + offset + i],
+                        rank_outputs[unsafe_offset=r * size + offset + i],
                         "expected",
                         Float32(k + 1),
                     )
                 assert_almost_equal[DTYPE](
-                    rank_outputs[r * size + offset + i],
+                    rank_outputs[unsafe_offset=r * size + offset + i],
                     Float32(k + 1),
                     atol=1e-6,
                 )
 
-    rank_inputs.free()
-    rank_outputs.free()
+    rank_inputs.unsafe_free()
+    rank_outputs.unsafe_free()
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
+    cpu_coord_ptr.unsafe_free()
 
 
 def test_multi_sharded_parameter_gather_cpu() raises:
@@ -743,11 +773,11 @@ def test_multi_sharded_parameter_gather_cpu() raises:
 
     for r in range(WORLD_SIZE):
         for i in range(sharded_size):
-            rank_inputs[r * sharded_size + i] = Float32(r + 1)
+            rank_inputs[unsafe_offset=r * sharded_size + i] = Float32(r + 1)
         for i in range(size):
-            rank_outputs[r * size + i] = 0.0
+            rank_outputs[unsafe_offset=r * size + i] = 0.0
 
-    var shared_ptrs = alloc[UnsafePointer[Scalar[DTYPE], MutUntrackedOrigin]](
+    var shared_ptrs = alloc[Pointer[Scalar[DTYPE], MutUntrackedOrigin]](
         WORLD_SIZE
     )
 
@@ -761,29 +791,31 @@ def test_multi_sharded_parameter_gather_cpu() raises:
                 cpu_coord=cpu_coord_ptr,
             )
 
-            var input_ptr = rank_inputs + rank * sharded_size
-            var output_ptr = rank_outputs + rank * size
+            var input_ptr = rank_inputs.unsafe_offset(rank * sharded_size)
+            var output_ptr = rank_outputs.unsafe_offset(rank * size)
 
             var host_in = ctx.enqueue_create_host_buffer[DTYPE](sharded_size)
             for j in range(sharded_size):
-                host_in.unsafe_ptr()[j] = input_ptr[j]
+                host_in.unsafe_ptr()[unsafe_offset=j] = input_ptr[
+                    unsafe_offset=j
+                ]
 
             var param = ShardedParameter[DTYPE, WORLD_SIZE, "cpu"](size, ctx)
             param.sharded_buffer.enqueue_copy_from(host_in)
             ctx.synchronize()
 
             shared_ptrs[
-                rank
+                unsafe_offset=rank
             ] = param.sharded_buffer.unsafe_ptr().unsafe_origin_cast[
                 MutUntrackedOrigin
             ]()
             z_ctx.cpu_coordinator_ptr.value()[].barrier2[].wait()
 
             var all_sharded = InlineArray[
-                UnsafePointer[Scalar[DTYPE], MutUntrackedOrigin], WORLD_SIZE
+                Pointer[Scalar[DTYPE], MutUntrackedOrigin], WORLD_SIZE
             ](uninitialized=True)
             for k in range(WORLD_SIZE):
-                all_sharded[k] = shared_ptrs[k]
+                all_sharded[k] = shared_ptrs[unsafe_offset=k]
 
             comptime in_layout = row_major(1, sharded_size)
             comptime out_layout = row_major(1, size)
@@ -797,7 +829,9 @@ def test_multi_sharded_parameter_gather_cpu() raises:
             ctx.synchronize()
 
             for j in range(size):
-                output_ptr[j] = host_out.unsafe_ptr()[j]
+                output_ptr[unsafe_offset=j] = host_out.unsafe_ptr()[
+                    unsafe_offset=j
+                ]
 
         except e:
             print("sharded parameter gather rank error:", e)
@@ -809,16 +843,16 @@ def test_multi_sharded_parameter_gather_cpu() raises:
             var offset = k * sharded_size
             for i in range(sharded_size):
                 assert_almost_equal[DTYPE](
-                    rank_outputs[r * size + offset + i],
+                    rank_outputs[unsafe_offset=r * size + offset + i],
                     Float32(k + 1),
                     atol=1e-6,
                 )
 
-    shared_ptrs.free()
-    rank_inputs.free()
-    rank_outputs.free()
+    shared_ptrs.unsafe_free()
+    rank_inputs.unsafe_free()
+    rank_outputs.unsafe_free()
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
+    cpu_coord_ptr.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -940,10 +974,10 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
             var host_s = ctx.enqueue_create_host_buffer[DTYPE](shard)
             var buf = ctx.enqueue_create_buffer[DTYPE](size)
             var shard_buf = ctx.enqueue_create_buffer[DTYPE](shard)
-            var buf_ptr = rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+            var buf_ptr = rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                 buf.unsafe_ptr().as_unsafe_any_origin()
             )
-            var shard_ptr = rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+            var shard_ptr = rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                 shard_buf.unsafe_ptr().as_unsafe_any_origin()
             )
 
@@ -956,7 +990,7 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
             buf.enqueue_copy_to(host)
             ctx.synchronize()
             for j in range(size):
-                ar_out[rank * size + j] = host[j]
+                ar_out[unsafe_offset=rank * size + j] = host[j]
 
             # ---- reducescatter: same inputs, shard output ----
             for j in range(size):
@@ -968,7 +1002,7 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
             shard_buf.enqueue_copy_to(host_s)
             ctx.synchronize()
             for j in range(shard):
-                rs_shard[rank * shard + j] = host_s[j]
+                rs_shard[unsafe_offset=rank * shard + j] = host_s[j]
 
             # ---- reducescatter_inplace: same inputs, reduced in place ----
             for j in range(size):
@@ -979,7 +1013,7 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
             buf.enqueue_copy_to(host)
             ctx.synchronize()
             for j in range(size):
-                rs_ip_out[rank * size + j] = host[j]
+                rs_ip_out[unsafe_offset=rank * size + j] = host[j]
 
             # ---- reducescatter_buckets: scattered buckets in a pool -> shard --
             var bpool = ctx.enqueue_create_buffer[DTYPE](BPOOL)
@@ -994,13 +1028,13 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
             bshard.enqueue_fill(Float32(0.0))
             ctx.synchronize()
             z_ctx.reducescatter_buckets[DTYPE](
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     bpool.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 bdest,
                 bpoff,
                 blens,
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     bshard.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 shard,
@@ -1008,7 +1042,7 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
             bshard.enqueue_copy_to(host_s)
             ctx.synchronize()
             for j in range(shard):
-                rsb_shard[rank * shard + j] = host_s[j]
+                rsb_shard[unsafe_offset=rank * shard + j] = host_s[j]
 
             # ---- allgather: only my slice is mine; the other is zeroed so
             # stale data can't fake a pass ----
@@ -1023,7 +1057,7 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
             buf.enqueue_copy_to(host)
             ctx.synchronize()
             for j in range(size):
-                ag_out[rank * size + j] = host[j]
+                ag_out[unsafe_offset=rank * size + j] = host[j]
         except e:
             print("multi-gpu rank", rank, "error:", e)
             # Without this the surviving ranks spin on the next barrier until
@@ -1037,13 +1071,15 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
     for r in range(WORLD_SIZE):
         for j in range(size):
             assert_almost_equal[DTYPE](
-                ar_out[r * size + j], Float32(RANK_SUM * (j + 1)), atol=1e-5
+                ar_out[unsafe_offset=r * size + j],
+                Float32(RANK_SUM * (j + 1)),
+                atol=1e-5,
             )
     # reducescatter: rank r's shard[j] == 3*(r*shard + j + 1).
     for r in range(WORLD_SIZE):
         for j in range(shard):
             assert_almost_equal[DTYPE](
-                rs_shard[r * shard + j],
+                rs_shard[unsafe_offset=r * shard + j],
                 Float32(RANK_SUM * (r * shard + j + 1)),
                 atol=1e-5,
             )
@@ -1058,14 +1094,16 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
                     RANK_SUM * (gidx + 1)
                 ) if k == r else Float32((r + 1) * (gidx + 1))
                 assert_almost_equal[DTYPE](
-                    rs_ip_out[r * size + gidx], expected, atol=1e-5
+                    rs_ip_out[unsafe_offset=r * size + gidx],
+                    expected,
+                    atol=1e-5,
                 )
     # allgather: every rank's slice k == rank k's staged shard values.
     for r in range(WORLD_SIZE):
         for k in range(WORLD_SIZE):
             for j in range(shard):
                 assert_almost_equal[DTYPE](
-                    ag_out[r * size + k * shard + j],
+                    ag_out[unsafe_offset=r * size + k * shard + j],
                     Float32((k + 1) * 1000 + j),
                     atol=1e-5,
                 )
@@ -1080,16 +1118,16 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
                 0.0
             )
             assert_almost_equal[DTYPE](
-                rsb_shard[r * shard + j], expected, atol=1e-5
+                rsb_shard[unsafe_offset=r * shard + j], expected, atol=1e-5
             )
 
-    ar_out.free()
-    rs_shard.free()
-    rs_ip_out.free()
-    rsb_shard.free()
-    ag_out.free()
+    ar_out.unsafe_free()
+    rs_shard.unsafe_free()
+    rs_ip_out.unsafe_free()
+    rsb_shard.unsafe_free()
+    ag_out.unsafe_free()
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
+    cpu_coord_ptr.unsafe_free()
 
 
 def test_multi_gpu_collectives() raises:
@@ -1181,7 +1219,7 @@ def test_multi_cpu_allgather_ranges() raises:
 
     var rank_windows = alloc[Scalar[DTYPE]](WORLD_SIZE * win)
     for i in range(WORLD_SIZE * win):
-        rank_windows[i] = 0.0
+        rank_windows[unsafe_offset=i] = 0.0
 
     @parameter
     def _run_rank(rank: Int):
@@ -1197,7 +1235,9 @@ def test_multi_cpu_allgather_ranges() raises:
             var shard_buf = ctx.enqueue_create_buffer[DTYPE](shard)
             var host_shard = ctx.enqueue_create_host_buffer[DTYPE](shard)
             for j in range(shard):
-                host_shard.unsafe_ptr()[j] = Float32(rank * shard + j)
+                host_shard.unsafe_ptr()[unsafe_offset=j] = Float32(
+                    rank * shard + j
+                )
             shard_buf.enqueue_copy_from(host_shard)
             ctx.synchronize()
 
@@ -1213,11 +1253,11 @@ def test_multi_cpu_allgather_ranges() raises:
             lengths.append(lenB)
 
             z_ctx.allgather_ranges[DTYPE](
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     shard_buf.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 shard,
-                rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     win_buf.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 dst_offsets,
@@ -1230,7 +1270,9 @@ def test_multi_cpu_allgather_ranges() raises:
             win_buf.enqueue_copy_to(host_win)
             ctx.synchronize()
             for j in range(win):
-                rank_windows[rank * win + j] = host_win.unsafe_ptr()[j]
+                rank_windows[
+                    unsafe_offset=rank * win + j
+                ] = host_win.unsafe_ptr()[unsafe_offset=j]
         except e:
             print("allgather_ranges rank error:", e)
 
@@ -1240,16 +1282,20 @@ def test_multi_cpu_allgather_ranges() raises:
     for r in range(WORLD_SIZE):
         for j in range(lenA):
             assert_almost_equal[DTYPE](
-                rank_windows[r * win + j], Float32(8 + j), atol=1e-6
+                rank_windows[unsafe_offset=r * win + j],
+                Float32(8 + j),
+                atol=1e-6,
             )
         for j in range(lenB):
             assert_almost_equal[DTYPE](
-                rank_windows[r * win + lenA + j], Float32(30 + j), atol=1e-6
+                rank_windows[unsafe_offset=r * win + lenA + j],
+                Float32(30 + j),
+                atol=1e-6,
             )
 
-    rank_windows.free()
+    rank_windows.unsafe_free()
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
+    cpu_coord_ptr.unsafe_free()
 
 
 def main() raises:

@@ -11,12 +11,12 @@
 # `_dispatch_cpu`).
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import UnsafePointer
 from std.math import ceildiv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu.host.info import is_gpu
-from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.memory import AddressSpace
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.sys import is_defined
 from layout import Layout, LayoutTensor
 
@@ -227,13 +227,13 @@ comptime E5M2_MAX = Float32(57344.0)
 @always_inline
 def _f32_bits(x: Float32) -> UInt32:
     var v = x
-    return UnsafePointer(to=v).bitcast[UInt32]()[]
+    return Pointer(to=v).unsafe_bitcast[UInt32]()[]
 
 
 @always_inline
 def _bits_f32(b: UInt32) -> Float32:
     var v = b
-    return UnsafePointer(to=v).bitcast[Float32]()[]
+    return Pointer(to=v).unsafe_bitcast[Float32]()[]
 
 
 @always_inline
@@ -524,12 +524,16 @@ def _quantize_kernel_devscale[
     out_ptr: MutKernelPtr[DType.uint8],
     in_ptr: ImmutKernelPtr[in_dtype],
     scale_ptr: ImmutKernelPtr[DType.float32],
-    n: Int,
+    n_arg: Int64,
 ) -> None:
+    var n = Int(n_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < n:
-        var v = in_ptr[idx].cast[DType.float32]() * scale_ptr[0]
-        out_ptr[idx] = encode_fp8[out_dtype, mode](v)
+        var v = (
+            in_ptr[unsafe_offset=idx].cast[DType.float32]()
+            * scale_ptr[unsafe_offset=0]
+        )
+        out_ptr[unsafe_offset=idx] = encode_fp8[out_dtype, mode](v)
 
 
 def quantize_devscale[
@@ -575,7 +579,7 @@ def quantize_devscale[
         out_ptr,
         in_ptr,
         scale_ptr,
-        n,
+        Int64(n),
         grid_dim=(num_blocks,),
         block_dim=(BLOCK_SIZE,),
     )
@@ -598,14 +602,16 @@ def _quantize_transpose_kernel_devscale[
     out_ptr: MutKernelPtr[DType.uint8],  # [cols, rows] row-major (transposed)
     in_ptr: ImmutKernelPtr[in_dtype],  # [rows, cols] row-major
     scale_ptr: ImmutKernelPtr[DType.float32],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
 ) -> None:
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
     # 32x32 shared-memory tile transpose (see the module comment above). The
     # scale is a device pointer, dereferenced once per thread here rather
     # than passed as a launch scalar; a broadcast read of one device fp32,
     # negligible next to the tile's own global traffic.
-    var scale = scale_ptr[0]
+    var scale = scale_ptr[unsafe_offset=0]
     var tile = LayoutTensor[
         in_dtype,
         Layout.row_major(_QT_TILE, _QT_STRIDE),
@@ -631,7 +637,9 @@ def _quantize_transpose_kernel_devscale[
             var gr = tile_r + r
             var gc = tile_c + tx
             if gr < rows and gc < cols:
-                tile.ptr[r * _QT_STRIDE + tx] = in_ptr[gr * cols + gc]
+                tile.ptr[unsafe_offset=r * _QT_STRIDE + tx] = in_ptr[
+                    unsafe_offset=gr * cols + gc
+                ]
             r += ROW_STEP
         barrier()
 
@@ -641,9 +649,14 @@ def _quantize_transpose_kernel_devscale[
             var gor = tile_r + tx
             if goc < cols and gor < rows:
                 var v = (
-                    tile.ptr[tx * _QT_STRIDE + r].cast[DType.float32]() * scale
+                    tile.ptr[unsafe_offset=tx * _QT_STRIDE + r].cast[
+                        DType.float32
+                    ]()
+                    * scale
                 )
-                out_ptr[goc * rows + gor] = encode_fp8[out_dtype, mode](v)
+                out_ptr[unsafe_offset=goc * rows + gor] = encode_fp8[
+                    out_dtype, mode
+                ](v)
             r += ROW_STEP
         barrier()
 
@@ -703,8 +716,8 @@ def quantize_transpose_devscale[
         out_ptr,
         in_ptr,
         scale_ptr,
-        rows,
-        cols,
+        Int64(rows),
+        Int64(cols),
         grid_dim=(num_blocks,),
         block_dim=(_QT_BLOCK,),
     )
@@ -726,10 +739,12 @@ def _quantize_dual_kernel_devscale[
     trans_out_ptr: MutKernelPtr[DType.uint8],  # [cols, rows] row-major (T)
     in_ptr: ImmutKernelPtr[in_dtype],  # [rows, cols] row-major
     scale_ptr: ImmutKernelPtr[DType.float32],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
 ) -> None:
-    var scale = scale_ptr[0]
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var scale = scale_ptr[unsafe_offset=0]
     var tile = LayoutTensor[
         in_dtype,
         Layout.row_major(_QT_TILE, _QT_STRIDE),
@@ -759,10 +774,12 @@ def _quantize_dual_kernel_devscale[
             var gr = tile_r + r
             var gc = tile_c + tx
             if gr < rows and gc < cols:
-                var raw = in_ptr[gr * cols + gc]
-                tile.ptr[r * _QT_STRIDE + tx] = raw
+                var raw = in_ptr[unsafe_offset=gr * cols + gc]
+                tile.ptr[unsafe_offset=r * _QT_STRIDE + tx] = raw
                 var v = raw.cast[DType.float32]() * scale
-                nat_out_ptr[gr * cols + gc] = encode_fp8[out_dtype, mode](v)
+                nat_out_ptr[unsafe_offset=gr * cols + gc] = encode_fp8[
+                    out_dtype, mode
+                ](v)
             r += ROW_STEP
         barrier()
 
@@ -774,9 +791,14 @@ def _quantize_dual_kernel_devscale[
             var gor = tile_r + tx
             if goc < cols and gor < rows:
                 var v = (
-                    tile.ptr[tx * _QT_STRIDE + r].cast[DType.float32]() * scale
+                    tile.ptr[unsafe_offset=tx * _QT_STRIDE + r].cast[
+                        DType.float32
+                    ]()
+                    * scale
                 )
-                trans_out_ptr[goc * rows + gor] = encode_fp8[out_dtype, mode](v)
+                trans_out_ptr[unsafe_offset=goc * rows + gor] = encode_fp8[
+                    out_dtype, mode
+                ](v)
             r += ROW_STEP
         barrier()
 
@@ -824,8 +846,8 @@ def quantize_dual_devscale[
         trans_out_ptr,
         in_ptr,
         scale_ptr,
-        rows,
-        cols,
+        Int64(rows),
+        Int64(cols),
         grid_dim=(num_blocks,),
         block_dim=(_QT_BLOCK,),
     )

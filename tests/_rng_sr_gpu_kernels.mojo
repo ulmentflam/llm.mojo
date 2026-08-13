@@ -18,31 +18,35 @@
 # never appear in its own `__functions_in_module()` tuple.
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import bitcast, UnsafePointer
+from std.memory import bitcast
 from std.gpu import block_dim, block_idx, thread_idx
 
 from llmm.rng_device import rng_u32, sr_cast_bf16
 
 
 def rng_u32_kernel(
-    out_ptr: UnsafePointer[UInt32, MutAnyOrigin],
+    out_ptr: Pointer[UInt32, MutAnyOrigin],
     seed: UInt64,
     stream: UInt64,
-    n: Int,
+    n_arg: Int64,
 ) -> None:
+    var n = Int(n_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < n:
-        out_ptr[idx] = rng_u32(seed, UInt64(idx), stream)
+        out_ptr[unsafe_offset=idx] = rng_u32(seed, UInt64(idx), stream)
 
 
 def sr_cast_kernel(
-    out_ptr: UnsafePointer[UInt16, MutAnyOrigin],
-    x_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
+    out_ptr: Pointer[UInt16, MutAnyOrigin],
+    x_ptr: Pointer[Float32, ImmutAnyOrigin],
     seed: UInt64,
     stream: UInt64,
-    n: Int,
+    n_arg: Int64,
 ) -> None:
+    var n = Int(n_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < n:
-        var bf = sr_cast_bf16(x_ptr[idx], seed, UInt64(idx), stream)
-        out_ptr[idx] = bitcast[DType.uint16](bf)
+        var bf = sr_cast_bf16(
+            x_ptr[unsafe_offset=idx], seed, UInt64(idx), stream
+        )
+        out_ptr[unsafe_offset=idx] = bitcast[DType.uint16](bf)

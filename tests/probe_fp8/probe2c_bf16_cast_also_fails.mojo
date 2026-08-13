@@ -12,7 +12,7 @@
 # found by this probe suite is native cuBLASLt fp8 GEMM (raw pointers
 # in, vendor library does the math) — see probe4b_cublaslt_fp8_bf16out.mojo.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import block_dim, block_idx, thread_idx
 from std.sys import has_nvidia_gpu_accelerator
 
@@ -20,8 +20,9 @@ from std.sys import has_nvidia_gpu_accelerator
 def _mini_kernel(
     out_ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     x_ptr: UnsafePointer[Scalar[DType.float8_e4m3fn], ImmutAnyOrigin],
-    n: Int,
+    n_arg: Int64,
 ) -> None:
+    var n = Int(n_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     if idx < n:
         var x = x_ptr[idx].cast[DType.bfloat16]()
@@ -42,7 +43,7 @@ def main() raises:
         compiled,
         dev_out.unsafe_ptr(),
         dev_in.unsafe_ptr(),
-        N,
+        Int64(N),
         grid_dim=(1,),
         block_dim=(32,),
     )

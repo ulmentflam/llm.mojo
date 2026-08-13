@@ -1,8 +1,7 @@
 from extensibility import register
 from std.sys import simd_width_of
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext
-from std.algorithm import sync_parallelize
+from max.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -234,8 +233,8 @@ def merge_fwd_gpu_coalesced[
         var t = r2 % t_len
         var b = r2 // t_len
         var head_flat = ((b * nh + h) * t_len + t) * hd + d
-        (dst_ptr + token_flat).store[width=width](
-            (src_ptr + head_flat).load[width=width]()
+        (dst_ptr.unsafe_offset(token_flat)).unsafe_store[width=width](
+            (src_ptr.unsafe_offset(head_flat)).unsafe_load[width=width]()
         )
 
 

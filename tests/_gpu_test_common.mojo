@@ -23,18 +23,20 @@
 # the `persistent_device_buffer` global idiom in `llmm/memory.mojo`.
 
 from std.ffi import _get_global_or_null, external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 
 def shared_gpu_ctx() raises -> DeviceContext:
     var name = String("LLMM_TEST_SHARED_GPU_CTX")
+    # Keep the implicit binding: `if var gp := ...` SIGSEGVs the MAX
+    # compiler here. See llmm/memory.mojo for the full note.
     if gp := _get_global_or_null(name):
-        return gp.value().bitcast[DeviceContext]()[]
+        return gp.value().unsafe_bitcast[DeviceContext]()[]
     var ctx = DeviceContext()
     var hp = alloc[DeviceContext](1)
     hp.unsafe_write(ctx^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), hp.bitcast[NoneType]()
+        StringSlice(name), hp.unsafe_bitcast[NoneType]()
     )
     return hp[]

@@ -1,6 +1,5 @@
-from std.os import getenv
 from std.sys import argv, exit, has_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from llmm.memory import MutMemPtr, ImmutMemPtr
@@ -91,11 +90,11 @@ def run_infer[
     # length or batch size is larger than the previous allocations".
     var warmup_tokens = alloc[Scalar[DType.int32]](model.config.max_seq_len)
     for i in range(model.config.max_seq_len):
-        warmup_tokens[i] = Scalar[DType.int32](tokenizer.eot_token)
+        warmup_tokens[unsafe_offset=i] = Scalar[DType.int32](tokenizer.eot_token)
     model.forward(warmup_tokens, null_int32_ptr, 1, model.config.max_seq_len)
-    warmup_tokens.free()
+    warmup_tokens.unsafe_free()
 
-    gen_tokens[0] = Scalar[DType.int32](tokenizer.eot_token)
+    gen_tokens[unsafe_offset=0] = Scalar[DType.int32](tokenizer.eot_token)
 
     # fp32 scratch buffer for the logits actually consumed by sample_softmax
     # (see the dtype-mismatch fix below): sized to vocab_size, not
@@ -107,13 +106,13 @@ def run_infer[
     for t in range(1, gen_max_length):
         model.forward(gen_tokens, null_int32_ptr, 1, t)
         var dev_logits_ptr = (
-            model.acts.logits + (t - 1) * model.config.padded_vocab_size
+            model.acts.logits.unsafe_offset((t - 1) * model.config.padded_vocab_size)
         )
         model.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
             ),
-            src_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+            src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
                 dev_logits_ptr.as_unsafe_any_origin()
             ),
             size=vocab_size,
@@ -130,19 +129,19 @@ def run_infer[
             model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
         )
         for i in range(vocab_size):
-            logits_fp32[i] = logits_bf16[i].cast[DType.float32]()
+            logits_fp32[unsafe_offset=i] = logits_bf16[unsafe_offset=i].cast[DType.float32]()
 
         var coin = random_f32(rng_state)
         var next_token = sample_softmax(
             rebind[ImmutMemPtr[DType.float32]](logits_fp32), vocab_size, coin
         )
-        gen_tokens[t] = Scalar[DType.int32](next_token)
+        gen_tokens[unsafe_offset=t] = Scalar[DType.int32](next_token)
         var token_str = tokenizer.decode(next_token)
         safe_print(token_str)
     print("\n---")
 
-    gen_tokens.free()
-    logits_fp32.free()
+    gen_tokens.unsafe_free()
+    logits_fp32.unsafe_free()
 
 
 def run_eval[
@@ -173,7 +172,7 @@ def run_eval[
         model.forward(loader.inputs, loader.targets, batch_size, seq_len)
         num_correct += eval_stat_correct(
             loader,
-            rebind[UnsafePointer[Scalar[DType.float32], MutAnyOrigin]](
+            rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
                 model.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()
             ),
         )

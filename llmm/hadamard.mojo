@@ -54,7 +54,7 @@ only on the GPU training path.
 
 from std.collections import InlineArray
 from std.math import ceildiv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu.host.info import is_gpu
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 
@@ -148,10 +148,13 @@ def _hadamard16_kernel[
 ](
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
-    rows: Int,
-    k: Int,
-    k_blocks: Int,
+    rows_arg: Int64,
+    k_arg: Int64,
+    k_blocks_arg: Int64,
 ) -> None:
+    var rows = Int(rows_arg)
+    var k = Int(k_arg)
+    var k_blocks = Int(k_blocks_arg)
     var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
     var total = rows * k_blocks
     if idx >= total:
@@ -163,7 +166,7 @@ def _hadamard16_kernel[
 
     var buf = InlineArray[Float32, HADAMARD_BLOCK](uninitialized=True)
     for i in range(HADAMARD_BLOCK):
-        buf[i] = x_ptr[base + i].cast[DType.float32]()
+        buf[i] = x_ptr[unsafe_offset=base + i].cast[DType.float32]()
 
     comptime if forward:
         # y = H16 @ (s ⊙ x)
@@ -177,7 +180,7 @@ def _hadamard16_kernel[
             buf[i] = (buf[i] * HADAMARD_INV_SCALE) * hadamard_sign(i)
 
     for i in range(HADAMARD_BLOCK):
-        out_ptr[base + i] = buf[i].cast[dtype]()
+        out_ptr[unsafe_offset=base + i] = buf[i].cast[dtype]()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -213,9 +216,9 @@ def _hadamard16_dispatch[
             compiled,
             out_ptr,
             x_ptr,
-            rows,
-            k,
-            k_blocks,
+            Int64(rows),
+            Int64(k),
+            Int64(k_blocks),
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )

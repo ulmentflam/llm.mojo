@@ -3,14 +3,13 @@ from std.time import perf_counter_ns
 from std.sys import exit, argv, has_accelerator
 from std.os import getenv
 from std.sys.info import size_of
-from std.memory import alloc, UnsafePointer
-from std.gpu.host import DeviceContext
+from std.memory import alloc
+from max.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from std.math import sqrt
 
 from llmm.memory import MutMemPtr
 from llmm.vendor import HAS_CUBLAS, USE_TF32
-from llmm.zero import ZeroContext
 
 from train_gpt2 import (
     GPT2,
@@ -41,7 +40,7 @@ def check_tensor[
 ](
     ctx: DeviceContext,
     device_ptr: MutMemPtr[dtype],
-    expected_ptr: UnsafePointer[Scalar[DType.float32], _],
+    expected_ptr: Pointer[Scalar[DType.float32], _],
     n: Int,
     label: String,
     atol: Float32,
@@ -53,10 +52,10 @@ def check_tensor[
     var host_buf = ctx.enqueue_create_host_buffer[dtype](n)
     try:
         ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            dst_ptr=rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                 host_buf.unsafe_ptr().as_unsafe_any_origin()
             ),
-            src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+            src_ptr=rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
                 device_ptr.as_unsafe_any_origin()
             ),
             size=n,
@@ -74,7 +73,7 @@ def check_tensor[
 
     for i in range(n):
         var actual = host_buf[i].cast[DType.float32]()
-        var expected = expected_ptr[i]
+        var expected = expected_ptr[unsafe_offset=i]
         var diff = abs(actual - expected)
         if diff > maxdiff:
             maxdiff = diff
@@ -110,7 +109,7 @@ def check_tensor[
         if i >= print_upto:
             break
         var actual = host_buf[i].cast[DType.float32]()
-        var diff = abs(actual - expected_ptr[i])
+        var diff = abs(actual - expected_ptr[unsafe_offset=i])
         if diff <= threshold:
             print("  OK  ", end="")
         else:
@@ -119,7 +118,7 @@ def check_tensor[
             " actual="
             + String(actual)
             + " ref="
-            + String(expected_ptr[i])
+            + String(expected_ptr[unsafe_offset=i])
             + " diff="
             + String(diff)
         )
@@ -195,7 +194,7 @@ def check_tensor[
 def read_to_dtype_pointer[
     T: DType
 ](
-    ptr: UnsafePointer[Scalar[T], _], mut file_handle: FileHandle, size: Int
+    ptr: Pointer[Scalar[T], _], mut file_handle: FileHandle, size: Int
 ) raises -> None:
     # Element-wise copy with an explicit keep-alive, mirroring
     # llmm.io.read_and_copy and tests/test_zero_equivalence.mojo. A rebound
@@ -207,12 +206,12 @@ def read_to_dtype_pointer[
     var bytes_data = file_handle.read_bytes(bytes_to_read)
     if len(bytes_data) < bytes_to_read:
         raise Error("Failed to read enough bytes from file")
-    var dest = rebind[UnsafePointer[Scalar[T], MutUntrackedOrigin]](ptr)
-    var src_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+    var dest = rebind[Pointer[Scalar[T], MutUntrackedOrigin]](ptr)
+    var src_ptr = rebind[Pointer[UInt8, MutUntrackedOrigin]](
         bytes_data.unsafe_ptr()
-    ).bitcast[Scalar[T]]()
+    ).unsafe_bitcast[Scalar[T]]()
     for i in range(size):
-        dest[i] = src_ptr[i]
+        dest[unsafe_offset=i] = src_ptr[unsafe_offset=i]
     _ = bytes_data^
 
 
@@ -299,8 +298,8 @@ def run_test[
     var state_header = alloc[Int32](256)
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
 
-    if state_header[0] != 20240520:
-        if state_header[0] == 20240327:
+    if state_header[unsafe_offset=0] != 20240520:
+        if state_header[unsafe_offset=0] == 20240327:
             # llm.c's downloadable debug state (magic 20240327, version 2) has
             # no activation tensors, so this test can't consume it. The
             # reference files must be regenerated with the PyTorch script.
@@ -313,13 +312,13 @@ def run_test[
         else:
             print("Bad magic model file")
         exit(1)
-    if state_header[1] != 3:
-        print("Bad version in model file:", state_header[1])
+    if state_header[unsafe_offset=1] != 3:
+        print("Bad version in model file:", state_header[unsafe_offset=1])
         exit(1)
 
-    var B: Int = Int(state_header[2])  # batch size, e.g. 4
+    var B: Int = Int(state_header[unsafe_offset=2])  # batch size, e.g. 4
     var T: Int = Int(
-        state_header[3]
+        state_header[unsafe_offset=3]
     )  # time / sequence length (e.g. 64, up to maxT)
 
     print("[State]")
@@ -354,7 +353,7 @@ def run_test[
     )
 
     state_file.close()
-    state_header.free()
+    state_header.unsafe_free()
 
     var allok: Bool = True
 
@@ -411,10 +410,10 @@ def run_test[
             )
             ctx.enqueue_copy(
                 dst_ptr=rebind[
-                    UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+                    Pointer[Scalar[DType.float32], MutAnyOrigin]
                 ](host_logits.unsafe_ptr().as_unsafe_any_origin()),
                 src_ptr=rebind[
-                    UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
+                    Pointer[Scalar[DType.float32], ImmutAnyOrigin]
                 ](model.acts.logits.as_unsafe_any_origin()),
                 size=B * T * V_p,
             )
@@ -432,17 +431,17 @@ def run_test[
                         if print_count < 3:
                             print(
                                 "PyTorch:",
-                                expected_logits[idx_py],
+                                expected_logits[unsafe_offset=idx_py],
                                 "Mojo:",
                                 host_logits[idx_mj],
                             )
                             print_count += 1
 
                         # We only check logits that have a non-negligible impact on softmax (expected_logits > -10.0)
-                        if expected_logits[idx_py] > -10.0:
+                        if expected_logits[unsafe_offset=idx_py] > -10.0:
                             if (
                                 abs(
-                                    expected_logits[idx_py]
+                                    expected_logits[unsafe_offset=idx_py]
                                     - host_logits[idx_mj]
                                 )
                                 >= logits_tol
@@ -456,7 +455,7 @@ def run_test[
                                 )
                                 print(
                                     "Expected (Py):",
-                                    expected_logits[idx_py],
+                                    expected_logits[unsafe_offset=idx_py],
                                     "Got (Mj):",
                                     host_logits[idx_mj],
                                 )
@@ -474,11 +473,11 @@ def run_test[
             _ = host_logits^
 
             # compare the achieved loss
-            if abs(model.mean_loss - expected_loss[0]) >= loss_tol:
-                print("LOSS MISMATCH:", model.mean_loss, expected_loss[0])
+            if abs(model.mean_loss - expected_loss[unsafe_offset=0]) >= loss_tol:
+                print("LOSS MISMATCH:", model.mean_loss, expected_loss[unsafe_offset=0])
                 allok = False
             else:
-                print("LOSS OK:", model.mean_loss, expected_loss[0])
+                print("LOSS OK:", model.mean_loss, expected_loss[unsafe_offset=0])
 
             # Run backward pass before checking gradients
             model.zero_gradients()
@@ -708,11 +707,11 @@ def run_test[
 
     print("overall okay:", allok)
 
-    x.free()
-    y.free()
-    expected_logits.free()
-    expected_loss.free()
-    expected_grads_memory.free()
+    x.unsafe_free()
+    y.unsafe_free()
+    expected_logits.unsafe_free()
+    expected_loss.unsafe_free()
+    expected_grads_memory.unsafe_free()
     return allok
 
 

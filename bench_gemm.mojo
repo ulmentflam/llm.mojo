@@ -31,9 +31,10 @@ from layout import Layout, TileTensor
 from layout.tile_layout import row_major
 from layout.layout_tensor import LayoutTensor
 from linalg.matmul import matmul
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
-from std.gpu import block_idx, thread_idx, barrier
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
+from std.gpu import block_idx, thread_idx
+from max.gpu import barrier
 from std.collections import InlineArray
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
@@ -64,10 +65,12 @@ def gemm_simd_kernel[
     c_ptr: MutKernelPtr[out_dtype],
     a_ptr: ImmutKernelPtr[in_dtype],
     b_ptr: ImmutKernelPtr[in_dtype],
-    M: Int,
-    N: Int,
-    K: Int,
-) -> None:
+    M_arg: Int64,
+    N_arg: Int64,
+    K_arg: Int64) -> None:
+    var M = Int(M_arg)
+    var N = Int(N_arg)
+    var K = Int(K_arg)
     comptime TX = BN // TN  # threads spanning N
     comptime TY = BM // TM  # threads spanning M
     comptime NTHREADS = TX * TY
@@ -102,7 +105,7 @@ def gemm_simd_kernel[
             var j = e % BK
             var gr = block_row + i
             var gk = k0 + j
-            a_sh.ptr[e] = a_ptr[gr * K + gk] if (gr < M and gk < K) else Scalar[
+            a_sh.ptr[unsafe_offset=e] = a_ptr[unsafe_offset=gr * K + gk] if (gr < M and gk < K) else Scalar[
                 in_dtype
             ](0)
             e += NTHREADS
@@ -114,11 +117,11 @@ def gemm_simd_kernel[
             var gk = k0 + kj
 
             comptime if transpose_b:
-                b_sh.ptr[e] = b_ptr[gn * K + gk] if (
+                b_sh.ptr[unsafe_offset=e] = b_ptr[unsafe_offset=gn * K + gk] if (
                     gn < N and gk < K
                 ) else Scalar[in_dtype](0)
             else:
-                b_sh.ptr[e] = b_ptr[gk * N + gn] if (
+                b_sh.ptr[unsafe_offset=e] = b_ptr[unsafe_offset=gk * N + gn] if (
                     gn < N and gk < K
                 ) else Scalar[in_dtype](0)
             e += NTHREADS
@@ -128,11 +131,11 @@ def gemm_simd_kernel[
             var a_frag = InlineArray[Float32, TM](uninitialized=True)
             var b_frag = InlineArray[Float32, TN](uninitialized=True)
             comptime for i in range(TM):
-                a_frag[i] = a_sh.ptr[(ty * TM + i) * BK + kk].cast[
+                a_frag[i] = a_sh.ptr[unsafe_offset=(ty * TM + i) * BK + kk].cast[
                     DType.float32
                 ]()
             comptime for j in range(TN):
-                b_frag[j] = b_sh.ptr[kk * BN + (tx * TN + j)].cast[
+                b_frag[j] = b_sh.ptr[unsafe_offset=kk * BN + (tx * TN + j)].cast[
                     DType.float32
                 ]()
             comptime for i in range(TM):
@@ -146,7 +149,7 @@ def gemm_simd_kernel[
         comptime for j in range(TN):
             var gc = block_col + tx * TN + j
             if gr < M and gc < N:
-                c_ptr[gr * N + gc] = acc[i * TN + j].cast[out_dtype]()
+                c_ptr[unsafe_offset=gr * N + gc] = acc[i * TN + j].cast[out_dtype]()
 
 
 def launch_gemm_simd[
@@ -176,12 +179,11 @@ def launch_gemm_simd[
         c_ptr,
         a_ptr,
         b_ptr,
-        M,
-        N,
-        K,
+        Int64(M),
+        Int64(N),
+        Int64(K),
         grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
-        block_dim=((BM // TM) * (BN // TN),),
-    )
+        block_dim=((BM // TM) * (BN // TN),))
 
 
 # ===----------------------------------------------------------------------=== #
@@ -242,9 +244,9 @@ def run_shape(
     var scale = 1.0 / sqrt(Float32(K))
     var st: UInt64 = 0x243F6A8885A308D3 + UInt64(M * 131 + N * 17 + K)
     for i in range(M * K):
-        a_host.unsafe_ptr()[i] = _lcg(st) * scale
+        a_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
     for i in range(N * K):
-        b_host.unsafe_ptr()[i] = _lcg(st) * scale
+        b_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
 
     # ---- device buffers ----
     var a_bf = ctx.enqueue_create_buffer[DType.bfloat16](M * K)
@@ -259,11 +261,11 @@ def run_shape(
     var b_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](N * K)
     ctx.synchronize()
     for i in range(M * K):
-        a_bf_host.unsafe_ptr()[i] = a_host.unsafe_ptr()[i].cast[
+        a_bf_host.unsafe_ptr()[unsafe_offset=i] = a_host.unsafe_ptr()[unsafe_offset=i].cast[
             DType.bfloat16
         ]()
     for i in range(N * K):
-        b_bf_host.unsafe_ptr()[i] = b_host.unsafe_ptr()[i].cast[
+        b_bf_host.unsafe_ptr()[unsafe_offset=i] = b_host.unsafe_ptr()[unsafe_offset=i].cast[
             DType.bfloat16
         ]()
     a_bf.enqueue_copy_from(a_bf_host)
@@ -340,8 +342,8 @@ def run_shape(
     var max_rel = Float32(0)
     var ref_mag = Float32(0)
     for i in range(M * N):
-        var r = c_lin_host.unsafe_ptr()[i].cast[DType.float32]()
-        var g = c_cand_host.unsafe_ptr()[i].cast[DType.float32]()
+        var r = c_lin_host.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
+        var g = c_cand_host.unsafe_ptr()[unsafe_offset=i].cast[DType.float32]()
         var d = abs(g - r)
         max_abs = max(max_abs, d)
         ref_mag = max(ref_mag, abs(r))

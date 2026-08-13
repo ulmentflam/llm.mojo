@@ -4,7 +4,7 @@ from layout.tile_layout import row_major
 from std.memory import alloc
 from std.sys import simd_width_of, align_of, is_defined
 from std.time import global_perf_counter_ns
-from std.utils.index import IndexList, Index
+from std.utils.index import Index
 from linalg.matmul import matmul
 from linalg.matmul.vendor import blas
 from _cublas.cublas import (
@@ -17,27 +17,22 @@ from _cublas.cublas import (
 from _cublas.dtype import DataType
 from linalg.matmul.vendor.blas import _get_global_handle
 from layout.tensor_core import TensorCore
-from std.gpu.primitives import warp, block
+from std.gpu.primitives import warp
+from max.gpu.primitives import block
 from extensibility import InputTensor
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
-from std.gpu.host import DeviceAttribute
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
+from max.gpu.host import DeviceAttribute
 from layout.layout_tensor import LayoutTensor
 from std.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
 from std.runtime.asyncrt import parallelism_level
-from std.algorithm import vectorize, sync_parallelize
+from std.algorithm import vectorize
 from std.math import fma, sqrt, ceildiv, exp, log, ldexp, floor, exp2
-from std.gpu import (
-    barrier,
-    block_dim,
-    block_idx,
-    grid_dim,
-    thread_idx,
-    WARP_SIZE,
-)
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx, WARP_SIZE
+from max.gpu import barrier
 
 from llmm.split import split_fwd, split_bwd
 from llmm.merge import merge_fwd, merge_bwd
@@ -94,7 +89,7 @@ struct KVCache:
         self.att_probs_stride = 0
 
 
-comptime KVCachePtr = UnsafePointer[KVCache, MutUntrackedOrigin]
+comptime KVCachePtr = Pointer[KVCache, MutUntrackedOrigin]
 
 
 # ===----------------------------------------------------------------------=== #
@@ -235,16 +230,20 @@ def _attention_query_key_dot_product[
     var dimension = 0
     while dimension + width <= head_dim:
         accumulator = fma(
-            (query_row + dimension).load[width=width]().cast[DType.float32](),
-            (key_row + dimension).load[width=width]().cast[DType.float32](),
+            (query_row.unsafe_offset(dimension))
+            .unsafe_load[width=width]()
+            .cast[DType.float32](),
+            (key_row.unsafe_offset(dimension))
+            .unsafe_load[width=width]()
+            .cast[DType.float32](),
             accumulator,
         )
         dimension += width
     var score = accumulator.reduce_add()
     for tail_dimension in range(dimension, head_dim):
         score += (
-            query_row[tail_dimension].cast[DType.float32]()
-            * key_row[tail_dimension].cast[DType.float32]()
+            query_row[unsafe_offset=tail_dimension].cast[DType.float32]()
+            * key_row[unsafe_offset=tail_dimension].cast[DType.float32]()
         )
     return score * attention_scale
 
@@ -271,12 +270,16 @@ def _attention_rescale_and_add_value_to_output[
         head_dim,
     }:
         var output_vector = (
-            (output_row + local).load[width=w]().cast[DType.float32]()
+            (output_row.unsafe_offset(local))
+            .unsafe_load[width=w]()
+            .cast[DType.float32]()
         )
         var value_vector = (
-            (value_row + local).load[width=w]().cast[DType.float32]()
+            (value_row.unsafe_offset(local))
+            .unsafe_load[width=w]()
+            .cast[DType.float32]()
         )
-        (output_row + local).store[width=w](
+        (output_row.unsafe_offset(local)).unsafe_store[width=w](
             fma(
                 output_vector,
                 SIMD[DType.float32, w](rescale_factor),
@@ -302,12 +305,16 @@ def _attention_add_weighted_value_to_output[
         w: Int
     ](local: Int) {output_row, value_row, attention_weight, head_dim,}:
         var output_vector = (
-            (output_row + local).load[width=w]().cast[DType.float32]()
+            (output_row.unsafe_offset(local))
+            .unsafe_load[width=w]()
+            .cast[DType.float32]()
         )
         var value_vector = (
-            (value_row + local).load[width=w]().cast[DType.float32]()
+            (value_row.unsafe_offset(local))
+            .unsafe_load[width=w]()
+            .cast[DType.float32]()
         )
-        (output_row + local).store[width=w](
+        (output_row.unsafe_offset(local)).unsafe_store[width=w](
             (
                 output_vector
                 + value_vector * SIMD[DType.float32, w](attention_weight)
@@ -331,9 +338,11 @@ def _attention_scale_output_row[
         w: Int
     ](local: Int) {output_row, scale_factor, head_dim}:
         var output_vector = (
-            (output_row + local).load[width=w]().cast[DType.float32]()
+            (output_row.unsafe_offset(local))
+            .unsafe_load[width=w]()
+            .cast[DType.float32]()
         )
-        (output_row + local).store[width=w](
+        (output_row.unsafe_offset(local)).unsafe_store[width=w](
             (output_vector * SIMD[DType.float32, w](scale_factor)).cast[dtype]()
         )
 
@@ -454,7 +463,7 @@ def _attention_finalize_output_row[
         state.epilogue_output_scale() * inverse_denominator,
         head_dim,
     )
-    log_sum_exp_out.store(state.log_sum_exp())
+    log_sum_exp_out.unsafe_store(state.log_sum_exp())
 
 
 @always_inline
@@ -475,17 +484,19 @@ def _attention_forward_query_row[
     head_dim: Int,
     attention_scale: Scalar[DType.float32],
 ) -> None:
-    var query_row = query_ptr + head_offset + query_index * head_dim
-    var output_row = output_ptr + head_offset + query_index * head_dim
-    var log_sum_exp_out = (
-        log_sum_exp_ptr
-        + (head_offset // (seq_len * head_dim)) * seq_len
-        + query_index
+    var query_row = query_ptr.unsafe_offset(head_offset).unsafe_offset(
+        query_index * head_dim
     )
+    var output_row = (output_ptr.unsafe_offset(head_offset)).unsafe_offset(
+        query_index * head_dim
+    )
+    var log_sum_exp_out = log_sum_exp_ptr.unsafe_offset(
+        (head_offset // (seq_len * head_dim)) * seq_len
+    ).unsafe_offset(query_index)
 
     var state = OnlineSoftmaxState[use_soft_exp, use_conditional_rescale]()
     for dimension in range(head_dim):
-        output_row[dimension] = Scalar[dtype](0.0)
+        output_row[unsafe_offset=dimension] = Scalar[dtype](0.0)
 
     for key_index in range(query_index + 1):
         _attention_update_query_row_for_key[
@@ -493,8 +504,12 @@ def _attention_forward_query_row[
         ](
             state,
             query_row,
-            key_ptr + head_offset + key_index * head_dim,
-            value_ptr + head_offset + key_index * head_dim,
+            (key_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                key_index * head_dim
+            ),
+            value_ptr.unsafe_offset(head_offset).unsafe_offset(
+                key_index * head_dim
+            ),
             output_row,
             head_dim,
             attention_scale,
@@ -530,9 +545,7 @@ def _attention_copy_rows_dram_to_shared[
     # Metal fix: rebind to MutAnyOrigin+SHARED so writes go to threadgroup memory.
     # address_space_cast[GENERIC] corrupts threadgroup pointers on Metal AIR.
     var shared_ptr = rebind[
-        UnsafePointer[
-            Scalar[dtype], MutAnyOrigin, address_space=AddressSpace.SHARED
-        ]
+        Pointer[Scalar[dtype], MutAnyOrigin, address_space=AddressSpace.SHARED]
     ](shared_tensor.ptr)
     var thread_id = Int(thread_idx.x)
     var element_count = row_count * head_dim
@@ -540,8 +553,8 @@ def _attention_copy_rows_dram_to_shared[
     while element_index < element_count:
         var local_row = element_index // head_dim
         var column = element_index % head_dim
-        shared_ptr[local_row * MAX_HEAD_DIM + column] = dram_ptr[
-            (dram_row_start + local_row) * head_dim + column
+        shared_ptr[unsafe_offset=local_row * MAX_HEAD_DIM + column] = dram_ptr[
+            unsafe_offset=(dram_row_start + local_row) * head_dim + column
         ]
         element_index += BLOCK_SIZE
 
@@ -566,7 +579,7 @@ def _attention_zero_output_tile_rows[
         var dimension = element_index % head_dim
         if query_tile_start + local_row < seq_len:
             output_ptr[
-                head_offset
+                unsafe_offset=head_offset
                 + (query_tile_start + local_row) * head_dim
                 + dimension
             ] = Scalar[dtype](0.0)
@@ -586,16 +599,16 @@ def _attention_load_online_softmax_state_from_shared[
     mut state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
 ) -> None:
     state.softmax_max_deferred = softmax_max_deferred_shared.ptr[
-        local_query_row
+        unsafe_offset=local_query_row
     ].cast[DType.float32]()
-    state.softmax_max_true = softmax_max_true_shared.ptr[local_query_row].cast[
-        DType.float32
-    ]()
+    state.softmax_max_true = softmax_max_true_shared.ptr[
+        unsafe_offset=local_query_row
+    ].cast[DType.float32]()
     state.softmax_denominator_true = softmax_denominator_true_shared.ptr[
-        local_query_row
+        unsafe_offset=local_query_row
     ].cast[DType.float32]()
     state.output_rescale_factor = output_rescale_factor_shared.ptr[
-        local_query_row
+        unsafe_offset=local_query_row
     ].cast[DType.float32]()
 
 
@@ -612,17 +625,17 @@ def _attention_store_online_softmax_state_to_shared[
     state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
 ) -> None:
     # Rebind to MutAnyOrigin+SHARED so writes go to threadgroup memory on Metal.
-    comptime _F32SharedPtr = UnsafePointer[
+    comptime _F32SharedPtr = Pointer[
         Scalar[DType.float32], MutAnyOrigin, address_space=AddressSpace.SHARED
     ]
     var p_max_def = rebind[_F32SharedPtr](softmax_max_deferred_shared.ptr)
     var p_max_true = rebind[_F32SharedPtr](softmax_max_true_shared.ptr)
     var p_denom = rebind[_F32SharedPtr](softmax_denominator_true_shared.ptr)
     var p_rescale = rebind[_F32SharedPtr](output_rescale_factor_shared.ptr)
-    p_max_def[local_query_row] = state.softmax_max_deferred
-    p_max_true[local_query_row] = state.softmax_max_true
-    p_denom[local_query_row] = state.softmax_denominator_true
-    p_rescale[local_query_row] = state.output_rescale_factor
+    p_max_def[unsafe_offset=local_query_row] = state.softmax_max_deferred
+    p_max_true[unsafe_offset=local_query_row] = state.softmax_max_true
+    p_denom[unsafe_offset=local_query_row] = state.softmax_denominator_true
+    p_rescale[unsafe_offset=local_query_row] = state.output_rescale_factor
 
 
 @always_inline
@@ -641,7 +654,7 @@ def _attention_init_online_softmax_state_shared[
     seq_len: Int,
 ) -> None:
     # Rebind to MutAnyOrigin+SHARED so writes go to threadgroup memory on Metal.
-    comptime _F32SharedPtr = UnsafePointer[
+    comptime _F32SharedPtr = Pointer[
         Scalar[DType.float32], MutAnyOrigin, address_space=AddressSpace.SHARED
     ]
     var p_max_def = rebind[_F32SharedPtr](softmax_max_deferred_shared.ptr)
@@ -655,10 +668,16 @@ def _attention_init_online_softmax_state_shared[
     ]()
     while row_index < query_tile_rows:
         if query_tile_start + row_index < seq_len:
-            p_max_def[row_index] = initial_state.softmax_max_deferred
-            p_max_true[row_index] = initial_state.softmax_max_true
-            p_denom[row_index] = initial_state.softmax_denominator_true
-            p_rescale[row_index] = initial_state.output_rescale_factor
+            p_max_def[
+                unsafe_offset=row_index
+            ] = initial_state.softmax_max_deferred
+            p_max_true[unsafe_offset=row_index] = initial_state.softmax_max_true
+            p_denom[
+                unsafe_offset=row_index
+            ] = initial_state.softmax_denominator_true
+            p_rescale[
+                unsafe_offset=row_index
+            ] = initial_state.output_rescale_factor
         row_index += BLOCK_SIZE
 
 
@@ -794,7 +813,9 @@ def _attention_gpu_process_key_value_tile_warp[
             query_tile_start + warp_index * ROWS_PER_WARP + local_row
         )
         var local_query_row = warp_index * ROWS_PER_WARP + local_row
-        var output_row = output_ptr + head_offset + query_index * head_dim
+        var output_row = (output_ptr.unsafe_offset(head_offset)).unsafe_offset(
+            query_index * head_dim
+        )
         var state = OnlineSoftmaxState[use_soft_exp, use_conditional_rescale]()
         _attention_load_online_softmax_state_from_shared[
             use_soft_exp, use_conditional_rescale
@@ -830,8 +851,12 @@ def _attention_gpu_process_key_value_tile_warp[
                     var idx = d_start + d
                     if idx < head_dim:
                         local_sum += (
-                            query_shared.ptr[q_base + idx].cast[DType.float32]()
-                            * key_shared.ptr[k_base + idx].cast[DType.float32]()
+                            query_shared.ptr[unsafe_offset=q_base + idx].cast[
+                                DType.float32
+                            ]()
+                            * key_shared.ptr[unsafe_offset=k_base + idx].cast[
+                                DType.float32
+                            ]()
                         )
 
             var S_ij = warp.sum(local_sum) * attention_scale
@@ -864,9 +889,11 @@ def _attention_gpu_process_key_value_tile_warp[
                         for d in range(ELEMENTS_PER_THREAD):
                             var idx = d_start + d
                             if idx < head_dim:
-                                var v_val = value_shared.ptr[v_base + idx]
-                                var out_val = output_row[idx]
-                                output_row[idx] = (
+                                var v_val = value_shared.ptr[
+                                    unsafe_offset=v_base + idx
+                                ]
+                                var out_val = output_row[unsafe_offset=idx]
+                                output_row[unsafe_offset=idx] = (
                                     rescale_factor
                                     * out_val.cast[DType.float32]()
                                     + attention_weight
@@ -880,9 +907,11 @@ def _attention_gpu_process_key_value_tile_warp[
                         for d in range(ELEMENTS_PER_THREAD):
                             var idx = d_start + d
                             if idx < head_dim:
-                                var v_val = value_shared.ptr[v_base + idx]
-                                var out_val = output_row[idx]
-                                output_row[idx] = (
+                                var v_val = value_shared.ptr[
+                                    unsafe_offset=v_base + idx
+                                ]
+                                var out_val = output_row[unsafe_offset=idx]
+                                output_row[unsafe_offset=idx] = (
                                     out_val.cast[DType.float32]()
                                     + attention_weight
                                     * v_val.cast[DType.float32]()
@@ -898,9 +927,11 @@ def _attention_gpu_process_key_value_tile_warp[
                     for d in range(ELEMENTS_PER_THREAD):
                         var idx = d_start + d
                         if idx < head_dim:
-                            var v_val = value_shared.ptr[v_base + idx]
-                            var out_val = output_row[idx]
-                            output_row[idx] = (
+                            var v_val = value_shared.ptr[
+                                unsafe_offset=v_base + idx
+                            ]
+                            var out_val = output_row[unsafe_offset=idx]
+                            output_row[unsafe_offset=idx] = (
                                 rescale_factor * out_val.cast[DType.float32]()
                                 + attention_weight * v_val.cast[DType.float32]()
                             ).cast[dtype]()
@@ -969,10 +1000,12 @@ def _attention_gpu_finalize_query_rows_warp[
             local_query_row,
             state,
         )
-        var output_row = output_ptr + head_offset + query_index * head_dim
-        var log_sum_exp_out = (
-            log_sum_exp_ptr + head_index * seq_len + query_index
+        var output_row = output_ptr.unsafe_offset(head_offset).unsafe_offset(
+            query_index * head_dim
         )
+        var log_sum_exp_out = (
+            log_sum_exp_ptr.unsafe_offset(head_index * seq_len)
+        ).unsafe_offset(query_index)
 
         var scale = (
             state.epilogue_output_scale() / state.softmax_denominator_true
@@ -981,13 +1014,13 @@ def _attention_gpu_finalize_query_rows_warp[
             for d in range(ELEMENTS_PER_THREAD):
                 var idx = d_start + d
                 if idx < head_dim:
-                    var out_val = output_row[idx]
-                    output_row[idx] = (
+                    var out_val = output_row[unsafe_offset=idx]
+                    output_row[unsafe_offset=idx] = (
                         out_val.cast[DType.float32]() * scale
                     ).cast[dtype]()
 
             if lane_id == 0:
-                log_sum_exp_out.store(state.log_sum_exp())
+                log_sum_exp_out.unsafe_store(state.log_sum_exp())
         barrier()
 
 
@@ -1020,9 +1053,9 @@ def _attention_gpu_forward_query_tile_block[
         Scalar[DType.float32](head_dim)
     )
 
-    var query_head = query_ptr + head_offset
-    var key_head = key_ptr + head_offset
-    var value_head = value_ptr + head_offset
+    var query_head = query_ptr.unsafe_offset(head_offset)
+    var key_head = key_ptr.unsafe_offset(head_offset)
+    var value_head = value_ptr.unsafe_offset(head_offset)
 
     var query_shared = LayoutTensor[
         dtype,
@@ -1167,8 +1200,8 @@ def attention_fwd_gpu[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    num_tiles: Int,
-    query_tiles: Int,
+    num_tiles_arg: Int64,
+    query_tiles_arg: Int64,
     output_ptr: MutKernelPtr[dtype],
     query_ptr: ImmutKernelPtr[dtype],
     key_ptr: ImmutKernelPtr[dtype],
@@ -1177,6 +1210,8 @@ def attention_fwd_gpu[
     seq_len: Int64,
     head_dim: Int64,
 ) -> None:
+    var num_tiles = Int(num_tiles_arg)
+    var query_tiles = Int(query_tiles_arg)
     var grid_stride = Int(grid_dim.x)
     var block_tile = Int(block_idx.x)
 
@@ -1239,13 +1274,15 @@ def _attention_softmax_causal_gpu[
     BLOCK_SIZE: Int,
     width: Int = 1,
 ](
-    num_rows: Int,
-    seq_len: Int,
+    num_rows_arg: Int64,
+    seq_len_arg: Int64,
     attention_scale: Scalar[DType.float32],
     scores_ptr: ImmutKernelPtr[dtype],
     att_ptr: MutKernelPtr[dtype],
     lse_ptr: MutKernelPtr[DType.float32],
 ) -> None:
+    var num_rows = Int(num_rows_arg)
+    var seq_len = Int(seq_len_arg)
     # One block per scores row (grid-strided). Row r belongs to head r // T and
     # query position i = r % T, so the causal prefix is columns [0, i]. The raw
     # QKᵀ dot products are scaled here (kept out of the GEMM epilogue so Q/K stay
@@ -1274,9 +1311,11 @@ def _attention_softmax_causal_gpu[
         for tile_base in range(0, valid, BLOCK_SPAN):
             var lane_base = tile_base + tid * width
             if lane_base + width <= valid:
-                var xv = (scores_ptr + base + lane_base).load[
-                    width=width, alignment=align
-                ]().cast[DType.float32]() * attention_scale
+                var xv = (
+                    (scores_ptr.unsafe_offset(base)).unsafe_offset(lane_base)
+                ).unsafe_load[width=width, alignment=align]().cast[
+                    DType.float32
+                ]() * attention_scale
 
                 comptime for i in range(width):
                     var x = xv[i]
@@ -1286,7 +1325,7 @@ def _attention_softmax_causal_gpu[
             elif lane_base < valid:
                 for c in range(lane_base, valid):
                     var x = (
-                        scores_ptr[base + c].cast[DType.float32]()
+                        scores_ptr[unsafe_offset=base + c].cast[DType.float32]()
                         * attention_scale
                     )
                     var new_m = max(m_thread, x)
@@ -1299,7 +1338,7 @@ def _attention_softmax_causal_gpu[
         var inv_s = Scalar[DType.float32](1.0) / s_row
 
         if tid == 0:
-            lse_ptr[row] = m_row + log(s_row)
+            lse_ptr[unsafe_offset=row] = m_row + log(s_row)
 
         # Write only the causal prefix [0, valid); the above-diagonal half of
         # att_ptr is left at its persistent zero (memset once on allocation),
@@ -1310,23 +1349,25 @@ def _attention_softmax_causal_gpu[
             var lane_base = tile_base + tid * width
             if lane_base + width <= valid:
                 var idx = base + lane_base
-                var xv = (scores_ptr + idx).load[
+                var xv = (scores_ptr.unsafe_offset(idx)).unsafe_load[
                     width=width, alignment=align
                 ]().cast[DType.float32]() * attention_scale
                 var p = exp(xv - m_row_vec) * inv_s_vec
-                (att_ptr + idx).store[alignment=align](p.cast[dtype]())
+                (att_ptr.unsafe_offset(idx)).unsafe_store[alignment=align](
+                    p.cast[dtype]()
+                )
             elif lane_base < valid:
                 for c2 in range(lane_base, valid):
                     var idx = base + c2
                     var p = (
                         exp(
-                            scores_ptr[idx].cast[DType.float32]()
+                            scores_ptr[unsafe_offset=idx].cast[DType.float32]()
                             * attention_scale
                             - m_row
                         )
                         * inv_s
                     )
-                    att_ptr[idx] = p.cast[dtype]()
+                    att_ptr[unsafe_offset=idx] = p.cast[dtype]()
 
 
 # Integrated, validated, but DISABLED: the fused flash forward below is correct
@@ -1360,9 +1401,9 @@ def _attention_flash_fwd_gpu[
     BC: Int,
     HEAD_DIM: Int,
 ](
-    num_tiles: Int,
-    num_query_tiles: Int,
-    seq_len: Int,
+    num_tiles_arg: Int64,
+    num_query_tiles_arg: Int64,
+    seq_len_arg: Int64,
     attention_scale: Scalar[DType.float32],
     q_ptr: ImmutKernelPtr[dtype],
     k_ptr: ImmutKernelPtr[dtype],
@@ -1370,6 +1411,9 @@ def _attention_flash_fwd_gpu[
     o_ptr: MutKernelPtr[dtype],
     lse_ptr: MutKernelPtr[DType.float32],
 ) -> None:
+    var num_tiles = Int(num_tiles_arg)
+    var num_query_tiles = Int(num_query_tiles_arg)
+    var seq_len = Int(seq_len_arg)
     # One warp per (head, query-tile of BR rows). Streams causal KV tiles of BC
     # with online-softmax rescale; QKᵀ and P·V on tensor cores (P·V over Vᵀ),
     # softmax in shared. Produces per-head attn + lse (the GEMM backward consumes
@@ -1405,14 +1449,14 @@ def _attention_flash_fwd_gpu[
         var e = t
         while e < BR * HEAD_DIM:
             var r = e // HEAD_DIM
-            q_sh.ptr[e] = q_ptr[
-                qoff + e
+            q_sh.ptr[unsafe_offset=e] = q_ptr[
+                unsafe_offset=qoff + e
             ] if query_start + r < seq_len else Scalar[dtype](0)
-            o_sh.ptr[e] = 0.0
+            o_sh.ptr[unsafe_offset=e] = 0.0
             e += NTHREADS
         if t < BR:
-            m_sh.ptr[t] = Scalar[DType.float32].MIN_FINITE
-            l_sh.ptr[t] = 0.0
+            m_sh.ptr[unsafe_offset=t] = Scalar[DType.float32].MIN_FINITE
+            l_sh.ptr[unsafe_offset=t] = 0.0
         barrier()
 
         var last_key = min(query_start + BR, seq_len)
@@ -1421,19 +1465,19 @@ def _attention_flash_fwd_gpu[
             while e2 < BC * HEAD_DIM:
                 var kr = e2 // HEAD_DIM
                 var ok = kt + kr < seq_len
-                k_sh.ptr[e2] = k_ptr[
-                    head_off + kt * HEAD_DIM + e2
+                k_sh.ptr[unsafe_offset=e2] = k_ptr[
+                    unsafe_offset=head_off + kt * HEAD_DIM + e2
                 ] if ok else Scalar[dtype](0)
-                v_sh.ptr[e2] = v_ptr[
-                    head_off + kt * HEAD_DIM + e2
+                v_sh.ptr[unsafe_offset=e2] = v_ptr[
+                    unsafe_offset=head_off + kt * HEAD_DIM + e2
                 ] if ok else Scalar[dtype](0)
                 e2 += NTHREADS
             barrier()
             e2 = t
             while e2 < BC * HEAD_DIM:
-                vt_sh.ptr[(e2 % HEAD_DIM) * BC + (e2 // HEAD_DIM)] = v_sh.ptr[
-                    e2
-                ]
+                vt_sh.ptr[
+                    unsafe_offset=(e2 % HEAD_DIM) * BC + (e2 // HEAD_DIM)
+                ] = v_sh.ptr[unsafe_offset=e2]
                 e2 += NTHREADS
             barrier()
 
@@ -1448,29 +1492,35 @@ def _attention_flash_fwd_gpu[
 
             if t < BR:
                 var qi = query_start + t
-                var srow = s_sh.ptr + t * BC
-                var prow = p_sh.ptr + t * BC
+                var srow = s_sh.ptr.unsafe_offset(t * BC)
+                var prow = p_sh.ptr.unsafe_offset(t * BC)
                 var tile_max = Scalar[DType.float32].MIN_FINITE
                 for j in range(BC):
                     var kj = kt + j
                     if kj > qi or kj >= seq_len:
-                        srow[j] = Scalar[DType.float32].MIN_FINITE
+                        srow[unsafe_offset=j] = Scalar[DType.float32].MIN_FINITE
                     else:
-                        srow[j] = srow[j] * attention_scale
-                    tile_max = max(tile_max, srow[j])
-                var m_old = m_sh.ptr[t]
+                        srow[unsafe_offset=j] = (
+                            srow[unsafe_offset=j] * attention_scale
+                        )
+                    tile_max = max(tile_max, srow[unsafe_offset=j])
+                var m_old = m_sh.ptr[unsafe_offset=t]
                 var m_new = max(m_old, tile_max)
                 var rescale = software_emulated_exp[True](m_old - m_new)
                 var tile_sum = Scalar[DType.float32](0.0)
                 for j in range(BC):
-                    var p = software_emulated_exp[True](srow[j] - m_new)
+                    var p = software_emulated_exp[True](
+                        srow[unsafe_offset=j] - m_new
+                    )
                     tile_sum += p
-                    prow[j] = p.cast[dtype]()
-                l_sh.ptr[t] = l_sh.ptr[t] * rescale + tile_sum
-                m_sh.ptr[t] = m_new
-                var orow = o_sh.ptr + t * HEAD_DIM
+                    prow[unsafe_offset=j] = p.cast[dtype]()
+                l_sh.ptr[unsafe_offset=t] = (
+                    l_sh.ptr[unsafe_offset=t] * rescale + tile_sum
+                )
+                m_sh.ptr[unsafe_offset=t] = m_new
+                var orow = o_sh.ptr.unsafe_offset(t * HEAD_DIM)
                 for d in range(HEAD_DIM):
-                    orow[d] = orow[d] * rescale
+                    orow[unsafe_offset=d] = orow[unsafe_offset=d] * rescale
             barrier()
 
             # O += P·V over Vᵀ. P is [BR,BC], so loop the BC dimension in 16-wide
@@ -1485,20 +1535,22 @@ def _attention_flash_fwd_gpu[
                 pv.store_d(pv_sh.tile[16, 8](warp_id, n), oc)
             barrier()
             if t < BR:
-                var orow = o_sh.ptr + t * HEAD_DIM
-                var pvrow = pv_sh.ptr + t * HEAD_DIM
+                var orow = o_sh.ptr.unsafe_offset(t * HEAD_DIM)
+                var pvrow = pv_sh.ptr.unsafe_offset(t * HEAD_DIM)
                 for d in range(HEAD_DIM):
-                    orow[d] += pvrow[d]
+                    orow[unsafe_offset=d] += pvrow[unsafe_offset=d]
             barrier()
 
         if t < BR and query_start + t < seq_len:
-            var inv = Scalar[DType.float32](1.0) / l_sh.ptr[t]
-            var orow = o_sh.ptr + t * HEAD_DIM
+            var inv = Scalar[DType.float32](1.0) / l_sh.ptr[unsafe_offset=t]
+            var orow = o_sh.ptr.unsafe_offset(t * HEAD_DIM)
             for d in range(HEAD_DIM):
-                o_ptr[qoff + t * HEAD_DIM + d] = (orow[d] * inv).cast[dtype]()
-            lse_ptr[bh * seq_len + query_start + t] = m_sh.ptr[t] + log(
-                l_sh.ptr[t]
-            )
+                o_ptr[unsafe_offset=qoff + t * HEAD_DIM + d] = (
+                    orow[unsafe_offset=d] * inv
+                ).cast[dtype]()
+            lse_ptr[unsafe_offset=bh * seq_len + query_start + t] = m_sh.ptr[
+                unsafe_offset=t
+            ] + log(l_sh.ptr[unsafe_offset=t])
         barrier()
 
 
@@ -1548,9 +1600,9 @@ def attention_fwd_gemm[
             var flash_compiled = device_ctx.compile_function[flash_kernel]()
             device_ctx.enqueue_function(
                 flash_compiled,
-                num_tiles_f,
-                num_query_tiles,
-                T,
+                Int64(num_tiles_f),
+                Int64(num_query_tiles),
+                Int64(T),
                 attention_scale,
                 query_ptr,
                 key_ptr,
@@ -1594,10 +1646,10 @@ def attention_fwd_gemm[
             cache.value()[].gemm_scores_addr = scores_addr
             cache.value()[].gemm_att_addr = att_addr
 
-    var scores_buf_ptr = UnsafePointer[BufType, MutUntrackedOrigin](
+    var scores_buf_ptr = Pointer[BufType, MutUntrackedOrigin](
         unsafe_from_address=scores_addr
     )
-    var att_buf_ptr = UnsafePointer[BufType, MutUntrackedOrigin](
+    var att_buf_ptr = Pointer[BufType, MutUntrackedOrigin](
         unsafe_from_address=att_addr
     )
     var scores_base = rebind[MutKernelPtr[dtype]](scores_buf_ptr[].unsafe_ptr())
@@ -1609,11 +1661,11 @@ def attention_fwd_gemm[
     # probs into this layer's slice so the backward can read them (no recompute).
     if cache and cache.value()[].att_probs_addr != 0:
         var c = cache.value()
-        var ap = UnsafePointer[Scalar[dtype], MutUntrackedOrigin](
+        var ap = Pointer[Scalar[dtype], MutUntrackedOrigin](
             unsafe_from_address=c[].att_probs_addr
         )
         att_base = rebind[MutKernelPtr[dtype]](
-            ap + c[].att_probs_layer * c[].att_probs_stride
+            ap.unsafe_offset(c[].att_probs_layer * c[].att_probs_stride)
         )
 
     # Step 1: QKᵀ for all heads in one cublasGemmStridedBatchedEx call. bf16 Q/K
@@ -1656,8 +1708,8 @@ def attention_fwd_gemm[
         var compiled = device_ctx.compile_function[softmax_kernel]()
         device_ctx.enqueue_function(
             compiled,
-            num_rows,
-            T,
+            Int64(num_rows),
+            Int64(T),
             attention_scale,
             scores_immut,
             att_base,
@@ -1674,8 +1726,8 @@ def attention_fwd_gemm[
         ]()
         device_ctx.enqueue_function(
             compiled_scalar,
-            num_rows,
-            T,
+            Int64(num_rows),
+            Int64(T),
             attention_scale,
             scores_immut,
             att_base,
@@ -1854,7 +1906,7 @@ def attention_fwd[
                 if cache:
                     cache.value()[].fwd_addr = addr_fwd
 
-            var casted_ptr = UnsafePointer[CompiledType, MutUntrackedOrigin](
+            var casted_ptr = Pointer[CompiledType, MutUntrackedOrigin](
                 unsafe_from_address=addr_fwd
             )
             var retrieved = casted_ptr[]
@@ -1877,8 +1929,8 @@ def attention_fwd[
             var compiled = device_ctx.compile_function[gpu_kernel]()
             device_ctx.enqueue_function(
                 compiled,
-                num_tiles,
-                query_tiles,
+                Int64(num_tiles),
+                Int64(query_tiles),
                 output_ptr,
                 query_ptr,
                 key_ptr,
@@ -2030,48 +2082,48 @@ def _attention_bwd_cpu[
     attention_scale: Scalar[DType.float32],
 ) -> None:
     var head_offset = head_index * seq_len * head_dim
-    var lse_head = log_sum_exp_ptr + head_index * seq_len
+    var lse_head = log_sum_exp_ptr.unsafe_offset(head_index * seq_len)
 
-    var q_head = query_ptr + head_offset
-    var k_head = key_ptr + head_offset
-    var v_head = value_ptr + head_offset
-    var o_head = output_ptr + head_offset
-    var do_head = d_output_ptr + head_offset
+    var q_head = query_ptr.unsafe_offset(head_offset)
+    var k_head = key_ptr.unsafe_offset(head_offset)
+    var v_head = value_ptr.unsafe_offset(head_offset)
+    var o_head = output_ptr.unsafe_offset(head_offset)
+    var do_head = d_output_ptr.unsafe_offset(head_offset)
 
-    var dq_head = d_query_ptr + head_offset
-    var dk_head = d_key_ptr + head_offset
-    var dv_head = d_value_ptr + head_offset
+    var dq_head = d_query_ptr.unsafe_offset(head_offset)
+    var dk_head = d_key_ptr.unsafe_offset(head_offset)
+    var dv_head = d_value_ptr.unsafe_offset(head_offset)
 
     # Zero out dk and dv for this head since we accumulate into them.
     for i in range(seq_len * head_dim):
-        dk_head[i] = Scalar[dtype](0.0)
-        dv_head[i] = Scalar[dtype](0.0)
+        dk_head[unsafe_offset=i] = Scalar[dtype](0.0)
+        dv_head[unsafe_offset=i] = Scalar[dtype](0.0)
 
     # Precompute row dot products D_i = sum_k (dO_i,k * O_i,k).
     var D = alloc[Scalar[DType.float32]](seq_len)
     for i in range(seq_len):
-        D[i] = _attention_query_key_dot_product[dtype, width](
-            do_head + i * head_dim,
-            o_head + i * head_dim,
+        D[unsafe_offset=i] = _attention_query_key_dot_product[dtype, width](
+            do_head.unsafe_offset(i * head_dim),
+            o_head.unsafe_offset(i * head_dim),
             head_dim,
             Scalar[DType.float32](1.0),
         )
 
     for i in range(seq_len):
-        var q_row = q_head + i * head_dim
-        var do_row = do_head + i * head_dim
-        var dq_row = dq_head + i * head_dim
-        var L_i = lse_head[i]
-        var D_i = D[i]
+        var q_row = q_head.unsafe_offset(i * head_dim)
+        var do_row = do_head.unsafe_offset(i * head_dim)
+        var dq_row = dq_head.unsafe_offset(i * head_dim)
+        var L_i = lse_head[unsafe_offset=i]
+        var D_i = D[unsafe_offset=i]
 
         for d in range(head_dim):
-            dq_row[d] = Scalar[dtype](0.0)
+            dq_row[unsafe_offset=d] = Scalar[dtype](0.0)
 
         for j in range(i + 1):  # Causal mask constraint, j <= i.
-            var k_row = k_head + j * head_dim
-            var v_row = v_head + j * head_dim
-            var dk_row = dk_head + j * head_dim
-            var dv_row = dv_head + j * head_dim
+            var k_row = k_head.unsafe_offset(j * head_dim)
+            var v_row = v_head.unsafe_offset(j * head_dim)
+            var dk_row = dk_head.unsafe_offset(j * head_dim)
+            var dv_row = dv_head.unsafe_offset(j * head_dim)
 
             _attention_bwd_update_step[dtype, width, use_soft_exp](
                 q_row,
@@ -2087,7 +2139,7 @@ def _attention_bwd_cpu[
                 attention_scale,
             )
 
-    D.free()
+    D.unsafe_free()
 
 
 def attention_bwd_cpu[
@@ -2166,21 +2218,21 @@ def _attention_copy_tile[
         var column = element_index % head_dim
         comptime if is_dram_to_shared:
             var dest_ptr = rebind[
-                UnsafePointer[
+                Pointer[
                     Scalar[dtype],
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                 ]
             ](dest.ptr)
-            dest_ptr[local_row * MAX_HEAD_DIM + column] = src.ptr[
-                local_row * head_dim + column
+            dest_ptr[unsafe_offset=local_row * MAX_HEAD_DIM + column] = src.ptr[
+                unsafe_offset=local_row * head_dim + column
             ].cast[dtype]()
         else:
-            var dest_ptr = rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            var dest_ptr = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                 dest.ptr
             )
-            dest_ptr[local_row * head_dim + column] = src.ptr[
-                local_row * MAX_HEAD_DIM + column
+            dest_ptr[unsafe_offset=local_row * head_dim + column] = src.ptr[
+                unsafe_offset=local_row * MAX_HEAD_DIM + column
             ].cast[dtype]()
         element_index += BLOCK_SIZE
 
@@ -2290,7 +2342,9 @@ def _attention_gpu_bwd_dq_tile_block[
 
     var thread_id = Int(thread_idx.x)
     if thread_id < query_tile_rows:
-        lse_shared.ptr[thread_id] = lse_head[query_tile_start + thread_id]
+        lse_shared.ptr[unsafe_offset=thread_id] = lse_head[
+            unsafe_offset=query_tile_start + thread_id
+        ]
         for d in range(head_dim):
             dq_shared[thread_id, d] = Scalar[dtype](0.0)
     barrier()
@@ -2301,14 +2355,14 @@ def _attention_gpu_bwd_dq_tile_block[
         var d_val: Scalar[DType.float32] = 0.0
         for d in range(head_dim):
             d_val += (
-                do_shared.ptr[thread_id * MAX_HEAD_DIM + d].cast[
+                do_shared.ptr[unsafe_offset=thread_id * MAX_HEAD_DIM + d].cast[
                     DType.float32
                 ]()
-                * o_shared.ptr[thread_id * MAX_HEAD_DIM + d].cast[
+                * o_shared.ptr[unsafe_offset=thread_id * MAX_HEAD_DIM + d].cast[
                     DType.float32
                 ]()
             )
-        D_shared.ptr[thread_id] = d_val
+        D_shared.ptr[unsafe_offset=thread_id] = d_val
     barrier()
 
     var local_row = thread_id % Br
@@ -2331,10 +2385,10 @@ def _attention_gpu_bwd_dq_tile_block[
 
         var k_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((k_head + key_tile_start * head_dim))
+        ]((k_head.unsafe_offset(key_tile_start * head_dim)))
         var v_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((v_head + key_tile_start * head_dim))
+        ]((v_head.unsafe_offset(key_tile_start * head_dim)))
 
         _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, True](
             key_shared, k_tile_dram, key_tile_rows, head_dim
@@ -2354,13 +2408,13 @@ def _attention_gpu_bwd_dq_tile_block[
         ].stack_allocation()
         var private_dq = private_dq_tensor.ptr
         for col in range(head_dim):
-            private_dq[col] = 0.0
+            private_dq[unsafe_offset=col] = 0.0
 
         if local_row < query_tile_rows:
             var global_i = query_tile_start + local_row
             var q_base = local_row * MAX_HEAD_DIM
-            var L_i = lse_shared.ptr[local_row]
-            var D_i = D_shared.ptr[local_row]
+            var L_i = lse_shared.ptr[unsafe_offset=local_row]
+            var D_i = D_shared.ptr[unsafe_offset=local_row]
 
             for j in range(thread_row_index, key_tile_rows, 4):
                 var global_j = key_tile_start + j
@@ -2375,16 +2429,24 @@ def _attention_gpu_bwd_dq_tile_block[
                 var S_ij: Scalar[DType.float32] = 0.0
                 for d in range(head_dim):
                     S_ij += (
-                        q_shared.ptr[q_base + d].cast[DType.float32]()
-                        * key_shared.ptr[k_base + d].cast[DType.float32]()
+                        q_shared.ptr[unsafe_offset=q_base + d].cast[
+                            DType.float32
+                        ]()
+                        * key_shared.ptr[unsafe_offset=k_base + d].cast[
+                            DType.float32
+                        ]()
                     )
                 S_ij *= attention_scale
                 var P_ij = software_emulated_exp[use_soft_exp](S_ij - L_i)
                 var dP_ij: Scalar[DType.float32] = 0.0
                 for d in range(head_dim):
                     dP_ij += (
-                        do_shared.ptr[q_base + d].cast[DType.float32]()
-                        * val_shared.ptr[k_base + d].cast[DType.float32]()
+                        do_shared.ptr[unsafe_offset=q_base + d].cast[
+                            DType.float32
+                        ]()
+                        * val_shared.ptr[unsafe_offset=k_base + d].cast[
+                            DType.float32
+                        ]()
                     )
                 var dS_ij = P_ij * (dP_ij - D_i)
 
@@ -2392,19 +2454,27 @@ def _attention_gpu_bwd_dq_tile_block[
                 var d = 0
                 while d + width <= head_dim:
                     var k_vec = (
-                        (key_shared.ptr + k_base + d)
-                        .load[width=width]()
+                        (
+                            (
+                                key_shared.ptr.unsafe_offset(k_base)
+                            ).unsafe_offset(d)
+                        )
+                        .unsafe_load[width=width]()
                         .cast[DType.float32]()
                     )
-                    var dq_vec = (private_dq + d).load[width=width]()
-                    (private_dq + d).store[width=width](
+                    var dq_vec = (private_dq.unsafe_offset(d)).unsafe_load[
+                        width=width
+                    ]()
+                    (private_dq.unsafe_offset(d)).unsafe_store[width=width](
                         fma(SIMD[DType.float32, width](factor), k_vec, dq_vec)
                     )
                     d += width
                 for tail in range(d, head_dim):
-                    private_dq[tail] += (
+                    private_dq[unsafe_offset=tail] += (
                         factor
-                        * key_shared.ptr[k_base + tail].cast[DType.float32]()
+                        * key_shared.ptr[unsafe_offset=k_base + tail].cast[
+                            DType.float32
+                        ]()
                     )
 
         for col_base in range(0, head_dim, 8):
@@ -2413,7 +2483,7 @@ def _attention_gpu_bwd_dq_tile_block[
                 if col < head_dim:
                     reduction_shared[
                         local_row, thread_row_index, c
-                    ] = private_dq[col]
+                    ] = private_dq[unsafe_offset=col]
             barrier()
             for step in range(2):
                 var c = thread_row_index + step * 4
@@ -2446,8 +2516,8 @@ def attention_bwd_dq_gpu[
     BLOCK_SIZE: Int,
     use_soft_exp: Bool = True,
 ](
-    num_tiles: Int,
-    query_tiles: Int,
+    num_tiles_arg: Int64,
+    query_tiles_arg: Int64,
     d_query_ptr: MutKernelPtr[dtype],
     query_ptr: ImmutKernelPtr[dtype],
     key_ptr: ImmutKernelPtr[dtype],
@@ -2458,6 +2528,8 @@ def attention_bwd_dq_gpu[
     seq_len: Int64,
     head_dim: Int64,
 ) -> None:
+    var num_tiles = Int(num_tiles_arg)
+    var query_tiles = Int(query_tiles_arg)
     var grid_stride = Int(grid_dim.x)
     var block_tile = Int(block_idx.x)
 
@@ -2469,20 +2541,44 @@ def attention_bwd_dq_gpu[
 
         var q_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((query_ptr + head_offset + query_tile_start * Int(head_dim)))
+        ](
+            (
+                (query_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                    query_tile_start * Int(head_dim)
+                )
+            )
+        )
         var do_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((d_output_ptr + head_offset + query_tile_start * Int(head_dim)))
+        ](
+            (
+                (d_output_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                    query_tile_start * Int(head_dim)
+                )
+            )
+        )
         var o_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((output_ptr + head_offset + query_tile_start * Int(head_dim)))
+        ](
+            (
+                output_ptr.unsafe_offset(head_offset).unsafe_offset(
+                    query_tile_start * Int(head_dim)
+                )
+            )
+        )
         var dq_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), MutAnyOrigin
-        ]((d_query_ptr + head_offset + query_tile_start * Int(head_dim)))
+        ](
+            (
+                (d_query_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                    query_tile_start * Int(head_dim)
+                )
+            )
+        )
 
-        var k_head = key_ptr + head_offset
-        var v_head = value_ptr + head_offset
-        var lse_head = log_sum_exp_ptr + head_index * Int(seq_len)
+        var k_head = key_ptr.unsafe_offset(head_offset)
+        var v_head = value_ptr.unsafe_offset(head_offset)
+        var lse_head = log_sum_exp_ptr.unsafe_offset(head_index * Int(seq_len))
 
         _attention_gpu_bwd_dq_tile_block[
             dtype, width, Br, Bc, BLOCK_SIZE, use_soft_exp
@@ -2637,13 +2733,13 @@ def _attention_gpu_bwd_dkv_tile_block[
 
         var q_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((q_head + query_tile_start * head_dim))
+        ]((q_head.unsafe_offset(query_tile_start * head_dim)))
         var do_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((do_head + query_tile_start * head_dim))
+        ]((do_head.unsafe_offset(query_tile_start * head_dim)))
         var o_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((o_head + query_tile_start * head_dim))
+        ]((o_head.unsafe_offset(query_tile_start * head_dim)))
 
         _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, True](
             q_shared, q_tile_dram, query_tile_rows, head_dim
@@ -2656,7 +2752,9 @@ def _attention_gpu_bwd_dkv_tile_block[
         )
 
         if thread_id < query_tile_rows:
-            lse_shared.ptr[thread_id] = lse_head[query_tile_start + thread_id]
+            lse_shared.ptr[unsafe_offset=thread_id] = lse_head[
+                unsafe_offset=query_tile_start + thread_id
+            ]
         barrier()
 
         # Compute D_i = dO_i · O_i (inline — Metal fix: use shared .ptr directly).
@@ -2664,14 +2762,14 @@ def _attention_gpu_bwd_dkv_tile_block[
             var d_val: Scalar[DType.float32] = 0.0
             for d in range(head_dim):
                 d_val += (
-                    do_shared.ptr[thread_id * MAX_HEAD_DIM + d].cast[
-                        DType.float32
-                    ]()
-                    * o_shared.ptr[thread_id * MAX_HEAD_DIM + d].cast[
-                        DType.float32
-                    ]()
+                    do_shared.ptr[
+                        unsafe_offset=thread_id * MAX_HEAD_DIM + d
+                    ].cast[DType.float32]()
+                    * o_shared.ptr[
+                        unsafe_offset=thread_id * MAX_HEAD_DIM + d
+                    ].cast[DType.float32]()
                 )
-            D_shared.ptr[thread_id] = d_val
+            D_shared.ptr[unsafe_offset=thread_id] = d_val
         barrier()
 
         # Per-thread dK/dV partials in local memory, same rationale as dQ pass.
@@ -2690,8 +2788,8 @@ def _attention_gpu_bwd_dkv_tile_block[
         ].stack_allocation()
         var private_dv = private_dv_tensor.ptr
         for col in range(head_dim):
-            private_dk[col] = 0.0
-            private_dv[col] = 0.0
+            private_dk[unsafe_offset=col] = 0.0
+            private_dv[unsafe_offset=col] = 0.0
 
         if local_col < key_tile_rows:
             var global_j = key_tile_start + local_col
@@ -2703,8 +2801,8 @@ def _attention_gpu_bwd_dkv_tile_block[
                     continue
 
                 var q_base = i * MAX_HEAD_DIM
-                var L_i = lse_shared.ptr[i]
-                var D_i = D_shared.ptr[i]
+                var L_i = lse_shared.ptr[unsafe_offset=i]
+                var D_i = D_shared.ptr[unsafe_offset=i]
 
                 # Metal fix: inline dot products via shared .ptr to preserve
                 # AddressSpace.SHARED — _attention_query_key_dot_product takes
@@ -2712,16 +2810,24 @@ def _attention_gpu_bwd_dkv_tile_block[
                 var S_ij: Scalar[DType.float32] = 0.0
                 for d in range(head_dim):
                     S_ij += (
-                        q_shared.ptr[q_base + d].cast[DType.float32]()
-                        * key_shared.ptr[k_base + d].cast[DType.float32]()
+                        q_shared.ptr[unsafe_offset=q_base + d].cast[
+                            DType.float32
+                        ]()
+                        * key_shared.ptr[unsafe_offset=k_base + d].cast[
+                            DType.float32
+                        ]()
                     )
                 S_ij *= attention_scale
                 var P_ij = software_emulated_exp[use_soft_exp](S_ij - L_i)
                 var dP_ij: Scalar[DType.float32] = 0.0
                 for d in range(head_dim):
                     dP_ij += (
-                        do_shared.ptr[q_base + d].cast[DType.float32]()
-                        * val_shared.ptr[k_base + d].cast[DType.float32]()
+                        do_shared.ptr[unsafe_offset=q_base + d].cast[
+                            DType.float32
+                        ]()
+                        * val_shared.ptr[unsafe_offset=k_base + d].cast[
+                            DType.float32
+                        ]()
                     )
                 var dS_ij = P_ij * (dP_ij - D_i)
 
@@ -2730,23 +2836,27 @@ def _attention_gpu_bwd_dkv_tile_block[
                 var d = 0
                 while d + width <= head_dim:
                     var q_vec = (
-                        (q_shared.ptr + q_base + d)
-                        .load[width=width]()
+                        ((q_shared.ptr.unsafe_offset(q_base)).unsafe_offset(d))
+                        .unsafe_load[width=width]()
                         .cast[DType.float32]()
                     )
-                    var dk_vec = (private_dk + d).load[width=width]()
-                    (private_dk + d).store[width=width](
+                    var dk_vec = (private_dk.unsafe_offset(d)).unsafe_load[
+                        width=width
+                    ]()
+                    (private_dk.unsafe_offset(d)).unsafe_store[width=width](
                         fma(
                             SIMD[DType.float32, width](dk_factor), q_vec, dk_vec
                         )
                     )
                     var do_vec = (
-                        (do_shared.ptr + q_base + d)
-                        .load[width=width]()
+                        ((do_shared.ptr.unsafe_offset(q_base)).unsafe_offset(d))
+                        .unsafe_load[width=width]()
                         .cast[DType.float32]()
                     )
-                    var dv_vec = (private_dv + d).load[width=width]()
-                    (private_dv + d).store[width=width](
+                    var dv_vec = (private_dv.unsafe_offset(d)).unsafe_load[
+                        width=width
+                    ]()
+                    (private_dv.unsafe_offset(d)).unsafe_store[width=width](
                         fma(
                             SIMD[DType.float32, width](dv_factor),
                             do_vec,
@@ -2755,13 +2865,17 @@ def _attention_gpu_bwd_dkv_tile_block[
                     )
                     d += width
                 for tail in range(d, head_dim):
-                    private_dk[tail] += (
+                    private_dk[unsafe_offset=tail] += (
                         dk_factor
-                        * q_shared.ptr[q_base + tail].cast[DType.float32]()
+                        * q_shared.ptr[unsafe_offset=q_base + tail].cast[
+                            DType.float32
+                        ]()
                     )
-                    private_dv[tail] += (
+                    private_dv[unsafe_offset=tail] += (
                         dv_factor
-                        * do_shared.ptr[q_base + tail].cast[DType.float32]()
+                        * do_shared.ptr[unsafe_offset=q_base + tail].cast[
+                            DType.float32
+                        ]()
                     )
 
         for col_base in range(0, head_dim, 8):
@@ -2769,10 +2883,10 @@ def _attention_gpu_bwd_dkv_tile_block[
                 var col = col_base + c
                 if col < head_dim:
                     reduction_dk[local_col, thread_col_index, c] = private_dk[
-                        col
+                        unsafe_offset=col
                     ]
                     reduction_dv[local_col, thread_col_index, c] = private_dv[
-                        col
+                        unsafe_offset=col
                     ]
             barrier()
             for step in range(2):
@@ -2822,9 +2936,9 @@ def attention_bwd_dkv_gpu[
     BLOCK_SIZE: Int,
     use_soft_exp: Bool = True,
 ](
-    num_tiles: Int,
-    kv_tiles: Int,
-    query_tiles: Int,
+    num_tiles_arg: Int64,
+    kv_tiles_arg: Int64,
+    query_tiles_arg: Int64,
     d_key_ptr: MutKernelPtr[dtype],
     d_value_ptr: MutKernelPtr[dtype],
     query_ptr: ImmutKernelPtr[dtype],
@@ -2836,6 +2950,9 @@ def attention_bwd_dkv_gpu[
     seq_len: Int64,
     head_dim: Int64,
 ) -> None:
+    var num_tiles = Int(num_tiles_arg)
+    var kv_tiles = Int(kv_tiles_arg)
+    var query_tiles = Int(query_tiles_arg)
     var grid_stride = Int(grid_dim.x)
     var block_tile = Int(block_idx.x)
 
@@ -2847,21 +2964,45 @@ def attention_bwd_dkv_gpu[
 
         var dk_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), MutAnyOrigin
-        ]((d_key_ptr + head_offset + key_tile_start * Int(head_dim)))
+        ](
+            (
+                (d_key_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                    key_tile_start * Int(head_dim)
+                )
+            )
+        )
         var dv_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), MutAnyOrigin
-        ]((d_value_ptr + head_offset + key_tile_start * Int(head_dim)))
+        ](
+            (
+                (d_value_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                    key_tile_start * Int(head_dim)
+                )
+            )
+        )
         var k_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((key_ptr + head_offset + key_tile_start * Int(head_dim)))
+        ](
+            (
+                (key_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                    key_tile_start * Int(head_dim)
+                )
+            )
+        )
         var v_tile_dram = LayoutTensor[
             dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((value_ptr + head_offset + key_tile_start * Int(head_dim)))
+        ](
+            (
+                value_ptr.unsafe_offset(head_offset).unsafe_offset(
+                    key_tile_start * Int(head_dim)
+                )
+            )
+        )
 
-        var q_head = query_ptr + head_offset
-        var do_head = d_output_ptr + head_offset
-        var o_head = output_ptr + head_offset
-        var lse_head = log_sum_exp_ptr + head_index * Int(seq_len)
+        var q_head = query_ptr.unsafe_offset(head_offset)
+        var do_head = d_output_ptr.unsafe_offset(head_offset)
+        var o_head = output_ptr.unsafe_offset(head_offset)
+        var lse_head = log_sum_exp_ptr.unsafe_offset(head_index * Int(seq_len))
 
         _attention_gpu_bwd_dkv_tile_block[
             dtype, width, Br, Bc, BLOCK_SIZE, use_soft_exp
@@ -2985,9 +3126,7 @@ def _gemm_scratch_buffer[
         var p = alloc[BufType](1)
         p.unsafe_write(buf^)
         out_addr = Int(p)
-    var bp = UnsafePointer[BufType, MutUntrackedOrigin](
-        unsafe_from_address=out_addr
-    )
+    var bp = Pointer[BufType, MutUntrackedOrigin](unsafe_from_address=out_addr)
     return (out_addr, rebind[MutKernelPtr[bdt]](bp[].unsafe_ptr()))
 
 
@@ -3015,8 +3154,11 @@ def _attention_bwd_recompute_p_gpu[
         var bh = e // plane
         var p = Scalar[DType.float32](0.0)
         if j <= i:
-            p = exp(scores_ptr[e] * attention_scale - lse_ptr[bh * seq_len + i])
-        p_ptr[e] = p.cast[dtype]()
+            p = exp(
+                scores_ptr[unsafe_offset=e] * attention_scale
+                - lse_ptr[unsafe_offset=bh * seq_len + i]
+            )
+        p_ptr[unsafe_offset=e] = p.cast[dtype]()
         e += grid_stride
 
 
@@ -3024,12 +3166,14 @@ def _attention_bwd_recompute_p_gpu[
 def _attention_bwd_rowdot_gpu[
     dtype: DType,
 ](
-    num_rows: Int,
-    head_dim: Int,
+    num_rows_arg: Int64,
+    head_dim_arg: Int64,
     do_ptr: ImmutKernelPtr[dtype],
     o_ptr: ImmutKernelPtr[dtype],
     d_ptr: MutKernelPtr[DType.float32],
 ) -> None:
+    var num_rows = Int(num_rows_arg)
+    var head_dim = Int(head_dim_arg)
     # D_i = Σ_d dO_i,d · O_i,d, one thread per [B·nh, T] row.
     var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var grid_stride = Int(grid_dim.x) * Int(block_dim.x)
@@ -3039,10 +3183,10 @@ def _attention_bwd_rowdot_gpu[
         var acc = Scalar[DType.float32](0.0)
         for d in range(head_dim):
             acc += (
-                do_ptr[base + d].cast[DType.float32]()
-                * o_ptr[base + d].cast[DType.float32]()
+                do_ptr[unsafe_offset=base + d].cast[DType.float32]()
+                * o_ptr[unsafe_offset=base + d].cast[DType.float32]()
             )
-        d_ptr[row] = acc
+        d_ptr[unsafe_offset=row] = acc
         row += grid_stride
 
 
@@ -3053,8 +3197,8 @@ def _attention_bwd_p_and_ds_gpu[
     stored_p: Bool = False,
     aligned: Bool = True,
 ](
-    num_blocks: Int,
-    seq_len: Int,
+    num_blocks_arg: Int64,
+    seq_len_arg: Int64,
     attention_scale: Scalar[DType.float32],
     scores_ptr: ImmutKernelPtr[dtype],
     lse_ptr: ImmutKernelPtr[DType.float32],
@@ -3063,6 +3207,8 @@ def _attention_bwd_p_and_ds_gpu[
     p_ptr: MutKernelPtr[dtype],
     ds_ptr: MutKernelPtr[dtype],
 ) -> None:
+    var num_blocks = Int(num_blocks_arg)
+    var seq_len = Int(seq_len_arg)
     # Fused P recompute + dS, one pass over the [B·nh,T,T] plane:
     #   P_ij = exp(scale·S_ij − L_i)        (causal; j > i → 0)
     #   dS_ij = scale·P_ij·(dP_ij − D_i)
@@ -3122,23 +3268,27 @@ def _attention_bwd_p_and_ds_gpu[
             # See docs/ai/bf16_backward_nan_upper_triangle_bug.md.
             if jbase > i:
                 var zero_vec = SIMD[dtype, width](0)
-                (ds_ptr + e0).store[width=width, alignment=align](zero_vec)
+                (ds_ptr.unsafe_offset(e0)).unsafe_store[
+                    width=width, alignment=align
+                ](zero_vec)
                 comptime if not stored_p:
-                    (p_ptr + e0).store[width=width, alignment=align](zero_vec)
+                    (p_ptr.unsafe_offset(e0)).unsafe_store[
+                        width=width, alignment=align
+                    ](zero_vec)
                 b += grid_stride
                 continue
-            var d_i = d_ptr[bh * seq_len + i]
+            var d_i = d_ptr[unsafe_offset=bh * seq_len + i]
             # `stored_p`: scores_ptr already holds P (the forward's stored
             # softmax probs), so read it directly — no QKᵀ recompute, no
             # exp/lse, no P store.
             var raw = (
-                (scores_ptr + e0)
-                .load[width=width, alignment=align]()
+                (scores_ptr.unsafe_offset(e0))
+                .unsafe_load[width=width, alignment=align]()
                 .cast[DType.float32]()
             )
             var dpv = (
-                (dp_ptr + e0)
-                .load[width=width, alignment=align]()
+                (dp_ptr.unsafe_offset(e0))
+                .unsafe_load[width=width, alignment=align]()
                 .cast[DType.float32]()
             )
 
@@ -3150,22 +3300,22 @@ def _attention_bwd_p_and_ds_gpu[
                     if jbase + w <= i:
                         var pw = raw[w]
                         dsv[w] = attention_scale * pw * (dpv[w] - d_i)
-                (ds_ptr + e0).store[width=width, alignment=align](
-                    dsv.cast[dtype]()
-                )
+                (ds_ptr.unsafe_offset(e0)).unsafe_store[
+                    width=width, alignment=align
+                ](dsv.cast[dtype]())
             else:
-                var lse_i = lse_ptr[bh * seq_len + i]
+                var lse_i = lse_ptr[unsafe_offset=bh * seq_len + i]
                 comptime for w in range(width):
                     if jbase + w <= i:
                         var pw = exp(raw[w] * attention_scale - lse_i)
                         pv[w] = pw
                         dsv[w] = attention_scale * pw * (dpv[w] - d_i)
-                (p_ptr + e0).store[width=width, alignment=align](
-                    pv.cast[dtype]()
-                )
-                (ds_ptr + e0).store[width=width, alignment=align](
-                    dsv.cast[dtype]()
-                )
+                (p_ptr.unsafe_offset(e0)).unsafe_store[
+                    width=width, alignment=align
+                ](pv.cast[dtype]())
+                (ds_ptr.unsafe_offset(e0)).unsafe_store[
+                    width=width, alignment=align
+                ](dsv.cast[dtype]())
             b += grid_stride
     else:
         # num_blocks here is the TOTAL element count (B·nh·T·T), not a
@@ -3177,19 +3327,19 @@ def _attention_bwd_p_and_ds_gpu[
             var i = rem // seq_len
             var j = rem % seq_len
             if j <= i:
-                var d_i = d_ptr[bh * seq_len + i]
-                var raw = scores_ptr[idx].cast[DType.float32]()
-                var dpv = dp_ptr[idx].cast[DType.float32]()
+                var d_i = d_ptr[unsafe_offset=bh * seq_len + i]
+                var raw = scores_ptr[unsafe_offset=idx].cast[DType.float32]()
+                var dpv = dp_ptr[unsafe_offset=idx].cast[DType.float32]()
                 comptime if stored_p:
                     var pw = raw
                     var dsv = attention_scale * pw * (dpv - d_i)
-                    ds_ptr[idx] = dsv.cast[dtype]()
+                    ds_ptr[unsafe_offset=idx] = dsv.cast[dtype]()
                 else:
-                    var lse_i = lse_ptr[bh * seq_len + i]
+                    var lse_i = lse_ptr[unsafe_offset=bh * seq_len + i]
                     var pw = exp(raw * attention_scale - lse_i)
                     var dsv = attention_scale * pw * (dpv - d_i)
-                    p_ptr[idx] = pw.cast[dtype]()
-                    ds_ptr[idx] = dsv.cast[dtype]()
+                    p_ptr[unsafe_offset=idx] = pw.cast[dtype]()
+                    ds_ptr[unsafe_offset=idx] = dsv.cast[dtype]()
             idx += grid_stride
 
 
@@ -3201,11 +3351,13 @@ def _attention_transpose_planes_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
 ](
-    num_planes: Int,
-    seq_len: Int,
+    num_planes_arg: Int64,
+    seq_len_arg: Int64,
     src_ptr: ImmutKernelPtr[dtype],
     dst_ptr: MutKernelPtr[dtype],
 ) -> None:
+    var num_planes = Int(num_planes_arg)
+    var seq_len = Int(seq_len_arg)
     # Coalesced per-plane transpose of a [num_planes, T, T] buffer using 32×32
     # shared-memory tiles (padded to avoid bank conflicts). Reads a tile
     # coalesced, writes the transposed tile coalesced — a naive strided
@@ -3242,7 +3394,9 @@ def _attention_transpose_planes_gpu[
             var gr = tile_row + r
             var gc = tile_col + tx
             if gr < seq_len and gc < seq_len:
-                tile.ptr[r * STRIDE + tx] = src_ptr[base + gr * seq_len + gc]
+                tile.ptr[unsafe_offset=r * STRIDE + tx] = src_ptr[
+                    unsafe_offset=base + gr * seq_len + gc
+                ]
             r += ROW_STEP
         barrier()
 
@@ -3251,7 +3405,9 @@ def _attention_transpose_planes_gpu[
             var gr = tile_col + r
             var gc = tile_row + tx
             if gr < seq_len and gc < seq_len:
-                dst_ptr[base + gr * seq_len + gc] = tile.ptr[tx * STRIDE + r]
+                dst_ptr[unsafe_offset=base + gr * seq_len + gc] = tile.ptr[
+                    unsafe_offset=tx * STRIDE + r
+                ]
             r += ROW_STEP
         barrier()
 
@@ -3263,12 +3419,15 @@ def _attention_transpose_rect_gpu[
     dtype: DType,
     BLOCK_SIZE: Int,
 ](
-    num_planes: Int,
-    rows: Int,
-    cols: Int,
+    num_planes_arg: Int64,
+    rows_arg: Int64,
+    cols_arg: Int64,
     src_ptr: ImmutKernelPtr[dtype],
     dst_ptr: MutKernelPtr[dtype],
 ) -> None:
+    var num_planes = Int(num_planes_arg)
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
     # Coalesced transpose of each [rows, cols] plane → [cols, rows], 32×32 tiles.
     # Used for the small [T,hd]↔[hd,T] transposes that let dK/dV avoid
     # transposing the big [T,T] dS/P matrices.
@@ -3307,7 +3466,9 @@ def _attention_transpose_rect_gpu[
             var gr = tile_row + r
             var gc = tile_col + tx
             if gr < rows and gc < cols:
-                tile.ptr[r * STRIDE + tx] = src_ptr[src_base + gr * cols + gc]
+                tile.ptr[unsafe_offset=r * STRIDE + tx] = src_ptr[
+                    unsafe_offset=src_base + gr * cols + gc
+                ]
             r += ROW_STEP
         barrier()
 
@@ -3317,7 +3478,9 @@ def _attention_transpose_rect_gpu[
             var gr = tile_col + r
             var gc = tile_row + tx
             if gr < cols and gc < rows:
-                dst_ptr[dst_base + gr * rows + gc] = tile.ptr[tx * STRIDE + r]
+                dst_ptr[unsafe_offset=dst_base + gr * rows + gc] = tile.ptr[
+                    unsafe_offset=tx * STRIDE + r
+                ]
             r += ROW_STEP
         barrier()
 
@@ -3331,19 +3494,28 @@ def _attn_batched_gemm_gpu[
     BN: Int,  # output cols per threadgroup
     BK: Int,  # K-tile step  (must equal BM so A-tile = B-tile element count)
 ](
-    bh: Int,  # total batch×head count (BH = B*NH)
-    M: Int,  # output rows (T or HD)
-    N: Int,  # output cols (HD or T)
-    K: Int,  # inner dimension (T)
+    bh_arg: Int64,  # total batch×head count (BH = B*NH)
+    M_arg: Int64,  # output rows (T or HD)
+    N_arg: Int64,  # output cols (HD or T)
+    K_arg: Int64,  # inner dimension (T)
     a_ptr: ImmutKernelPtr[dt],  # [bh, M, K]
     b_ptr: ImmutKernelPtr[dt],  # [bh, K, N]
     c_ptr: MutKernelPtr[dt],  # [bh, M, N]
-    a_stride: Int,  # M*K
-    b_stride: Int,  # K*N
-    c_stride: Int,  # M*N
-    tiles_m: Int,  # ceildiv(M, BM)
-    tiles_n: Int,  # ceildiv(N, BN)
+    a_stride_arg: Int64,  # M*K
+    b_stride_arg: Int64,  # K*N
+    c_stride_arg: Int64,  # M*N
+    tiles_m_arg: Int64,  # ceildiv(M, BM)
+    tiles_n_arg: Int64,  # ceildiv(N, BN)
 ) -> None:
+    var bh = Int(bh_arg)
+    var M = Int(M_arg)
+    var N = Int(N_arg)
+    var K = Int(K_arg)
+    var a_stride = Int(a_stride_arg)
+    var b_stride = Int(b_stride_arg)
+    var c_stride = Int(c_stride_arg)
+    var tiles_m = Int(tiles_m_arg)
+    var tiles_n = Int(tiles_n_arg)
     # Generic tiled batched GEMM: C[bh, M, N] = A[bh, M, K] · B[bh, K, N].
     # One threadgroup per (head, m-tile, n-tile); flat grid encodes the triple.
     # BM = BK is required so A-tile [BM,BK] and B-tile [BK,BN] can both be loaded
@@ -3397,24 +3569,28 @@ def _attn_batched_gemm_gpu[
         if tid < BM * BK:
             var ra = tid // BK  # row in A tile  [0, BM)
             var ca = tid % BK  # col in A tile  [0, BK)
-            a_sh.ptr[ra * (BK + 1) + ca] = a_ptr[a_base + ra * K + k + ca]
+            a_sh.ptr[unsafe_offset=ra * (BK + 1) + ca] = a_ptr[
+                unsafe_offset=a_base + ra * K + k + ca
+            ]
         # Load B tile [BK, BN]: all threads, one element each.
         # ty ∈ [0, BM=BK) serves as the k-row index; tx as the n-col index.
-        b_sh.ptr[ty * (BN + 1) + tx] = b_ptr[b_base + (k + ty) * N + tx]
+        b_sh.ptr[unsafe_offset=ty * (BN + 1) + tx] = b_ptr[
+            unsafe_offset=b_base + (k + ty) * N + tx
+        ]
         barrier()
 
         # Accumulate: acc += sum_{kk} A_sh[ty, kk] * B_sh[kk, tx]
         for kk in range(BK):
             acc = fma(
-                a_sh.ptr[ty * (BK + 1) + kk],
-                b_sh.ptr[kk * (BN + 1) + tx],
+                a_sh.ptr[unsafe_offset=ty * (BK + 1) + kk],
+                b_sh.ptr[unsafe_offset=kk * (BN + 1) + tx],
                 acc,
             )
         barrier()
 
     # Boundary guard: write if within M×N (needed when tiles don't divide evenly).
     if m_off + ty < M and n_off + tx < N:
-        c_ptr[c_base + ty * N + tx] = acc
+        c_ptr[unsafe_offset=c_base + ty * N + tx] = acc
 
 
 def _launch_batched_headout[
@@ -3443,18 +3619,18 @@ def _launch_batched_headout[
     var compiled = ctx.compile_function[k]()
     ctx.enqueue_function(
         compiled,
-        BH,
-        T,
-        HD,
-        T,
+        Int64(BH),
+        Int64(T),
+        Int64(HD),
+        Int64(T),
         a_ptr,
         b_ptr,
         c_ptr,
-        T * T,
-        T * HD,
-        T * HD,
-        tiles_m,
-        tiles_n,
+        Int64(T * T),
+        Int64(T * HD),
+        Int64(T * HD),
+        Int64(tiles_m),
+        Int64(tiles_n),
         grid_dim=(num_blocks,),
         block_dim=(THREADS,),
     )
@@ -3486,18 +3662,18 @@ def _launch_batched_kvgrad[
     var compiled = ctx.compile_function[k]()
     ctx.enqueue_function(
         compiled,
-        BH,
-        HD,
-        T,
-        T,
+        Int64(BH),
+        Int64(HD),
+        Int64(T),
+        Int64(T),
         a_ptr,
         b_ptr,
         c_ptr,
-        HD * T,
-        T * T,
-        HD * T,
-        tiles_m,
-        tiles_n,
+        Int64(HD * T),
+        Int64(T * T),
+        Int64(HD * T),
+        Int64(tiles_m),
+        Int64(tiles_n),
         grid_dim=(num_blocks,),
         block_dim=(THREADS,),
     )
@@ -3521,17 +3697,23 @@ def _attn_headout4_gpu[
     BN: Int,  # output cols per block (= HD = 64)
     BK: Int,  # K-tile step; BK × BN must equal THREADS; ROWS_PER_THREAD = BM//(THREADS//BN)
 ](
-    bh: Int,
-    M: Int,  # T
-    N: Int,  # HD
-    K: Int,  # T (the common K-dimension)
+    bh_arg: Int64,
+    M_arg: Int64,  # T
+    N_arg: Int64,  # HD
+    K_arg: Int64,  # T (the common K-dimension)
     a_ptr: ImmutKernelPtr[dt],  # [BH, M, K]
     b_ptr: ImmutKernelPtr[dt],  # [BH, K, N]
     c_ptr: MutKernelPtr[dt],  # [BH, M, N]
-    a_stride: Int,  # M*K
-    b_stride: Int,  # K*N
-    c_stride: Int,  # M*N
+    a_stride_arg: Int64,  # M*K
+    b_stride_arg: Int64,  # K*N
+    c_stride_arg: Int64,  # M*N
 ) -> None:
+    var M = Int(M_arg)
+    var N = Int(N_arg)
+    var K = Int(K_arg)
+    var a_stride = Int(a_stride_arg)
+    var b_stride = Int(b_stride_arg)
+    var c_stride = Int(c_stride_arg)
     # With BM=64, BN=64, BK=16, THREADS=1024:
     #   ROWS_PER_THREAD = BM / (THREADS / BN) = 64 / (1024 / 64) = 64 / 16 = 4
     # ty = tid // BN: which "4-row group" this thread belongs to [0, THREADS/BN)
@@ -3583,9 +3765,9 @@ def _attn_headout4_gpu[
         # production shapes (T=1024, HD=64), so no fast-path change.
         var ra = tid // BK
         var ca = tid % BK
-        a_sh.ptr[ra * (BK + 1) + ca] = a_ptr[a_base + ra * K + k + ca] if (
-            m_off + ra < M and k + ca < K
-        ) else Scalar[dt](0)
+        a_sh.ptr[unsafe_offset=ra * (BK + 1) + ca] = a_ptr[
+            unsafe_offset=a_base + ra * K + k + ca
+        ] if (m_off + ra < M and k + ca < K) else Scalar[dt](0)
 
         # Load B tile [BK, BN]: tid → row = tid//BN, col = tid%BN.
         # BK×BN = THREADS → every thread loads exactly 1 element.
@@ -3593,9 +3775,9 @@ def _attn_headout4_gpu[
         # BN cols → 1 cache line per SIMD pair → perfect coalescing.
         var rb = tid // BN
         var cb = tid % BN
-        b_sh.ptr[rb * (BN + 1) + cb] = b_ptr[b_base + (k + rb) * N + cb] if (
-            k + rb < K and n_off + cb < N
-        ) else Scalar[dt](0)
+        b_sh.ptr[unsafe_offset=rb * (BN + 1) + cb] = b_ptr[
+            unsafe_offset=b_base + (k + rb) * N + cb
+        ] if (k + rb < K and n_off + cb < N) else Scalar[dt](0)
 
         barrier()
 
@@ -3605,18 +3787,34 @@ def _attn_headout4_gpu[
         # comptime for forces compile-time unroll: BK=16 iterations, each yields a
         # B-broadcast and 4 FMAs → the Metal shader sees 16 inlined instruction groups.
         comptime for kk in range(BK):
-            var bv = b_sh.ptr[kk * (BN + 1) + tx]
+            var bv = b_sh.ptr[unsafe_offset=kk * (BN + 1) + tx]
             acc0 = fma(
-                a_sh.ptr[(ty * ROWS_PER_THREAD + 0) * (BK + 1) + kk], bv, acc0
+                a_sh.ptr[
+                    unsafe_offset=(ty * ROWS_PER_THREAD + 0) * (BK + 1) + kk
+                ],
+                bv,
+                acc0,
             )
             acc1 = fma(
-                a_sh.ptr[(ty * ROWS_PER_THREAD + 1) * (BK + 1) + kk], bv, acc1
+                a_sh.ptr[
+                    unsafe_offset=(ty * ROWS_PER_THREAD + 1) * (BK + 1) + kk
+                ],
+                bv,
+                acc1,
             )
             acc2 = fma(
-                a_sh.ptr[(ty * ROWS_PER_THREAD + 2) * (BK + 1) + kk], bv, acc2
+                a_sh.ptr[
+                    unsafe_offset=(ty * ROWS_PER_THREAD + 2) * (BK + 1) + kk
+                ],
+                bv,
+                acc2,
             )
             acc3 = fma(
-                a_sh.ptr[(ty * ROWS_PER_THREAD + 3) * (BK + 1) + kk], bv, acc3
+                a_sh.ptr[
+                    unsafe_offset=(ty * ROWS_PER_THREAD + 3) * (BK + 1) + kk
+                ],
+                bv,
+                acc3,
             )
 
         barrier()
@@ -3625,13 +3823,13 @@ def _attn_headout4_gpu[
     var row_base = m_off + ty * ROWS_PER_THREAD
     var c_off = c_base + ty * ROWS_PER_THREAD * N + tx
     if row_base + 0 < M and n_off + tx < N:
-        c_ptr[c_off + 0 * N] = acc0
+        c_ptr[unsafe_offset=c_off + 0 * N] = acc0
     if row_base + 1 < M and n_off + tx < N:
-        c_ptr[c_off + 1 * N] = acc1
+        c_ptr[unsafe_offset=c_off + 1 * N] = acc1
     if row_base + 2 < M and n_off + tx < N:
-        c_ptr[c_off + 2 * N] = acc2
+        c_ptr[unsafe_offset=c_off + 2 * N] = acc2
     if row_base + 3 < M and n_off + tx < N:
-        c_ptr[c_off + 3 * N] = acc3
+        c_ptr[unsafe_offset=c_off + 3 * N] = acc3
 
 
 def _launch_headout4[
@@ -3658,16 +3856,16 @@ def _launch_headout4[
     var compiled = ctx.compile_function[k]()
     ctx.enqueue_function(
         compiled,
-        BH,
-        T,
-        HD,
-        T,
+        Int64(BH),
+        Int64(T),
+        Int64(HD),
+        Int64(T),
         a_ptr,
         b_ptr,
         c_ptr,
-        T * T,
-        T * HD,
-        T * HD,
+        Int64(T * T),
+        Int64(T * HD),
+        Int64(T * HD),
         grid_dim=(tiles_n, tiles_m, BH),
         block_dim=(THREADS,),
     )
@@ -3698,17 +3896,23 @@ def _attn_headout4_transA_gpu[
     BN: Int,  # output cols per block (= HD = 64); BK × BN == THREADS
     BK: Int,  # K-tile step over the summed query axis
 ](
-    bh: Int,
-    M: Int,  # T (key axis → dK/dV rows)
-    N: Int,  # HD
-    K: Int,  # T (query axis, summed)
+    bh_arg: Int64,
+    M_arg: Int64,  # T (key axis → dK/dV rows)
+    N_arg: Int64,  # HD
+    K_arg: Int64,  # T (query axis, summed)
     a_ptr: ImmutKernelPtr[dt],  # [BH, K, M]  — dS or P
     b_ptr: ImmutKernelPtr[dt],  # [BH, K, N]  — Q or dO
     c_ptr: MutKernelPtr[dt],  # [BH, M, N]  — dK or dV
-    a_stride: Int,  # K*M
-    b_stride: Int,  # K*N
-    c_stride: Int,  # M*N
+    a_stride_arg: Int64,  # K*M
+    b_stride_arg: Int64,  # K*N
+    c_stride_arg: Int64,  # M*N
 ) -> None:
+    var M = Int(M_arg)
+    var N = Int(N_arg)
+    var K = Int(K_arg)
+    var a_stride = Int(a_stride_arg)
+    var b_stride = Int(b_stride_arg)
+    var c_stride = Int(c_stride_arg)
     comptime ROWS_PER_THREAD = BM * BN // (BM * BK)  # = BN // BK
     var a_sh = LayoutTensor[
         dt,
@@ -3751,15 +3955,15 @@ def _attn_headout4_transA_gpu[
         # otherwise spill garbage into the dK/dV accumulators on Metal.
         var ra = tid // BM  # k-row in tile  [0, BK)
         var ca = tid % BM  # m-col in tile  [0, BM)
-        a_sh.ptr[ra * (BM + 1) + ca] = a_ptr[
-            a_base + (k + ra) * M + m_off + ca
+        a_sh.ptr[unsafe_offset=ra * (BM + 1) + ca] = a_ptr[
+            unsafe_offset=a_base + (k + ra) * M + m_off + ca
         ] if (k + ra < K and m_off + ca < M) else Scalar[dt](0)
 
         # Load B tile [BK, BN] into b_sh[k_local, n_local]: B[k0+k_local, n_off+n].
         var rb = tid // BN
         var cb = tid % BN
-        b_sh.ptr[rb * (BN + 1) + cb] = b_ptr[
-            b_base + (k + rb) * N + n_off + cb
+        b_sh.ptr[unsafe_offset=rb * (BN + 1) + cb] = b_ptr[
+            unsafe_offset=b_base + (k + rb) * N + n_off + cb
         ] if (k + rb < K and n_off + cb < N) else Scalar[dt](0)
 
         barrier()
@@ -3767,18 +3971,34 @@ def _attn_headout4_transA_gpu[
         # 4 FMAs per B-read: A_sh[kk, m] is a per-SIMD broadcast (ty uniform in a
         # SIMD group); b_sh[kk, tx] cycles all banks over tx.
         comptime for kk in range(BK):
-            var bv = b_sh.ptr[kk * (BN + 1) + tx]
+            var bv = b_sh.ptr[unsafe_offset=kk * (BN + 1) + tx]
             acc0 = fma(
-                a_sh.ptr[kk * (BM + 1) + ty * ROWS_PER_THREAD + 0], bv, acc0
+                a_sh.ptr[
+                    unsafe_offset=kk * (BM + 1) + ty * ROWS_PER_THREAD + 0
+                ],
+                bv,
+                acc0,
             )
             acc1 = fma(
-                a_sh.ptr[kk * (BM + 1) + ty * ROWS_PER_THREAD + 1], bv, acc1
+                a_sh.ptr[
+                    unsafe_offset=kk * (BM + 1) + ty * ROWS_PER_THREAD + 1
+                ],
+                bv,
+                acc1,
             )
             acc2 = fma(
-                a_sh.ptr[kk * (BM + 1) + ty * ROWS_PER_THREAD + 2], bv, acc2
+                a_sh.ptr[
+                    unsafe_offset=kk * (BM + 1) + ty * ROWS_PER_THREAD + 2
+                ],
+                bv,
+                acc2,
             )
             acc3 = fma(
-                a_sh.ptr[kk * (BM + 1) + ty * ROWS_PER_THREAD + 3], bv, acc3
+                a_sh.ptr[
+                    unsafe_offset=kk * (BM + 1) + ty * ROWS_PER_THREAD + 3
+                ],
+                bv,
+                acc3,
             )
 
         barrier()
@@ -3786,13 +4006,13 @@ def _attn_headout4_transA_gpu[
     var row_base = m_off + ty * ROWS_PER_THREAD
     var c_off = c_base + ty * ROWS_PER_THREAD * N + tx
     if row_base + 0 < M and n_off + tx < N:
-        c_ptr[c_off + 0 * N] = acc0
+        c_ptr[unsafe_offset=c_off + 0 * N] = acc0
     if row_base + 1 < M and n_off + tx < N:
-        c_ptr[c_off + 1 * N] = acc1
+        c_ptr[unsafe_offset=c_off + 1 * N] = acc1
     if row_base + 2 < M and n_off + tx < N:
-        c_ptr[c_off + 2 * N] = acc2
+        c_ptr[unsafe_offset=c_off + 2 * N] = acc2
     if row_base + 3 < M and n_off + tx < N:
-        c_ptr[c_off + 3 * N] = acc3
+        c_ptr[unsafe_offset=c_off + 3 * N] = acc3
 
 
 def _launch_headout4_transA[
@@ -3819,16 +4039,16 @@ def _launch_headout4_transA[
     var compiled = ctx.compile_function[k]()
     ctx.enqueue_function(
         compiled,
-        BH,
-        T,
-        HD,
-        T,
+        Int64(BH),
+        Int64(T),
+        Int64(HD),
+        Int64(T),
         a_ptr,
         b_ptr,
         c_ptr,
-        T * T,
-        T * HD,
-        T * HD,
+        Int64(T * T),
+        Int64(T * HD),
+        Int64(T * HD),
         grid_dim=(tiles_n, tiles_m, BH),
         block_dim=(THREADS,),
     )
@@ -3849,18 +4069,24 @@ def _attn_batched_scoreout_gpu[
     BN: Int,  # output cols per block
     BK: Int,  # = HD = 64; entire K loaded in one tile (BM//2 * BK must equal THREADS)
 ](
-    bh: Int,
-    M: Int,  # T
-    N: Int,  # T
-    K: Int,  # HD
+    bh_arg: Int64,
+    M_arg: Int64,  # T
+    N_arg: Int64,  # T
+    K_arg: Int64,  # HD
     a_ptr: ImmutKernelPtr[dt],  # [BH, T, HD] — Q or dO
     b_ptr: ImmutKernelPtr[
         dt
     ],  # [BH, T, HD] — K or V (accessed as row-major, col is K dim)
     c_ptr: MutKernelPtr[dt],  # [BH, T, T]  — output scores (written in fp32)
-    tiles_m: Int,
-    tiles_n: Int,
+    tiles_m_arg: Int64,
+    tiles_n_arg: Int64,
 ) -> None:
+    var bh = Int(bh_arg)
+    var M = Int(M_arg)
+    var N = Int(N_arg)
+    var K = Int(K_arg)
+    var tiles_m = Int(tiles_m_arg)
+    var tiles_n = Int(tiles_n_arg)
     # Shared mem: A_sh[BM, BK+1] and B_sh[BN, BK+1] — +1 padding avoids bank conflicts.
     var a_sh = LayoutTensor[
         dt,
@@ -3899,22 +4125,22 @@ def _attn_batched_scoreout_gpu[
     #         ia // BK = row ∈ [0, BM//2), ia % BK = col ∈ [0, BK)
     # Pass 2: ia = tid + BM//2 * BK (= tid + THREADS) → row ∈ [BM//2, BM)
     var ia = tid
-    a_sh.ptr[ia // BK * (BK + 1) + ia % BK] = a_ptr[
-        a_base + ia // BK * K + ia % BK
+    a_sh.ptr[unsafe_offset=ia // BK * (BK + 1) + ia % BK] = a_ptr[
+        unsafe_offset=a_base + ia // BK * K + ia % BK
     ]
     ia = tid + BM // 2 * BK
-    a_sh.ptr[ia // BK * (BK + 1) + ia % BK] = a_ptr[
-        a_base + ia // BK * K + ia % BK
+    a_sh.ptr[unsafe_offset=ia // BK * (BK + 1) + ia % BK] = a_ptr[
+        unsafe_offset=a_base + ia // BK * K + ia % BK
     ]
 
     # Load B tile [BN, BK] = 2*THREADS elements; same pattern as A.
     var ib = tid
-    b_sh.ptr[ib // BK * (BK + 1) + ib % BK] = b_ptr[
-        b_base + ib // BK * K + ib % BK
+    b_sh.ptr[unsafe_offset=ib // BK * (BK + 1) + ib % BK] = b_ptr[
+        unsafe_offset=b_base + ib // BK * K + ib % BK
     ]
     ib = tid + BN // 2 * BK
-    b_sh.ptr[ib // BK * (BK + 1) + ib % BK] = b_ptr[
-        b_base + ib // BK * K + ib % BK
+    b_sh.ptr[unsafe_offset=ib // BK * (BK + 1) + ib % BK] = b_ptr[
+        unsafe_offset=b_base + ib // BK * K + ib % BK
     ]
 
     barrier()
@@ -3927,11 +4153,13 @@ def _attn_batched_scoreout_gpu[
     var acc = Scalar[dt](0.0)
     for kk in range(K):
         acc = fma(
-            a_sh.ptr[ty * (BK + 1) + kk], b_sh.ptr[tx * (BK + 1) + kk], acc
+            a_sh.ptr[unsafe_offset=ty * (BK + 1) + kk],
+            b_sh.ptr[unsafe_offset=tx * (BK + 1) + kk],
+            acc,
         )
 
     if m_off + ty < M and n_off + tx < N:
-        c_ptr[c_base + ty * N + tx] = acc
+        c_ptr[unsafe_offset=c_base + ty * N + tx] = acc
 
 
 def _launch_batched_scoreout[
@@ -3958,15 +4186,15 @@ def _launch_batched_scoreout[
     var compiled = ctx.compile_function[k]()
     ctx.enqueue_function(
         compiled,
-        BH,
-        T,
-        T,
-        HD,
+        Int64(BH),
+        Int64(T),
+        Int64(T),
+        Int64(HD),
         a_ptr,
         b_ptr,
         c_ptr,
-        tiles_m,
-        tiles_n,
+        Int64(tiles_m),
+        Int64(tiles_n),
         grid_dim=(num_blocks,),
         block_dim=(THREADS,),
     )
@@ -4005,8 +4233,8 @@ def _launch_transpose_planes[
     var compiled = ctx.compile_function[k]()
     ctx.enqueue_function(
         compiled,
-        num_planes,
-        seq_len,
+        Int64(num_planes),
+        Int64(seq_len),
         src_ptr,
         dst_ptr,
         grid_dim=(num_blocks,),
@@ -4045,9 +4273,9 @@ def _launch_rect_transpose[
     var compiled = ctx.compile_function[k]()
     ctx.enqueue_function(
         compiled,
-        num_planes,
-        rows,
-        cols,
+        Int64(num_planes),
+        Int64(rows),
+        Int64(cols),
         src_ptr,
         dst_ptr,
         grid_dim=(num_blocks,),
@@ -4089,19 +4317,19 @@ def _attn_gemm_batched_metal[
         for bh in range(BH):
             var a = TileTensor(
                 Span[Scalar[dt], ImmutAnyOrigin](
-                    unsafe_ptr=a_ptr + bh * a_stride, length=M * K
+                    unsafe_ptr=a_ptr.unsafe_offset(bh * a_stride), length=M * K
                 ),
                 row_major(M, K),
             )
             var b = TileTensor(
                 Span[Scalar[dt], ImmutAnyOrigin](
-                    unsafe_ptr=b_ptr + bh * b_stride, length=N * K
+                    unsafe_ptr=b_ptr.unsafe_offset(bh * b_stride), length=N * K
                 ),
                 row_major(N, K),
             )
             var c = TileTensor(
                 Span[Scalar[dt], MutAnyOrigin](
-                    unsafe_ptr=c_ptr + bh * c_stride, length=M * N
+                    unsafe_ptr=c_ptr.unsafe_offset(bh * c_stride), length=M * N
                 ),
                 row_major(M, N),
             )
@@ -4110,19 +4338,19 @@ def _attn_gemm_batched_metal[
         for bh in range(BH):
             var a = TileTensor(
                 Span[Scalar[dt], ImmutAnyOrigin](
-                    unsafe_ptr=a_ptr + bh * a_stride, length=M * K
+                    unsafe_ptr=a_ptr.unsafe_offset(bh * a_stride), length=M * K
                 ),
                 row_major(M, K),
             )
             var b = TileTensor(
                 Span[Scalar[dt], ImmutAnyOrigin](
-                    unsafe_ptr=b_ptr + bh * b_stride, length=K * N
+                    unsafe_ptr=b_ptr.unsafe_offset(bh * b_stride), length=K * N
                 ),
                 row_major(K, N),
             )
             var c = TileTensor(
                 Span[Scalar[dt], MutAnyOrigin](
-                    unsafe_ptr=c_ptr + bh * c_stride, length=M * N
+                    unsafe_ptr=c_ptr.unsafe_offset(bh * c_stride), length=M * N
                 ),
                 row_major(M, N),
             )
@@ -4294,23 +4522,27 @@ def _attn_gemm_batched[
                 Int64(N),
                 Int64(M),
                 Int64(K),
-                UnsafePointer(to=alpha)
-                .bitcast[NoneType]()
+                Pointer(to=alpha)
+                .unsafe_bitcast[NoneType]()
                 .as_imm()
                 .as_unsafe_any_origin(),
-                b_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+                b_ptr.unsafe_bitcast[NoneType]()
+                .as_imm()
+                .as_unsafe_any_origin(),
                 _cublas_dt[b_dt](),
                 Int64(lda),
                 Int64(b_stride),
-                a_ptr.bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+                a_ptr.unsafe_bitcast[NoneType]()
+                .as_imm()
+                .as_unsafe_any_origin(),
                 _cublas_dt[a_dt](),
                 Int64(ldb),
                 Int64(a_stride),
-                UnsafePointer(to=beta)
-                .bitcast[NoneType]()
+                Pointer(to=beta)
+                .unsafe_bitcast[NoneType]()
                 .as_imm()
                 .as_unsafe_any_origin(),
-                c_ptr.bitcast[NoneType]().as_unsafe_any_origin(),
+                c_ptr.unsafe_bitcast[NoneType]().as_unsafe_any_origin(),
                 _cublas_dt[c_dt](),
                 Int64(N),
                 Int64(c_stride),
@@ -4547,10 +4779,12 @@ def attention_bwd_gemm[
     var use_stored = cache and cache.value()[].att_probs_addr != 0
     if use_stored:
         var c = cache.value()
-        var ap = UnsafePointer[Scalar[dtype], MutUntrackedOrigin](
+        var ap = Pointer[Scalar[dtype], MutUntrackedOrigin](
             unsafe_from_address=c[].att_probs_addr
         )
-        var att_slice = ap + c[].att_probs_layer * c[].att_probs_stride
+        var att_slice = ap.unsafe_offset(
+            c[].att_probs_layer * c[].att_probs_stride
+        )
         scores_immut = rebind[ImmutKernelPtr[dtype]](att_slice)
         p_immut = rebind[ImmutKernelPtr[dtype]](att_slice)
     # NOTE (Metal): do NOT reuse the forward's gemm_att scratch (p_buf) as the
@@ -4606,8 +4840,8 @@ def attention_bwd_gemm[
     var d_compiled = device_ctx.compile_function[d_kernel]()
     device_ctx.enqueue_function(
         d_compiled,
-        BH * T,
-        hd,
+        Int64(BH * T),
+        Int64(hd),
         d_output_ptr,
         output_ptr,
         d_buf,
@@ -4635,8 +4869,8 @@ def attention_bwd_gemm[
             var pds_c = device_ctx.compile_function[pds_stored]()
             device_ctx.enqueue_function(
                 pds_c,
-                pds_blocks,
-                T,
+                Int64(pds_blocks),
+                Int64(T),
                 attention_scale,
                 scores_immut,
                 log_sum_exp_ptr,
@@ -4654,8 +4888,8 @@ def attention_bwd_gemm[
             var pds_c = device_ctx.compile_function[pds_stored_u]()
             device_ctx.enqueue_function(
                 pds_c,
-                pds_blocks,
-                T,
+                Int64(pds_blocks),
+                Int64(T),
                 attention_scale,
                 scores_immut,
                 log_sum_exp_ptr,
@@ -4674,8 +4908,8 @@ def attention_bwd_gemm[
             var pds_c = device_ctx.compile_function[pds_recompute]()
             device_ctx.enqueue_function(
                 pds_c,
-                pds_blocks,
-                T,
+                Int64(pds_blocks),
+                Int64(T),
                 attention_scale,
                 scores_immut,
                 log_sum_exp_ptr,
@@ -4693,8 +4927,8 @@ def attention_bwd_gemm[
             var pds_c = device_ctx.compile_function[pds_recompute_u]()
             device_ctx.enqueue_function(
                 pds_c,
-                pds_blocks,
-                T,
+                Int64(pds_blocks),
+                Int64(T),
                 attention_scale,
                 scores_immut,
                 log_sum_exp_ptr,
@@ -4922,9 +5156,9 @@ def attention_bwd[
                 if cache:
                     cache.value()[].bwd_dq_addr = addr_dq
 
-            var casted_ptr_dq = UnsafePointer[
-                CompiledTypeDQ, MutUntrackedOrigin
-            ](unsafe_from_address=addr_dq)
+            var casted_ptr_dq = Pointer[CompiledTypeDQ, MutUntrackedOrigin](
+                unsafe_from_address=addr_dq
+            )
             var retrieved_dq = casted_ptr_dq[]
 
             device_ctx.enqueue_function(
@@ -4947,8 +5181,8 @@ def attention_bwd[
             var compiled_dq = device_ctx.compile_function[gpu_kernel_dq]()
             device_ctx.enqueue_function(
                 compiled_dq,
-                num_tiles_dq,
-                query_tiles,
+                Int64(num_tiles_dq),
+                Int64(query_tiles),
                 d_query_ptr,
                 query_ptr,
                 key_ptr,
@@ -4995,9 +5229,9 @@ def attention_bwd[
                 if cache:
                     cache.value()[].bwd_dkv_addr = addr_dkv
 
-            var casted_ptr_dkv = UnsafePointer[
-                CompiledTypeDKV, MutUntrackedOrigin
-            ](unsafe_from_address=addr_dkv)
+            var casted_ptr_dkv = Pointer[CompiledTypeDKV, MutUntrackedOrigin](
+                unsafe_from_address=addr_dkv
+            )
             var retrieved_dkv = casted_ptr_dkv[]
 
             device_ctx.enqueue_function(
@@ -5022,9 +5256,9 @@ def attention_bwd[
             var compiled_dkv = device_ctx.compile_function[gpu_kernel_dkv]()
             device_ctx.enqueue_function(
                 compiled_dkv,
-                num_tiles_dkv,
-                kv_tiles,
-                query_tiles,
+                Int64(num_tiles_dkv),
+                Int64(kv_tiles),
+                Int64(query_tiles),
                 d_key_ptr,
                 d_value_ptr,
                 query_ptr,

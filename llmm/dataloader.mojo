@@ -4,7 +4,7 @@ from std.python import Python
 # llm.c shuffles its dataloader with the mt19937 stream from rand.h (not the
 # xorshift sampler rng), so use the mt19937 port for batch-order parity.
 from llmm.rand import MT19937, random_permutation
-from llmm.memory import ImmutKernelPtr, MutMemPtr
+from llmm.memory import MutMemPtr
 
 
 # ===----------------------------------------------------------------------=== #
@@ -225,17 +225,17 @@ struct DataLoader:
                 + self.files[self.current_shard_idx]
             )
 
-        var header_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        var header_ptr = rebind[Pointer[UInt8, MutUntrackedOrigin]](
             header_bytes.unsafe_ptr()
-        ).bitcast[Int32]()
-        self.magic = header_ptr.load(0)
+        ).unsafe_bitcast[Int32]()
+        self.magic = header_ptr.unsafe_load(0)
         assert (
             self.magic == GPT2_MAGIC or self.magic == LLAMA3_MAGIC
         ), "DataLoader error: Invalid magic number in header: " + String(
             self.magic
         )
-        self.version = header_ptr.load(1)
-        self.current_shard_tokens = Int(header_ptr.load(2))
+        self.version = header_ptr.unsafe_load(1)
+        self.current_shard_tokens = Int(header_ptr.unsafe_load(2))
         # Keep the header buffer live past the last header_ptr use; the raw
         # pointer does not own it and ASAP destruction otherwise frees it at
         # the .unsafe_ptr() call (allocator scribble over magic/version).
@@ -352,20 +352,20 @@ struct DataLoader:
                 "DataLoader error: Failed to read enough bytes from file"
             )
 
-        var raw_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        var raw_ptr = rebind[Pointer[UInt8, MutUntrackedOrigin]](
             bytes_read.unsafe_ptr()
         )
 
         if self.token_size == 2:
-            var ptr_u16 = raw_ptr.bitcast[UInt16]()
+            var ptr_u16 = raw_ptr.unsafe_bitcast[UInt16]()
             for i in range(B * T):
-                self.inputs.store(i, Int32(ptr_u16.load(i)))
-                self.targets.store(i, Int32(ptr_u16.load(i + 1)))
+                self.inputs.unsafe_store(i, Int32(ptr_u16.unsafe_load(i)))
+                self.targets.unsafe_store(i, Int32(ptr_u16.unsafe_load(i + 1)))
         else:
-            var ptr_u32 = raw_ptr.bitcast[UInt32]()
+            var ptr_u32 = raw_ptr.unsafe_bitcast[UInt32]()
             for i in range(B * T):
-                self.inputs.store(i, Int32(ptr_u32.load(i)))
-                self.targets.store(i, Int32(ptr_u32.load(i + 1)))
+                self.inputs.unsafe_store(i, Int32(ptr_u32.unsafe_load(i)))
+                self.targets.unsafe_store(i, Int32(ptr_u32.unsafe_load(i + 1)))
         # Keep the token buffer live past the copy loops (see header note).
         _ = bytes_read^
 
@@ -381,11 +381,11 @@ struct DataLoader:
         except:
             pass
 
-    def __del__(deinit self):
+    def __deinit__(deinit self):
         try:
             self.tokens_file.close()
         except:
             pass
         if self.has_allocated:
-            self.inputs.free()
-            self.targets.free()
+            self.inputs.unsafe_free()
+            self.targets.unsafe_free()

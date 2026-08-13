@@ -10,17 +10,17 @@ from std.sys import (
 from std.sys.info import size_of
 from std.time import global_perf_counter_ns
 from std.ffi import external_call
-from std.algorithm import sync_parallelize
+from max.algorithm import sync_parallelize
 from std.gpu.host.info import is_cpu, is_gpu
 from std.sys import get_defined_int, get_defined_string, is_defined
-from std.gpu.host import (
+from max.gpu.host import (
     DeviceContext,
     HostBuffer,
     DeviceBuffer,
     DeviceAttribute,
 )
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.memory import alloc, UnsafePointer, unsafe_memcpy, memset_zero
+from std.gpu import block_dim, block_idx, grid_dim
+from std.memory import alloc, unsafe_memcpy
 
 from llmm.io import read_and_copy
 from llmm.lowp import (
@@ -71,10 +71,7 @@ from llmm.matmul import (
     matmul_fwd_fp4,
     matmul_bwd_fp4,
 )
-from llmm.softmax import softmax_fwd, softmax_bwd
-from llmm.crossentropy import crossentropy_ohe_fwd, crossentropy_ohe_bwd
 from llmm.global_norm import (
-    global_norm_squared,
     global_norm_squared_cpu,
     global_norm_squared_gpu,
     global_norm_aggregate_gpu,
@@ -92,20 +89,14 @@ from llmm.rand import MT19937, normal_
 from llmm.mfu import estimate_mfu
 from llmm.tokenizer import Tokenizer, safe_print
 from llmm.memory import (
-    ImmutKernelPtr,
     ImmutMemPtr,
     MutMemPtr,
     MutKernelPtr,
-    as_immut_kernel,
     as_immut_kernel_from_mut,
     as_mut_kernel,
     rebind_mut_mem,
 )
-from llmm.zero import (
-    ZeroContext,
-    ShardedParameter,
-    CpuCoordinator,
-)
+from llmm.zero import ZeroContext, CpuCoordinator
 from llmm.vendor import HAS_METAL
 
 
@@ -571,7 +562,7 @@ struct ParameterTensors[
         self.params_memory = params_memory
 
         comptime ParamPtr = MutMemPtr[Self.dtype]
-        comptime ParamPtrPtr = UnsafePointer[ParamPtr, MutAnyOrigin]
+        comptime ParamPtrPtr = Pointer[ParamPtr, MutAnyOrigin]
 
         var ptrs = List[ParamPtrPtr]()
         ptrs.append(ParamPtrPtr(to=self.wte))
@@ -595,7 +586,9 @@ struct ParameterTensors[
 
         for i in range(len(param_sizes)):
             ptrs[i][] = params_memory_iterator
-            params_memory_iterator += param_sizes[i]
+            params_memory_iterator = params_memory_iterator.unsafe_offset(
+                param_sizes[i]
+            )
 
 
 # ===----------------------------------------------------------------------=== #
@@ -728,8 +721,8 @@ struct ActivationTensors[
         # the main (param-precision) activations live in `main_memory`, the fp32
         # statistics/losses in `stats_memory`. Each list is (field-ptr, size) in
         # buffer order; a running cursor walks each block independently.
-        comptime MainPtrPtr = UnsafePointer[MutMemPtr[Self.dtype], MutAnyOrigin]
-        comptime StatPtrPtr = UnsafePointer[MutMemPtr[StatsDType], MutAnyOrigin]
+        comptime MainPtrPtr = Pointer[MutMemPtr[Self.dtype], MutAnyOrigin]
+        comptime StatPtrPtr = Pointer[MutMemPtr[StatsDType], MutAnyOrigin]
 
         # Main (param-precision) activations, in buffer order, with their sizes.
         var mains = List[MainPtrPtr]()
@@ -796,12 +789,12 @@ struct ActivationTensors[
         var a = main_memory
         for i in range(len(mains)):
             mains[i][] = a
-            a += sizes[main_idx[i]]
+            a = a.unsafe_offset(sizes[main_idx[i]])
 
         var s = stats_memory
         for i in range(len(stats)):
             stats[i][] = s
-            s += sizes[stat_idx[i]]
+            s = s.unsafe_offset(sizes[stat_idx[i]])
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1382,7 +1375,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         zero_stage: Int,
         ctx: DeviceContext,
         cpu_coordinator_ptr: Optional[
-            UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
+            Pointer[CpuCoordinator, MutUntrackedOrigin]
         ] = None,
     ) raises:
         self.ctx = ctx
@@ -1544,27 +1537,30 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var model_header = alloc[Int32](256)
             read_and_copy[DType.int32](model_file, model_header, 256)
 
-            var model_magic = model_header.load(0)
+            var model_magic = model_header.unsafe_load(0)
             if model_magic != GPT2_MAGIC and model_magic != GPT2_MAGIC_LEGACY:
                 print("Bad magic number in header: " + String(model_magic))
-                model_header.free()
+                model_header.unsafe_free()
                 raise Error("GPT2 error: Invalid magic number in header")
             # llm.c's version convention: 3 => fp32 params, 5 => bf16 params.
             comptime EXPECTED_VERSION = 5 if GPT2_DTYPE == DType.bfloat16 else 3
-            if Int(model_header.load(1)) != EXPECTED_VERSION:
-                print("Bad version in header: " + String(model_header.load(1)))
-                model_header.free()
+            if Int(model_header.unsafe_load(1)) != EXPECTED_VERSION:
+                print(
+                    "Bad version in header: "
+                    + String(model_header.unsafe_load(1))
+                )
+                model_header.unsafe_free()
                 raise Error("GPT2 error: Invalid version in header")
 
             self.config = GPT2Config(
-                max_seq_len=Int(model_header.load(2)),
-                vocab_size=Int(model_header.load(3)),
-                num_layer=Int(model_header.load(4)),
-                num_heads=Int(model_header.load(5)),
-                channels=Int(model_header.load(6)),
-                padded_vocab_size=Int(model_header.load(7)),
+                max_seq_len=Int(model_header.unsafe_load(2)),
+                vocab_size=Int(model_header.unsafe_load(3)),
+                num_layer=Int(model_header.unsafe_load(4)),
+                num_heads=Int(model_header.unsafe_load(5)),
+                channels=Int(model_header.unsafe_load(6)),
+                padded_vocab_size=Int(model_header.unsafe_load(7)),
             )
-            model_header.free()
+            model_header.unsafe_free()
 
             self.allocate_parameters(model_file)
         elif self.checkpoint_path.endswith(".safetensors"):
@@ -1669,10 +1665,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         return acc
 
     @always_inline
-    def _z3_shard_ptr(self) -> UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]:
+    def _z3_shard_ptr(self) -> Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]:
         """This rank's persistent parameter shard base (offset 0 == full-vector
         index rank*optimizer_num_parameters) as a collective-ready pointer."""
-        return rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+        return rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
             self.params_memory.as_unsafe_any_origin()
         )
 
@@ -1691,7 +1687,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         return False
 
     def _z3_finalize_params(
-        mut self, host_full: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+        mut self, host_full: Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
     ) raises:
         """Shared tail of the three parameter-allocation paths. `host_full` holds
         all `num_parameters` params on the host. Under ZeRO-3 streaming the
@@ -1723,22 +1719,22 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             if ln > 0:
                 self.ctx.enqueue_copy(
-                    dst_ptr=rebind[
-                        UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
-                    ](self.params_memory.as_unsafe_any_origin()),
-                    src_ptr=rebind[
-                        UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
-                    ]((host_full + off).as_unsafe_any_origin()),
+                    dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.params_memory.as_unsafe_any_origin()
+                    ),
+                    src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                        (host_full.unsafe_offset(off)).as_unsafe_any_origin()
+                    ),
                     size=ln,
                 )
         else:
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                     self.params_memory.as_unsafe_any_origin()
                 ),
-                src_ptr=rebind[
-                    UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
-                ](host_full.as_unsafe_any_origin()),
+                src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                    host_full.as_unsafe_any_origin()
+                ),
                 size=self.num_parameters,
             )
         self.ctx.synchronize()
@@ -1806,7 +1802,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.zero_ctx.allgather_ranges[GPT2_DTYPE](
             self._z3_shard_ptr(),
             self.optimizer_num_parameters,
-            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 wbase.as_unsafe_any_origin()
             ),
             dst_offsets,
@@ -1815,11 +1811,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
         var b = 0
         comptime if not Z3_WTE_ONDEMAND:
-            self.params.wte = wbase + dst_offsets[0]
+            self.params.wte = wbase.unsafe_offset(dst_offsets[0])
             b = 1
-        self.params.wpe = wbase + dst_offsets[b]
-        self.params.ln_f_gamma = wbase + dst_offsets[b + 1]
-        self.params.ln_f_beta = wbase + dst_offsets[b + 2]
+        self.params.wpe = wbase.unsafe_offset(dst_offsets[b])
+        self.params.ln_f_gamma = wbase.unsafe_offset(dst_offsets[b + 1])
+        self.params.ln_f_beta = wbase.unsafe_offset(dst_offsets[b + 2])
 
     def _lm_head_wte_tile(
         mut self, tile_start: Int, tile_rows: Int
@@ -1835,18 +1831,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         comptime if Z3_WTE_ONDEMAND:
             if self.z3_streaming:
                 var c = self.config.channels
-                var dst_offsets = [0]
-                var flat_starts = [
+                var dst_offsets: List[Int] = [0]
+                var flat_starts: List[Int] = [
                     self._z3_param_offset(Parameters.wte) + tile_start * c
                 ]
-                var lengths = [tile_rows * c]
+                var lengths: List[Int] = [tile_rows * c]
                 var tbase = rebind_mut_mem[GPT2_DTYPE](
                     self.wte_tile_buf.unsafe_ptr().as_unsafe_any_origin()
                 )
                 self.zero_ctx.allgather_ranges[GPT2_DTYPE](
                     self._z3_shard_ptr(),
                     self.optimizer_num_parameters,
-                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         tbase.as_unsafe_any_origin()
                     ),
                     dst_offsets,
@@ -1854,7 +1850,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     lengths,
                 )
                 return tbase
-        return self.params.wte + tile_start * self.config.channels
+        return self.params.wte.unsafe_offset(tile_start * self.config.channels)
 
     def _z3_stream_layer(mut self, layer: Int) raises:
         """Gather transformer `layer`'s 12 tensors into `param_window_buf` and
@@ -1895,7 +1891,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.zero_ctx.allgather_ranges[GPT2_DTYPE](
             self._z3_shard_ptr(),
             self.optimizer_num_parameters,
-            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 wbase.as_unsafe_any_origin()
             ),
             dst_offsets,
@@ -1905,27 +1901,45 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         # Re-base so the existing `<ptr> + layer*stride` addressing in
         # forward/backward lands on this layer's window slot.
-        self.params.ln_1_gamma = wbase + (dst_offsets[0] - layer * lengths[0])
-        self.params.ln_1_beta = wbase + (dst_offsets[1] - layer * lengths[1])
-        self.params.qkv_weight = wbase + (dst_offsets[2] - layer * lengths[2])
-        self.params.qkv_bias = wbase + (dst_offsets[3] - layer * lengths[3])
-        self.params.attn_proj_weight = wbase + (
-            dst_offsets[4] - layer * lengths[4]
+        self.params.ln_1_gamma = wbase.unsafe_offset(
+            (dst_offsets[0] - layer * lengths[0])
         )
-        self.params.attn_proj_bias = wbase + (
-            dst_offsets[5] - layer * lengths[5]
+        self.params.ln_1_beta = wbase.unsafe_offset(
+            (dst_offsets[1] - layer * lengths[1])
         )
-        self.params.ln_2_gamma = wbase + (dst_offsets[6] - layer * lengths[6])
-        self.params.ln_2_beta = wbase + (dst_offsets[7] - layer * lengths[7])
-        self.params.fc_weight = wbase + (dst_offsets[8] - layer * lengths[8])
-        self.params.fc_bias = wbase + (dst_offsets[9] - layer * lengths[9])
-        self.params.proj_weight = wbase + (
-            dst_offsets[10] - layer * lengths[10]
+        self.params.qkv_weight = wbase.unsafe_offset(
+            (dst_offsets[2] - layer * lengths[2])
         )
-        self.params.proj_bias = wbase + (dst_offsets[11] - layer * lengths[11])
+        self.params.qkv_bias = wbase.unsafe_offset(
+            (dst_offsets[3] - layer * lengths[3])
+        )
+        self.params.attn_proj_weight = wbase.unsafe_offset(
+            (dst_offsets[4] - layer * lengths[4])
+        )
+        self.params.attn_proj_bias = wbase.unsafe_offset(
+            (dst_offsets[5] - layer * lengths[5])
+        )
+        self.params.ln_2_gamma = wbase.unsafe_offset(
+            (dst_offsets[6] - layer * lengths[6])
+        )
+        self.params.ln_2_beta = wbase.unsafe_offset(
+            (dst_offsets[7] - layer * lengths[7])
+        )
+        self.params.fc_weight = wbase.unsafe_offset(
+            (dst_offsets[8] - layer * lengths[8])
+        )
+        self.params.fc_bias = wbase.unsafe_offset(
+            (dst_offsets[9] - layer * lengths[9])
+        )
+        self.params.proj_weight = wbase.unsafe_offset(
+            (dst_offsets[10] - layer * lengths[10])
+        )
+        self.params.proj_bias = wbase.unsafe_offset(
+            (dst_offsets[11] - layer * lengths[11])
+        )
 
     def _z3_gather_full(
-        mut self, dst: UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+        mut self, dst: Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
     ) raises:
         """Reconstruct the full parameter vector (natural layout) into `dst` from
         the per-rank shards. Collective — every rank must call it. Used only for
@@ -2037,7 +2051,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         model_file.close()
 
         self._z3_finalize_params(
-            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 temp_ptr.as_unsafe_any_origin()
             )
         )
@@ -2068,7 +2082,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             host_params.unsafe_ptr().as_unsafe_any_origin()
         )
         for i in range(self.num_parameters):
-            hp[i] = Scalar[GPT2_DTYPE](0.0)
+            hp[unsafe_offset=i] = Scalar[GPT2_DTYPE](0.0)
 
         # fp32 scratch for the normal_ draws, sized to the largest single draw
         # (wte is V*C; the per-layer weight draws are at most 4*C*C).
@@ -2100,7 +2114,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     or i == Parameters.ln_f_gamma
                 ):
                     for j in range(n_elem):
-                        hp[offset + j] = Scalar[GPT2_DTYPE](1.0)
+                        hp[unsafe_offset=offset + j] = Scalar[GPT2_DTYPE](1.0)
                 # Weight tensors: wte/wpe once at l==0, the per-layer attention
                 # and MLP weights every layer.
                 var is_layer_weight = (
@@ -2130,16 +2144,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         scale = INIT_WEIGHT_STD * residual_scale
                     normal_(rng, fp32_ptr, n, Float32(0.0), scale)
                     for j in range(n):
-                        hp[offset + layer_offset + j] = fp32_ptr[j].cast[
-                            GPT2_DTYPE
-                        ]()
+                        hp[unsafe_offset=offset + layer_offset + j] = fp32_ptr[
+                            unsafe_offset=j
+                        ].cast[GPT2_DTYPE]()
                 offset += n_elem
 
-        fp32_scratch.free()
+        fp32_scratch.unsafe_free()
 
         # Copy the host params to the device (shard-only under ZeRO-3 streaming).
         self._z3_finalize_params(
-            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 hp.as_unsafe_any_origin()
             )
         )
@@ -2174,7 +2188,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             temp_host_buf.unsafe_ptr().as_unsafe_any_origin()
         )
         for i in range(self.num_parameters):
-            hp[i] = Scalar[GPT2_DTYPE](0.0)
+            hp[unsafe_offset=i] = Scalar[GPT2_DTYPE](0.0)
 
         var st = SafetensorsFile(safetensors_path)
 
@@ -2185,10 +2199,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # ignores them (it masks dlogits/loss to the real V columns, see
         # llmm/fused_classifier.mojo).
         var base = 0
-        st.read_tensor[GPT2_DTYPE]("transformer.wte.weight", hp + base)
+        st.read_tensor[GPT2_DTYPE](
+            "transformer.wte.weight", hp.unsafe_offset(base)
+        )
         base += V_p * C
 
-        st.read_tensor[GPT2_DTYPE]("transformer.wpe.weight", hp + base)
+        st.read_tensor[GPT2_DTYPE](
+            "transformer.wpe.weight", hp.unsafe_offset(base)
+        )
         base += max_T * C
 
         # ln_1_gamma / ln_1_beta: each layer's C values are concatenated
@@ -2197,13 +2215,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".ln_1.weight",
-                hp + base + l * C,
+                (hp.unsafe_offset(base)).unsafe_offset(l * C),
             )
         base += L * C
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".ln_1.bias",
-                hp + base + l * C,
+                (hp.unsafe_offset(base)).unsafe_offset(l * C),
             )
         base += L * C
 
@@ -2212,7 +2230,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".attn.c_attn.weight",
-                hp + base + l * (3 * C * C),
+                hp.unsafe_offset(base).unsafe_offset(l * (3 * C * C)),
                 transpose_rows=3 * C,
                 transpose_cols=C,
             )
@@ -2220,14 +2238,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".attn.c_attn.bias",
-                hp + base + l * (3 * C),
+                (hp.unsafe_offset(base)).unsafe_offset(l * (3 * C)),
             )
         base += L * (3 * C)
 
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".attn.c_proj.weight",
-                hp + base + l * (C * C),
+                (hp.unsafe_offset(base)).unsafe_offset(l * (C * C)),
                 transpose_rows=C,
                 transpose_cols=C,
             )
@@ -2235,20 +2253,20 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".attn.c_proj.bias",
-                hp + base + l * C,
+                (hp.unsafe_offset(base)).unsafe_offset(l * C),
             )
         base += L * C
 
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".ln_2.weight",
-                hp + base + l * C,
+                (hp.unsafe_offset(base)).unsafe_offset(l * C),
             )
         base += L * C
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".ln_2.bias",
-                hp + base + l * C,
+                (hp.unsafe_offset(base)).unsafe_offset(l * C),
             )
         base += L * C
 
@@ -2257,7 +2275,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".mlp.c_fc.weight",
-                hp + base + l * (4 * C * C),
+                hp.unsafe_offset(base).unsafe_offset(l * (4 * C * C)),
                 transpose_rows=4 * C,
                 transpose_cols=C,
             )
@@ -2265,7 +2283,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".mlp.c_fc.bias",
-                hp + base + l * (4 * C),
+                (hp.unsafe_offset(base)).unsafe_offset(l * (4 * C)),
             )
         base += L * (4 * C)
 
@@ -2274,7 +2292,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".mlp.c_proj.weight",
-                hp + base + l * (C * 4 * C),
+                (hp.unsafe_offset(base)).unsafe_offset(l * (C * 4 * C)),
                 transpose_rows=C,
                 transpose_cols=4 * C,
             )
@@ -2282,17 +2300,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for l in range(L):
             st.read_tensor[GPT2_DTYPE](
                 "transformer.h." + String(l) + ".mlp.c_proj.bias",
-                hp + base + l * C,
+                (hp.unsafe_offset(base)).unsafe_offset(l * C),
             )
         base += L * C
 
-        st.read_tensor[GPT2_DTYPE]("transformer.ln_f.weight", hp + base)
+        st.read_tensor[GPT2_DTYPE](
+            "transformer.ln_f.weight", hp.unsafe_offset(base)
+        )
         base += C
-        st.read_tensor[GPT2_DTYPE]("transformer.ln_f.bias", hp + base)
+        st.read_tensor[GPT2_DTYPE](
+            "transformer.ln_f.bias", hp.unsafe_offset(base)
+        )
         base += C
 
         self._z3_finalize_params(
-            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 hp.as_unsafe_any_origin()
             )
         )
@@ -2442,7 +2464,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         across buckets and micro-steps, so this clears the previous occupant."""
         comptime if is_cpu[Self.target]():
             for i in range(cnt):
-                self.grad_pool_memory[i] = Scalar[GPT2_DTYPE](0)
+                self.grad_pool_memory[unsafe_offset=i] = Scalar[GPT2_DTYPE](0)
         else:
             self.ctx.enqueue_memset(
                 self.grad_pool_buf.create_sub_buffer[GPT2_DTYPE](0, cnt),
@@ -2458,13 +2480,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         """Reduce-scatter one gradient bucket from the pool into the persistent
         shard accumulator (+= across ranks and micro-steps)."""
         self.zero_ctx.reducescatter_buckets[GPT2_DTYPE](
-            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 self.grad_pool_memory.as_unsafe_any_origin()
             ),
             dest_starts,
             pool_offsets,
             lengths,
-            rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                 self.grad_shard_memory.as_unsafe_any_origin()
             ),
             self.optimizer_num_parameters,
@@ -2517,7 +2539,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 zero_cnt += wpe_size
             self._zero_grad_pool(zero_cnt)
             self.grads.wte = pool
-            self.grads.wpe = pool + chunk_elems
+            self.grads.wpe = pool.unsafe_offset(chunk_elems)
 
             # Buckets come out of build_wte_buckets in ascending compact-row
             # order, so this chunk's buckets are a contiguous slice and one
@@ -2525,7 +2547,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var bucket_start = bucket_cursor
             while bucket_cursor < self.num_wte_buckets:
                 var row = Int(
-                    self.bucket_info[bucket_cursor * WTE_BUCKET_IDX_SIZE + 2]
+                    self.bucket_info[
+                        unsafe_offset=bucket_cursor * WTE_BUCKET_IDX_SIZE + 2
+                    ]
                 )
                 if row >= row_hi:
                     break
@@ -2536,10 +2560,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # row. Every row the kernels touch is >= row_lo, so every address
             # formed lands inside the pool.
             encoder_bwd[GPT2_DTYPE, Self.target](
-                as_mut_kernel[GPT2_DTYPE](pool - row_lo * channels),
+                as_mut_kernel[GPT2_DTYPE](
+                    pool.unsafe_offset(-(row_lo * channels))
+                ),
                 as_mut_kernel[GPT2_DTYPE](self.grads.wpe),
                 as_immut_kernel_from_mut[DType.int32](
-                    enc_bucket_info + bucket_start * WTE_BUCKET_IDX_SIZE
+                    enc_bucket_info.unsafe_offset(
+                        bucket_start * WTE_BUCKET_IDX_SIZE
+                    )
                 ),
                 as_immut_kernel_from_mut[DType.int32](enc_workload_indices),
                 as_immut_kernel_from_mut[GPT2_DTYPE](self.grad_acts.encoded),
@@ -2671,14 +2699,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var host_p = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n)
             var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n)
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                     host_p.unsafe_ptr().as_unsafe_any_origin()
                 ),
-                src_ptr=rebind[
-                    UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
-                ](
+                src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
                     (
-                        self.params_memory + master_src_offset
+                        self.params_memory.unsafe_offset(master_src_offset)
                     ).as_unsafe_any_origin()
                 ),
                 size=n,
@@ -2687,12 +2713,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             for i in range(n):
                 host_m[i] = host_p[i].cast[MASTER_DTYPE]()
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[
-                    UnsafePointer[Scalar[MASTER_DTYPE], MutAnyOrigin]
-                ](self.master_memory.as_unsafe_any_origin()),
-                src_ptr=rebind[
-                    UnsafePointer[Scalar[MASTER_DTYPE], ImmutAnyOrigin]
-                ](host_m.unsafe_ptr().as_unsafe_any_origin()),
+                dst_ptr=rebind[Pointer[Scalar[MASTER_DTYPE], MutAnyOrigin]](
+                    self.master_memory.as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[MASTER_DTYPE], ImmutAnyOrigin]](
+                    host_m.unsafe_ptr().as_unsafe_any_origin()
+                ),
                 size=n,
             )
             self.ctx.synchronize()
@@ -3002,10 +3028,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.config.vocab_size,
         )
         self.zero_ctx.allreduce_or_host[DType.uint32](
-            rebind[UnsafePointer[Scalar[DType.uint32], MutAnyOrigin]](
+            rebind[Pointer[Scalar[DType.uint32], MutAnyOrigin]](
                 self.enc_bitmap.as_unsafe_any_origin()
             ),
-            rebind[UnsafePointer[Scalar[DType.uint32], MutAnyOrigin]](
+            rebind[Pointer[Scalar[DType.uint32], MutAnyOrigin]](
                 self.enc_bitmap_union.as_unsafe_any_origin()
             ),
             bitmap_words(self.config.vocab_size),
@@ -3085,22 +3111,22 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var cls_targets = self.targets
         comptime if is_gpu[Self.target]():
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[
-                    UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
-                ](self.inputs_dev.as_unsafe_any_origin()),
-                src_ptr=rebind[
-                    UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin]
-                ](self.inputs.as_unsafe_any_origin()),
+                dst_ptr=rebind[Pointer[Scalar[DType.int32], MutAnyOrigin]](
+                    self.inputs_dev.as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[DType.int32], ImmutAnyOrigin]](
+                    self.inputs.as_unsafe_any_origin()
+                ),
                 size=batch_size * seq_len,
             )
             enc_inputs = self.inputs_dev
             if targets != NULL_INT32_PTR:
                 self.ctx.enqueue_copy(
-                    dst_ptr=rebind[
-                        UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
-                    ](self.targets_dev.as_unsafe_any_origin()),
+                    dst_ptr=rebind[Pointer[Scalar[DType.int32], MutAnyOrigin]](
+                        self.targets_dev.as_unsafe_any_origin()
+                    ),
                     src_ptr=rebind[
-                        UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin]
+                        Pointer[Scalar[DType.int32], ImmutAnyOrigin]
                     ](self.targets.as_unsafe_any_origin()),
                     size=batch_size * seq_len,
                 )
@@ -3119,21 +3145,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # host data to device buffers so the wte-backward GPU kernel reads correctly.
         comptime if is_gpu[Self.target]():
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[
-                    UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
-                ](self.bucket_info_dev.as_unsafe_any_origin()),
-                src_ptr=rebind[
-                    UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin]
-                ](self.bucket_info.as_unsafe_any_origin()),
+                dst_ptr=rebind[Pointer[Scalar[DType.int32], MutAnyOrigin]](
+                    self.bucket_info_dev.as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[DType.int32], ImmutAnyOrigin]](
+                    self.bucket_info.as_unsafe_any_origin()
+                ),
                 size=self.num_wte_buckets * 4,
             )
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[
-                    UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
-                ](self.workload_indices_dev.as_unsafe_any_origin()),
-                src_ptr=rebind[
-                    UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin]
-                ](self.workload_indices.as_unsafe_any_origin()),
+                dst_ptr=rebind[Pointer[Scalar[DType.int32], MutAnyOrigin]](
+                    self.workload_indices_dev.as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[DType.int32], ImmutAnyOrigin]](
+                    self.workload_indices.as_unsafe_any_origin()
+                ),
                 size=batch_size * seq_len,
             )
             # Metal: in-order queue ensures bucket_info_dev/workload_indices_dev
@@ -3154,7 +3180,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 # coordinator): params stay fully resident and this all-gather is
                 # a no-op. Kept so that path's behaviour is unchanged.
                 self.zero_ctx.allgather(
-                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.params_memory.as_unsafe_any_origin()
                     ),
                     self.optimizer_num_parameters,
@@ -3189,78 +3215,108 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             ):  # First layer, use the encoded activations as the pointer
                 residual = self.acts.encoded
             else:
-                residual = (
-                    self.acts.residual_3
-                    + (layer - 1) * batch_size * seq_len * channels
+                residual = self.acts.residual_3.unsafe_offset(
+                    (layer - 1) * batch_size * seq_len * channels
                 )
 
-            var l_ln_1_gamma = self.params.ln_1_gamma + layer * channels
-            var l_ln_1_beta = self.params.ln_1_beta + layer * channels
-            var l_qkv_weight = (
-                self.params.qkv_weight + layer * (3 * channels) * channels
+            var l_ln_1_gamma = self.params.ln_1_gamma.unsafe_offset(
+                layer * channels
             )
-            var l_qkv_bias = self.params.qkv_bias + layer * (3 * channels)
-            var l_attn_proj_weight = (
-                self.params.attn_proj_weight + layer * channels * channels
+            var l_ln_1_beta = self.params.ln_1_beta.unsafe_offset(
+                layer * channels
             )
-            var l_attn_proj_bias = self.params.attn_proj_bias + layer * channels
-            var l_ln_2_gamma = self.params.ln_2_gamma + layer * channels
-            var l_ln_2_beta = self.params.ln_2_beta + layer * channels
-            var l_fc_weight = (
-                self.params.fc_weight + layer * (4 * channels) * channels
+            var l_qkv_weight = self.params.qkv_weight.unsafe_offset(
+                layer * (3 * channels) * channels
             )
-            var l_fc_bias = self.params.fc_bias + layer * (4 * channels)
-            var l_proj_weight = self.params.proj_weight + layer * channels * (
-                4 * channels
+            var l_qkv_bias = self.params.qkv_bias.unsafe_offset(
+                layer * (3 * channels)
             )
-            var l_proj_bias = self.params.proj_bias + layer * channels
+            var l_attn_proj_weight = self.params.attn_proj_weight.unsafe_offset(
+                layer * channels * channels
+            )
+            var l_attn_proj_bias = self.params.attn_proj_bias.unsafe_offset(
+                layer * channels
+            )
+            var l_ln_2_gamma = self.params.ln_2_gamma.unsafe_offset(
+                layer * channels
+            )
+            var l_ln_2_beta = self.params.ln_2_beta.unsafe_offset(
+                layer * channels
+            )
+            var l_fc_weight = self.params.fc_weight.unsafe_offset(
+                layer * (4 * channels) * channels
+            )
+            var l_fc_bias = self.params.fc_bias.unsafe_offset(
+                layer * (4 * channels)
+            )
+            var l_proj_weight = self.params.proj_weight.unsafe_offset(
+                layer * channels * (4 * channels)
+            )
+            var l_proj_bias = self.params.proj_bias.unsafe_offset(
+                layer * channels
+            )
 
-            var l_ln_1 = (
-                self.acts.ln_1 + layer * batch_size * seq_len * channels
+            var l_ln_1 = self.acts.ln_1.unsafe_offset(
+                layer * batch_size * seq_len * channels
             )
-            var l_ln_1_mean = self.acts.ln_1_mean + layer * batch_size * seq_len
-            var l_ln_1_rstd = self.acts.ln_1_rstd + layer * batch_size * seq_len
-            var l_qkv = self.acts.qkv + layer * batch_size * seq_len * (
-                3 * channels
+            var l_ln_1_mean = self.acts.ln_1_mean.unsafe_offset(
+                layer * batch_size * seq_len
             )
-            var l_q = self.acts.q + layer * batch_size * seq_len * channels
-            var l_k = self.acts.k + layer * batch_size * seq_len * channels
-            var l_v = self.acts.v + layer * batch_size * seq_len * channels
-            var l_lse = self.acts.lse + layer * batch_size * num_heads * seq_len
-            var l_attn = (
-                self.acts.attn + layer * batch_size * seq_len * channels
+            var l_ln_1_rstd = self.acts.ln_1_rstd.unsafe_offset(
+                layer * batch_size * seq_len
             )
-            var l_attn_merged = (
-                self.acts.attn_merged + layer * batch_size * seq_len * channels
+            var l_qkv = self.acts.qkv.unsafe_offset(
+                layer * batch_size * seq_len * (3 * channels)
             )
-            var l_attn_proj = (
-                self.acts.attn_proj + layer * batch_size * seq_len * channels
+            var l_q = self.acts.q.unsafe_offset(
+                layer * batch_size * seq_len * channels
             )
-            var l_residual_2 = (
-                self.acts.residual_2 + layer * batch_size * seq_len * channels
+            var l_k = self.acts.k.unsafe_offset(
+                layer * batch_size * seq_len * channels
             )
-            var l_ln_2 = (
-                self.acts.ln_2 + layer * batch_size * seq_len * channels
+            var l_v = self.acts.v.unsafe_offset(
+                layer * batch_size * seq_len * channels
             )
-            var l_ln_2_mean = self.acts.ln_2_mean + layer * batch_size * seq_len
-            var l_ln_2_rstd = self.acts.ln_2_rstd + layer * batch_size * seq_len
+            var l_lse = self.acts.lse.unsafe_offset(
+                layer * batch_size * num_heads * seq_len
+            )
+            var l_attn = self.acts.attn.unsafe_offset(
+                layer * batch_size * seq_len * channels
+            )
+            var l_attn_merged = self.acts.attn_merged.unsafe_offset(
+                layer * batch_size * seq_len * channels
+            )
+            var l_attn_proj = self.acts.attn_proj.unsafe_offset(
+                layer * batch_size * seq_len * channels
+            )
+            var l_residual_2 = self.acts.residual_2.unsafe_offset(
+                layer * batch_size * seq_len * channels
+            )
+            var l_ln_2 = self.acts.ln_2.unsafe_offset(
+                layer * batch_size * seq_len * channels
+            )
+            var l_ln_2_mean = self.acts.ln_2_mean.unsafe_offset(
+                layer * batch_size * seq_len
+            )
+            var l_ln_2_rstd = self.acts.ln_2_rstd.unsafe_offset(
+                layer * batch_size * seq_len
+            )
             # fch / fch_gelu live in a single-layer scratch slot when recompute
             # is on, so their per-layer offset collapses to 0.
             var fch_layer = layer
             comptime if Self.recompute:
                 fch_layer = 0
-            var l_fch = self.acts.fch + fch_layer * batch_size * seq_len * (
-                4 * channels
+            var l_fch = self.acts.fch.unsafe_offset(
+                fch_layer * batch_size * seq_len * (4 * channels)
             )
-            var l_fch_gelu = (
-                self.acts.fch_gelu
-                + fch_layer * batch_size * seq_len * (4 * channels)
+            var l_fch_gelu = self.acts.fch_gelu.unsafe_offset(
+                fch_layer * batch_size * seq_len * (4 * channels)
             )
-            var l_fc_proj = (
-                self.acts.fc_proj + layer * batch_size * seq_len * channels
+            var l_fc_proj = self.acts.fc_proj.unsafe_offset(
+                layer * batch_size * seq_len * channels
             )
-            var l_residual_3 = (
-                self.acts.residual_3 + layer * batch_size * seq_len * channels
+            var l_residual_3 = self.acts.residual_3.unsafe_offset(
+                layer * batch_size * seq_len * channels
             )
 
             # 1. LayerNorm 1 / Residual Fused
@@ -3279,13 +3335,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
             else:
-                var prev_residual_2 = (
-                    self.acts.residual_2
-                    + (layer - 1) * batch_size * seq_len * channels
+                var prev_residual_2 = self.acts.residual_2.unsafe_offset(
+                    (layer - 1) * batch_size * seq_len * channels
                 )
-                var prev_fc_proj = (
-                    self.acts.fc_proj
-                    + (layer - 1) * batch_size * seq_len * channels
+                var prev_fc_proj = self.acts.fc_proj.unsafe_offset(
+                    (layer - 1) * batch_size * seq_len * channels
                 )
                 layernorm_fused_residual_fwd[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](residual),
@@ -3379,7 +3433,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 Int64(seq_len),
                 Int64(head_dim),
                 self.ctx,
-                cache=rebind[KVCachePtr](UnsafePointer(to=self.kv_cache)),
+                cache=rebind[KVCachePtr](Pointer(to=self.kv_cache)),
             )
 
             # Matmul Attn Proj. Always bf16 under fp4 (same rationale as the
@@ -3556,17 +3610,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
 
         # Final LayerNorm
-        var last_residual_3 = (
-            self.acts.residual_3
-            + (num_layers - 1) * batch_size * seq_len * channels
+        var last_residual_3 = self.acts.residual_3.unsafe_offset(
+            (num_layers - 1) * batch_size * seq_len * channels
         )
-        var last_residual_2 = (
-            self.acts.residual_2
-            + (num_layers - 1) * batch_size * seq_len * channels
+        var last_residual_2 = self.acts.residual_2.unsafe_offset(
+            (num_layers - 1) * batch_size * seq_len * channels
         )
-        var last_fc_proj = (
-            self.acts.fc_proj
-            + (num_layers - 1) * batch_size * seq_len * channels
+        var last_fc_proj = self.acts.fc_proj.unsafe_offset(
+            (num_layers - 1) * batch_size * seq_len * channels
         )
         layernorm_fused_residual_fwd[GPT2_DTYPE, Self.target](
             as_mut_kernel[GPT2_DTYPE](last_residual_3),
@@ -3615,8 +3666,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # pass 2 (in backward()) consume those.
             var rows = batch_size * seq_len
             var m_ptr = self._ce_stats_ptr()
-            var s_ptr = m_ptr + rows
-            var xt_ptr = m_ptr + 2 * rows
+            var s_ptr = m_ptr.unsafe_offset(rows)
+            var xt_ptr = m_ptr.unsafe_offset(2 * rows)
             var t0 = 0
             var first = True
             while t0 < vocab_size_padded:
@@ -3675,7 +3726,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var oc = min(lm_tile_rows, vocab_size_padded - t0)
                 var w_tile = self._lm_head_wte_tile(t0, oc)
                 matmul_lm_head_fwd_tile[GPT2_DTYPE, Self.target](
-                    as_mut_kernel[GPT2_DTYPE](self.acts.logits + t0),
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.acts.logits.unsafe_offset(t0)
+                    ),
                     vocab_size_padded,
                     as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.ln_f),
                     as_immut_kernel_from_mut[GPT2_DTYPE](w_tile),
@@ -3701,12 +3754,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             for i in range(batch_size * seq_len):
                 self.losses_host_buf[i] = dloss_mean
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[UnsafePointer[Scalar[StatsDType], MutAnyOrigin]](
+                dst_ptr=rebind[Pointer[Scalar[StatsDType], MutAnyOrigin]](
                     self.grad_acts.losses.as_unsafe_any_origin()
                 ),
-                src_ptr=rebind[
-                    UnsafePointer[Scalar[StatsDType], ImmutAnyOrigin]
-                ](self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()),
+                src_ptr=rebind[Pointer[Scalar[StatsDType], ImmutAnyOrigin]](
+                    self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()
+                ),
                 size=batch_size * seq_len,
             )
             # The dL/dloss seed above is an ASYNC enqueue_copy, but on CPU it is
@@ -3745,8 +3798,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 chunked_ce_loss[Self.target](
                     as_mut_kernel[StatsDType](self.acts.losses),
                     as_immut_kernel_from_mut[DType.float32](m_ptr),
-                    as_immut_kernel_from_mut[DType.float32](m_ptr + rows),
-                    as_immut_kernel_from_mut[DType.float32](m_ptr + 2 * rows),
+                    as_immut_kernel_from_mut[DType.float32](
+                        m_ptr.unsafe_offset(rows)
+                    ),
+                    as_immut_kernel_from_mut[DType.float32](
+                        m_ptr.unsafe_offset(2 * rows)
+                    ),
                     rows,
                     self.ctx,
                 )
@@ -3774,12 +3831,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
             var count = batch_size * seq_len
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[UnsafePointer[Scalar[StatsDType], MutAnyOrigin]](
+                dst_ptr=rebind[Pointer[Scalar[StatsDType], MutAnyOrigin]](
                     self.losses_host_buf.unsafe_ptr().as_unsafe_any_origin()
                 ),
-                src_ptr=rebind[
-                    UnsafePointer[Scalar[StatsDType], ImmutAnyOrigin]
-                ](self.acts.losses.as_unsafe_any_origin()),
+                src_ptr=rebind[Pointer[Scalar[StatsDType], ImmutAnyOrigin]](
+                    self.acts.losses.as_unsafe_any_origin()
+                ),
                 size=count,
             )
             self.ctx.synchronize()
@@ -3987,7 +4044,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # forward (parameters do not move until update()).
             var rows = batch_size * seq_len
             var m_ptr = self._ce_stats_ptr()
-            var s_ptr = m_ptr + rows
+            var s_ptr = m_ptr.unsafe_offset(rows)
             var cls_targets = self.targets
             comptime if is_gpu[Self.target]():
                 cls_targets = self.targets_dev
@@ -3998,7 +4055,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 if bucketing:
                     self.grads.wte = pool  # pool[0 : oc*C], recycled per tile
                     self._zero_grad_pool(oc * channels)
-                var dw = pool if bucketing else (self.grads.wte + t0 * channels)
+                var dw = pool if bucketing else (
+                    self.grads.wte.unsafe_offset(t0 * channels)
+                )
                 var w_tile = self._lm_head_wte_tile(t0, oc)
 
                 # Recompute this tile's logits into the packed scratch. The
@@ -4102,12 +4161,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 if bucketing:
                     self.grads.wte = pool  # pool[0 : oc*C], recycled per tile
                     self._zero_grad_pool(oc * channels)
-                var dw = pool if bucketing else (self.grads.wte + t0 * channels)
+                var dw = pool if bucketing else (
+                    self.grads.wte.unsafe_offset(t0 * channels)
+                )
                 var w_tile = self._lm_head_wte_tile(t0, oc)
                 matmul_lm_head_bwd_tile[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
                     as_mut_kernel[GPT2_DTYPE](dw),
-                    as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.logits + t0),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](
+                        self.acts.logits.unsafe_offset(t0)
+                    ),
                     vocab_size_padded,
                     as_immut_kernel_from_mut[GPT2_DTYPE](self.acts.ln_f),
                     as_immut_kernel_from_mut[GPT2_DTYPE](w_tile),
@@ -4132,18 +4195,26 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         if bucketing:
             # Bucket 2 — ln_f (gamma at pool[0], beta at pool[C]).
             self.grads.ln_f_gamma = pool
-            self.grads.ln_f_beta = pool + channels
+            self.grads.ln_f_beta = pool.unsafe_offset(channels)
             self._zero_grad_pool(2 * channels)
 
         # Final fused LayerNorm backward.
         var last_layer = num_layers - 1
-        var last_residual_3 = self.acts.residual_3 + last_layer * layer_stride
-        var last_residual_2 = self.acts.residual_2 + last_layer * layer_stride
-        var last_fc_proj = self.acts.fc_proj + last_layer * layer_stride
-        var d_last_residual_2 = (
-            self.grad_acts.residual_2 + last_layer * layer_stride
+        var last_residual_3 = self.acts.residual_3.unsafe_offset(
+            last_layer * layer_stride
         )
-        var d_last_fc_proj = self.grad_acts.fc_proj + last_layer * layer_stride
+        var last_residual_2 = self.acts.residual_2.unsafe_offset(
+            last_layer * layer_stride
+        )
+        var last_fc_proj = self.acts.fc_proj.unsafe_offset(
+            last_layer * layer_stride
+        )
+        var d_last_residual_2 = self.grad_acts.residual_2.unsafe_offset(
+            last_layer * layer_stride
+        )
+        var d_last_fc_proj = self.grad_acts.fc_proj.unsafe_offset(
+            last_layer * layer_stride
+        )
 
         layernorm_fused_residual_bwd[GPT2_DTYPE, Self.target](
             as_mut_kernel[GPT2_DTYPE](d_last_residual_2),
@@ -4156,7 +4227,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             as_mut_kernel[GPT2_DTYPE](self.grads.ln_f_gamma),
             as_mut_kernel[GPT2_DTYPE](self.grads.ln_f_beta),
             as_mut_kernel[GPT2_DTYPE](
-                self.grad_acts.residual_3 + last_layer * layer_stride
+                self.grad_acts.residual_3.unsafe_offset(
+                    last_layer * layer_stride
+                )
             ),
             # No incoming residual gradient to seed here (ln_f receives only
             # the LM-head matmul backward's d_output); HAS_RESID_IN defaults
@@ -4197,158 +4270,214 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # below lands at `pool + pool_slot_X`, then zero the layer's pool
             # slice (the weight-grad kernels += accumulate).
             if bucketing:
-                self.grads.ln_1_gamma = (
-                    pool
-                    + pool_slot[Parameters.ln_1_gamma]
-                    - layer * layer_grad_stride[Parameters.ln_1_gamma]
+                self.grads.ln_1_gamma = pool.unsafe_offset(
+                    pool_slot[Parameters.ln_1_gamma]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.ln_1_gamma])
                 )
-                self.grads.ln_1_beta = (
-                    pool
-                    + pool_slot[Parameters.ln_1_beta]
-                    - layer * layer_grad_stride[Parameters.ln_1_beta]
+                self.grads.ln_1_beta = pool.unsafe_offset(
+                    pool_slot[Parameters.ln_1_beta]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.ln_1_beta])
                 )
-                self.grads.qkv_weight = (
-                    pool
-                    + pool_slot[Parameters.qkv_weight]
-                    - layer * layer_grad_stride[Parameters.qkv_weight]
+                self.grads.qkv_weight = pool.unsafe_offset(
+                    pool_slot[Parameters.qkv_weight]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.qkv_weight])
                 )
-                self.grads.qkv_bias = (
-                    pool
-                    + pool_slot[Parameters.qkv_bias]
-                    - layer * layer_grad_stride[Parameters.qkv_bias]
+                self.grads.qkv_bias = pool.unsafe_offset(
+                    pool_slot[Parameters.qkv_bias]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.qkv_bias])
                 )
-                self.grads.attn_proj_weight = (
-                    pool
-                    + pool_slot[Parameters.attn_proj_weight]
-                    - layer * layer_grad_stride[Parameters.attn_proj_weight]
+                self.grads.attn_proj_weight = pool.unsafe_offset(
+                    pool_slot[Parameters.attn_proj_weight]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.attn_proj_weight])
                 )
-                self.grads.attn_proj_bias = (
-                    pool
-                    + pool_slot[Parameters.attn_proj_bias]
-                    - layer * layer_grad_stride[Parameters.attn_proj_bias]
+                self.grads.attn_proj_bias = pool.unsafe_offset(
+                    pool_slot[Parameters.attn_proj_bias]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.attn_proj_bias])
                 )
-                self.grads.ln_2_gamma = (
-                    pool
-                    + pool_slot[Parameters.ln_2_gamma]
-                    - layer * layer_grad_stride[Parameters.ln_2_gamma]
+                self.grads.ln_2_gamma = pool.unsafe_offset(
+                    pool_slot[Parameters.ln_2_gamma]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.ln_2_gamma])
                 )
-                self.grads.ln_2_beta = (
-                    pool
-                    + pool_slot[Parameters.ln_2_beta]
-                    - layer * layer_grad_stride[Parameters.ln_2_beta]
+                self.grads.ln_2_beta = pool.unsafe_offset(
+                    pool_slot[Parameters.ln_2_beta]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.ln_2_beta])
                 )
-                self.grads.fc_weight = (
-                    pool
-                    + pool_slot[Parameters.fc_weight]
-                    - layer * layer_grad_stride[Parameters.fc_weight]
+                self.grads.fc_weight = pool.unsafe_offset(
+                    pool_slot[Parameters.fc_weight]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.fc_weight])
                 )
-                self.grads.fc_bias = (
-                    pool
-                    + pool_slot[Parameters.fc_bias]
-                    - layer * layer_grad_stride[Parameters.fc_bias]
+                self.grads.fc_bias = pool.unsafe_offset(
+                    pool_slot[Parameters.fc_bias]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.fc_bias])
                 )
-                self.grads.proj_weight = (
-                    pool
-                    + pool_slot[Parameters.proj_weight]
-                    - layer * layer_grad_stride[Parameters.proj_weight]
+                self.grads.proj_weight = pool.unsafe_offset(
+                    pool_slot[Parameters.proj_weight]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.proj_weight])
                 )
-                self.grads.proj_bias = (
-                    pool
-                    + pool_slot[Parameters.proj_bias]
-                    - layer * layer_grad_stride[Parameters.proj_bias]
+                self.grads.proj_bias = pool.unsafe_offset(
+                    pool_slot[Parameters.proj_bias]
+                ).unsafe_offset(
+                    -(layer * layer_grad_stride[Parameters.proj_bias])
                 )
                 self._zero_grad_pool(per_layer_pool)
 
-            var l_ln_1_gamma = self.params.ln_1_gamma + layer * channels
-            var l_ln_1_beta = self.params.ln_1_beta + layer * channels
-            var l_qkv_weight = (
-                self.params.qkv_weight + layer * (3 * channels) * channels
+            var l_ln_1_gamma = self.params.ln_1_gamma.unsafe_offset(
+                layer * channels
             )
-            var l_qkv_bias = self.params.qkv_bias + layer * (3 * channels)
-            var l_attn_proj_weight = (
-                self.params.attn_proj_weight + layer * channels * channels
+            var l_ln_1_beta = self.params.ln_1_beta.unsafe_offset(
+                layer * channels
             )
-            var l_attn_proj_bias = self.params.attn_proj_bias + layer * channels
-            var l_ln_2_gamma = self.params.ln_2_gamma + layer * channels
-            var l_ln_2_beta = self.params.ln_2_beta + layer * channels
-            var l_fc_weight = (
-                self.params.fc_weight + layer * (4 * channels) * channels
+            var l_qkv_weight = self.params.qkv_weight.unsafe_offset(
+                layer * (3 * channels) * channels
             )
-            var l_fc_bias = self.params.fc_bias + layer * (4 * channels)
-            var l_proj_weight = self.params.proj_weight + layer * channels * (
-                4 * channels
+            var l_qkv_bias = self.params.qkv_bias.unsafe_offset(
+                layer * (3 * channels)
             )
-            var l_proj_bias = self.params.proj_bias + layer * channels
+            var l_attn_proj_weight = self.params.attn_proj_weight.unsafe_offset(
+                layer * channels * channels
+            )
+            var l_attn_proj_bias = self.params.attn_proj_bias.unsafe_offset(
+                layer * channels
+            )
+            var l_ln_2_gamma = self.params.ln_2_gamma.unsafe_offset(
+                layer * channels
+            )
+            var l_ln_2_beta = self.params.ln_2_beta.unsafe_offset(
+                layer * channels
+            )
+            var l_fc_weight = self.params.fc_weight.unsafe_offset(
+                layer * (4 * channels) * channels
+            )
+            var l_fc_bias = self.params.fc_bias.unsafe_offset(
+                layer * (4 * channels)
+            )
+            var l_proj_weight = self.params.proj_weight.unsafe_offset(
+                layer * channels * (4 * channels)
+            )
+            var l_proj_bias = self.params.proj_bias.unsafe_offset(
+                layer * channels
+            )
 
-            var d_l_ln_1_gamma = self.grads.ln_1_gamma + layer * channels
-            var d_l_ln_1_beta = self.grads.ln_1_beta + layer * channels
-            var d_l_qkv_weight = (
-                self.grads.qkv_weight + layer * (3 * channels) * channels
+            var d_l_ln_1_gamma = self.grads.ln_1_gamma.unsafe_offset(
+                layer * channels
             )
-            var d_l_qkv_bias = self.grads.qkv_bias + layer * (3 * channels)
+            var d_l_ln_1_beta = self.grads.ln_1_beta.unsafe_offset(
+                layer * channels
+            )
+            var d_l_qkv_weight = self.grads.qkv_weight.unsafe_offset(
+                layer * (3 * channels) * channels
+            )
+            var d_l_qkv_bias = self.grads.qkv_bias.unsafe_offset(
+                layer * (3 * channels)
+            )
             var d_l_attn_proj_weight = (
-                self.grads.attn_proj_weight + layer * channels * channels
+                self.grads.attn_proj_weight.unsafe_offset(
+                    layer * channels * channels
+                )
             )
-            var d_l_attn_proj_bias = (
-                self.grads.attn_proj_bias + layer * channels
+            var d_l_attn_proj_bias = self.grads.attn_proj_bias.unsafe_offset(
+                layer * channels
             )
-            var d_l_ln_2_gamma = self.grads.ln_2_gamma + layer * channels
-            var d_l_ln_2_beta = self.grads.ln_2_beta + layer * channels
-            var d_l_fc_weight = (
-                self.grads.fc_weight + layer * (4 * channels) * channels
+            var d_l_ln_2_gamma = self.grads.ln_2_gamma.unsafe_offset(
+                layer * channels
             )
-            var d_l_fc_bias = self.grads.fc_bias + layer * (4 * channels)
-            var d_l_proj_weight = self.grads.proj_weight + layer * channels * (
-                4 * channels
+            var d_l_ln_2_beta = self.grads.ln_2_beta.unsafe_offset(
+                layer * channels
             )
-            var d_l_proj_bias = self.grads.proj_bias + layer * channels
+            var d_l_fc_weight = self.grads.fc_weight.unsafe_offset(
+                layer * (4 * channels) * channels
+            )
+            var d_l_fc_bias = self.grads.fc_bias.unsafe_offset(
+                layer * (4 * channels)
+            )
+            var d_l_proj_weight = self.grads.proj_weight.unsafe_offset(
+                layer * channels * (4 * channels)
+            )
+            var d_l_proj_bias = self.grads.proj_bias.unsafe_offset(
+                layer * channels
+            )
 
-            var l_ln_1 = self.acts.ln_1 + layer_offset
-            var l_ln_1_mean = self.acts.ln_1_mean + layer * batch_size * seq_len
-            var l_ln_1_rstd = self.acts.ln_1_rstd + layer * batch_size * seq_len
-            var l_qkv = self.acts.qkv + layer * qkv_layer_stride
-            var l_q = self.acts.q + layer_offset
-            var l_k = self.acts.k + layer_offset
-            var l_v = self.acts.v + layer_offset
-            var l_lse = self.acts.lse + layer * batch_size * num_heads * seq_len
-            var l_attn = self.acts.attn + layer_offset
-            var l_attn_merged = self.acts.attn_merged + layer_offset
-            var l_attn_proj = self.acts.attn_proj + layer_offset
-            var l_residual_2 = self.acts.residual_2 + layer_offset
-            var l_ln_2 = self.acts.ln_2 + layer_offset
-            var l_ln_2_mean = self.acts.ln_2_mean + layer * batch_size * seq_len
-            var l_ln_2_rstd = self.acts.ln_2_rstd + layer * batch_size * seq_len
+            var l_ln_1 = self.acts.ln_1.unsafe_offset(layer_offset)
+            var l_ln_1_mean = self.acts.ln_1_mean.unsafe_offset(
+                layer * batch_size * seq_len
+            )
+            var l_ln_1_rstd = self.acts.ln_1_rstd.unsafe_offset(
+                layer * batch_size * seq_len
+            )
+            var l_qkv = self.acts.qkv.unsafe_offset(layer * qkv_layer_stride)
+            var l_q = self.acts.q.unsafe_offset(layer_offset)
+            var l_k = self.acts.k.unsafe_offset(layer_offset)
+            var l_v = self.acts.v.unsafe_offset(layer_offset)
+            var l_lse = self.acts.lse.unsafe_offset(
+                layer * batch_size * num_heads * seq_len
+            )
+            var l_attn = self.acts.attn.unsafe_offset(layer_offset)
+            var l_attn_merged = self.acts.attn_merged.unsafe_offset(
+                layer_offset
+            )
+            var l_attn_proj = self.acts.attn_proj.unsafe_offset(layer_offset)
+            var l_residual_2 = self.acts.residual_2.unsafe_offset(layer_offset)
+            var l_ln_2 = self.acts.ln_2.unsafe_offset(layer_offset)
+            var l_ln_2_mean = self.acts.ln_2_mean.unsafe_offset(
+                layer * batch_size * seq_len
+            )
+            var l_ln_2_rstd = self.acts.ln_2_rstd.unsafe_offset(
+                layer * batch_size * seq_len
+            )
             # With recompute on, fch / fch_gelu (and their grads) share a single
             # scratch slot, so the per-layer offset collapses to 0; backward
             # rematerializes them below before the MLP backward kernels run.
             var fch_layer = layer
             comptime if Self.recompute:
                 fch_layer = 0
-            var l_fch = self.acts.fch + fch_layer * fch_layer_stride
-            var l_fch_gelu = self.acts.fch_gelu + fch_layer * fch_layer_stride
-            var l_fc_proj = self.acts.fc_proj + layer_offset
-
-            var d_l_ln_1 = self.grad_acts.ln_1 + layer_offset
-            var d_l_qkv = self.grad_acts.qkv + layer * qkv_layer_stride
-            var d_l_q = self.grad_acts.q + layer_offset
-            var d_l_k = self.grad_acts.k + layer_offset
-            var d_l_v = self.grad_acts.v + layer_offset
-            var d_l_attn = self.grad_acts.attn + layer_offset
-            var d_l_attn_merged = self.grad_acts.attn_merged + layer_offset
-            var d_l_attn_proj = self.grad_acts.attn_proj + layer_offset
-            var d_l_ln_2 = self.grad_acts.ln_2 + layer_offset
-            var d_l_fch = self.grad_acts.fch + fch_layer * fch_layer_stride
-            var d_l_fch_gelu = (
-                self.grad_acts.fch_gelu + fch_layer * fch_layer_stride
+            var l_fch = self.acts.fch.unsafe_offset(
+                fch_layer * fch_layer_stride
             )
-            var d_l_fc_proj = self.grad_acts.fc_proj + layer_offset
+            var l_fch_gelu = self.acts.fch_gelu.unsafe_offset(
+                fch_layer * fch_layer_stride
+            )
+            var l_fc_proj = self.acts.fc_proj.unsafe_offset(layer_offset)
+
+            var d_l_ln_1 = self.grad_acts.ln_1.unsafe_offset(layer_offset)
+            var d_l_qkv = self.grad_acts.qkv.unsafe_offset(
+                layer * qkv_layer_stride
+            )
+            var d_l_q = self.grad_acts.q.unsafe_offset(layer_offset)
+            var d_l_k = self.grad_acts.k.unsafe_offset(layer_offset)
+            var d_l_v = self.grad_acts.v.unsafe_offset(layer_offset)
+            var d_l_attn = self.grad_acts.attn.unsafe_offset(layer_offset)
+            var d_l_attn_merged = self.grad_acts.attn_merged.unsafe_offset(
+                layer_offset
+            )
+            var d_l_attn_proj = self.grad_acts.attn_proj.unsafe_offset(
+                layer_offset
+            )
+            var d_l_ln_2 = self.grad_acts.ln_2.unsafe_offset(layer_offset)
+            var d_l_fch = self.grad_acts.fch.unsafe_offset(
+                fch_layer * fch_layer_stride
+            )
+            var d_l_fch_gelu = self.grad_acts.fch_gelu.unsafe_offset(
+                fch_layer * fch_layer_stride
+            )
+            var d_l_fc_proj = self.grad_acts.fc_proj.unsafe_offset(layer_offset)
 
             var d_block_input: MutMemPtr[GPT2_DTYPE]
             if layer == 0:
                 d_block_input = self.grad_acts.encoded
             else:
-                d_block_input = (
-                    self.grad_acts.residual_3 + (layer - 1) * layer_stride
+                d_block_input = self.grad_acts.residual_3.unsafe_offset(
+                    (layer - 1) * layer_stride
                 )
 
             # Recompute checkpointing: rematerialize fch (pre-GELU) and fch_gelu
@@ -4578,7 +4707,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_mut_kernel[GPT2_DTYPE](d_l_ln_2_gamma),
                 as_mut_kernel[GPT2_DTYPE](d_l_ln_2_beta),
                 as_mut_kernel[GPT2_DTYPE](
-                    self.grad_acts.residual_2 + layer_offset
+                    self.grad_acts.residual_2.unsafe_offset(layer_offset)
                 ),
                 as_immut_kernel_from_mut[GPT2_DTYPE](d_l_fc_proj),
                 Int64(batch_size),
@@ -4653,7 +4782,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 Int64(seq_len),
                 Int64(head_dim),
                 self.ctx,
-                cache=rebind[KVCachePtr](UnsafePointer(to=self.kv_cache)),
+                cache=rebind[KVCachePtr](Pointer(to=self.kv_cache)),
             )
 
             # QKV matmul backward.
@@ -4756,14 +4885,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     GPT2_DTYPE, Self.target, HAS_RESID_IN=True
                 ](
                     as_mut_kernel[GPT2_DTYPE](
-                        self.grad_acts.residual_2 + prev_layer_offset
+                        self.grad_acts.residual_2.unsafe_offset(
+                            prev_layer_offset
+                        )
                     ),
                     as_mut_kernel[GPT2_DTYPE](
-                        self.grad_acts.fc_proj + prev_layer_offset
+                        self.grad_acts.fc_proj.unsafe_offset(prev_layer_offset)
                     ),
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1),
                     as_mut_kernel[GPT2_DTYPE](
-                        self.acts.residual_3 + prev_layer_offset
+                        self.acts.residual_3.unsafe_offset(prev_layer_offset)
                     ),
                     as_immut_kernel_from_mut[GPT2_DTYPE](l_ln_1_gamma),
                     as_mut_kernel[StatsDType](l_ln_1_mean),
@@ -4771,7 +4902,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1_gamma),
                     as_mut_kernel[GPT2_DTYPE](d_l_ln_1_beta),
                     as_mut_kernel[GPT2_DTYPE](
-                        self.grad_acts.residual_3 + prev_layer_offset
+                        self.grad_acts.residual_3.unsafe_offset(
+                            prev_layer_offset
+                        )
                     ),
                     as_immut_kernel_from_mut[GPT2_DTYPE](d_block_input),
                     Int64(batch_size),
@@ -4822,7 +4955,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # single-rank runs.
             if bucketing:
                 self.grads.wte = pool  # pool[0 : wte_size]
-                self.grads.wpe = pool + wte_size  # pool[wte_size : +wpe_size]
+                self.grads.wpe = pool.unsafe_offset(
+                    wte_size
+                )  # pool[wte_size : +wpe_size]
                 self._zero_grad_pool(wte_size + wpe_size)
 
             encoder_bwd[GPT2_DTYPE, Self.target](
@@ -4905,14 +5040,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 # is zero-filled at allocation and never written by backward,
                 # so reducing it is a harmless no-op.
                 self.zero_ctx.allreduce(
-                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.grads_memory.as_unsafe_any_origin()
                     ),
                     self.padded_num_parameters,
                 )
             else:
                 self.zero_ctx.reducescatter_inplace(
-                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.grads_memory.as_unsafe_any_origin()
                     ),
                     self.padded_num_parameters,
@@ -4965,15 +5100,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     # ZeRO-3 streaming keeps only the shard resident at
                     # params_memory offset 0; otherwise the shard lives at
                     # rank*opt inside the full param buffer.
-                    p_ptr = self.params_memory + (
-                        0 if self.z3_streaming else offset
+                    p_ptr = self.params_memory.unsafe_offset(
+                        (0 if self.z3_streaming else offset)
                     )
                     # Every sharded stage now reads its gradient shard from
                     # grads_memory + offset: ZeRO-1 all-reduced (grads fully
                     # replicated), ZeRO-2/3 in-place reduce-scattered (only slice
                     # [offset, offset+opt) holds the reduced sum) — same address.
                     # grads stay a full buffer even under ZeRO-3 streaming.
-                    g_ptr = self.grads_memory + offset
+                    g_ptr = self.grads_memory.unsafe_offset(offset)
                     # Bucketing keeps no full grads buffer: the reduced shard is
                     # the accumulator at grad_shard_memory[0 : opt].
                     if self._use_bucketing():
@@ -5007,7 +5142,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     and self.zero_ctx.zero_stage < 3
                 ):
                     self.zero_ctx.allgather(
-                        rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                             self.params_memory.as_unsafe_any_origin()
                         ),
                         self.optimizer_num_parameters,
@@ -5042,10 +5177,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         adamw_update[GPT2_DTYPE, Self.target](
                             local_num_params,
                             as_mut_kernel[GPT2_DTYPE](
-                                self.params_memory + offset
+                                self.params_memory.unsafe_offset(offset)
                             ),
                             as_mut_kernel[GPT2_DTYPE](
-                                self.grads_memory + offset
+                                self.grads_memory.unsafe_offset(offset)
                             ),
                             as_mut_kernel[MASTER_DTYPE](self.master_memory),
                             USE_BF16,
@@ -5058,7 +5193,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx.synchronize()
                     # Allgather so params_memory is consistent before the next forward.
                     self.zero_ctx.allgather(
-                        rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                             self.params_memory.as_unsafe_any_origin()
                         ),
                         self.optimizer_num_parameters,
@@ -5076,7 +5211,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.num_parameters - offset,
                         self.optimizer_num_parameters,
                     )
-                    var g_shard = self.grads_memory + offset
+                    var g_shard = self.grads_memory.unsafe_offset(offset)
                     if self._use_bucketing():
                         g_shard = self.grad_shard_memory
                     # ZeRO-3 streaming keeps only the shard resident at
@@ -5087,7 +5222,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         adamw_update[GPT2_DTYPE, Self.target](
                             local_num_params,
                             as_mut_kernel[GPT2_DTYPE](
-                                self.params_memory + p_off
+                                self.params_memory.unsafe_offset(p_off)
                             ),
                             as_mut_kernel[GPT2_DTYPE](g_shard),
                             as_mut_kernel[MASTER_DTYPE](self.master_memory),
@@ -5102,9 +5237,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     # ZeRO-2 allgathers here so params_memory is immediately consistent.
                     if self.zero_ctx.zero_stage == 2:
                         self.zero_ctx.allgather(
-                            rebind[
-                                UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
-                            ](self.params_memory.as_unsafe_any_origin()),
+                            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                                self.params_memory.as_unsafe_any_origin()
+                            ),
                             self.optimizer_num_parameters,
                         )
                         self.ctx.synchronize()
@@ -5156,8 +5291,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 # in-place reduce-scatter left this rank's reduced shard at
                 # grads_memory + rank*opt.
                 n = self.optimizer_num_parameters
-                grads_src = self.grads_memory + (
-                    self.zero_ctx.rank * self.optimizer_num_parameters
+                grads_src = self.grads_memory.unsafe_offset(
+                    (self.zero_ctx.rank * self.optimizer_num_parameters)
                 )
                 # Bucketing keeps the reduced shard in the accumulator, not in a
                 # full grads buffer sliced at rank*opt.
@@ -5168,7 +5303,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         comptime if is_cpu[Self.target]():
             var host_out = alloc[Scalar[DType.float32]](1)
-            host_out[0] = Scalar[DType.float32](0.0)
+            host_out[unsafe_offset=0] = Scalar[DType.float32](0.0)
             global_norm_squared_cpu[GPT2_DTYPE, width](
                 rebind[MutKernelPtr[DType.float32]](
                     host_out.as_unsafe_any_origin()
@@ -5176,8 +5311,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_immut_kernel_from_mut[GPT2_DTYPE](grads_src),
                 n,
             )
-            var sumsq = host_out[0]
-            host_out.free()
+            var sumsq = host_out[unsafe_offset=0]
+            host_out.unsafe_free()
             if sharded:
                 sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
             return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
@@ -5209,8 +5344,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 compiled_norm,
                 as_mut_kernel[DType.float32](out_ptr),
                 as_immut_kernel_from_mut[GPT2_DTYPE](grads_src),
-                n,  # count (single slice)
-                n,  # stride (unused with one slice)
+                Int64(n),  # count (single slice)
+                Int64(n),  # stride (unused with one slice)
                 grid_dim=(grid_x, 1),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -5220,7 +5355,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx.enqueue_function(
                 compiled_agg,
                 as_mut_kernel[DType.float32](out_ptr),
-                grid_x,
+                Int64(grid_x),
                 grid_dim=(1,),
                 block_dim=(BLOCK_SIZE,),
             )
@@ -5232,12 +5367,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             comptime if not HAS_METAL:
                 self.ctx.synchronize()
             self.ctx.enqueue_copy(
-                dst_ptr=rebind[
-                    UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-                ](self.grad_norm_host_buf.unsafe_ptr().as_unsafe_any_origin()),
-                src_ptr=rebind[
-                    UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
-                ](out_ptr.as_unsafe_any_origin()),
+                dst_ptr=rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+                    self.grad_norm_host_buf.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[DType.float32], ImmutAnyOrigin]](
+                    out_ptr.as_unsafe_any_origin()
+                ),
                 size=1,
             )
             self.ctx.synchronize()
@@ -5328,12 +5463,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var n = self.param_sizes[t]
                 self.ctx.enqueue_function(
                     compiled_scan,
-                    as_mut_kernel[DType.float32](out_ptr + s),
+                    as_mut_kernel[DType.float32](out_ptr.unsafe_offset(s)),
                     as_immut_kernel_from_mut[GPT2_DTYPE](
-                        self.grads_memory + flat_base[t]
+                        self.grads_memory.unsafe_offset(flat_base[t])
                     ),
-                    n,  # count (single slice)
-                    n,  # stride (unused with one slice)
+                    Int64(n),  # count (single slice)
+                    Int64(n),  # stride (unused with one slice)
                     grid_dim=(1, 1),
                     block_dim=(BLOCK_SIZE,),
                 )
@@ -5347,12 +5482,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var stride = self.param_sizes[t] // L
                 self.ctx.enqueue_function(
                     compiled_scan,
-                    as_mut_kernel[DType.float32](out_ptr + 4 + k * L),
-                    as_immut_kernel_from_mut[GPT2_DTYPE](
-                        self.grads_memory + flat_base[t]
+                    as_mut_kernel[DType.float32](
+                        (out_ptr.unsafe_offset(4)).unsafe_offset(k * L)
                     ),
-                    stride,  # count per slice
-                    stride,  # slice stride
+                    as_immut_kernel_from_mut[GPT2_DTYPE](
+                        self.grads_memory.unsafe_offset(flat_base[t])
+                    ),
+                    Int64(stride),  # count per slice
+                    Int64(stride),  # slice stride
                     grid_dim=(1, L),
                     block_dim=(BLOCK_SIZE,),
                 )
@@ -5452,10 +5589,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         dtype: DType
     ](mut self, host: HostBuffer[dtype], src: MutMemPtr[dtype], n: Int,) raises:
         self.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            dst_ptr=rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                 host.unsafe_ptr().as_unsafe_any_origin()
             ),
-            src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+            src_ptr=rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
                 src.as_unsafe_any_origin()
             ),
             size=n,
@@ -5465,10 +5602,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         dtype: DType
     ](mut self, dst: MutMemPtr[dtype], host: HostBuffer[dtype], n: Int,) raises:
         self.ctx.enqueue_copy(
-            dst_ptr=rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            dst_ptr=rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
                 dst.as_unsafe_any_origin()
             ),
-            src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+            src_ptr=rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
                 host.unsafe_ptr().as_unsafe_any_origin()
             ),
             size=n,
@@ -5501,7 +5638,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         comptime if Self.WORLD_SIZE > 1:
             if self.z3_streaming:
                 self._z3_gather_full(
-                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         snap_full.unsafe_ptr().as_unsafe_any_origin()
                     )
                 )
@@ -5511,7 +5648,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
             elif self.zero_ctx.zero_stage >= 3:
                 self.zero_ctx.allgather(
-                    rebind[UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         self.params_memory.as_unsafe_any_origin()
                     ),
                     self.optimizer_num_parameters,
@@ -5587,12 +5724,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             if ln > 0:
                 self.ctx.enqueue_copy(
-                    dst_ptr=rebind[
-                        UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
-                    ](self.params_memory.as_unsafe_any_origin()),
-                    src_ptr=rebind[
-                        UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
-                    ]((host_params.unsafe_ptr() + off).as_unsafe_any_origin()),
+                    dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.params_memory.as_unsafe_any_origin()
+                    ),
+                    src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                        (
+                            host_params.unsafe_ptr().unsafe_offset(off)
+                        ).as_unsafe_any_origin()
+                    ),
                     size=ln,
                 )
         else:
@@ -6024,9 +6163,9 @@ def train[
 ](
     args: TrainArgs,
     rank: Int = 0,
-    cpu_coord: Optional[
-        UnsafePointer[CpuCoordinator, MutUntrackedOrigin]
-    ] = Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+    cpu_coord: Optional[Pointer[CpuCoordinator, MutUntrackedOrigin]] = Optional[
+        Pointer[CpuCoordinator, MutUntrackedOrigin]
+    ](),
 ) raises:
     var ctx: DeviceContext
     comptime if is_cpu[target]():
@@ -6287,7 +6426,7 @@ def train[
         if args.sample_every > 0 and (
             step > 0 and step % args.sample_every == 0 or last_step
         ):
-            gen_tokens[0] = Scalar[DType.int32](
+            gen_tokens[unsafe_offset=0] = Scalar[DType.int32](
                 tokenizer.eot_token
             )  # The GPT-2 EOT token kicks off generation.
 
@@ -6297,18 +6436,16 @@ def train[
                 # In a real inference setting we would use a separate code for this anyway.
                 # Inference is here only for sanity checking.
                 model.forward(gen_tokens, null_int32_ptr, 1, t)
-                var dev_logits_ptr = (
-                    model.acts.logits + (t - 1) * model.config.padded_vocab_size
+                var dev_logits_ptr = model.acts.logits.unsafe_offset(
+                    (t - 1) * model.config.padded_vocab_size
                 )
                 model.ctx.enqueue_copy(
-                    dst_ptr=rebind[
-                        UnsafePointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
-                    ](
+                    dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                         model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
                     ),
-                    src_ptr=rebind[
-                        UnsafePointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
-                    ](dev_logits_ptr.as_unsafe_any_origin()),
+                    src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                        dev_logits_ptr.as_unsafe_any_origin()
+                    ),
                     size=model.config.vocab_size,
                 )
                 model.ctx.synchronize()
@@ -6320,7 +6457,7 @@ def train[
                 var next_token = sample_softmax(
                     logits, model.config.vocab_size, coin
                 )
-                gen_tokens[t] = Scalar[DType.int32](next_token)
+                gen_tokens[unsafe_offset=t] = Scalar[DType.int32](next_token)
                 if rank == 0:
                     var token_str = tokenizer.decode(next_token)
                     safe_print(token_str)
@@ -6481,7 +6618,7 @@ def _dispatch_world_size[
     args: TrainArgs,
     rank: Int,
     world_size: Int,
-    cpu_coord: Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]],
+    cpu_coord: Optional[Pointer[CpuCoordinator, MutUntrackedOrigin]],
 ) raises:
     # train() is monomorphized on WORLD_SIZE (a comptime parameter), so a runtime
     # world_size can only dispatch to an instantiation compiled into this binary:
@@ -6659,7 +6796,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
                 args,
                 0,
                 world_size,
-                Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+                Optional[Pointer[CpuCoordinator, MutUntrackedOrigin]](),
             )
         else:
             var cpu_coord_ptr = alloc[CpuCoordinator](1)
@@ -6683,7 +6820,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
             fp8_mutex_preseed()
             sync_parallelize[_run_rank](world_size)
             cpu_coord_ptr[].free()
-            cpu_coord_ptr.free()
+            cpu_coord_ptr.unsafe_free()
 
 
 def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
@@ -6716,7 +6853,7 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
                 args,
                 rank,
                 world_size,
-                Optional[UnsafePointer[CpuCoordinator, MutUntrackedOrigin]](),
+                Optional[Pointer[CpuCoordinator, MutUntrackedOrigin]](),
             )
         else:
             # True N-device data parallelism: one host thread per rank, each
@@ -6740,7 +6877,7 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             fp8_mutex_preseed()
             sync_parallelize[_run_rank](world_size)
             coord_ptr[].free()
-            coord_ptr.free()
+            coord_ptr.unsafe_free()
         return True
     else:
         return False

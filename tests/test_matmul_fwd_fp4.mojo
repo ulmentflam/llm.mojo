@@ -32,10 +32,9 @@
 # `flock -w 10800 /tmp/llmm-gpu.lock -c '...'` (shared GPU).
 # ===----------------------------------------------------------------------=== #
 
-from std.memory import UnsafePointer
 from std.random import random_float64, seed
 from std.sys import has_nvidia_gpu_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true
 
 from llmm.matmul import matmul_fwd, matmul_fwd_fp4
@@ -69,13 +68,13 @@ def _run_site_case(
     seed(20260710)
     for i in range(n_in):
         var v = Float32((random_float64() * 2.0 - 1.0) * 1.5)
-        host_in.unsafe_ptr()[i] = v.cast[DT]()
+        host_in.unsafe_ptr()[unsafe_offset=i] = v.cast[DT]()
     for i in range(n_w):
         var v = Float32((random_float64() * 2.0 - 1.0) * 0.02)
-        host_w.unsafe_ptr()[i] = v.cast[DT]()
+        host_w.unsafe_ptr()[unsafe_offset=i] = v.cast[DT]()
     for i in range(out_channels):
         var v = Float32((random_float64() * 2.0 - 1.0) * 0.01)
-        host_b.unsafe_ptr()[i] = v.cast[DT]()
+        host_b.unsafe_ptr()[unsafe_offset=i] = v.cast[DT]()
 
     var dev_in = ctx.enqueue_create_buffer[DT](n_in)
     var dev_w = ctx.enqueue_create_buffer[DT](n_w)

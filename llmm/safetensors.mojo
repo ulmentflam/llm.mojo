@@ -1,5 +1,4 @@
 from std.math import ceildiv
-from std.memory import alloc
 
 from llmm.checkpointing import CheckpointConfig
 from llmm.io import get_dtype_size
@@ -374,13 +373,13 @@ struct SafetensorsFile:
             raise Error(
                 "safetensors error: truncated tensor data for '" + name + "'"
             )
-        var src_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        var src_ptr = rebind[Pointer[UInt8, MutUntrackedOrigin]](
             raw.unsafe_ptr()
-        ).bitcast[Scalar[dtype]]()
+        ).unsafe_bitcast[Scalar[dtype]]()
 
         if transpose_rows < 0:
             for i in range(n):
-                dest.store(i, src_ptr.load(i))
+                dest.unsafe_store(i, src_ptr.unsafe_load(i))
             # Keep `raw` live past the copy; src_ptr does not own it.
             _ = raw^
             return
@@ -401,9 +400,9 @@ struct SafetensorsFile:
             )
         for r in range(transpose_rows):
             for c in range(transpose_cols):
-                dest.store(
+                dest.unsafe_store(
                     r * transpose_cols + c,
-                    src_ptr.load(c * transpose_rows + r),
+                    src_ptr.unsafe_load(c * transpose_rows + r),
                 )
         # Keep `raw` live past the transpose copy; src_ptr does not own it.
         _ = raw^

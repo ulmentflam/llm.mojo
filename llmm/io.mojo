@@ -1,6 +1,6 @@
 from std.collections import Span
 
-from llmm.memory import ImmutKernelPtr, MutMemPtr
+from llmm.memory import MutMemPtr
 
 
 def get_dtype_size(dtype: DType) raises -> Int:
@@ -44,11 +44,11 @@ def read_and_copy[
     if len(bytes_read) < bytes_to_read:
         raise Error("Failed to read enough bytes from file")
 
-    var src_ptr = rebind[UnsafePointer[UInt8, MutUntrackedOrigin]](
+    var src_ptr = rebind[Pointer[UInt8, MutUntrackedOrigin]](
         bytes_read.unsafe_ptr()
-    ).bitcast[Scalar[dtype]]()
+    ).unsafe_bitcast[Scalar[dtype]]()
     for i in range(count):
-        dest.store(i, src_ptr.load(i))
+        dest.unsafe_store(i, src_ptr.unsafe_load(i))
     # Keep `bytes_read` live until the copy is done: the rebind drops the
     # List's lifetime tracking, so without this ASAP destruction frees the
     # buffer at the `.unsafe_ptr()` call and the allocator clobbers the
@@ -64,4 +64,4 @@ def write_buffer[
     dtype: DType,
 ](mut file: FileHandle, src: MutMemPtr[dtype], count: Int) raises:
     var nbytes = count * get_dtype_size(dtype)
-    file.write_all(Span(unsafe_ptr=src.bitcast[Byte](), length=nbytes))
+    file.write_all(Span(unsafe_ptr=src.unsafe_bitcast[Byte](), length=nbytes))

@@ -24,10 +24,10 @@ Run (pin GPUs by UUID -- see MEMORY.md workstation-max-gpu1-gsp-hang):
   CUDA_VISIBLE_DEVICES=<uuid0>,<uuid1> ./build/bench_collectives
 """
 
-from std.algorithm import sync_parallelize
-from std.gpu.host import DeviceContext
+from max.algorithm import sync_parallelize
+from max.gpu.host import DeviceContext
 from std.math import isnan
-from std.memory import UnsafePointer, alloc
+from std.memory import alloc
 from std.os import getenv
 from std.sys import get_defined_int, has_nvidia_gpu_accelerator, simd_width_of
 from std.sys.info import size_of
@@ -284,7 +284,7 @@ def main() raises:
 
     var rank_ok = alloc[Int](WORLD_SIZE)
     for i in range(WORLD_SIZE):
-        rank_ok[i] = 1
+        rank_ok[unsafe_offset=i] = 1
 
     comptime simd_align = WORLD_SIZE * simd_width_of[DTYPE]()
 
@@ -329,7 +329,7 @@ def main() raises:
                 var ar_buf = ctx.enqueue_create_buffer[DTYPE](padded)
                 ar_buf.enqueue_fill(Float32(rank + 1))
                 ctx.synchronize()
-                var ar_ptr = rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                var ar_ptr = rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     ar_buf.unsafe_ptr().as_unsafe_any_origin()
                 )
 
@@ -363,10 +363,10 @@ def main() raises:
                 rs_out.enqueue_fill(Float32(0.0))
                 ctx.synchronize()
                 var rs_in_ptr = rebind[
-                    UnsafePointer[Scalar[DTYPE], MutAnyOrigin]
+                    Pointer[Scalar[DTYPE], MutAnyOrigin]
                 ](rs_in.unsafe_ptr().as_unsafe_any_origin())
                 var rs_out_ptr = rebind[
-                    UnsafePointer[Scalar[DTYPE], MutAnyOrigin]
+                    Pointer[Scalar[DTYPE], MutAnyOrigin]
                 ](rs_out.unsafe_ptr().as_unsafe_any_origin())
 
                 for _ in range(WARMUP_ITERS):
@@ -398,7 +398,7 @@ def main() raises:
                 var ag_buf = ctx.enqueue_create_buffer[DTYPE](padded)
                 ag_buf.enqueue_fill(Float32(rank + 1))
                 ctx.synchronize()
-                var ag_ptr = rebind[UnsafePointer[Scalar[DTYPE], MutAnyOrigin]](
+                var ag_ptr = rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
                     ag_buf.unsafe_ptr().as_unsafe_any_origin()
                 )
 
@@ -472,18 +472,18 @@ def main() raises:
                 )
         except e:
             print("bench_collectives rank", rank, "error:", e)
-            rank_ok[rank] = 0
+            rank_ok[unsafe_offset=rank] = 0
 
     sync_parallelize[_run_rank](WORLD_SIZE)
 
     var all_ok = True
     for i in range(WORLD_SIZE):
-        if rank_ok[i] == 0:
+        if rank_ok[unsafe_offset=i] == 0:
             all_ok = False
 
-    rank_ok.free()
+    rank_ok.unsafe_free()
     cpu_coord_ptr[].free()
-    cpu_coord_ptr.free()
+    cpu_coord_ptr.unsafe_free()
 
     if not all_ok:
         print("FATAL: bench_collectives: one or more ranks raised (see above)")

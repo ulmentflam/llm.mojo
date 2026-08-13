@@ -27,8 +27,8 @@
 from std.sys import argv
 from std.os import makedirs
 from std.os.path import exists
-from std.memory import alloc, UnsafePointer
-from std.gpu.host import DeviceContext
+from std.memory import alloc
+from max.gpu.host import DeviceContext
 
 from llmm.memory import MutMemPtr
 from llmm.io import write_buffer, read_and_copy
@@ -43,10 +43,10 @@ def dump_tensor[
 ) raises -> None:
     var host_buf = ctx.enqueue_create_host_buffer[dtype](n)
     ctx.enqueue_copy(
-        dst_ptr=rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+        dst_ptr=rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
             host_buf.unsafe_ptr().as_unsafe_any_origin()
         ),
-        src_ptr=rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+        src_ptr=rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](
             ptr.as_unsafe_any_origin()
         ),
         size=n,
@@ -55,14 +55,14 @@ def dump_tensor[
 
     var f32 = alloc[Scalar[DType.float32]](n)
     for i in range(n):
-        f32[i] = host_buf[i].cast[DType.float32]()
+        f32[unsafe_offset=i] = host_buf[i].cast[DType.float32]()
 
     var file = open(path, "w")
     write_buffer[DType.float32](
         file, rebind[MutMemPtr[DType.float32]](f32.as_unsafe_any_origin()), n
     )
     file.close()
-    f32.free()
+    f32.unsafe_free()
     _ = host_buf^
 
 
@@ -95,7 +95,7 @@ def dump_per_layer[
     name: String,
 ) raises -> None:
     for layer in range(num_layer):
-        var layer_ptr = ptr + layer * per_layer_n
+        var layer_ptr = ptr.unsafe_offset(layer * per_layer_n)
         var path = out_dir + "/" + name + "_layer" + _zero_pad2(layer) + ".bin"
         dump_tensor(ctx, layer_ptr, per_layer_n, path)
 
@@ -134,8 +134,8 @@ def main() raises:
         rebind[MutMemPtr[DType.int32]](state_header.as_unsafe_any_origin()),
         256,
     )
-    var dB: Int = Int(state_header[2])
-    var dT: Int = Int(state_header[3])
+    var dB: Int = Int(state_header[unsafe_offset=2])
+    var dT: Int = Int(state_header[unsafe_offset=3])
     var dbg_x = alloc[SIMD[DType.int32, 1]](dB * dT)
     var dbg_y = alloc[SIMD[DType.int32, 1]](dB * dT)
     read_and_copy[DType.int32](
@@ -149,7 +149,7 @@ def main() raises:
         dB * dT,
     )
     state_file.close()
-    state_header.free()
+    state_header.unsafe_free()
 
     # Optional argv override: <out_dir> [T] [B]. Default is the fixed debug
     # batch (dB=4, dT=64). A larger T (e.g. 1024) tiles the debug tokens to
@@ -165,10 +165,10 @@ def main() raises:
     var y = alloc[SIMD[DType.int32, 1]](B * T)
     var ndbg = dB * dT
     for i in range(B * T):
-        x[i] = dbg_x[i % ndbg]
-        y[i] = dbg_y[i % ndbg]
-    dbg_x.free()
-    dbg_y.free()
+        x[unsafe_offset=i] = dbg_x[unsafe_offset=i % ndbg]
+        y[unsafe_offset=i] = dbg_y[unsafe_offset=i % ndbg]
+    dbg_x.unsafe_free()
+    dbg_y.unsafe_free()
 
     model.forward(
         rebind[MutMemPtr[DType.int32]](x),
