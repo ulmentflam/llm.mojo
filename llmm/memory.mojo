@@ -4,6 +4,22 @@ from std.memory import UnsafePointer, alloc
 
 
 # ===----------------------------------------------------------------------=== #
+# Raw heap allocation
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def heap_alloc[T: AnyType](count: Int) -> Pointer[T, MutUntrackedOrigin]:
+    """Raw heap allocation of `count` `T`s, freed with `.unsafe_free()`.
+
+    The single call site of the deprecated count-based `alloc` in this repo.
+    See docs/ai/mojo_1_0_migration.md for why it cannot be migrated to the
+    `Layout`-based replacement yet.
+    """
+    return alloc[T](count)
+
+
+# ===----------------------------------------------------------------------=== #
 # Memory pointer aliases
 # ===----------------------------------------------------------------------=== #
 
@@ -78,14 +94,9 @@ def persistent_device_buffer[
     """
     comptime BufType = type_of(ctx.enqueue_create_buffer[dtype](1))
     var name = String("LLMM_") + name_suffix + String("_") + String(ctx.id())
-    # Mojo 1.0 deprecates this implicit binding and suggests `if var gp := ...`.
-    # Do NOT apply it here: `gp` aliases a pointer into the process-global
-    # buffer cache, and the owned `var` spelling SIGSEGVs the MAX compiler when
-    # a custom op is built against this module (it took down the whole
-    # test-python-cuda suite at tests/test_attention_equivalence.py). The three
-    # `_get_global_or_null` call sites keep the deprecation warning on purpose.
-    if gp := _get_global_or_null(name):
-        var p = gp.value().unsafe_bitcast[BufType]()
+    var cached = _get_global_or_null(name)
+    if cached:
+        var p = cached.value().unsafe_bitcast[BufType]()
         var cached_count = len(p[])
         if count > cached_count:
             raise Error(
@@ -103,7 +114,7 @@ def persistent_device_buffer[
     var buf = ctx.enqueue_create_buffer[dtype](count)
     if zero:
         ctx.enqueue_memset(buf, Scalar[dtype](0))
-    var hp = alloc[BufType](1)
+    var hp = heap_alloc[BufType](1)
     hp.unsafe_write(buf^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(name), hp.unsafe_bitcast[NoneType]()

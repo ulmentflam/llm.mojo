@@ -42,11 +42,16 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.testing import assert_almost_equal, assert_true, TestSuite
-from std.memory import alloc
+
 from std.math import ceildiv, exp, log
 from max.gpu.host import DeviceContext
 
-from llmm.memory import MutMemPtr, as_mut_kernel, as_immut_kernel_from_mut
+from llmm.memory import (
+    MutMemPtr,
+    as_mut_kernel,
+    as_immut_kernel_from_mut,
+    heap_alloc,
+)
 from llmm.fused_classifier import (
     chunked_ce_pass1,
     chunked_ce_loss,
@@ -67,7 +72,7 @@ comptime TILE = 8
 
 
 def _alloc(n: Int) -> MutMemPtr[DT]:
-    var p = alloc[Scalar[DT]](n)
+    var p = heap_alloc[Scalar[DT]](n)
     var q = rebind[MutMemPtr[DT]](p.as_unsafe_any_origin())
     for i in range(n):
         q[unsafe_offset=i] = 0.0
@@ -75,7 +80,7 @@ def _alloc(n: Int) -> MutMemPtr[DT]:
 
 
 def _alloc_i32(n: Int) -> MutMemPtr[DType.int32]:
-    var p = alloc[Scalar[DType.int32]](n)
+    var p = heap_alloc[Scalar[DType.int32]](n)
     var q = rebind[MutMemPtr[DType.int32]](p.as_unsafe_any_origin())
     for i in range(n):
         q[unsafe_offset=i] = 0

@@ -1,5 +1,5 @@
 from extensibility import register
-from std.memory import alloc, stack_allocation
+from std.memory import stack_allocation
 from std.math import ceildiv
 from layout import Layout, TileTensor
 from layout.layout_tensor import LayoutTensor
@@ -83,13 +83,12 @@ def _fp8_gemm_lock() -> Pointer[Atomic[DType.int32], MutUntrackedOrigin]:
     After InsertGlobal, the registry is re-read and its winner adopted so a
     raced loser at least converges instead of keeping a private cell."""
     var name = String("LLMM_FP8_GEMM_LOCK")
-    # Keep the implicit binding: `if var gp := ...` SIGSEGVs the MAX
-    # compiler here. See llmm/memory.mojo for the full note.
-    if gp := _get_global_or_null(name):
-        return gp.value().unsafe_bitcast[Atomic[DType.int32]]()
+    var cached = _get_global_or_null(name)
+    if cached:
+        return cached.value().unsafe_bitcast[Atomic[DType.int32]]()
     # Atomic[int32] is layout-compatible with a bare int32 cell; allocate
     # and zero the cell, then hand out Atomic-typed views of it.
-    var p = alloc[Scalar[DType.int32]](1)
+    var p = heap_alloc[Scalar[DType.int32]](1)
     p[unsafe_offset=0] = 0
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(name), p.unsafe_bitcast[NoneType]()
@@ -148,6 +147,7 @@ from llmm.memory import (
     ImmutKernelPtr,
     MutKernelPtr,
     persistent_device_buffer,
+    heap_alloc,
 )
 from llmm.vendor import HAS_CUBLAS, HAS_METAL, USE_TF32
 from std.gpu.primitives.warp import shuffle_xor
@@ -3473,7 +3473,7 @@ def matmul_d_weight_bwd[
             ),
             row_major(out_channels, rows),
         )
-        var perms = alloc[Scalar[DType.int]](2)
+        var perms = heap_alloc[Scalar[DType.int]](2)
         perms[unsafe_offset=0] = 1
         perms[unsafe_offset=1] = 0
         transpose(scratch_t, a_d_output, perms)
@@ -3484,7 +3484,7 @@ def matmul_d_weight_bwd[
             # elementwise lambda runs as a sweep AFTER cblas has already
             # overwritten C, so "load previous" there reads the fresh GEMM
             # result and doubles it. Materialize, then add.
-            var temp = alloc[Scalar[dtype]](out_channels * in_channels)
+            var temp = heap_alloc[Scalar[dtype]](out_channels * in_channels)
             var c_temp = TileTensor(
                 Span[Scalar[dtype], MutAnyOrigin](
                     unsafe_ptr=temp.as_unsafe_any_origin(),

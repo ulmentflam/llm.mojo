@@ -1,7 +1,5 @@
-from std.memory import alloc
-
 from llmm.io import read_and_copy, write_buffer
-from llmm.memory import MutMemPtr
+from llmm.memory import MutMemPtr, heap_alloc
 from llmm.dataloader import DataLoader, RNG_SEED
 from llmm.rand import MT19937
 
@@ -167,7 +165,7 @@ def write_model_checkpoint[
     if resolved_version == AUTO_VERSION:
         resolved_version = _version_for_dtype(dtype)
 
-    var header = alloc[Int32](CHECKPOINT_HEADER_SIZE)
+    var header = heap_alloc[Int32](CHECKPOINT_HEADER_SIZE)
     for i in range(CHECKPOINT_HEADER_SIZE):
         header.unsafe_store(i, Int32(0))
     header.unsafe_store(0, Int32(MODEL_MAGIC))
@@ -188,7 +186,7 @@ def write_model_checkpoint[
 
 def read_model_header(mut file: FileHandle) raises -> ModelHeader:
     """Read and validate a 256-int model header from an already-open file."""
-    var header = alloc[Int32](CHECKPOINT_HEADER_SIZE)
+    var header = heap_alloc[Int32](CHECKPOINT_HEADER_SIZE)
     read_and_copy[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
 
     var magic = Int(header.unsafe_load(0))
@@ -280,7 +278,7 @@ def write_state_checkpoint[
     (`GPT2.optimizer_num_parameters`); under ZeRO each rank writes its own shard
     to its own `state_<step>_<rank>.bin`, matching llm.c.
     """
-    var header = alloc[Int32](CHECKPOINT_HEADER_SIZE)
+    var header = heap_alloc[Int32](CHECKPOINT_HEADER_SIZE)
     for i in range(CHECKPOINT_HEADER_SIZE):
         header.unsafe_store(i, Int32(0))
     header.unsafe_store(0, Int32(STATE_MAGIC))
@@ -309,7 +307,7 @@ def write_state_checkpoint[
 
 def read_state_header(mut file: FileHandle) raises -> TrainingState:
     """Read and validate a 256-int state header from an already-open file."""
-    var header = alloc[Int32](CHECKPOINT_HEADER_SIZE)
+    var header = heap_alloc[Int32](CHECKPOINT_HEADER_SIZE)
     read_and_copy[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
 
     var magic = Int(header.unsafe_load(0))

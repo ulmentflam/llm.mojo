@@ -17,13 +17,13 @@ across ranks first, and these tests exercise precisely that: the existing
 pass even if the union were omitted entirely.
 """
 
-from std.memory import alloc
+
 from max.gpu.host import DeviceContext
 from max.algorithm import sync_parallelize
 from std.math import ceildiv
 from std.bit import pop_count
 
-from llmm.memory import MutKernelPtr, ImmutKernelPtr
+from llmm.memory import MutKernelPtr, ImmutKernelPtr, heap_alloc
 from llmm.zero import ZeroContext, CpuCoordinator
 from llmm.encoder import (
     build_wte_buckets,
@@ -90,9 +90,9 @@ def test_row_map_dedups_and_maps_rows() raises:
     monotonic (compact row order follows global row order)."""
     comptime SMALL_V = 64
     var words = bitmap_words(SMALL_V)
-    var bm = alloc[Scalar[DType.uint32]](words)
-    var row_of = alloc[Scalar[DType.int32]](SMALL_V)
-    var toks = alloc[Scalar[DType.int32]](8)
+    var bm = heap_alloc[Scalar[DType.uint32]](words)
+    var row_of = heap_alloc[Scalar[DType.int32]](SMALL_V)
+    var toks = heap_alloc[Scalar[DType.int32]](8)
     # 5 is repeated 3x, 40 twice; distinct ids are {5, 6, 20, 40}.
     var vals = [5, 40, 5, 20, 6, 40, 5, 20]
     for i in range(8):
@@ -142,9 +142,9 @@ def test_row_map_merges_gaps_within_capacity() raises:
     bounded by the caller's capacity so the compact buffers cannot overflow."""
     comptime SMALL_V = 64
     var words = bitmap_words(SMALL_V)
-    var bm = alloc[Scalar[DType.uint32]](words)
-    var row_of = alloc[Scalar[DType.int32]](SMALL_V)
-    var toks = alloc[Scalar[DType.int32]](3)
+    var bm = heap_alloc[Scalar[DType.uint32]](words)
+    var row_of = heap_alloc[Scalar[DType.int32]](SMALL_V)
+    var toks = heap_alloc[Scalar[DType.int32]](3)
     toks[unsafe_offset=0] = 1
     toks[unsafe_offset=1] = 5
     toks[unsafe_offset=2] = 40
@@ -203,9 +203,9 @@ def test_row_map_rejects_overflow() raises:
     """More distinct rows than capacity is a hard error, not a silent clamp."""
     comptime SMALL_V = 64
     var words = bitmap_words(SMALL_V)
-    var bm = alloc[Scalar[DType.uint32]](words)
-    var row_of = alloc[Scalar[DType.int32]](SMALL_V)
-    var toks = alloc[Scalar[DType.int32]](10)
+    var bm = heap_alloc[Scalar[DType.uint32]](words)
+    var row_of = heap_alloc[Scalar[DType.int32]](SMALL_V)
+    var toks = heap_alloc[Scalar[DType.int32]](10)
     for i in range(10):
         toks[unsafe_offset=i] = Scalar[DType.int32](i * 3)
     build_token_bitmap(
@@ -247,20 +247,20 @@ def test_union_makes_row_lists_rank_invariant() raises:
     batch."""
     var ctx = DeviceContext(api="cpu")
     comptime N = 2
-    var coord = alloc[CpuCoordinator](1)
+    var coord = heap_alloc[CpuCoordinator](1)
     coord[] = CpuCoordinator(N)
 
     var words = bitmap_words(V)
     # Per-rank results, compared on the main thread after the join.
-    var n_rows_out = alloc[Int](N)
-    var run_count_out = alloc[Int](N)
-    var union_out = alloc[Scalar[DType.uint32]](N * words)
+    var n_rows_out = heap_alloc[Int](N)
+    var run_count_out = heap_alloc[Int](N)
+    var union_out = heap_alloc[Scalar[DType.uint32]](N * words)
     # Each rank's own bitmap BEFORE the union. Without this the test can
     # only compare ranks to each other, and 'every rank ended up with the
     # same bitmap' is satisfied just as well by broadcasting one rank's.
-    var own_out = alloc[Scalar[DType.uint32]](N * words)
-    var first_out = alloc[Int](N * BT * 2)
-    var len_out = alloc[Int](N * BT * 2)
+    var own_out = heap_alloc[Scalar[DType.uint32]](N * words)
+    var first_out = heap_alloc[Int](N * BT * 2)
+    var len_out = heap_alloc[Int](N * BT * 2)
 
     @parameter
     def _run_rank(rank: Int):
@@ -268,7 +268,7 @@ def test_union_makes_row_lists_rank_invariant() raises:
             var z = ZeroContext["cpu", N](
                 rank=rank, zero_stage=2, ctx=ctx, cpu_coord=coord
             )
-            var toks = alloc[Scalar[DType.int32]](BT)
+            var toks = heap_alloc[Scalar[DType.int32]](BT)
             # Deliberately divergent, partially overlapping token bands. Span
             # is wider than the encoder-equivalence test's (600 vs 300) with a
             # half-span offset so the union stays sparse enough, at
@@ -283,9 +283,9 @@ def test_union_makes_row_lists_rank_invariant() raises:
                 600,
                 1000 + rank * 300,
             )
-            var bm = alloc[Scalar[DType.uint32]](words)
-            var un = alloc[Scalar[DType.uint32]](words)
-            var row_of = alloc[Scalar[DType.int32]](V)
+            var bm = heap_alloc[Scalar[DType.uint32]](words)
+            var un = heap_alloc[Scalar[DType.uint32]](words)
+            var row_of = heap_alloc[Scalar[DType.int32]](V)
             build_token_bitmap(
                 ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
                 MutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
@@ -438,9 +438,9 @@ def test_divergent_range_lists_are_rejected() raises:
     var ctx = DeviceContext(api="cpu")
     comptime N = 2
     comptime OPT = 16
-    var coord = alloc[CpuCoordinator](1)
+    var coord = heap_alloc[CpuCoordinator](1)
     coord[] = CpuCoordinator(N)
-    var raised_count = alloc[Int](N)
+    var raised_count = heap_alloc[Int](N)
     raised_count[unsafe_offset=0] = 0
     raised_count[unsafe_offset=1] = 0
 
@@ -471,7 +471,7 @@ def test_divergent_range_lists_are_rejected() raises:
     assert_equal(raised_count[unsafe_offset=1], 1)
 
     # Agreeing lists must pass cleanly.
-    var ok = alloc[Int](N)
+    var ok = heap_alloc[Int](N)
     ok[unsafe_offset=0] = 0
     ok[unsafe_offset=1] = 0
 
@@ -535,7 +535,7 @@ def _run_encoder_bucket[
             var z = ZeroContext["cpu", N](
                 rank=rank, zero_stage=2, ctx=ctx, cpu_coord=coord
             )
-            var toks = alloc[Scalar[DType.int32]](BT)
+            var toks = heap_alloc[Scalar[DType.int32]](BT)
             _fill_tokens(
                 MutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
                 BT,
@@ -543,26 +543,28 @@ def _run_encoder_bucket[
                 300,
                 1000 + rank * 150,
             )
-            var dout = alloc[Scalar[DType.float32]](BT * C)
+            var dout = heap_alloc[Scalar[DType.float32]](BT * C)
             _fill_dout(
                 MutKernelPtr[DType.float32](dout.as_unsafe_any_origin()),
                 BT * C,
                 UInt64(77 + rank),
             )
-            var shard = alloc[Scalar[DType.float32]](opt)
+            var shard = heap_alloc[Scalar[DType.float32]](opt)
             for i in range(opt):
                 shard[unsafe_offset=i] = 0.0
 
             var cap = BT * ceildiv(C, 128)
-            var binfo = alloc[Scalar[DType.int32]](cap * WTE_BUCKET_IDX_SIZE)
-            var widx = alloc[Scalar[DType.int32]](BT)
-            var row_of = alloc[Scalar[DType.int32]](V)
+            var binfo = heap_alloc[Scalar[DType.int32]](
+                cap * WTE_BUCKET_IDX_SIZE
+            )
+            var widx = heap_alloc[Scalar[DType.int32]](BT)
+            var row_of = heap_alloc[Scalar[DType.int32]](V)
 
             # Weight tying: the LM head contributes a DENSE gradient to the
             # same flat range. Deposit it first on both paths so the test also
             # covers the two contributions landing on one shard via
             # reduce-scatter linearity.
-            var lm = alloc[Scalar[DType.float32]](WTE_ELEMS)
+            var lm = heap_alloc[Scalar[DType.float32]](WTE_ELEMS)
             for i in range(WTE_ELEMS):
                 lm[unsafe_offset=i] = Scalar[DType.float32]((i % 7) - 3) * 0.25
             var dl = List[Int]()
@@ -598,7 +600,7 @@ def _run_encoder_bucket[
                     ImmutKernelPtr[DType.int32](row_of.as_unsafe_any_origin()),
                     False,
                 )
-                var pool = alloc[Scalar[DType.float32]](WTE_ELEMS)
+                var pool = heap_alloc[Scalar[DType.float32]](WTE_ELEMS)
                 for i in range(WTE_ELEMS):
                     pool[unsafe_offset=i] = 0.0
                 wte_backward_cpu[DType.float32, 4](
@@ -630,8 +632,8 @@ def _run_encoder_bucket[
                 pool.unsafe_free()
             else:
                 var words = bitmap_words(V)
-                var bm = alloc[Scalar[DType.uint32]](words)
-                var un = alloc[Scalar[DType.uint32]](words)
+                var bm = heap_alloc[Scalar[DType.uint32]](words)
+                var un = heap_alloc[Scalar[DType.uint32]](words)
                 build_token_bitmap(
                     ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
                     MutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
@@ -670,7 +672,7 @@ def _run_encoder_bucket[
                     ImmutKernelPtr[DType.int32](row_of.as_unsafe_any_origin()),
                     True,
                 )
-                var pool = alloc[Scalar[DType.float32]](chunk_rows * C)
+                var pool = heap_alloc[Scalar[DType.float32]](chunk_rows * C)
                 var num_chunks = max(1, ceildiv(n_rows, chunk_rows))
                 var cursor = 0
                 for j in range(num_chunks):
@@ -780,11 +782,11 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
     var ctx = DeviceContext(api="cpu")
     comptime N = 2
     comptime OPT = WTE_ELEMS // N
-    var coord = alloc[CpuCoordinator](1)
+    var coord = heap_alloc[CpuCoordinator](1)
     coord[] = CpuCoordinator(N)
 
-    var dense = alloc[Scalar[DType.float32]](N * OPT)
-    var sparse = alloc[Scalar[DType.float32]](N * OPT)
+    var dense = heap_alloc[Scalar[DType.float32]](N * OPT)
+    var sparse = heap_alloc[Scalar[DType.float32]](N * OPT)
     for i in range(N * OPT):
         dense[unsafe_offset=i] = 0.0
         sparse[unsafe_offset=i] = 0.0

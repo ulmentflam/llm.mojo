@@ -7,7 +7,7 @@
 from max.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from std.algorithm import vectorize
-from std.memory import alloc
+from llmm.memory import heap_alloc
 
 
 def _fp8_op[
@@ -38,8 +38,8 @@ def main() raises:
     var ctx = DeviceContext(api="cpu")
     comptime N = 64
     comptime DT = DType.float8_e4m3fn
-    var x = alloc[Scalar[DT]](N)
-    var y = alloc[Scalar[DT]](N)
+    var x = heap_alloc[Scalar[DT]](N)
+    var y = heap_alloc[Scalar[DT]](N)
     for i in range(N):
         x[i] = Float32(i).cast[DT]()
 

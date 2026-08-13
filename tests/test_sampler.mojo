@@ -9,10 +9,10 @@
 
 from std.math import exp
 from std.testing import assert_equal, TestSuite
-from std.memory import alloc
+
 
 from llmm.sampler import sample_softmax
-from llmm.memory import ImmutMemPtr, MutMemPtr
+from llmm.memory import ImmutMemPtr, MutMemPtr, heap_alloc
 
 
 def sample_softmax_llmc_reference(
@@ -35,7 +35,7 @@ def sample_softmax_llmc_reference(
 
 
 def _alloc_logits(n: Int) -> MutMemPtr[DType.float32]:
-    return alloc[Scalar[DType.float32]](n)
+    return heap_alloc[Scalar[DType.float32]](n)
 
 
 def _assert_matches_reference(

@@ -189,8 +189,7 @@ deprecates implicit walrus bindings and suggests declaring them with `var`.
 Applying that to the three `_get_global_or_null` call sites (the process-global
 device-buffer cache in `llmm/memory.mojo`, `llmm/matmul.mojo`, and
 `tests/_gpu_test_common.mojo`) **SIGSEGVs the MAX compiler** when a custom op is
-built against the module. `gp` aliases a pointer into a global cache, and the
-owned `var` binding disturbs it; the crash lands inside `max/engine/api.py`'s
+built against the module. The crash lands inside `max/engine/api.py`'s
 `compile`, nowhere near the source change.
 
 It cost a full gate to find and is worth describing because of how it presented:
@@ -199,9 +198,23 @@ passed, and `test_zero` passed. Only `test-python-cuda` died, on
 `test_attention_equivalence.py`, because that suite is the only thing that
 compiles kernels through the custom-op path. Bisecting a three-line diff
 (`UnsafePointer` -> `Pointer` aliases, `bitcast` -> `unsafe_bitcast`, and the
-walrus) found the walrus was the only guilty one; the other two are kept. The
-three sites now carry a comment saying not to re-apply the suggestion, and keep
-their deprecation warnings on purpose.
+walrus) found the walrus was the only guilty one; the other two are kept.
+
+**The fix is to hoist rather than to annotate.** Binding first and testing
+separately is warning-free AND does not crash:
+
+```mojo
+var cached = _get_global_or_null(name)      # not `if var gp := ...`
+if cached:
+    ...
+```
+
+So the bug is specific to the `if var x := ...` form, not to owning the
+Optional: `var cached = ...` is equally owned and compiles fine. All three sites
+(`llmm/memory.mojo`, `llmm/matmul.mojo`, `tests/_gpu_test_common.mojo`) use the
+hoisted spelling, which is why this category is now at zero warnings. **Do not
+"simplify" them back into a walrus**, and do not apply the compiler's suggested
+`if var gp := ...`: that is the exact edit that crashes.
 
 Two lessons: **a compiler's suggested fix is a suggestion, not a proof**, and a
 warning cleanup needs the same gate as a semantic change, because "it still

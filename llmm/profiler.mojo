@@ -1,9 +1,10 @@
 from std.os import getenv
-from std.memory import alloc
+
 from std.sys import is_defined
 from std.ffi import external_call
 from std.time import global_perf_counter_ns
 from max.algorithm import sync_parallelize
+from llmm.memory import heap_alloc
 
 
 # Per-thread CPU trace, written directly as Perfetto/Chrome-trace JSON.
@@ -107,9 +108,9 @@ def traced_parallelize[
             sync_parallelize[work_fn](num_workers)
             return
 
-        var starts = alloc[UInt64](num_workers)
-        var ends = alloc[UInt64](num_workers)
-        var tids = alloc[UInt64](num_workers)
+        var starts = heap_alloc[UInt64](num_workers)
+        var ends = heap_alloc[UInt64](num_workers)
+        var tids = heap_alloc[UInt64](num_workers)
 
         @parameter
         def _timed_worker(i: Int) raises:

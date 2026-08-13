@@ -1,10 +1,10 @@
 from std.testing import assert_almost_equal, TestSuite
 from std.sys.info import size_of
-from std.memory import alloc
+
 from max.gpu.host import DeviceContext
 from std.python import Python
 
-from llmm.memory import MutMemPtr
+from llmm.memory import MutMemPtr, heap_alloc
 
 from train_gpt2 import GPT2, GPT2_DTYPE
 
@@ -107,7 +107,7 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
     """
     # 1. Load inputs and targets from the debug state file
     var state_file = open("gpt2_tiny_debug_state.bin", "r")
-    var state_header = alloc[Int32](256)
+    var state_header = heap_alloc[Int32](256)
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
     if state_header[unsafe_offset=0] != 20240520:
         state_file.close()
@@ -121,8 +121,8 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
         state_header.unsafe_free()
         raise Error("Dimension mismatch in state file")
 
-    var x = alloc[SIMD[DType.int32, 1]](B * T)
-    var y = alloc[SIMD[DType.int32, 1]](B * T)
+    var x = heap_alloc[SIMD[DType.int32, 1]](B * T)
+    var y = heap_alloc[SIMD[DType.int32, 1]](B * T)
     read_to_dtype_pointer[DType.int32](x, state_file, B * T)
     read_to_dtype_pointer[DType.int32](y, state_file, B * T)
     state_file.close()
@@ -130,7 +130,7 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
 
     # 2. Run baseline (zero_stage = 0, WORLD_SIZE = 1)
     var ctx = DeviceContext(api="cpu")
-    var baseline_params = alloc[Float32](NUM_PARAMS)
+    var baseline_params = heap_alloc[Float32](NUM_PARAMS)
 
     try:
         var baseline_model = GPT2["cpu", 1](

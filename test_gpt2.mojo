@@ -3,12 +3,12 @@ from std.time import perf_counter_ns
 from std.sys import exit, argv, has_accelerator
 from std.os import getenv
 from std.sys.info import size_of
-from std.memory import alloc
+
 from max.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
 from std.math import sqrt
 
-from llmm.memory import MutMemPtr
+from llmm.memory import MutMemPtr, heap_alloc
 from llmm.vendor import HAS_CUBLAS, USE_TF32
 
 from train_gpt2 import (
@@ -295,7 +295,7 @@ def run_test[
 
     var state_file = open("gpt2_124M_debug_state.bin", "r")
 
-    var state_header = alloc[Int32](256)
+    var state_header = heap_alloc[Int32](256)
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
 
     if state_header[unsafe_offset=0] != 20240520:
@@ -326,7 +326,7 @@ def run_test[
     print("seq_len:", T)
 
     var expected_grads = ParameterTensors[DType.float32]()
-    var expected_grads_memory = alloc[Scalar[DType.float32]](
+    var expected_grads_memory = heap_alloc[Scalar[DType.float32]](
         model.num_parameters
     )
     expected_grads.point_parameters(
@@ -336,11 +336,11 @@ def run_test[
 
     # inputs and expected outputs, only used for error checking
 
-    var x = alloc[SIMD[DType.int32, 1]](B * T)
-    var y = alloc[SIMD[DType.int32, 1]](B * T)
+    var x = heap_alloc[SIMD[DType.int32, 1]](B * T)
+    var y = heap_alloc[SIMD[DType.int32, 1]](B * T)
 
-    var expected_logits = alloc[SIMD[DType.float32, 1]](B * T * V)
-    var expected_loss = alloc[SIMD[DType.float32, 1]](1)
+    var expected_logits = heap_alloc[SIMD[DType.float32, 1]](B * T * V)
+    var expected_loss = heap_alloc[SIMD[DType.float32, 1]](1)
 
     # read reference information from Python
 

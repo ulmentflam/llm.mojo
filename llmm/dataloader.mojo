@@ -1,10 +1,9 @@
-from std.memory import alloc
 from std.python import Python
 
 # llm.c shuffles its dataloader with the mt19937 stream from rand.h (not the
 # xorshift sampler rng), so use the mt19937 port for batch-order parity.
 from llmm.rand import MT19937, random_permutation
-from llmm.memory import MutMemPtr
+from llmm.memory import MutMemPtr, heap_alloc
 
 
 # ===----------------------------------------------------------------------=== #
@@ -177,8 +176,8 @@ struct DataLoader:
             raise Error("DataLoader error: empty file list")
 
         # Allocate buffers for the input and target tokens.
-        self.inputs = alloc[Scalar[DType.int32]](batch_size * seq_len)
-        self.targets = alloc[Scalar[DType.int32]](batch_size * seq_len)
+        self.inputs = heap_alloc[Scalar[DType.int32]](batch_size * seq_len)
+        self.targets = heap_alloc[Scalar[DType.int32]](batch_size * seq_len)
         self.has_allocated = True
 
         for i in range(len(self.files)):

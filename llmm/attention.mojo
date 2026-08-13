@@ -1,7 +1,7 @@
 from extensibility import register
 from layout import Layout, TileTensor
 from layout.tile_layout import row_major
-from std.memory import alloc
+
 from std.sys import simd_width_of, align_of, is_defined
 from std.time import global_perf_counter_ns
 from std.utils.index import Index
@@ -38,7 +38,7 @@ from llmm.split import split_fwd, split_bwd
 from llmm.merge import merge_fwd, merge_bwd
 from llmm.matmul import _matmul_cublaslt
 from llmm.profiler import traced_parallelize
-from llmm.memory import ImmutKernelPtr, MutKernelPtr
+from llmm.memory import ImmutKernelPtr, MutKernelPtr, heap_alloc
 from llmm.vendor import HAS_CUBLAS, HAS_METAL, USE_TF32
 
 
@@ -1636,9 +1636,9 @@ def attention_fwd_gemm[
         # structurally zero), and A·V / the backward read it as zero. Halves the
         # softmax's store traffic.
         device_ctx.enqueue_memset(att_buf, Scalar[dtype](0))
-        var sptr = alloc[BufType](1)
+        var sptr = heap_alloc[BufType](1)
         sptr.unsafe_write(scores_buf^)
-        var aptr = alloc[BufType](1)
+        var aptr = heap_alloc[BufType](1)
         aptr.unsafe_write(att_buf^)
         scores_addr = Int(sptr)
         att_addr = Int(aptr)
@@ -1900,7 +1900,7 @@ def attention_fwd[
             # Cache miss, compile the kernel and store the address.
             if addr_fwd == 0:
                 var compiled = device_ctx.compile_function[gpu_kernel]()
-                var ptr = alloc[CompiledType](1)
+                var ptr = heap_alloc[CompiledType](1)
                 ptr.unsafe_write(compiled^)
                 addr_fwd = Int(ptr)
                 if cache:
@@ -2100,7 +2100,7 @@ def _attention_bwd_cpu[
         dv_head[unsafe_offset=i] = Scalar[dtype](0.0)
 
     # Precompute row dot products D_i = sum_k (dO_i,k * O_i,k).
-    var D = alloc[Scalar[DType.float32]](seq_len)
+    var D = heap_alloc[Scalar[DType.float32]](seq_len)
     for i in range(seq_len):
         D[unsafe_offset=i] = _attention_query_key_dot_product[dtype, width](
             do_head.unsafe_offset(i * head_dim),
@@ -3123,7 +3123,7 @@ def _gemm_scratch_buffer[
         var buf = ctx.enqueue_create_buffer[bdt](count)
         if zero_on_alloc:
             ctx.enqueue_memset(buf, Scalar[bdt](0))
-        var p = alloc[BufType](1)
+        var p = heap_alloc[BufType](1)
         p.unsafe_write(buf^)
         out_addr = Int(p)
     var bp = Pointer[BufType, MutUntrackedOrigin](unsafe_from_address=out_addr)
@@ -5150,7 +5150,7 @@ def attention_bwd[
 
             if addr_dq == 0:
                 var compiled_dq = device_ctx.compile_function[gpu_kernel_dq]()
-                var ptr_dq = alloc[CompiledTypeDQ](1)
+                var ptr_dq = heap_alloc[CompiledTypeDQ](1)
                 ptr_dq.unsafe_write(compiled_dq^)
                 addr_dq = Int(ptr_dq)
                 if cache:
@@ -5223,7 +5223,7 @@ def attention_bwd[
             # Cache miss, compile the kernel and store the address.
             if addr_dkv == 0:
                 var compiled_dkv = device_ctx.compile_function[gpu_kernel_dkv]()
-                var ptr_dkv = alloc[CompiledTypeDKV](1)
+                var ptr_dkv = heap_alloc[CompiledTypeDKV](1)
                 ptr_dkv.unsafe_write(compiled_dkv^)
                 addr_dkv = Int(ptr_dkv)
                 if cache:

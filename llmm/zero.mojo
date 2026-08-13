@@ -7,10 +7,11 @@ from comm.allgather import allgather
 from std.collections import InlineArray
 from std.gpu import block_dim, block_idx, thread_idx
 from layout import TileTensor, TensorLayout
-from std.memory import UnsafePointer, alloc
+from std.memory import UnsafePointer
 from std.gpu.host.info import is_cpu
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.sys import has_nvidia_gpu_accelerator
+from llmm.memory import heap_alloc
 
 
 # ===----------------------------------------------------------------------=== #
@@ -130,17 +131,17 @@ struct CpuCoordinator:
     var shared_scalars: Pointer[Float64, MutUntrackedOrigin]
 
     def __init__(out self, num_threads: Int):
-        self.barrier1 = alloc[CpuBarrier](1)
+        self.barrier1 = heap_alloc[CpuBarrier](1)
         self.barrier1[] = CpuBarrier(num_threads)
-        self.barrier2 = alloc[CpuBarrier](1)
+        self.barrier2 = heap_alloc[CpuBarrier](1)
         self.barrier2[] = CpuBarrier(num_threads)
-        self.shared_inputs = alloc[Pointer[UInt8, MutUntrackedOrigin]](
+        self.shared_inputs = heap_alloc[Pointer[UInt8, MutUntrackedOrigin]](
             num_threads
         )
-        self.shared_outputs = alloc[Pointer[UInt8, MutUntrackedOrigin]](
+        self.shared_outputs = heap_alloc[Pointer[UInt8, MutUntrackedOrigin]](
             num_threads
         )
-        self.shared_scalars = alloc[Float64](num_threads)
+        self.shared_scalars = heap_alloc[Float64](num_threads)
 
     def abort(self) -> None:
         """Stop every rank waiting on this coordinator, with an error.

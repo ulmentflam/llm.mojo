@@ -3,9 +3,9 @@ from std.sys import argv, exit, has_accelerator
 from std.gpu.host.info import is_cpu
 from max.gpu.host import DeviceContext
 from std.time import global_perf_counter_ns
-from std.memory import alloc
 
-from llmm.memory import MutMemPtr
+
+from llmm.memory import MutMemPtr, heap_alloc
 from llmm.profiler import (
     TraceProfiler,
     thread_trace_path,
@@ -95,8 +95,8 @@ def run_profile[
 
     # Synthetic inputs/targets, exactly like profile_gpt2.cu: token i = i % V.
     var vocab_size = model.config.vocab_size
-    var x = alloc[Scalar[DType.int32]](B * T)
-    var y = alloc[Scalar[DType.int32]](B * T)
+    var x = heap_alloc[Scalar[DType.int32]](B * T)
+    var y = heap_alloc[Scalar[DType.int32]](B * T)
     for i in range(B * T):
         x[unsafe_offset=i] = Int32(i % vocab_size)
         y[unsafe_offset=i] = Int32(i % vocab_size)

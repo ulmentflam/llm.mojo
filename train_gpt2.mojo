@@ -20,7 +20,7 @@ from max.gpu.host import (
     DeviceAttribute,
 )
 from std.gpu import block_dim, block_idx, grid_dim
-from std.memory import alloc, unsafe_memcpy
+from std.memory import unsafe_memcpy
 
 from llmm.io import read_and_copy
 from llmm.lowp import (
@@ -95,6 +95,7 @@ from llmm.memory import (
     as_immut_kernel_from_mut,
     as_mut_kernel,
     rebind_mut_mem,
+    heap_alloc,
 )
 from llmm.zero import ZeroContext, CpuCoordinator
 from llmm.vendor import HAS_METAL
@@ -1534,7 +1535,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         #    run trains from scratch with PyTorch-identical initial conditions.
         if self.checkpoint_path.endswith(".bin"):
             var model_file = open(self.checkpoint_path, "r")
-            var model_header = alloc[Int32](256)
+            var model_header = heap_alloc[Int32](256)
             read_and_copy[DType.int32](model_file, model_header, 256)
 
             var model_magic = model_header.unsafe_load(0)
@@ -2091,7 +2092,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             max_draw = self.config.max_seq_len * C
         if 4 * C * C > max_draw:
             max_draw = 4 * C * C
-        var fp32_scratch = alloc[Scalar[DType.float32]](max_draw)
+        var fp32_scratch = heap_alloc[Scalar[DType.float32]](max_draw)
         var fp32_ptr = rebind_mut_mem[DType.float32](
             fp32_scratch.as_unsafe_any_origin()
         )
@@ -5302,7 +5303,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         comptime width = simd_width_of[GPT2_DTYPE]()
 
         comptime if is_cpu[Self.target]():
-            var host_out = alloc[Scalar[DType.float32]](1)
+            var host_out = heap_alloc[Scalar[DType.float32]](1)
             host_out[unsafe_offset=0] = Scalar[DType.float32](0.0)
             global_norm_squared_cpu[GPT2_DTYPE, width](
                 rebind[MutKernelPtr[DType.float32]](
@@ -6349,7 +6350,7 @@ def train[
     # Initialize some memory for generating samples from the model.
     var rng_state = UInt64(1337)
     var gen_max_length = args.gen_tokens
-    var gen_tokens = alloc[Scalar[DType.int32]](gen_max_length)
+    var gen_tokens = heap_alloc[Scalar[DType.int32]](gen_max_length)
     var zero = 0
     var null_int32_ptr = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
@@ -6799,7 +6800,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
                 Optional[Pointer[CpuCoordinator, MutUntrackedOrigin]](),
             )
         else:
-            var cpu_coord_ptr = alloc[CpuCoordinator](1)
+            var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
             cpu_coord_ptr[] = CpuCoordinator(world_size)
 
             @parameter
@@ -6861,7 +6862,7 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             # train()), coordinated through the same barrier/pointer-exchange
             # struct the CPU multi-rank path uses. The `rank` CLI/env value is
             # ignored here — all ranks live in this process.
-            var coord_ptr = alloc[CpuCoordinator](1)
+            var coord_ptr = heap_alloc[CpuCoordinator](1)
             coord_ptr[] = CpuCoordinator(world_size)
 
             @parameter

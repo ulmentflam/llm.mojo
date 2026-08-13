@@ -27,10 +27,10 @@
 from std.sys import argv
 from std.os import makedirs
 from std.os.path import exists
-from std.memory import alloc
+
 from max.gpu.host import DeviceContext
 
-from llmm.memory import MutMemPtr
+from llmm.memory import MutMemPtr, heap_alloc
 from llmm.io import write_buffer, read_and_copy
 
 from train_gpt2 import GPT2, Parameters, GPT2_DTYPE
@@ -53,7 +53,7 @@ def dump_tensor[
     )
     ctx.synchronize()
 
-    var f32 = alloc[Scalar[DType.float32]](n)
+    var f32 = heap_alloc[Scalar[DType.float32]](n)
     for i in range(n):
         f32[unsafe_offset=i] = host_buf[i].cast[DType.float32]()
 
@@ -128,7 +128,7 @@ def main() raises:
     # Same fixed reference batch test_gpt2.mojo uses -- "identical step-1
     # data" across the fp8 and bf16 builds this tool is run against.
     var state_file = open("gpt2_124M_debug_state.bin", "r")
-    var state_header = alloc[Int32](256)
+    var state_header = heap_alloc[Int32](256)
     read_and_copy[DType.int32](
         state_file,
         rebind[MutMemPtr[DType.int32]](state_header.as_unsafe_any_origin()),
@@ -136,8 +136,8 @@ def main() raises:
     )
     var dB: Int = Int(state_header[unsafe_offset=2])
     var dT: Int = Int(state_header[unsafe_offset=3])
-    var dbg_x = alloc[SIMD[DType.int32, 1]](dB * dT)
-    var dbg_y = alloc[SIMD[DType.int32, 1]](dB * dT)
+    var dbg_x = heap_alloc[SIMD[DType.int32, 1]](dB * dT)
+    var dbg_y = heap_alloc[SIMD[DType.int32, 1]](dB * dT)
     read_and_copy[DType.int32](
         state_file,
         rebind[MutMemPtr[DType.int32]](dbg_x.as_unsafe_any_origin()),
@@ -161,8 +161,8 @@ def main() raises:
         T = Int(atol(String(args[2])))
     if len(args) >= 4:
         B = Int(atol(String(args[3])))
-    var x = alloc[SIMD[DType.int32, 1]](B * T)
-    var y = alloc[SIMD[DType.int32, 1]](B * T)
+    var x = heap_alloc[SIMD[DType.int32, 1]](B * T)
+    var y = heap_alloc[SIMD[DType.int32, 1]](B * T)
     var ndbg = dB * dT
     for i in range(B * T):
         x[unsafe_offset=i] = dbg_x[unsafe_offset=i % ndbg]

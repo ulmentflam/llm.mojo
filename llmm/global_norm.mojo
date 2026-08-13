@@ -1,5 +1,5 @@
 from extensibility import register
-from std.memory import alloc
+
 from extensibility import InputTensor
 from std.sys import simd_width_of, align_of
 from std.math import ceildiv, max
@@ -14,7 +14,7 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.primitives import block
 
 from llmm.profiler import traced_parallelize
-from llmm.memory import ImmutKernelPtr, MutKernelPtr
+from llmm.memory import ImmutKernelPtr, MutKernelPtr, heap_alloc
 
 # ===----------------------------------------------------------------------=== #
 # Constants and Comptime Variables
@@ -60,7 +60,7 @@ def global_norm_squared_cpu[
     var max_workers = parallelism_level()
     var chunk = ceildiv(num_params, max_workers)
     var num_workers = ceildiv(num_params, chunk)
-    var partials = alloc[Scalar[DType.float32]](num_workers)
+    var partials = heap_alloc[Scalar[DType.float32]](num_workers)
 
     @parameter
     def _worker(w: Int):

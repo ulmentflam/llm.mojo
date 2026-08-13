@@ -34,12 +34,17 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.testing import assert_almost_equal, assert_true, TestSuite
-from std.memory import alloc
+
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from std.python import Python
 
-from llmm.memory import MutMemPtr, as_mut_kernel, as_immut_kernel_from_mut
+from llmm.memory import (
+    MutMemPtr,
+    as_mut_kernel,
+    as_immut_kernel_from_mut,
+    heap_alloc,
+)
 from llmm.matmul import (
     matmul_fwd,
     matmul_bwd,
@@ -70,7 +75,7 @@ def _fill(p: MutMemPtr[DT], n: Int, seed: Int) -> None:
 
 
 def _alloc(n: Int) -> MutMemPtr[DT]:
-    var p = alloc[Scalar[DT]](n)
+    var p = heap_alloc[Scalar[DT]](n)
     var q = rebind[MutMemPtr[DT]](p.as_unsafe_any_origin())
     for i in range(n):
         q[unsafe_offset=i] = 0.0

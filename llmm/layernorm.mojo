@@ -1,5 +1,5 @@
 from extensibility import register
-from std.memory import alloc
+
 from std.sys import simd_width_of, align_of
 from std.gpu.primitives import warp
 from max.gpu.primitives import block
@@ -26,6 +26,7 @@ from llmm.memory import (
     ImmutKernelPtr,
     MutKernelPtr,
     persistent_device_buffer,
+    heap_alloc,
 )
 
 # ===----------------------------------------------------------------------=== #
@@ -1307,8 +1308,8 @@ def layernorm_bwd_cpu[
     # One private [channels] accumulator per worker for the parameter
     # gradients. Reducing these once after the join replaces the per-element
     # atomics: the same cross-row sum, but contention-free and vectorizable.
-    var dgamma_partial = alloc[Scalar[DType.float32]](num_workers * c)
-    var dbeta_partial = alloc[Scalar[DType.float32]](num_workers * c)
+    var dgamma_partial = heap_alloc[Scalar[DType.float32]](num_workers * c)
+    var dbeta_partial = heap_alloc[Scalar[DType.float32]](num_workers * c)
 
     @parameter
     def _worker(w: Int):

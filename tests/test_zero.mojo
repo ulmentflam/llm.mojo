@@ -1,5 +1,5 @@
 from std.collections import InlineArray
-from std.memory import alloc
+
 from max.gpu.host import DeviceContext
 from std.sys.info import size_of
 from std.sys import has_nvidia_gpu_accelerator
@@ -15,6 +15,7 @@ from llmm.zero import (
 
 
 from std.testing import TestSuite, assert_almost_equal, assert_equal
+from llmm.memory import heap_alloc
 
 
 # ===----------------------------------------------------------------------=== #
@@ -280,11 +281,11 @@ def test_rank_failure_aborts_peers_instead_of_hanging() raises:
     answer.
     """
     comptime WORLD_SIZE = 4
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
     # Per rank: 1 == returned normally, 2 == raised out of the barrier.
-    var outcome = alloc[Int](WORLD_SIZE)
+    var outcome = heap_alloc[Int](WORLD_SIZE)
     for r in range(WORLD_SIZE):
         outcome[unsafe_offset=r] = 0
 
@@ -319,11 +320,11 @@ def test_multi_cpu_allreduce() raises:
     comptime DTYPE = DType.float32
     comptime size = 64
 
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
-    var rank_inputs = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
-    var rank_outputs = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rank_inputs = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rank_outputs = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * size)
 
     for r in range(WORLD_SIZE):
         for i in range(size):
@@ -393,11 +394,11 @@ def test_multi_cpu_reducescatter() raises:
     comptime size = 64
     comptime sharded_size = size // WORLD_SIZE
 
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
-    var rank_inputs = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
-    var rank_outputs = alloc[Scalar[DTYPE]](WORLD_SIZE * sharded_size)
+    var rank_inputs = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rank_outputs = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * sharded_size)
 
     for r in range(WORLD_SIZE):
         for i in range(size):
@@ -481,11 +482,11 @@ def test_multi_cpu_reducescatter_inplace() raises:
     comptime size = 64
     comptime sharded_size = size // WORLD_SIZE
 
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
     # Each rank's full buffer holds the constant (r+1) everywhere.
-    var rank_bufs = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rank_bufs = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * size)
     for r in range(WORLD_SIZE):
         for i in range(size):
             rank_bufs[unsafe_offset=r * size + i] = Float32(r + 1)
@@ -561,7 +562,7 @@ def test_multi_cpu_reducescatter_buckets() raises:
     comptime opt = 16
     comptime padded = opt * WORLD_SIZE  # 64
 
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
     # Two buckets: bucket 0 -> flat [0,16) (rank 0's shard), bucket 1 ->
@@ -584,7 +585,7 @@ def test_multi_cpu_reducescatter_buckets() raises:
     lens.append(B1_LEN)
     lens.append(B2_LEN)
 
-    var rank_shards = alloc[Scalar[DTYPE]](WORLD_SIZE * opt)
+    var rank_shards = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * opt)
     for i in range(WORLD_SIZE * opt):
         rank_shards[unsafe_offset=i] = 0.0
 
@@ -661,11 +662,11 @@ def test_multi_cpu_allgather() raises:
     comptime sharded_size = 16
     comptime size = sharded_size * WORLD_SIZE
 
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
-    var rank_inputs = alloc[Scalar[DTYPE]](WORLD_SIZE * sharded_size)
-    var rank_outputs = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rank_inputs = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * sharded_size)
+    var rank_outputs = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * size)
 
     for r in range(WORLD_SIZE):
         for i in range(sharded_size):
@@ -765,11 +766,11 @@ def test_multi_sharded_parameter_gather_cpu() raises:
     comptime size = 64
     comptime sharded_size = size // WORLD_SIZE
 
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
-    var rank_inputs = alloc[Scalar[DTYPE]](WORLD_SIZE * sharded_size)
-    var rank_outputs = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rank_inputs = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * sharded_size)
+    var rank_outputs = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * size)
 
     for r in range(WORLD_SIZE):
         for i in range(sharded_size):
@@ -777,7 +778,7 @@ def test_multi_sharded_parameter_gather_cpu() raises:
         for i in range(size):
             rank_outputs[unsafe_offset=r * size + i] = 0.0
 
-    var shared_ptrs = alloc[Pointer[Scalar[DTYPE], MutUntrackedOrigin]](
+    var shared_ptrs = heap_alloc[Pointer[Scalar[DTYPE], MutUntrackedOrigin]](
         WORLD_SIZE
     )
 
@@ -927,18 +928,18 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
     # literal 3, which is 1+2 -- N=2 baked into every expectation.
     comptime RANK_SUM = WORLD_SIZE * (WORLD_SIZE + 1) // 2
 
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
     # Per-op snapshots, indexed [rank*len + j]:
     #   ar_out    — full buffer after allreduce
     #   rs_shard  — shard output after reducescatter
     #   ag_out    — full buffer after allgather
-    var ar_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
-    var rs_shard = alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
-    var rs_ip_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
-    var rsb_shard = alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
-    var ag_out = alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var ar_out = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rs_shard = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
+    var rs_ip_out = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * size)
+    var rsb_shard = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * shard)
+    var ag_out = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * size)
 
     # reducescatter_buckets legs: two buckets in a contiguous pool mapping to
     # SCATTERED global flat ranges — bucket A -> flat [0,32) (rank 0's shard),
@@ -1214,10 +1215,10 @@ def test_multi_cpu_allgather_ranges() raises:
     comptime lenB = 20
     comptime win = lenA + lenB
 
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
-    var rank_windows = alloc[Scalar[DTYPE]](WORLD_SIZE * win)
+    var rank_windows = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * win)
     for i in range(WORLD_SIZE * win):
         rank_windows[unsafe_offset=i] = 0.0
 

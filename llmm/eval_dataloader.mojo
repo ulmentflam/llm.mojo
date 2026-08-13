@@ -1,6 +1,4 @@
-from std.memory import alloc
-
-from llmm.memory import MutMemPtr, MutKernelPtr
+from llmm.memory import MutMemPtr, MutKernelPtr, heap_alloc
 
 # Loader for multiple-choice completion-style evals (HellaSwag, MMLU-style),
 # mirroring llm.c's EvalLoader (llmc/dataloader.h). Each example is a shared
@@ -119,10 +117,10 @@ struct EvalDataLoader:
         self.end_example_index = 0
         self.current_example_index = 0
 
-        self.inputs = alloc[Scalar[DType.int32]](batch_size * seq_len)
-        self.targets = alloc[Scalar[DType.int32]](batch_size * seq_len)
-        self.mask = alloc[Scalar[DType.uint8]](batch_size * seq_len)
-        self.label = alloc[Scalar[DType.int32]](self.can_fit_examples)
+        self.inputs = heap_alloc[Scalar[DType.int32]](batch_size * seq_len)
+        self.targets = heap_alloc[Scalar[DType.int32]](batch_size * seq_len)
+        self.mask = heap_alloc[Scalar[DType.uint8]](batch_size * seq_len)
+        self.label = heap_alloc[Scalar[DType.int32]](self.can_fit_examples)
         self.has_allocated = True
 
         self.reset()

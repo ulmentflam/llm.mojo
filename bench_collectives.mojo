@@ -27,13 +27,14 @@ Run (pin GPUs by UUID -- see MEMORY.md workstation-max-gpu1-gsp-hang):
 from max.algorithm import sync_parallelize
 from max.gpu.host import DeviceContext
 from std.math import isnan
-from std.memory import alloc
+
 from std.os import getenv
 from std.sys import get_defined_int, has_nvidia_gpu_accelerator, simd_width_of
 from std.sys.info import size_of
 from std.time import global_perf_counter_ns
 
 from llmm.zero import CpuCoordinator, ZeroContext
+from llmm.memory import heap_alloc
 
 comptime WORLD_SIZE = get_defined_int["WORLD_SIZE", 2]()
 comptime DTYPE = DType.float32
@@ -279,10 +280,10 @@ def main() raises:
 
     _check_gpu_availability(WORLD_SIZE)
 
-    var cpu_coord_ptr = alloc[CpuCoordinator](1)
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
     cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
 
-    var rank_ok = alloc[Int](WORLD_SIZE)
+    var rank_ok = heap_alloc[Int](WORLD_SIZE)
     for i in range(WORLD_SIZE):
         rank_ok[unsafe_offset=i] = 1
 

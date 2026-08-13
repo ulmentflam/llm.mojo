@@ -1,8 +1,8 @@
 from std.sys import argv, exit, has_accelerator
 from max.gpu.host import DeviceContext
-from std.memory import alloc
 
-from llmm.memory import MutMemPtr, ImmutMemPtr
+
+from llmm.memory import MutMemPtr, ImmutMemPtr, heap_alloc
 from llmm.sampler import random_f32, sample_softmax
 from llmm.tokenizer import Tokenizer, safe_print
 from llmm.eval_dataloader import EvalDataLoader, eval_stat_correct
@@ -76,7 +76,7 @@ def run_infer[
 
     var tokenizer = Tokenizer("gpt2_tokenizer.bin")
 
-    var gen_tokens = alloc[Scalar[DType.int32]](gen_max_length)
+    var gen_tokens = heap_alloc[Scalar[DType.int32]](gen_max_length)
     var zero = 0
     var null_int32_ptr = MutMemPtr[DType.int32](unsafe_from_address=zero)
     var rng_state = seed
@@ -88,7 +88,7 @@ def run_infer[
     # run. A standalone inference-only tool's first call IS the tiny one, so
     # replicate training's sizing here or every (1, t>1) call raises "Sequence
     # length or batch size is larger than the previous allocations".
-    var warmup_tokens = alloc[Scalar[DType.int32]](model.config.max_seq_len)
+    var warmup_tokens = heap_alloc[Scalar[DType.int32]](model.config.max_seq_len)
     for i in range(model.config.max_seq_len):
         warmup_tokens[unsafe_offset=i] = Scalar[DType.int32](tokenizer.eot_token)
     model.forward(warmup_tokens, null_int32_ptr, 1, model.config.max_seq_len)
@@ -100,7 +100,7 @@ def run_infer[
     # (see the dtype-mismatch fix below): sized to vocab_size, not
     # padded_vocab_size, matching what sample_softmax iterates over.
     var vocab_size = model.config.vocab_size
-    var logits_fp32 = alloc[Float32](vocab_size)
+    var logits_fp32 = heap_alloc[Float32](vocab_size)
 
     print("generating:\n---")
     for t in range(1, gen_max_length):

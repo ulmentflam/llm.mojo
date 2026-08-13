@@ -1,9 +1,8 @@
-from std.memory import alloc
 from std.python import Python
 from std.testing import assert_equal, assert_almost_equal, TestSuite
 
 from llmm.dataloader import DataLoader
-from llmm.memory import MutMemPtr
+from llmm.memory import MutMemPtr, heap_alloc
 from llmm.checkpointing import (
     CheckpointConfig,
     TrainingState,
@@ -80,7 +79,7 @@ def test_model_checkpoint_roundtrip() raises:
     var config = _tiny_config()
     var n = config.num_parameters()
 
-    var params = alloc[Float32](n)
+    var params = heap_alloc[Float32](n)
     _fill_pattern(params, n, 0.5)
 
     write_model_checkpoint(path, config, params, n)
@@ -91,7 +90,7 @@ def test_model_checkpoint_roundtrip() raises:
     assert_equal(header.config == config, True)
     assert_equal(header.config.num_parameters(), n)
 
-    var restored = alloc[Float32](n)
+    var restored = heap_alloc[Float32](n)
     var read_header = read_model_checkpoint(path, restored, n)
     assert_equal(read_header.config == config, True)
     for i in range(n):
@@ -110,15 +109,15 @@ def test_model_checkpoint_bad_magic() raises:
     assert_equal(MODEL_MAGIC != STATE_MAGIC, True)
 
     var path = String("test_ckpt_badmagic.bin")
-    var m = alloc[Float32](4)
-    var v = alloc[Float32](4)
+    var m = heap_alloc[Float32](4)
+    var v = heap_alloc[Float32](4)
     for i in range(4):
         m.unsafe_store(i, 1.0)
         v.unsafe_store(i, 2.0)
     var state = TrainingState(0, 1, 0, 0, 0, 0, 0, 0, 0)
     write_state_checkpoint(path, state, m, v, 4)
 
-    var out = alloc[Float32](4)
+    var out = heap_alloc[Float32](4)
     var raised = False
     try:
         _ = read_model_checkpoint(path, out, 4)
@@ -136,11 +135,11 @@ def test_model_checkpoint_buffer_too_small() raises:
     var path = String("test_ckpt_small.bin")
     var config = _tiny_config()
     var n = config.num_parameters()
-    var params = alloc[Float32](n)
+    var params = heap_alloc[Float32](n)
     _fill_pattern(params, n, 0.25)
     write_model_checkpoint(path, config, params, n)
 
-    var out = alloc[Float32](n - 1)
+    var out = heap_alloc[Float32](n - 1)
     var raised = False
     try:
         _ = read_model_checkpoint(path, out, n - 1)
@@ -162,8 +161,8 @@ def test_state_checkpoint_roundtrip() raises:
     var path = String("test_ckpt_state.bin")
     var n = 17  # Deliberately not a power of two.
 
-    var m = alloc[Float32](n)
-    var v = alloc[Float32](n)
+    var m = heap_alloc[Float32](n)
+    var v = heap_alloc[Float32](n)
     _fill_pattern(m, n, 0.1)
     _fill_pattern(v, n, 0.3)
 
@@ -181,8 +180,8 @@ def test_state_checkpoint_roundtrip() raises:
 
     write_state_checkpoint(path, state, m, v, n)
 
-    var m_out = alloc[Float32](n)
-    var v_out = alloc[Float32](n)
+    var m_out = heap_alloc[Float32](n)
+    var v_out = heap_alloc[Float32](n)
     var restored = read_state_checkpoint(path, m_out, v_out, n)
 
     # Scalar header fields, including the 64-bit RNG slots.
@@ -213,12 +212,12 @@ def test_state_checkpoint_bad_magic() raises:
     var path = String("test_ckpt_state_badmagic.bin")
     var config = _tiny_config()
     var n = config.num_parameters()
-    var params = alloc[Float32](n)
+    var params = heap_alloc[Float32](n)
     _fill_pattern(params, n, 0.5)
     write_model_checkpoint(path, config, params, n)
 
-    var m_out = alloc[Float32](4)
-    var v_out = alloc[Float32](4)
+    var m_out = heap_alloc[Float32](4)
+    var v_out = heap_alloc[Float32](4)
     var raised = False
     try:
         _ = read_state_checkpoint(path, m_out, v_out, 4)
@@ -258,8 +257,8 @@ def test_dataloader_capture_restore() raises:
 
     # Persist the (empty) optimizer payload alongside the captured position so
     # the round-trip exercises the on-disk header fields, not just the struct.
-    var m = alloc[Float32](1)
-    var v = alloc[Float32](1)
+    var m = heap_alloc[Float32](1)
+    var v = heap_alloc[Float32](1)
     m.unsafe_store(0, 0.0)
     v.unsafe_store(0, 0.0)
     write_state_checkpoint(path, state, m, v, 1)
@@ -269,8 +268,8 @@ def test_dataloader_capture_restore() raises:
     var expected_first = loader.inputs.unsafe_load(0)
     var expected_last = loader.inputs.unsafe_load(7)
 
-    var m_out = alloc[Float32](1)
-    var v_out = alloc[Float32](1)
+    var m_out = heap_alloc[Float32](1)
+    var v_out = heap_alloc[Float32](1)
     var restored = read_state_checkpoint(path, m_out, v_out, 1)
     assert_equal(restored.step, 3)
     assert_equal(restored.current_sample_idx, 3)
@@ -326,8 +325,8 @@ def test_dataloader_capture_restore_shuffled() raises:
 
     var path = String("test_ckpt_loader_shuffled_state.bin")
     var state = make_training_state(loader, step=3, sampler_rng_state=UInt64(7))
-    var m = alloc[Float32](1)
-    var v = alloc[Float32](1)
+    var m = heap_alloc[Float32](1)
+    var v = heap_alloc[Float32](1)
     m.unsafe_store(0, 0.0)
     v.unsafe_store(0, 0.0)
     write_state_checkpoint(path, state, m, v, 1)
@@ -339,8 +338,8 @@ def test_dataloader_capture_restore_shuffled() raises:
     var expected_first = loader.inputs.unsafe_load(0)
     var expected_last = loader.inputs.unsafe_load(7)
 
-    var m_out = alloc[Float32](1)
-    var v_out = alloc[Float32](1)
+    var m_out = heap_alloc[Float32](1)
+    var v_out = heap_alloc[Float32](1)
     var restored = read_state_checkpoint(path, m_out, v_out, 1)
     assert_equal(restored.step, 3)
     assert_equal(restored.should_shuffle, 1)

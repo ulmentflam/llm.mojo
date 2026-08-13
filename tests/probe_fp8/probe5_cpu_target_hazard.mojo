@@ -21,7 +21,8 @@
 #     tests/probe_fp8/probe5_cpu_target_hazard.mojo
 
 from std.algorithm import vectorize
-from std.memory import alloc
+from llmm.memory import heap_alloc
+
 
 comptime UNROLL = 4
 
@@ -43,8 +44,8 @@ def _fp8_axpy_cpu(
 def main() raises:
     print("=== probe5: fp8 CPU-target (AArch64) codegen hazard check ===")
     comptime N = 64
-    var x = alloc[Scalar[DType.float8_e4m3fn]](N)
-    var y = alloc[Scalar[DType.float8_e4m3fn]](N)
+    var x = heap_alloc[Scalar[DType.float8_e4m3fn]](N)
+    var y = heap_alloc[Scalar[DType.float8_e4m3fn]](N)
     for i in range(N):
         x[i] = Float32(i).cast[DType.float8_e4m3fn]()
 

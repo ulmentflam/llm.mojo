@@ -1,6 +1,5 @@
-from std.memory import alloc
-
 from .io import read_and_copy
+from llmm.memory import heap_alloc
 
 # ===----------------------------------------------------------------------=== #
 # GPT-2 Tokenizer (decode only)
@@ -109,7 +108,7 @@ struct Tokenizer:
                 pass
 
     def _load(mut self, mut file: FileHandle) raises:
-        var header = alloc[Int32](HEADER_SIZE)
+        var header = heap_alloc[Int32](HEADER_SIZE)
         read_and_copy[DType.int32](file, header, HEADER_SIZE)
 
         var magic = Int(header.unsafe_load(0))
