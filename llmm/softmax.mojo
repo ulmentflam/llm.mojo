@@ -33,16 +33,16 @@ comptime UNROLL = 4
 def _softmax_comp_max[
     dtype: DType,
     width: Int,
+    aligned: Bool = False,
 ](
     idx: Int,
     logits_ptr: ImmutKernelPtr[dtype],
     mut s: SIMD[DType.float32, width],
     mut m: SIMD[DType.float32, width],
 ) -> None:
-    # Explicit 16-byte alignment so the wide (128-bit) load is actually emitted:
-    # idx = row*Vp + tile*BLOCK_SPAN + tid*width is 16-aligned but the compiler
-    # can't prove it (Vp is runtime). This is the classifier's biggest read path.
-    comptime align = align_of[SIMD[dtype, width]]()
+    comptime align = align_of[SIMD[dtype, width]]() if aligned else align_of[
+        Scalar[dtype]
+    ]()
     var x = (
         (logits_ptr.unsafe_offset(idx))
         .unsafe_load[width=width, alignment=align]()
@@ -195,13 +195,15 @@ def softmax_phase_1_and_2_gpu[
         var lane_base = tile_base + tid * width
         if lane_base + width <= vocab_size:
             var idx = row * vocab_size_padded + lane_base
-            _softmax_comp_max[dtype, width](idx, logits_ptr, s, m)
+            _softmax_comp_max[dtype, width, aligned=True](idx, logits_ptr, s, m)
         elif lane_base < vocab_size:
             # Ragged edge of the last tile.
             # This is so every thread keeps the same tile trip count for the reductions.
             for i in range(lane_base, vocab_size):
                 var idx = row * vocab_size_padded + i
-                _softmax_comp_max[dtype, 1](idx, logits_ptr, s_tail, m_tail)
+                _softmax_comp_max[dtype, 1, aligned=True](
+                    idx, logits_ptr, s_tail, m_tail
+                )
 
     # Per-thread merge
     var m_thread = max(m.reduce_max(), m_tail)

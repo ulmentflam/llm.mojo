@@ -93,6 +93,7 @@ struct AdamWConfig:
 def _adamw_update[
     dtype: DType,
     width: Int,
+    aligned: Bool = False,
 ](
     idx: Int,
     params_ptr: MutKernelPtr[dtype],
@@ -119,12 +120,12 @@ def _adamw_update[
 ) -> None:
     # This mirrors llm.c's `adamw_update`: read the grad as fp32, keep both Adam
     # moments in fp32, and do the weight update in fp32 against the master copy.
-    # Explicit alignment (idx = global_tid*width is naturally aligned but the
-    # compiler can't prove it) so the wide 128-bit loads/stores are emitted —
-    # without it Mojo issues narrow transactions and this bandwidth-bound kernel
-    # runs at ~half speed (same fix as the fused classifier).
-    comptime align_d = align_of[SIMD[dtype, width]]()
-    comptime align_f = align_of[SIMD[DType.float32, width]]()
+    comptime align_d = align_of[SIMD[dtype, width]]() if aligned else align_of[
+        Scalar[dtype]
+    ]()
+    comptime align_f = align_of[
+        SIMD[DType.float32, width]
+    ]() if aligned else align_of[Scalar[DType.float32]]()
     var grad = (
         config.grad_scale
         * (grads_ptr.unsafe_offset(idx))
@@ -250,7 +251,7 @@ def adamw_update_cpu[
             t,
         }:
             var idx = base + local
-            _adamw_update[dtype, w](
+            _adamw_update[dtype, w, aligned=False](
                 idx,
                 params_ptr,
                 grads_ptr,
@@ -287,7 +288,7 @@ def adamw_update_cpu_seq[
 ) -> None:
     var i = 0
     while i + width <= num_params:
-        _adamw_update[dtype, width](
+        _adamw_update[dtype, width, aligned=False](
             i,
             params_ptr,
             grads_ptr,
@@ -302,7 +303,7 @@ def adamw_update_cpu_seq[
         )
         i += width
     while i < num_params:
-        _adamw_update[dtype, 1](
+        _adamw_update[dtype, 1, aligned=False](
             i,
             params_ptr,
             grads_ptr,
@@ -353,7 +354,7 @@ def adamw_update_gpu[
     var has_master = has_master_flag != 0
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
     if idx + width <= num_params:
-        _adamw_update[dtype, width](
+        _adamw_update[dtype, width, aligned=True](
             idx,
             params_ptr,
             grads_ptr,
@@ -369,7 +370,7 @@ def adamw_update_gpu[
     elif idx < num_params:
         # Last vector straddles num_params so handle the remainder one element at a time.
         for i in range(idx, num_params):
-            _adamw_update[dtype, 1](
+            _adamw_update[dtype, 1, aligned=True](
                 i,
                 params_ptr,
                 grads_ptr,

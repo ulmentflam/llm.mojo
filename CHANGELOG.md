@@ -75,6 +75,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CPU custom ops SIGSEGV'd on AVX-512 by asserting an alignment they do not
+  have.** `test_adamw_equivalence`, `test_fused_classifier_equivalence` and
+  `test_softmax_equivalence` segfaulted on Linux x86-64 while the same suite
+  passed on macOS/arm64. Captured under gdb, the faulting instruction is
+  `vmovaps -0xc0(%rbp,%r15,1),%zmm4`: the alignment-REQUIRED move into a
+  512-bit register, against a stack temporary, which needs 64-byte alignment.
+  The kernels pass `alignment=align_of[SIMD[dtype, width]]()` to their loads,
+  justified by a comment about "128-bit" loads written when `width` was 4.
+  `width` is `simd_width_of[dtype]()`, which resolves against the HOST: 16
+  bytes on NEON, 64 on AVX-512. The cited proof (`idx = global_tid*width`) is
+  GPU addressing anyway; the CPU path arrives via `vectorize` over
+  chunk-relative offsets. Alignment is now asserted only behind a comptime
+  `aligned` flag the caller opts into, matching `_softmax_dot` and
+  `_encoder_fwd_vector_slice`, which already did exactly this.
+  `fused_classifier` needed no change of its own: it crashed through the shared
+  `_softmax_comp_max`. 53 previously-segfaulting tests now pass on the CPU
+  path. NOT the upstream MAX crash in
+  `max_cpu_custom_op_crash_2026-07-24.md`, which is a call through a null
+  pointer; ruled that out along with stale MEF caches, the 1.0 pointer
+  rewrites, thread count, and xdist worker count, each by experiment. Full
+  evidence: docs/ai/cpu_avx512_vmovaps_alignment_crash.md.
+
 - **`wte_backward_cpu` left `dwte` zero on CPU targets where `WARP_SIZE` is not
   GPU warp geometry** (reported in
   [PR #3](https://github.com/ulmentflam/llm.mojo/pull/3), hit on Apple Silicon /
