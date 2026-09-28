@@ -11,7 +11,7 @@ from std.sys.info import size_of
 from std.time import global_perf_counter_ns
 from std.ffi import external_call
 from max.algorithm import sync_parallelize
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from std.sys import get_defined_int, get_defined_string, is_defined
 from max.gpu.host import (
     DeviceContext,
@@ -19,7 +19,7 @@ from max.gpu.host import (
     DeviceBuffer,
     DeviceAttribute,
 )
-from std.gpu import block_dim, block_idx, grid_dim
+from max.gpu import block_dim, block_idx, grid_dim
 from std.memory import unsafe_memcpy
 
 from llmm.io import read_and_copy
@@ -6803,8 +6803,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
             var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
             cpu_coord_ptr[] = CpuCoordinator(world_size)
 
-            @parameter
-            def _run_rank(rank: Int):
+            def _run_rank(rank: Int) {imm}:
                 try:
                     _dispatch_world_size["cpu"](
                         args, rank, world_size, cpu_coord_ptr
@@ -6819,7 +6818,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
                     cpu_coord_ptr[].abort()
 
             fp8_mutex_preseed()
-            sync_parallelize[_run_rank](world_size)
+            sync_parallelize(_run_rank, world_size)
             cpu_coord_ptr[].free()
             cpu_coord_ptr.unsafe_free()
 
@@ -6865,8 +6864,7 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             var coord_ptr = heap_alloc[CpuCoordinator](1)
             coord_ptr[] = CpuCoordinator(world_size)
 
-            @parameter
-            def _run_rank(r: Int):
+            def _run_rank(r: Int) {imm}:
                 try:
                     _dispatch_world_size["gpu"](args, r, world_size, coord_ptr)
                 except e:
@@ -6876,7 +6874,7 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
                     coord_ptr[].abort()
 
             fp8_mutex_preseed()
-            sync_parallelize[_run_rank](world_size)
+            sync_parallelize(_run_rank, world_size)
             coord_ptr[].free()
             coord_ptr.unsafe_free()
         return True

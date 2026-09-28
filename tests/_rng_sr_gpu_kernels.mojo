@@ -19,7 +19,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.memory import bitcast
-from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu import block_dim, block_idx, thread_idx
 
 from llmm.rng_device import rng_u32, sr_cast_bf16
 

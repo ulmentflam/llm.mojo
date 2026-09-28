@@ -17,21 +17,21 @@ from _cublas.cublas import (
 from _cublas.dtype import DataType
 from linalg.matmul.vendor.blas import _get_global_handle
 from layout.tensor_core import TensorCore
-from std.gpu.primitives import warp
+from max.gpu.primitives import warp
 from max.gpu.primitives import block
 from extensibility import InputTensor
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceAttribute
 from layout.layout_tensor import LayoutTensor
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.runtime.asyncrt import parallelism_level
+from std.runtime import parallelism_level
 from std.algorithm import vectorize
 from std.math import fma, sqrt, ceildiv, exp, log, ldexp, floor, exp2
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx, WARP_SIZE
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx, WARP_SIZE
 from max.gpu import barrier
 
 from llmm.split import split_fwd, split_bwd
@@ -745,7 +745,7 @@ def attention_fwd_cpu[
     var heads_per_worker = ceildiv(total_heads, max_workers)
     var num_workers = ceildiv(total_heads, heads_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(worker_index: Int):
         var base = worker_index * heads_per_worker
         var count = min(heads_per_worker, total_heads - base)
@@ -2169,7 +2169,7 @@ def attention_bwd_cpu[
     var heads_per_worker = ceildiv(total_heads, max_workers)
     var num_workers = ceildiv(total_heads, heads_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(worker_index: Int):
         var base = worker_index * heads_per_worker
         var count = min(heads_per_worker, total_heads - base)
@@ -4805,7 +4805,7 @@ def attention_bwd_gemm[
     comptime SM_OVERPROVISION = 32
     var num_sm = device_ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
 
-    @parameter
+    @__parameter
     def _grid(work: Int) -> Int:
         return max(min(ceildiv(work, BLOCK_SIZE), SM_OVERPROVISION * num_sm), 1)
 

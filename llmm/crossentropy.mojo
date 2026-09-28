@@ -2,11 +2,11 @@ from extensibility import register
 from std.math import ceildiv, log
 from extensibility import InputTensor
 from max.gpu.host import DeviceContext
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu import block_dim, block_idx, thread_idx
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
 from llmm.profiler import traced_parallelize
@@ -62,7 +62,7 @@ def crossentropy_ohe_fwd_cpu[
 
     var num_chunks = Int((batch_size * seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE)
 
-    @parameter
+    @__parameter
     def _chunk(c: Int):
         var base = c * CHUNK_SIZE
         var total = Int(batch_size * seq_len)  # Our B * T
@@ -234,7 +234,7 @@ def crossentropy_ohe_bwd_cpu[
 ) raises -> None:
     var num_chunks = Int((batch_size * seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE)
 
-    @parameter
+    @__parameter
     def _chunk(c: Int):
         var base = c * CHUNK_SIZE
         var total = Int(batch_size * seq_len)

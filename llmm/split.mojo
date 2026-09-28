@@ -2,9 +2,9 @@ from extensibility import register
 from std.sys import simd_width_of
 from extensibility import InputTensor
 from max.gpu.host import DeviceContext
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from std.algorithm import vectorize
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
@@ -202,7 +202,7 @@ def _split_cpu[
 ) raises -> None:
     var channels = num_heads * head_dim
 
-    @parameter
+    @__parameter
     def _worker(bh: Int):
         var b = bh // num_heads
         var h = bh % num_heads

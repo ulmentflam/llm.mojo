@@ -4,11 +4,11 @@ from std.ffi import external_call
 from std.math import ceildiv
 from comm import Signal, MAX_GPUS
 from comm.allgather import allgather
-from std.collections import InlineArray
-from std.gpu import block_dim, block_idx, thread_idx
+from std.collections import Array
+from max.gpu import block_dim, block_idx, thread_idx
 from layout import TileTensor, TensorLayout
 from std.memory import UnsafePointer
-from std.gpu.host.info import is_cpu
+from max.gpu.host.info import is_cpu
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.sys import has_nvidia_gpu_accelerator
 from llmm.memory import heap_alloc
@@ -20,10 +20,10 @@ from llmm.memory import heap_alloc
 
 
 struct SpinLock:
-    var locked: Atomic[DType.int32]
+    var locked: Atomic[Int32]
 
     def __init__(out self):
-        self.locked = Atomic[DType.int32](0)
+        self.locked = Atomic[Int32](0)
 
     def lock(mut self) -> None:
         while True:
@@ -55,20 +55,20 @@ struct CpuBarrier:
     """
 
     var counter: Int
-    var generation: Atomic[DType.int32]
+    var generation: Atomic[Int32]
     var num_threads: Int
     var lock: SpinLock
     # Sticky: once set it is never cleared. A barrier whose cohort has lost a
     # member cannot become usable again -- the missing arrival is missing for
     # every future generation too.
-    var aborted: Atomic[DType.int32]
+    var aborted: Atomic[Int32]
 
     def __init__(out self, num_threads: Int):
         self.counter = 0
-        self.generation = Atomic[DType.int32](0)
+        self.generation = Atomic[Int32](0)
         self.num_threads = num_threads
         self.lock = SpinLock()
-        self.aborted = Atomic[DType.int32](0)
+        self.aborted = Atomic[Int32](0)
 
     def abort(mut self) -> None:
         """Release every current and future waiter with an error."""
@@ -566,10 +566,10 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
 
     def get_rank_sigs_any(
         self,
-    ) -> InlineArray[Pointer[Signal, MutAnyOrigin], MAX_GPUS]:
-        var rank_sigs_any = InlineArray[
-            Pointer[Signal, MutAnyOrigin], MAX_GPUS
-        ](uninitialized=True)
+    ) -> Array[Pointer[Signal, MutAnyOrigin], MAX_GPUS]:
+        var rank_sigs_any = Array[Pointer[Signal, MutAnyOrigin], MAX_GPUS](
+            uninitialized=True
+        )
         for i in range(MAX_GPUS):
             rank_sigs_any[i] = (
                 self.signal_ptr().unsafe_offset(i)
@@ -1389,7 +1389,7 @@ struct ShardedParameter[
     ](
         self,
         zero_ctx: ZeroContext[Self.target, Self.N_GPUS],
-        all_sharded_buffers: InlineArray[
+        all_sharded_buffers: Array[
             Pointer[Scalar[Self.dtype], MutUntrackedOrigin], Self.N_GPUS
         ],
         in_tensor_layout: in_layout,
@@ -1449,7 +1449,7 @@ struct ShardedParameter[
             else:
                 # Same CUDA P2P requirement — raises on non-NVIDIA for N_GPUS>=2.
                 comptime if has_nvidia_gpu_accelerator():
-                    var input_tensors = InlineArray[
+                    var input_tensors = Array[
                         TileTensor[Self.dtype, in_layout, ImmutAnyOrigin],
                         Self.N_GPUS,
                     ](uninitialized=True)
@@ -1464,10 +1464,16 @@ struct ShardedParameter[
                         out_tensor_layout,
                     )
 
-                    var output_tensors = InlineArray[
+                    # MAX 26.6's allgather takes every device's output slots,
+                    # laid out [device * N_GPUS + source], and this rank only
+                    # writes its own slice. Each slot names this rank's
+                    # out_tile, as the single-slice API did before.
+                    var output_tensors = Array[
                         TileTensor[Self.dtype, out_layout, MutAnyOrigin],
-                        Self.N_GPUS,
+                        Self.N_GPUS * Self.N_GPUS,
                     ](uninitialized=True)
+                    for i in range(Self.N_GPUS * Self.N_GPUS):
+                        output_tensors[i] = out_tile
 
                     for i in range(Self.N_GPUS):
                         input_tensors[i] = TileTensor(
@@ -1483,9 +1489,8 @@ struct ShardedParameter[
                             ),
                             in_tensor_layout,
                         )
-                        output_tensors[i] = out_tile
 
-                    var rank_sigs_any = InlineArray[
+                    var rank_sigs_any = Array[
                         Pointer[Signal, MutAnyOrigin], MAX_GPUS
                     ](uninitialized=True)
                     for i in range(MAX_GPUS):

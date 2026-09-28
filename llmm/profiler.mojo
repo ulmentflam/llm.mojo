@@ -89,7 +89,7 @@ def current_thread_id() -> UInt64:
 # The instrumentation is gated at COMPILE TIME on the `LLMM_TRACE` define: unless
 # the binary is built with `-D LLMM_TRACE=1`, the whole tracing path (the getenv,
 # the allocations, the timing, the file I/O) is comptime-eliminated and this is
-# *exactly* `sync_parallelize[work_fn]` — provably zero overhead. Regular
+# *exactly* `sync_parallelize(work_fn, n)` — provably zero overhead. Regular
 # train/test builds therefore pay nothing; only the profiling binary opts in.
 # Within a tracing build it is additionally runtime-gated by LLMM_THREAD_TRACE,
 # so a profiling binary run without that env var still just does the work.
@@ -100,26 +100,32 @@ def traced_parallelize[
     label: StaticString,
     work_fn: def(Int) raises capturing[origins] -> None,
 ](num_workers: Int) raises -> None:
+    # Mojo 1.1 dropped the `sync_parallelize[fn](n)` parameter form; it takes
+    # the body as a runtime closure. Keeping `work_fn` a parameter here spares
+    # every kernel call site the migration, and this capture-free adapter is
+    # all the unified API needs.
+    def _work(i: Int) raises:
+        work_fn(i)
+
     comptime if not is_defined["LLMM_TRACE"]():
-        sync_parallelize[work_fn](num_workers)
+        sync_parallelize(_work, num_workers)
     else:
         var path = getenv("LLMM_THREAD_TRACE")
         if path == "":
-            sync_parallelize[work_fn](num_workers)
+            sync_parallelize(_work, num_workers)
             return
 
         var starts = heap_alloc[UInt64](num_workers)
         var ends = heap_alloc[UInt64](num_workers)
         var tids = heap_alloc[UInt64](num_workers)
 
-        @parameter
-        def _timed_worker(i: Int) raises:
+        def _timed_worker(i: Int) raises {imm}:
             tids[unsafe_offset=i] = current_thread_id()
             starts[unsafe_offset=i] = global_perf_counter_ns()
             work_fn(i)
             ends[unsafe_offset=i] = global_perf_counter_ns()
 
-        sync_parallelize[_timed_worker](num_workers)
+        sync_parallelize(_timed_worker, num_workers)
 
         # Appended from the calling (main) thread after the barrier, so the file
         # is written sequentially — no cross-thread contention on the handle.

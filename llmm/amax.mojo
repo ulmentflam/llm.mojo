@@ -49,7 +49,7 @@ from std.memory import UnsafePointer
 from std.math import ceildiv, isnan, isinf, nan
 from std.sys import simd_width_of
 from max.gpu.host import DeviceContext, DeviceBuffer, DeviceAttribute
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.primitives import block
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr, persistent_device_buffer

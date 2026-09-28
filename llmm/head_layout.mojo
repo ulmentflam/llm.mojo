@@ -125,7 +125,7 @@ def layout_copy[
     # __ldcs/__stcs ("this data is touched exactly once, don't pollute the
     # cache") on every load/store — this is a genuinely single-touch
     # permutation, so the streaming hint is a legitimate match. Mojo exposes
-    # the load side via std.gpu.memory's `load[cache_policy=STREAMING]` and
+    # the load side via max.gpu.memory's `load[cache_policy=STREAMING]` and
     # the store side via UnsafePointer.store's `non_temporal=True` (maps to
     # `st.global.cs`). Both are only honored at >= 4-byte transactions (see
     # std/gpu/memory/memory.mojo's `_load_impl` width floor), so this is only

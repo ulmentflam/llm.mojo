@@ -13,7 +13,7 @@
 # specific to e4m3, scalar-vs-SIMD, or this particular expression.
 
 from max.gpu.host import DeviceContext
-from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu import block_dim, block_idx, thread_idx
 from std.sys import has_nvidia_gpu_accelerator
 
 

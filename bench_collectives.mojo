@@ -289,8 +289,7 @@ def main() raises:
 
     comptime simd_align = WORLD_SIZE * simd_width_of[DTYPE]()
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var ctx = DeviceContext(device_id=rank)
             var z_ctx = ZeroContext["gpu", WORLD_SIZE](
@@ -475,7 +474,7 @@ def main() raises:
             print("bench_collectives rank", rank, "error:", e)
             rank_ok[unsafe_offset=rank] = 0
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     var all_ok = True
     for i in range(WORLD_SIZE):

@@ -13,8 +13,8 @@
 
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
-from std.gpu.host.info import is_gpu
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu.host.info import is_gpu
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu import barrier
 from max.gpu.memory import AddressSpace
 from std.sys import is_defined

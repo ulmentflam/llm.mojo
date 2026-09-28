@@ -2,11 +2,11 @@ from extensibility import register
 from std.sys import simd_width_of
 from extensibility import InputTensor
 from max.gpu.host import DeviceContext
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.profiler import traced_parallelize
 
@@ -81,7 +81,7 @@ def _merge_cpu[
     num_heads: Int,
     head_dim: Int,
 ) raises -> None:
-    @parameter
+    @__parameter
     def _worker(bh: Int):
         for t in range(seq_len):
             _merge_cpu_tile[dtype, width, backward](

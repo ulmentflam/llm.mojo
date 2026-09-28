@@ -13,7 +13,7 @@
 # in, vendor library does the math) — see probe4b_cublaslt_fp8_bf16out.mojo.
 
 from max.gpu.host import DeviceContext
-from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu import block_dim, block_idx, thread_idx
 from std.sys import has_nvidia_gpu_accelerator
 
 

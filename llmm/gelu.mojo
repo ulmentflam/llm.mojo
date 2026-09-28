@@ -3,13 +3,13 @@ from extensibility import InputTensor
 from max.gpu.host import DeviceContext
 from std.sys import simd_width_of, align_of
 from std.math import sqrt, ceildiv, tanh, pi
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.runtime.asyncrt import parallelism_level
+from std.runtime import parallelism_level
 from std.algorithm import vectorize
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
@@ -109,7 +109,7 @@ def gelu_fwd_cpu[
     var chunk = ceildiv(num_params, max_workers)
     var num_workers = ceildiv(num_params, chunk)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * chunk
         var count = min(chunk, num_params - base)
@@ -411,7 +411,7 @@ def gelu_bwd_cpu[
     var chunk = ceildiv(num_params, max_workers)
     var num_workers = ceildiv(num_params, chunk)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * chunk
         var count = min(chunk, num_params - base)

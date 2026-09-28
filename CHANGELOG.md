@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-09-28
+
+### Changed
+
+- **Migrated to Mojo 1.1.0 / MAX 26.6.0 stable.** Unlike the 1.0 migration,
+  the release notes list every break this tree hit:
+  - `std.gpu` is private now (`std._gpu`) and `max.gpu` mirrors all of it,
+    which finally ends 1.0's per-symbol std/max split: every GPU import is
+    `max.gpu.*`.
+  - `std.runtime.asyncrt` is private; `parallelism_level` moved up to
+    `std.runtime`.
+  - The `InlineArray` alias is gone (`Array`), `Atomic` takes a value type
+    (`Atomic[Int32]`, not `Atomic[DType.int32]`), and `@parameter` on
+    closures is spelled `@__parameter`.
+  - `sync_parallelize` lost its compile-time-parameter form and takes the body
+    as a runtime closure. `traced_parallelize` keeps its parameter signature
+    and adapts internally, so none of its ~20 kernel call sites changed; the
+    direct callers (the trainer's rank fan-out, `test_zero`,
+    `test_encoder_row_sparse`, `bench_collectives`) now pass `{imm}`-capturing
+    closures.
+  - `comm.allgather` takes every device's output slots
+    (`N_GPUS * N_GPUS`, laid out `[device * N_GPUS + source]`) instead of this
+    rank's `N_GPUS`. Each slot names this rank's `out_tile`, as before; the
+    kernel only touches this rank's slice in the full-world case. CUDA-only
+    path, type-checked here but not run.
+  - Constructing a type from a value already of that type
+    (`MutKernelPtr[DType.int32](p)` where `p` is that pointer) is an error
+    now. 32 such wrappers in `tests/test_encoder_row_sparse.mojo`, some
+    nested, were stripped; nothing else in the tree had them.
+
+  Built on this Mac, 1.1 needs Xcode's Metal toolchain component, which
+  Xcode 27 no longer bundles: `xcodebuild -downloadComponent MetalToolchain`.
+
+### Known issues
+
+- **`make compile-rest` is red on Apple Silicon, and was before this
+  migration.** `calibrate_fp8_scales.mojo` builds with
+  `-D LLMM_PRECISION=fp8`, whose backward reaches `lowp_gemm_devscale`'s
+  `comptime assert HAS_CUBLAS`. The same failure reproduces on the previous
+  commit with Mojo 1.0.0, so `make check` has only ever been fully green on
+  CUDA hosts.
+
 ## [Unreleased] - 2026-08-11
 
 ### Added

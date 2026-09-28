@@ -5,7 +5,7 @@
 # for one extra `+ 1.0` on the fp32 value — that one fails GPU codegen.
 
 from max.gpu.host import DeviceContext
-from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu import block_dim, block_idx, thread_idx
 from std.sys import has_nvidia_gpu_accelerator
 
 

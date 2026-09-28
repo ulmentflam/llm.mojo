@@ -52,11 +52,11 @@ fp32 compute), but the guard is kept because these kernels are meant to run
 only on the GPU training path.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
-from std.gpu.host.info import is_gpu
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu.host.info import is_gpu
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
 
@@ -114,7 +114,7 @@ def hadamard_sign(i: Int) -> Float32:
 
 
 @always_inline
-def _fwht16(mut buf: InlineArray[Float32, HADAMARD_BLOCK]) -> None:
+def _fwht16(mut buf: Array[Float32, HADAMARD_BLOCK]) -> None:
     """In-place unnormalized 16-point Sylvester-Hadamard butterfly:
     `buf <- H16 @ buf`. Standard iterative FWHT (natural/Hadamard order);
     `H16` is symmetric with `H16 @ H16 == 16 * I`, so this same routine
@@ -164,7 +164,7 @@ def _hadamard16_kernel[
     var k0 = kb * HADAMARD_BLOCK
     var base = r * k + k0
 
-    var buf = InlineArray[Float32, HADAMARD_BLOCK](uninitialized=True)
+    var buf = Array[Float32, HADAMARD_BLOCK](uninitialized=True)
     for i in range(HADAMARD_BLOCK):
         buf[i] = x_ptr[unsafe_offset=base + i].cast[DType.float32]()
 

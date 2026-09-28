@@ -5,14 +5,14 @@ from extensibility import InputTensor
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
 from std.sys import simd_width_of, align_of
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from layout.layout_tensor import LayoutTensor
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.runtime.asyncrt import parallelism_level
+from std.runtime import parallelism_level
 from std.algorithm import vectorize
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx, WARP_SIZE
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx, WARP_SIZE
 from max.gpu import barrier
 
 from llmm.profiler import traced_parallelize
@@ -102,7 +102,7 @@ def encoder_fwd_cpu[
     var rows_per_worker = ceildiv(total_rows, max_workers)
     var num_workers = ceildiv(total_rows, rows_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base_row = w * rows_per_worker
         var count_row = min(rows_per_worker, total_rows - base_row)
@@ -656,7 +656,7 @@ def wte_backward_cpu[
     var buckets_per_worker = ceildiv(num_buckets, max_workers)
     var num_workers = ceildiv(num_buckets, buckets_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * buckets_per_worker
         var count = min(buckets_per_worker, num_buckets - base)
@@ -731,7 +731,7 @@ def wpe_backward_cpu[
     var t_per_worker = ceildiv(seq_len, max_workers)
     var num_workers = ceildiv(seq_len, t_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base_t = w * t_per_worker
         var count_t = min(t_per_worker, seq_len - base_t)

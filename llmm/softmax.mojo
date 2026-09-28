@@ -5,13 +5,13 @@ from max.gpu.host import DeviceContext
 from std.math import fma, ceildiv, exp
 from max.gpu.host import DeviceAttribute
 from std.sys import simd_width_of, align_of
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.runtime.asyncrt import parallelism_level
+from std.runtime import parallelism_level
 from std.algorithm import vectorize
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
@@ -151,7 +151,7 @@ def softmax_fwd_cpu[
     var rows_per_worker = ceildiv(total, max_workers)
     var num_workers = ceildiv(total, rows_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * rows_per_worker
         var count = min(rows_per_worker, total - base)
@@ -517,7 +517,7 @@ def softmax_bwd_cpu[
     var rows_per_worker = ceildiv(total, max_workers)
     var num_workers = ceildiv(total, rows_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * rows_per_worker
         var count = min(rows_per_worker, total - base)

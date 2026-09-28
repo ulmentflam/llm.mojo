@@ -1,6 +1,6 @@
 from std.os import getenv
 from std.sys import argv, exit, has_accelerator
-from std.gpu.host.info import is_cpu
+from max.gpu.host.info import is_cpu
 from max.gpu.host import DeviceContext
 from std.time import global_perf_counter_ns
 

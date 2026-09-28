@@ -1,21 +1,21 @@
 from extensibility import register
 
 from std.sys import simd_width_of, align_of
-from std.gpu.primitives import warp
+from max.gpu.primitives import warp
 from max.gpu.primitives import block
-from std.gpu import WARP_SIZE
+from max.gpu import WARP_SIZE
 from extensibility import InputTensor
 from max.gpu.host import DeviceContext
 from max.gpu.host import DeviceAttribute
-from std.collections import InlineArray
+from std.collections import Array
 from std.math import fma, ceildiv, rsqrt
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.runtime.asyncrt import parallelism_level
+from std.runtime import parallelism_level
 from std.algorithm import vectorize
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu import barrier
 from max.gpu.memory import AddressSpace
 from std.atomic import Atomic
@@ -172,7 +172,7 @@ def layernorm_fwd_cpu[
     var rows_per_worker = ceildiv(total, max_workers)
     var num_workers = ceildiv(total, rows_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * rows_per_worker
         var count = min(rows_per_worker, total - base)
@@ -624,7 +624,7 @@ def layernorm_fused_residual_fwd_cpu[
     var rows_per_worker = ceildiv(total, max_workers)
     var num_workers = ceildiv(total, rows_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * rows_per_worker
         var count = min(rows_per_worker, total - base)
@@ -1311,7 +1311,7 @@ def layernorm_bwd_cpu[
     var dgamma_partial = heap_alloc[Scalar[DType.float32]](num_workers * c)
     var dbeta_partial = heap_alloc[Scalar[DType.float32]](num_workers * c)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * rows_per_worker
         var count = min(rows_per_worker, total - base)
@@ -1644,10 +1644,10 @@ def _layernorm_bwd_fused_gpu[
     var inv_c = 1.0 / Float32(channels)
 
     comptime if aligned:
-        var dg_acc = InlineArray[SIMD[DType.float32, width], NUM_TILES](
+        var dg_acc = Array[SIMD[DType.float32, width], NUM_TILES](
             fill=SIMD[DType.float32, width](0.0)
         )
-        var db_acc = InlineArray[SIMD[DType.float32, width], NUM_TILES](
+        var db_acc = Array[SIMD[DType.float32, width], NUM_TILES](
             fill=SIMD[DType.float32, width](0.0)
         )
 
@@ -1776,10 +1776,10 @@ def _layernorm_bwd_fused_gpu[
                         unsafe_offset=c * blocks_cap + block_row
                     ] = db_acc[t][lane]
     else:
-        var dg_acc = InlineArray[Scalar[DType.float32], NUM_COLS](
+        var dg_acc = Array[Scalar[DType.float32], NUM_COLS](
             fill=Scalar[DType.float32](0.0)
         )
-        var db_acc = InlineArray[Scalar[DType.float32], NUM_COLS](
+        var db_acc = Array[Scalar[DType.float32], NUM_COLS](
             fill=Scalar[DType.float32](0.0)
         )
 
@@ -1943,8 +1943,8 @@ def _ln_dparam_accum_gpu[
         var x_hat = (x - mean_ptr[unsafe_offset=r]) * rstd_ptr[unsafe_offset=r]
         acc_dg = fma(dy, x_hat, acc_dg)
         acc_db += dy
-    _ = Atomic[DType.float32].fetch_add(scratch.unsafe_offset(col), acc_dg)
-    _ = Atomic[DType.float32].fetch_add(
+    _ = Atomic[Float32].fetch_add(scratch.unsafe_offset(col), acc_dg)
+    _ = Atomic[Float32].fetch_add(
         (scratch.unsafe_offset(cap)).unsafe_offset(col), acc_db
     )
 

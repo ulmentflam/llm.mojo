@@ -100,7 +100,7 @@ def test_row_map_dedups_and_maps_rows() raises:
 
     build_token_bitmap(
         ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
-        MutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
+        bm.as_unsafe_any_origin(),
         8,
         SMALL_V,
     )
@@ -110,7 +110,7 @@ def test_row_map_dedups_and_maps_rows() raises:
     # merge_gap 0 disables coalescing so the exact run structure is visible.
     var n_rows = build_row_runs(
         ImmutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
-        MutKernelPtr[DType.int32](row_of.as_unsafe_any_origin()),
+        row_of.as_unsafe_any_origin(),
         SMALL_V,
         SMALL_V,
         0,
@@ -150,7 +150,7 @@ def test_row_map_merges_gaps_within_capacity() raises:
     toks[unsafe_offset=2] = 40
     build_token_bitmap(
         ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
-        MutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
+        bm.as_unsafe_any_origin(),
         3,
         SMALL_V,
     )
@@ -161,7 +161,7 @@ def test_row_map_merges_gaps_within_capacity() raises:
     var run_len = List[Int]()
     var n_rows = build_row_runs(
         ImmutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
-        MutKernelPtr[DType.int32](row_of.as_unsafe_any_origin()),
+        row_of.as_unsafe_any_origin(),
         SMALL_V,
         8,
         ENC_MERGE_GAP_ROWS,
@@ -184,7 +184,7 @@ def test_row_map_merges_gaps_within_capacity() raises:
     var rl2 = List[Int]()
     var n2 = build_row_runs(
         ImmutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
-        MutKernelPtr[DType.int32](row_of.as_unsafe_any_origin()),
+        row_of.as_unsafe_any_origin(),
         SMALL_V,
         3,
         ENC_MERGE_GAP_ROWS,
@@ -210,7 +210,7 @@ def test_row_map_rejects_overflow() raises:
         toks[unsafe_offset=i] = Scalar[DType.int32](i * 3)
     build_token_bitmap(
         ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
-        MutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
+        bm.as_unsafe_any_origin(),
         10,
         SMALL_V,
     )
@@ -220,7 +220,7 @@ def test_row_map_rejects_overflow() raises:
     try:
         _ = build_row_runs(
             ImmutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
-            MutKernelPtr[DType.int32](row_of.as_unsafe_any_origin()),
+            row_of.as_unsafe_any_origin(),
             SMALL_V,
             4,
             0,
@@ -262,8 +262,7 @@ def test_union_makes_row_lists_rank_invariant() raises:
     var first_out = heap_alloc[Int](N * BT * 2)
     var len_out = heap_alloc[Int](N * BT * 2)
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z = ZeroContext["cpu", N](
                 rank=rank, zero_stage=2, ctx=ctx, cpu_coord=coord
@@ -277,7 +276,7 @@ def test_union_makes_row_lists_rank_invariant() raises:
             # cross-rank union step this test exists to exercise would be
             # indistinguishable from a no-op.
             _fill_tokens(
-                MutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
+                toks.as_unsafe_any_origin(),
                 BT,
                 UInt64(1000 + rank),
                 600,
@@ -288,26 +287,22 @@ def test_union_makes_row_lists_rank_invariant() raises:
             var row_of = heap_alloc[Scalar[DType.int32]](V)
             build_token_bitmap(
                 ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
-                MutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
+                bm.as_unsafe_any_origin(),
                 BT,
                 V,
             )
             for w in range(words):
                 own_out[unsafe_offset=rank * words + w] = bm[unsafe_offset=w]
             z.allreduce_or_host[DType.uint32](
-                Pointer[Scalar[DType.uint32], MutAnyOrigin](
-                    bm.as_unsafe_any_origin()
-                ),
-                Pointer[Scalar[DType.uint32], MutAnyOrigin](
-                    un.as_unsafe_any_origin()
-                ),
+                bm.as_unsafe_any_origin(),
+                un.as_unsafe_any_origin(),
                 words,
             )
             var rf = List[Int]()
             var rl = List[Int]()
             var n = build_row_runs(
                 ImmutKernelPtr[DType.uint32](un.as_unsafe_any_origin()),
-                MutKernelPtr[DType.int32](row_of.as_unsafe_any_origin()),
+                row_of.as_unsafe_any_origin(),
                 V,
                 N * BT,
                 ENC_MERGE_GAP_ROWS,
@@ -331,7 +326,7 @@ def test_union_makes_row_lists_rank_invariant() raises:
             # without aborting hangs the peers on the next barrier.
             coord[].abort()
 
-    sync_parallelize[_run_rank](N)
+    sync_parallelize(_run_rank, N)
 
     assert_equal(n_rows_out[unsafe_offset=0], n_rows_out[unsafe_offset=1])
     assert_equal(run_count_out[unsafe_offset=0], run_count_out[unsafe_offset=1])
@@ -444,8 +439,7 @@ def test_divergent_range_lists_are_rejected() raises:
     raised_count[unsafe_offset=0] = 0
     raised_count[unsafe_offset=1] = 0
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z = ZeroContext["cpu", N](
                 rank=rank, zero_stage=2, ctx=ctx, cpu_coord=coord
@@ -466,7 +460,7 @@ def test_divergent_range_lists_are_rejected() raises:
         except e:
             print("divergent range list rank error:", e)
 
-    sync_parallelize[_run_rank](N)
+    sync_parallelize(_run_rank, N)
     assert_equal(raised_count[unsafe_offset=0], 1)
     assert_equal(raised_count[unsafe_offset=1], 1)
 
@@ -475,8 +469,7 @@ def test_divergent_range_lists_are_rejected() raises:
     ok[unsafe_offset=0] = 0
     ok[unsafe_offset=1] = 0
 
-    @parameter
-    def _run_ok(rank: Int):
+    def _run_ok(rank: Int) {imm}:
         try:
             var z = ZeroContext["cpu", N](
                 rank=rank, zero_stage=2, ctx=ctx, cpu_coord=coord
@@ -495,7 +488,7 @@ def test_divergent_range_lists_are_rejected() raises:
         except e:
             print("divergent range list ok-rank error:", e)
 
-    sync_parallelize[_run_ok](N)
+    sync_parallelize(_run_ok, N)
     assert_equal(ok[unsafe_offset=0], 1)
     assert_equal(ok[unsafe_offset=1], 1)
 
@@ -529,15 +522,14 @@ def _run_encoder_bucket[
     """
     comptime N = 2
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z = ZeroContext["cpu", N](
                 rank=rank, zero_stage=2, ctx=ctx, cpu_coord=coord
             )
             var toks = heap_alloc[Scalar[DType.int32]](BT)
             _fill_tokens(
-                MutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
+                toks.as_unsafe_any_origin(),
                 BT,
                 UInt64(1000 + rank),
                 300,
@@ -545,7 +537,7 @@ def _run_encoder_bucket[
             )
             var dout = heap_alloc[Scalar[DType.float32]](BT * C)
             _fill_dout(
-                MutKernelPtr[DType.float32](dout.as_unsafe_any_origin()),
+                dout.as_unsafe_any_origin(),
                 BT * C,
                 UInt64(77 + rank),
             )
@@ -574,15 +566,11 @@ def _run_encoder_bucket[
             dpo.append(0)
             dln.append(WTE_ELEMS)
             z.reducescatter_buckets[DType.float32](
-                Pointer[Scalar[DType.float32], MutAnyOrigin](
-                    lm.as_unsafe_any_origin()
-                ),
+                lm.as_unsafe_any_origin(),
                 dl,
                 dpo,
                 dln,
-                Pointer[Scalar[DType.float32], MutAnyOrigin](
-                    shard.as_unsafe_any_origin()
-                ),
+                shard.as_unsafe_any_origin(),
                 opt,
             )
             lm.unsafe_free()
@@ -590,8 +578,8 @@ def _run_encoder_bucket[
             comptime if not row_sparse:
                 var nb = build_wte_buckets(
                     ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
-                    MutKernelPtr[DType.int32](binfo.as_unsafe_any_origin()),
-                    MutKernelPtr[DType.int32](widx.as_unsafe_any_origin()),
+                    binfo.as_unsafe_any_origin(),
+                    widx.as_unsafe_any_origin(),
                     B,
                     T,
                     V,
@@ -604,7 +592,7 @@ def _run_encoder_bucket[
                 for i in range(WTE_ELEMS):
                     pool[unsafe_offset=i] = 0.0
                 wte_backward_cpu[DType.float32, 4](
-                    MutKernelPtr[DType.float32](pool.as_unsafe_any_origin()),
+                    pool.as_unsafe_any_origin(),
                     ImmutKernelPtr[DType.int32](binfo.as_unsafe_any_origin()),
                     ImmutKernelPtr[DType.int32](widx.as_unsafe_any_origin()),
                     ImmutKernelPtr[DType.float32](dout.as_unsafe_any_origin()),
@@ -618,15 +606,11 @@ def _run_encoder_bucket[
                 po.append(0)
                 ln.append(WTE_ELEMS)
                 z.reducescatter_buckets[DType.float32](
-                    Pointer[Scalar[DType.float32], MutAnyOrigin](
-                        pool.as_unsafe_any_origin()
-                    ),
+                    pool.as_unsafe_any_origin(),
                     d,
                     po,
                     ln,
-                    Pointer[Scalar[DType.float32], MutAnyOrigin](
-                        shard.as_unsafe_any_origin()
-                    ),
+                    shard.as_unsafe_any_origin(),
                     opt,
                 )
                 pool.unsafe_free()
@@ -636,24 +620,20 @@ def _run_encoder_bucket[
                 var un = heap_alloc[Scalar[DType.uint32]](words)
                 build_token_bitmap(
                     ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
-                    MutKernelPtr[DType.uint32](bm.as_unsafe_any_origin()),
+                    bm.as_unsafe_any_origin(),
                     BT,
                     V,
                 )
                 z.allreduce_or_host[DType.uint32](
-                    Pointer[Scalar[DType.uint32], MutAnyOrigin](
-                        bm.as_unsafe_any_origin()
-                    ),
-                    Pointer[Scalar[DType.uint32], MutAnyOrigin](
-                        un.as_unsafe_any_origin()
-                    ),
+                    bm.as_unsafe_any_origin(),
+                    un.as_unsafe_any_origin(),
                     words,
                 )
                 var rf = List[Int]()
                 var rl = List[Int]()
                 var n_rows = build_row_runs(
                     ImmutKernelPtr[DType.uint32](un.as_unsafe_any_origin()),
-                    MutKernelPtr[DType.int32](row_of.as_unsafe_any_origin()),
+                    row_of.as_unsafe_any_origin(),
                     V,
                     N * BT,
                     ENC_MERGE_GAP_ROWS,
@@ -662,8 +642,8 @@ def _run_encoder_bucket[
                 )
                 var nb = build_wte_buckets(
                     ImmutKernelPtr[DType.int32](toks.as_unsafe_any_origin()),
-                    MutKernelPtr[DType.int32](binfo.as_unsafe_any_origin()),
-                    MutKernelPtr[DType.int32](widx.as_unsafe_any_origin()),
+                    binfo.as_unsafe_any_origin(),
+                    widx.as_unsafe_any_origin(),
                     B,
                     T,
                     V,
@@ -692,9 +672,9 @@ def _run_encoder_bucket[
                             break
                         cursor += 1
                     wte_backward_cpu[DType.float32, 4](
-                        MutKernelPtr[DType.float32](
-                            pool.as_unsafe_any_origin()
-                        ).unsafe_offset(-(row_lo * C)),
+                        pool.as_unsafe_any_origin().unsafe_offset(
+                            -(row_lo * C)
+                        ),
                         ImmutKernelPtr[DType.int32](
                             binfo.as_unsafe_any_origin()
                         ).unsafe_offset(bstart * WTE_BUCKET_IDX_SIZE),
@@ -720,15 +700,11 @@ def _run_encoder_bucket[
                             ln.append((hi - lo) * C)
                         cum += rl[k]
                     z.reducescatter_buckets[DType.float32](
-                        Pointer[Scalar[DType.float32], MutAnyOrigin](
-                            pool.as_unsafe_any_origin()
-                        ),
+                        pool.as_unsafe_any_origin(),
                         d,
                         po,
                         ln,
-                        Pointer[Scalar[DType.float32], MutAnyOrigin](
-                            shard.as_unsafe_any_origin()
-                        ),
+                        shard.as_unsafe_any_origin(),
                         opt,
                     )
                 pool.unsafe_free()
@@ -749,7 +725,7 @@ def _run_encoder_bucket[
         except e:
             print("encoder bucket rank error:", e)
 
-    sync_parallelize[_run_rank](n_ranks)
+    sync_parallelize(_run_rank, n_ranks)
 
 
 def test_row_sparse_matches_dense_with_divergent_tokens() raises:
@@ -763,7 +739,7 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
     row_sparse=True path of `_run_encoder_bucket`. Evidence from an
     instrumented run: per chunk, one rank calls `wte_backward_cpu` (which
     dispatches its own nested `sync_parallelize`/`traced_parallelize` work
-    split) from *inside* the outer `sync_parallelize[_run_rank](N)` rank
+    split) from *inside* the outer `sync_parallelize(_run_rank, N)` rank
     closure — the identical pattern `_dispatch_cpu`/`_encoder_backward_row_sparse`
     use in production for real CPU multi-rank training. When one rank's chunk
     has zero local buckets (a legitimate case per `encoder_bwd`'s "empty bucket
@@ -796,9 +772,7 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
         coord,
         N,
         0,
-        Pointer[Scalar[DType.float32], MutAnyOrigin](
-            dense.as_unsafe_any_origin()
-        ),
+        dense.as_unsafe_any_origin(),
         OPT,
     )
     # A deliberately small chunk so the row set spans several chunks and the
@@ -809,9 +783,7 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
         coord,
         N,
         64,
-        Pointer[Scalar[DType.float32], MutAnyOrigin](
-            sparse.as_unsafe_any_origin()
-        ),
+        sparse.as_unsafe_any_origin(),
         OPT,
     )
 

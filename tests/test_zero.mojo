@@ -1,4 +1,4 @@
-from std.collections import InlineArray
+from std.collections import Array
 
 from max.gpu.host import DeviceContext
 from std.sys.info import size_of
@@ -175,9 +175,9 @@ def test_sharded_parameter_gather_cpu() raises:
     param.sharded_buffer.enqueue_copy_from(host_in)
     ctx.synchronize()
 
-    var all_sharded = InlineArray[
-        Pointer[Scalar[DTYPE], MutUntrackedOrigin], 1
-    ](uninitialized=True)
+    var all_sharded = Array[Pointer[Scalar[DTYPE], MutUntrackedOrigin], 1](
+        uninitialized=True
+    )
     all_sharded[0] = param.sharded_buffer.unsafe_ptr().unsafe_origin_cast[
         MutUntrackedOrigin
     ]()
@@ -223,9 +223,9 @@ def test_sharded_parameter_gather_gpu() raises:
     param.sharded_buffer.enqueue_copy_from(host_in)
     ctx.synchronize()
 
-    var all_sharded = InlineArray[
-        Pointer[Scalar[DTYPE], MutUntrackedOrigin], 1
-    ](uninitialized=True)
+    var all_sharded = Array[Pointer[Scalar[DTYPE], MutUntrackedOrigin], 1](
+        uninitialized=True
+    )
     all_sharded[0] = param.sharded_buffer.unsafe_ptr().unsafe_origin_cast[
         MutUntrackedOrigin
     ]()
@@ -289,8 +289,7 @@ def test_rank_failure_aborts_peers_instead_of_hanging() raises:
     for r in range(WORLD_SIZE):
         outcome[unsafe_offset=r] = 0
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         if rank == 0:
             # Stand-in for any real per-rank failure: a GPU context that will
             # not initialise, a kernel that fails to compile, an OOM.
@@ -303,7 +302,7 @@ def test_rank_failure_aborts_peers_instead_of_hanging() raises:
         except:
             outcome[unsafe_offset=rank] = 2
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     assert_equal(outcome[unsafe_offset=0], 1)
     for r in range(1, WORLD_SIZE):
@@ -331,8 +330,7 @@ def test_multi_cpu_allreduce() raises:
             rank_inputs[unsafe_offset=r * size + i] = Float32(r + 1)
             rank_outputs[unsafe_offset=r * size + i] = 0.0
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z_ctx = ZeroContext["cpu", WORLD_SIZE](
                 rank=rank,
@@ -373,7 +371,7 @@ def test_multi_cpu_allreduce() raises:
         except e:
             print("allreduce rank error:", e)
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     for r in range(WORLD_SIZE):
         for i in range(size):
@@ -406,8 +404,7 @@ def test_multi_cpu_reducescatter() raises:
         for i in range(sharded_size):
             rank_outputs[unsafe_offset=r * sharded_size + i] = 0.0
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z_ctx = ZeroContext["cpu", WORLD_SIZE](
                 rank=rank,
@@ -453,7 +450,7 @@ def test_multi_cpu_reducescatter() raises:
         except e:
             print("reducescatter rank error:", e)
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     for r in range(WORLD_SIZE):
         for i in range(sharded_size):
@@ -491,8 +488,7 @@ def test_multi_cpu_reducescatter_inplace() raises:
         for i in range(size):
             rank_bufs[unsafe_offset=r * size + i] = Float32(r + 1)
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z_ctx = ZeroContext["cpu", WORLD_SIZE](
                 rank=rank,
@@ -530,7 +526,7 @@ def test_multi_cpu_reducescatter_inplace() raises:
         except e:
             print("reducescatter_inplace rank error:", e)
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     # Sum over ranks of (r+1) == 1+2+3+4 == 10.
     for r in range(WORLD_SIZE):
@@ -589,8 +585,7 @@ def test_multi_cpu_reducescatter_buckets() raises:
     for i in range(WORLD_SIZE * opt):
         rank_shards[unsafe_offset=i] = 0.0
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z_ctx = ZeroContext["cpu", WORLD_SIZE](
                 rank=rank, zero_stage=2, ctx=ctx, cpu_coord=cpu_coord_ptr
@@ -631,12 +626,12 @@ def test_multi_cpu_reducescatter_buckets() raises:
         except e:
             print("reducescatter_buckets rank error:", e)
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     # Expected: for each global flat index f covered by a bucket, the owning
     # rank's shard[f - r*opt] == sum_k (k+1)*(f+1) == 10*(f+1). Uncovered
     # indices stay 0. Covered flats: [0,16), [16,20), [40,56).
-    @parameter
+    @__parameter
     def _covered(f: Int) -> Bool:
         return (f < 20) or (f >= 40 and f < 56)
 
@@ -674,8 +669,7 @@ def test_multi_cpu_allgather() raises:
         for i in range(size):
             rank_outputs[unsafe_offset=r * size + i] = 0.0
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z_ctx = ZeroContext["cpu", WORLD_SIZE](
                 rank=rank,
@@ -720,7 +714,7 @@ def test_multi_cpu_allgather() raises:
         except e:
             print("allgather rank error:", e)
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     for r in range(WORLD_SIZE):
         for k in range(WORLD_SIZE):
@@ -782,8 +776,7 @@ def test_multi_sharded_parameter_gather_cpu() raises:
         WORLD_SIZE
     )
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z_ctx = ZeroContext["cpu", WORLD_SIZE](
                 rank=rank,
@@ -812,7 +805,7 @@ def test_multi_sharded_parameter_gather_cpu() raises:
             ]()
             z_ctx.cpu_coordinator_ptr.value()[].barrier2[].wait()
 
-            var all_sharded = InlineArray[
+            var all_sharded = Array[
                 Pointer[Scalar[DTYPE], MutUntrackedOrigin], WORLD_SIZE
             ](uninitialized=True)
             for k in range(WORLD_SIZE):
@@ -837,7 +830,7 @@ def test_multi_sharded_parameter_gather_cpu() raises:
         except e:
             print("sharded parameter gather rank error:", e)
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     for r in range(WORLD_SIZE):
         for k in range(WORLD_SIZE):
@@ -959,8 +952,7 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
     blens.append(BA_LEN)
     blens.append(BB_LEN)
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var ctx = DeviceContext(device_id=rank)
             var z_ctx = ZeroContext["gpu", WORLD_SIZE](
@@ -1066,7 +1058,7 @@ def _run_gpu_collectives[WORLD_SIZE: Int]() raises:
             # above, seconds in -- reads as "this test takes 45 minutes".
             cpu_coord_ptr[].abort()
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     # allreduce: every rank's full buffer[j] == 3*(j+1)  (sum of r+1).
     for r in range(WORLD_SIZE):
@@ -1222,8 +1214,7 @@ def test_multi_cpu_allgather_ranges() raises:
     for i in range(WORLD_SIZE * win):
         rank_windows[unsafe_offset=i] = 0.0
 
-    @parameter
-    def _run_rank(rank: Int):
+    def _run_rank(rank: Int) {imm}:
         try:
             var z_ctx = ZeroContext["cpu", WORLD_SIZE](
                 rank=rank,
@@ -1277,7 +1268,7 @@ def test_multi_cpu_allgather_ranges() raises:
         except e:
             print("allgather_ranges rank error:", e)
 
-    sync_parallelize[_run_rank](WORLD_SIZE)
+    sync_parallelize(_run_rank, WORLD_SIZE)
 
     # Every rank's window == full-vector values at [8,24) then [30,50).
     for r in range(WORLD_SIZE):

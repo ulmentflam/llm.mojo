@@ -5,7 +5,7 @@
 # via a real DeviceContext(api="cpu") (matching tests/test_zero.mojo's own
 # CPU DeviceContext pattern) rather than plain host `vectorize()`.
 from max.gpu.host import DeviceContext
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from std.algorithm import vectorize
 from llmm.memory import heap_alloc
 

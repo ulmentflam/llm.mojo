@@ -33,9 +33,9 @@ from layout.layout_tensor import LayoutTensor
 from linalg.matmul import matmul
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from std.gpu import block_idx, thread_idx
+from max.gpu import block_idx, thread_idx
 from max.gpu import barrier
-from std.collections import InlineArray
+from std.collections import Array
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
@@ -94,7 +94,7 @@ def gemm_simd_kernel[
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
 
-    var acc = InlineArray[Float32, TM * TN](fill=0.0)
+    var acc = Array[Float32, TM * TN](fill=0.0)
 
     var k0 = 0
     while k0 < K:
@@ -128,8 +128,8 @@ def gemm_simd_kernel[
         barrier()
 
         comptime for kk in range(BK):
-            var a_frag = InlineArray[Float32, TM](uninitialized=True)
-            var b_frag = InlineArray[Float32, TN](uninitialized=True)
+            var a_frag = Array[Float32, TM](uninitialized=True)
+            var b_frag = Array[Float32, TN](uninitialized=True)
             comptime for i in range(TM):
                 a_frag[i] = a_sh.ptr[unsafe_offset=(ty * TM + i) * BK + kk].cast[
                     DType.float32

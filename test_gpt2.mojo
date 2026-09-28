@@ -1,11 +1,11 @@
-from std.collections import InlineArray, List
+from std.collections import Array, List
 from std.time import perf_counter_ns
 from std.sys import exit, argv, has_accelerator
 from std.os import getenv
 from std.sys.info import size_of
 
 from max.gpu.host import DeviceContext
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from std.math import sqrt
 
 from llmm.memory import MutMemPtr, heap_alloc
@@ -484,7 +484,7 @@ def run_test[
             model.backward()
 
             # finally check all the gradients
-            var gradoks = InlineArray[Bool, 16](fill=False)
+            var gradoks = Array[Bool, 16](fill=False)
 
             gradoks[0] = check_tensor(
                 ctx,

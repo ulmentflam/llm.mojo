@@ -11,17 +11,17 @@ from std.utils.index import IndexList
 from extensibility import InputTensor
 from linalg.transpose import transpose
 from layout.tile_layout import row_major
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.runtime.asyncrt import parallelism_level
+from std.runtime import parallelism_level
 from std.algorithm import vectorize
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu import barrier
-from std.gpu.intrinsics import threadfence, Scope
+from max.gpu.intrinsics import threadfence, Scope
 from std.atomic import Atomic
 from std.ffi import _get_global_or_null, external_call
 
@@ -75,7 +75,7 @@ comptime FP8_BWD_SYNC_ONLY = is_defined["LLMM_FP8_BWD_SYNC_ONLY"]()
 comptime FP8_STASH_LEGACY = is_defined["LLMM_FP8_STASH_LEGACY"]()
 
 
-def _fp8_gemm_lock() -> Pointer[Atomic[DType.int32], MutUntrackedOrigin]:
+def _fp8_gemm_lock() -> Pointer[Atomic[Int32], MutUntrackedOrigin]:
     """Process-global lock cell for the FP8_*_MUTEX probes. MUST be seeded
     from a single thread before any concurrency (`fp8_mutex_preseed`, called
     ahead of `sync_parallelize` in train_gpt2.mojo) — a concurrent first
@@ -85,7 +85,7 @@ def _fp8_gemm_lock() -> Pointer[Atomic[DType.int32], MutUntrackedOrigin]:
     var name = String("LLMM_FP8_GEMM_LOCK")
     var cached = _get_global_or_null(name)
     if cached:
-        return cached.value().unsafe_bitcast[Atomic[DType.int32]]()
+        return cached.value().unsafe_bitcast[Atomic[Int32]]()
     # Atomic[int32] is layout-compatible with a bare int32 cell; allocate
     # and zero the cell, then hand out Atomic-typed views of it.
     var p = heap_alloc[Scalar[DType.int32]](1)
@@ -98,11 +98,11 @@ def _fp8_gemm_lock() -> Pointer[Atomic[DType.int32], MutUntrackedOrigin]:
         var wp = winner.value().unsafe_bitcast[Scalar[DType.int32]]()
         if wp != p:
             p.unsafe_free()
-        return rebind[Pointer[Atomic[DType.int32], MutUntrackedOrigin]](
-            wp.unsafe_bitcast[Atomic[DType.int32]]().as_unsafe_any_origin()
+        return rebind[Pointer[Atomic[Int32], MutUntrackedOrigin]](
+            wp.unsafe_bitcast[Atomic[Int32]]().as_unsafe_any_origin()
         )
-    return rebind[Pointer[Atomic[DType.int32], MutUntrackedOrigin]](
-        p.unsafe_bitcast[Atomic[DType.int32]]().as_unsafe_any_origin()
+    return rebind[Pointer[Atomic[Int32], MutUntrackedOrigin]](
+        p.unsafe_bitcast[Atomic[Int32]]().as_unsafe_any_origin()
     )
 
 
@@ -150,7 +150,7 @@ from llmm.memory import (
     heap_alloc,
 )
 from llmm.vendor import HAS_CUBLAS, HAS_METAL, USE_TF32
-from std.gpu.primitives.warp import shuffle_xor
+from max.gpu.primitives.warp import shuffle_xor
 
 from llmm.hadamard import hadamard_sign
 from llmm.lowp import (
@@ -554,7 +554,7 @@ def _matmul_cublaslt[
     if batch_count > 1:
         var bc = Int32(batch_count)
 
-        @parameter
+        @__parameter
         def _set_batch(lay: cublasLtMatrixLayout_t, stride: Int) raises:
             check_cublas_error(
                 cublasLtMatrixLayoutSetAttribute(
@@ -1564,7 +1564,7 @@ def matmul_fwd[
         row_major(out_channels, in_channels),
     )
 
-    @parameter
+    @__parameter
     @always_inline
     def epilogue_with_bias[
         dtype: DType, width: SIMDLength, *, alignment: Int = 1
@@ -1586,7 +1586,7 @@ def matmul_fwd[
         else:
             (out_ptr.unsafe_offset(offset)).unsafe_store(v.cast[elem_dtype]())
 
-    @parameter
+    @__parameter
     @always_inline
     def epilogue_no_bias[
         dtype: DType, width: SIMDLength, *, alignment: Int = 1
@@ -1613,7 +1613,7 @@ def matmul_fwd[
     # this raced against neighboring kernels (CUDA_ERROR_ILLEGAL_ADDRESS) even
     # though the fast cuBLASLt path needs none (its epilogue is inside the
     # vendor GEMM itself, not a separately-launched elementwise sweep).
-    @parameter
+    @__parameter
     @always_inline
     def _portable_matmul() raises:
         ctx.synchronize()
@@ -2479,9 +2479,7 @@ def _dbias_fused_gpu[
         1, DType.int32, address_space=AddressSpace.SHARED
     ]()
     if Int(thread_idx.x) == 0:
-        var arrived = Atomic[DType.int32].fetch_add(
-            counters.unsafe_offset(bx), 1
-        )
+        var arrived = Atomic[Int32].fetch_add(counters.unsafe_offset(bx), 1)
         # Residue, not equality. Each launch adds exactly `row_blocks` to
         # this slot, so `row_blocks` consecutive tickets cover every residue
         # mod `row_blocks` exactly once — meaning EXACTLY ONE block takes
@@ -2554,7 +2552,7 @@ def matmul_bias_bwd_cpu[
     var cols_per_worker = ceildiv(out_channels, max_workers)
     var num_workers = ceildiv(out_channels, cols_per_worker)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * cols_per_worker
         var count = min(cols_per_worker, out_channels - base)
@@ -2833,12 +2831,12 @@ def matmul_d_input_bwd[
 
     # Vendor-neutral matmul with the gelu-backward epilogue lambda: used
     # unconditionally on CPU, and on GPU whenever HAS_CUBLAS is False.
-    @parameter
+    @__parameter
     @always_inline
     def _portable_matmul_d_input() raises:
         ctx.synchronize()
 
-        @parameter
+        @__parameter
         @always_inline
         def d_input_epilogue[
             dtype: DType, width: SIMDLength, *, alignment: Int = 1
@@ -2952,7 +2950,7 @@ def _add_into[
     var chunk = ceildiv(total, max_workers)
     var num_workers = ceildiv(total, chunk)
 
-    @parameter
+    @__parameter
     def _worker(w: Int):
         var base = w * chunk
         var count = min(chunk, total - base)

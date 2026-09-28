@@ -4,11 +4,11 @@ from extensibility import InputTensor
 from max.gpu.host import DeviceContext
 from std.math import fma, sqrt, ceildiv
 from std.sys import simd_width_of, align_of, is_defined, get_defined_int
-from std.gpu.host.info import is_cpu, is_gpu
+from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
-from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu import block_dim, block_idx, thread_idx
 
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
@@ -229,7 +229,7 @@ def adamw_update_cpu[
 ) raises -> None:
     var num_chunks = (num_params + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    @parameter
+    @__parameter
     def _chunk(c: Int):
         var base = c * CHUNK_SIZE
         var count = min(CHUNK_SIZE, num_params - base)

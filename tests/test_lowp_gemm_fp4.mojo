@@ -586,7 +586,7 @@ def test_sr_nvfp4_quantize_deterministic_under_fixed_seed() raises:
     var q_size = nvfp4_packed_size(rows, k)
     var scale_size = nvfp4_scale_buffer_size(rows, k, 1)
 
-    @parameter
+    @__parameter
     def _run(mut qs: List[UInt8], mut ss: List[UInt8]) raises -> None:
         var q_dev = ctx.enqueue_create_buffer[DType.uint8](q_size)
         var scale_dev = ctx.enqueue_create_buffer[DType.uint8](scale_size)

@@ -122,13 +122,13 @@ call sites (`lowp_gemm_fp4` and friends) rather than going through
 descriptive-only.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.math import ceildiv
 from std.sys import get_defined_int
 from max.gpu.host import DeviceContext
-from std.gpu.host.info import is_gpu
+from max.gpu.host.info import is_gpu
 from max.gpu.primitives import block
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu import barrier
 from max.gpu.memory import AddressSpace
 from layout import Layout
@@ -805,7 +805,7 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     # guaranteed in-bounds along kidx; only `r` needs guarding. Out-of-
     # bounds threads load zeros (amax 0.0) and must NOT return before the
     # barrier below.
-    var vals = InlineArray[Float32, NVFP4_BLOCK](uninitialized=True)
+    var vals = Array[Float32, NVFP4_BLOCK](uninitialized=True)
     var local_amax = Float32(0.0)
     for kk in range(NVFP4_BLOCK):
         var v = Float32(0.0)
