@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-09-28
 
+### Added
+
+- **GPT-2 inference scaffolds on MAX's Python APIs, one per API.**
+  `infer_gpt2_max_graph.py` targets the stable graph API (`max.nn` modules,
+  `max.graph.Graph`, `InferenceSession`); `infer_gpt2_max_eager.py` targets the
+  experimental eager API (`max.experimental.nn`), runnable op-by-op or through
+  `Module.compile()` (`--mode eager|compiled`). Both share
+  `max_gpt2_common.py`: the `.bin` checkpoint reader (fp32 and bf16), the
+  llm.c tokenizer, the llm.c xorshift sampler and a generation loop that
+  mirrors `infer_gpt2.mojo`, so output seeded the same way is directly
+  comparable with the Mojo binary's (identical until float differences flip a
+  sample). Everything up to the forward math is
+  wired and checked: all 148 tensors of `gpt2_124M.bin` land in each module
+  tree under strict name matching, and a stand-in forward runs through graph
+  compile, eager and eager-compiled execution with exact results. The forward
+  bodies raise `NotImplementedError`. `tests/test_max_gpt2.py` carries the
+  acceptance tests, logits against a tiny random Hugging Face
+  `GPT2LMHeadModel`, as strict xfails that flip to failures the moment a
+  forward runs. New targets: `make infer-max-graph`, `make infer-max-eager`.
+
 ### Changed
 
 - **Migrated to Mojo 1.1.0 / MAX 26.6.0 stable.** Unlike the 1.0 migration,

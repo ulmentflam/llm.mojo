@@ -1,6 +1,7 @@
 # Source roots only — never `find .` (crawls .pixi and hangs on iCloud).
 MOJO_PATHS := train_gpt2.mojo profile_gpt2.mojo llmm tests
-PYTHON_PATHS := train_gpt2.py profile_gpt2.py scripts tests data
+PYTHON_PATHS := train_gpt2.py profile_gpt2.py max_gpt2_common.py infer_gpt2_max_graph.py \
+                infer_gpt2_max_eager.py scripts tests data
 LATEX_SOURCES := docs/backprop.tex
  
 # Auto-detect python library for Mojo standard library python interop.
@@ -162,7 +163,7 @@ $(PIXI_STAMP):
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
-        build-infer build-infer-bf16 build-infer-fp8 data-hellaswag eval eval-cpu benchmark-eval \
+        build-infer build-infer-bf16 build-infer-fp8 infer-max-graph infer-max-eager data-hellaswag eval eval-cpu benchmark-eval \
         verify-fp8-grads verify-fp8-static-grads calibrate-fp8-scales \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal benchmark-zero \
         figure-blindness figure-breakeven figures-wte benchmark-vocab-tiles \
@@ -241,6 +242,10 @@ help:
 	@echo "  build-infer      Compile infer_gpt2.mojo to build/infer_gpt2 (fp32/CPU-capable)"
 	@echo "  build-infer-bf16 Compile the bf16 (-D LLMM_BF16) inference binary, build/infer_gpt2_bf16"
 	@echo "  build-infer-fp8  Compile the fp8 (-D LLMM_PRECISION=fp8) inference binary, build/infer_gpt2_fp8"
+	@echo "  infer-max-graph  GPT-2 generation on MAX's stable graph API (infer_gpt2_max_graph.py;"
+	@echo "                   ARGS=\"--device gpu -n 128 --prompt ...\" pass-through)"
+	@echo "  infer-max-eager  GPT-2 generation on MAX's experimental eager API (infer_gpt2_max_eager.py;"
+	@echo "                   ARGS=\"--mode eager|compiled ...\" pass-through)"
 	@echo "  verify-fp8-grads Build both grad-dump binaries, dump 148 param-grad tensors fp8 vs"
 	@echo "                   bf16 on the fixed debug-state batch, and run the recalibrated"
 	@echo "                   gradient gate (tests/compare_grad_dumps.py). GPU-only."
@@ -568,6 +573,16 @@ build-infer-bf16: $(INFER_BIN_BF16)
 $(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
+
+# GPT-2 inference on MAX's Python APIs, no Mojo build step: the stable graph
+# API (max.nn + max.graph) and the experimental eager API (max.experimental),
+# sharing max_gpt2_common.py. tests/test_max_gpt2.py holds their acceptance
+# tests against a Hugging Face GPT-2 reference.
+infer-max-graph: | $(PIXI_STAMP)
+	$(PIXI) run python infer_gpt2_max_graph.py $(ARGS)
+
+infer-max-eager: | $(PIXI_STAMP)
+	$(PIXI) run python infer_gpt2_max_eager.py $(ARGS)
 
 # fp8 build of the inference binary (see build-fp8 above for the Chunk A
 # inert-flag caveat). FP8/FP4 load the bf16 checkpoint (storage stays bf16).
