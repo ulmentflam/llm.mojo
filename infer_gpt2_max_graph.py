@@ -31,13 +31,27 @@ import numpy as np
 from max.driver import CPU, Accelerator, Buffer, Device, accelerator_count
 from max.dtype import DType
 from max.engine import InferenceSession, Model
-from max.graph import DeviceRef, Graph, TensorType, TensorValue, ops  # noqa: F401
+from max.graph import (
+    AlgebraicDim,
+    BufferType,
+    DeviceRef,
+    Dim,
+    Graph,
+    TensorType,
+    TensorValue,
+    ops,
+)
 from max.nn import Embedding, LayerList, LayerNorm, Linear, Module
 
 from max_gpt2_common import (
+    ATTENTION_OP,
+    ATTENTION_PARAMETERS,
+    GELU_ALGEBRAIC_ROWS,
+    GELU_OP,
     GPT2Config,
     Tokenizer,
     base_arg_parser,
+    llmm_package,
     load_checkpoint,
     run_generation,
 )
@@ -47,6 +61,62 @@ from max_gpt2_common import (
 # to float32 before sampling.
 DTYPE = DType.float32
 LAYERNORM_EPS = 1e-5
+
+
+# --- llmm's Mojo kernels as graph ops. build_graph loads the package; each
+# helper allocates the kernel's in-place outputs with ops.buffer_create and
+# reads the result back with ops.buffer_load.
+
+
+def _host_scalar(dim: Dim) -> TensorValue:
+    """A dimension as the 0-d int64 tensor a kernel's Int64 argument takes.
+
+    Always on the CPU, whatever device the tensors are on: MAX hands scalar
+    operands to the kernel as host values and rejects them elsewhere
+    ("Scalars should always be on the host CPU"). Works for symbolic dims.
+    """
+    return ops.reshape(ops.shape_to_tensor([dim]), []).to(DeviceRef.CPU())
+
+
+def llmm_attention(q: TensorValue, k: TensorValue, v: TensorValue) -> TensorValue:
+    """Causal self-attention on llmm's `attention_fwd` kernel.
+
+    q, k, v: [B, NH, T, HS] on one device, in the kernel dtype; T may be
+    symbolic. The kernel applies the causal mask and the 1/sqrt(HS) scale.
+    Returns [B, NH, T, HS]. The log-sum-exp it also writes (for the backward)
+    is discarded.
+    """
+    b, nh, t, hs = q.shape
+    device = q.device
+    out = ops.buffer_create(BufferType(q.dtype, [b, nh, t, hs], device))
+    lse = ops.buffer_create(BufferType(DType.float32, [b, nh, t], device))
+    ops.inplace_custom(
+        name=ATTENTION_OP,
+        device=device,
+        values=[out, q, k, v, lse, *(_host_scalar(d) for d in (b, nh, t, hs))],
+        parameters=dict(ATTENTION_PARAMETERS),
+    )
+    return ops.buffer_load(out)
+
+
+def llmm_gelu(x: TensorValue) -> TensorValue:
+    """GELU (tanh approximation, as GPT-2) on llmm's `gelu_fwd` kernel.
+
+    The kernel works on [rows, cols], so leading dims are flattened into rows
+    and the input's shape is restored on the way out. They must flatten to
+    one static or symbolic dim ([T, C], [1, T, C], [B, C] with B static);
+    see GELU_ALGEBRAIC_ROWS for why [2, T, C] cannot.
+    """
+    shape = list(x.shape)
+    x2d = ops.reshape(x, [-1, shape[-1]])
+    rows = x2d.shape[0]
+    if isinstance(rows, AlgebraicDim):
+        raise NotImplementedError(
+            GELU_ALGEBRAIC_ROWS.format(dims=shape[:-1], rows=rows)
+        )
+    out = ops.buffer_create(BufferType(x.dtype, list(x2d.shape), x.device))
+    ops.inplace_custom(name=GELU_OP, device=x.device, values=[out, x2d])
+    return ops.reshape(ops.buffer_load(out), shape)
 
 
 class CausalSelfAttention(Module):
@@ -67,6 +137,7 @@ class CausalSelfAttention(Module):
         [B, num_heads, T, head_dim]; scores = q @ k^T / sqrt(head_dim);
         mask j > i to -inf (ops.band_part or a constant upper-triangular
         mask); softmax; @ v; merge heads back to [B, T, C]; c_proj.
+        Or replace the scores-through-@-v steps with llmm_attention(q, k, v).
         """
         raise NotImplementedError("CausalSelfAttention.__call__")
 
@@ -84,7 +155,8 @@ class MLP(Module):
         """x: [B, T, C] -> [B, T, C].
 
         TODO: c_proj(gelu(c_fc(x))). GPT-2 uses the tanh approximation
-        (ops.gelu(..., approximate="tanh")), same as llmm/gelu.mojo.
+        (ops.gelu(..., approximate="tanh")), same as llmm/gelu.mojo, which
+        llmm_gelu(x) calls.
         """
         raise NotImplementedError("MLP.__call__")
 
@@ -143,7 +215,9 @@ def pick_device(name: str) -> Device:
 def build_graph(model: GPT2, device: DeviceRef) -> Graph:
     """Trace the model over a dynamic sequence length into a MAX graph."""
     tokens_type = TensorType(DType.int64, [1, "seq_len"], device=device)
-    with Graph("gpt2", input_types=[tokens_type]) as graph:
+    with Graph(
+        "gpt2", input_types=[tokens_type], custom_extensions=[llmm_package()]
+    ) as graph:
         graph.output(model(graph.inputs[0].tensor))
     return graph
 

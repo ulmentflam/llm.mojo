@@ -27,6 +27,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GPT2LMHeadModel`, as strict xfails that flip to failures the moment a
   forward runs. New targets: `make infer-max-graph`, `make infer-max-eager`.
 
+- **`llmm_attention` and `llmm_gelu` in both MAX scaffolds**, calling this
+  repo's registered `attention_fwd` and `gelu_fwd` Mojo kernels as MAX custom
+  ops, as drop-in alternatives to writing attention and GELU in MAX ops. The
+  graph versions allocate the kernels' in-place outputs with
+  `ops.buffer_create`; the eager versions hand zeros tensors over with
+  `__buffervalue__()` inside `F.ensure_context()` and also work under
+  `Module.compile`. Size arguments go in as 0-d int64 tensors on the host
+  CPU whatever the tensors' device, because MAX rejects scalar operands
+  elsewhere ("Scalars should always be on the host CPU"). Checked against
+  numpy on CPU (pytest)
+  and on Metal at GPT-2 sizes through graph, eager and eager-compiled
+  execution, all within 5e-7. One MAX 26.6 limit shapes `llmm_gelu`:
+  flattening to the kernel's [rows, cols] must not produce an algebraic rows
+  dim like `2 * seq_len`, because `mo.mutable.load` then fails to verify;
+  the scaffolds' `[1, seq_len, 4C]` flattens to `seq_len` and works, and the
+  helper raises a clear error in the unsupported case.
+
+- **One llmm kernel package for every Python caller.** `llmm_pkg.py` builds
+  and caches `llmm.mojoc` at `build/llmm_pkg/<fingerprint>/`, keyed by a hash
+  of the toolchain and every `llmm/*.mojo`, and both the pytest bridge and the
+  MAX scaffolds load it. The bridge used to own this logic and cache the
+  package under `tests/.mef_cache/`, so the scaffolds' helpers would otherwise
+  have needed a second precompile of the same sources with its own staleness
+  rule. A content hash cannot go stale the way a timestamp can after
+  `git checkout` or an iCloud sync. The bridge keeps its per-kernel MEF cache,
+  whose keys are unchanged, so warm test runs stay warm. `make build-mojo`
+  runs `python -m llmm_pkg` (0.18s when nothing changed), and `make build`,
+  `test-python` and `infer-max-*` depend on it; `build-train` is the trainer
+  alone.
+
 ### Changed
 
 - **Migrated to Mojo 1.1.0 / MAX 26.6.0 stable.** Unlike the 1.0 migration,

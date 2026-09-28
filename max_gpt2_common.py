@@ -23,6 +23,8 @@ from pathlib import Path
 
 import numpy as np
 
+from llmm_pkg import ensure_llmm_package
+
 # Model checkpoint magic written by train_gpt2.mojo / train_gpt2.py. llm.c's
 # own starter-pack magic (20240326) uses the identical layout, so accept both.
 MODEL_MAGICS = (20240520, 20240326)
@@ -36,6 +38,40 @@ TOKENIZER_VERSION = 2
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_CHECKPOINT = REPO_ROOT / "gpt2_124M.bin"
 DEFAULT_TOKENIZER = REPO_ROOT / "gpt2_tokenizer.bin"
+
+# --- llmm's Mojo kernels as MAX custom ops.
+#
+# Both scaffolds can call the @register'd kernels in llmm/ through their
+# `llmm_attention` / `llmm_gelu` helpers, loading the package llmm_pkg builds
+# and caches by source content (`make build-mojo`; shared with the tests).
+ATTENTION_OP = "attention_fwd"
+# Exact exp and unconditional rescaling: the variants tests/ checks against
+# PyTorch. The Mojo defaults (True) select approximate fast paths.
+ATTENTION_PARAMETERS: dict[str, bool | int | str] = {
+    "use_soft_exp": False,
+    "use_conditional_rescale": False,
+}
+GELU_OP = "gelu_fwd"
+# gelu_fwd works on [rows, cols], so the helpers flatten leading dims. MAX
+# 26.6 cannot buffer_load a buffer sized by an algebraic dim (e.g. rows =
+# 2 * seq_len): the graph fails to compile with "'mo.mutable.load' op failed
+# to verify that all of {inBuffer, outTensor} have same shape". Leading dims
+# must therefore flatten to a single static or symbolic dim, which the
+# scaffolds' [1, seq_len, 4C] activations do.
+GELU_ALGEBRAIC_ROWS = (
+    "llmm_gelu: leading dims {dims} flatten to the algebraic dim {rows}, which"
+    " MAX 26.6 cannot size a kernel output buffer with (mo.mutable.load fails"
+    " to verify). Use a static batch of 1 or a single symbolic leading dim."
+)
+
+
+def llmm_package() -> Path:
+    """The precompiled llmm package for the current sources.
+
+    Content-addressed (see llmm_pkg), so it can never be stale; built on
+    first use if `make build-mojo` has not already.
+    """
+    return ensure_llmm_package()
 
 
 @dataclass(frozen=True)

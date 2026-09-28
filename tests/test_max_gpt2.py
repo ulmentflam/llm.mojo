@@ -38,13 +38,18 @@ from max_gpt2_common import (
     XORSHIFT_RIGHT_2,
     XORSHIFT_STAR_MULTIPLIER,
     GPT2Config,
+    llmm_package,
     load_checkpoint,
     param_shapes,
     random_f32,
     sample_softmax,
 )
-from max.driver import CPU
-from max.graph import DeviceRef
+from max.driver import CPU, Buffer
+from max.dtype import DType
+from max.engine import InferenceSession
+from max.experimental.nn import Module
+from max.experimental.tensor import Tensor
+from max.graph import DeviceRef, Graph, TensorType
 from tests._sampler_reference import coin_sweep, make_logits, sample_softmax_c
 
 TINY = GPT2Config(
@@ -185,6 +190,147 @@ def test_random_f32_matches_u64_arithmetic() -> None:
         )
         assert got == float(want)
         assert 0.0 <= got < 1.0
+
+
+# --- llmm kernel helpers (the llmm_pkg package; `make test` builds it)
+
+HELPER_T = (1, 9)  # one compiled graph must serve several sequence lengths
+
+
+def _causal_attention(q: np.ndarray, k: np.ndarray, v: np.ndarray) -> np.ndarray:
+    s = q @ k.transpose(0, 1, 3, 2) / np.sqrt(q.shape[-1])
+    t = q.shape[2]
+    s = np.where(np.triu(np.ones((t, t), bool), 1), -np.inf, s)
+    s = np.exp(s - s.max(-1, keepdims=True))
+    return (s / s.sum(-1, keepdims=True)) @ v
+
+
+def _gelu_tanh(x: np.ndarray) -> np.ndarray:
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+
+
+def _qkv(t: int) -> list[np.ndarray]:
+    rng = np.random.default_rng(t)
+    return [rng.standard_normal((1, 4, t, 16), dtype=np.float32) for _ in range(3)]
+
+
+def _activations(t: int) -> np.ndarray:
+    # Rank 3, like the MLP's [1, T, 4C]: exercises the flatten/restore.
+    return np.random.default_rng(t).standard_normal((1, t, 32), dtype=np.float32)
+
+
+def _graph_model(fn, input_types: list[TensorType]):
+    graph = Graph(
+        "llmm_helper",
+        forward=fn,
+        input_types=input_types,
+        custom_extensions=[llmm_package()],
+    )
+    return InferenceSession(devices=[CPU()]).load(graph)
+
+
+def _run_graph(model, *arrays: np.ndarray) -> np.ndarray:
+    (out,) = model.execute(*(Buffer.from_numpy(a) for a in arrays))
+    assert isinstance(out, Buffer)
+    return out.to_numpy()
+
+
+def test_graph_llmm_attention() -> None:
+    qkv_type = TensorType(DType.float32, [1, 4, "seq_len", 16], DeviceRef.CPU())
+    model = _graph_model(graph_api.llmm_attention, [qkv_type] * 3)
+    for t in HELPER_T:
+        q, k, v = _qkv(t)
+        got = _run_graph(model, q, k, v)
+        np.testing.assert_allclose(got, _causal_attention(q, k, v), atol=1e-5)
+
+
+def test_graph_llmm_gelu() -> None:
+    x_type = TensorType(DType.float32, [1, "seq_len", 32], DeviceRef.CPU())
+    model = _graph_model(graph_api.llmm_gelu, [x_type])
+    for t in HELPER_T:
+        x = _activations(t)
+        np.testing.assert_allclose(_run_graph(model, x), _gelu_tanh(x), atol=1e-5)
+
+
+class _EagerAttention(Module[[Tensor, Tensor, Tensor], Tensor]):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        return eager.llmm_attention(q, k, v)
+
+
+class _EagerGelu(Module[[Tensor], Tensor]):
+    def forward(self, x: Tensor) -> Tensor:
+        return eager.llmm_gelu(x)
+
+
+def _to_numpy(t: Tensor) -> np.ndarray:
+    return np.from_dlpack(t.to(CPU()))
+
+
+@pytest.mark.filterwarnings("ignore:The eager interpreter failed")
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_eager_llmm_attention(mode: str) -> None:
+    fn = eager.llmm_attention
+    if mode == "compiled":
+        qkv_type = TensorType(DType.float32, [1, 4, "seq_len", 16], device=CPU())
+        fn = _EagerAttention().compile(qkv_type, qkv_type, qkv_type)
+    for t in HELPER_T:
+        q, k, v = _qkv(t)
+        got = _to_numpy(fn(*(Tensor.from_dlpack(a) for a in (q, k, v))))
+        np.testing.assert_allclose(got, _causal_attention(q, k, v), atol=1e-5)
+
+
+@pytest.mark.filterwarnings("ignore:The eager interpreter failed")
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_eager_llmm_gelu(mode: str) -> None:
+    fn = eager.llmm_gelu
+    if mode == "compiled":
+        x_type = TensorType(DType.float32, [1, "seq_len", 32], device=CPU())
+        fn = _EagerGelu().compile(x_type)
+    for t in HELPER_T:
+        x = _activations(t)
+        got = _to_numpy(fn(Tensor.from_dlpack(x)))
+        np.testing.assert_allclose(got, _gelu_tanh(x), atol=1e-5)
+
+
+def test_graph_llmm_gelu_rejects_algebraic_rows() -> None:
+    """[2, T, C] flattens to rows = 2 * T, which MAX 26.6 cannot size a
+    kernel buffer with. The helper must say so, not let MAX fail opaquely
+    at compile time. If a MAX upgrade lifts the limit, relax the helper."""
+    x_type = TensorType(DType.float32, [2, "seq_len", 32], DeviceRef.CPU())
+    with pytest.raises(NotImplementedError, match="algebraic dim"):
+        Graph("gelu_2xT", forward=graph_api.llmm_gelu, input_types=[x_type])
+
+
+def test_llmm_package_is_content_addressed(tmp_path, monkeypatch) -> None:
+    """A source edit must resolve to a different package path (never a stale
+    package), and reverting it must find the original path again."""
+    import llmm_pkg
+
+    src = tmp_path / "llmm"
+    src.mkdir()
+    kernel = src / "gelu.mojo"
+    kernel.write_text("v1")
+    monkeypatch.setattr(llmm_pkg, "SOURCE_DIR", src)
+    monkeypatch.setattr(llmm_pkg, "CACHE_ROOT", tmp_path / "cache")
+
+    def path_now():
+        llmm_pkg.package_fingerprint.cache_clear()
+        return llmm_pkg.package_path()
+
+    try:
+        original = path_now()
+        kernel.write_text("v2")
+        edited = path_now()
+        kernel.write_text("v1")
+        reverted = path_now()
+    finally:
+        # Drop the tmp-tree fingerprint so later tests hash the real llmm/.
+        llmm_pkg.package_fingerprint.cache_clear()
+    assert original != edited
+    assert reverted == original
+    # MAX resolves kernels by the package's file name.
+    assert original.name == edited.name == "llmm.mojoc"
+    assert original.parent.parent == tmp_path / "cache"
 
 
 # --- scaffold module trees accept the checkpoint names (strict)

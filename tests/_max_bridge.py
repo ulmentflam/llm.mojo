@@ -41,35 +41,24 @@ import functools
 import hashlib
 import os
 import re
-import shutil
-import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Union
 
 import numpy as np
 
+from llmm_pkg import SOURCE_DIR, ensure_llmm_package, toolchain_fingerprint
+
 if TYPE_CHECKING:
     from max.driver import Device
     from max.engine import InferenceSession, Model
 
 
-# Source dir by default; `_ensure_packaged` reassigns this to a prebuilt
-# .mojoc before any compile so MAX never repackages the sources into its
-# shared (and race-prone) temp mojo_pkg cache. Compiling custom_extensions
-# from the SOURCE dir makes MAX repackage it into one shared temp package
-# (/var/folders/.../.modular_*/mojo_pkg/, content-hashed name) on every
-# Graph build, rewritten non-atomically and read back immediately. That
-# file is the root of the nondeterministic "Failed to compile the model"
-# flakes: a single process can read its own half-written package, and
-# concurrent pytest runs tear each other's down (observed corrupt "invalid
-# magic bytes" leftovers that poison later runs until deleted). A prebuilt
-# package is loaded directly — the temp dir is never created (verified).
-MOJO_KERNELS_DIR = Path(__file__).resolve().parents[1] / "llmm"
-_SOURCE_KERNELS_DIR = MOJO_KERNELS_DIR
-_PKG_SUFFIX = ".mojoc"
-_PKG_FILENAME = f"llmm{_PKG_SUFFIX}"
+# The llmm package every kernel compile loads is built and cached by
+# llmm_pkg (shared with the MAX GPT-2 scaffolds); see its docstring for why it
+# is prebuilt and content-addressed.
+_SOURCE_KERNELS_DIR = SOURCE_DIR
+_ensure_packaged = ensure_llmm_package
 
 # Persistent compiled-model cache (tests/.mef_cache/<fingerprint>/). A MAX
 # model compile costs 4-10s per (kernel, dtype, parameters) and the suite
@@ -82,7 +71,7 @@ _PKG_FILENAME = f"llmm{_PKG_SUFFIX}"
 # Entries are scoped to what they actually depend on. A MEF is keyed on the
 # transitive `from llmm.X import` closure of the module its kernel is
 # `@register`ed in; the package, which really is built from every module, is
-# keyed on the whole tree. This used to be one directory named after a hash of
+# keyed on the whole tree (by llmm_pkg, under build/llmm_pkg/). This used to be one directory named after a hash of
 # ALL of llmm/, with every sibling rmtree'd on resolution -- so editing any
 # one kernel discarded every other kernel's compiled graph, and reverting the
 # edit did not bring them back. Measured on a 72-test subset: cold 254s, warm
@@ -95,8 +84,6 @@ _PKG_FILENAME = f"llmm{_PKG_SUFFIX}"
 # tree. Serving a stale MEF would mean the suite silently testing code that is
 # not in the working tree; a needless recompile is merely slow.
 # Set LLMM_DISABLE_MEF_CACHE=1 to force full recompiles.
-# `mojo precompile` output is NOT bit-stable across identical sources
-# (verified), hence hashing sources rather than the package.
 _MEF_CACHE_ROOT = Path(__file__).resolve().parent / ".mef_cache"
 _MEF_SCHEMA = 2  # bump when _compile_model's graph construction changes
 _MEF_CACHE_DIR: "Path | None | Literal[False]" = False  # False = unresolved
@@ -107,18 +94,9 @@ _REGISTER_RE = re.compile(r'^\s*@register\(\s*"([^"]+)"\s*\)', re.M)
 
 
 def _toolchain_fingerprint(h: "hashlib._Hash") -> None:
-    """Everything that invalidates every artifact regardless of kernel source."""
+    """Everything that invalidates every MEF regardless of kernel source."""
     h.update(f"schema={_MEF_SCHEMA}".encode())
-    try:
-        from max import _core
-
-        h.update(f"max={_core.__version__}".encode())
-    except Exception:
-        h.update(b"max=unknown")
-    mojo = shutil.which("mojo")
-    if mojo:
-        st = Path(mojo).resolve().stat()
-        h.update(f"mojo={st.st_size}:{st.st_mtime_ns}".encode())
+    toolchain_fingerprint(h)
 
 
 @functools.lru_cache(maxsize=1)
@@ -213,82 +191,6 @@ def _kernel_fingerprint(kernel_name: str) -> str:
         h.update(m.encode())
         h.update(p.read_bytes() if p.exists() else b"<missing>")
     return h.hexdigest()[:16]
-
-
-@functools.lru_cache(maxsize=1)
-def _package_fingerprint() -> str:
-    """Hash over ALL of llmm/ -- correct for the package, which is built from
-    every module regardless of which kernel is being compiled."""
-    h = hashlib.sha256()
-    _toolchain_fingerprint(h)
-    for f in sorted(_SOURCE_KERNELS_DIR.rglob("*.mojo")):
-        h.update(f.relative_to(_SOURCE_KERNELS_DIR).as_posix().encode())
-        h.update(f.read_bytes())
-    return h.hexdigest()[:16]
-
-
-def _ensure_packaged(echo_warnings: bool = False) -> Path:
-    """Precompile llmm.mojoc once (per kernel-source state) and reuse it.
-
-    Lazy: a fully MEF-cached run never compiles a graph, so it never pays
-    for packaging either. The package lands in the fingerprint cache dir
-    (reused across runs); with the cache disabled it falls back to a
-    per-process temp dir. Written via temp file + os.replace so concurrent
-    pytest processes can't read a half-written package.
-
-    With echo_warnings (the `make build-mojo` path), mojo's compile
-    warnings are forwarded to stderr instead of swallowed.
-    """
-    global MOJO_KERNELS_DIR
-    if MOJO_KERNELS_DIR.suffix == _PKG_SUFFIX and MOJO_KERNELS_DIR.exists():
-        return MOJO_KERNELS_DIR
-    cache = _mef_cache_dir()
-    if cache is None:
-        target = Path(tempfile.mkdtemp(prefix="llmm_pkg_")) / _PKG_FILENAME
-    else:
-        target = cache / f"pkg-{_package_fingerprint()}" / _PKG_FILENAME
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            MOJO_KERNELS_DIR = target
-            return target
-    # The package embeds its module name from the build-time FILENAME
-    # (a mismatched filename leaves kernels under the wrong module prefix,
-    # which MAX's generated code then can't resolve), so the temp build
-    # must be named exactly llmm.mojoc; uniqueness comes from a
-    # per-process scratch dir beside the target (same filesystem, so the
-    # final os.replace stays atomic).
-    scratch = target.parent / f".pkg_build{os.getpid()}"
-    scratch.mkdir(parents=True, exist_ok=True)
-    tmp = scratch / target.name
-    legacy = target.parent / "llmm.mojopkg"
-    try:
-        proc = subprocess.run(
-            ["mojo", "precompile", str(_SOURCE_KERNELS_DIR), "-o", str(tmp)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        os.replace(tmp, target)
-        if legacy.exists():
-            legacy.unlink()
-    except FileNotFoundError as e:
-        raise RuntimeError(
-            "`mojo` not on PATH; run the suite via `pixi run pytest` or "
-            "activate the pixi env (see CLAUDE notes)."
-        ) from e
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"mojo precompile failed:\n{e.stderr}") from e
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    if echo_warnings and proc.stderr:
-        import sys
-
-        noise = ("Crashpad",)
-        for line in proc.stderr.splitlines():
-            if not any(n in line for n in noise):
-                print(line, file=sys.stderr)
-    MOJO_KERNELS_DIR = target
-    return target
 
 
 class KernelSignatureMismatch(RuntimeError):
@@ -641,8 +543,5 @@ def _from_device_buffer(buf, dtype_name: str) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    # `python -m tests._max_bridge`: the build half of the test chain.
-    # Builds (or reuses) llmm.mojoc in the persistent cache and prints
-    # its path, so `make build-mojo` produces exactly the artifact the
-    # test step consumes; rerunning with unchanged sources is a no-op.
-    print(_ensure_packaged(echo_warnings=True))
+    # Kept for muscle memory; `make build-mojo` runs `python -m llmm_pkg`.
+    print(ensure_llmm_package(echo_warnings=True))

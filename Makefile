@@ -1,6 +1,6 @@
 # Source roots only — never `find .` (crawls .pixi and hangs on iCloud).
 MOJO_PATHS := train_gpt2.mojo profile_gpt2.mojo llmm tests
-PYTHON_PATHS := train_gpt2.py profile_gpt2.py max_gpt2_common.py infer_gpt2_max_graph.py \
+PYTHON_PATHS := train_gpt2.py profile_gpt2.py llmm_pkg.py max_gpt2_common.py infer_gpt2_max_graph.py \
                 infer_gpt2_max_eager.py scripts tests data
 LATEX_SOURCES := docs/backprop.tex
  
@@ -195,8 +195,8 @@ help:
 	@echo "  check         Run lint (incl. typecheck), build-mojo, build train_gpt2, build-profile, compile-rest"
 	@echo "  compile-rest  Compile-only pass over the benches/tools no other target builds"
 	@echo "  figures       Regenerate every data-derived figure (no GPU needed; see Makefile)"
-	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2"
-	@echo "  build-train   Alias for build"
+	@echo "  build         Compile train_gpt2.mojo to build/train_gpt2, and build-mojo"
+	@echo "  build-train   Compile train_gpt2.mojo only"
 	@echo "  train         Build and run build/train_gpt2 (sets MOJO_PYTHON_LIBRARY)"
 	@echo "                Multi-GPU: build with WORLD_SIZE=N (one rank/GPU, compile-time)"
 	@echo "                and pick a ZeRO stage at runtime with -z 0|1|2|3 (or ZERO_STAGE=)"
@@ -287,7 +287,7 @@ help:
 	@echo "  lint-cuda     Lint CUDA sources with clang-format and clang-tidy"
 	@echo "  lint-latex    Lint LaTeX sources with latexindent (check only)"
 	@echo "  typecheck     Type-check Python sources with pyrefly"
-	@echo "  build-mojo    Precompile llmm.mojoc into the test cache; surfaces Mojo warnings"
+	@echo "  build-mojo    Precompile llmm.mojoc (tests + MAX scaffolds); surfaces Mojo warnings"
 	@echo ""
 	@echo "Formatting:"
 	@echo "  format        Format Python, Mojo, C, CUDA, and LaTeX sources"
@@ -411,6 +411,9 @@ compile-rest: | $(PIXI_STAMP)
 # Compiles the GPT-2 training binary. MOJO_PYTHON_LIBRARY must be set because
 # DataLoader uses Python glob; pixi run supplies the Modular std/toolchain env.
 build build-train: $(TRAIN_BIN)
+# `make build` also produces the kernel package, so it means "everything the
+# default workflows load is built". build-train stays the trainer alone.
+build: build-mojo
 
 $(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES) | $(PIXI_STAMP)
 	@mkdir -p build
@@ -578,10 +581,10 @@ $(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 # API (max.nn + max.graph) and the experimental eager API (max.experimental),
 # sharing max_gpt2_common.py. tests/test_max_gpt2.py holds their acceptance
 # tests against a Hugging Face GPT-2 reference.
-infer-max-graph: | $(PIXI_STAMP)
+infer-max-graph: build-mojo
 	$(PIXI) run python infer_gpt2_max_graph.py $(ARGS)
 
-infer-max-eager: | $(PIXI_STAMP)
+infer-max-eager: build-mojo
 	$(PIXI) run python infer_gpt2_max_eager.py $(ARGS)
 
 # fp8 build of the inference binary (see build-fp8 above for the Chunk A
@@ -1073,14 +1076,14 @@ profile-llmc-fp32-nsys: build-llmc-gpu stage-llmc
 		echo "nsys report: build/profile_llmc_fp32.nsys-rep"; \
 	fi
 
-# Builds llmm.mojoc into the persistent cache the pytest suite consumes
-# (tests/.mef_cache/<source-fingerprint>/llmm.mojoc, via the bridge so
-# the fingerprint logic lives in one place). Content-addressed: a no-op
-# when sources are unchanged, so chaining it before test-python costs
-# nothing on warm runs while keeping the two steps independently runnable.
+# Builds llmm.mojoc, the one custom-op package every Python caller of the
+# kernels loads: the pytest bridge and the MAX scaffolds' llmm_attention /
+# llmm_gelu. llmm_pkg.py owns it, at build/llmm_pkg/<source-fingerprint>/.
+# Content-addressed: a no-op when sources are unchanged, so chaining it before
+# build, test-python and infer-max-* costs nothing on warm runs.
 build-mojo: | $(PIXI_STAMP)
 	@if [ -d llmm ]; then \
-		$(PIXI) run python -m tests._max_bridge; \
+		$(PIXI) run python -m llmm_pkg; \
 	else \
 		echo "No llmm package found, skipping mojo build."; \
 	fi

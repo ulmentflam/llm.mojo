@@ -31,12 +31,17 @@ from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.nn import Embedding, LayerNorm, Linear, Module, ModuleList
 from max.experimental.tensor import Tensor, default_dtype
-from max.graph import TensorType
+from max.graph import AlgebraicDim, DeviceRef, Dim, TensorType, ops
 
 from max_gpt2_common import (
+    ATTENTION_OP,
+    ATTENTION_PARAMETERS,
+    GELU_ALGEBRAIC_ROWS,
+    GELU_OP,
     GPT2Config,
     Tokenizer,
     base_arg_parser,
+    llmm_package,
     load_checkpoint,
     run_generation,
 )
@@ -46,6 +51,80 @@ from max_gpt2_common import (
 # the graph scaffold's DTYPE).
 DTYPE = DType.float32
 LAYERNORM_EPS = 1e-5
+
+
+# --- llmm's Mojo kernels as custom ops. Each helper runs eagerly and under
+# Module.compile (symbolic seq_len). Kernel outputs are written in place, so
+# they are zeros tensors handed over with __buffervalue__(), which needs the
+# realization context; hence the explicit F.ensure_context(). Called eagerly,
+# MAX warns that its interpreter cannot run custom ops and compiles the op
+# instead; --mode compiled builds the whole forward once and never hits that.
+
+
+def _host_scalar(dim: Dim) -> Tensor:
+    """A dimension as the 0-d int64 tensor a kernel's Int64 argument takes.
+
+    Always on the CPU, whatever device the tensors are on: MAX hands scalar
+    operands to the kernel as host values and rejects them elsewhere
+    ("Scalars should always be on the host CPU"). Works for symbolic dims.
+    """
+    return Tensor.from_graph_value(
+        ops.reshape(ops.shape_to_tensor([dim]), []).to(DeviceRef.CPU())
+    )
+
+
+def llmm_attention(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    """Causal self-attention on llmm's `attention_fwd` kernel.
+
+    q, k, v: [B, NH, T, HS] on one device, in the kernel dtype. The kernel
+    applies the causal mask and the 1/sqrt(HS) scale. Returns [B, NH, T, HS];
+    the log-sum-exp it also writes (for the backward) is discarded.
+    """
+    with F.ensure_context():
+        dims = list(q.shape)
+        out = Tensor.zeros(dims, dtype=q.dtype, device=q.device)
+        lse = Tensor.zeros(dims[:3], dtype=DType.float32, device=q.device)
+        F.inplace_custom(
+            name=ATTENTION_OP,
+            device=DeviceRef.from_device(q.device),
+            values=[
+                out.__buffervalue__(),
+                q,
+                k,
+                v,
+                lse.__buffervalue__(),
+                *(_host_scalar(d) for d in dims),
+            ],
+            parameters=dict(ATTENTION_PARAMETERS),
+            custom_extensions=llmm_package(),
+        )
+    return out
+
+
+def llmm_gelu(x: Tensor) -> Tensor:
+    """GELU (tanh approximation, as GPT-2) on llmm's `gelu_fwd` kernel.
+
+    The kernel works on [rows, cols], so leading dims are flattened into rows
+    and the input's shape is restored on the way out. They must flatten to
+    one static or symbolic dim ([T, C], [1, T, C], [B, C] with B static);
+    see GELU_ALGEBRAIC_ROWS for why [2, T, C] cannot under compile.
+    """
+    with F.ensure_context():
+        shape = list(x.shape)
+        x2d = F.reshape(x, [-1, shape[-1]])
+        rows = x2d.shape[0]
+        if isinstance(rows, AlgebraicDim):
+            raise NotImplementedError(
+                GELU_ALGEBRAIC_ROWS.format(dims=shape[:-1], rows=rows)
+            )
+        out = Tensor.zeros(list(x2d.shape), dtype=x.dtype, device=x.device)
+        F.inplace_custom(
+            name=GELU_OP,
+            device=DeviceRef.from_device(x.device),
+            values=[out.__buffervalue__(), x2d],
+            custom_extensions=llmm_package(),
+        )
+    return F.reshape(out, shape)
 
 
 class CausalSelfAttention(Module[[Tensor], Tensor]):
@@ -65,6 +144,7 @@ class CausalSelfAttention(Module[[Tensor], Tensor]):
         [B, num_heads, T, head_dim]; scores = q @ k^T / sqrt(head_dim);
         causal mask (F.band_part, or F.where against an upper-triangular
         mask); F.softmax; @ v; merge heads; c_proj.
+        Or replace the scores-through-@-v steps with llmm_attention(q, k, v).
         """
         raise NotImplementedError("CausalSelfAttention.forward")
 
@@ -80,7 +160,8 @@ class MLP(Module[[Tensor], Tensor]):
     def forward(self, x: Tensor) -> Tensor:
         """x: [B, T, C] -> [B, T, C].
 
-        TODO: c_proj(F.gelu(c_fc(x), approximate="tanh")).
+        TODO: c_proj(F.gelu(c_fc(x), approximate="tanh")), or
+        c_proj(llmm_gelu(c_fc(x))) for llmm's kernel.
         """
         raise NotImplementedError("MLP.forward")
 
