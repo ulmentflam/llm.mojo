@@ -38,6 +38,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Built on this Mac, 1.1 needs Xcode's Metal toolchain component, which
   Xcode 27 no longer bundles: `xcodebuild -downloadComponent MetalToolchain`.
 
+### Fixed
+
+- **`make verify` is green again, CPU and Metal.** The loss-trajectory check
+  failed every step by 0.02-0.3 on this Mac, and identically on Mojo 1.0.0,
+  while logits, the step-0 loss and all 16 gradient tensors passed. Two
+  reference-side problems, neither in the trainer:
+  - `train_gpt2.py`'s `LayerNorm` used `torch.var_mean`'s default unbiased
+    (N-1) variance, not GPT-2's population variance. It moved PyTorch's loss
+    ~2e-3 off llm.c and llmm, and since `scripts/gen_expected_losses.py`
+    checks itself against a debug state written by that same model, nothing
+    caught it. Now `unbiased=False`; on llm.c's batch the regenerated state
+    stores 5.2699823 against llm.c's own 5.2700086.
+  - This Mac's `gpt2_124M_debug_state.bin` came from an older
+    `train_gpt2.py` data path with a different first batch (stored loss
+    5.354448) than the one the expected-loss list was generated on
+    (5.2678394, the same batch under the N-1 LayerNorm). Regenerated with
+    `train_gpt2.py --device cpu --num_iterations 0`, which rewrote the four
+    model `.bin` files byte-identically, and the list regenerated from
+    `gen_expected_losses.py` (self-check drift 0). CPU and Metal now match it
+    to within 3e-4 per step. The data file is not in git, so other machines
+    need the same regeneration.
+
 ### Known issues
 
 - **`make compile-rest` is red on Apple Silicon, and was before this

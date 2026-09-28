@@ -364,8 +364,18 @@ def run_test[
     # Batch: x/y from gpt2_124M_debug_state.bin (B=4, T=64), repeated 10 steps.
     # dtype=float32, TF32 off. Step 0 is a plain forward pass on the debug
     # state's own batch and weights, so it reproduces the reference loss stored
-    # in that file exactly: 5.2678394. The generator asserts this and refuses to
-    # emit a list if it ever stops holding.
+    # in that file exactly: 5.2699823 (llm.c's own reference for this batch is
+    # 5.2700086). The generator asserts this and refuses to emit a list if it
+    # ever stops holding.
+    #
+    # The previous list (step 0 = 5.2678394) came from train_gpt2.py while its
+    # LayerNorm used the unbiased (N-1) variance, which puts PyTorch ~2e-3 off
+    # GPT-2 (and off llmm, which uses the population variance). The 0.02-0.3
+    # per-step misses `make verify` used to print were a second problem: a
+    # debug state left by an older train_gpt2.py held a different first batch
+    # (stored loss 5.354448) than the one the list was generated on. With the
+    # LayerNorm fixed and the state regenerated, PyTorch and this trainer agree
+    # to ~2e-4 per step.
     #
     # These numbers come from PyTorch and must ONLY ever come from PyTorch.
     # Regenerating them from this trainer's own output would make the check
@@ -376,16 +386,16 @@ def run_test[
     # LOSS MISMATCH on every commit, and `make verify-gpu` exited 1 for
     # everyone. See scripts/gen_expected_losses.py for the full story.
     var expected_losses: List[Float32] = [
-        5.267839431762695,
-        4.058647632598877,
-        3.3738152980804443,
-        2.79958176612854,
-        2.3142261505126953,
-        1.8480125665664673,
-        1.3934744596481323,
-        0.9979062676429749,
-        0.6228312253952026,
-        0.37594959139823914,
+        5.26998233795166,
+        4.059586048126221,
+        3.374852418899536,
+        2.8005142211914062,
+        2.315274715423584,
+        1.8489989042282104,
+        1.3946499824523926,
+        0.9988086223602295,
+        0.6243725419044495,
+        0.37682223320007324,
     ]
 
     for step in range(10):

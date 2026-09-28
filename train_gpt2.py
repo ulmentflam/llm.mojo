@@ -161,8 +161,11 @@ class LayerNorm(nn.Module):
         self.beta = nn.Parameter(torch.zeros((in_features), **factory_kwargs))
 
     def forward(self, x: Tensor) -> Tensor:
-        # Compute the mean across the feature dimension
-        sigma, u = torch.var_mean(x, dim=-1, keepdim=True)
+        # Mean and POPULATION variance across the feature dimension. var_mean
+        # defaults to the unbiased (N-1) estimator, which is not GPT-2's
+        # LayerNorm: it shifted the debug-state loss by 1.7e-3 away from
+        # llm.c and llmm, enough to fail the verify gate's self-check.
+        sigma, u = torch.var_mean(x, dim=-1, keepdim=True, unbiased=False)
         # Stabilize x
         stabilized_x = x - u
         # Square root of variance

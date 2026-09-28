@@ -21,6 +21,19 @@ A gate that fails for a bogus reason is as harmful as one that passes without
 testing anything -- arguably worse, because a permanently red gate teaches
 people to ignore it, and then it cannot warn them when something real breaks.
 
+It went wrong a second time (fixed 2026-09-28). The list above was generated
+while train_gpt2.py's LayerNorm used ``torch.var_mean``'s default unbiased
+(N-1) variance, not GPT-2's population variance. The self-check below cannot
+see that, because the debug state it checks against is written by the same
+model. Meanwhile the state file on at least one machine predated a
+train_gpt2.py data-path change and held a different first batch (stored loss
+5.354448), so ``make verify`` failed by 0.02-0.3 per step there. With the
+LayerNorm fixed, a regenerated state stores 5.2699823 on llm.c's batch (llm.c's
+own reference: 5.2700086) and the trainer matches the list to ~3e-4. If
+``make verify`` misses the whole trajectory, compare the state's stored loss
+with the list's step 0 before suspecting the trainer, and regenerate the
+state with ``pixi run python train_gpt2.py --device cpu --num_iterations 0``.
+
 SO: THE ONE RULE FOR REGENERATING THIS LIST
 -------------------------------------------
 **The expected losses must come from PyTorch, never from the Mojo trainer's
