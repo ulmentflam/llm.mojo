@@ -44,6 +44,15 @@ DEFAULT_TOKENIZER = REPO_ROOT / "gpt2_tokenizer.bin"
 # Both scaffolds can call the @register'd kernels in llmm/ through their
 # `llmm_attention` / `llmm_gelu` helpers, loading the package llmm_pkg builds
 # and caches by source content (`make build-mojo`; shared with the tests).
+#
+# Two rules shape both helpers. The kernels declare their outputs as
+# MutableInputTensor and write them in place, so MAX must hand them buffers
+# rather than the immutable tensors ordinary ops return; each helper allocates
+# those buffers and reads the result back out. And a kernel's Int64 arguments
+# (sizes such as seq_len) travel as 0-d int64 tensors on the host CPU,
+# whatever device the data lives on: the kernel reads them on the host to
+# size-check its buffers and pick a launch grid, and MAX rejects scalar
+# operands anywhere else ("Scalars should always be on the host CPU").
 ATTENTION_OP = "attention_fwd"
 # Exact exp and unconditional rescaling: the variants tests/ checks against
 # PyTorch. The Mojo defaults (True) select approximate fast paths.
@@ -248,8 +257,10 @@ def sample_softmax(logits: np.ndarray, coin: float) -> int:
     """Sample from softmax(logits) with the C reference's float semantics.
 
     Matches llmm.sampler.sample_softmax and tests/_sampler_reference.py:
-    exp in float32, normaliser accumulated sequentially in float64, CDF
-    accumulated sequentially in float32. No max-subtraction, like llm.c.
+    exp in float32, normalizer accumulated sequentially in float64, CDF
+    accumulated sequentially in float32. It skips the usual max-subtraction
+    because llm.c does and the draw must round exactly as llm.c's; exp only
+    overflows float32 for logits above ~88.
     """
     with np.errstate(over="ignore"):
         e = np.exp(np.asarray(logits, dtype=np.float32))
@@ -260,7 +271,7 @@ def sample_softmax(logits: np.ndarray, coin: float) -> int:
     return int(hits[0]) if hits.size else int(e.shape[0] - 1)
 
 
-# --- Generation loop, parameterised by a forward callable.
+# --- Generation loop, parameterized by a forward callable.
 
 # tokens int64 [1, T] -> logits float32 [1, T, padded_vocab_size]
 ForwardFn = Callable[[np.ndarray], np.ndarray]
@@ -280,7 +291,9 @@ def generate(
     prompt), recompute the whole window every step (no KV cache), sample the
     last position's logits over the real (unpadded) vocab. `max_tokens`
     counts the whole sequence including the start token, as in the Mojo tool.
-    A KV cache is a forward-side optimisation and would slot in here.
+    Without a KV cache every step reruns the forward over the whole window,
+    so a T-token sequence costs O(T^2) positions; a cache belongs in the
+    forward, not in this loop.
     """
     tokens = [eot_token] + list(prompt or [])
     rng_state = seed

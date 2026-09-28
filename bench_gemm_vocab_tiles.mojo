@@ -109,8 +109,10 @@ def linalg_gemm[
     matmul[transpose_b=True, target="gpu"](c, a, b, ctx=ctx)
 
 
-# Benchmark operand fill: xorshift64 (Marsaglia's 13/7/17 triple) mapped to
-# [-0.5, 0.5]; same generator as bench_gemm.mojo. Deterministic, not statistically important.
+# Fills benchmark operands with xorshift64 (Marsaglia's 13/7/17 triple) mapped
+# to [-0.5, 0.5], the same generator as bench_gemm.mojo. Only determinism
+# matters: every run times the same matrices, so its statistical quality does
+# not.
 comptime XORSHIFT64_LEFT_1 = 13
 comptime XORSHIFT64_RIGHT = 7
 comptime XORSHIFT64_LEFT_2 = 17

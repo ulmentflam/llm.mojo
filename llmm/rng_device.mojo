@@ -112,7 +112,6 @@ comptime SPLITMIX64_SHIFT_3 = 31
 # passing the seed through unchanged.
 comptime GOLDEN_RATIO_64 = UInt64(0x9E3779B97F4A7C15)
 comptime STREAM_KEY_OFFSET = UInt64(0xD1B54A32D192ED03)
-# Squares needs an odd key.
 comptime SQUARES_KEY_ODD_BIT = UInt64(1)
 
 

@@ -89,7 +89,7 @@ def current_thread_id() -> UInt64:
 # The instrumentation is gated at COMPILE TIME on the `LLMM_TRACE` define: unless
 # the binary is built with `-D LLMM_TRACE=1`, the whole tracing path (the getenv,
 # the allocations, the timing, the file I/O) is comptime-eliminated and this is
-# *exactly* `sync_parallelize(work_fn, n)` — provably zero overhead. Regular
+# *exactly* `sync_parallelize(work_fn, n)`, provably zero overhead. Regular
 # train/test builds therefore pay nothing; only the profiling binary opts in.
 # Within a tracing build it is additionally runtime-gated by LLMM_THREAD_TRACE,
 # so a profiling binary run without that env var still just does the work.

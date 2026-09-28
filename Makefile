@@ -411,8 +411,9 @@ compile-rest: | $(PIXI_STAMP)
 # Compiles the GPT-2 training binary. MOJO_PYTHON_LIBRARY must be set because
 # DataLoader uses Python glob; pixi run supplies the Modular std/toolchain env.
 build build-train: $(TRAIN_BIN)
-# `make build` also produces the kernel package, so it means "everything the
-# default workflows load is built". build-train stays the trainer alone.
+# `make build` also builds the kernel package, so one command readies the
+# trainer, the tests and the MAX scaffolds. build-train builds the trainer
+# alone.
 build: build-mojo
 
 $(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES) | $(PIXI_STAMP)
@@ -577,10 +578,11 @@ $(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
 
-# GPT-2 inference on MAX's Python APIs, no Mojo build step: the stable graph
-# API (max.nn + max.graph) and the experimental eager API (max.experimental),
-# sharing max_gpt2_common.py. tests/test_max_gpt2.py holds their acceptance
-# tests against a Hugging Face GPT-2 reference.
+# GPT-2 inference on MAX's Python APIs: the stable graph API (max.nn +
+# max.graph) and the experimental eager API (max.experimental), sharing
+# max_gpt2_common.py. They depend on build-mojo because their llmm_attention /
+# llmm_gelu helpers load the kernel package. tests/test_max_gpt2.py holds their
+# acceptance tests against a Hugging Face GPT-2 reference.
 infer-max-graph: build-mojo
 	$(PIXI) run python infer_gpt2_max_graph.py $(ARGS)
 
@@ -1079,8 +1081,9 @@ profile-llmc-fp32-nsys: build-llmc-gpu stage-llmc
 # Builds llmm.mojoc, the one custom-op package every Python caller of the
 # kernels loads: the pytest bridge and the MAX scaffolds' llmm_attention /
 # llmm_gelu. llmm_pkg.py owns it, at build/llmm_pkg/<source-fingerprint>/.
-# Content-addressed: a no-op when sources are unchanged, so chaining it before
-# build, test-python and infer-max-* costs nothing on warm runs.
+# The path changes only when a source changes, so with unchanged sources this
+# is a no-op and chaining it before build, test-python and infer-max-* costs
+# nothing on warm runs.
 build-mojo: | $(PIXI_STAMP)
 	@if [ -d llmm ]; then \
 		$(PIXI) run python -m llmm_pkg; \

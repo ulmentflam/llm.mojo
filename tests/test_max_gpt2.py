@@ -78,7 +78,7 @@ def _reference_model() -> GPT2LMHeadModel:
             eos_token_id=0,
         )
     )
-    # GPT-2 initialises biases and LN shifts to zero; perturb every parameter
+    # GPT-2 initializes biases and LN shifts to zero; perturb every parameter
     # so a forward that drops a bias or swaps a LN term cannot still match.
     with torch.no_grad():
         for p in model.parameters():

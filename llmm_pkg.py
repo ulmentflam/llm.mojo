@@ -14,7 +14,7 @@ again, and no timestamp can make the two disagree (mtimes lie after
 across identical sources, which is why the key hashes sources rather than the
 package.
 
-Why a prebuilt package at all: compiling `custom_extensions` from the SOURCE
+Prebuilding also avoids a race. Compiling `custom_extensions` from the SOURCE
 dir makes MAX repackage it into one shared temp package
 (/var/folders/.../.modular_*/mojo_pkg/, content-hashed name) on every Graph
 build, rewritten non-atomically and read back immediately. That file was the
@@ -83,7 +83,7 @@ def package_path() -> Path:
 def ensure_llmm_package(echo_warnings: bool = False) -> Path:
     """Return the llmm package for the current sources, building it if absent.
 
-    Memoised per process. Written via a scratch file + os.replace, so
+    Memoized per process. Written via a scratch file + os.replace, so
     concurrent pytest workers never read a half-written package. With
     echo_warnings (the `make build-mojo` path), mojo's compile warnings are
     forwarded to stderr instead of swallowed.

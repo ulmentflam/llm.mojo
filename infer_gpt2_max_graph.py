@@ -1,8 +1,9 @@
 """GPT-2 inference on MAX's stable graph API (max.nn + max.graph).
 
-Scaffold: the module tree, checkpoint loading, graph construction,
-compilation and the sampling loop are wired up; the forward math (every
-`__call__` marked TODO) is left to implement. The eager-API twin is
+The module tree, checkpoint loading, graph construction, compilation and the
+sampling loop are wired up; the forward math (every `__call__` marked TODO) is
+left to implement, optionally on llmm's own kernels via llmm_attention and
+llmm_gelu. The eager-API twin is
 `infer_gpt2_max_eager.py`; both share `max_gpt2_common.py`.
 
 How the pieces fit:
@@ -19,10 +20,10 @@ Run:
     make infer-max-graph                         # CPU, gpt2_124M.bin
     make infer-max-graph ARGS='--device gpu -n 128 --prompt "Hello"'
 
-Acceptance test: tests/test_max_gpt2.py compares logits against the PyTorch
-reference model in train_gpt2.py. It is marked xfail while the forward
-raises NotImplementedError and turns into a hard failure (strict xfail) the
-moment the forward runs, so drop the marker once it passes.
+Acceptance test: tests/test_max_gpt2.py compares logits against a tiny random
+Hugging Face GPT-2. It is marked xfail while the forward raises
+NotImplementedError and turns into a hard failure (strict xfail) the moment
+the forward runs, so drop the marker once it passes.
 """
 
 from __future__ import annotations
@@ -63,18 +64,15 @@ DTYPE = DType.float32
 LAYERNORM_EPS = 1e-5
 
 
-# --- llmm's Mojo kernels as graph ops. build_graph loads the package; each
-# helper allocates the kernel's in-place outputs with ops.buffer_create and
-# reads the result back with ops.buffer_load.
+# --- llmm's Mojo kernels as graph ops (the rules they follow are in
+# max_gpt2_common). build_graph loads the package; each helper allocates the
+# kernel's in-place outputs with ops.buffer_create and reads them back with
+# ops.buffer_load.
 
 
 def _host_scalar(dim: Dim) -> TensorValue:
-    """A dimension as the 0-d int64 tensor a kernel's Int64 argument takes.
-
-    Always on the CPU, whatever device the tensors are on: MAX hands scalar
-    operands to the kernel as host values and rejects them elsewhere
-    ("Scalars should always be on the host CPU"). Works for symbolic dims.
-    """
+    """A dimension, symbolic or static, as the 0-d int64 host tensor a
+    kernel's Int64 argument takes (host-only: see max_gpt2_common)."""
     return ops.reshape(ops.shape_to_tensor([dim]), []).to(DeviceRef.CPU())
 
 

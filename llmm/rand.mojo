@@ -44,7 +44,8 @@ comptime MT19937_TEMPER_T = 15
 comptime MT19937_TEMPER_C = UInt32(0xEFC60000)
 comptime MT19937_TEMPER_L = 18
 
-# randint64 packs two draws, the first into the high word.
+# Width of one draw. randint64 packs two, the first into the high word;
+# rng_device and the sampler reuse it for their own 64/32-bit splits.
 comptime U32_BITS = 32
 
 # Uniform floats keep as many bits of a draw as the float's significand holds

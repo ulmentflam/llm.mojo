@@ -1,8 +1,9 @@
 """GPT-2 inference on MAX's experimental eager API (max.experimental).
 
-Scaffold: the module tree, checkpoint loading, device placement, the
-eager/compiled execution switch and the sampling loop are wired up; the
-forward math (every `forward` marked TODO) is left to implement. The
+The module tree, checkpoint loading, device placement, the eager/compiled
+execution switch and the sampling loop are wired up; the forward math (every
+`forward` marked TODO) is left to implement, optionally on llmm's own kernels
+via llmm_attention and llmm_gelu. The
 stable-graph-API twin is `infer_gpt2_max_graph.py`; both share
 `max_gpt2_common.py`.
 
@@ -53,21 +54,19 @@ DTYPE = DType.float32
 LAYERNORM_EPS = 1e-5
 
 
-# --- llmm's Mojo kernels as custom ops. Each helper runs eagerly and under
-# Module.compile (symbolic seq_len). Kernel outputs are written in place, so
-# they are zeros tensors handed over with __buffervalue__(), which needs the
-# realization context; hence the explicit F.ensure_context(). Called eagerly,
-# MAX warns that its interpreter cannot run custom ops and compiles the op
-# instead; --mode compiled builds the whole forward once and never hits that.
+# --- llmm's Mojo kernels as custom ops (the rules they follow are in
+# max_gpt2_common). Each helper runs eagerly and under Module.compile with a
+# symbolic seq_len. The in-place outputs are zeros tensors passed as
+# __buffervalue__(), which only works inside the realization context;
+# F.inplace_custom enters that context after its arguments are evaluated, so
+# the helpers enter it first. Called eagerly, MAX warns that its interpreter
+# cannot run custom ops and compiles the op instead; --mode compiled builds the
+# whole forward once and never hits that.
 
 
 def _host_scalar(dim: Dim) -> Tensor:
-    """A dimension as the 0-d int64 tensor a kernel's Int64 argument takes.
-
-    Always on the CPU, whatever device the tensors are on: MAX hands scalar
-    operands to the kernel as host values and rejects them elsewhere
-    ("Scalars should always be on the host CPU"). Works for symbolic dims.
-    """
+    """A dimension, symbolic or static, as the 0-d int64 host tensor a
+    kernel's Int64 argument takes (host-only: see max_gpt2_common)."""
     return Tensor.from_graph_value(
         ops.reshape(ops.shape_to_tensor([dim]), []).to(DeviceRef.CPU())
     )
@@ -216,7 +215,7 @@ def pick_device(name: str) -> Device:
 def build_model(
     config: GPT2Config, weights: dict[str, np.ndarray], device: Device
 ) -> GPT2:
-    """Construct without materialising the random init, then load real weights."""
+    """Construct without materializing the random init, then load real weights."""
     with F.lazy(), default_dtype(DTYPE):
         model = GPT2(config)
     model.load_state_dict(weights)

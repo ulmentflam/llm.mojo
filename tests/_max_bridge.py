@@ -70,14 +70,14 @@ _ensure_packaged = ensure_llmm_package
 #
 # Entries are scoped to what they actually depend on. A MEF is keyed on the
 # transitive `from llmm.X import` closure of the module its kernel is
-# `@register`ed in; the package, which really is built from every module, is
-# keyed on the whole tree (by llmm_pkg, under build/llmm_pkg/). This used to be one directory named after a hash of
-# ALL of llmm/, with every sibling rmtree'd on resolution -- so editing any
-# one kernel discarded every other kernel's compiled graph, and reverting the
-# edit did not bring them back. Measured on a 72-test subset: cold 254s, warm
-# 7.4s, after editing llmm/zero.mojo 7.0s (was a full 254s rebuild, because
-# zero.mojo is in the import closure of none of the kernels the Python suite
-# exercises), after editing llmm/matmul.mojo 142s -- the matmul kernels
+# `@register`ed in. (The package, built from every module, is keyed on the
+# whole tree by llmm_pkg.) The MEF cache used to be one directory named after a
+# hash of ALL of llmm/, with every sibling rmtree'd on resolution -- so editing
+# any one kernel discarded every other kernel's compiled graph, and reverting
+# the edit did not bring them back. Measured on a 72-test subset: cold 254s,
+# warm 7.4s, after editing llmm/zero.mojo 7.0s (was a full 254s rebuild,
+# because zero.mojo is in the import closure of none of the kernels the Python
+# suite exercises), after editing llmm/matmul.mojo 142s -- the matmul kernels
 # recompile and the rest stay cached, which is the point.
 #
 # A kernel with no discoverable @register site falls back to hashing the whole
