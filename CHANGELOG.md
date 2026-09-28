@@ -58,6 +58,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Built on this Mac, 1.1 needs Xcode's Metal toolchain component, which
   Xcode 27 no longer bundles: `xcodebuild -downloadComponent MetalToolchain`.
 
+- **Every RNG's constants are named, and named the same way everywhere.**
+  The xorshift* sampler (`llmm/sampler.mojo` and its Python port in
+  `max_gpt2_common.py`), MT19937 (`llmm/rand.mojo`, with Matsumoto and
+  Nishimura's parameter names), splitmix64/Squares and the bf16 stochastic
+  rounding (`llmm/rng_device.mojo`), the benches' xorshift64 fill and the
+  encoder test's MMIX LCG no longer carry bare shifts, multipliers or masks.
+  The float-in-[0, 1) widths come from one pair of constants
+  (`FLOAT32_SIGNIFICAND_BITS`, `FLOAT64_SIGNIFICAND_BITS`), and the
+  `(step << 32) | index` SR counter, written out by hand five times across
+  `adamw.mojo` and `nvfp4_quant.mojo`, is `rng_step_counter`. The benches'
+  `_lcg` was an xorshift64 and is now `_xorshift64_centered`. Behaviour is
+  unchanged: 1926 exact outputs across every library generator (MT19937
+  draws, both `normal_` paths, the permutation, Squares keys and draws, SR
+  bf16 bits, the sampler) are identical before and after, and the Mojo and
+  Python samplers still agree on 2000 draws. Also fixed `rng_uniform01`'s
+  docstring, which said it keeps the top 24 bits; it keeps the low 24.
+
 ### Fixed
 
 - **`make verify` is green again, CPU and Metal.** The loss-trajectory check

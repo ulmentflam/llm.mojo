@@ -175,20 +175,37 @@ class Tokenizer:
 
 # --- Sampling: llm.c's xorshift RNG + inverse-CDF sampling (llmc/sampler.h).
 
+# xorshift64* (Marsaglia's xorshift, Vigna's multiplicative scrambler), with
+# llm.c's constants. llmm/sampler.mojo defines them under the same names;
+# changing any of them breaks sample parity with the Mojo binary.
+U64_MASK = (1 << 64) - 1  # Python ints are unbounded; wrap like a C uint64_t
+XORSHIFT_RIGHT_1 = 12
+XORSHIFT_LEFT = 25
+XORSHIFT_RIGHT_2 = 27
+XORSHIFT_STAR_MULTIPLIER = 0x2545F4914F6CDD1D
+U32_BITS = 32
+FLOAT32_SIGNIFICAND_BITS = 24
+# The scrambled state's low bits are weak, so the output keeps the high half.
+U32_OUTPUT_SHIFT = U32_BITS
+# A float32 carries 24 significant bits: keep the top 24 of the u32 and scale
+# by 2^24, so every value in [0, 1) is exactly representable.
+F32_DISCARD_BITS = U32_BITS - FLOAT32_SIGNIFICAND_BITS
+F32_UNIT_SCALE = float(1 << FLOAT32_SIGNIFICAND_BITS)
+
 
 def random_u32(state: int) -> tuple[int, int]:
     """One xorshift* step. Returns (value, new_state); state is a u64."""
-    mask = (1 << 64) - 1
-    state ^= state >> 12
-    state ^= (state << 25) & mask
-    state ^= state >> 27
-    return ((state * 0x2545F4914F6CDD1D) & mask) >> 32, state
+    state ^= state >> XORSHIFT_RIGHT_1
+    state ^= (state << XORSHIFT_LEFT) & U64_MASK
+    state ^= state >> XORSHIFT_RIGHT_2
+    scrambled = (state * XORSHIFT_STAR_MULTIPLIER) & U64_MASK
+    return scrambled >> U32_OUTPUT_SHIFT, state
 
 
 def random_f32(state: int) -> tuple[float, int]:
     """Uniform float32 in [0, 1). Returns (value, new_state)."""
     u, state = random_u32(state)
-    return float(np.float32((u >> 8) / 16777216.0)), state
+    return float(np.float32((u >> F32_DISCARD_BITS) / F32_UNIT_SCALE)), state
 
 
 def sample_softmax(logits: np.ndarray, coin: float) -> int:

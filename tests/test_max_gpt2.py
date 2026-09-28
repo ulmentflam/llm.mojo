@@ -29,7 +29,14 @@ from transformers import GPT2LMHeadModel
 import infer_gpt2_max_eager as eager
 import infer_gpt2_max_graph as graph_api
 from max_gpt2_common import (
+    F32_DISCARD_BITS,
+    F32_UNIT_SCALE,
     REPO_ROOT,
+    U32_OUTPUT_SHIFT,
+    XORSHIFT_LEFT,
+    XORSHIFT_RIGHT_1,
+    XORSHIFT_RIGHT_2,
+    XORSHIFT_STAR_MULTIPLIER,
     GPT2Config,
     load_checkpoint,
     param_shapes,
@@ -162,15 +169,20 @@ def test_sample_softmax_matches_c_reference() -> None:
 
 
 def test_random_f32_matches_u64_arithmetic() -> None:
+    """Python-int masking must agree with native uint64 wraparound (C/Mojo)."""
     state_py, state_np = 1337, np.uint64(1337)
     for _ in range(100):
         got, state_py = random_f32(state_py)
         with np.errstate(over="ignore"):
-            state_np ^= state_np >> np.uint64(12)
-            state_np ^= state_np << np.uint64(25)
-            state_np ^= state_np >> np.uint64(27)
-            u = (state_np * np.uint64(0x2545F4914F6CDD1D)) >> np.uint64(32)
-        want = np.float32(np.uint32(u) >> np.uint32(8)) / np.float32(16777216.0)
+            state_np ^= state_np >> np.uint64(XORSHIFT_RIGHT_1)
+            state_np ^= state_np << np.uint64(XORSHIFT_LEFT)
+            state_np ^= state_np >> np.uint64(XORSHIFT_RIGHT_2)
+            u = (state_np * np.uint64(XORSHIFT_STAR_MULTIPLIER)) >> np.uint64(
+                U32_OUTPUT_SHIFT
+            )
+        want = np.float32(np.uint32(u) >> np.uint32(F32_DISCARD_BITS)) / np.float32(
+            F32_UNIT_SCALE
+        )
         assert got == float(want)
         assert 0.0 <= got < 1.0
 

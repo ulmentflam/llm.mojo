@@ -10,9 +10,6 @@ from typing import Sequence
 
 import numpy as np
 
-RU32_HEX = 0x2545F4914F6CDD1D
-FLOAT_CONST = 16777216.0
-
 
 def expf(x: float | np.floating) -> np.float32:
     """C expf: single-precision exp in, single-precision out."""

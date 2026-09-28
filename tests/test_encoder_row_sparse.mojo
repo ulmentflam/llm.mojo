@@ -50,9 +50,16 @@ comptime BT = B * T
 comptime WTE_ELEMS = V * C
 
 
+# Test-data LCG with Knuth's MMIX constants. Its low bits have short periods,
+# so draws come from the top 31 bits.
+comptime LCG_MULTIPLIER = UInt64(6364136223846793005)
+comptime LCG_INCREMENT = UInt64(1442695040888963407)
+comptime LCG_OUTPUT_SHIFT = 33
+
+
 def _lcg(mut s: UInt64) -> UInt64:
-    s = s * 6364136223846793005 + 1442695040888963407
-    return s >> 33
+    s = s * LCG_MULTIPLIER + LCG_INCREMENT
+    return s >> LCG_OUTPUT_SHIFT
 
 
 def _fill_tokens(

@@ -12,7 +12,7 @@ from max.gpu import block_dim, block_idx, thread_idx
 
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr
-from llmm.rng_device import sr_cast_bf16
+from llmm.rng_device import rng_step_counter, sr_cast_bf16
 
 
 # ===----------------------------------------------------------------------=== #
@@ -190,11 +190,10 @@ def _adamw_update[
         )
         var sr_param = SIMD[DType.bfloat16, width]()
         comptime for lane in range(width):
-            # Counter = (t << 32) | element_index: unique per (step, element)
-            # pair under a fixed seed, so repeated runs with the same seed
-            # are bit-identical (same t, same idx -> same counter -> same
-            # draw) while different steps/elements never collide.
-            var counter = (UInt64(t) << 32) | UInt64(idx + lane)
+            # Unique per (step, element) under a fixed seed, so repeated runs
+            # with the same seed are bit-identical while different
+            # steps/elements never collide (see rng_step_counter).
+            var counter = rng_step_counter(UInt64(t), UInt64(idx + lane))
             sr_param[lane] = sr_cast_bf16(
                 param[lane], SR_MASTER_SEED, counter, SR_MASTER_STREAM
             )

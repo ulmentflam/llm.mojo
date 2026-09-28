@@ -55,6 +55,7 @@ from linalg.matmul import matmul
 from max.gpu.host import DeviceContext
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
+from llmm.rand import FLOAT32_SIGNIFICAND_BITS
 
 
 # GPT-2 124M LM-head shape constants.
@@ -108,12 +109,25 @@ def linalg_gemm[
     matmul[transpose_b=True, target="gpu"](c, a, b, ctx=ctx)
 
 
-def _lcg(mut state: UInt64) -> Float32:
-    # xorshift64 -> [-0.5, 0.5]; same generator as bench_gemm.mojo.
-    state ^= state << 13
-    state ^= state >> 7
-    state ^= state << 17
-    var u = Float32((state >> 40) & 0xFFFFFF) / Float32(0xFFFFFF)
+# Benchmark operand fill: xorshift64 (Marsaglia's 13/7/17 triple) mapped to
+# [-0.5, 0.5]; same generator as bench_gemm.mojo. Deterministic, not statistically important.
+comptime XORSHIFT64_LEFT_1 = 13
+comptime XORSHIFT64_RIGHT = 7
+comptime XORSHIFT64_LEFT_2 = 17
+# Keep the top FLOAT32_SIGNIFICAND_BITS of the 64-bit state, so the draw is
+# exact in float32.
+comptime U64_BITS = 64
+comptime UNIFORM_SOURCE_SHIFT = U64_BITS - FLOAT32_SIGNIFICAND_BITS
+comptime UNIFORM_MAX = (1 << FLOAT32_SIGNIFICAND_BITS) - 1
+
+
+def _xorshift64_centered(mut state: UInt64) -> Float32:
+    state ^= state << XORSHIFT64_LEFT_1
+    state ^= state >> XORSHIFT64_RIGHT
+    state ^= state << XORSHIFT64_LEFT_2
+    var u = Float32((state >> UNIFORM_SOURCE_SHIFT) & UNIFORM_MAX) / Float32(
+        UNIFORM_MAX
+    )
     return u - 0.5
 
 
@@ -133,21 +147,21 @@ def run_tiles(
     var scale = 1.0 / sqrt(Float32(K))
     var st: UInt64 = 0x243F6A8885A308D3 + UInt64(M * 131 + N * 17 + K)
     for i in range(M * K):
-        a_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
+        a_host.unsafe_ptr()[unsafe_offset=i] = _xorshift64_centered(st) * scale
     for i in range(N * K):
-        b_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
+        b_host.unsafe_ptr()[unsafe_offset=i] = _xorshift64_centered(st) * scale
 
     var a_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](M * K)
     var b_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](N * K)
     ctx.synchronize()
     for i in range(M * K):
-        a_bf_host.unsafe_ptr()[unsafe_offset=i] = a_host.unsafe_ptr()[unsafe_offset=i].cast[
-            DType.bfloat16
-        ]()
+        a_bf_host.unsafe_ptr()[unsafe_offset=i] = a_host.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.bfloat16]()
     for i in range(N * K):
-        b_bf_host.unsafe_ptr()[unsafe_offset=i] = b_host.unsafe_ptr()[unsafe_offset=i].cast[
-            DType.bfloat16
-        ]()
+        b_bf_host.unsafe_ptr()[unsafe_offset=i] = b_host.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.bfloat16]()
 
     var a_bf = ctx.enqueue_create_buffer[DType.bfloat16](M * K)
     var b_bf = ctx.enqueue_create_buffer[DType.bfloat16](N * K)
@@ -237,21 +251,21 @@ def check_tiles(M: Int, tiles: Int, ctx: DeviceContext) raises -> None:
     var scale = 1.0 / sqrt(Float32(K))
     var st: UInt64 = 0x243F6A8885A308D3 + UInt64(M * 131 + N * 17 + K)
     for i in range(M * K):
-        a_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
+        a_host.unsafe_ptr()[unsafe_offset=i] = _xorshift64_centered(st) * scale
     for i in range(N * K):
-        b_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
+        b_host.unsafe_ptr()[unsafe_offset=i] = _xorshift64_centered(st) * scale
 
     var a_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](M * K)
     var b_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](N * K)
     ctx.synchronize()
     for i in range(M * K):
-        a_bf_host.unsafe_ptr()[unsafe_offset=i] = a_host.unsafe_ptr()[unsafe_offset=i].cast[
-            DType.bfloat16
-        ]()
+        a_bf_host.unsafe_ptr()[unsafe_offset=i] = a_host.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.bfloat16]()
     for i in range(N * K):
-        b_bf_host.unsafe_ptr()[unsafe_offset=i] = b_host.unsafe_ptr()[unsafe_offset=i].cast[
-            DType.bfloat16
-        ]()
+        b_bf_host.unsafe_ptr()[unsafe_offset=i] = b_host.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.bfloat16]()
 
     var a_bf = ctx.enqueue_create_buffer[DType.bfloat16](M * K)
     var b_bf = ctx.enqueue_create_buffer[DType.bfloat16](N * K)
@@ -297,12 +311,12 @@ def check_tiles(M: Int, tiles: Int, ctx: DeviceContext) raises -> None:
         ctx.synchronize()
         for r in range(M):
             for j in range(this_n):
-                var want = full_host.unsafe_ptr()[unsafe_offset=r * N + start + j].cast[
-                    DType.float32
-                ]()
-                var got = tile_host.unsafe_ptr()[unsafe_offset=r * tile_n + j].cast[
-                    DType.float32
-                ]()
+                var want = full_host.unsafe_ptr()[
+                    unsafe_offset=r * N + start + j
+                ].cast[DType.float32]()
+                var got = tile_host.unsafe_ptr()[
+                    unsafe_offset=r * tile_n + j
+                ].cast[DType.float32]()
                 var d = abs(got - want)
                 max_abs = max(max_abs, d)
                 ref_mag = max(ref_mag, abs(want))

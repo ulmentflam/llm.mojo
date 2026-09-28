@@ -38,6 +38,7 @@ from max.gpu import barrier
 from std.collections import Array
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
+from llmm.rand import FLOAT32_SIGNIFICAND_BITS
 
 
 # ===----------------------------------------------------------------------=== #
@@ -67,7 +68,8 @@ def gemm_simd_kernel[
     b_ptr: ImmutKernelPtr[in_dtype],
     M_arg: Int64,
     N_arg: Int64,
-    K_arg: Int64) -> None:
+    K_arg: Int64,
+) -> None:
     var M = Int(M_arg)
     var N = Int(N_arg)
     var K = Int(K_arg)
@@ -105,9 +107,9 @@ def gemm_simd_kernel[
             var j = e % BK
             var gr = block_row + i
             var gk = k0 + j
-            a_sh.ptr[unsafe_offset=e] = a_ptr[unsafe_offset=gr * K + gk] if (gr < M and gk < K) else Scalar[
-                in_dtype
-            ](0)
+            a_sh.ptr[unsafe_offset=e] = a_ptr[unsafe_offset=gr * K + gk] if (
+                gr < M and gk < K
+            ) else Scalar[in_dtype](0)
             e += NTHREADS
         e = t
         while e < BK * BN:
@@ -117,13 +119,13 @@ def gemm_simd_kernel[
             var gk = k0 + kj
 
             comptime if transpose_b:
-                b_sh.ptr[unsafe_offset=e] = b_ptr[unsafe_offset=gn * K + gk] if (
-                    gn < N and gk < K
-                ) else Scalar[in_dtype](0)
+                b_sh.ptr[unsafe_offset=e] = b_ptr[
+                    unsafe_offset=gn * K + gk
+                ] if (gn < N and gk < K) else Scalar[in_dtype](0)
             else:
-                b_sh.ptr[unsafe_offset=e] = b_ptr[unsafe_offset=gk * N + gn] if (
-                    gn < N and gk < K
-                ) else Scalar[in_dtype](0)
+                b_sh.ptr[unsafe_offset=e] = b_ptr[
+                    unsafe_offset=gk * N + gn
+                ] if (gn < N and gk < K) else Scalar[in_dtype](0)
             e += NTHREADS
         barrier()
 
@@ -131,13 +133,13 @@ def gemm_simd_kernel[
             var a_frag = Array[Float32, TM](uninitialized=True)
             var b_frag = Array[Float32, TN](uninitialized=True)
             comptime for i in range(TM):
-                a_frag[i] = a_sh.ptr[unsafe_offset=(ty * TM + i) * BK + kk].cast[
-                    DType.float32
-                ]()
+                a_frag[i] = a_sh.ptr[
+                    unsafe_offset=(ty * TM + i) * BK + kk
+                ].cast[DType.float32]()
             comptime for j in range(TN):
-                b_frag[j] = b_sh.ptr[unsafe_offset=kk * BN + (tx * TN + j)].cast[
-                    DType.float32
-                ]()
+                b_frag[j] = b_sh.ptr[
+                    unsafe_offset=kk * BN + (tx * TN + j)
+                ].cast[DType.float32]()
             comptime for i in range(TM):
                 comptime for j in range(TN):
                     acc[i * TN + j] += a_frag[i] * b_frag[j]
@@ -149,7 +151,9 @@ def gemm_simd_kernel[
         comptime for j in range(TN):
             var gc = block_col + tx * TN + j
             if gr < M and gc < N:
-                c_ptr[unsafe_offset=gr * N + gc] = acc[i * TN + j].cast[out_dtype]()
+                c_ptr[unsafe_offset=gr * N + gc] = acc[i * TN + j].cast[
+                    out_dtype
+                ]()
 
 
 def launch_gemm_simd[
@@ -183,7 +187,8 @@ def launch_gemm_simd[
         Int64(N),
         Int64(K),
         grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
-        block_dim=((BM // TM) * (BN // TN),))
+        block_dim=((BM // TM) * (BN // TN),),
+    )
 
 
 # ===----------------------------------------------------------------------=== #
@@ -222,12 +227,25 @@ def linalg_gemm[
 # ===----------------------------------------------------------------------=== #
 
 
-def _lcg(mut state: UInt64) -> Float32:
-    # xorshift64 -> [-0.5, 0.5]
-    state ^= state << 13
-    state ^= state >> 7
-    state ^= state << 17
-    var u = Float32((state >> 40) & 0xFFFFFF) / Float32(0xFFFFFF)
+# Benchmark operand fill: xorshift64 (Marsaglia's 13/7/17 triple) mapped to
+# [-0.5, 0.5]. Deterministic, not statistically important.
+comptime XORSHIFT64_LEFT_1 = 13
+comptime XORSHIFT64_RIGHT = 7
+comptime XORSHIFT64_LEFT_2 = 17
+# Keep the top FLOAT32_SIGNIFICAND_BITS of the 64-bit state, so the draw is
+# exact in float32.
+comptime U64_BITS = 64
+comptime UNIFORM_SOURCE_SHIFT = U64_BITS - FLOAT32_SIGNIFICAND_BITS
+comptime UNIFORM_MAX = (1 << FLOAT32_SIGNIFICAND_BITS) - 1
+
+
+def _xorshift64_centered(mut state: UInt64) -> Float32:
+    state ^= state << XORSHIFT64_LEFT_1
+    state ^= state >> XORSHIFT64_RIGHT
+    state ^= state << XORSHIFT64_LEFT_2
+    var u = Float32((state >> UNIFORM_SOURCE_SHIFT) & UNIFORM_MAX) / Float32(
+        UNIFORM_MAX
+    )
     return u - 0.5
 
 
@@ -244,9 +262,9 @@ def run_shape(
     var scale = 1.0 / sqrt(Float32(K))
     var st: UInt64 = 0x243F6A8885A308D3 + UInt64(M * 131 + N * 17 + K)
     for i in range(M * K):
-        a_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
+        a_host.unsafe_ptr()[unsafe_offset=i] = _xorshift64_centered(st) * scale
     for i in range(N * K):
-        b_host.unsafe_ptr()[unsafe_offset=i] = _lcg(st) * scale
+        b_host.unsafe_ptr()[unsafe_offset=i] = _xorshift64_centered(st) * scale
 
     # ---- device buffers ----
     var a_bf = ctx.enqueue_create_buffer[DType.bfloat16](M * K)
@@ -261,13 +279,13 @@ def run_shape(
     var b_bf_host = ctx.enqueue_create_host_buffer[DType.bfloat16](N * K)
     ctx.synchronize()
     for i in range(M * K):
-        a_bf_host.unsafe_ptr()[unsafe_offset=i] = a_host.unsafe_ptr()[unsafe_offset=i].cast[
-            DType.bfloat16
-        ]()
+        a_bf_host.unsafe_ptr()[unsafe_offset=i] = a_host.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.bfloat16]()
     for i in range(N * K):
-        b_bf_host.unsafe_ptr()[unsafe_offset=i] = b_host.unsafe_ptr()[unsafe_offset=i].cast[
-            DType.bfloat16
-        ]()
+        b_bf_host.unsafe_ptr()[unsafe_offset=i] = b_host.unsafe_ptr()[
+            unsafe_offset=i
+        ].cast[DType.bfloat16]()
     a_bf.enqueue_copy_from(a_bf_host)
     b_bf.enqueue_copy_from(b_bf_host)
     a_f32.enqueue_copy_from(a_host)

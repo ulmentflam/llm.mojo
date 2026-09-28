@@ -36,6 +36,9 @@ from std.sys import has_nvidia_gpu_accelerator
 from std.testing import TestSuite, assert_true, assert_equal
 
 from llmm.rng_device import (
+    BF16_DROPPED_MASK,
+    BF16_KEPT_MASK,
+    BF16_ULP_IN_F32_BITS,
     rng_key,
     squares32,
     rng_u32,
@@ -68,7 +71,7 @@ def _bf16_lo_bits(x: Float32) -> UInt32:
     round-down neighbor (i.e. bf16's bit pattern zero-extended back to 32
     bits) — the "floor" value any SR draw of `x` must bracket.
     """
-    return _f32_bits(x) & UInt32(0xFFFF0000)
+    return _f32_bits(x) & BF16_KEPT_MASK
 
 
 @always_inline
@@ -77,7 +80,7 @@ def _straddle(base_bits: UInt32, frac_num: UInt32) -> Float32:
     round-down neighbor of `base_bits` to its round-up neighbor. `base_bits`
     must already have its low 16 bits zeroed (a `_bf16_lo_bits` result).
     """
-    return bitcast[DType.float32](base_bits | (frac_num & UInt32(0xFFFF)))
+    return bitcast[DType.float32](base_bits | (frac_num & BF16_DROPPED_MASK))
 
 
 # ===----------------------------------------------------------------------=== #
@@ -236,7 +239,7 @@ def test_sr_round_bits_only_two_neighbors() raises:
     ]
     for base in bases:
         var lo_bits = _bf16_lo_bits(base)
-        var hi_bits = lo_bits + UInt32(0x10000)
+        var hi_bits = lo_bits + BF16_ULP_IN_F32_BITS
         var lo_bf = bitcast[DType.float32](lo_bits).cast[DType.bfloat16]()
         var hi_bf = bitcast[DType.float32](hi_bits).cast[DType.bfloat16]()
         var x = _straddle(lo_bits, UInt32(30000))  # frac ~= 0.458
@@ -279,7 +282,7 @@ def test_sr_cast_bf16_unbiased() raises:
     var stream: UInt64 = 0
     for base in bases:
         var lo_bits = _bf16_lo_bits(base)
-        var hi_bits = lo_bits + UInt32(0x10000)
+        var hi_bits = lo_bits + BF16_ULP_IN_F32_BITS
         var lo_val = Float64(bitcast[DType.float32](lo_bits))
         var hi_val = Float64(bitcast[DType.float32](hi_bits))
         # For negative `base`, increasing the bit pattern moves the value

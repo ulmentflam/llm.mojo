@@ -63,7 +63,8 @@ to themselves regardless of the drawn `rand`, matching RNE's behavior there.
 
 `_nvfp4_quantize_gpu`/`nvfp4_quantize` thread a `(seed, stream, step)` triple
 through to `rng_uniform01` per the same convention `llmm/adamw.mojo`'s
-`LLMM_SR_MASTER` seam uses: `counter = (step << 32) | flat_element_index`
+`LLMM_SR_MASTER` seam uses:
+`counter = rng_step_counter(step, flat_element_index)`
 (unique per (step, element), so repeated runs with the same seed are
 bit-identical) and a `stream` id reserved for this module
 (`NVFP4_SR_STREAM`, distinct from `llmm/adamw.mojo`'s `SR_MASTER_STREAM=1`)
@@ -142,7 +143,7 @@ from llmm.lowp import (
     _fp8_decode,
     _fp8_encode,
 )
-from llmm.rng_device import rng_uniform01
+from llmm.rng_device import rng_step_counter, rng_uniform01
 
 
 # ===----------------------------------------------------------------------=== #
@@ -700,7 +701,9 @@ def _nvfp4_quantize_gpu[
             )
             var c0: UInt8
             comptime if round_mode == ROUND_MODE_STOCHASTIC:
-                var counter0 = (UInt64(sr_step) << 32) | UInt64(r * k + k0)
+                var counter0 = rng_step_counter(
+                    UInt64(sr_step), UInt64(r * k + k0)
+                )
                 var rand0 = rng_uniform01(sr_seed, counter0, sr_stream)
                 c0 = encode_e2m1[round_mode](v0, rand0)
             else:
@@ -715,7 +718,9 @@ def _nvfp4_quantize_gpu[
                     / sc_val
                 )
                 comptime if round_mode == ROUND_MODE_STOCHASTIC:
-                    var counter1 = (UInt64(sr_step) << 32) | UInt64(r * k + k1)
+                    var counter1 = rng_step_counter(
+                        UInt64(sr_step), UInt64(r * k + k1)
+                    )
                     var rand1 = rng_uniform01(sr_seed, counter1, sr_stream)
                     c1 = encode_e2m1[round_mode](v1, rand1)
                 else:
@@ -768,9 +773,9 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     Bit-identity with `_nvfp4_quantize_gpu[TRANSPOSE=True]`: max is an
     order-invariant reduction (no floating-point-associativity hazard,
     unlike a sum), the encode math (`encode_e4m3`/`encode_e2m1`) and the SR
-    counter formula (`(sr_step << 32) | (r*k + kidx)`, LOGICAL indices) are
-    byte-for-byte the same, and the packed-nibble/swizzled-scale writes are
-    the unchanged per-row formulas (`(r*k + k0)//2`,
+    counter formula (`rng_step_counter(sr_step, r*k + kidx)`, LOGICAL
+    indices) are byte-for-byte the same, and the packed-nibble/swizzled-scale
+    writes are the unchanged per-row formulas (`(r*k + k0)//2`,
     `nvfp4_scale_swizzle_offset(r, kb, ...)` — one scale write per physical
     row, which for BLOCK_ROWS=16 reproduces the replicated-value-per-row
     layout the non-tiled kernel produces with its per-tile `rr` loop; see
@@ -862,7 +867,9 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
         var v0 = vals[kk] / sc_val
         var c0: UInt8
         comptime if round_mode == ROUND_MODE_STOCHASTIC:
-            var counter0 = (UInt64(sr_step) << 32) | UInt64(r * k + k0_idx)
+            var counter0 = rng_step_counter(
+                UInt64(sr_step), UInt64(r * k + k0_idx)
+            )
             var rand0 = rng_uniform01(sr_seed, counter0, sr_stream)
             c0 = encode_e2m1[round_mode](v0, rand0)
         else:
@@ -870,7 +877,9 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
         var v1 = vals[kk + 1] / sc_val
         var c1: UInt8
         comptime if round_mode == ROUND_MODE_STOCHASTIC:
-            var counter1 = (UInt64(sr_step) << 32) | UInt64(r * k + k0_idx + 1)
+            var counter1 = rng_step_counter(
+                UInt64(sr_step), UInt64(r * k + k0_idx + 1)
+            )
             var rand1 = rng_uniform01(sr_seed, counter1, sr_stream)
             c1 = encode_e2m1[round_mode](v1, rand1)
         else:

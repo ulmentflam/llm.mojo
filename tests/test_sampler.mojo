@@ -11,7 +11,7 @@ from std.math import exp
 from std.testing import assert_equal, TestSuite
 
 
-from llmm.sampler import sample_softmax
+from llmm.sampler import random_u32, sample_softmax
 from llmm.memory import ImmutMemPtr, MutMemPtr, heap_alloc
 
 
@@ -103,11 +103,8 @@ def test_seeded_logits_sweep() raises:
         var logits = _alloc_logits(n)
         var state = UInt64(0x123456789ABCDEF0 + UInt64(s_idx))
         for i in range(n):
-            state ^= state >> 12
-            state ^= state << 25
-            state ^= state >> 27
-            var u = (state * UInt64(0x2545F4914F6CDD1D)) >> 32
-            var x = Float32(Int(u % UInt64(10000))) / 1000.0 - 5.0
+            var u = random_u32(state)
+            var x = Float32(Int(u % UInt32(10000))) / 1000.0 - 5.0
             logits[unsafe_offset=i] = Scalar[DType.float32](x)
         for k in range(200):
             var coin = Float32(Float64(k) / 200.0 * 0.9999)
@@ -119,11 +116,8 @@ def test_large_vocab_like() raises:
     var logits = _alloc_logits(n)
     var state = UInt64(42)
     for i in range(n):
-        state ^= state >> 12
-        state ^= state << 25
-        state ^= state >> 27
-        var u = (state * UInt64(0x2545F4914F6CDD1D)) >> 32
-        var x = Float32(Int(u % UInt64(10000))) / 500.0 - 10.0
+        var u = random_u32(state)
+        var x = Float32(Int(u % UInt32(10000))) / 500.0 - 10.0
         logits[unsafe_offset=i] = Scalar[DType.float32](x)
     for k in range(50):
         var coin = Float32(Float64(k) / 50.0 * 0.9999)

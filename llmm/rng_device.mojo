@@ -91,10 +91,29 @@
 
 from std.memory import bitcast
 
+from llmm.rand import FLOAT32_UNIFORM_MASK, FLOAT32_UNIFORM_STEP, U32_BITS
+
 
 # ===----------------------------------------------------------------------=== #
 # Key derivation (seed, stream) -> Squares key, via splitmix64.
 # ===----------------------------------------------------------------------=== #
+
+# splitmix64's output finalizer (Vigna; Stafford's "Mix13" variant of the
+# MurmurHash3 fmix64 constants): xorshift-multiply, twice, then xorshift.
+comptime SPLITMIX64_SHIFT_1 = 30
+comptime SPLITMIX64_MULTIPLIER_1 = UInt64(0xBF58476D1CE4E5B9)
+comptime SPLITMIX64_SHIFT_2 = 27
+comptime SPLITMIX64_MULTIPLIER_2 = UInt64(0x94D049BB133111EB)
+comptime SPLITMIX64_SHIFT_3 = 31
+
+# rng_key mixes the stream id in as a Weyl step: stream * 2^64/phi (the
+# golden-ratio increment splitmix64 itself uses) spreads consecutive stream
+# ids across the 64-bit space, and a fixed odd offset keeps stream 0 from
+# passing the seed through unchanged.
+comptime GOLDEN_RATIO_64 = UInt64(0x9E3779B97F4A7C15)
+comptime STREAM_KEY_OFFSET = UInt64(0xD1B54A32D192ED03)
+# Squares needs an odd key.
+comptime SQUARES_KEY_ODD_BIT = UInt64(1)
 
 
 @always_inline
@@ -104,9 +123,9 @@ def _splitmix64_step(state: UInt64) -> UInt64:
     not used as a general-purpose RNG here.
     """
     var z: UInt64 = state
-    z = (z ^ (z >> 30)) * UInt64(0xBF58476D1CE4E5B9)
-    z = (z ^ (z >> 27)) * UInt64(0x94D049BB133111EB)
-    return z ^ (z >> 31)
+    z = (z ^ (z >> SPLITMIX64_SHIFT_1)) * SPLITMIX64_MULTIPLIER_1
+    z = (z ^ (z >> SPLITMIX64_SHIFT_2)) * SPLITMIX64_MULTIPLIER_2
+    return z ^ (z >> SPLITMIX64_SHIFT_3)
 
 
 @always_inline
@@ -123,15 +142,22 @@ def rng_key(seed: UInt64, stream: UInt64 = 0) -> UInt64:
     exhaustively-vetted key tables in Widynski's paper, which matter for
     exact-equidistribution guarantees SR does not need).
     """
-    var state = seed ^ (
-        stream * UInt64(0x9E3779B97F4A7C15) + UInt64(0xD1B54A32D192ED03)
-    )
-    return _splitmix64_step(state) | UInt64(1)
+    var state = seed ^ (stream * GOLDEN_RATIO_64 + STREAM_KEY_OFFSET)
+    return _splitmix64_step(state) | SQUARES_KEY_ODD_BIT
 
 
 # ===----------------------------------------------------------------------=== #
 # Squares core (Widynski, squares32 / 4-round variant).
 # ===----------------------------------------------------------------------=== #
+
+# Each round squares the 64-bit value and swaps its 32-bit halves, which is
+# a rotation by half the word.
+comptime SQUARES_HALF_SHIFT = U32_BITS
+
+
+@always_inline
+def _swap_halves(x: UInt64) -> UInt64:
+    return (x >> SQUARES_HALF_SHIFT) | (x << SQUARES_HALF_SHIFT)
 
 
 @always_inline
@@ -147,17 +173,21 @@ def squares32(counter: UInt64, key: UInt64) -> UInt32:
     var y: UInt64 = x
     var z: UInt64 = y + key
 
-    x = x * x + y
-    x = (x >> 32) | (x << 32)  # round 1: swap 32-bit halves
+    x = _swap_halves(x * x + y)  # round 1
+    x = _swap_halves(x * x + z)  # round 2
+    x = _swap_halves(x * x + y)  # round 3
+    x = x * x + z  # round 4: take the high half directly, no swap needed
+    return UInt32(x >> SQUARES_HALF_SHIFT)
 
-    x = x * x + z
-    x = (x >> 32) | (x << 32)  # round 2
 
-    x = x * x + y
-    x = (x >> 32) | (x << 32)  # round 3
-
-    x = x * x + z  # round 4 — take the high 32 bits directly, no swap needed
-    return UInt32(x >> 32)
+@always_inline
+def rng_step_counter(step: UInt64, index: UInt64) -> UInt64:
+    """Counter for draw `index` of optimizer step `step`: the step in the high
+    32 bits, the element index in the low 32. Unique per (step, element) for
+    indices below 2^32, so a fixed seed replays bit-identically while different
+    steps and elements never share a draw.
+    """
+    return (step << U32_BITS) | index
 
 
 @always_inline
@@ -174,13 +204,11 @@ def rng_u32(seed: UInt64, counter: UInt64, stream: UInt64 = 0) -> UInt32:
 @always_inline
 def rng_uniform01(seed: UInt64, counter: UInt64, stream: UInt64 = 0) -> Float32:
     """Uniform draw in [0, 1), 24-bit precision — same construction as
-    `llmm/rand.mojo`'s `MT19937.randfloat32` (top 24 bits of a u32, scaled by
+    `llmm/rand.mojo`'s `MT19937.randfloat32` (low 24 bits of a u32, scaled by
     2^-24), for consistency with the rest of the tree.
     """
     var bits = rng_u32(seed, counter, stream)
-    return Float32(Int(bits & UInt32(0xFFFFFF))) * (
-        Float32(1.0) / Float32(1 << 24)
-    )
+    return Float32(Int(bits & FLOAT32_UNIFORM_MASK)) * FLOAT32_UNIFORM_STEP
 
 
 # ===----------------------------------------------------------------------=== #
@@ -202,7 +230,12 @@ def rng_uniform01(seed: UInt64, counter: UInt64, stream: UInt64 = 0) -> Float32:
 # ===----------------------------------------------------------------------=== #
 
 comptime _F32_EXP_MASK = UInt32(0x7F800000)
-comptime _LOW16_MASK = UInt32(0xFFFF)
+# bf16 is fp32 with the low 16 mantissa bits dropped. In fp32 bits, one bf16
+# ULP is therefore 1 << 16, and the dither lives in the dropped mask.
+comptime BF16_DROPPED_BITS = 16
+comptime BF16_DROPPED_MASK = UInt32((1 << BF16_DROPPED_BITS) - 1)
+comptime BF16_KEPT_MASK = ~BF16_DROPPED_MASK
+comptime BF16_ULP_IN_F32_BITS = UInt32(1 << BF16_DROPPED_BITS)
 
 
 @always_inline
@@ -221,14 +254,14 @@ def sr_round_bits(x: Float32, rand_bits: UInt32) -> BFloat16:
     if (bits & _F32_EXP_MASK) == _F32_EXP_MASK:
         return x.cast[DType.bfloat16]()
 
-    var dither = rand_bits & _LOW16_MASK
+    var dither = rand_bits & BF16_DROPPED_MASK
     # No overflow risk: `bits` for any finite x is <= 0xFF7FFFFF and
     # `dither` <= 0xFFFF, so `rounded` never wraps UInt32 — the carry we
     # want (into bit 16, and rarely from there into the exponent field on a
     # power-of-two boundary, which is correct rounding-up behavior) is the
     # only carry that can occur.
     var rounded: UInt32 = bits + dither
-    var bf_bits = UInt16(rounded >> 16)
+    var bf_bits = UInt16(rounded >> BF16_DROPPED_BITS)
     return bitcast[DType.bfloat16](bf_bits)
 
 
