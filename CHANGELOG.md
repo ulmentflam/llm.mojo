@@ -107,6 +107,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`make check`, and with it the pre-push hook, passes on Apple Silicon.**
+  `compile-rest` built `calibrate_fp8_scales.mojo` everywhere, but its fp8
+  backward reaches `lowp_gemm_devscale`, whose only body is cuBLASLt
+  (`comptime assert HAS_CUBLAS`), so every push from a Mac failed the hook;
+  the same failure reproduced on Mojo 1.0.0. The Makefile now defines
+  `HAS_NVIDIA_GPU` once (an NVIDIA GPU that answers `nvidia-smi` within 2s,
+  the condition Mojo's `has_nvidia_gpu_accelerator()` resolves on the build
+  host), compiles calibrate only where it is 1 and prints a skip notice
+  elsewhere. `make test` uses the same variable instead of its own inline
+  probe. Forcing `HAS_NVIDIA_GPU=1` on a Mac reproduces the old failure, so
+  the gate, not a weakened check, is what changed.
+
 - **`make verify` is green again, CPU and Metal.** The loss-trajectory check
   failed every step by 0.02-0.3 on this Mac, and identically on Mojo 1.0.0,
   while logits, the step-0 loss and all 16 gradient tensors passed. Two
@@ -127,14 +139,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to within 3e-4 per step. The data file is not in git, so other machines
     need the same regeneration.
 
-### Known issues
-
-- **`make compile-rest` is red on Apple Silicon, and was before this
-  migration.** `calibrate_fp8_scales.mojo` builds with
-  `-D LLMM_PRECISION=fp8`, whose backward reaches `lowp_gemm_devscale`'s
-  `comptime assert HAS_CUBLAS`. The same failure reproduces on the previous
-  commit with Mojo 1.0.0, so `make check` has only ever been fully green on
-  CUDA hosts.
 
 ## [Unreleased] - 2026-08-11
 

@@ -125,6 +125,12 @@ HAVE_NVCC := $(shell command -v nvcc 2>/dev/null)
 # Detect Apple Silicon so make benchmark auto-selects the Metal path.
 IS_DARWIN := $(shell uname -s 2>/dev/null)
 IS_APPLE_SILICON := $(shell [ "$$(uname -s)" = "Darwin" ] && [ "$$(uname -m)" = "arm64" ] && echo 1 || echo 0)
+# 1 when this host has an NVIDIA GPU that answers nvidia-smi. Mojo resolves
+# has_nvidia_gpu_accelerator(), and with it llmm/vendor.mojo's HAS_CUBLAS,
+# from the build host, so cuBLAS-only code compiles only where this is 1. A
+# driver that hangs counts as no GPU: the 2s timeout keeps a wedged
+# nvidia-smi from stalling every make invocation.
+HAS_NVIDIA_GPU := $(shell command -v nvidia-smi >/dev/null 2>&1 && timeout 2 nvidia-smi >/dev/null 2>&1 && echo 1 || echo 0)
 
 SHELL := /bin/bash
 
@@ -387,6 +393,10 @@ check: lint build-mojo build build-profile compile-rest
 # Compile-only (-o /dev/null): these have no tests, and the point is to prove
 # they still build. calibrate_fp8_scales.mojo is listed separately because it
 # `comptime assert`s its precision and cannot build without the fp8 define.
+# Its fp8 backward also reaches lowp_gemm_devscale, whose only body is cuBLASLt
+# (`comptime assert HAS_CUBLAS`), so it builds only on NVIDIA hosts; elsewhere
+# compile-rest skips it with a notice instead of failing `make check`, and with
+# it the pre-push hook, on every Apple Silicon push.
 #
 # tests/probe_fp8/ is deliberately NOT covered: those are investigation
 # artifacts recording what the toolchain could not do at the time (see their
@@ -403,9 +413,13 @@ compile-rest: | $(PIXI_STAMP)
 		$(PIXI) run mojo build $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) \
 			-o /dev/null "$$f" || fail=1; \
 	done; \
-	echo "==> compile-only: calibrate_fp8_scales.mojo (-D LLMM_PRECISION=fp8)"; \
-	$(PIXI) run mojo build -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) \
-		$(MOJO_LINK_FLAGS) -o /dev/null calibrate_fp8_scales.mojo || fail=1; \
+	if [ "$(HAS_NVIDIA_GPU)" = 1 ]; then \
+		echo "==> compile-only: calibrate_fp8_scales.mojo (-D LLMM_PRECISION=fp8)"; \
+		$(PIXI) run mojo build -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) \
+			$(MOJO_LINK_FLAGS) -o /dev/null calibrate_fp8_scales.mojo || fail=1; \
+	else \
+		echo "==> skip: calibrate_fp8_scales.mojo needs cuBLAS (no NVIDIA GPU on this host)"; \
+	fi; \
 	exit $$fail
 
 # Compiles the GPT-2 training binary. MOJO_PYTHON_LIBRARY must be set because
@@ -1218,7 +1232,7 @@ typecheck: | $(PIXI_STAMP)
 	@$(PIXI) run pyrefly check $(PYTHON_PATHS)
 
 test:
-	@if command -v nvidia-smi >/dev/null 2>&1 && timeout 2 nvidia-smi >/dev/null 2>&1; then \
+	@if [ "$(HAS_NVIDIA_GPU)" = 1 ]; then \
 		echo "GPU detected. Running GPU tests..."; \
 		$(MAKE) test-mojo test-python-cuda; \
 	else \
