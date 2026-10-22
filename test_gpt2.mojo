@@ -398,6 +398,30 @@ def run_test[
         0.37682223320007324,
     ]
 
+    # Stale-state guard. Step 0 of the list is a plain forward pass on the debug
+    # state's own batch, so the loss stored in the state file must equal it
+    # (llm.c's own reference differs by 3e-5). A state left by an older
+    # train_gpt2.py holds a different batch (e.g. 5.3544) and would otherwise
+    # surface as ten unrelated-looking LOSS MISMATCH lines; fail here, loudly,
+    # naming the cause and the fix instead.
+    if abs(expected_loss[unsafe_offset=0] - expected_losses[0]) > 1e-3:
+        print("=========================================================")
+        print(
+            "STALE DEBUG STATE: gpt2_124M_debug_state.bin stores loss",
+            expected_loss[unsafe_offset=0],
+        )
+        print("but the expected trajectory starts at", expected_losses[0])
+        print(
+            "The state file was written by an older train_gpt2.py (different"
+            " batch)."
+        )
+        print("This is NOT a trainer regression. Regenerate it with:")
+        print(
+            "    pixi run python train_gpt2.py --device cpu --num_iterations 0"
+        )
+        print("=========================================================")
+        return False
+
     for step in range(10):
         var start = perf_counter_ns()
         model.forward(
@@ -419,12 +443,12 @@ def run_test[
                 B * T * V_p
             )
             ctx.enqueue_copy(
-                dst_ptr=rebind[
-                    Pointer[Scalar[DType.float32], MutAnyOrigin]
-                ](host_logits.unsafe_ptr().as_unsafe_any_origin()),
-                src_ptr=rebind[
-                    Pointer[Scalar[DType.float32], ImmutAnyOrigin]
-                ](model.acts.logits.as_unsafe_any_origin()),
+                dst_ptr=rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+                    host_logits.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[DType.float32], ImmutAnyOrigin]](
+                    model.acts.logits.as_unsafe_any_origin()
+                ),
                 size=B * T * V_p,
             )
             ctx.synchronize()
@@ -483,11 +507,20 @@ def run_test[
             _ = host_logits^
 
             # compare the achieved loss
-            if abs(model.mean_loss - expected_loss[unsafe_offset=0]) >= loss_tol:
-                print("LOSS MISMATCH:", model.mean_loss, expected_loss[unsafe_offset=0])
+            if (
+                abs(model.mean_loss - expected_loss[unsafe_offset=0])
+                >= loss_tol
+            ):
+                print(
+                    "LOSS MISMATCH:",
+                    model.mean_loss,
+                    expected_loss[unsafe_offset=0],
+                )
                 allok = False
             else:
-                print("LOSS OK:", model.mean_loss, expected_loss[unsafe_offset=0])
+                print(
+                    "LOSS OK:", model.mean_loss, expected_loss[unsafe_offset=0]
+                )
 
             # Run backward pass before checking gradients
             model.zero_gradients()
