@@ -1,9 +1,8 @@
 from extensibility import register
 from std.memory import stack_allocation
 from std.math import ceildiv
-from layout import Layout, TileTensor
+from layout import TileTensor
 from layout.coord import Coord
-from layout.layout_tensor import LayoutTensor
 from linalg.matmul import matmul
 from std.sys import simd_width_of, get_defined_int, is_defined
 from max.gpu.primitives import block
@@ -12,6 +11,7 @@ from std.utils.index import IndexList
 from extensibility import InputTensor
 from linalg.transpose import transpose
 from layout.tile_layout import row_major
+from layout.tile_tensor import stack_allocation as tile_stack_allocation
 from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -3057,12 +3057,9 @@ def _rht_transpose_tiled_kernel[
     var cols = Int(cols_arg)
     comptime TILE = 32
     comptime STRIDE = TILE + 1  # 33 — avoids shared-memory bank conflicts
-    var tile = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, STRIDE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = tile_stack_allocation[dtype, address_space=AddressSpace.SHARED](
+        row_major[TILE, STRIDE]()
+    )
 
     var tiles_r = ceildiv(rows, TILE)  # tiles along src's row dimension
     var tiles_c = ceildiv(cols, TILE)  # tiles along src's col dimension
@@ -3167,12 +3164,9 @@ def _gpu_transpose_add_into_kernel[
     var OC_ = Int(OC_arg)
     comptime TILE = 32
     comptime STRIDE = TILE + 1  # 33 — avoids shared-memory bank conflicts
-    var tile = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, STRIDE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = tile_stack_allocation[dtype, address_space=AddressSpace.SHARED](
+        row_major[TILE, STRIDE]()
+    )
 
     var tiles_c = ceildiv(C_, TILE)  # tiles along C  dimension (src rows)
     var tiles_oc = ceildiv(OC_, TILE)  # tiles along OC dimension (src cols)
