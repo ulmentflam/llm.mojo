@@ -1,12 +1,12 @@
 from extensibility import register
-from layout import Layout
+from layout.tile_layout import row_major
+from layout.tile_tensor import stack_allocation
 from std.math import ceildiv
 from extensibility import InputTensor
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
 from std.sys import simd_width_of, align_of
 from max.gpu.host.info import is_cpu, is_gpu
-from layout.layout_tensor import LayoutTensor
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
 )
@@ -822,12 +822,9 @@ def wte_backward_gpu_kernel[
     var active = warp_id < bucket_size
 
     comptime SMEM_SIZE = BLOCK_SIZE * width
-    var accum_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(SMEM_SIZE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var accum_shared = stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[SMEM_SIZE]())
     # GOTCHA (Metal): access shared memory via .ptr directly — do NOT cast to
     # AddressSpace.GENERIC. A cast like
     #   rebind[MutKernelPtr[...]](accum_shared.ptr.address_space_cast[GENERIC]())
