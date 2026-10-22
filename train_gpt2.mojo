@@ -4,9 +4,9 @@ from std.os.path import isdir
 from std.sys import (
     argv,
     has_accelerator,
-    has_apple_gpu_accelerator,
     simd_width_of,
 )
+from llmm.vendor import has_apple_gpu_accelerator
 from std.sys.info import size_of
 from std.time import global_perf_counter_ns
 from std.ffi import external_call

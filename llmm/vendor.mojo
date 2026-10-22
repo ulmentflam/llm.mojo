@@ -1,8 +1,16 @@
-from std.sys import (
-    has_nvidia_gpu_accelerator,
-    has_apple_gpu_accelerator,
-    is_defined,
-)
+from std.sys import is_defined
+from std.sys.info import _accelerator_arch
+
+
+# Mojo 1.2 dropped std.sys.has_{nvidia,apple}_gpu_accelerator(); the host
+# accelerator's vendor is now only visible via the arch string ("nvidia:sm_121a").
+def has_nvidia_gpu_accelerator() -> Bool:
+    return _accelerator_arch().startswith("nvidia")
+
+
+def has_apple_gpu_accelerator() -> Bool:
+    return _accelerator_arch().startswith("metal")
+
 
 # ===----------------------------------------------------------------------=== #
 # Vendor GPU dispatch — flag glossary

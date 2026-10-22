@@ -6,7 +6,7 @@
 
 from max.gpu.host import DeviceContext
 from max.gpu import block_dim, block_idx, thread_idx
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 
 
 def _mini_kernel(

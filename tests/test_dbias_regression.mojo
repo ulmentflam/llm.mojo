@@ -76,7 +76,7 @@
 
 from std.math import sqrt
 from std.random import random_float64, seed
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from max.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true
 

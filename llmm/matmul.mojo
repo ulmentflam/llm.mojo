@@ -2,6 +2,7 @@ from extensibility import register
 from std.memory import stack_allocation
 from std.math import ceildiv
 from layout import Layout, TileTensor
+from layout.coord import Coord
 from layout.layout_tensor import LayoutTensor
 from linalg.matmul import matmul
 from std.sys import simd_width_of, get_defined_int, is_defined
@@ -1568,11 +1569,11 @@ def matmul_fwd[
     @always_inline
     def epilogue_with_bias[
         dtype: DType, width: SIMDLength, *, alignment: Int = 1
-    ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
-        var offset = idx[0] * out_channels + idx[1]
+    ](idx: Coord, val: SIMD[dtype, width]) -> None:
+        var offset = Int(idx[0].value()) * out_channels + Int(idx[1].value())
         var v = (
             val.cast[DType.float32]()
-            + (bias_ptr.unsafe_offset(idx[1]))
+            + (bias_ptr.unsafe_offset(Int(idx[1].value())))
             .unsafe_load[width=width]()
             .cast[DType.float32]()
         )
@@ -1590,8 +1591,8 @@ def matmul_fwd[
     @always_inline
     def epilogue_no_bias[
         dtype: DType, width: SIMDLength, *, alignment: Int = 1
-    ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
-        var offset = idx[0] * out_channels + idx[1]
+    ](idx: Coord, val: SIMD[dtype, width]) -> None:
+        var offset = Int(idx[0].value()) * out_channels + Int(idx[1].value())
         var v = val.cast[DType.float32]()
         comptime if use_gelu:
             (pre_gelu_ptr.unsafe_offset(offset)).unsafe_store(
@@ -2840,8 +2841,8 @@ def matmul_d_input_bwd[
         @always_inline
         def d_input_epilogue[
             dtype: DType, width: SIMDLength, *, alignment: Int = 1
-        ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
-            var offset = idx[0] * in_channels + idx[1]
+        ](idx: Coord, val: SIMD[dtype, width]) -> None:
+            var offset = Int(idx[0].value()) * in_channels + Int(idx[1].value())
             var v = val.cast[DType.float32]()
             var pre_gelu = (
                 (pre_gelu_ptr.unsafe_offset(offset))

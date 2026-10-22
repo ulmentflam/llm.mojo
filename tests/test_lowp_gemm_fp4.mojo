@@ -21,7 +21,7 @@
 # run under `flock -w 10800 /tmp/llmm-gpu.lock -c '...'` (shared GPU).
 # ===----------------------------------------------------------------------=== #
 
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from max.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true, assert_equal
 

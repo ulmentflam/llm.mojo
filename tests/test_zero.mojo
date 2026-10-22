@@ -2,7 +2,7 @@ from std.collections import Array
 
 from max.gpu.host import DeviceContext
 from std.sys.info import size_of
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from max.algorithm import sync_parallelize
 from layout.tile_layout import row_major
 

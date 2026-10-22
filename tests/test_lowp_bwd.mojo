@@ -28,7 +28,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.random import seed
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.testing import TestSuite, assert_true
 

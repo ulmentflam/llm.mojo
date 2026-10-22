@@ -7,7 +7,7 @@ swizzle tests below need no device at all).
 """
 
 from std.math import sqrt
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr

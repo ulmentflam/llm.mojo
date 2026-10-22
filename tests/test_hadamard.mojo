@@ -4,7 +4,7 @@ Run: `pixi run mojo run -I . tests/test_hadamard.mojo` (all tests here need
 the GPU -- flock per project policy).
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from std.testing import (
     assert_equal,
     assert_true,

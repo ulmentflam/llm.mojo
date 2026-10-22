@@ -35,7 +35,7 @@
 
 from std.memory import UnsafePointer
 from std.sys import size_of
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from max.gpu.host import DeviceContext
 from max.gpu.host._nvidia_cuda import CUDA
 from _cublas.dtype import DataType

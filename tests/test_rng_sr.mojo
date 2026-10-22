@@ -32,7 +32,7 @@
 
 from std.memory import bitcast
 from std.math import isnan, nan, inf, ceildiv
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from std.testing import TestSuite, assert_true, assert_equal
 
 from llmm.rng_device import (

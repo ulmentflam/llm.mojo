@@ -10,7 +10,7 @@ from layout import TileTensor, TensorLayout
 from std.memory import UnsafePointer
 from max.gpu.host.info import is_cpu
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from llmm.memory import heap_alloc
 
 
@@ -1491,9 +1491,9 @@ struct ShardedParameter[
                         )
 
                     var rank_sigs_any = Array[
-                        Pointer[Signal, MutAnyOrigin], MAX_GPUS
+                        Pointer[Signal, MutAnyOrigin], Self.N_GPUS
                     ](uninitialized=True)
-                    for i in range(MAX_GPUS):
+                    for i in range(Self.N_GPUS):
                         rank_sigs_any[i] = (
                             zero_ctx.signal_ptr().unsafe_offset(i)
                         ).as_unsafe_any_origin()

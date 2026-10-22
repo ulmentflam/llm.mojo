@@ -15,7 +15,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.host import DeviceContext, DeviceBuffer
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from std.math import isnan, isinf
 from std.testing import (
     TestSuite,

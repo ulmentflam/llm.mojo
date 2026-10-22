@@ -29,7 +29,8 @@ from max.gpu.host import DeviceContext
 from std.math import isnan
 
 from std.os import getenv
-from std.sys import get_defined_int, has_nvidia_gpu_accelerator, simd_width_of
+from std.sys import get_defined_int, simd_width_of
+from llmm.vendor import has_nvidia_gpu_accelerator
 from std.sys.info import size_of
 from std.time import global_perf_counter_ns
 

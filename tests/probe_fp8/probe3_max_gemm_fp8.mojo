@@ -23,7 +23,7 @@
 # value in arithmetic).
 
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from llmm.vendor import has_nvidia_gpu_accelerator
 from layout import TileTensor
 from layout.tile_layout import row_major
 from linalg.matmul import matmul
