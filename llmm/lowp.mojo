@@ -18,7 +18,8 @@ from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu import barrier
 from max.gpu.memory import AddressSpace
 from std.sys import is_defined
-from layout import Layout, LayoutTensor
+from layout.tile_layout import row_major
+from layout.tile_tensor import stack_allocation as tile_stack_allocation
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 
@@ -612,12 +613,9 @@ def _quantize_transpose_kernel_devscale[
     # than passed as a launch scalar; a broadcast read of one device fp32,
     # negligible next to the tile's own global traffic.
     var scale = scale_ptr[unsafe_offset=0]
-    var tile = LayoutTensor[
-        in_dtype,
-        Layout.row_major(_QT_TILE, _QT_STRIDE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = tile_stack_allocation[
+        in_dtype, address_space=AddressSpace.SHARED
+    ](row_major[_QT_TILE, _QT_STRIDE]())
 
     var tiles_rows = ceildiv(rows, _QT_TILE)
     var tiles_cols = ceildiv(cols, _QT_TILE)
@@ -745,12 +743,9 @@ def _quantize_dual_kernel_devscale[
     var rows = Int(rows_arg)
     var cols = Int(cols_arg)
     var scale = scale_ptr[unsafe_offset=0]
-    var tile = LayoutTensor[
-        in_dtype,
-        Layout.row_major(_QT_TILE, _QT_STRIDE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = tile_stack_allocation[
+        in_dtype, address_space=AddressSpace.SHARED
+    ](row_major[_QT_TILE, _QT_STRIDE]())
 
     var tiles_rows = ceildiv(rows, _QT_TILE)
     var tiles_cols = ceildiv(cols, _QT_TILE)

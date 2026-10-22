@@ -132,8 +132,8 @@ from max.gpu.primitives import block
 from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu import barrier
 from max.gpu.memory import AddressSpace
-from layout import Layout
-from layout.layout_tensor import LayoutTensor
+from layout.tile_layout import row_major
+from layout.tile_tensor import stack_allocation
 
 from llmm.memory import ImmutKernelPtr, MutKernelPtr, ImmutMemPtr, MutMemPtr
 from llmm.lowp import (
@@ -798,12 +798,9 @@ def _nvfp4_quantize_transpose_coalesced_gpu[
     var k0 = kb * NVFP4_BLOCK
 
     # Per-thread-amax exchange buffer for the BLOCK_ROWS=16 group reduction.
-    var amax_sh = LayoutTensor[
-        DType.float32,
-        Layout.row_major(BLOCK_SIZE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var amax_sh = stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[BLOCK_SIZE]())
 
     # 1. Coalesced register load + thread-local amax. `k` is always a
     # multiple of 16 (host wrapper enforces it), so a full k-block is
