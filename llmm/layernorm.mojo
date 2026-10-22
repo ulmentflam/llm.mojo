@@ -20,6 +20,8 @@ from max.gpu import barrier
 from max.gpu.memory import AddressSpace
 from std.atomic import Atomic
 from layout import Layout, LayoutTensor
+from layout.tile_layout import row_major
+from layout.tile_tensor import stack_allocation
 
 from llmm.profiler import traced_parallelize
 from llmm.memory import (
@@ -674,12 +676,9 @@ def _layernorm_fused_residual_fwd_gpu[
     # read it from SMEM instead of re-reading global. CAP covers GPT-2's C=768;
     # a block handles ≤ CAP channels per row.
     comptime LN_CAP = 2048
-    var s_res = LayoutTensor[
-        DType.float32,
-        Layout.row_major(LN_CAP),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var s_res = stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[LN_CAP]())
 
     # `aligned` (comptime): True keeps the vectorized fast path with explicit
     # 16-byte alignment on the global loads/stores (byte-identical to before)
