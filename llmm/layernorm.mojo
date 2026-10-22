@@ -19,7 +19,6 @@ from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu import barrier
 from max.gpu.memory import AddressSpace
 from std.atomic import Atomic
-from layout import Layout, LayoutTensor
 from layout.tile_layout import row_major
 from layout.tile_tensor import stack_allocation
 
@@ -858,24 +857,15 @@ def _ln_fused_residual_warp_gpu[
     # or switch to the production _layernorm_fused_residual_fwd_gpu path
     # (uses only s_res[LN_CAP=2048] = 8 192 bytes → safely within limit).
     comptime CAP = 1024
-    var s_weight = LayoutTensor[
-        dtype,
-        Layout.row_major(CAP),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var s_bias = LayoutTensor[
-        dtype,
-        Layout.row_major(CAP),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var s_res = LayoutTensor[
-        dtype,
-        Layout.row_major(WARPS * CAP),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var s_weight = stack_allocation[dtype, address_space=AddressSpace.SHARED](
+        row_major[CAP]()
+    )
+    var s_bias = stack_allocation[dtype, address_space=AddressSpace.SHARED](
+        row_major[CAP]()
+    )
+    var s_res = stack_allocation[dtype, address_space=AddressSpace.SHARED](
+        row_major[WARPS * CAP]()
+    )
 
     var tid = Int(thread_idx.x)
     var warp_id = tid // WARP_SIZE
