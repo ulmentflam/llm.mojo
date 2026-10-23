@@ -1,6 +1,7 @@
 from extensibility import register
 from layout import Layout, TileTensor
 from layout.tile_layout import row_major
+from layout.tile_tensor import stack_allocation as tile_stack_allocation
 
 from std.sys import simd_width_of, align_of, is_defined
 from std.time import global_perf_counter_ns
@@ -532,7 +533,7 @@ def _attention_copy_rows_dram_to_shared[
     dtype: DType,
     BLOCK_SIZE: Int,
 ](
-    mut shared_tensor: LayoutTensor,
+    mut shared_tensor: TileTensor,
     dram_ptr: ImmutKernelPtr[dtype],
     dram_row_start: Int,
     row_count: Int,
@@ -591,10 +592,10 @@ def _attention_load_online_softmax_state_from_shared[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    softmax_max_deferred_shared: LayoutTensor,
-    softmax_max_true_shared: LayoutTensor,
-    softmax_denominator_true_shared: LayoutTensor,
-    output_rescale_factor_shared: LayoutTensor,
+    softmax_max_deferred_shared: TileTensor,
+    softmax_max_true_shared: TileTensor,
+    softmax_denominator_true_shared: TileTensor,
+    output_rescale_factor_shared: TileTensor,
     local_query_row: Int,
     mut state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
 ) -> None:
@@ -617,10 +618,10 @@ def _attention_store_online_softmax_state_to_shared[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    mut softmax_max_deferred_shared: LayoutTensor,
-    mut softmax_max_true_shared: LayoutTensor,
-    mut softmax_denominator_true_shared: LayoutTensor,
-    mut output_rescale_factor_shared: LayoutTensor,
+    mut softmax_max_deferred_shared: TileTensor,
+    mut softmax_max_true_shared: TileTensor,
+    mut softmax_denominator_true_shared: TileTensor,
+    mut output_rescale_factor_shared: TileTensor,
     local_query_row: Int,
     state: OnlineSoftmaxState[use_soft_exp, use_conditional_rescale],
 ) -> None:
@@ -645,10 +646,10 @@ def _attention_init_online_softmax_state_shared[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
 ](
-    mut softmax_max_deferred_shared: LayoutTensor,
-    mut softmax_max_true_shared: LayoutTensor,
-    mut softmax_denominator_true_shared: LayoutTensor,
-    mut output_rescale_factor_shared: LayoutTensor,
+    mut softmax_max_deferred_shared: TileTensor,
+    mut softmax_max_true_shared: TileTensor,
+    mut softmax_denominator_true_shared: TileTensor,
+    mut output_rescale_factor_shared: TileTensor,
     query_tile_start: Int,
     query_tile_rows: Int,
     seq_len: Int,
@@ -790,14 +791,14 @@ def _attention_gpu_process_key_value_tile_warp[
     head_offset: Int,
     attention_scale: Scalar[DType.float32],
     output_ptr: MutKernelPtr[dtype],
-    query_shared: LayoutTensor,
-    key_shared: LayoutTensor,
-    value_shared: LayoutTensor,
-    mut softmax_max_deferred_shared: LayoutTensor,
-    mut softmax_max_true_shared: LayoutTensor,
-    mut softmax_denominator_true_shared: LayoutTensor,
-    mut output_rescale_factor_shared: LayoutTensor,
-    reduction_shared: LayoutTensor,
+    query_shared: TileTensor,
+    key_shared: TileTensor,
+    value_shared: TileTensor,
+    mut softmax_max_deferred_shared: TileTensor,
+    mut softmax_max_true_shared: TileTensor,
+    mut softmax_denominator_true_shared: TileTensor,
+    mut output_rescale_factor_shared: TileTensor,
+    reduction_shared: TileTensor,
 ) -> None:
     comptime NUM_WARPS = BLOCK_SIZE // WARP_SIZE
     comptime ROWS_PER_WARP = Br // NUM_WARPS
@@ -972,10 +973,10 @@ def _attention_gpu_finalize_query_rows_warp[
     head_index: Int,
     output_ptr: MutKernelPtr[dtype],
     log_sum_exp_ptr: MutKernelPtr[DType.float32],
-    softmax_max_deferred_shared: LayoutTensor,
-    softmax_max_true_shared: LayoutTensor,
-    softmax_denominator_true_shared: LayoutTensor,
-    output_rescale_factor_shared: LayoutTensor,
+    softmax_max_deferred_shared: TileTensor,
+    softmax_max_true_shared: TileTensor,
+    softmax_denominator_true_shared: TileTensor,
+    output_rescale_factor_shared: TileTensor,
 ) -> None:
     comptime NUM_WARPS = BLOCK_SIZE // WARP_SIZE
     comptime ROWS_PER_WARP = Br // NUM_WARPS
@@ -1057,54 +1058,30 @@ def _attention_gpu_forward_query_tile_block[
     var key_head = key_ptr.unsafe_offset(head_offset)
     var value_head = value_ptr.unsafe_offset(head_offset)
 
-    var query_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Br, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var key_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Bc, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var value_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Bc, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var softmax_max_deferred_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Br),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var softmax_max_true_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Br),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var softmax_denominator_true_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Br),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var output_rescale_factor_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Br),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var reduction_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(BLOCK_SIZE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var query_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Br, MAX_HEAD_DIM]())
+    var key_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Bc, MAX_HEAD_DIM]())
+    var value_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Bc, MAX_HEAD_DIM]())
+    var softmax_max_deferred_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Br]())
+    var softmax_max_true_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Br]())
+    var softmax_denominator_true_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Br]())
+    var output_rescale_factor_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Br]())
+    var reduction_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[BLOCK_SIZE]())
     # Metal fix: pass the LayoutTensors directly to helper functions instead of
     # casting to GENERIC pointers. The old pattern corrupted threadgroup pointers
     # on Metal AIR; using .ptr[i] on the LayoutTensor preserves AddressSpace.SHARED.
