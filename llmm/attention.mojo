@@ -25,7 +25,6 @@ from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceAttribute
 from layout.layout_tensor import LayoutTensor
-from layout.tile_tensor import stack_allocation as tile_stack_allocation
 from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
