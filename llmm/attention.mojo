@@ -25,6 +25,7 @@ from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceAttribute
 from layout.layout_tensor import LayoutTensor
+from layout.tile_tensor import stack_allocation as tile_stack_allocation
 from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
@@ -3342,12 +3343,9 @@ def _attention_transpose_planes_gpu[
     comptime TILE = TRANSPOSE_TILE
     comptime STRIDE = TILE + 1  # pad to avoid shared-memory bank conflicts
     # Metal fix: use tile.ptr[i] directly to preserve AddressSpace.SHARED.
-    var tile = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, STRIDE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = tile_stack_allocation[dtype, address_space=AddressSpace.SHARED](
+        row_major[TILE, STRIDE]()
+    )
 
     var plane = seq_len * seq_len
     var tiles = ceildiv(seq_len, TILE)
@@ -3411,12 +3409,9 @@ def _attention_transpose_rect_gpu[
     comptime TILE = TRANSPOSE_TILE
     comptime STRIDE = TILE + 1
     # Metal fix: use tile.ptr[i] directly to preserve AddressSpace.SHARED.
-    var tile = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, STRIDE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = tile_stack_allocation[dtype, address_space=AddressSpace.SHARED](
+        row_major[TILE, STRIDE]()
+    )
 
     var src_plane = rows * cols
     var dst_plane = cols * rows
@@ -3508,18 +3503,12 @@ def _attn_batched_gemm_gpu[
     # First BM*BK threads load one A element each.
     # NOTE: BN must equal N when used for headout (N=HD=64, BN=64) so the full N
     # dimension is covered in one tile (no n-tile loop needed, tiles_n=1).
-    var a_sh = LayoutTensor[
-        dt,
-        Layout.row_major(BM, BK + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var b_sh = LayoutTensor[
-        dt,
-        Layout.row_major(BK, BN + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var a_sh = tile_stack_allocation[dt, address_space=AddressSpace.SHARED](
+        row_major[BM, BK + 1]()
+    )
+    var b_sh = tile_stack_allocation[dt, address_space=AddressSpace.SHARED](
+        row_major[BK, BN + 1]()
+    )
 
     var tid = Int(thread_idx.x)  # [0, BM*BN)
     var ty = tid // BN  # output-tile row   [0, BM)
@@ -3696,18 +3685,12 @@ def _attn_headout4_gpu[
     # ty = tid // BN: which "4-row group" this thread belongs to [0, THREADS/BN)
     # tx = tid %  BN: which output column                         [0, BN)
     comptime ROWS_PER_THREAD = BM * BN // (BM * BK)  # = BN // BK = 64 // 16 = 4
-    var a_sh = LayoutTensor[
-        dt,
-        Layout.row_major(BM, BK + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var b_sh = LayoutTensor[
-        dt,
-        Layout.row_major(BK, BN + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var a_sh = tile_stack_allocation[dt, address_space=AddressSpace.SHARED](
+        row_major[BM, BK + 1]()
+    )
+    var b_sh = tile_stack_allocation[dt, address_space=AddressSpace.SHARED](
+        row_major[BK, BN + 1]()
+    )
 
     var tid = Int(thread_idx.x)
     var bh_idx = Int(block_idx.z)  # head index (no integer division!)
@@ -3891,18 +3874,12 @@ def _attn_headout4_transA_gpu[
     var b_stride = Int(b_stride_arg)
     var c_stride = Int(c_stride_arg)
     comptime ROWS_PER_THREAD = BM * BN // (BM * BK)  # = BN // BK
-    var a_sh = LayoutTensor[
-        dt,
-        Layout.row_major(BK, BM + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var b_sh = LayoutTensor[
-        dt,
-        Layout.row_major(BK, BN + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var a_sh = tile_stack_allocation[dt, address_space=AddressSpace.SHARED](
+        row_major[BK, BM + 1]()
+    )
+    var b_sh = tile_stack_allocation[dt, address_space=AddressSpace.SHARED](
+        row_major[BK, BN + 1]()
+    )
 
     var tid = Int(thread_idx.x)
     var bh_idx = Int(block_idx.z)
@@ -4065,18 +4042,12 @@ def _attn_batched_scoreout_gpu[
     var tiles_m = Int(tiles_m_arg)
     var tiles_n = Int(tiles_n_arg)
     # Shared mem: A_sh[BM, BK+1] and B_sh[BN, BK+1] — +1 padding avoids bank conflicts.
-    var a_sh = LayoutTensor[
-        dt,
-        Layout.row_major(BM, BK + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var b_sh = LayoutTensor[
-        dt,
-        Layout.row_major(BN, BK + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var a_sh = tile_stack_allocation[dt, address_space=AddressSpace.SHARED](
+        row_major[BM, BK + 1]()
+    )
+    var b_sh = tile_stack_allocation[dt, address_space=AddressSpace.SHARED](
+        row_major[BN, BK + 1]()
+    )
 
     var tid = Int(thread_idx.x)  # [0, BM*BN = THREADS)
     var ty = tid // BN  # output row in C-tile: [0, BM)
