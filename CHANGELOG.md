@@ -59,6 +59,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Migrated to Mojo 1.2.0 / MAX 26.7.0 stable, and from `LayoutTensor` to
+  `TileTensor`.** 1.2 breaks three things this tree used, and deprecates the
+  rest of its tensor type:
+  - `std.sys.has_{nvidia,apple}_gpu_accelerator()` are gone. `llmm/vendor.mojo`
+    now defines same-named helpers over `std.sys.info._accelerator_arch()` (a
+    private API; the `metal` prefix match has not been run on Apple hardware),
+    and every caller imports them from there.
+  - `linalg.matmul`'s `elementwise_lambda_fn` receives a `Coord`, not an
+    `IndexList[2]`; the three epilogues index it with `idx[i].value()`.
+  - `comm.allgather` wants `rank_sigs` sized `N_GPUS`, not `MAX_GPUS`.
+  - `LayoutTensor` is deprecated (about 100 warnings per build). All shared
+    scratch buffers, DRAM views and helper parameters in `llmm/` and
+    `bench_gemm.mojo` are now `TileTensor` (`stack_allocation[...](row_major[..]())`
+    for shared tiles). `layout.tensor_core.TensorCore` still takes only
+    `LayoutTensor`, so the flash-attention MMA calls bridge with
+    `.to_layout_tensor()` as Modular's own sm80/sm90 code does. Verified by
+    byte-identical SASS and shared-memory layout against the pre-migration
+    build for every touched kernel (kernels absent from the trainers were
+    force-instantiated), plus bit-identical bf16/fp8/fp4 loss traces. See
+    `docs/ai/tiletensor_migration.md`.
+- `make verify` now stops with a `STALE DEBUG STATE` message when
+  `gpt2_124M_debug_state.bin` stores a different first-batch loss than the
+  expected trajectory, instead of printing ten misleading `LOSS MISMATCH` lines.
+  Regenerate it with `pixi run python train_gpt2.py --device cpu --num_iterations 0`.
 - **Migrated to Mojo 1.1.0 / MAX 26.6.0 stable.** Unlike the 1.0 migration,
   the release notes list every break this tree hit:
   - `std.gpu` is private now (`std._gpu`) and `max.gpu` mirrors all of it,
