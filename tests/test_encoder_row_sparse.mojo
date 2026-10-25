@@ -741,27 +741,16 @@ def test_row_sparse_matches_dense_with_divergent_tokens() raises:
     as through the dense path — including the tied LM-head contribution landing
     on the same ranges.
 
-    KNOWN HANG (not a test bug — reported, not worked around; see the debug
-    session that isolated this): this currently deadlocks inside the
-    row_sparse=True path of `_run_encoder_bucket`. Evidence from an
-    instrumented run: per chunk, one rank calls `wte_backward_cpu` (which
-    dispatches its own nested `sync_parallelize`/`traced_parallelize` work
-    split) from *inside* the outer `sync_parallelize(_run_rank, N)` rank
-    closure — the identical pattern `_dispatch_cpu`/`_encoder_backward_row_sparse`
-    use in production for real CPU multi-rank training. When one rank's chunk
-    has zero local buckets (a legitimate case per `encoder_bwd`'s "empty bucket
-    list is normal" comment) it races ahead to `z.reducescatter_buckets` and
-    blocks in `CpuBarrier.wait()`, while the other rank is still inside its own
-    nested `wte_backward_cpu` dispatch for that chunk (nonzero buckets) — which
-    then never returns. /proc/<pid>/task/*/wchan on the hung process shows
-    exactly one thread actually running (the barrier spinner) and ~191 idle in
-    futex_wait_queue, i.e. the nested dispatch's own worker tasks are never
-    picked up — a nested-`sync_parallelize` deadlock, not a raised exception.
-    This looks like a real bug in `wte_backward_cpu`'s nested parallel dispatch
-    (llmm/encoder.mojo) interacting with `CpuBarrier`'s busy-spin (llmm/zero.mojo),
-    and it is very likely reachable from real CPU multi-rank training with the
-    row-sparse encoder path enabled, not just from this test. Do not "fix" this
-    by weakening the test — the encoder/zero implementation needs a look."""
+    This test used to hang, and was left out of main() because of it. One
+    rank's nested `wte_backward_cpu` dispatch (a `parallelize` inside the
+    outer `sync_parallelize` rank closure) never finished while its peer spun
+    in `CpuBarrier.wait()`. The cause was in the barrier: a spinning rank never
+    re-entered the AsyncRT run loop, so work parked on its runtime worker
+    (non-stealable local waiters and per-worker affinity items) never ran. The
+    barrier now pumps the runtime while it waits. See `_pump_asyncrt_worker`
+    in llmm/zero.mojo and docs/ai/test_zero_hang.md. Before that fix, a
+    scratch build of this test hung 3/3 at a 60 s cap. After it, the same
+    build passed 100/100 runs in under 0.1 s each."""
     var ctx = DeviceContext(api="cpu")
     comptime N = 2
     comptime OPT = WTE_ELEMS // N
@@ -835,3 +824,5 @@ def main() raises:
     print("test_union_makes_row_lists_rank_invariant PASSED")
     test_divergent_range_lists_are_rejected()
     print("test_divergent_range_lists_are_rejected PASSED")
+    test_row_sparse_matches_dense_with_divergent_tokens()
+    print("test_row_sparse_matches_dense_with_divergent_tokens PASSED")

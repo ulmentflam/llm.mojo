@@ -472,6 +472,12 @@ walk, the biased `dwte` pointer, `include_wpe` firing on chunk 0 only, and the
 tied-weight interaction (LM-head and encoder contributions summing on the same
 shard ranges via reduce-scatter linearity).
 
+> **Update (2026-10-25):** this test is now enabled and passing. The
+> deadlock described below was in `CpuBarrier.wait`, not in the encoder: a
+> rank spinning in the barrier never re-entered the AsyncRT run loop, so work
+> parked on its runtime worker never ran. See
+> [`test_zero_hang.md`](test_zero_hang.md).
+
 **Why it is disabled: nested parallelism deadlock, not a logic error.**
 Diagnosed by reading `/proc/<pid>/task/*/wchan` on the hung process (stdout
 buffering hides everything, and ptrace/gdb are blocked in this sandbox): 193

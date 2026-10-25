@@ -1038,7 +1038,7 @@ ones.
 
 **Three caveats, all still true.**
 
-1. **The end-to-end sparse-vs-dense comparison is not gated.**
+1. **The end-to-end sparse-vs-dense comparison is not gated.** *(Update 2026-10-25: it now is; the hang was in `CpuBarrier.wait`. See [`test_zero_hang.md`](test_zero_hang.md).)*
    `test_row_sparse_matches_dense_with_divergent_tokens` exists in the file but
    is not called from `main()`. So the pieces it alone would exercise —
    chunk boundaries, the bucket-cursor walk, the biased `dwte` pointer,

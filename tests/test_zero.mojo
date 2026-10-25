@@ -313,6 +313,51 @@ def test_rank_failure_aborts_peers_instead_of_hanging() raises:
     outcome.unsafe_free()
 
 
+def test_barrier_does_not_strand_parked_asyncrt_work() raises:
+    """Second liveness test: every rank present, nobody aborts, still a hang.
+
+    The shape of every `test_multi_cpu_*` rank body: shared CPU DeviceContext
+    traffic, `ctx.synchronize()`, then the coordinator's barriers. Ranks are
+    AsyncRT worker tasks. A rank whose synchronize completes a PEER's work
+    gets that peer's wakeup queued on its own non-stealable local task list;
+    if it then spins in `CpuBarrier.wait` without re-entering the runtime, the
+    peer sleeps in synchronize forever and the barrier never fills. See
+    `_pump_asyncrt_worker` in llmm/zero.mojo and docs/ai/test_zero_hang.md.
+
+    The single-shot tests hit this in about 6% of runs, and only under
+    load. Looping the pattern makes it near-certain. Built against the pre-fix
+    llmm/zero.mojo, this test hung in 10/10 runs on an idle box (20 s cap).
+    Fixed, the whole file takes about 1.4 s idle. Under heavy
+    oversubscription it slows to tens of seconds, but it does not stall. Like
+    the abort test, a regression here does not fail: it hangs until the
+    per-file timeout.
+    """
+    var ctx = DeviceContext(api="cpu")
+    comptime WORLD_SIZE = 4
+    comptime ITERS = 500
+
+    for _ in range(ITERS):
+        var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
+        cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
+
+        def _run_rank(rank: Int) {imm}:
+            try:
+                var buf = ctx.enqueue_create_buffer[DType.float32](64)
+                var host = ctx.enqueue_create_host_buffer[DType.float32](64)
+                buf.enqueue_copy_from(host)
+                buf.enqueue_fill(Float32(rank))
+                ctx.synchronize()
+                cpu_coord_ptr[].barrier1[].wait()
+                cpu_coord_ptr[].barrier2[].wait()
+            except e:
+                print("rank", rank, "error:", e)
+                cpu_coord_ptr[].abort()
+
+        sync_parallelize(_run_rank, WORLD_SIZE)
+        cpu_coord_ptr[].free()
+        cpu_coord_ptr.unsafe_free()
+
+
 def test_multi_cpu_allreduce() raises:
     var ctx = DeviceContext(api="cpu")
     comptime WORLD_SIZE = 4
