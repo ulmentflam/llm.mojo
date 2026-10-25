@@ -27,9 +27,9 @@ Run under the shared GPU lock:
 
 from std.math import ceildiv, sqrt
 from std.time import global_perf_counter_ns
-from layout import Layout, TileTensor
+from layout import TileTensor
 from layout.tile_layout import row_major
-from layout.layout_tensor import LayoutTensor
+from layout.tile_tensor import stack_allocation
 from linalg.matmul import matmul
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
@@ -83,18 +83,12 @@ def gemm_simd_kernel[
     var block_row = Int(block_idx.y) * BM
     var block_col = Int(block_idx.x) * BN
 
-    var a_sh = LayoutTensor[
-        in_dtype,
-        Layout.row_major(BM, BK),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var b_sh = LayoutTensor[
-        in_dtype,
-        Layout.row_major(BK, BN),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var a_sh = stack_allocation[
+        in_dtype, address_space=AddressSpace.SHARED
+    ](row_major[BM, BK]())
+    var b_sh = stack_allocation[
+        in_dtype, address_space=AddressSpace.SHARED
+    ](row_major[BK, BN]())
 
     var acc = Array[Float32, TM * TN](fill=0.0)
 
