@@ -1360,15 +1360,15 @@ comptime USE_FLASH_FWD = False
 @always_inline
 def _flash_sh[
     dt: DType, R: Int, C: Int
-]() -> LayoutTensor[
-    dt, Layout.row_major(R, C), MutAnyOrigin, address_space=AddressSpace.SHARED
+]() -> TileTensor[
+    dt,
+    type_of(row_major[R, C]()),
+    MutAnyOrigin,
+    address_space=AddressSpace.SHARED,
 ]:
-    return LayoutTensor[
-        dt,
-        Layout.row_major(R, C),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    return tile_stack_allocation[dt, address_space=AddressSpace.SHARED](
+        row_major[R, C]()
+    )
 
 
 @always_inline
@@ -1461,10 +1461,14 @@ def _attention_flash_fwd_gpu[
             comptime for n in range(BC // 8):
                 var c0 = qk.c_reg_tile_type.stack_allocation().fill(0.0)
                 comptime for kk in range(HEAD_DIM // 16):
-                    var qa = qk.load_a(q_sh.tile[16, 16](warp_id, kk))
-                    var kb = qk.load_b(k_sh.tile[8, 16](n, kk))
+                    var qa = qk.load_a(
+                        q_sh.tile[16, 16](warp_id, kk).to_layout_tensor()
+                    )
+                    var kb = qk.load_b(
+                        k_sh.tile[8, 16](n, kk).to_layout_tensor()
+                    )
                     c0 = qk.mma_op(qa, kb, c0)
-                qk.store_d(s_sh.tile[16, 8](warp_id, n), c0)
+                qk.store_d(s_sh.tile[16, 8](warp_id, n).to_layout_tensor(), c0)
             barrier()
 
             if t < BR:
@@ -1506,10 +1510,14 @@ def _attention_flash_fwd_gpu[
             comptime for n in range(HEAD_DIM // 8):
                 var oc = pv.c_reg_tile_type.stack_allocation().fill(0.0)
                 comptime for kk in range(BC // 16):
-                    var pa = pv.load_a(p_sh.tile[16, 16](warp_id, kk))
-                    var vb = pv.load_b(vt_sh.tile[8, 16](n, kk))
+                    var pa = pv.load_a(
+                        p_sh.tile[16, 16](warp_id, kk).to_layout_tensor()
+                    )
+                    var vb = pv.load_b(
+                        vt_sh.tile[8, 16](n, kk).to_layout_tensor()
+                    )
                     oc = pv.mma_op(pa, vb, oc)
-                pv.store_d(pv_sh.tile[16, 8](warp_id, n), oc)
+                pv.store_d(pv_sh.tile[16, 8](warp_id, n).to_layout_tensor(), oc)
             barrier()
             if t < BR:
                 var orow = o_sh.ptr.unsafe_offset(t * HEAD_DIM)
