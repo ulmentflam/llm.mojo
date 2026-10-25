@@ -130,7 +130,21 @@ attention plus `attention_bwd_gemm`), so identity had to be established by
 
 - `attention_fwd_gpu` plus six gemm / transpose kernels: 28 variants, all
   identical.
-- Backward dq / dkv kernels: 10 variants, identical.
+- Backward dq / dkv kernels: **not fully identical.** The Phase 3 implementer
+  reported 10 variants identical, but the independent validator forced 12
+  (f32 / bf16 / f16, five Br / Bc / BLOCK_SIZE combinations) and found 4
+  identical and 8 different. The differences are integer address arithmetic
+  only (LEA, IMAD.SHL, LOP3, MOV, NOP): e.g. the baseline computes
+  `(tid*4)&0xfe0 + (tid&7)*0x80` where the migrated kernel computes
+  `((tid&7)*4 + (tid>>3))*0x20`, both the same
+  `reduction_shared[local_row, thread_row_index, c]` offset. Counts and
+  modifiers of every memory instruction (LDG, STG, LDS, STS, LDL, STL, BAR, LDC)
+  match, register count, frame size and `.nv.shared` size / alignment are
+  unchanged, and the dq / dkv outputs are bit-identical (18 runs over head_dim
+  64, 36 and 128 with T = 37, hashed on the bit patterns, plus a
+  `compute-sanitizer memcheck` run with 0 errors). Judged benign, but this is
+  the one place the "identical SASS" gate was relaxed to "same memory ops and
+  bit-identical outputs".
 - Flash forward, bf16 and f16: 4 variants identical in SASS, with identical
   numerics against the CPU reference.
 - `bench_gemm`: identical.

@@ -75,9 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     for shared tiles). `layout.tensor_core.TensorCore` still takes only
     `LayoutTensor`, so the flash-attention MMA calls bridge with
     `.to_layout_tensor()` as Modular's own sm80/sm90 code does. Verified by
-    byte-identical SASS and shared-memory layout against the pre-migration
-    build for every touched kernel (kernels absent from the trainers were
-    force-instantiated), plus bit-identical bf16/fp8/fp4 loss traces. See
+    identical SASS and shared-memory layout against the pre-migration build for
+    every touched kernel (kernels absent from the trainers were
+    force-instantiated; the backward dq/dkv tile kernels differ only in integer
+    address arithmetic, with identical memory ops and bit-identical outputs),
+    plus bit-identical bf16/fp8/fp4 loss traces. See
     `docs/ai/tiletensor_migration.md`.
 - `make verify` now stops with a `STALE DEBUG STATE` message when
   `gpt2_124M_debug_state.bin` stores a different first-batch loss than the
