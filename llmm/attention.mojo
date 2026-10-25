@@ -2178,12 +2178,7 @@ def _attention_copy_tile[
     R: Int,
     C: Int,
     is_dram_to_shared: Bool,
-](
-    dest: LayoutTensor,
-    src: LayoutTensor,
-    row_count: Int,
-    head_dim: Int,
-) -> None:
+](dest: TileTensor, src: TileTensor, row_count: Int, head_dim: Int,) -> None:
     # Metal fix: rebind dest.ptr to the correct MutAnyOrigin+address_space so
     # writes go to the right memory space. address_space_cast[GENERIC] corrupted
     # threadgroup writes on Metal AIR. src is read-only; no rebind needed.
@@ -2230,18 +2225,10 @@ def _attention_gpu_bwd_dq_tile_block[
 ](
     query_tile_index: Int,
     query_tile_start: Int,
-    q_tile_dram: LayoutTensor[
-        dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-    ],
-    do_tile_dram: LayoutTensor[
-        dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-    ],
-    o_tile_dram: LayoutTensor[
-        dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-    ],
-    dq_tile_dram: LayoutTensor[
-        dtype, Layout.row_major(Br, MAX_HEAD_DIM), MutAnyOrigin
-    ],
+    q_tile_dram: TileTensor,
+    do_tile_dram: TileTensor,
+    o_tile_dram: TileTensor,
+    dq_tile_dram: TileTensor,
     k_head: ImmutKernelPtr[dtype],
     v_head: ImmutKernelPtr[dtype],
     lse_head: ImmutKernelPtr[DType.float32],
@@ -2255,55 +2242,31 @@ def _attention_gpu_bwd_dq_tile_block[
 
     # Shared tiles via .stack_allocation() (Mojo's __shared__). Rows padded to
     # MAX_HEAD_DIM so one binary serves any head_dim <= 128.
-    var q_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Br, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var do_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Br, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var o_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Br, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var dq_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Br, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var key_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Bc, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var val_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Bc, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var q_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Br, MAX_HEAD_DIM]())
+    var do_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Br, MAX_HEAD_DIM]())
+    var o_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Br, MAX_HEAD_DIM]())
+    var dq_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Br, MAX_HEAD_DIM]())
+    var key_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Bc, MAX_HEAD_DIM]())
+    var val_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Bc, MAX_HEAD_DIM]())
 
-    var lse_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Br),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var D_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Br),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var lse_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Br]())
+    var D_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Br]())
     # Metal fix: use lse_shared.ptr / D_shared.ptr directly (no GENERIC cast).
 
     # Load Q, dO, O tiles into SRAM once and reuse across every KV inner tile.
@@ -2347,12 +2310,9 @@ def _attention_gpu_bwd_dq_tile_block[
     # Scratch for cross-thread reduction:
     # 4 threads per query row (Br rows × 4 lanes)
     # merge their private dQ partials before writing dq_shared.
-    var reduction_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Br, 4, 8),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var reduction_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Br, 4, 8]())
 
     # FA2 inner loop (dQ path): stream KV tiles J over the Br×Bc attention
     # sub-block. Causal masking stops at j <= i. K/V tiles are reloaded each
@@ -2360,12 +2320,20 @@ def _attention_gpu_bwd_dq_tile_block[
     for key_tile_start in range(0, query_tile_start + Br, Bc):
         var key_tile_rows = min(Bc, seq_len - key_tile_start)
 
-        var k_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((k_head.unsafe_offset(key_tile_start * head_dim)))
-        var v_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((v_head.unsafe_offset(key_tile_start * head_dim)))
+        var k_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(k_head.unsafe_offset(key_tile_start * head_dim)),
+                length=Bc * MAX_HEAD_DIM,
+            ),
+            row_major[Bc, MAX_HEAD_DIM](),
+        )
+        var v_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(v_head.unsafe_offset(key_tile_start * head_dim)),
+                length=Bc * MAX_HEAD_DIM,
+            ),
+            row_major[Bc, MAX_HEAD_DIM](),
+        )
 
         _attention_copy_tile[dtype, BLOCK_SIZE, Bc, MAX_HEAD_DIM, True](
             key_shared, k_tile_dram, key_tile_rows, head_dim
@@ -2377,12 +2345,9 @@ def _attention_gpu_bwd_dq_tile_block[
 
         # Per-thread dQ partials live in local memory (registers/spill), not
         # shared SRAM, only this thread reads/writes them before the reduction.
-        var private_dq_tensor = LayoutTensor[
-            DType.float32,
-            Layout.row_major(MAX_HEAD_DIM),
-            MutAnyOrigin,
-            address_space=AddressSpace.GENERIC,
-        ].stack_allocation()
+        var private_dq_tensor = tile_stack_allocation[
+            DType.float32, address_space=AddressSpace.GENERIC
+        ](row_major[MAX_HEAD_DIM]())
         var private_dq = private_dq_tensor.ptr
         for col in range(head_dim):
             private_dq[unsafe_offset=col] = 0.0
@@ -2516,41 +2481,49 @@ def attention_bwd_dq_gpu[
         var query_tile_start = query_tile_index * Br
         var head_offset = head_index * Int(seq_len * head_dim)
 
-        var q_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                (query_ptr.unsafe_offset(head_offset)).unsafe_offset(
-                    query_tile_start * Int(head_dim)
-                )
-            )
+        var q_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(
+                    (query_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                        query_tile_start * Int(head_dim)
+                    )
+                ),
+                length=Br * MAX_HEAD_DIM,
+            ),
+            row_major[Br, MAX_HEAD_DIM](),
         )
-        var do_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                (d_output_ptr.unsafe_offset(head_offset)).unsafe_offset(
-                    query_tile_start * Int(head_dim)
-                )
-            )
+        var do_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(
+                    (d_output_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                        query_tile_start * Int(head_dim)
+                    )
+                ),
+                length=Br * MAX_HEAD_DIM,
+            ),
+            row_major[Br, MAX_HEAD_DIM](),
         )
-        var o_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                output_ptr.unsafe_offset(head_offset).unsafe_offset(
-                    query_tile_start * Int(head_dim)
-                )
-            )
+        var o_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(
+                    output_ptr.unsafe_offset(head_offset).unsafe_offset(
+                        query_tile_start * Int(head_dim)
+                    )
+                ),
+                length=Br * MAX_HEAD_DIM,
+            ),
+            row_major[Br, MAX_HEAD_DIM](),
         )
-        var dq_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Br, MAX_HEAD_DIM), MutAnyOrigin
-        ](
-            (
-                (d_query_ptr.unsafe_offset(head_offset)).unsafe_offset(
-                    query_tile_start * Int(head_dim)
-                )
-            )
+        var dq_tile_dram = TileTensor(
+            Span[Scalar[dtype], MutAnyOrigin](
+                unsafe_ptr=(
+                    (d_query_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                        query_tile_start * Int(head_dim)
+                    )
+                ),
+                length=Br * MAX_HEAD_DIM,
+            ),
+            row_major[Br, MAX_HEAD_DIM](),
         )
 
         var k_head = key_ptr.unsafe_offset(head_offset)
@@ -2587,18 +2560,10 @@ def _attention_gpu_bwd_dkv_tile_block[
 ](
     key_tile_index: Int,
     key_tile_start: Int,
-    dk_tile_dram: LayoutTensor[
-        dtype, Layout.row_major(Bc, MAX_HEAD_DIM), MutAnyOrigin
-    ],
-    dv_tile_dram: LayoutTensor[
-        dtype, Layout.row_major(Bc, MAX_HEAD_DIM), MutAnyOrigin
-    ],
-    k_tile_dram: LayoutTensor[
-        dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-    ],
-    v_tile_dram: LayoutTensor[
-        dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-    ],
+    dk_tile_dram: TileTensor,
+    dv_tile_dram: TileTensor,
+    k_tile_dram: TileTensor,
+    v_tile_dram: TileTensor,
     q_head: ImmutKernelPtr[dtype],
     do_head: ImmutKernelPtr[dtype],
     o_head: ImmutKernelPtr[dtype],
@@ -2614,62 +2579,35 @@ def _attention_gpu_bwd_dkv_tile_block[
 
     # Shared layout mirrors pass 1: K/V/dK/dV are the outer (Bc-row) tiles;
     # Q/dO/O stream inner.
-    var key_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Bc, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var val_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Bc, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var dk_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Bc, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var dv_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Bc, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var key_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Bc, MAX_HEAD_DIM]())
+    var val_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Bc, MAX_HEAD_DIM]())
+    var dk_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Bc, MAX_HEAD_DIM]())
+    var dv_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Bc, MAX_HEAD_DIM]())
 
-    var q_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Br, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var do_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Br, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var o_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(Br, MAX_HEAD_DIM),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var q_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Br, MAX_HEAD_DIM]())
+    var do_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Br, MAX_HEAD_DIM]())
+    var o_shared = tile_stack_allocation[
+        dtype, address_space=AddressSpace.SHARED
+    ](row_major[Br, MAX_HEAD_DIM]())
 
-    var lse_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Br),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var D_shared = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Br),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var lse_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Br]())
+    var D_shared = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Br]())
     # Metal fix: use lse_shared.ptr / D_shared.ptr directly (no GENERIC cast).
 
     # Load K, V tiles into SRAM once; reused across every query inner tile.
@@ -2691,32 +2629,38 @@ def _attention_gpu_bwd_dkv_tile_block[
     var thread_col_index = thread_id // Bc
 
     # 4 threads per KV column merge private dK/dV partials before dk/dv_shared.
-    var reduction_dk = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Bc, 4, 8),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var reduction_dv = LayoutTensor[
-        DType.float32,
-        Layout.row_major(Bc, 4, 8),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var reduction_dk = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Bc, 4, 8]())
+    var reduction_dv = tile_stack_allocation[
+        DType.float32, address_space=AddressSpace.SHARED
+    ](row_major[Bc, 4, 8]())
 
     for query_tile_idx in range((key_tile_index * Bc) // Br, query_tiles):
         var query_tile_start = query_tile_idx * Br
         var query_tile_rows = min(Br, seq_len - query_tile_start)
 
-        var q_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((q_head.unsafe_offset(query_tile_start * head_dim)))
-        var do_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((do_head.unsafe_offset(query_tile_start * head_dim)))
-        var o_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Br, MAX_HEAD_DIM), ImmutAnyOrigin
-        ]((o_head.unsafe_offset(query_tile_start * head_dim)))
+        var q_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(q_head.unsafe_offset(query_tile_start * head_dim)),
+                length=Br * MAX_HEAD_DIM,
+            ),
+            row_major[Br, MAX_HEAD_DIM](),
+        )
+        var do_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(do_head.unsafe_offset(query_tile_start * head_dim)),
+                length=Br * MAX_HEAD_DIM,
+            ),
+            row_major[Br, MAX_HEAD_DIM](),
+        )
+        var o_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(o_head.unsafe_offset(query_tile_start * head_dim)),
+                length=Br * MAX_HEAD_DIM,
+            ),
+            row_major[Br, MAX_HEAD_DIM](),
+        )
 
         _attention_copy_tile[dtype, BLOCK_SIZE, Br, MAX_HEAD_DIM, True](
             q_shared, q_tile_dram, query_tile_rows, head_dim
@@ -2750,19 +2694,13 @@ def _attention_gpu_bwd_dkv_tile_block[
         barrier()
 
         # Per-thread dK/dV partials in local memory, same rationale as dQ pass.
-        var private_dk_tensor = LayoutTensor[
-            DType.float32,
-            Layout.row_major(MAX_HEAD_DIM),
-            MutAnyOrigin,
-            address_space=AddressSpace.GENERIC,
-        ].stack_allocation()
+        var private_dk_tensor = tile_stack_allocation[
+            DType.float32, address_space=AddressSpace.GENERIC
+        ](row_major[MAX_HEAD_DIM]())
         var private_dk = private_dk_tensor.ptr
-        var private_dv_tensor = LayoutTensor[
-            DType.float32,
-            Layout.row_major(MAX_HEAD_DIM),
-            MutAnyOrigin,
-            address_space=AddressSpace.GENERIC,
-        ].stack_allocation()
+        var private_dv_tensor = tile_stack_allocation[
+            DType.float32, address_space=AddressSpace.GENERIC
+        ](row_major[MAX_HEAD_DIM]())
         var private_dv = private_dv_tensor.ptr
         for col in range(head_dim):
             private_dk[unsafe_offset=col] = 0.0
@@ -2939,41 +2877,49 @@ def attention_bwd_dkv_gpu[
         var key_tile_start = key_tile_index * Bc
         var head_offset = head_index * Int(seq_len * head_dim)
 
-        var dk_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Bc, MAX_HEAD_DIM), MutAnyOrigin
-        ](
-            (
-                (d_key_ptr.unsafe_offset(head_offset)).unsafe_offset(
-                    key_tile_start * Int(head_dim)
-                )
-            )
+        var dk_tile_dram = TileTensor(
+            Span[Scalar[dtype], MutAnyOrigin](
+                unsafe_ptr=(
+                    (d_key_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                        key_tile_start * Int(head_dim)
+                    )
+                ),
+                length=Bc * MAX_HEAD_DIM,
+            ),
+            row_major[Bc, MAX_HEAD_DIM](),
         )
-        var dv_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Bc, MAX_HEAD_DIM), MutAnyOrigin
-        ](
-            (
-                (d_value_ptr.unsafe_offset(head_offset)).unsafe_offset(
-                    key_tile_start * Int(head_dim)
-                )
-            )
+        var dv_tile_dram = TileTensor(
+            Span[Scalar[dtype], MutAnyOrigin](
+                unsafe_ptr=(
+                    (d_value_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                        key_tile_start * Int(head_dim)
+                    )
+                ),
+                length=Bc * MAX_HEAD_DIM,
+            ),
+            row_major[Bc, MAX_HEAD_DIM](),
         )
-        var k_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                (key_ptr.unsafe_offset(head_offset)).unsafe_offset(
-                    key_tile_start * Int(head_dim)
-                )
-            )
+        var k_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(
+                    (key_ptr.unsafe_offset(head_offset)).unsafe_offset(
+                        key_tile_start * Int(head_dim)
+                    )
+                ),
+                length=Bc * MAX_HEAD_DIM,
+            ),
+            row_major[Bc, MAX_HEAD_DIM](),
         )
-        var v_tile_dram = LayoutTensor[
-            dtype, Layout.row_major(Bc, MAX_HEAD_DIM), ImmutAnyOrigin
-        ](
-            (
-                value_ptr.unsafe_offset(head_offset).unsafe_offset(
-                    key_tile_start * Int(head_dim)
-                )
-            )
+        var v_tile_dram = TileTensor(
+            Span[Scalar[dtype], ImmutAnyOrigin](
+                unsafe_ptr=(
+                    value_ptr.unsafe_offset(head_offset).unsafe_offset(
+                        key_tile_start * Int(head_dim)
+                    )
+                ),
+                length=Bc * MAX_HEAD_DIM,
+            ),
+            row_major[Bc, MAX_HEAD_DIM](),
         )
 
         var q_head = query_ptr.unsafe_offset(head_offset)
