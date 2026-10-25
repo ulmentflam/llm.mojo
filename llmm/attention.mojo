@@ -522,7 +522,7 @@ def _attention_forward_query_row[
 
 # Shared (threadgroup) pointers must stay SHARED-typed: casting them to
 # AddressSpace.GENERIC is silently mis-compiled by Metal AIR (loads return 0,
-# stores go to device memory), so GPU kernels index shared LayoutTensors via
+# stores go to device memory), so GPU kernels index shared TileTensors via
 # SHARED-typed pointers only.
 # See docs/ai/metal_port_gotchas_and_optimizations.md G3.
 
@@ -1081,9 +1081,9 @@ def _attention_gpu_forward_query_tile_block[
     var reduction_shared = tile_stack_allocation[
         DType.float32, address_space=AddressSpace.SHARED
     ](row_major[BLOCK_SIZE]())
-    # Metal fix: pass the LayoutTensors directly to helper functions instead of
+    # Metal fix: pass the TileTensors directly to helper functions instead of
     # casting to GENERIC pointers. The old pattern corrupted threadgroup pointers
-    # on Metal AIR; using .ptr[i] on the LayoutTensor preserves AddressSpace.SHARED.
+    # on Metal AIR; using .ptr[i] on the TileTensor preserves AddressSpace.SHARED.
 
     # Load this CTA's query tile once; it is reused across every KV tile.
     _attention_copy_rows_dram_to_shared[dtype, BLOCK_SIZE](
@@ -1870,7 +1870,7 @@ def attention_fwd[
             # The compiled kernel comes from the cache pointer the GPT2 model
             # passes in: JIT-compiling (device_ctx.compile_function) per layer
             # call would pay host compiler overhead on every training step.
-            # Backward-pass scratch is stack-allocated (LayoutTensors) — heap
+            # Backward-pass scratch is stack-allocated (TileTensors) — heap
             # alloc()/free() inside the thread-block inner loops serializes
             # execution on the GPU.
             var addr_fwd = 0
