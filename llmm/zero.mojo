@@ -12,6 +12,7 @@ from max.gpu.host.info import is_cpu
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from llmm.vendor import has_nvidia_gpu_accelerator
 from llmm.memory import heap_alloc
+from std.runtime._asyncrt import _run
 
 
 # ===----------------------------------------------------------------------=== #
@@ -52,6 +53,11 @@ struct CpuBarrier:
     `CpuCoordinator.abort`). Every waiter then raises instead of spinning, so
     an N-rank failure surfaces as N errors and a non-zero exit rather than
     silence.
+
+    A waiting rank also pumps the AsyncRT run loop while it spins (see
+    `_pump_asyncrt_worker`): ranks are runtime tasks, and a spinning one can
+    otherwise strand a peer's wakeup on its own private task list -- a hang
+    with every rank present and nobody aborted.
     """
 
     var counter: Int
@@ -98,6 +104,7 @@ struct CpuBarrier:
             self.lock.unlock()
         else:
             self.lock.unlock()
+            var spins = 0
             while self.generation.load() == gen:
                 if self.aborted.load() != 0:
                     raise Error(
@@ -105,7 +112,86 @@ struct CpuBarrier:
                         " waiting. The originating failure was reported by"
                         " that rank; this error only means it never arrived."
                     )
+                # Pump on the FIRST iteration and periodically after: see
+                # `_pump_asyncrt_worker`. Pumping only once is not enough --
+                # the pump can itself run a task whose completion parks a
+                # peer's continuation on this worker again (measured: an
+                # entry-only pump still hangs 5/5).
+                if spins % _BARRIER_PUMP_PERIOD == 0:
+                    _pump_asyncrt_worker()
+                spins += 1
                 _ = external_call["sched_yield", Int32]()
+
+
+# How many spin iterations a waiting rank makes between AsyncRT pumps. Each
+# pump enqueues a no-op task and may wake an idle worker, so pumping every
+# iteration would turn every barrier wait into a wake storm; 32 sched_yields is
+# well under a millisecond on an idle box.
+comptime _BARRIER_PUMP_PERIOD = 32
+
+
+# Upper bound on no-op round trips per pump. Only reached when the no-op keeps
+# being picked up by some other worker -- or always, from a thread that is not
+# an AsyncRT worker (whose await never runs tasks itself).
+comptime _BARRIER_PUMP_MAX_TRIES = 8
+
+
+async def _asyncrt_thread_id() -> UInt:
+    return external_call["pthread_self", UInt]()
+
+
+def _pump_asyncrt_worker():
+    """Run this AsyncRT worker's parked tasks before spinning on.
+
+    WHY A BARRIER HAS TO DO THIS. Ranks are AsyncRT tasks, not OS threads:
+    `sync_parallelize` runs each rank on a runtime worker (in every hung
+    process captured, rank i sat on worker "Thread i"). AsyncRT assumes a
+    task never blocks, and `CpuBarrier.wait` blocks. That alone would be fine,
+    except for one runtime detail: when a worker completes an async value,
+    the value's waiters are queued on THAT worker's private local task list
+    (`AsyncValue::runWaiterLater` -> `addLocalTask`), which no other worker
+    can steal and which the owner only drains when it re-enters the runtime's
+    run loop. `ctx.synchronize()` returns as soon as its own value is ready,
+    leaving those waiters parked. So (the stacks show the outcome; the
+    exact op that does the parking is inferred from the runtime source):
+
+      rank A's synchronize runs the shared CPU stream's next op, which
+      completes rank B's work; B's wakeup is parked on A's local list; A's
+      synchronize returns; A spins here; B blocks in its synchronize forever
+      waiting for a wakeup only A can deliver; A waits for B forever.
+
+    That is the intermittent test_zero hang: one worker spinning in
+    `CpuBarrier.wait`, the other ranks parked in `AsyncRT_DeviceContext_
+    synchronize`, every other worker asleep. Load only changes who runs
+    which op, i.e. how often the parking happens to land on a spinner.
+
+    `_run` executes a tiny coroutine via the GLOBAL queue and awaits it. A
+    worker that awaits a not-yet-ready value donates itself to the run loop,
+    which drains its local list (then its affinity list -- where nested
+    `parallelize` items for this worker index wait) before anything else.
+    Completion is guaranteed: a global-queue task can always be run by the
+    awaiting worker itself.
+
+    One await is not proof of a drain, though. An idle worker can steal the
+    no-op and finish it before this thread reaches the await, which then
+    returns at once ("all values ready") without touching the local list.
+    The periodic re-pump would recover from that eventually, but it is cheaper
+    to know. (Not separately measured: stress runs with and without this
+    retry were both clean; see docs/ai/test_zero_hang.md.) So the
+    coroutine reports which thread ran it. If THIS thread ran it, the run loop
+    was entered and the local list drained first; otherwise retry, up to
+    `_BARRIER_PUMP_MAX_TRIES`. A non-worker thread never runs it and just
+    pays the bounded retries, which is harmless.
+
+    `std.runtime._asyncrt` is private API (the stdlib says async is unstable);
+    there is no public way to yield to the runtime. If it moves, the
+    regression test `test_barrier_does_not_strand_parked_asyncrt_work` in
+    tests/test_zero.mojo is what tells you.
+    """
+    var me = external_call["pthread_self", UInt]()
+    for _ in range(_BARRIER_PUMP_MAX_TRIES):
+        if _run(_asyncrt_thread_id()) == me:
+            return
 
 
 struct CpuCoordinator:
