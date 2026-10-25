@@ -1,5 +1,5 @@
 from extensibility import register
-from layout import Layout, TileTensor
+from layout import TileTensor
 from layout.tile_layout import row_major
 from layout.tile_tensor import stack_allocation as tile_stack_allocation
 
@@ -24,7 +24,6 @@ from extensibility import InputTensor
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceAttribute
-from layout.layout_tensor import LayoutTensor
 from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
     _MutableInputTensor as MutableInputTensor,
