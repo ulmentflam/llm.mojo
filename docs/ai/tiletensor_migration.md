@@ -182,7 +182,53 @@ Apple hardware.
 
 ## Benchmarks
 
-Pending: post-migration benchmark results will be added here by the benchmark pass (benchmark-gpu / profile step times, same-window interleaved against the 6aea140 baseline binaries).
+**Verdict: neutral within noise.** No dtype got slower or faster. Every
+migrated-to-baseline ratio is within 0.2% of 1.000, and the round-to-round
+spread of either binary is 0.2-0.9%. This fits the SASS-identity result in
+section 4.
+
+Measured 2026-10-25 on the GB10. Baseline is worktree `llm.mojo-base` at
+`6aea140` (binaries built 2026-10-22, newer than every `.mojo`/Makefile
+source). Migrated is `tiletensor-migration` at `e5f7cf8`, rebuilt with
+`make build build-bf16 build-fp8 build-fp4` just before the run. Both trees
+use the same `.pixi` env (Mojo 1.2.0 `2016d0cd`, identical `pixi.lock`).
+`make -n` confirmed that neither tree would rebuild during the run.
+
+**Method.** Each arm ran through its own tree's make target:
+`make -C <tree> train-gpt2-124m-<dtype> STEPS=40 ARGS="-v 1000 -s 1000 -m 1"`.
+That is GPT-2 124M checkpoint init on tinyshakespeare, B=4, T=1024, with
+40 steps per run. Runs were interleaved base, tt, base, tt for 7 rounds per
+dtype, in the order fp32, bf16, fp8, fp4. Only one GPU job ran at a time.
+The metric is the trainer's own per-step `ms` print, which is synchronized
+and excludes val/sampling. Steps 1-5 were dropped as warmup, and the median
+of steps 6-40 is taken per run. The table gives the median and the minimum
+of those 7 per-run medians, plus the fastest single step seen in any run.
+"Spread" is (max - min) / median of the per-run medians. `make benchmark-gpu`
+was not used. It times the `profile_gpt2*` harnesses against llm.c/PyTorch
+rather than comparing two trees' trainers, and it has no fp8/fp4 arms.
+
+**Load.** The vLLM tenant (`VLLM::EngineCore`, pid 27742, 65,121 MiB) was
+resident on the GPU throughout. `nvidia-smi` was checked before the run,
+after it, and before every run, and nothing else was using the GPU. That
+footprint slows tensor-core kernels, so these absolute numbers are not
+comparable to tenant-free figures elsewhere in `docs/ai/`. Only the
+same-window ratio is meaningful.
+
+| dtype | base median | tt median | ratio (median) | base min | tt min | ratio (min) | fastest step base / tt | spread base / tt | per-round ratio range |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fp32 | 282.41 | 282.38 | **0.9999** | 280.39 | 280.80 | 1.0015 | 277.83 / 278.21 | 0.9% / 0.8% | 0.994-1.005 |
+| bf16 | 137.80 | 138.03 | **1.0017** | 137.57 | 137.50 | 0.9995 | 134.68 / 135.48 | 0.8% / 0.6% | 0.993-1.004 |
+| fp8 | 153.42 | 153.34 | **0.9995** | 153.29 | 153.15 | 0.9991 | 151.40 / 150.99 | 0.2% / 0.2% | 0.999-1.001 |
+| fp4 | 158.03 | 157.89 | **0.9991** | 157.57 | 157.55 | 0.9999 | 155.20 / 155.50 | 0.4% / 0.5% | 0.998-1.002 |
+
+(ms/step; ratio = tt / base, so less than 1 means the migrated tree is faster.)
+
+**Numerics, as a side check.** The bf16, fp8 and fp4 loss traces were
+bit-identical across all 14 runs of each dtype: every round, and baseline
+vs migrated alike. fp32 is not run-to-run deterministic in *either* tree.
+Its step-40 loss ranges over 3.082057-3.082421 across the 7 baseline runs
+and over 3.081976-3.082446 across the 7 migrated runs. The two ranges
+overlap, so fp32 shows no migration effect either.
 
 ---
 

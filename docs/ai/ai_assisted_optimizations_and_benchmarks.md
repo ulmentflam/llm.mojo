@@ -4859,3 +4859,34 @@ gains with zero regression.
 ### AI use statement
 
 Written with AI assistance (Claude Code / Fable agent), directed by Evan Owen.
+
+---
+
+## 2026-10-25 — TileTensor migration A/B (branch `tiletensor-migration` `e5f7cf8` vs `6aea140`): neutral within noise
+
+The LayoutTensor to TileTensor migration was not meant to change performance.
+This A/B checks that it didn't. Full write-up:
+`docs/ai/tiletensor_migration.md` § Benchmarks.
+
+Each arm ran `make -C <tree> train-gpt2-124m-<dtype> STEPS=40 ARGS="-v 1000 -s 1000 -m 1"`
+(124M checkpoint init, tinyshakespeare, B=4, T=1024). The two trees
+alternated base/tt for 7 rounds per dtype, one GPU job at a time. Each
+run's metric is the median of steps 6-40. The table gives the median of
+the 7 per-run medians. The vLLM tenant (pid 27742, 65 GB) was resident the
+whole time, so the absolute ms are inflated against tenant-free entries
+above. Only the ratio counts.
+
+| dtype | baseline ms | migrated ms | tt / base | round-to-round spread |
+|---|---:|---:|---:|---:|
+| fp32 | 282.41 | 282.38 | 0.9999 | 0.8-0.9% |
+| bf16 | 137.80 | 138.03 | 1.0017 | 0.6-0.8% |
+| fp8 | 153.42 | 153.34 | 0.9995 | 0.2% |
+| fp4 | 158.03 | 157.89 | 0.9991 | 0.4-0.5% |
+
+**Verdict:** no regression and no speedup. Every ratio is within 0.2% of
+1.0, inside the spread. The bf16, fp8 and fp4 loss traces are bit-identical
+between the trees.
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Opus 5.5 agent), directed by Evan Owen.
