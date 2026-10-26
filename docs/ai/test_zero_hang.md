@@ -193,6 +193,12 @@ Caveat, written into the code: `std.runtime._asyncrt` is private API, and
 Mojo exposes no public way to yield to the runtime. If it moves, the
 regression test below is what catches it.
 
+**Superseded (2026-10-25):** the pump no longer uses `_asyncrt`. It now
+uses the public `DeviceContext.enqueue_cpu_function` + `synchronize`, and
+the regression test fails in about a minute instead of hanging. See
+"Follow-up: dropping the private `_asyncrt` dependency" below. The text above
+describes the fix as first committed (`dcbc3ea`).
+
 ## Regression test
 
 `tests/test_zero.mojo::test_barrier_does_not_strand_parked_asyncrt_work`
@@ -205,8 +211,10 @@ coordinator barriers) 500 times.
 - Fixed: 15 tests, 14 passed, 1 skipped (the multi-GPU test needs 3 or more
   GPUs). About 1.4 s.
 
-Like `test_rank_failure_aborts_peers_instead_of_hanging`, this test fails by
-hanging, so `make test-mojo` reports a regression as a per-file timeout.
+Like `test_rank_failure_aborts_peers_instead_of_hanging`, this test failed by
+hanging, so `make test-mojo` reported a regression as a per-file timeout
+(2700 s). Since the follow-up below it fails instead: its barriers carry a
+60 s timeout, and a regression shows up as a named test failure.
 
 ## What this does and does not explain
 
@@ -229,6 +237,138 @@ hanging, so `make test-mojo` reports a regression as a per-file timeout.
 - **The verify-cpu "lost worker partition" flake** (memory note
   `open-flakes-f7-verifycpu`) produces wrong values, not a hang. Nothing
   here explains it, and it stays open.
+
+## Follow-up: dropping the private `_asyncrt` dependency (2026-10-25)
+
+`dcbc3ea` pumped the runtime with `std.runtime._asyncrt._run`. That module
+is private. `std/runtime/__init__.mojo` says the async primitives are
+"deliberately not part of this package's public API", and the compiler
+warns on every build of `llmm/zero.mojo` that `async def` is "experimental
+and unstable ... do not expect correctness". The question was whether a
+public mechanism does the same job.
+
+### Options checked
+
+Sources read: the Modular checkout at `~/workspace/modular` (stdlib, MAX
+Mojo, `AsyncRT/`, `KGEN/lib/CompilerRT/AsyncRT.cpp`, `Support/`). The C++
+behind `DeviceContext` is not in that checkout, so its behaviour below is
+measured, not read.
+
+| Option | Public? | Verdict |
+|---|---|---|
+| A public task-yield primitive | none exists | `std.runtime` exports only `initialize_runtime` and `parallelism_level`. |
+| `std.utils.lock.SpinWaiter` / `BlockingSpinLock` | yes | **Rejected.** `SpinWaiter_Wait` calls `Support`'s `SpinWaiter::yieldToOS`, which is `std::this_thread::yield` and then `sleep_for`. It never enters the run loop, so it is the same hang as `sched_yield`. |
+| `sync_parallelize` / `parallelize` / `enqueue_cpu_range` as the pump | yes | **Rejected.** Range item *j* is pinned to worker *j*. In the probe, item 0 ran on rank 0's thread for all 4 ranks. A pump from worker *k* would then wait on whatever worker 0 is doing. A first draft built this way passed 4/4 sanity runs, but its liveness argument depends on worker 0 also pumping. |
+| **`DeviceContext.enqueue_cpu_function` + `synchronize`** on a private CPU context | yes (MAX `DeviceContext`) | **Chosen.** It schedules like `_run` (see the probe), and it is the same "schedule a task, wait on it from this worker" operation. |
+| A barrier built on runtime waits (the waiter awaits a value the last arriver completes) | no | It needs a host-completable async value. That exists only in private `_asyncrt` (`_Chain`, `_async_complete`, `TaskGroup`). MAX's public `AnyAsyncValueRef` has no create or emplace. |
+| Ranks on real OS threads | no | **Rejected as riskier.** Mojo's stdlib has no thread API, so this needs `pthread_create` through FFI with C-ABI trampolines. It would change both dispatchers in `train_gpt2.mojo` and every test, and `KGEN_CompilerRT_AsyncRT_Execute` dereferences `getCurrentCPUDeviceOrNull()` with no null check. That pointer is null on a thread the runtime does not own, so any coroutine path started from a rank thread could crash. |
+
+### The probe
+
+`probe.mojo` in the scratch dir runs inside 4 `sync_parallelize` ranks on an
+otherwise loaded box (load average about 48). Each rank does 2,000 round
+trips per mechanism and records which thread ran the no-op.
+
+| Mechanism | Ran on the calling thread | µs per round trip |
+|---|---|---|
+| `_run(async no-op)` (the `dcbc3ea` pump) | 0-21 / 2000 per rank (two runs) | 1-12 |
+| `enqueue_cpu_function` + `synchronize` | 0-12 / 2000 | 1-8 |
+| `enqueue_cpu_range(count=1)` + `synchronize` | rank 0: 2000/2000, ranks 1-3: 0/2000 | 4-28 (33-52 with a fresh context per trip) |
+| `DeviceContext(api="cpu")` creation alone | n/a | 3-17 |
+
+**This corrects the earlier writeup.** The thread-identity retry almost
+never succeeds, for `_run` or for the replacement: the no-op runs on the
+calling thread about 0.5% of the time. In practice every pump makes all 8
+round trips. The retry costs only microseconds and is kept, but "retry
+until it ran here" describes the code's intent, not what it achieves. The
+mechanism still rests on the drain that happens whenever this worker's
+wait finds the value not yet ready.
+
+### What changed
+
+- `_pump_asyncrt_worker(pump_ctx)` calls `pump_ctx.enqueue_cpu_function(no-op
+  that records pthread_self)` and then `pump_ctx.synchronize()`. The
+  identity retry, the 32-spin period and the 8-try cap are unchanged.
+  `CpuBarrier.wait` creates the CPU context lazily, once per wait that
+  actually spins. A private context means the no-op never queues behind
+  another stream's work.
+- `CpuBarrier(num_threads, timeout_ns=0)` and
+  `CpuCoordinator(num_threads, barrier_timeout_ns=0)`. With a nonzero
+  timeout, a wait that outlives it raises an error that names this doc.
+  Production keeps 0, so it waits forever. A legitimate wait (a peer
+  writing a checkpoint, or running eval) has no bound, and a false timeout
+  in a training run would be worse than the hang.
+- `test_barrier_does_not_strand_parked_asyncrt_work` uses a 60 s barrier
+  timeout and a failure flag. If a rank raises, the test raises.
+
+### What is still not public
+
+Swapping the API does not make the **behaviour** public. Both versions rely
+on this: a worker waiting on a not-yet-ready value re-enters the run loop and
+drains its local task list first. Nothing documents that for
+`DeviceContext.synchronize`. A Mojo or MAX upgrade could change it and still
+compile, and the barrier would hang again. That is why the guard below is
+there. If `enqueue_cpu_function` itself is renamed or removed, the build
+fails, which is loud already.
+
+### Guard: fail loudly instead of hanging
+
+With the 60 s timeout, a broken pump plays out like this. The stranded
+rank's peer raises out of the barrier. That rank's task returns, its worker
+goes back to the run loop and delivers the parked wakeup, the sleeping rank
+sees the abort flag, and every rank exits. The test then fails, about 61 s
+in, with:
+
+```
+rank 3 error: CpuBarrier: timed out after 60s with every rank accounted for
+  but the cohort incomplete. If peers are parked in DeviceContext.synchronize(),
+  the AsyncRT pump in CpuBarrier.wait no longer drains parked work -- likely a
+  Mojo/MAX runtime change; see docs/ai/test_zero_hang.md.
+FAIL test_barrier_does_not_strand_parked_asyncrt_work
+Summary: 15 tests run: 13 passed, 1 failed, 1 skipped
+```
+
+Before this change the same regression held `make test-mojo` until the
+2700 s per-file timeout.
+
+A compile-time guard was considered and rejected. Mojo has no compile-time
+version query, and the failure that matters (the behaviour changing) cannot
+be checked at compile time anyway. A startup self-test cannot reliably
+produce "a waiter parked on this worker's local list" on demand. The looped
+test can.
+
+### Validation
+
+All binaries were built with the `make test-mojo` flags (`mojo build -I .
+-Xlinker -lm`). Every binary was rebuilt after its last source edit (mtime
+checked). The "no pump" builds are the current code with the
+`_pump_asyncrt_worker(...)` call replaced by `pass`.
+
+| Binary | Load | Runs | Result |
+|---|---|---|---|
+| no pump, `dcbc3ea`-era test (no timeout) | loaded box, 2 concurrent | 4 | **4 hung** in the regression test (20 s no-output cap), at iterations 0, 0, 150 and 375 |
+| no pump, new test (60 s timeout) | 2 concurrent | 4 | **4 failed** at about 61.6 s with the message above (13 passed, 1 failed, 1 skipped). None hung. |
+| public pump, traced test_zero | 6 concurrent + 24 burners, unpinned, on a box already at load 48-92 from other agents | 300 | **300 ok, 0 hangs, 0 failures**. Median 16.4 s, max 35.7 s. |
+| public pump, traced test_zero | `taskset -c 0-5`, 3 concurrent + 8 burners | 120 | **120 ok, 0 hangs, 0 failures**. Median 10.6 s, max 18.1 s. |
+| public pump, plain `tests/test_zero.mojo` | loaded | 3 | 15 tests: 14 passed, 1 skipped |
+| no pump, `tests/test_encoder_row_sparse.mojo` | loaded | 3 | **3 hung** (60 s cap) |
+| public pump, `tests/test_encoder_row_sparse.mojo` | loaded (during the 300-run stress) | 100 | 100 passed, median 0.59 s, max 1.04 s |
+| public pump, `tests/test_zero_equivalence.mojo` (real multi-rank CPU GPT-2 ZeRO stages 1-3, w2 and w8) | loaded | 21 | 21 passed |
+| `make build-train build-bf16` | | 1 | both built. The bf16 build compiles the barrier's `DeviceContext(api="cpu")` without the AArch64 crash (memory note `bf16-build-needs-gpu-only-dispatch`). |
+
+The stress harness (`zero_pub/stress.py` in the scratch dir) counts a run as
+hung only when its output stops for 120 s (180 s for the pinned run). The
+traced test prints a flushed line every 25 loop iterations and at every test
+start. Progress, not a wall-clock cap, is the hang signal, per the lesson
+above. Burners are the harness's own child processes, so no `pkill` pattern
+is involved.
+
+Cost: the old (`_run`) and new plain `test_zero` binaries were run 10 times
+each, interleaved, while other agents' jobs kept load between 40 and 70. The
+first five pairs were dominated by that load: old 6.9-16.6 s, new 10.0-25.2
+s. The last five pairs ran in a calmer window: old 3.19-3.75 s, new
+3.39-3.76 s. Within this noise the two cannot be told apart. That fits the
+probe, where the per-round-trip costs overlap.
 
 ## AI use statement
 
