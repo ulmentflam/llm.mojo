@@ -96,6 +96,7 @@ from llmm.memory import (
     as_mut_kernel,
     rebind_mut_mem,
     heap_alloc,
+    stall_cpu_queue,
 )
 from llmm.zero import ZeroContext, CpuCoordinator
 from llmm.vendor import HAS_METAL
@@ -1335,6 +1336,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var has_allocated_grads: Bool
     var has_allocated_optimizer_moments: Bool
 
+    # Test-only fault injection (CPU target): when True, the CPU queue is
+    # stalled in front of each async write that a synchronous host kernel
+    # later reads, so a missing ctx.synchronize() loses its race every time
+    # instead of ~1 in thousands. Always False outside tests. See
+    # llmm.memory.stall_cpu_queue and tests/test_cpu_queue_ordering.mojo.
+    var debug_stall_cpu_queue: Bool
+
     # Cache management
     var kv_cache: KVCache
 
@@ -1385,6 +1393,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.has_allocated_acts = False
         self.has_allocated_grads = False
         self.has_allocated_optimizer_moments = False
+        self.debug_stall_cpu_queue = False
         self.kv_cache = KVCache()
         self.zero_ctx = ZeroContext[Self.target, Self.WORLD_SIZE](
             rank, zero_stage, ctx, cpu_coordinator_ptr
@@ -3754,6 +3763,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             for i in range(batch_size * seq_len):
                 self.losses_host_buf[i] = dloss_mean
+            comptime if is_cpu[Self.target]():
+                if self.debug_stall_cpu_queue:
+                    stall_cpu_queue(self.ctx)
             self.ctx.enqueue_copy(
                 dst_ptr=rebind[Pointer[Scalar[StatsDType], MutAnyOrigin]](
                     self.grad_acts.losses.as_unsafe_any_origin()
@@ -3852,6 +3864,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # gradients accumulate across micro-steps, so they are only zeroed on the
         # first micro-step (zero_param_grads=False on later micro-steps lets the
         # backward kernels keep `+=`-accumulating into them).
+        comptime if is_cpu[Self.target]():
+            if self.debug_stall_cpu_queue:
+                stall_cpu_queue(self.ctx)
         if zero_param_grads and self.has_allocated_grads:
             if self._use_bucketing():
                 # No monolithic gradient buffer exists under bucketing: zero the

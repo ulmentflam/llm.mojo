@@ -2,6 +2,7 @@ from std.ffi import _get_global_or_null, external_call
 from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.memory.alloc import unsafe_alloc
+from std.time import perf_counter_ns
 
 
 # ===----------------------------------------------------------------------=== #
@@ -121,3 +122,48 @@ def persistent_device_buffer[
         StringSlice(name), hp.unsafe_bitcast[NoneType]()
     )
     return rebind[MutKernelPtr[dtype]](hp[].unsafe_ptr())
+
+
+# ===----------------------------------------------------------------------=== #
+# CPU queue-ordering fault injection
+# ===----------------------------------------------------------------------=== #
+
+
+# How long stall_cpu_queue holds the queue. Long enough that no plausible
+# scheduling noise lets a held-back write land first; short enough that a test
+# doing a few stalled steps stays well under a second.
+comptime CPU_QUEUE_STALL_NS = 50_000_000
+
+
+def stall_cpu_queue(ctx: DeviceContext) raises:
+    """Enqueue a CPU_QUEUE_STALL_NS busy-wait on `ctx`'s CPU queue and return
+    at once.
+
+    Test-only fault injection for one hazard class. On the CPU target an
+    `enqueue_copy` / `enqueue_fill` / `enqueue_memset` goes onto the context's
+    queue and runs later on an AsyncRT worker. The llmm CPU kernels, however,
+    run synchronously on the host via `traced_parallelize` (a fresh CPU
+    context per call), so nothing orders them after that queue. Each such
+    async write needs a `ctx.synchronize()` before a host kernel reads its
+    buffer. If one is missing, the write and the read race. On an idle box
+    the write usually wins, so the bug is a rare flake
+    (docs/ai/verify_cpu_wrong_values_flake.md).
+
+    Putting this stall in front of an async write holds that write back. The
+    queue runs in order, so the write cannot land before the stall ends. A
+    missing barrier then loses every time, while a present `synchronize()`
+    just waits the stall out.
+
+    The duration is a comptime constant and the closure captures nothing, on
+    purpose. `enqueue_cpu_range` keeps a reference to `func` for a task that
+    runs after this function has returned. A closure with captured state
+    would read it from a dead stack frame. The first version captured a
+    runtime `stall_ns`, read garbage, and spun forever.
+    """
+
+    def _spin(i: Int) {}:
+        var t0 = perf_counter_ns()
+        while Int(perf_counter_ns() - t0) < CPU_QUEUE_STALL_NS:
+            pass
+
+    ctx.enqueue_cpu_range(_spin, count=1)
