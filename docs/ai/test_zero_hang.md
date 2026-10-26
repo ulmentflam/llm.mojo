@@ -228,7 +228,8 @@ hanging, so `make test-mojo` reports a regression as a per-file timeout.
   that list it as ungated carry an update note.
 - **The verify-cpu "lost worker partition" flake** (memory note
   `open-flakes-f7-verifycpu`) produces wrong values, not a hang. Nothing
-  here explains it, and it stays open.
+  here explains it. **Update:** it was the dL/dloss seed race, already
+  fixed by `25fff32`. See `docs/ai/verify_cpu_wrong_values_flake.md`.
 
 ## AI use statement
 

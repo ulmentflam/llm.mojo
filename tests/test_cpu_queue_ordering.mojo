@@ -89,9 +89,9 @@ def _run_two_steps(
     That is the barrier this test is known to guard. With it removed, the
     stalled run fails on 3107 of 9184 elements (dlogits all zero). Each step
     also stalls in front of zero_gradients' async fill. Removing that
-    barrier alone does NOT fail here: the first backward kernel
-    (matmul_d_weight_bwd on CPU) calls ctx.synchronize() before it reads
-    anything, which orders the fill too. That stall covers the case where
+    barrier alone does NOT fail here (measured). The backward's CPU GEMMs
+    run through linalg.matmul(ctx=ctx), which enqueues on the same in-order
+    queue and synchronizes it, and that orders the fill too. That stall covers the case where
     the backward's leading kernel stops synchronizing. It is not proof that
     zero_gradients' own barrier is needed.
     """
