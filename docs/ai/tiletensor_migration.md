@@ -163,8 +163,10 @@ builds all 23 files and passes (141 tests, 140 passed, 1 skipped), and pytest
 on the Metal GPU (`MAX_USE_ACCELERATOR=1`) passes (263 passed, 5 skipped,
 3 xfailed). The hadamard, SR, amax, NVFP4-quant, dbias and attention
 shape-change tests run on Metal. bf16 generation sampled normally on Metal by
-hand; the bf16 generation smoke tests still skip there (no `log124M`
-checkpoint on that machine).
+hand, and after the `log124M/model_19552.bin` checkpoint was copied over
+(SHA-256 verified) all 6 generation smoke tests pass on Metal at `12a180a`,
+bf16 and fp32, including the HF-reference check, with a coherent 64-token
+sample.
 
 ### Functional gates (all on the GB10)
 
@@ -181,9 +183,9 @@ checkpoint on that machine).
 
 - ~~`test_zero` hangs intermittently~~ Fixed: a barrier/runtime-scheduling
   deadlock, not part of the migration (`docs/ai/test_zero_hang.md`).
-- Metal on hardware: now run by a Mac session (see the Metal section above).
-  Still open: the bf16 generation smoke tests there need the `log124M`
-  checkpoint copied over.
+- ~~Metal on hardware~~ Done: run by a Mac session, full suite and generation
+  smoke tests pass (see the Metal section above). Not run on Metal: the
+  flash-attention path, which is unused (`USE_FLASH_FWD` is off).
 - The SASS-identity results in section 4 were taken at `6325a36`. Later
   commits changed host-side code in `attention.mojo` and `train_gpt2.mojo`
   (shape-change zeroing, sampling); they are not expected to change any kernel,
