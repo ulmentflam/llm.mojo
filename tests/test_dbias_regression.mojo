@@ -70,13 +70,16 @@
 # assertion (1) below cannot be the only check: a test that looked solely for
 # zeros would have passed this run while the kernel returned 3.7e19.
 #
-# GPU-only; guarded by `has_nvidia_gpu_accelerator()` and expected to run under
+# GPU-only; guarded by `has_gpu_accelerator()` (NVIDIA or Apple) and expected to run under
 # the shared-GPU flock like the rest of the GPU suites.
 # ===----------------------------------------------------------------------=== #
 
 from std.math import sqrt
 from std.random import random_float64, seed
-from llmm.vendor import has_nvidia_gpu_accelerator
+from llmm.vendor import (
+    has_nvidia_gpu_accelerator,
+    has_apple_gpu_accelerator,
+)
 from max.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_true
 
@@ -97,6 +100,10 @@ comptime PROD_ROWS = 4096
 comptime REPEATS = 8
 
 
+def has_gpu_accelerator() -> Bool:
+    return has_nvidia_gpu_accelerator() or has_apple_gpu_accelerator()
+
+
 def _fill_random(
     ptr: Pointer[Scalar[DT], MutUntrackedOrigin],
     numel: Int,
@@ -115,7 +122,7 @@ def _run_dbias_case(label: String, rows: Int, out_channels: Int) raises -> None:
     under test, so "GPU agrees with reference" cannot be satisfied by both sides
     being broken — which is precisely how the previous relative check failed.
     """
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_dbias_regression.mojo::_run_dbias_case: needs an"
             " NVIDIA GPU"

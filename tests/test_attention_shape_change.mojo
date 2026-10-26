@@ -23,7 +23,10 @@ Run: `make test-mojo` (GPU required; skips cleanly without an NVIDIA GPU).
 from std.math import exp, sin, sqrt
 from std.testing import assert_true, TestSuite
 
-from llmm.vendor import has_nvidia_gpu_accelerator
+from llmm.vendor import (
+    has_nvidia_gpu_accelerator,
+    has_apple_gpu_accelerator,
+)
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
 from llmm.attention import attention_fwd, KVCache, KVCachePtr
 from _gpu_test_common import shared_gpu_ctx
@@ -32,6 +35,10 @@ comptime NH = 12
 comptime HD = 64
 comptime T_MAX = 64
 comptime NUM_LAYERS = 2
+
+
+def has_gpu_accelerator() -> Bool:
+    return has_nvidia_gpu_accelerator() or has_apple_gpu_accelerator()
 
 
 def _val(which: Int, h: Int, t: Int, d: Int) -> Float64:
@@ -195,40 +202,40 @@ def _run_sequence[dtype: DType](store_p: Bool, atol: Float64) raises:
 
 
 def test_store_p_fp32() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_attention_shape_change.mojo::test_store_p_fp32:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     _run_sequence[DType.float32](True, 1e-2)
 
 
 def test_scratch_fp32() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_attention_shape_change.mojo::test_scratch_fp32:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     _run_sequence[DType.float32](False, 1e-2)
 
 
 def test_store_p_bf16() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_attention_shape_change.mojo::test_store_p_bf16:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     _run_sequence[DType.bfloat16](True, 3e-2)
 
 
 def test_scratch_bf16() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_attention_shape_change.mojo::test_scratch_bf16:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     _run_sequence[DType.bfloat16](False, 3e-2)
