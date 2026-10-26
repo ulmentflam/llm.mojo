@@ -7,7 +7,10 @@ swizzle tests below need no device at all).
 """
 
 from std.math import sqrt
-from llmm.vendor import has_nvidia_gpu_accelerator
+from llmm.vendor import (
+    has_nvidia_gpu_accelerator,
+    has_apple_gpu_accelerator,
+)
 from std.testing import assert_equal, assert_true, TestSuite
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
@@ -36,6 +39,10 @@ from llmm.nvfp4_quant import (
 # ===----------------------------------------------------------------------=== #
 # e2m1 codec (host-only, no GPU)
 # ===----------------------------------------------------------------------=== #
+
+
+def has_gpu_accelerator() -> Bool:
+    return has_nvidia_gpu_accelerator() or has_apple_gpu_accelerator()
 
 
 def test_e2m1_grid_points_roundtrip() raises:
@@ -330,10 +337,10 @@ def _quantize_roundtrip_case[
 
 
 def test_quantize_1d_roundtrip_gaussian_gpu() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_nvfp4_quant.mojo::test_quantize_1d_roundtrip_gaussian_gpu:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     var rel_l2 = _quantize_roundtrip_case[1](
@@ -343,10 +350,10 @@ def test_quantize_1d_roundtrip_gaussian_gpu() raises:
 
 
 def test_quantize_2d_roundtrip_gaussian_gpu() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_nvfp4_quant.mojo::test_quantize_2d_roundtrip_gaussian_gpu:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     var rel_l2 = _quantize_roundtrip_case[16](
@@ -504,10 +511,10 @@ def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
     # BLOCK_ROWS=1 (1D 1x16 blocks -- activations/gradients). See
     # `_transpose_matches_materialized_case`'s docstring for the check
     # itself.
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_nvfp4_quant.mojo::test_quantize_transpose_matches_materialized_transpose_gpu:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     _transpose_matches_materialized_case[1](32, 48, UInt32(777))
@@ -548,20 +555,20 @@ def test_quantize_transpose_matches_materialized_transpose_block16_gpu() raises:
     #      BLOCK_ROWS=1-only coverage did not.
     #   3. llmm/nvfp4_quant.mojo restored; `git diff --stat llmm/` empty
     #      afterward.
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_nvfp4_quant.mojo::test_quantize_transpose_matches_materialized_transpose_block16_gpu:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     _transpose_matches_materialized_case[16](32, 48, UInt32(778))
 
 
 def test_quantize_all_zero_tensor_gpu() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_nvfp4_quant.mojo::test_quantize_all_zero_tensor_gpu:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     var ctx = shared_gpu_ctx()
@@ -618,10 +625,10 @@ def test_quantize_all_zero_tensor_gpu() raises:
 
 
 def test_quantize_large_outlier_no_overflow_gpu() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_nvfp4_quant.mojo::test_quantize_large_outlier_no_overflow_gpu:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     var ctx = shared_gpu_ctx()

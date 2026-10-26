@@ -32,7 +32,10 @@
 
 from std.memory import bitcast
 from std.math import isnan, nan, inf, ceildiv
-from llmm.vendor import has_nvidia_gpu_accelerator
+from llmm.vendor import (
+    has_nvidia_gpu_accelerator,
+    has_apple_gpu_accelerator,
+)
 from std.testing import TestSuite, assert_true, assert_equal
 
 from llmm.rng_device import (
@@ -56,6 +59,10 @@ from _gpu_test_common import shared_gpu_ctx
 
 
 @always_inline
+def has_gpu_accelerator() -> Bool:
+    return has_nvidia_gpu_accelerator() or has_apple_gpu_accelerator()
+
+
 def _bf16_bits(x: Scalar[DType.bfloat16]) -> UInt16:
     return bitcast[DType.uint16](x)
 
@@ -339,10 +346,10 @@ def test_sr_cast_bf16_unbiased() raises:
 
 
 def test_rng_u32_device_matches_host() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_rng_sr.mojo::test_rng_u32_device_matches_host:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
 
@@ -377,10 +384,10 @@ def test_rng_u32_device_matches_host() raises:
 
 
 def test_sr_cast_device_matches_host_and_is_deterministic() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_rng_sr.mojo::test_sr_cast_device_matches_host_and_is_deterministic:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
 

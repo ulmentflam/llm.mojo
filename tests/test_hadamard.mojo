@@ -4,7 +4,10 @@ Run: `pixi run mojo run -I . tests/test_hadamard.mojo` (all tests here need
 the GPU -- flock per project policy).
 """
 
-from llmm.vendor import has_nvidia_gpu_accelerator
+from llmm.vendor import (
+    has_nvidia_gpu_accelerator,
+    has_apple_gpu_accelerator,
+)
 from std.testing import (
     assert_equal,
     assert_true,
@@ -26,6 +29,10 @@ from _gpu_test_common import shared_gpu_ctx
 # ===----------------------------------------------------------------------=== #
 # Sign vector sanity (host-only, no GPU)
 # ===----------------------------------------------------------------------=== #
+
+
+def has_gpu_accelerator() -> Bool:
+    return has_nvidia_gpu_accelerator() or has_apple_gpu_accelerator()
 
 
 def test_sign_vector_is_plus_minus_one() raises:
@@ -67,10 +74,10 @@ def test_sign_vector_matches_reference() raises:
 
 
 def test_hadamard_known_vector_gpu() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_hadamard.mojo::test_hadamard_known_vector_gpu:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     var ctx = shared_gpu_ctx()
@@ -175,10 +182,10 @@ def test_hadamard_known_vector_gpu() raises:
 
 
 def test_hadamard_orthogonality_random_gpu() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_hadamard.mojo::test_hadamard_orthogonality_random_gpu:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     var ctx = shared_gpu_ctx()
@@ -261,10 +268,10 @@ def test_hadamard_multi_row_grid_indexing_gpu() raises:
     # Regression test for the flattened (row, k-block) grid index math: use
     # a row count that is not a multiple of the block-per-launch tiling to
     # make sure every row is touched exactly once.
-    if not has_nvidia_gpu_accelerator():
+    if not has_gpu_accelerator():
         print(
             "SKIP tests/test_hadamard.mojo::test_hadamard_multi_row_grid_indexing_gpu:"
-            " needs an NVIDIA GPU"
+            " needs a GPU (NVIDIA or Apple)"
         )
         return
     var ctx = shared_gpu_ctx()
