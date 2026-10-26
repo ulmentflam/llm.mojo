@@ -116,6 +116,10 @@ def _run_dbias_case(label: String, rows: Int, out_channels: Int) raises -> None:
     being broken — which is precisely how the previous relative check failed.
     """
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_dbias_regression.mojo::_run_dbias_case: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
 

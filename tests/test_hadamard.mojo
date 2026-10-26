@@ -68,6 +68,10 @@ def test_sign_vector_matches_reference() raises:
 
 def test_hadamard_known_vector_gpu() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_hadamard.mojo::test_hadamard_known_vector_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = shared_gpu_ctx()
     var rows = 1
@@ -172,6 +176,10 @@ def test_hadamard_known_vector_gpu() raises:
 
 def test_hadamard_orthogonality_random_gpu() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_hadamard.mojo::test_hadamard_orthogonality_random_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = shared_gpu_ctx()
     var rows = 5
@@ -254,6 +262,10 @@ def test_hadamard_multi_row_grid_indexing_gpu() raises:
     # a row count that is not a multiple of the block-per-launch tiling to
     # make sure every row is touched exactly once.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_hadamard.mojo::test_hadamard_multi_row_grid_indexing_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = shared_gpu_ctx()
     var rows = 13

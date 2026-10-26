@@ -340,6 +340,10 @@ def test_sr_cast_bf16_unbiased() raises:
 
 def test_rng_u32_device_matches_host() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_rng_sr.mojo::test_rng_u32_device_matches_host:"
+            " needs an NVIDIA GPU"
+        )
         return
 
     var ctx = shared_gpu_ctx()
@@ -374,6 +378,10 @@ def test_rng_u32_device_matches_host() raises:
 
 def test_sr_cast_device_matches_host_and_is_deterministic() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_rng_sr.mojo::test_sr_cast_device_matches_host_and_is_deterministic:"
+            " needs an NVIDIA GPU"
+        )
         return
 
     var ctx = shared_gpu_ctx()

@@ -86,6 +86,10 @@ def _run_bwd_site_case(
     use_gelu: Bool,
 ) raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_matmul_bwd_fp4.mojo::_run_bwd_site_case: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime DT = DType.bfloat16
@@ -385,6 +389,10 @@ def test_proj_bwd_site() raises:
 
 def test_fp4_gemm_accumulate() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_matmul_bwd_fp4.mojo::test_fp4_gemm_accumulate:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime DT = DType.bfloat16

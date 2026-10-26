@@ -50,6 +50,10 @@ def _run_site_case(
     use_gelu: Bool,
 ) raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_matmul_fwd_fp4.mojo::_run_site_case: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime DT = DType.bfloat16

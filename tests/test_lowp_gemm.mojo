@@ -202,6 +202,10 @@ def test_encode_near_max_no_nan_pattern() raises:
 
 def test_quantize_kernel_matches_manual_encode() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_gemm.mojo::test_quantize_kernel_matches_manual_encode:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime N = 4096
@@ -279,6 +283,10 @@ def test_quantize_kernel_amax_zero() raises:
     # scale from amax is the caller's job, not tested here), quantize must
     # produce all-zero fp8 bytes and no NaN/Inf.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_gemm.mojo::test_quantize_kernel_amax_zero:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime N = 256
@@ -316,6 +324,10 @@ def test_quantize_kernel_amax_zero() raises:
 
 def test_quantize_transpose_matches_manual() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_gemm.mojo::test_quantize_transpose_matches_manual:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime ROWS = 37
@@ -388,6 +400,10 @@ def _run_lowp_gemm_case[
     min_cosine: Float32 = Float32(0.999),
 ) raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_gemm.mojo::test_quantize_transpose_matches_manual:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime IN_DT = DType.bfloat16

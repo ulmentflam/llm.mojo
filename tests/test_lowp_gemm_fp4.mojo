@@ -104,6 +104,10 @@ def _run_fp4_gemm_case[
     max_bf16_rel_l2: Float64 = 0.02,
 ) raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_gemm_fp4.mojo::_assert_finite: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime IN_DT = DType.bfloat16
@@ -353,6 +357,10 @@ def test_fp4_rht_quantize_gemm_contract() raises:
     # the transform composes correctly with the quantize/GEMM pipeline
     # rather than merely round-tripping in isolation.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_gemm_fp4.mojo::test_fp4_rht_quantize_gemm_contract:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime IN_DT = DType.bfloat16
@@ -563,6 +571,10 @@ def test_sr_e2m1_bracket_and_unbiasedness() raises:
 
 def test_sr_nvfp4_quantize_deterministic_under_fixed_seed() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_gemm_fp4.mojo::test_sr_nvfp4_quantize_deterministic_under_fixed_seed:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime IN_DT = DType.bfloat16

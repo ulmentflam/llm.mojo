@@ -99,6 +99,10 @@ def _prime_state[
 
 def _run_d_input_bwd_case(use_gelu_case: Bool) raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_bwd.mojo::_run_d_input_bwd_case: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime ROWS = 128
@@ -261,6 +265,10 @@ def test_matmul_d_input_bwd_lowp_gelu() raises:
 
 def _run_d_weight_bwd_case(accumulate_case: Bool) raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_bwd.mojo::_run_d_weight_bwd_case: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime ROWS = 128
@@ -414,6 +422,10 @@ def test_matmul_d_weight_bwd_lowp_accum() raises:
 
 def test_matmul_bwd_lowp_end_to_end() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_bwd.mojo::test_matmul_bwd_lowp_end_to_end:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime ROWS = 128
@@ -609,6 +621,10 @@ def test_doutput_amax_steady_state_ignores_current_spike_gpu() raises:
       3. llmm/matmul.mojo restored; `git diff --stat llmm/` empty afterward.
     """
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_lowp_bwd.mojo::test_doutput_amax_steady_state_ignores_current_spike_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime ROWS = 32

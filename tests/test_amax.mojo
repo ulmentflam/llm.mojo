@@ -144,6 +144,10 @@ def test_format_max_e2m1_seam() raises:
 
 def test_compute_amax_bf16_basic() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_compute_amax_bf16_basic: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var values = List[Float32]()
@@ -159,6 +163,10 @@ def test_compute_amax_bf16_basic() raises:
 
 def test_compute_amax_fp32_basic() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_compute_amax_fp32_basic: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var values = List[Float32]()
@@ -183,6 +191,10 @@ def test_compute_amax_large_tensor() raises:
     # single-block toy size) so the two-kernel partial/aggregate structure is
     # actually tested, not just its degenerate 1-block case.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_compute_amax_large_tensor: needs"
+            " an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     comptime n = 200_000
@@ -211,6 +223,10 @@ def test_compute_amax_large_tensor() raises:
 
 def test_compute_amax_all_zero() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_compute_amax_all_zero: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var values = List[Float32]()
@@ -225,6 +241,10 @@ def test_compute_amax_all_zero() raises:
 
 def test_compute_amax_nan_detection() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_compute_amax_nan_detection: needs"
+            " an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var values = List[Float32]()
@@ -237,6 +257,10 @@ def test_compute_amax_nan_detection() raises:
 
 def test_compute_amax_inf_detection() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_compute_amax_inf_detection: needs"
+            " an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var values = List[Float32]()
@@ -249,6 +273,10 @@ def test_compute_amax_inf_detection() raises:
 
 def test_compute_amax_determinism() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_compute_amax_determinism: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var values = List[Float32]()
@@ -269,6 +297,10 @@ def test_update_scale_warmup_uses_current_amax() raises:
     # `amax_history_len` calls), scale is derived from *this* call's amax,
     # not history — even when history would suggest something different.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_warmup_uses_current_amax:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var state = AmaxState[_H4_SPEC](ctx)
@@ -298,6 +330,10 @@ def test_update_scale_steady_state_uses_history_max() raises:
     # After warmup (H=4), the scale must come from max(history), *not* the
     # just-pushed current-step amax — this is what makes it "delayed".
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_steady_state_uses_history_max:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var state = AmaxState[_H4_SPEC](ctx)
@@ -333,6 +369,10 @@ def test_update_scale_steady_state_uses_history_max() raises:
 def test_update_scale_margin() raises:
     # scale = fmt_max / (amax / 2^margin) = fmt_max * 2^margin / amax.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_margin: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var state = AmaxState[_MARGIN1_SPEC](ctx)
@@ -349,6 +389,10 @@ def test_update_scale_margin() raises:
 
 def test_update_scale_e5m2_format_max() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_e5m2_format_max:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var state = AmaxState[_H4_SPEC](ctx)
@@ -365,6 +409,10 @@ def test_update_scale_e5m2_format_max() raises:
 
 def test_update_scale_all_zero_amax_no_div_by_zero() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_all_zero_amax_no_div_by_zero:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var state = AmaxState[_H4_SPEC](ctx)
@@ -383,6 +431,10 @@ def test_update_scale_all_zero_amax_no_div_by_zero() raises:
 
 def test_update_scale_nan_amax_no_nan_scale() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_nan_amax_no_nan_scale:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var state = AmaxState[_H4_SPEC](ctx)
@@ -399,6 +451,10 @@ def test_update_scale_nan_amax_no_nan_scale() raises:
 
 def test_update_scale_inf_amax_no_inf_scale() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_inf_amax_no_inf_scale:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var state = AmaxState[_H4_SPEC](ctx)
@@ -417,6 +473,10 @@ def test_update_scale_ring_buffer_wraps() raises:
     # H = 4. After 8 calls (2 full wraps), the history must hold only the
     # last 4 pushed values -- an early spike must have rotated out.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_ring_buffer_wraps:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
     var state = AmaxState[_H4_SPEC](ctx)
@@ -473,6 +533,10 @@ def _run_update_scale_sequence(
 
 def test_update_scale_determinism() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_determinism: needs an"
+            " NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
 
@@ -490,6 +554,10 @@ def test_update_scale_pair_matches_two_separate_calls() raises:
     # bit-identical to calling update_scale on each state separately,
     # across a multi-step warmup+steady-state sequence.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_amax.mojo::test_update_scale_pair_matches_two_separate_calls:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = DeviceContext()
 

@@ -196,24 +196,40 @@ def _run_sequence[dtype: DType](store_p: Bool, atol: Float64) raises:
 
 def test_store_p_fp32() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_attention_shape_change.mojo::test_store_p_fp32:"
+            " needs an NVIDIA GPU"
+        )
         return
     _run_sequence[DType.float32](True, 1e-2)
 
 
 def test_scratch_fp32() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_attention_shape_change.mojo::test_scratch_fp32:"
+            " needs an NVIDIA GPU"
+        )
         return
     _run_sequence[DType.float32](False, 1e-2)
 
 
 def test_store_p_bf16() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_attention_shape_change.mojo::test_store_p_bf16:"
+            " needs an NVIDIA GPU"
+        )
         return
     _run_sequence[DType.bfloat16](True, 3e-2)
 
 
 def test_scratch_bf16() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_attention_shape_change.mojo::test_scratch_bf16:"
+            " needs an NVIDIA GPU"
+        )
         return
     _run_sequence[DType.bfloat16](False, 3e-2)
 

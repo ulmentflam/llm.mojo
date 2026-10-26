@@ -331,6 +331,10 @@ def _quantize_roundtrip_case[
 
 def test_quantize_1d_roundtrip_gaussian_gpu() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_nvfp4_quant.mojo::test_quantize_1d_roundtrip_gaussian_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     var rel_l2 = _quantize_roundtrip_case[1](
         32, 256, Float32(0.0), Float32(1.0), UInt32(42)
@@ -340,6 +344,10 @@ def test_quantize_1d_roundtrip_gaussian_gpu() raises:
 
 def test_quantize_2d_roundtrip_gaussian_gpu() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_nvfp4_quant.mojo::test_quantize_2d_roundtrip_gaussian_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     var rel_l2 = _quantize_roundtrip_case[16](
         64, 256, Float32(0.0), Float32(1.0), UInt32(43)
@@ -497,6 +505,10 @@ def test_quantize_transpose_matches_materialized_transpose_gpu() raises:
     # `_transpose_matches_materialized_case`'s docstring for the check
     # itself.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_nvfp4_quant.mojo::test_quantize_transpose_matches_materialized_transpose_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     _transpose_matches_materialized_case[1](32, 48, UInt32(777))
 
@@ -537,12 +549,20 @@ def test_quantize_transpose_matches_materialized_transpose_block16_gpu() raises:
     #   3. llmm/nvfp4_quant.mojo restored; `git diff --stat llmm/` empty
     #      afterward.
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_nvfp4_quant.mojo::test_quantize_transpose_matches_materialized_transpose_block16_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     _transpose_matches_materialized_case[16](32, 48, UInt32(778))
 
 
 def test_quantize_all_zero_tensor_gpu() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_nvfp4_quant.mojo::test_quantize_all_zero_tensor_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = shared_gpu_ctx()
     var rows = 8
@@ -599,6 +619,10 @@ def test_quantize_all_zero_tensor_gpu() raises:
 
 def test_quantize_large_outlier_no_overflow_gpu() raises:
     if not has_nvidia_gpu_accelerator():
+        print(
+            "SKIP tests/test_nvfp4_quant.mojo::test_quantize_large_outlier_no_overflow_gpu:"
+            " needs an NVIDIA GPU"
+        )
         return
     var ctx = shared_gpu_ctx()
     var rows = 4
