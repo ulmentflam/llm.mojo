@@ -10,10 +10,12 @@ See [llm.c](https://github.com/karpathy/llm.c) for a detailed explanation of the
 
 <img src="docs/bench.gif" width="800" alt="make verify passing the CPU and Metal GPU correctness gates, then a 40-step llm.c-matching training run on Tiny Shakespeare with the loss falling and a generated sample" />
 
-*Real time (2x where marked, M4 Max). `make verify` checks every gradient tensor and a 10-step loss
-trajectory against PyTorch, then `make train ARGS='-x 40 -b 4 -t 64 -l 1e-4 -m 5 -s 40'` reproduces
-llm.c's canonical 40-step run batch-for-batch (same mt19937 shuffle order; val loss 5.3255 → 4.2922
-vs llm.c's 5.3255 → 4.2915).*
+*Played at 2x with the static Mojo compile waits trimmed, as the badge says; the closing hold on
+the sample is real time, and the frame names the machine that recorded it. Regenerate with
+`scripts/render_bench_gif.sh` (script: `docs/bench.tape`). `make verify` checks every gradient
+tensor and a 10-step loss trajectory against PyTorch, then
+`make train ARGS='-x 40 -b 4 -t 64 -l 1e-4 -m 5 -s 40'` reproduces llm.c's canonical 40-step run
+batch-for-batch (same mt19937 shuffle order; val loss 5.3255 → 4.2924 vs llm.c's 5.3255 → 4.2915).*
 
 ## Installation
 
