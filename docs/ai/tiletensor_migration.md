@@ -176,7 +176,16 @@ Apple hardware.
 - Metal is untested on hardware, and bf16-on-Metal was not even cross-compiled.
 - A TileTensor-native tensor-core path would let the `.to_layout_tensor()`
   bridge go away.
-- Some comments in `llmm/attention.mojo` still mention `LayoutTensor`s.
+- The backward dq/dkv DRAM `TileTensor` views (`Span(unsafe_ptr=...,
+  length=R*MAX_HEAD_DIM)`, `row_major[R, MAX_HEAD_DIM]()`) overstate the extent
+  when `head_dim < MAX_HEAD_DIM` (real row stride is `head_dim`, and the last
+  tile can have fewer than R rows). Audited: all 13 such views (4 sites) are
+  consumed only by `_attention_copy_tile`, via `.ptr` with the real stride, so
+  nothing is out of bounds. Deliberately left as is, since a true-extent fix
+  would change the types/layouts of SASS-validated kernels; the invariant
+  ("access only via `.ptr`; extent is an upper bound") is now documented in
+  comments (comment-only change). The per-head GEMM views (`length=M*K` etc.)
+  are exact.
 - The flash path's dispatch glue is unexercised: `USE_FLASH_FWD` is hard-coded
   off. Only the kernels were checked, by direct instantiation.
 
