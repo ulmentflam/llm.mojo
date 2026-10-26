@@ -3,7 +3,7 @@ from max.gpu.host import DeviceContext
 
 
 from llmm.memory import MutMemPtr, ImmutMemPtr, heap_alloc
-from llmm.sampler import random_f32, sample_softmax
+from llmm.sampler import random_f32
 from llmm.tokenizer import Tokenizer, safe_print
 from llmm.eval_dataloader import EvalDataLoader, eval_stat_correct
 from llmm.hf_download import fetch_hf_checkpoint
@@ -96,52 +96,20 @@ def run_infer[
 
     gen_tokens[unsafe_offset=0] = Scalar[DType.int32](tokenizer.eot_token)
 
-    # fp32 scratch buffer for the logits actually consumed by sample_softmax
-    # (see the dtype-mismatch fix below): sized to vocab_size, not
-    # padded_vocab_size, matching what sample_softmax iterates over.
-    var vocab_size = model.config.vocab_size
-    var logits_fp32 = heap_alloc[Float32](vocab_size)
-
     print("generating:\n---")
     for t in range(1, gen_max_length):
         model.forward(gen_tokens, null_int32_ptr, 1, t)
-        var dev_logits_ptr = (
-            model.acts.logits.unsafe_offset((t - 1) * model.config.padded_vocab_size)
-        )
-        model.ctx.enqueue_copy(
-            dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
-            ),
-            src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
-                dev_logits_ptr.as_unsafe_any_origin()
-            ),
-            size=vocab_size,
-        )
-        model.ctx.synchronize()
-
-        # BUGFIX (was a raw rebind of a GPT2_DTYPE=bfloat16 host buffer to
-        # DType.float32 — a 2-byte-vs-4-byte reinterpret, not a cast. That read
-        # vocab_size*4 bytes from a padded_vocab_size*2-byte buffer: a ~100KB
-        # out-of-bounds host read every sampled token, producing garbage
-        # logits regardless of whether the GPU-side crash also fires.
-        # Cast element-by-element into a properly-sized fp32 scratch buffer.
-        var logits_bf16 = rebind[ImmutMemPtr[GPT2_DTYPE]](
-            model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
-        )
-        for i in range(vocab_size):
-            logits_fp32[unsafe_offset=i] = logits_bf16[unsafe_offset=i].cast[DType.float32]()
-
+        # Same readback + sampling code as train_gpt2's periodic sample
+        # (GPT2.sample_next_token), so the two paths cannot drift apart again
+        # (docs/ai/attention_stale_upper_triangle_generation_bug.md).
         var coin = random_f32(rng_state)
-        var next_token = sample_softmax(
-            rebind[ImmutMemPtr[DType.float32]](logits_fp32), vocab_size, coin
-        )
+        var next_token = model.sample_next_token(t, coin)
         gen_tokens[unsafe_offset=t] = Scalar[DType.int32](next_token)
         var token_str = tokenizer.decode(next_token)
         safe_print(token_str)
     print("\n---")
 
     gen_tokens.unsafe_free()
-    logits_fp32.unsafe_free()
 
 
 def run_eval[
