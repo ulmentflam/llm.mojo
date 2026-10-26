@@ -59,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Tests: NVIDIA-gated tests say SKIP, and six of them run on Metal.** An
+  early-return guard printed nothing and counted as a pass. Each now prints
+  `SKIP <file>::<test>: needs ...`. `test_hadamard`, `test_rng_sr`,
+  `test_amax`, `test_nvfp4_quant`, `test_dbias_regression` and
+  `test_attention_shape_change` accept an Apple GPU as well as an NVIDIA one
+  (checked on Metal by a Mac session). New `make test-metal` runs the Mojo
+  tests plus pytest with `MAX_USE_ACCELERATOR=1`; `make test` on a Mac no
+  longer claims Metal kernel coverage it does not have.
+
 - **Migrated to Mojo 1.2.0 / MAX 26.7.0 stable, and from `LayoutTensor` to
   `TileTensor`.** 1.2 breaks three things this tree used, and deprecates the
   rest of its tensor type:
@@ -132,6 +141,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   docstring, which said it keeps the top 24 bits; it keeps the low 24.
 
 ### Fixed
+
+- **Generated text after training was gibberish, and a mid-run sample
+  corrupted every later training step.** Two bugs. The training loop's sampler
+  read bf16 logits as fp32 bytes (the bug `f0da883` fixed only in
+  `infer_gpt2`); sampling now goes through one `GPT2.sample_next_token` for
+  both binaries, and `sample_softmax` works on any logits dtype. Separately,
+  the causal softmax writes only the lower triangle and relied on a one-time
+  zeroing of the upper triangle; when (B*nh, T) changed (token-by-token
+  generation, or a sample in the middle of training) the previous call's
+  values landed in the new layout's upper triangle and were attended to as
+  real probabilities. `KVCache` now re-zeroes the planes when the shape
+  changes; fixed-shape training is unchanged. A 20-step bf16 run with a sample
+  at step 10 now matches the no-sample run. Fixed-shape training never hit
+  this, so the FineWeb 124M run was unaffected; samples quoted in older docs
+  may come from the buggy paths. Regression tests:
+  `tests/test_attention_shape_change.mojo`, a sampler test, and an
+  HF-reference generation test. Details:
+  `docs/ai/attention_stale_upper_triangle_generation_bug.md`.
+
+- **`test_zero` hung intermittently (about 6% of runs under load).**
+  `CpuBarrier.wait` spun with `sched_yield` on an AsyncRT worker thread, which
+  stranded a peer rank's wakeup on that worker's private task list. The
+  waiting rank now pumps the runtime through the public `DeviceContext`
+  API, and the barrier takes an optional timeout so a future runtime change
+  fails the regression test in about 60 s instead of hanging. The disabled
+  row-sparse divergent-token test hung for the same reason and is enabled
+  again. Details: `docs/ai/test_zero_hang.md`.
+
+- **`make verify-cpu`'s intermittent wrong values have a regression test.**
+  The cause was the dL/dloss seed race fixed in `25fff32`; nothing guarded it.
+  `tests/test_cpu_queue_ordering.mojo` stalls the CPU queue (a test-only
+  `GPT2.debug_stall_cpu_queue` hook) so a missing `ctx.synchronize()` fails
+  every time instead of one run in thousands. Details:
+  `docs/ai/verify_cpu_wrong_values_flake.md`.
 
 - **`make check`, and with it the pre-push hook, passes on Apple Silicon.**
   `compile-rest` built `calibrate_fp8_scales.mojo` everywhere, but its fp8

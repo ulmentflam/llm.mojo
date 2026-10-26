@@ -157,13 +157,21 @@ scan for read-only-cache loads (`LDG.E.CONSTANT`-style) that an invariant
 
 Cross-compiled with `--target-accelerator=metal:4 --emit asm`: the IR is
 byte-identical for 17 kernels in f32/f16. The Metal-only dead layernorm
-kernels were compile-checked only. **Not done:** bf16 on Metal, and any run on
-Apple hardware.
+kernels were compile-checked only. **Later, on Apple hardware** (reported by a
+Mac session at `12a180a`/`bf39d73`, not run on the GB10): `make test-mojo`
+builds all 23 files and passes (141 tests, 140 passed, 1 skipped), and pytest
+on the Metal GPU (`MAX_USE_ACCELERATOR=1`) passes (263 passed, 5 skipped,
+3 xfailed). The hadamard, SR, amax, NVFP4-quant, dbias and attention
+shape-change tests run on Metal. bf16 generation sampled normally on Metal by
+hand; the bf16 generation smoke tests still skip there (no `log124M`
+checkpoint on that machine).
 
 ### Functional gates (all on the GB10)
 
-- `make test-mojo`: 21 files / 168 tests pass (the intermittent `test_zero`
-  hang aside, see below).
+- `make test-mojo`: 21 files / 168 tests passed at the time of the migration;
+  the later fixes below bring it to 23 files, all passing. (The intermittent
+  `test_zero` hang was root-caused and fixed afterwards, see
+  `docs/ai/test_zero_hang.md`.)
 - `make verify-gpu`: step 0 loss `5.2700114` exactly.
 - `make verify-gpu-tf32` passes.
 - `test_attention_equivalence`: 32 passed.
@@ -171,9 +179,15 @@ Apple hardware.
 
 ## 5. Open items
 
-- `test_zero` hangs intermittently; root cause is being chased in a separate
-  worktree (see `docs/ai/test_zero_hang.md` if present).
-- Metal is untested on hardware, and bf16-on-Metal was not even cross-compiled.
+- ~~`test_zero` hangs intermittently~~ Fixed: a barrier/runtime-scheduling
+  deadlock, not part of the migration (`docs/ai/test_zero_hang.md`).
+- Metal on hardware: now run by a Mac session (see the Metal section above).
+  Still open: the bf16 generation smoke tests there need the `log124M`
+  checkpoint copied over.
+- The SASS-identity results in section 4 were taken at `6325a36`. Later
+  commits changed host-side code in `attention.mojo` and `train_gpt2.mojo`
+  (shape-change zeroing, sampling); they are not expected to change any kernel,
+  but the comparison was not repeated.
 - A TileTensor-native tensor-core path would let the `.to_layout_tensor()`
   bridge go away.
 - The backward dq/dkv DRAM `TileTensor` views (`Span(unsafe_ptr=...,
