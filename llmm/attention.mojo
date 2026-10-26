@@ -2230,6 +2230,9 @@ def _attention_copy_tile[
     C: Int,
     is_dram_to_shared: Bool,
 ](dest: TileTensor, src: TileTensor, row_count: Int, head_dim: Int,) -> None:
+    # Contract: DRAM-side tensors are accessed ONLY via .ptr with the real
+    # head_dim row stride; their declared MAX_HEAD_DIM shape/length is an upper
+    # bound and must not be indexed through the layout.
     # Metal fix: rebind dest.ptr to the correct MutAnyOrigin+address_space so
     # writes go to the right memory space. address_space_cast[GENERIC] corrupted
     # threadgroup writes on Metal AIR. src is read-only; no rebind needed.
@@ -2371,6 +2374,12 @@ def _attention_gpu_bwd_dq_tile_block[
     for key_tile_start in range(0, query_tile_start + Br, Bc):
         var key_tile_rows = min(Bc, seq_len - key_tile_start)
 
+        # DRAM tile views below: the declared [R, MAX_HEAD_DIM] shape/length is
+        # an UPPER BOUND, not the real extent. Real data has row stride head_dim
+        # (<= MAX_HEAD_DIM) and the last tile may have fewer than R valid rows.
+        # Invariant: _attention_copy_tile touches these only through .ptr with
+        # the real head_dim stride, so nothing is read/written out of bounds.
+        # Do not index them via the TileTensor layout.
         var k_tile_dram = TileTensor(
             Span[Scalar[dtype], ImmutAnyOrigin](
                 unsafe_ptr=(k_head.unsafe_offset(key_tile_start * head_dim)),
@@ -2532,6 +2541,12 @@ def attention_bwd_dq_gpu[
         var query_tile_start = query_tile_index * Br
         var head_offset = head_index * Int(seq_len * head_dim)
 
+        # DRAM tile views below: the declared [R, MAX_HEAD_DIM] shape/length is
+        # an UPPER BOUND, not the real extent. Real data has row stride head_dim
+        # (<= MAX_HEAD_DIM) and the last tile may have fewer than R valid rows.
+        # Invariant: _attention_copy_tile touches these only through .ptr with
+        # the real head_dim stride, so nothing is read/written out of bounds.
+        # Do not index them via the TileTensor layout.
         var q_tile_dram = TileTensor(
             Span[Scalar[dtype], ImmutAnyOrigin](
                 unsafe_ptr=(
@@ -2691,6 +2706,12 @@ def _attention_gpu_bwd_dkv_tile_block[
         var query_tile_start = query_tile_idx * Br
         var query_tile_rows = min(Br, seq_len - query_tile_start)
 
+        # DRAM tile views below: the declared [R, MAX_HEAD_DIM] shape/length is
+        # an UPPER BOUND, not the real extent. Real data has row stride head_dim
+        # (<= MAX_HEAD_DIM) and the last tile may have fewer than R valid rows.
+        # Invariant: _attention_copy_tile touches these only through .ptr with
+        # the real head_dim stride, so nothing is read/written out of bounds.
+        # Do not index them via the TileTensor layout.
         var q_tile_dram = TileTensor(
             Span[Scalar[dtype], ImmutAnyOrigin](
                 unsafe_ptr=(q_head.unsafe_offset(query_tile_start * head_dim)),
@@ -2928,6 +2949,12 @@ def attention_bwd_dkv_gpu[
         var key_tile_start = key_tile_index * Bc
         var head_offset = head_index * Int(seq_len * head_dim)
 
+        # DRAM tile views below: the declared [R, MAX_HEAD_DIM] shape/length is
+        # an UPPER BOUND, not the real extent. Real data has row stride head_dim
+        # (<= MAX_HEAD_DIM) and the last tile may have fewer than R valid rows.
+        # Invariant: _attention_copy_tile touches these only through .ptr with
+        # the real head_dim stride, so nothing is read/written out of bounds.
+        # Do not index them via the TileTensor layout.
         var dk_tile_dram = TileTensor(
             Span[Scalar[dtype], MutAnyOrigin](
                 unsafe_ptr=(
