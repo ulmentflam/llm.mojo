@@ -73,12 +73,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rest of its tensor type:
   - `std.sys.has_{nvidia,apple}_gpu_accelerator()` are gone. `llmm/vendor.mojo`
     now defines same-named helpers over `std.sys.info._accelerator_arch()` (a
-    private API; the `metal` prefix match has not been run on Apple hardware),
+    private API; the `metal` prefix match was exercised on Apple hardware by the
+    full test suite),
     and every caller imports them from there.
   - `linalg.matmul`'s `elementwise_lambda_fn` receives a `Coord`, not an
     `IndexList[2]`; the three epilogues index it with `idx[i].value()`.
   - `comm.allgather` wants `rank_sigs` sized `N_GPUS`, not `MAX_GPUS`.
-  - `LayoutTensor` is deprecated (about 100 warnings per build). All shared
+  - `LayoutTensor` is deprecated (about 100 warnings per build; `train_gpt2.mojo`
+    now compiles with none). All shared
     scratch buffers, DRAM views and helper parameters in `llmm/` and
     `bench_gemm.mojo` are now `TileTensor` (`stack_allocation[...](row_major[..]())`
     for shared tiles). `layout.tensor_core.TensorCore` still takes only
@@ -88,7 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     every touched kernel (kernels absent from the trainers were
     force-instantiated; the backward dq/dkv tile kernels differ only in integer
     address arithmetic, with identical memory ops and bit-identical outputs),
-    plus bit-identical bf16/fp8/fp4 loss traces. See
+    plus bit-identical bf16/fp8/fp4 loss traces. Step time is unchanged: fp32,
+    bf16, fp8 and fp4 each within 0.3% of the pre-migration build (interleaved,
+    7 runs per tree), smaller than the run-to-run spread. See
     `docs/ai/tiletensor_migration.md`.
 - `make verify` now stops with a `STALE DEBUG STATE` message when
   `gpt2_124M_debug_state.bin` stores a different first-batch loss than the
