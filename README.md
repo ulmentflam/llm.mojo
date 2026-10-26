@@ -10,9 +10,10 @@ See [llm.c](https://github.com/karpathy/llm.c) for a detailed explanation of the
 
 <img src="docs/bench.gif" width="800" alt="make verify passing the CPU and Metal GPU correctness gates, then a 40-step llm.c-matching training run on Tiny Shakespeare with the loss falling and a generated sample" />
 
-*Played at 2x with the static Mojo compile waits trimmed, as the badge says; the closing hold on
-the sample is real time, and the frame names the machine that recorded it. Regenerate with
-`scripts/render_bench_gif.sh` (script: `docs/bench.tape`). `make verify` checks every gradient
+*Verification plays at 2x and training in real time, with static waits (Mojo compiling, the model
+loading) trimmed, as the badges say; the output is the trainer's and `make verify`'s own `pretty`
+format (see below), and the frame names the machine that recorded it. Regenerate with
+`scripts/render_bench_gif.sh` (tapes in `docs/bench/`). `make verify` checks every gradient
 tensor and a 10-step loss trajectory against PyTorch, then
 `make train ARGS='-x 40 -b 4 -t 64 -l 1e-4 -m 5 -s 40'` reproduces llm.c's canonical 40-step run
 batch-for-batch (same mt19937 shuffle order; val loss 5.3255 → 4.2924 vs llm.c's 5.3255 → 4.2915).*
@@ -76,6 +77,22 @@ make train
 ```
 
 For additional help, see `make help`.
+
+The trainer, `make verify` and `make test-mojo` report the same events (setup, step, val, sample,
+check, test) in one of four formats. Run by an LLM coding harness (Claude Code, Codex, Gemini CLI,
+OpenCode, Cursor, or anything that sets `AI_AGENT`), they print `llm` lines automatically;
+otherwise they print the compact `pretty` layout the demo above shows.
+
+| Variable | Values |
+|---|---|
+| `LLMM_LOG` | `llm` (`key=value`, no color or glyphs; `agent` is an alias), `pretty`, `json` (one object per line), `plain` (llm.c's original output: setup tables, per-step norm, lr, z-scores and MFU) |
+| `LLMM_LOG_LEVEL` | `quiet` (results and failures), `normal` (default), `verbose` (norm, lr, z-scores and MFU per step, a line per gradient tensor and trajectory step, every test case), `debug` (per-element gradient dumps, raw test output) |
+| `LLMM_LOG_FILE` | also append every event, up to `verbose`, as JSON lines to this file |
+| `LLMM_LOG_TIME` | `1` adds the time since the run began to every event |
+| `NO_COLOR` | keep the pretty layout, drop its colors |
+
+A failing check or test file prints its full detail at every level. `scripts/train_log.py` reads a
+training log back from any of the four formats.
 
 Multi-GPU training: build with `WORLD_SIZE=N` (one rank per GPU, compile-time)
 and choose a ZeRO sharding stage at runtime:

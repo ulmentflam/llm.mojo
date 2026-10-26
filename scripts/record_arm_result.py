@@ -16,16 +16,14 @@ import argparse
 import json
 import math
 import re
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RESULTS_DIR = REPO_ROOT / "docs" / "ai" / "v2_arm_results"
+sys.path.insert(0, str(REPO_ROOT))
+from scripts.train_log import steps_and_vals  # noqa: E402  every LLMM_LOG format
 
-STEP_RE = re.compile(
-    r"^step (\d+)/(\d+) \| loss ([0-9.]+).*?\| ([0-9.]+) ms .*?\| (\d+) tok/s",
-    re.M,
-)
-VAL_RE = re.compile(r"^val loss ([0-9.]+)", re.M)
+RESULTS_DIR = REPO_ROOT / "docs" / "ai" / "v2_arm_results"
 
 
 def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -53,22 +51,21 @@ def main() -> int:
 
     log = (args.run_dir / "train.log").read_text(errors="replace")
 
-    steps = STEP_RE.findall(log)
+    steps, vals = steps_and_vals(log)
     if not steps:
         raise SystemExit(f"no step lines parsed out of {args.run_dir}/train.log")
     last = steps[-1]
-    final_step, total_steps = int(last[0]), int(last[1])
-    final_loss = float(last[2])
+    final_step, total_steps = last["step"], last["steps"]
+    final_loss = last["loss"]
 
     # Steady-state throughput: median over the last 500 logged steps. The mean
     # is skewed by checkpoint-write stalls and by however much of the run
     # shared the box; the median over a long tail is not.
     tail = steps[-500:]
-    ms = sorted(float(s[3]) for s in tail)
-    toks = sorted(int(s[4]) for s in tail)
+    ms = sorted(s["ms"] for s in tail)
+    toks = sorted(s["tok_s"] for s in tail)
     mid = len(ms) // 2
 
-    vals = VAL_RE.findall(log)
     if not vals:
         raise SystemExit(f"no val loss lines in {args.run_dir}/train.log")
 
@@ -90,7 +87,7 @@ def main() -> int:
         "final_step": final_step,
         "total_steps": total_steps,
         "final_train_loss": final_loss,
-        "final_val_loss": float(vals[-1]),
+        "final_val_loss": vals[-1]["loss"],
         "hellaswag_k": k,
         "hellaswag_n": n,
         "hellaswag_acc": k / n,

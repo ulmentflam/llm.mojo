@@ -27,7 +27,6 @@ Usage:
 import os
 import glob
 import json
-import re
 import sys
 
 import matplotlib
@@ -35,6 +34,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.benchmark_eval import wilson_ci
+from scripts.train_log import read_events  # every LLMM_LOG format
 from scripts.benchmark_train import (
     FIGURES,
     GRID_COLOR,
@@ -92,9 +92,6 @@ def _load_runs():
 
 RUNS = _load_runs()
 
-VAL_RE = re.compile(r"^val loss ([0-9.]+)")
-STEP_RE = re.compile(r"^step (\d+)/(\d+)")
-
 
 def parse_val_losses(log_path):
     """(step, val_loss) series from a train.log. The trainer prints `val loss`
@@ -104,18 +101,13 @@ def parse_val_losses(log_path):
     matching what the final model actually trained through.
     """
     points = {}
-    last_step = 0
     total = None
     with open(log_path) as f:
-        for line in f:
-            m = STEP_RE.match(line)
-            if m:
-                last_step = int(m.group(1))
-                total = int(m.group(2))
-                continue
-            m = VAL_RE.match(line)
-            if m:
-                points[last_step] = float(m.group(1))
+        for kind, fields in read_events(f.read()):
+            if kind == "step":
+                total = fields["steps"]
+            else:
+                points[fields["step"]] = fields["loss"]
     steps = sorted(points)
     return steps, [points[s] for s in steps], total
 

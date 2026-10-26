@@ -59,6 +59,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Structured run output: an `llm` format for coding agents, picked
+  automatically, plus `pretty`, `json` and `plain`.** The trainer,
+  `make verify` and `make test-mojo` report events (setup, step, val, sample,
+  checkpoint, done; gate, check, tensor, trajectory, result; test, skip, case,
+  tests) through `llmm/log.mojo` and its mirror `scripts/test_log.py`.
+  `LLMM_LOG=llm` prints `key=value` lines with no color, glyphs or redraws and
+  is the default whenever an LLM harness is detected (`AI_AGENT`, `CLAUDECODE`,
+  `CODEX_SANDBOX`, `GEMINI_CLI`, `OPENCODE`, `CURSOR_AGENT`); otherwise the
+  default is `pretty`, the compact colored layout (one header line, one line
+  per step, val losses, the sample with `<|endoftext|>` as line breaks; one
+  line per verify check with counters redrawn in place; one line per test
+  file). `json` is one object per line; `plain` is llm.c's original output.
+  `LLMM_LOG_LEVEL=quiet|normal|verbose|debug` sets how much is reported,
+  `LLMM_LOG_FILE` also writes every event as JSON lines, `LLMM_LOG_TIME=1`
+  timestamps them. `make verify`'s logits check now reports how many logits it
+  compared and its tolerance; `make test-mojo` counts NVIDIA-gated early
+  returns as skipped, not passed. Failures print their full detail at every
+  level. `scripts/train_log.py` parses all four formats for
+  `record_arm_result.py` and `benchmark_precision.py`; `benchmark_zero.py`
+  pins `LLMM_LOG=plain`.
+
+- **README demo re-recorded and reproducible.** `docs/bench.gif` ended on the
+  stale-attention bug's word salad. It is now rendered from vhs tapes in
+  `docs/bench/` by `scripts/render_bench_gif.sh` (verification at 2x, training
+  in real time, static waits trimmed and badged), in a 4:3 frame sized so the
+  text reads at README width.
+
 - **Tests: NVIDIA-gated tests say SKIP, and six of them run on Metal.** An
   early-return guard printed nothing and counted as a pass. Each now prints
   `SKIP <file>::<test>: needs ...`. `test_hadamard`, `test_rng_sr`,

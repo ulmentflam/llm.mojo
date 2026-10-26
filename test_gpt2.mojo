@@ -9,16 +9,32 @@ from max.gpu.host.info import is_cpu, is_gpu
 from std.math import sqrt
 
 from llmm.memory import MutMemPtr, heap_alloc
+from llmm.log import Field, Log, num, text, DEBUG, NORMAL, QUIET, VERBOSE
+from llmm.term import pad_right
 from llmm.vendor import HAS_CUBLAS, USE_TF32
 
 from train_gpt2 import (
     GPT2,
     GPT2_DTYPE,
     ParameterTensors,
+    _ffmt,
 )
 
 comptime SIZEOF_INT = size_of[DType.int32]()
 comptime SIZEOF_FLOAT = size_of[DType.float32]()
+
+
+# Output: one event per check (llmm/log.mojo), so every LLMM_LOG format works.
+# In pretty, the gradient and loss-trajectory counters redraw in place on a
+# terminal. A failing check always prints its full detail; LLMM_LOG_LEVEL=
+# verbose adds a line per tensor and per trajectory step, and debug adds the
+# element dumps and first logits this gate used to print unconditionally.
+def _row(log: Log, label: String, body: String) -> String:
+    return "  " + log.style.dim(pad_right(label, 11)) + body
+
+
+def _ok(log: Log) -> String:
+    return log.style.good("ok")
 
 
 # Tensor checker with mixed relative+absolute tolerance and L2 norm guard.
@@ -46,6 +62,9 @@ def check_tensor[
     atol: Float32,
     rtol: Float32,
     l2_factor: Float32,
+    log: Log,
+    gate: String,
+    mut checked: Int,
 ) raises -> Bool:
     # Allocate a Metal-registered host buffer so enqueue_copy works on
     # both Metal (which rejects plain-malloc dst pointers) and CUDA.
@@ -101,30 +120,73 @@ def check_tensor[
         l2_ok = our_l2 <= Float32(1e-3)
 
     var ok = maxdiff_ok and l2_ok
+    checked += 1
+
+    var l2_ratio = our_l2 / ref_l2 if ref_l2 > Float32(1e-6) else our_l2
+    var tensor_fields: List[Field] = [
+        text("gate", gate),
+        text("tensor", label),
+        text("status", "ok" if ok else "fail"),
+        num("maxdiff", maxdiff),
+        num("threshold", threshold),
+        num("l2_ratio", l2_ratio),
+    ]
+    var tensor_body = (
+        pad_right(label, 10)
+        + log.style.dim("maxdiff ")
+        + String(maxdiff)
+        + log.style.dim(" / ")
+        + String(threshold)
+        + log.style.dim("  l2 ")
+        + String(l2_ratio)
+        + " "
+    )
+    var tensor_line = _row(
+        log,
+        "tensor",
+        tensor_body + (_ok(log) if ok else log.style.bad("FAIL")),
+    )
+    log.emit(
+        "tensor",
+        VERBOSE if ok else QUIET,
+        tensor_fields,
+        pretty=tensor_line,
+        plain=tensor_line,
+    )
+    if ok:
+        log.redraw(
+            NORMAL,
+            _row(log, "gradients", String(checked) + " tensors ") + _ok(log),
+        )
+
+    # The element dump: always for a failure, for every tensor at debug.
+    var dump_level = DEBUG if ok else QUIET
+    if not log.at(dump_level):
+        _ = host_buf^
+        return ok
 
     # --- Pass 2: print label + first few elements ---
     var print_upto: Int = 5
-    print(label)
+    log.raw(dump_level, label)
     for i in range(n):
         if i >= print_upto:
             break
         var actual = host_buf[i].cast[DType.float32]()
         var diff = abs(actual - expected_ptr[unsafe_offset=i])
-        if diff <= threshold:
-            print("  OK  ", end="")
-        else:
-            print("  FAIL", end="")
-        print(
-            " actual="
+        log.raw(
+            dump_level,
+            ("  OK  " if diff <= threshold else "  FAIL")
+            + " actual="
             + String(actual)
             + " ref="
             + String(expected_ptr[unsafe_offset=i])
             + " diff="
-            + String(diff)
+            + String(diff),
         )
 
     # --- Per-tensor diagnostic summary ---
-    print(
+    log.raw(
+        dump_level,
         "  maxdiff="
         + String(maxdiff)
         + "  threshold="
@@ -135,10 +197,11 @@ def check_tensor[
         + String(rtol)
         + " ref_maxabs="
         + String(ref_maxabs)
-        + ")"
+        + ")",
     )
     if ref_l2 > Float32(1e-6):
-        print(
+        log.raw(
+            dump_level,
             "  our_l2="
             + String(our_l2)
             + "  ref_l2="
@@ -149,20 +212,21 @@ def check_tensor[
             + String(l2_factor)
             + ", "
             + String(l2_factor)
-            + ")]"
+            + ")]",
         )
     else:
-        print(
+        log.raw(
+            dump_level,
             "  our_l2="
             + String(our_l2)
             + "  ref_l2="
             + String(ref_l2)
-            + "  (ref≈0; our must be <1e-3)"
+            + "  (ref≈0; our must be <1e-3)",
         )
 
     # --- Verdict ---
     if ok:
-        print("TENSOR OK")
+        log.raw(dump_level, "TENSOR OK")
     else:
         var reasons: String = ""
         if not maxdiff_ok:
@@ -185,7 +249,7 @@ def check_tensor[
                 + String(l2_factor)
                 + "x)"
             )
-        print("TENSOR NOT OK:" + reasons)
+        log.raw(dump_level, log.style.bad("TENSOR NOT OK:" + reasons))
 
     _ = host_buf^
     return ok
@@ -262,12 +326,26 @@ def run_test[
         and is_gpu[target]()
         and GPT2_DTYPE == DType.float32
     )
+    var log = Log()
+    var gate = String(target)
+    var checked = 0
     comptime if tf32_active:
         LOSS_STEP_TOL = 0.02
-        print(
+        var tf32_note = String(
             "TF32 fp32 GEMMs active (USE_TF32=1): LOSS_STEP_TOL=0.02"
             " (calibrated for TF32 drift; build with -D LLMM_NO_TF32=1 for"
             " the strict-IEEE 0.01 gate)"
+        )
+        var note_fields: List[Field] = [
+            text("gate", gate),
+            text("text", tf32_note),
+        ]
+        log.emit(
+            "note",
+            NORMAL,
+            note_fields,
+            pretty=log.style.dim("  note: " + tf32_note),
+            plain="  note: " + tf32_note,
         )
     var ctx: DeviceContext
     comptime if is_cpu[target]():
@@ -321,9 +399,9 @@ def run_test[
         state_header[unsafe_offset=3]
     )  # time / sequence length (e.g. 64, up to maxT)
 
-    print("[State]")
-    print("batch_size:", B)
-    print("seq_len:", T)
+    log.raw(DEBUG, "[State]")
+    log.raw(DEBUG, "batch_size: " + String(B))
+    log.raw(DEBUG, "seq_len: " + String(T))
 
     var expected_grads = ParameterTensors[DType.float32]()
     var expected_grads_memory = heap_alloc[Scalar[DType.float32]](
@@ -422,6 +500,10 @@ def run_test[
         print("=========================================================")
         return False
 
+    var steps_failed = 0
+    var last_step_line = String()
+    var last_loss = Float32(0.0)
+    var last_ref = Float32(0.0)
     for step in range(10):
         var start = perf_counter_ns()
         model.forward(
@@ -455,6 +537,9 @@ def run_test[
 
             var logits_ok: Bool = True
             var print_count = 0
+            # How many logits the check below actually compared, reported so
+            # the gate can't silently pass on an empty comparison.
+            var logits_compared = 0
 
             for b in range(B):
                 for t in range(T):
@@ -462,17 +547,19 @@ def run_test[
                         var idx_py = (b * T + t) * V + v
                         var idx_mj = (b * T + t) * V_p + v
 
-                        if print_count < 3:
-                            print(
-                                "PyTorch:",
-                                expected_logits[unsafe_offset=idx_py],
-                                "Mojo:",
-                                host_logits[idx_mj],
+                        if log.at(DEBUG) and print_count < 3:
+                            log.raw(
+                                DEBUG,
+                                "PyTorch: "
+                                + String(expected_logits[unsafe_offset=idx_py])
+                                + " Mojo: "
+                                + String(host_logits[idx_mj]),
                             )
                             print_count += 1
 
                         # We only check logits that have a non-negligible impact on softmax (expected_logits > -10.0)
                         if expected_logits[unsafe_offset=idx_py] > -10.0:
+                            logits_compared += 1
                             if (
                                 abs(
                                     expected_logits[unsafe_offset=idx_py]
@@ -480,18 +567,18 @@ def run_test[
                                 )
                                 >= logits_tol
                             ):
-                                print(
+                                log.raw(
+                                    QUIET,
                                     "MISMATCH AT INDEX (Py="
                                     + String(idx_py)
                                     + ", Mj="
                                     + String(idx_mj)
-                                    + "):"
-                                )
-                                print(
-                                    "Expected (Py):",
-                                    expected_logits[unsafe_offset=idx_py],
-                                    "Got (Mj):",
-                                    host_logits[idx_mj],
+                                    + "): expected (Py) "
+                                    + String(
+                                        expected_logits[unsafe_offset=idx_py]
+                                    )
+                                    + ", got (Mj) "
+                                    + String(host_logits[idx_mj]),
                                 )
                                 logits_ok = False
                                 break
@@ -500,27 +587,62 @@ def run_test[
                 if not logits_ok:
                     break
 
-            if not logits_ok:
-                print("NOT ", end="")
-            print("OK (LOGITS)")
+            var logits_fields: List[Field] = [
+                text("gate", gate),
+                text("check", "logits"),
+                text("status", "ok" if logits_ok else "fail"),
+                num("compared", logits_compared),
+                num("tol", logits_tol),
+            ]
+            var logits_line = _row(
+                log,
+                "logits",
+                String(logits_compared)
+                + " compared "
+                + (_ok(log) if logits_ok else log.style.bad("MISMATCH")),
+            )
+            log.emit(
+                "check",
+                NORMAL if logits_ok else QUIET,
+                logits_fields,
+                pretty=logits_line,
+                plain=logits_line,
+            )
             allok = allok and logits_ok
             _ = host_logits^
 
             # compare the achieved loss
-            if (
-                abs(model.mean_loss - expected_loss[unsafe_offset=0])
-                >= loss_tol
-            ):
-                print(
-                    "LOSS MISMATCH:",
-                    model.mean_loss,
-                    expected_loss[unsafe_offset=0],
-                )
+            var loss_ok = (
+                abs(model.mean_loss - expected_loss[unsafe_offset=0]) < loss_tol
+            )
+            var loss_line = _row(
+                log,
+                "loss",
+                _ffmt(Float64(model.mean_loss), 4)
+                + "  "
+                + log.style.dim("ref")
+                + " "
+                + _ffmt(Float64(expected_loss[unsafe_offset=0]), 4)
+                + " "
+                + (_ok(log) if loss_ok else log.style.bad("MISMATCH")),
+            )
+            var loss_fields: List[Field] = [
+                text("gate", gate),
+                text("check", "loss"),
+                text("status", "ok" if loss_ok else "fail"),
+                num("loss", model.mean_loss),
+                num("ref", expected_loss[unsafe_offset=0]),
+                num("tol", loss_tol),
+            ]
+            log.emit(
+                "check",
+                NORMAL if loss_ok else QUIET,
+                loss_fields,
+                pretty=loss_line,
+                plain=loss_line,
+            )
+            if not loss_ok:
                 allok = False
-            else:
-                print(
-                    "LOSS OK:", model.mean_loss, expected_loss[unsafe_offset=0]
-                )
 
             # Run backward pass before checking gradients
             model.zero_gradients()
@@ -538,6 +660,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[1] = check_tensor(
                 ctx,
@@ -548,6 +673,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[2] = check_tensor(
                 ctx,
@@ -558,6 +686,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[3] = check_tensor(
                 ctx,
@@ -568,6 +699,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[4] = check_tensor(
                 ctx,
@@ -578,6 +712,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[5] = check_tensor(
                 ctx,
@@ -588,6 +725,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[6] = check_tensor(
                 ctx,
@@ -598,6 +738,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[7] = check_tensor(
                 ctx,
@@ -608,6 +751,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[8] = check_tensor(
                 ctx,
@@ -618,6 +764,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[9] = check_tensor(
                 ctx,
@@ -628,6 +777,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[10] = check_tensor(
                 ctx,
@@ -638,6 +790,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[11] = check_tensor(
                 ctx,
@@ -648,6 +803,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[12] = check_tensor(
                 ctx,
@@ -658,6 +816,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[13] = check_tensor(
                 ctx,
@@ -668,6 +829,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[14] = check_tensor(
                 ctx,
@@ -678,6 +842,9 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
             gradoks[15] = check_tensor(
                 ctx,
@@ -688,10 +855,40 @@ def run_test[
                 GRAD_ATOL,
                 GRAD_RTOL,
                 GRAD_L2_FACTOR,
+                log,
+                gate,
+                checked,
             )
 
+            var grads_passed = 0
             for i in range(16):
                 allok = allok and gradoks[i]
+                if gradoks[i]:
+                    grads_passed += 1
+            var grads_ok = grads_passed == 16
+            var grads_line = _row(
+                log,
+                "gradients",
+                "16 tensors "
+                + _ok(log) if grads_ok else log.style.bad(
+                    String(16 - grads_passed) + " of 16 tensors FAILED"
+                ),
+            )
+            var grads_fields: List[Field] = [
+                text("gate", gate),
+                text("check", "grads"),
+                text("status", "ok" if grads_ok else "fail"),
+                num("tensors", 16),
+                num("failed", 16 - grads_passed),
+            ]
+            # In pretty on a terminal this replaces the counter line.
+            log.emit(
+                "check",
+                NORMAL if grads_ok else QUIET,
+                grads_fields,
+                pretty=grads_line,
+                plain=grads_line,
+            )
         else:
             # For step > 0, just run backward to keep state consistent
             model.zero_gradients()
@@ -718,37 +915,69 @@ def run_test[
         var loss_step_ok = loss_step_diff <= LOSS_STEP_TOL
         allok = allok and loss_step_ok
 
+        var step_line = _row(
+            log,
+            "10 steps",
+            "step "
+            + String(step)
+            + "  loss "
+            + _ffmt(Float64(actual_loss), 4)
+            + "  "
+            + log.style.dim("ref")
+            + " "
+            + _ffmt(Float64(expected_loss_val), 4)
+            + " "
+            + (
+                _ok(log) if loss_step_ok else log.style.bad(
+                    "MISMATCH diff="
+                    + String(loss_step_diff)
+                    + " > tol="
+                    + String(LOSS_STEP_TOL)
+                )
+            ),
+        )
+        var trajectory_fields: List[Field] = [
+            text("gate", gate),
+            num("step", step),
+            text("status", "ok" if loss_step_ok else "fail"),
+            num("loss", actual_loss),
+            num("ref", expected_loss_val),
+            num("diff", loss_step_diff),
+        ]
+        # verbose shows every step; a mismatch always shows.
+        log.emit(
+            "trajectory",
+            VERBOSE if loss_step_ok else QUIET,
+            trajectory_fields,
+            pretty=step_line,
+            plain=step_line,
+        )
         if loss_step_ok:
-            print(
-                "step "
-                + String(step)
-                + ": loss "
-                + String(actual_loss)
-                + " expected "
-                + String(expected_loss_val)
-                + " LOSS OK"
-                + " (took "
-                + String(elapsed_time_ms)
-                + " ms)"
-            )
+            log.redraw(NORMAL, step_line)
         else:
-            print(
-                "step "
-                + String(step)
-                + ": loss "
-                + String(actual_loss)
-                + " expected "
-                + String(expected_loss_val)
-                + " LOSS MISMATCH diff="
-                + String(loss_step_diff)
-                + " > tol="
-                + String(LOSS_STEP_TOL)
-                + " (took "
-                + String(elapsed_time_ms)
-                + " ms)"
-            )
+            steps_failed += 1
+        last_step_line = step_line
+        last_loss = actual_loss
+        last_ref = expected_loss_val
 
-    print("overall okay:", allok)
+    var steps_ok = steps_failed == 0
+    var steps_fields: List[Field] = [
+        text("gate", gate),
+        text("check", "steps"),
+        text("status", "ok" if steps_ok else "fail"),
+        num("steps", 10),
+        num("failed", steps_failed),
+        num("loss", last_loss),
+        num("ref", last_ref),
+        num("tol", LOSS_STEP_TOL),
+    ]
+    log.emit(
+        "check",
+        NORMAL if steps_ok else QUIET,
+        steps_fields,
+        pretty=last_step_line,
+        plain=last_step_line,
+    )
 
     x.unsafe_free()
     y.unsafe_free()
@@ -758,7 +987,27 @@ def run_test[
     return allok
 
 
+def _gate_heading(log: Log, gate: String) raises:
+    var fields: List[Field] = [text("gate", gate)]
+    var heading = log.style.heading(
+        gate.upper() + " gate", "GPT-2 124M against the PyTorch reference"
+    )
+    log.emit("gate", NORMAL, fields, pretty=heading, plain=heading)
+
+
+def _gate_verdict(log: Log, gate: String, ok: Bool) raises:
+    var fields: List[Field] = [
+        text("gate", gate),
+        text("status", "pass" if ok else "fail"),
+    ]
+    var verdict = "  " + (
+        log.style.good("passed") if ok else log.style.bad("FAILED")
+    )
+    log.emit("result", QUIET, fields, pretty=verdict, plain=verdict)
+
+
 def main() raises:
+    var log = Log()
     var args = argv()
     var target: String = "cpu"
     if len(args) > 1:
@@ -775,14 +1024,14 @@ def main() raises:
         # The "gpu" instantiation is comptime-guarded: the stdlib's GPU-arch
         # lookup fails the whole build on hosts with no accelerator.
         comptime if has_accelerator():
-            print("=== Running GPU Tests ===")
+            _gate_heading(log, "gpu")
             # GPU version can run with dedicated tolerances
             var gpu_ok: Bool
             if recompute:
                 gpu_ok = run_test["gpu", True](100.0, 0.1)
             else:
                 gpu_ok = run_test["gpu", False](100.0, 0.1)
-            print("GPU Test Result:", gpu_ok)
+            _gate_verdict(log, "gpu", gpu_ok)
             if not gpu_ok:
                 exit(1)
         else:
@@ -791,17 +1040,13 @@ def main() raises:
             )
             exit(1)
     else:
-        print("=== Running CPU Tests ===")
+        _gate_heading(log, "cpu")
         # CPU version has higher precision, let's use dedicated tolerances
         var cpu_ok: Bool
         if recompute:
             cpu_ok = run_test["cpu", True](100.0, 0.08)
         else:
             cpu_ok = run_test["cpu", False](100.0, 0.08)
-        print("CPU Test Result:", cpu_ok)
+        _gate_verdict(log, "cpu", cpu_ok)
         if not cpu_ok:
             exit(1)
-        print(
-            "All CPU tests passed successfully! To run GPU tests, run: mojo"
-            " test_gpt2.mojo gpu"
-        )

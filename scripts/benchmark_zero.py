@@ -222,6 +222,9 @@ def _run_stage(binary, world_size, stage, b, t, d, steps, timeout_s, extra):
     root = _repo_root()
     env = dict(os.environ)
     env["WORLD_SIZE"] = str(world_size)
+    # _STEP_RE parses llm.c's step line; the trainer's default compact layout
+    # (llmm/term.mojo) drops the fields around it.
+    env["LLMM_LOG"] = "plain"
     # Ask the trainer for its exact per-rank allocation accounting (two printed
     # lines per rank; no effect on the training path). Harmless on binaries that
     # predate it — they ignore the variable and _parse_mem_report finds nothing.

@@ -1,16 +1,16 @@
 """Draw the static frame around the README demo terminal (docs/bench.gif).
 
-Writes two 1600x900 PNGs into the output directory:
+Writes 1600x1200 PNGs into the output directory:
 
 - bench-bg.png: vhs's MarginFill. A dark field lit by an ember glow (bottom
   left) and a cooler violet one (top right), a soft drop shadow where the
   terminal window will sit, and a caption naming the machine in the bottom
   margin. vhs paints the window over it.
-- badge-2x.png: a transparent overlay with a pill in the bottom margin
-  saying the run plays at double speed with its compile waits cut, shown
-  over exactly that part.
+- badge-verify.png, badge-train.png: transparent overlays with a pill in the
+  bottom margin saying how each segment is played back, laid over exactly
+  that segment.
 
-The geometry has to match docs/bench.tape (Width, Height, Margin,
+The geometry has to match docs/bench/common.tape (Width, Height, Margin,
 BorderRadius). The caption is read from the host, so it always names the
 machine that recorded the run.
 
@@ -22,9 +22,15 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-W, H = 1600, 900
-MARGIN = 72  # docs/bench.tape: Set Margin
-RADIUS = 16  # docs/bench.tape: Set BorderRadius
+W, H = 1600, 1200
+MARGIN = 72  # docs/bench/common.tape: Set Margin
+RADIUS = 16  # docs/bench/common.tape: Set BorderRadius
+TEXT_SIZE = 28  # caption and badges; halved in the 800px README render
+
+BADGES = {
+    "verify": "2x speed · compile waits cut",
+    "train": "real time · idle waits cut",
+}
 
 BASE = (9, 10, 15)
 EMBER = (255, 94, 40)
@@ -75,29 +81,27 @@ def background(caption: str) -> Image.Image:
         outline=(255, 255, 255, 34),
         width=1,
     )
-    baseline = H - MARGIN // 2 + 9
+    f = font(TEXT_SIZE)
+    baseline = H - MARGIN // 2 + 10
+    draw.text((MARGIN + 4, baseline), "llm.mojo", font=f, fill=ACCENT, anchor="ls")
     draw.text(
-        (MARGIN + 4, baseline), "llm.mojo", font=font(24), fill=ACCENT, anchor="ls"
-    )
-    draw.text(
-        (MARGIN + 4 + font(24).getlength("llm.mojo  "), baseline),
+        (MARGIN + 4 + f.getlength("llm.mojo  "), baseline),
         caption,
-        font=font(24),
+        font=f,
         fill=CAPTION,
         anchor="ls",
     )
     return img.convert("RGB")
 
 
-def badge() -> Image.Image:
+def badge(label: str) -> Image.Image:
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    label = "2x speed · compile waits cut"
-    f = font(22)
+    f = font(TEXT_SIZE - 2)
     width = f.getlength(label)
     right, cy = W - MARGIN - 4, H - MARGIN // 2
-    box = (right - width - 32, cy - 19, right, cy + 19)
-    draw.rounded_rectangle(box, 19, fill=(*ACCENT, 40), outline=(*ACCENT, 170), width=2)
+    box = (right - width - 36, cy - 22, right, cy + 22)
+    draw.rounded_rectangle(box, 22, fill=(*ACCENT, 40), outline=(*ACCENT, 170), width=2)
     draw.text(
         ((box[0] + box[2]) / 2, cy), label, font=f, fill=(255, 196, 170), anchor="mm"
     )
@@ -108,7 +112,8 @@ def main() -> None:
     out, caption = Path(sys.argv[1]), sys.argv[2]
     out.mkdir(parents=True, exist_ok=True)
     background(caption).save(out / "bench-bg.png")
-    badge().save(out / "badge-2x.png")
+    for name, label in BADGES.items():
+        badge(label).save(out / f"badge-{name}.png")
 
 
 if __name__ == "__main__":

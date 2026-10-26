@@ -23,6 +23,14 @@ When unsure, write it down.
 - `make lint` gates every commit (whole-tree pre-commit hook) — run it first, don't `--no-verify`.
 - Verify another agent's load-bearing claims yourself (rebuild/rerun) before merging.
 
+## Run output: LLM mode
+The trainer, `make verify` and `make test-mojo` print `key=value` lines for agents (`LLMM_LOG=llm`, alias `agent`): no color, glyphs or in-place redraws. It switches on by itself when the shell sets `AI_AGENT`, `CLAUDECODE`, `CODEX_SANDBOX`, `GEMINI_CLI`, `OPENCODE` or `CURSOR_AGENT`; if your harness sets none of these, export `LLMM_LOG=llm`. An explicit `LLMM_LOG` always wins.
+- Read the verdict line, not the counts: `done …` (trainer), `result gate=… status=pass|fail` (verify, one per gate), `tests result=pass|fail …` (test-mojo). Exit codes still gate.
+- `LLMM_LOG_LEVEL=quiet` for verdicts and failures only; `verbose` adds per-step norm/lr/z-scores/MFU, per-tensor gradient stats and every test case; `debug` adds element dumps. Failures print full detail at every level.
+- For anything you'll parse later, set `LLMM_LOG_FILE=<path>` (JSON lines, up to `verbose`) and read it with `scripts/train_log.py`, which handles all four formats. Don't regex pretty/plain output.
+- Recording or screenshotting for humans: set `LLMM_LOG=pretty` explicitly, or you'll capture `llm` lines (`docs/bench/common.tape` does). `scripts/benchmark_zero.py` pins `LLMM_LOG=plain`.
+- Format logic lives in `llmm/term.mojo` + `llmm/log.mojo`, mirrored for test-mojo in `scripts/test_log.py`. Change them together.
+
 ## AI use statement
 
 Written with AI assistance ([Agent/Harness]), directed by [Author].

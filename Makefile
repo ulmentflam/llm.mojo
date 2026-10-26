@@ -306,6 +306,10 @@ help:
 	@echo "Testing:"
 	@echo "  test          Run Mojo + Python test suites"
 	@echo "  test-mojo     Run pure-Mojo unit tests with mojo test"
+	@echo ""
+	@echo "Output (trainer, verify, test-mojo): LLMM_LOG=llm|pretty|json|plain (llm under"
+	@echo "  an LLM harness, else pretty); LLMM_LOG_LEVEL=quiet|normal|verbose|debug;"
+	@echo "  LLMM_LOG_FILE=path also writes JSON lines; LLMM_LOG_TIME=1 adds timestamps"
 	@echo "  test-python   Run pytest equivalence + property tests"
 	@echo "  test-python-cuda Run GPU/accelerator pytest equivalence + property tests"
 	@echo "  test-metal       Apple Silicon: Mojo tests + pytest on the Metal GPU (MAX_USE_ACCELERATOR=1)"
@@ -1300,30 +1304,34 @@ endif
 # A compile failure and an assertion failure both fail the suite, but they are
 # reported differently: a file that never built is a different problem from a
 # file whose test failed, and the old target could not tell you which you had.
+# scripts/test_log.py reports each file as one event in the trainer's LLMM_LOG
+# format (llm under an LLM harness, pretty otherwise, or json/plain) and counts
+# NVIDIA-gated early returns as skipped; a failing file prints its full output.
+# LLMM_LOG_LEVEL=verbose lists every test case; LLMM_LOG=plain passes the raw
+# TestSuite output through.
 test-mojo: | $(PIXI_STAMP)
 	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
 		fail=0; \
 		bindir=$$(mktemp -d -t llmm-test-bins-XXXXXX); \
 		trap 'rm -rf "$$bindir"' EXIT INT TERM; \
+		export TEST_TALLY="$$bindir/tally" TEST_RUN_START=$$(date +%s); \
 		for f in tests/test_*.mojo; do \
-			echo "==> $$f"; \
-			start=$$(date +%s); \
+			export TEST_START=$$(date +%s); \
 			bin="$$bindir/$$(basename "$$f" .mojo)"; \
-			if ! timeout $(TEST_FILE_TIMEOUT) $(PIXI) run mojo build \
+			if ! $(PIXI) run python scripts/test_log.py --build "$$f" -- \
+				timeout $(TEST_FILE_TIMEOUT) mojo build \
 				$(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o "$$bin" "$$f"; then \
-				end=$$(date +%s); \
-				echo "==> $$f COMPILE FAILED in $$((end - start))s"; \
 				fail=1; \
 				continue; \
 			fi; \
-			timeout $(TEST_FILE_TIMEOUT) $(PIXI) run bash -c \
+			if ! $(PIXI) run python scripts/test_log.py "$$f" -- \
+				timeout $(TEST_FILE_TIMEOUT) bash -c \
 				'export LD_LIBRARY_PATH="$$CONDA_PREFIX/lib:$$LD_LIBRARY_PATH"; exec "$$0"' \
-				"$$bin"; \
-			rc=$$?; \
-			end=$$(date +%s); \
-			echo "==> $$f done in $$((end - start))s (exit $$rc)"; \
-			if [ $$rc -ne 0 ]; then fail=1; fi; \
+				"$$bin"; then \
+				fail=1; \
+			fi; \
 		done; \
+		$(PIXI) run python scripts/test_log.py --summary "$$TEST_TALLY"; \
 		exit $$fail; \
 	else \
 		echo "No mojo tests found, skipping."; \

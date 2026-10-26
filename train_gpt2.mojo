@@ -88,6 +88,8 @@ from llmm.sampler import random_f32, sample_softmax
 from llmm.rand import MT19937, normal_
 from llmm.mfu import estimate_mfu
 from llmm.tokenizer import Tokenizer, safe_print
+from llmm.term import pad_left, plain_output
+from llmm.log import Field, Log, num, text, NORMAL, QUIET, VERBOSE
 from llmm.memory import (
     ImmutMemPtr,
     MutMemPtr,
@@ -1640,7 +1642,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.inputs_dev = MutMemPtr[DType.int32](unsafe_from_address=zero)
         self.targets_dev = MutMemPtr[DType.int32](unsafe_from_address=zero)
 
-        if self.zero_ctx.rank == 0:
+        # The compact terminal layout (llmm/term.mojo) folds this summary into
+        # the trainer's one-line header.
+        if self.zero_ctx.rank == 0 and plain_output():
             print("Model Summary:")
             print("--------------------------------")
             print("Model Name: GPT-2")
@@ -2806,7 +2810,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             num_activations += self.act_sizes[i]
         self.num_activations = num_activations
 
-        print("Number of Activations: " + String(self.num_activations))
+        if plain_output():
+            print("Number of Activations: " + String(self.num_activations))
 
         # `grad_act_sizes` mirrors `act_sizes`, except that on GPU builds
         # `fch`, `logits`, and `att_probs` are zeroed out: those three
@@ -2849,7 +2854,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # `stats_size` is identical for grad_act_sizes (none of the three
         # shrunk tensors are stats entries).
         var grad_main_size = num_grad_activations - stats_size
-        print("Number of Activation Gradients: " + String(num_grad_activations))
+        if plain_output():
+            print(
+                "Number of Activation Gradients: "
+                + String(num_grad_activations)
+            )
 
         # Re-allocate device memory and point the structures
         self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](main_size)
@@ -6192,6 +6201,41 @@ def _find_max_step(output_log_dir: String) raises -> Int:
     return max_step
 
 
+def _dataset_label(pattern: String) -> String:
+    """`./data/.tinyshakespeare/tiny_shakespeare_train.bin` -> `tiny_shakespeare`.
+    """
+    var slash = pattern.rfind("/")
+    var name = String(pattern[byte = slash + 1 :]) if slash >= 0 else pattern
+    for suffix in ["_train.bin", "_train_*.bin", "_*.bin", ".bin"]:
+        if name.endswith(suffix):
+            var stem_bytes = name.byte_length() - String(suffix).byte_length()
+            return String(name[byte=:stem_bytes])
+    return name
+
+
+def _print_sample_piece(piece: String, at_line_start: Bool) raises -> Bool:
+    """Stream one decoded token of the compact-layout sample.
+
+    Each <|endoftext|> becomes a line break, every line is indented under the
+    `▸ sample` heading, and blank lines are dropped. Returns whether the cursor
+    now sits at the start of a line.
+    """
+    var start = at_line_start
+    var lines = piece.replace("<|endoftext|>", "\n").split("\n")
+    for i in range(len(lines)):
+        if i > 0 and not start:
+            print()
+            start = True
+        var text = String(lines[i].lstrip()) if start else String(lines[i])
+        if start:
+            if text.byte_length() == 0:
+                continue
+            print("  ", end="")
+            start = False
+        safe_print(text)
+    return start
+
+
 def _table_row(label: String, value: String) -> String:
     # "| <label padded to 21> | <value padded to 50> |", like llm.c's printf0.
     var lhs = label
@@ -6252,44 +6296,64 @@ def train[
         )
     var grad_accum_steps = total_batch_size // tokens_per_fwdbwd
 
+    # Run output is a stream of events (llmm/log.mojo): llm.c's setup tables
+    # and step lines in the plain format, one compact line each in pretty,
+    # key=value lines for LLMs, JSON lines. scripts/train_log.py reads them all.
+    var run_log = Log(enabled=rank == 0)
+    var pretty = run_log.pretty()
+    var style = run_log.style
+    # Silences rank 0's setup tables outside the plain format (printf0 is
+    # rank-gated already, so any rank other than 0 prints nothing either way).
+    var setup_rank = rank if run_log.plain() else -1
+
     var bar = "+-----------------------+----------------------------------------------------+"
-    printf0(rank, bar)
-    printf0(rank, _table_row("Parameter", "Value"))
-    printf0(rank, bar)
-    printf0(rank, _table_row("train data pattern", train_data_pattern))
-    printf0(rank, _table_row("val data pattern", args.val_data_pattern))
+    printf0(setup_rank, bar)
+    printf0(setup_rank, _table_row("Parameter", "Value"))
+    printf0(setup_rank, bar)
+    printf0(setup_rank, _table_row("train data pattern", train_data_pattern))
+    printf0(setup_rank, _table_row("val data pattern", args.val_data_pattern))
     printf0(
-        rank,
+        setup_rank,
         _table_row(
             "output log dir",
             "NULL" if args.output_log_dir == "" else args.output_log_dir,
         ),
     )
-    printf0(rank, _table_row("checkpoint_every", String(args.checkpoint_every)))
-    printf0(rank, _table_row("resume", String(args.resume)))
-    printf0(rank, _table_row("micro batch size B", String(B)))
-    printf0(rank, _table_row("sequence length T", String(T)))
-    printf0(rank, _table_row("total batch size", String(total_batch_size)))
-    printf0(rank, _table_row("LR scheduler", args.lr_scheduler_type))
-    printf0(rank, _table_row("learning rate (LR)", String(args.learning_rate)))
     printf0(
-        rank, _table_row("warmup iterations", String(args.warmup_iterations))
+        setup_rank,
+        _table_row("checkpoint_every", String(args.checkpoint_every)),
+    )
+    printf0(setup_rank, _table_row("resume", String(args.resume)))
+    printf0(setup_rank, _table_row("micro batch size B", String(B)))
+    printf0(setup_rank, _table_row("sequence length T", String(T)))
+    printf0(
+        setup_rank, _table_row("total batch size", String(total_batch_size))
+    )
+    printf0(setup_rank, _table_row("LR scheduler", args.lr_scheduler_type))
+    printf0(
+        setup_rank, _table_row("learning rate (LR)", String(args.learning_rate))
     )
     printf0(
-        rank,
+        setup_rank,
+        _table_row("warmup iterations", String(args.warmup_iterations)),
+    )
+    printf0(
+        setup_rank,
         _table_row("final LR fraction", String(args.final_learning_rate_frac)),
     )
-    printf0(rank, _table_row("weight decay", String(args.weight_decay)))
-    printf0(rank, _table_row("max_steps", String(args.max_steps)))
-    printf0(rank, _table_row("val_loss_every", String(args.val_loss_every)))
-    printf0(rank, _table_row("val_max_steps", String(args.val_max_steps)))
-    printf0(rank, _table_row("sample_every", String(args.sample_every)))
-    printf0(rank, _table_row("genT", String(args.gen_tokens)))
+    printf0(setup_rank, _table_row("weight decay", String(args.weight_decay)))
+    printf0(setup_rank, _table_row("max_steps", String(args.max_steps)))
     printf0(
-        rank,
+        setup_rank, _table_row("val_loss_every", String(args.val_loss_every))
+    )
+    printf0(setup_rank, _table_row("val_max_steps", String(args.val_max_steps)))
+    printf0(setup_rank, _table_row("sample_every", String(args.sample_every)))
+    printf0(setup_rank, _table_row("genT", String(args.gen_tokens)))
+    printf0(
+        setup_rank,
         _table_row("overfit_single_batch", String(args.overfit_single_batch)),
     )
-    printf0(rank, bar)
+    printf0(setup_rank, bar)
 
     # Build the GPT-2 model from a checkpoint (.bin) or a descriptor (from
     # scratch). See GPT2.__init__ / parse_model_descriptor.
@@ -6301,24 +6365,32 @@ def train[
         cpu_coordinator_ptr=cpu_coord,
     )
 
-    printf0(rank, bar)
-    printf0(rank, _table_row("weight init method", args.load_filename))
+    printf0(setup_rank, bar)
+    printf0(setup_rank, _table_row("weight init method", args.load_filename))
     printf0(
-        rank,
+        setup_rank,
         _table_row("max_sequence_length T", String(model.config.max_seq_len)),
     )
-    printf0(rank, _table_row("vocab_size V", String(model.config.vocab_size)))
     printf0(
-        rank,
+        setup_rank, _table_row("vocab_size V", String(model.config.vocab_size))
+    )
+    printf0(
+        setup_rank,
         _table_row(
             "padded_vocab_size Vp", String(model.config.padded_vocab_size)
         ),
     )
-    printf0(rank, _table_row("num_layers L", String(model.config.num_layer)))
-    printf0(rank, _table_row("num_heads NH", String(model.config.num_heads)))
-    printf0(rank, _table_row("channels C", String(model.config.channels)))
-    printf0(rank, _table_row("num_parameters", String(model.num_parameters)))
-    printf0(rank, bar)
+    printf0(
+        setup_rank, _table_row("num_layers L", String(model.config.num_layer))
+    )
+    printf0(
+        setup_rank, _table_row("num_heads NH", String(model.config.num_heads))
+    )
+    printf0(setup_rank, _table_row("channels C", String(model.config.channels)))
+    printf0(
+        setup_rank, _table_row("num_parameters", String(model.num_parameters))
+    )
+    printf0(setup_rank, bar)
 
     # Exact allocation accounting, phase 1 of 2 (no-op unless LLMM_MEM_REPORT is
     # set). Here the params/gradients/optimizer/ZeRO-3-window buffers exist but
@@ -6345,15 +6417,15 @@ def train[
     var train_loader = DataLoader(
         train_files^, B, T, rank, WORLD_SIZE, should_shuffle=True
     )
-    printf0(rank, "Loaded train tokens from " + train_tokens)
-    printf0(rank, "Number of tokens: " + String(train_loader.num_tokens))
+    printf0(setup_rank, "Loaded train tokens from " + train_tokens)
+    printf0(setup_rank, "Number of tokens: " + String(train_loader.num_tokens))
     var val_loader = DataLoader(args.val_files.copy(), B, T, rank, WORLD_SIZE)
-    printf0(rank, "Loaded val tokens from " + val_tokens)
-    printf0(rank, "Number of tokens: " + String(val_loader.num_tokens))
+    printf0(setup_rank, "Loaded val tokens from " + val_tokens)
+    printf0(setup_rank, "Number of tokens: " + String(val_loader.num_tokens))
 
     # Build the tokenizer.
     var tokenizer = Tokenizer("gpt2_tokenizer.bin")
-    printf0(rank, "Loaded tokenizer from gpt2_tokenizer.bin")
+    printf0(setup_rank, "Loaded tokenizer from gpt2_tokenizer.bin")
 
     # Number of training/validation batches. With -x set we run exactly that
     # many steps; otherwise we run a single epoch over the training tokens.
@@ -6368,7 +6440,7 @@ def train[
         val_num_batches = val_loader.num_tokens // tokens_per_fwdbwd
 
     printf0(
-        rank,
+        setup_rank,
         "batch_size B="
         + String(B)
         + " * seq_len T="
@@ -6379,15 +6451,17 @@ def train[
         + String(total_batch_size),
     )
     printf0(
-        rank,
+        setup_rank,
         "=> setting grad_accum_steps=" + String(grad_accum_steps),
     )
-    printf0(rank, bar)
-    printf0(rank, _table_row("train_num_batches", String(train_num_batches)))
-    printf0(rank, _table_row("val_num_batches", String(val_num_batches)))
-    printf0(rank, _table_row("num_processes", String(WORLD_SIZE)))
-    printf0(rank, _table_row("zero_stage", String(zero_stage)))
-    printf0(rank, bar)
+    printf0(setup_rank, bar)
+    printf0(
+        setup_rank, _table_row("train_num_batches", String(train_num_batches))
+    )
+    printf0(setup_rank, _table_row("val_num_batches", String(val_num_batches)))
+    printf0(setup_rank, _table_row("num_processes", String(WORLD_SIZE)))
+    printf0(setup_rank, _table_row("zero_stage", String(zero_stage)))
+    printf0(setup_rank, bar)
 
     # Build the learning rate scheduler.
     var learning_rate_scheduler = _build_lr_scheduler(args, train_num_batches)
@@ -6422,8 +6496,17 @@ def train[
             restore_dataloader_state(train_loader, resumed)
             rng_state = resumed.sampler_rng_state
             start_step = resumed.step
-            printf0(
-                rank, "Resumed from checkpoint at step " + String(start_step)
+            var resume_fields: List[Field] = [
+                num("step", start_step),
+                text("path", model_path),
+            ]
+            run_log.emit(
+                "resume",
+                NORMAL,
+                resume_fields,
+                pretty="  "
+                + style.dim("resumed from step " + String(start_step)),
+                plain="Resumed from checkpoint at step " + String(start_step),
             )
 
     #####################################################################################
@@ -6440,6 +6523,53 @@ def train[
     var device_name = String("cpu")
     comptime if is_gpu[target]():
         device_name = ctx.name()
+
+    var model_size = (
+        String(Int(Float64(model.num_parameters) / 1e6 + 0.5)) + "M"
+    )
+    var dataset = _dataset_label(train_data_pattern)
+    var setup_fields: List[Field] = [
+        text("model", "gpt2-" + model_size),
+        num("params", model.num_parameters),
+        text("data", dataset),
+        num("B", B),
+        num("T", T),
+        num("steps", train_num_batches),
+        num("lr", args.learning_rate),
+        text("device", device_name),
+        text("precision", String(PRECISION)),
+        num("batch", total_batch_size, VERBOSE),
+        num("grad_accum", grad_accum_steps, VERBOSE),
+        num("world_size", WORLD_SIZE, VERBOSE),
+        num("zero_stage", zero_stage, VERBOSE),
+        text("lr_schedule", args.lr_scheduler_type, VERBOSE),
+    ]
+    run_log.emit(
+        "setup",
+        NORMAL,
+        setup_fields,
+        pretty=style.heading(
+            "train",
+            "GPT-2 "
+            + model_size
+            + " on "
+            + dataset
+            + " · B="
+            + String(B)
+            + " T="
+            + String(T)
+            + " · "
+            + String(train_num_batches)
+            + " steps · "
+            + device_name,
+        ),
+    )
+    # Where the streamed sample's cursor is, so line breaks never stack up.
+    var sample_at_line_start = True
+    var steps_width = String(train_num_batches).byte_length()
+    # The run's closing numbers, for the `done` event.
+    var last_val_loss = Float32(-1.0)
+    var last_tok_s = 0.0
 
     for step in range(start_step, train_num_batches + 1):
         var last_step = step == train_num_batches
@@ -6462,7 +6592,21 @@ def train[
                 model.zero_ctx.allreduce_scalar(Float64(val_loss))
                 / Float64(WORLD_SIZE)
             )
-            printf0(rank, "val loss " + String(val_loss))
+            var val_fields: List[Field] = [
+                num("step", step),
+                num("loss", val_loss),
+            ]
+            run_log.emit(
+                "val",
+                NORMAL,
+                val_fields,
+                pretty="  "
+                + style.accent("val loss")
+                + "  "
+                + style.bold(_ffmt(Float64(val_loss), 4)),
+                plain="val loss " + String(val_loss),
+            )
+            last_val_loss = val_loss
 
         # Once in a while do model inference to print generated text. ALL
         # ranks run the generation forwards (like llm.c): at zero_stage >= 3
@@ -6476,7 +6620,21 @@ def train[
                 tokenizer.eot_token
             )  # The GPT-2 EOT token kicks off generation.
 
-            printf0(rank, "generating:\n---")
+            # Pretty and plain stream the sample token by token; llm and json
+            # get it whole, as one `sample` event, once it is done.
+            var stream_sample = run_log.at(NORMAL) and (
+                pretty or run_log.plain()
+            )
+            var sample_text = String()
+            if stream_sample and pretty:
+                printf0(rank, "")
+                printf0(
+                    rank,
+                    style.heading("sample", "after " + String(step) + " steps"),
+                )
+                sample_at_line_start = True
+            elif stream_sample:
+                printf0(rank, "generating:\n---")
             for t in range(1, gen_max_length):
                 # NOTE: Inference is wasteful here because for each t we recompute all activations between 0 and t.
                 # In a real inference setting we would use a separate code for this anyway.
@@ -6487,8 +6645,23 @@ def train[
                 gen_tokens[unsafe_offset=t] = Scalar[DType.int32](next_token)
                 if rank == 0:
                     var token_str = tokenizer.decode(next_token)
-                    safe_print(token_str)
-            printf0(rank, "\n---")
+                    sample_text += token_str
+                    if stream_sample and pretty:
+                        sample_at_line_start = _print_sample_piece(
+                            token_str, sample_at_line_start
+                        )
+                    elif stream_sample:
+                        safe_print(token_str)
+            if stream_sample and pretty:
+                if not sample_at_line_start:
+                    printf0(rank, "")
+            elif stream_sample:
+                printf0(rank, "\n---")
+            var sample_fields: List[Field] = [
+                num("step", step),
+                text("text", sample_text),
+            ]
+            run_log.emit("sample", NORMAL, sample_fields)
 
         # Once in a while checkpoint the optimization state (all ranks).
         if (
@@ -6508,7 +6681,17 @@ def train[
             model.write_checkpoint(
                 model_path, state_path, step, train_loader, rng_state
             )
-            printf0(rank, "Writing checkpoint at step " + String(step))
+            var checkpoint_fields: List[Field] = [
+                num("step", step),
+                text("path", model_path),
+            ]
+            run_log.emit(
+                "checkpoint",
+                NORMAL,
+                checkpoint_fields,
+                pretty="  " + style.dim("checkpoint  " + model_path),
+                plain="Writing checkpoint at step " + String(step),
+            )
 
         if last_step:
             break
@@ -6601,32 +6784,85 @@ def train[
             String("n/a") if mfu < 0.0 else _ffmt(mfu * 100.0, 1) + "%"
         )
 
-        printf0(
-            rank,
-            "step "
-            + String(step + 1)
-            + "/"
-            + String(train_num_batches)
-            + " | loss "
-            + _ffmt(Float64(accumulated_loss), 6)
-            + " ("
-            + _zfmt(zloss)
-            + "z)| norm "
-            + _ffmt(Float64(grad_norm), 4)
-            + " ("
-            + _zfmt(zgrad)
-            + "z)| lr "
-            + String(step_learning_rate)
-            + " | "
-            + _ffmt(time_elapsed_ms, 2)
-            + " ms | "
-            + mfu_str
-            + " "
-            + prec_label
-            + " MFU | "
-            + _ffmt(bias_corrected_ema, 0)
-            + " tok/s",
+        # One event per step. llm/json always carry loss, ms and tok/s; norm,
+        # lr, the z-scores and MFU join them at `verbose` (plain always shows
+        # them, being llm.c's line).
+        var step_pretty = String()
+        var step_plain = String()
+        if pretty:
+            step_pretty = (
+                "  "
+                + style.dim("step")
+                + " "
+                + pad_left(String(step + 1), steps_width)
+                + "/"
+                + String(train_num_batches)
+                + "  "
+                + style.dim("loss")
+                + " "
+                + _ffmt(Float64(accumulated_loss), 4)
+                + "  "
+                + style.dim(pad_left(_ffmt(time_elapsed_ms, 1), 7) + " ms")
+                + "  "
+                + pad_left(_ffmt(bias_corrected_ema, 0), 6)
+                + " "
+                + style.dim("tok/s")
+            )
+            if run_log.at(VERBOSE):
+                step_pretty += style.dim(
+                    "  norm "
+                    + _ffmt(Float64(grad_norm), 2)
+                    + "  lr "
+                    + String(step_learning_rate)
+                    + "  mfu "
+                    + mfu_str
+                )
+        elif run_log.plain():
+            step_plain = (
+                "step "
+                + String(step + 1)
+                + "/"
+                + String(train_num_batches)
+                + " | loss "
+                + _ffmt(Float64(accumulated_loss), 6)
+                + " ("
+                + _zfmt(zloss)
+                + "z)| norm "
+                + _ffmt(Float64(grad_norm), 4)
+                + " ("
+                + _zfmt(zgrad)
+                + "z)| lr "
+                + String(step_learning_rate)
+                + " | "
+                + _ffmt(time_elapsed_ms, 2)
+                + " ms | "
+                + mfu_str
+                + " "
+                + prec_label
+                + " MFU | "
+                + _ffmt(bias_corrected_ema, 0)
+                + " tok/s"
+            )
+        var step_fields: List[Field] = [
+            num("step", step + 1),
+            num("steps", train_num_batches),
+            num("loss", _ffmt(Float64(accumulated_loss), 6)),
+            num("ms", _ffmt(time_elapsed_ms, 2)),
+            num("tok_s", _ffmt(bias_corrected_ema, 0)),
+            num("norm", _ffmt(Float64(grad_norm), 4), VERBOSE),
+            num("lr", step_learning_rate, VERBOSE),
+            num("zloss", zloss, VERBOSE),
+            num("zgrad", zgrad, VERBOSE),
+            num(
+                "mfu_pct",
+                "nan" if mfu < 0.0 else _ffmt(mfu * 100.0, 1),
+                VERBOSE,
+            ),
+        ]
+        run_log.emit(
+            "step", NORMAL, step_fields, pretty=step_pretty, plain=step_plain
         )
+        last_tok_s = bias_corrected_ema
 
     # Exact allocation accounting, phase 2 of 2 (no-op unless LLMM_MEM_REPORT is
     # set): steady state, with activations and the ZeRO collective scratches
@@ -6634,6 +6870,22 @@ def train[
     # run's high-water mark — the DeviceContext caching allocator never returns
     # a committed chunk, so the driver figure only ever ratchets up.
     model.print_memory_report("steady")
+
+    # The run's verdict line: what `quiet` keeps. Plain stays llm.c's output.
+    var done_fields: List[Field] = [
+        num("steps", train_num_batches),
+        num("tok_s", _ffmt(last_tok_s, 0)),
+    ]
+    var done_pretty = (
+        "  " + style.good("done") + "  " + String(train_num_batches) + " steps"
+    )
+    if last_val_loss >= 0.0:
+        done_fields.append(num("val_loss", last_val_loss))
+        done_pretty += style.dim(" · val loss ") + _ffmt(
+            Float64(last_val_loss), 4
+        )
+    done_pretty += style.dim(" · ") + _ffmt(last_tok_s, 0) + style.dim(" tok/s")
+    run_log.emit("done", QUIET, done_fields, pretty=done_pretty)
 
     train_loader.close()
     val_loader.close()
@@ -6817,7 +7069,8 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
             " to train on CPU."
         )
     else:
-        print("Training on CPU.")
+        if plain_output():
+            print("Training on CPU.")
         if world_size == 1:
             _dispatch_world_size["cpu"](
                 args,
@@ -6859,10 +7112,19 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             return False
 
         if has_apple_gpu_accelerator():
-            print(
-                "Note: Metal (Apple GPU) training is experimental. Set"
-                " LLMM_USE_CPU=1 or build with -D LLMM_DISABLE_METAL=1 to fall"
-                " back to CPU."
+            var note = String(
+                "Metal (Apple GPU) training is experimental. Set"
+                " LLMM_USE_CPU=1 or build with -D LLMM_DISABLE_METAL=1 to"
+                " fall back to CPU."
+            )
+            var note_log = Log()
+            var note_fields: List[Field] = [text("text", note)]
+            note_log.emit(
+                "note",
+                NORMAL,
+                note_fields,
+                pretty=note_log.style.dim("Note: " + note),
+                plain="Note: " + note,
             )
             if world_size > 1:
                 raise Error(
@@ -6873,7 +7135,8 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
                     " or use an NVIDIA backend."
                 )
 
-        print("GPU detected — training on GPU.")
+        if plain_output():
+            print("GPU detected — training on GPU.")
         if world_size == 1:
             _dispatch_world_size["gpu"](
                 args,
@@ -6932,14 +7195,17 @@ def main() raises:
     if args.resume == 1 and args.output_log_dir != "":
         args.resume_from_step = _find_max_step(args.output_log_dir)
 
-    print(
-        "Rank:",
-        rank,
-        "World size:",
-        world_size,
-        "ZeRO stage:",
-        args.zero_stage,
-    )
+    # The compact layout names the device in its header; the rank line only
+    # carries information once there is more than one rank.
+    if plain_output() or world_size > 1:
+        print(
+            "Rank:",
+            rank,
+            "World size:",
+            world_size,
+            "ZeRO stage:",
+            args.zero_stage,
+        )
 
     if getenv("LLMM_USE_CPU") != "" or not _try_gpu(args, rank, world_size):
         _dispatch_cpu(args, world_size)
