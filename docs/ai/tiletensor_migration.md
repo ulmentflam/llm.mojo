@@ -191,23 +191,35 @@ Apple hardware.
 
 ## Benchmarks
 
-**Verdict: neutral within noise.** No dtype got slower or faster. Every
-migrated-to-baseline ratio is within 0.2% of 1.000, and the round-to-round
-spread of either binary is 0.2-0.9%. This fits the SASS-identity result in
-section 4.
+**Verdict: still neutral within noise on current `main`.** Re-measured
+2026-10-26 at `bf39d73`. No dtype got slower or faster. Every new-to-baseline
+median ratio is within 0.3% of 1.000. The round-to-round spread of either
+binary is 0.3-1.4%, and the per-round ratios straddle 1.0 for every dtype.
+This fits the SASS-identity result in section 4.
 
-Measured 2026-10-25 on the GB10. Baseline is worktree `llm.mojo-base` at
-`6aea140` (binaries built 2026-10-22, newer than every `.mojo`/Makefile
-source). Migrated is `tiletensor-migration` at `e5f7cf8`, rebuilt with
-`make build build-bf16 build-fp8 build-fp4` just before the run. Both trees
-use the same `.pixi` env (Mojo 1.2.0 `2016d0cd`, identical `pixi.lock`).
-`make -n` confirmed that neither tree would rebuild during the run.
+The re-run was needed because the first measurement (2026-10-25, at
+`03d9b9e`, migrated branch `e5f7cf8`) predates later changes to the trainer:
+the forward attention path in `llmm/attention.mojo` (shape-change re-zeroing in
+`attention_fwd_gemm`), plus `train_gpt2.mojo`, `llmm/zero.mojo`,
+`llmm/memory.mojo` and `llmm/sampler.mojo`. Those first figures are kept below
+for reference.
 
-**Method.** Each arm ran through its own tree's make target:
+**Trees.** Baseline is a fresh detached worktree `llm.mojo-base` at `6aea140`
+(the pre-migration commit). New is an agent worktree at `bf39d73` (current
+`main`). Both trees share the main checkout's `.pixi` env (Mojo 1.2.0,
+`pixi.lock` identical between the two commits), weights and tinyshakespeare
+data via symlinks. Both were built with `make build build-bf16 build-fp8
+build-fp4` just before the run. Every `build/train_gpt2*` binary was
+timestamped 2026-10-26 11:18-11:20, newer than every `.mojo` source in its
+tree, and `make -n` confirmed that neither tree would rebuild during the run.
+
+**Method.** Unchanged from the first run. Each arm ran through its own tree's
+make target:
 `make -C <tree> train-gpt2-124m-<dtype> STEPS=40 ARGS="-v 1000 -s 1000 -m 1"`.
 That is GPT-2 124M checkpoint init on tinyshakespeare, B=4, T=1024, with
-40 steps per run. Runs were interleaved base, tt, base, tt for 7 rounds per
-dtype, in the order fp32, bf16, fp8, fp4. Only one GPU job ran at a time.
+40 steps per run. Runs were interleaved base, new, base, new for 7 rounds per
+dtype, in the order fp32, bf16, fp8, fp4 (56 runs, 11:20-11:30). Only one GPU
+job ran at a time.
 The metric is the trainer's own per-step `ms` print, which is synchronized
 and excludes val/sampling. Steps 1-5 were dropped as warmup, and the median
 of steps 6-40 is taken per run. The table gives the median and the minimum
@@ -217,11 +229,43 @@ was not used. It times the `profile_gpt2*` harnesses against llm.c/PyTorch
 rather than comparing two trees' trainers, and it has no fp8/fp4 arms.
 
 **Load.** The vLLM tenant (`VLLM::EngineCore`, pid 27742, 65,121 MiB) was
-resident on the GPU throughout. `nvidia-smi` was checked before the run,
-after it, and before every run, and nothing else was using the GPU. That
-footprint slows tensor-core kernels, so these absolute numbers are not
-comparable to tenant-free figures elsewhere in `docs/ai/`. Only the
-same-window ratio is meaningful.
+resident on the GPU throughout. `nvidia-smi --query-compute-apps` was checked
+before the run, after it, and before every run, and nothing else was using
+the GPU. The instantaneous utilization sampled before each launch was often
+non-zero (1-82%). That sample was taken right after the previous run exited,
+so it may be the previous run's tail rather than vLLM traffic; it cannot be
+told apart, and it hit both arms alike. The tenant's footprint slows
+tensor-core kernels, so these absolute numbers are not comparable to
+tenant-free figures elsewhere in `docs/ai/`. Only the same-window ratio is
+meaningful.
+
+| dtype | base median | new median | ratio (median) | base min | new min | ratio (min) | fastest step base / new | spread base / new | per-round ratio range |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fp32 | 282.89 | 282.92 | **1.0001** | 280.12 | 281.00 | 1.0031 | 277.31 / 277.30 | 1.4% / 1.0% | 0.994-1.004 |
+| bf16 | 138.29 | 138.31 | **1.0001** | 137.75 | 138.00 | 1.0018 | 134.95 / 136.10 | 1.1% / 0.7% | 0.993-1.005 |
+| fp8 | 153.72 | 153.82 | **1.0007** | 153.47 | 153.40 | 0.9995 | 151.30 / 151.24 | 0.3% / 0.4% | 0.997-1.002 |
+| fp4 | 158.21 | 158.62 | **1.0026** | 157.89 | 158.07 | 1.0011 | 155.91 / 155.80 | 0.8% / 0.6% | 0.997-1.005 |
+
+(ms/step; ratio = new / base, so less than 1 means current `main` is faster.)
+
+fp4's 1.0026 is the largest ratio. It is below fp4's own spread (0.6-0.8%),
+its per-round ratios range 0.997-1.005 with three rounds at 1.000, and its
+min-run ratio is 1.0011. The first run measured fp4 at 0.9991. It is noise,
+not a regression.
+
+**Numerics, as a side check.** The bf16, fp8 and fp4 loss traces were
+bit-identical across all 14 runs of each dtype: every round, and baseline
+vs new alike (step-40 loss bf16 3.076523, fp8 3.106864, fp4 3.095101).
+fp32 is not run-to-run deterministic in *either* tree. Its step-40 loss
+ranges over 3.081985-3.082455 across the 7 baseline runs and over
+3.081875-3.082516 across the 7 new runs. The two ranges overlap, so fp32
+shows no effect either.
+
+### First run (2026-10-25, migrated branch `e5f7cf8`, merged as `03d9b9e`)
+
+Same method, baseline binaries built 2026-10-22, same vLLM tenant resident.
+Neutral within noise: every ratio within 0.2% of 1.000, spread 0.2-0.9%,
+bf16/fp8/fp4 loss traces bit-identical.
 
 | dtype | base median | tt median | ratio (median) | base min | tt min | ratio (min) | fastest step base / tt | spread base / tt | per-round ratio range |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -229,15 +273,6 @@ same-window ratio is meaningful.
 | bf16 | 137.80 | 138.03 | **1.0017** | 137.57 | 137.50 | 0.9995 | 134.68 / 135.48 | 0.8% / 0.6% | 0.993-1.004 |
 | fp8 | 153.42 | 153.34 | **0.9995** | 153.29 | 153.15 | 0.9991 | 151.40 / 150.99 | 0.2% / 0.2% | 0.999-1.001 |
 | fp4 | 158.03 | 157.89 | **0.9991** | 157.57 | 157.55 | 0.9999 | 155.20 / 155.50 | 0.4% / 0.5% | 0.998-1.002 |
-
-(ms/step; ratio = tt / base, so less than 1 means the migrated tree is faster.)
-
-**Numerics, as a side check.** The bf16, fp8 and fp4 loss traces were
-bit-identical across all 14 runs of each dtype: every round, and baseline
-vs migrated alike. fp32 is not run-to-run deterministic in *either* tree.
-Its step-40 loss ranges over 3.082057-3.082421 across the 7 baseline runs
-and over 3.081976-3.082446 across the 7 migrated runs. The two ranges
-overlap, so fp32 shows no migration effect either.
 
 ---
 

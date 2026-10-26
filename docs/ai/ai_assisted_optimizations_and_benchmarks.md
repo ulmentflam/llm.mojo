@@ -4890,3 +4890,37 @@ between the trees.
 ### AI use statement
 
 Written with AI assistance (Claude Code / Opus 5.5 agent), directed by Evan Owen.
+
+---
+
+## 2026-10-26 — TileTensor migration A/B re-run on current `main` (`bf39d73` vs `6aea140`): still neutral within noise
+
+The 2026-10-25 entry above measured the migration at `03d9b9e`. Since then
+the forward attention path (`llmm/attention.mojo`, shape-change re-zeroing in
+`attention_fwd_gemm`) and `train_gpt2.mojo` changed, so the A/B was re-run
+against the same pre-migration baseline. Full write-up:
+`docs/ai/tiletensor_migration.md` § Benchmarks.
+
+Same method. Each arm ran `make -C <tree> train-gpt2-124m-<dtype> STEPS=40 ARGS="-v 1000 -s 1000 -m 1"`
+(124M checkpoint init, tinyshakespeare, B=4, T=1024). The trees alternated
+base/new for 7 rounds per dtype, one GPU job at a time. Both trees were
+freshly built, with binary mtimes checked newer than sources. Each run's
+metric is the median of steps 6-40. The table gives the median of the 7
+per-run medians. The vLLM tenant (pid 27742, 65 GB) was resident the whole
+time, so the absolute ms are inflated against tenant-free entries above.
+Only the ratio counts.
+
+| dtype | baseline ms | `bf39d73` ms | new / base | round-to-round spread |
+|---|---:|---:|---:|---:|
+| fp32 | 282.89 | 282.92 | 1.0001 | 1.0-1.4% |
+| bf16 | 138.29 | 138.31 | 1.0001 | 0.7-1.1% |
+| fp8 | 153.72 | 153.82 | 1.0007 | 0.3-0.4% |
+| fp4 | 158.21 | 158.62 | 1.0026 | 0.6-0.8% |
+
+**Verdict:** no regression and no speedup. Every ratio is within 0.3% of
+1.0, inside the spread. fp4's per-round ratios range 0.997-1.005. The bf16,
+fp8 and fp4 loss traces are bit-identical between the trees.
+
+### AI use statement
+
+Written with AI assistance (Claude Code / Opus 5.5 agent), directed by Evan Owen.
