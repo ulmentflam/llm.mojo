@@ -21,7 +21,7 @@ from layout.tensor_core import TensorCore
 from max.gpu.primitives import warp
 from max.gpu.primitives import block
 from extensibility import InputTensor
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceAttribute
 from max.gpu.host.info import is_cpu, is_gpu
@@ -72,6 +72,20 @@ struct KVCache:
     var att_probs_addr: Int
     var att_probs_layer: Int
     var att_probs_stride: Int
+    # Shape (B·nh, T) for which each causal probability destination's
+    # above-diagonal half is known to be zero. The causal softmax writes only
+    # the lower triangle, so that zero must be re-established whenever the
+    # plane is reinterpreted at a different (B·nh, T): a smaller T changes the
+    # row stride and lands the previous call's lower-triangle values in the new
+    # layout's upper triangle, where A·V reads them as real probabilities
+    # (docs/ai/attention_stale_upper_triangle_generation_bug.md). The stored
+    # per-layer att_probs slices track one bit per layer (layers >= 64 are
+    # re-zeroed on every call, which is correct, just slower).
+    var gemm_att_zero_bh: Int
+    var gemm_att_zero_t: Int
+    var att_probs_zero_bh: Int
+    var att_probs_zero_t: Int
+    var att_probs_zero_mask: UInt64
 
     def __init__(out self):
         self.fwd_addr = 0
@@ -87,6 +101,11 @@ struct KVCache:
         self.att_probs_addr = 0
         self.att_probs_layer = 0
         self.att_probs_stride = 0
+        self.gemm_att_zero_bh = 0
+        self.gemm_att_zero_t = 0
+        self.att_probs_zero_bh = 0
+        self.att_probs_zero_t = 0
+        self.att_probs_zero_mask = 0
 
 
 comptime KVCachePtr = Pointer[KVCache, MutUntrackedOrigin]
@@ -1629,6 +1648,8 @@ def attention_fwd_gemm[
         if cache:
             cache.value()[].gemm_scores_addr = scores_addr
             cache.value()[].gemm_att_addr = att_addr
+            cache.value()[].gemm_att_zero_bh = BH
+            cache.value()[].gemm_att_zero_t = T
 
     var scores_buf_ptr = Pointer[BufType, MutUntrackedOrigin](
         unsafe_from_address=scores_addr
@@ -1651,6 +1672,29 @@ def attention_fwd_gemm[
         att_base = rebind[MutKernelPtr[dtype]](
             ap.unsafe_offset(c[].att_probs_layer * c[].att_probs_stride)
         )
+        # Re-zero this layer's slice the first time it is used at a new
+        # (B·nh, T) — see KVCache.att_probs_zero_mask. Training runs one fixed
+        # shape, so this fires once per layer and never again.
+        if c[].att_probs_zero_bh != BH or c[].att_probs_zero_t != T:
+            c[].att_probs_zero_bh = BH
+            c[].att_probs_zero_t = T
+            c[].att_probs_zero_mask = 0
+        var layer = c[].att_probs_layer
+        var layer_bit = UInt64(0)
+        if layer >= 0 and layer < 64:
+            layer_bit = UInt64(1) << UInt64(layer)
+        if layer_bit == 0 or (c[].att_probs_zero_mask & layer_bit) == 0:
+            _zero_device_range[dtype](device_ctx, att_base, BH * T * T)
+            c[].att_probs_zero_mask |= layer_bit
+    elif cache and (
+        cache.value()[].gemm_att_zero_bh != BH
+        or cache.value()[].gemm_att_zero_t != T
+    ):
+        # Same invariant for the shared scratch plane (zeroed at allocation for
+        # the allocation shape only).
+        _zero_device_range[dtype](device_ctx, att_base, BH * T * T)
+        cache.value()[].gemm_att_zero_bh = BH
+        cache.value()[].gemm_att_zero_t = T
 
     # Step 1: QKᵀ for all heads in one cublasGemmStridedBatchedEx call. bf16 Q/K
     # in, bf16 scores out; the scale is applied in the softmax so Q/K stay
@@ -2186,6 +2230,9 @@ def _attention_copy_tile[
     C: Int,
     is_dram_to_shared: Bool,
 ](dest: TileTensor, src: TileTensor, row_count: Int, head_dim: Int,) -> None:
+    # Contract: DRAM-side tensors are accessed ONLY via .ptr with the real
+    # head_dim row stride; their declared MAX_HEAD_DIM shape/length is an upper
+    # bound and must not be indexed through the layout.
     # Metal fix: rebind dest.ptr to the correct MutAnyOrigin+address_space so
     # writes go to the right memory space. address_space_cast[GENERIC] corrupted
     # threadgroup writes on Metal AIR. src is read-only; no rebind needed.
@@ -2327,6 +2374,12 @@ def _attention_gpu_bwd_dq_tile_block[
     for key_tile_start in range(0, query_tile_start + Br, Bc):
         var key_tile_rows = min(Bc, seq_len - key_tile_start)
 
+        # DRAM tile views below: the declared [R, MAX_HEAD_DIM] shape/length is
+        # an UPPER BOUND, not the real extent. Real data has row stride head_dim
+        # (<= MAX_HEAD_DIM) and the last tile may have fewer than R valid rows.
+        # Invariant: _attention_copy_tile touches these only through .ptr with
+        # the real head_dim stride, so nothing is read/written out of bounds.
+        # Do not index them via the TileTensor layout.
         var k_tile_dram = TileTensor(
             Span[Scalar[dtype], ImmutAnyOrigin](
                 unsafe_ptr=(k_head.unsafe_offset(key_tile_start * head_dim)),
@@ -2488,6 +2541,12 @@ def attention_bwd_dq_gpu[
         var query_tile_start = query_tile_index * Br
         var head_offset = head_index * Int(seq_len * head_dim)
 
+        # DRAM tile views below: the declared [R, MAX_HEAD_DIM] shape/length is
+        # an UPPER BOUND, not the real extent. Real data has row stride head_dim
+        # (<= MAX_HEAD_DIM) and the last tile may have fewer than R valid rows.
+        # Invariant: _attention_copy_tile touches these only through .ptr with
+        # the real head_dim stride, so nothing is read/written out of bounds.
+        # Do not index them via the TileTensor layout.
         var q_tile_dram = TileTensor(
             Span[Scalar[dtype], ImmutAnyOrigin](
                 unsafe_ptr=(
@@ -2647,6 +2706,12 @@ def _attention_gpu_bwd_dkv_tile_block[
         var query_tile_start = query_tile_idx * Br
         var query_tile_rows = min(Br, seq_len - query_tile_start)
 
+        # DRAM tile views below: the declared [R, MAX_HEAD_DIM] shape/length is
+        # an UPPER BOUND, not the real extent. Real data has row stride head_dim
+        # (<= MAX_HEAD_DIM) and the last tile may have fewer than R valid rows.
+        # Invariant: _attention_copy_tile touches these only through .ptr with
+        # the real head_dim stride, so nothing is read/written out of bounds.
+        # Do not index them via the TileTensor layout.
         var q_tile_dram = TileTensor(
             Span[Scalar[dtype], ImmutAnyOrigin](
                 unsafe_ptr=(q_head.unsafe_offset(query_tile_start * head_dim)),
@@ -2884,6 +2949,12 @@ def attention_bwd_dkv_gpu[
         var key_tile_start = key_tile_index * Bc
         var head_offset = head_index * Int(seq_len * head_dim)
 
+        # DRAM tile views below: the declared [R, MAX_HEAD_DIM] shape/length is
+        # an UPPER BOUND, not the real extent. Real data has row stride head_dim
+        # (<= MAX_HEAD_DIM) and the last tile may have fewer than R valid rows.
+        # Invariant: _attention_copy_tile touches these only through .ptr with
+        # the real head_dim stride, so nothing is read/written out of bounds.
+        # Do not index them via the TileTensor layout.
         var dk_tile_dram = TileTensor(
             Span[Scalar[dtype], MutAnyOrigin](
                 unsafe_ptr=(
@@ -3035,6 +3106,15 @@ def attention_bwd[
 
 
 @always_inline
+def _zero_device_range[
+    dtype: DType
+](ctx: DeviceContext, ptr: MutKernelPtr[dtype], count: Int) raises:
+    """Enqueue a memset-to-zero of `count` elements at device pointer `ptr`
+    (a non-owning view, so nothing is freed)."""
+    var view = DeviceBuffer[dtype](ctx, ptr, count, owning=False)
+    ctx.enqueue_memset(view, Scalar[dtype](0))
+
+
 def _gemm_scratch_buffer[
     bdt: DType
 ](

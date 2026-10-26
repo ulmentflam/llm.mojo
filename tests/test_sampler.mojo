@@ -138,5 +138,32 @@ def test_extreme_logits() raises:
         _assert_matches_reference(logits, n, coin)
 
 
+def test_bf16_logits_sample_like_widened_fp32() raises:
+    # sample_softmax[bfloat16] must sample exactly as the fp32 sampler does on
+    # the same values widened to fp32 (bf16 -> fp32 is exact). The training
+    # loop once handed a bf16 logits buffer to the fp32 sampler through a raw
+    # pointer rebind, which reads 4-byte garbage out of 2-byte storage
+    # (docs/ai/attention_stale_upper_triangle_generation_bug.md); the dtype-generic
+    # sampler is what makes that rebind unnecessary.
+    var n = 50257
+    var bf = heap_alloc[Scalar[DType.bfloat16]](n)
+    var wide = _alloc_logits(n)
+    var state = UInt64(7)
+    for i in range(n):
+        var u = random_u32(state)
+        var x = Float32(Int(u % UInt32(10000))) / 500.0 - 10.0
+        bf[unsafe_offset=i] = x.cast[DType.bfloat16]()
+        wide[unsafe_offset=i] = bf[unsafe_offset=i].cast[DType.float32]()
+    var bf_immut = rebind[ImmutMemPtr[DType.bfloat16]](bf)
+    var wide_immut = rebind[ImmutMemPtr[DType.float32]](wide)
+    for k in range(50):
+        var coin_bf = Float32(Float64(k) / 50.0 * 0.9999)
+        var coin_wide = coin_bf
+        assert_equal(
+            sample_softmax[DType.bfloat16](bf_immut, n, coin_bf),
+            sample_softmax(wide_immut, n, coin_wide),
+        )
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

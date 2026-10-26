@@ -56,11 +56,17 @@ def random_permutation(mut arr: List[Int], mut state: UInt64):
 # ===----------------------------------------------------------------------=== #
 
 
-def sample_softmax(
-    logits_ptr: ImmutMemPtr[DType.float32],
-    n: Int,
-    mut coin: Float32,
-) -> Int:
+def sample_softmax[
+    dtype: DType = DType.float32
+](logits_ptr: ImmutMemPtr[dtype], n: Int, mut coin: Float32,) -> Int:
+    """Sample an index from softmax(logits[0:n]) with llm.c semantics.
+
+    Generic over the logits' storage dtype: each element is widened to fp32
+    on read (exact for bf16/fp16), so callers pass the model's native
+    GPT2_DTYPE host buffer as-is. Never `rebind` a bf16 buffer to a float32
+    pointer to call this: that reinterprets bytes instead of casting
+    (docs/ai/attention_stale_upper_triangle_generation_bug.md).
+    """
     var norm: Float64 = 0.0
     for i in range(n):
         norm += Float64(exp(logits_ptr[unsafe_offset=i].cast[DType.float32]()))
