@@ -308,6 +308,7 @@ help:
 	@echo "  test-mojo     Run pure-Mojo unit tests with mojo test"
 	@echo "  test-python   Run pytest equivalence + property tests"
 	@echo "  test-python-cuda Run GPU/accelerator pytest equivalence + property tests"
+	@echo "  test-metal       Apple Silicon: Mojo tests + pytest on the Metal GPU (MAX_USE_ACCELERATOR=1)"
 	@echo "  test-fixtures Regenerate tests/fixtures/*.npz from PyTorch reference"
 	@echo "  verify        Verify both CPU and GPU versions against reference state"
 	@echo "  verify-cpu    Verify CPU version against reference state"
@@ -1236,7 +1237,7 @@ test:
 		echo "GPU detected. Running GPU tests..."; \
 		$(MAKE) test-mojo test-python-cuda; \
 	elif [ "$(IS_APPLE_SILICON)" = 1 ]; then \
-		echo "Apple Silicon detected. Running Mojo tests (Metal GPU kernels included; NVIDIA-only tests skip) and CPU Python tests..."; \
+		echo "Apple Silicon detected. Running Mojo tests (NVIDIA-only tests print SKIP) and CPU Python tests. For the Python tests on the Metal GPU run: make test-metal"; \
 		$(MAKE) test-mojo test-python; \
 	else \
 		echo "GPU not detected (or unresponsive). Running CPU tests..."; \
@@ -1351,6 +1352,13 @@ test-python: build-mojo
 
 test-python-cuda: build-mojo
 	MAX_USE_ACCELERATOR=1 $(PIXI) run -e cuda pytest tests/ -v
+
+# Apple Silicon: the pytest suite on the Metal GPU (default pixi env; there is
+# no cuda env on macOS). `make test` only runs it on the CPU.
+test-python-metal: build-mojo
+	MAX_USE_ACCELERATOR=1 $(PIXI) run pytest tests/ -v
+
+test-metal: test-mojo test-python-metal
 
 # ---------------------------------------------------------------------------
 # Fast pre-merge smoke subset — for iteration, NOT a merge gate.
