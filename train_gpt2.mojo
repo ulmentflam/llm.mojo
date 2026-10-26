@@ -3859,6 +3859,36 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 total_loss += self.losses_host_buf[i].cast[DType.float32]()
             self.mean_loss = total_loss / Float32(count)
 
+    def sample_next_token(mut self, t: Int, mut coin: Float32) raises -> Int:
+        """Sample the token following position t-1 from the last forward().
+
+        Shared by the training loop's periodic sample and infer_gpt2, so the
+        logits readback lives in exactly one place. Copies the first
+        vocab_size logits of row t-1 (B=1 layout) into logits_host_buf and
+        samples from them in their native GPT2_DTYPE; sample_softmax widens
+        each element to fp32 on read. A previous duplicate of this code in the
+        training loop reinterpreted the bf16 buffer as float32 and produced
+        gibberish samples (docs/ai/attention_stale_upper_triangle_generation_bug.md).
+        """
+        var vocab_size = self.config.vocab_size
+        var dev_logits_ptr = self.acts.logits.unsafe_offset(
+            (t - 1) * self.config.padded_vocab_size
+        )
+        self.ctx.enqueue_copy(
+            dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                self.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
+            ),
+            src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                dev_logits_ptr.as_unsafe_any_origin()
+            ),
+            size=vocab_size,
+        )
+        self.ctx.synchronize()
+        var logits = rebind[ImmutMemPtr[GPT2_DTYPE]](
+            self.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        return sample_softmax[GPT2_DTYPE](logits, vocab_size, coin)
+
     def zero_gradients(mut self, zero_param_grads: Bool = True) raises:
         # Activation gradients are scratch and are always re-zeroed. Parameter
         # gradients accumulate across micro-steps, so they are only zeroed on the
@@ -6452,27 +6482,8 @@ def train[
                 # In a real inference setting we would use a separate code for this anyway.
                 # Inference is here only for sanity checking.
                 model.forward(gen_tokens, null_int32_ptr, 1, t)
-                var dev_logits_ptr = model.acts.logits.unsafe_offset(
-                    (t - 1) * model.config.padded_vocab_size
-                )
-                model.ctx.enqueue_copy(
-                    dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                        model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
-                    ),
-                    src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
-                        dev_logits_ptr.as_unsafe_any_origin()
-                    ),
-                    size=model.config.vocab_size,
-                )
-                model.ctx.synchronize()
-
-                var logits = rebind[ImmutMemPtr[DType.float32]](
-                    model.logits_host_buf.unsafe_ptr().as_unsafe_any_origin()
-                )
                 var coin = random_f32(rng_state)
-                var next_token = sample_softmax(
-                    logits, model.config.vocab_size, coin
-                )
+                var next_token = model.sample_next_token(t, coin)
                 gen_tokens[unsafe_offset=t] = Scalar[DType.int32](next_token)
                 if rank == 0:
                     var token_str = tokenizer.decode(next_token)

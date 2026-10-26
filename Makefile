@@ -1235,6 +1235,9 @@ test:
 	@if [ "$(HAS_NVIDIA_GPU)" = 1 ]; then \
 		echo "GPU detected. Running GPU tests..."; \
 		$(MAKE) test-mojo test-python-cuda; \
+	elif [ "$(IS_APPLE_SILICON)" = 1 ]; then \
+		echo "Apple Silicon detected. Running Mojo tests (Metal GPU kernels included; NVIDIA-only tests skip) and CPU Python tests..."; \
+		$(MAKE) test-mojo test-python; \
 	else \
 		echo "GPU not detected (or unresponsive). Running CPU tests..."; \
 		$(MAKE) test-mojo test-python; \

@@ -12,7 +12,7 @@ from max.gpu.host.info import is_cpu
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from llmm.vendor import has_nvidia_gpu_accelerator
 from llmm.memory import heap_alloc
-from std.runtime._asyncrt import _run
+from std.time import perf_counter_ns
 
 
 # ===----------------------------------------------------------------------=== #
@@ -58,6 +58,13 @@ struct CpuBarrier:
     `_pump_asyncrt_worker`): ranks are runtime tasks, and a spinning one can
     otherwise strand a peer's wakeup on its own private task list -- a hang
     with every rank present and nobody aborted.
+
+    `timeout_ns` (0 = wait forever, the production default) turns a wait that
+    outlives it into an error. It exists for the liveness tests: if a Mojo/MAX
+    upgrade changes the runtime behaviour the pump relies on, they fail within
+    a minute naming the cause, instead of hanging to the 45-minute per-file
+    `make test-mojo` timeout. Production leaves it off because a legitimate
+    barrier wait (a peer writing a checkpoint, running eval) has no bound.
     """
 
     var counter: Int
@@ -68,13 +75,15 @@ struct CpuBarrier:
     # member cannot become usable again -- the missing arrival is missing for
     # every future generation too.
     var aborted: Atomic[Int32]
+    var timeout_ns: Int
 
-    def __init__(out self, num_threads: Int):
+    def __init__(out self, num_threads: Int, timeout_ns: Int = 0):
         self.counter = 0
         self.generation = Atomic[Int32](0)
         self.num_threads = num_threads
         self.lock = SpinLock()
         self.aborted = Atomic[Int32](0)
+        self.timeout_ns = timeout_ns
 
     def abort(mut self) -> None:
         """Release every current and future waiter with an error."""
@@ -105,6 +114,8 @@ struct CpuBarrier:
         else:
             self.lock.unlock()
             var spins = 0
+            var pump_ctx = Optional[DeviceContext]()
+            var start_ns = perf_counter_ns() if self.timeout_ns > 0 else 0
             while self.generation.load() == gen:
                 if self.aborted.load() != 0:
                     raise Error(
@@ -118,7 +129,27 @@ struct CpuBarrier:
                 # peer's continuation on this worker again (measured: an
                 # entry-only pump still hangs 5/5).
                 if spins % _BARRIER_PUMP_PERIOD == 0:
-                    _pump_asyncrt_worker()
+                    if not pump_ctx:
+                        # One private CPU context per wait, so the pump's
+                        # no-op never queues behind anyone else's stream work.
+                        pump_ctx = DeviceContext(api="cpu")
+                    _pump_asyncrt_worker(pump_ctx.value())
+                    if (
+                        self.timeout_ns > 0
+                        and Int(perf_counter_ns() - start_ns) > self.timeout_ns
+                    ):
+                        raise Error(
+                            "CpuBarrier: timed out after ",
+                            self.timeout_ns // 1_000_000_000,
+                            (
+                                "s with every rank accounted for but the cohort"
+                                " incomplete. If peers are parked in"
+                                " DeviceContext.synchronize(), the AsyncRT pump"
+                                " in CpuBarrier.wait no longer drains parked"
+                                " work -- likely a Mojo/MAX runtime change; see"
+                                " docs/ai/test_zero_hang.md."
+                            ),
+                        )
                 spins += 1
                 _ = external_call["sched_yield", Int32]()
 
@@ -136,11 +167,7 @@ comptime _BARRIER_PUMP_PERIOD = 32
 comptime _BARRIER_PUMP_MAX_TRIES = 8
 
 
-async def _asyncrt_thread_id() -> UInt:
-    return external_call["pthread_self", UInt]()
-
-
-def _pump_asyncrt_worker():
+def _pump_asyncrt_worker(pump_ctx: DeviceContext) raises:
     """Run this AsyncRT worker's parked tasks before spinning on.
 
     WHY A BARRIER HAS TO DO THIS. Ranks are AsyncRT tasks, not OS threads:
@@ -165,33 +192,53 @@ def _pump_asyncrt_worker():
     synchronize`, every other worker asleep. Load only changes who runs
     which op, i.e. how often the parking happens to land on a spinner.
 
-    `_run` executes a tiny coroutine via the GLOBAL queue and awaits it. A
-    worker that awaits a not-yet-ready value donates itself to the run loop,
-    which drains its local list (then its affinity list -- where nested
-    `parallelize` items for this worker index wait) before anything else.
-    Completion is guaranteed: a global-queue task can always be run by the
-    awaiting worker itself.
+    THE PUMP. Enqueue a no-op host task on a private CPU `DeviceContext`
+    (`enqueue_cpu_function`) and `synchronize()` on it. A worker that waits
+    on a not-yet-ready value donates itself to the run loop, which drains its
+    local list (then its affinity list -- where nested `parallelize` items
+    for this worker index wait) before anything else. The no-op is not pinned
+    to a worker: in a probe (see the doc) it landed like `_run`'s
+    global-queue task (the DeviceContext C++ is not in our checkout, so that
+    is measured, not read), so the waiting worker can always run it itself if
+    nobody else does. Not `enqueue_cpu_range`: its item 0 is pinned to worker
+    0 (measured: from ranks 1-3 it ran on rank 0's thread every time), so a
+    pump from worker k would wait on whatever worker 0 is doing.
 
-    One await is not proof of a drain, though. An idle worker can steal the
-    no-op and finish it before this thread reaches the await, which then
-    returns at once ("all values ready") without touching the local list.
-    The periodic re-pump would recover from that eventually, but it is cheaper
-    to know. (Not separately measured: stress runs with and without this
-    retry were both clean; see docs/ai/test_zero_hang.md.) So the
-    coroutine reports which thread ran it. If THIS thread ran it, the run loop
-    was entered and the local list drained first; otherwise retry, up to
-    `_BARRIER_PUMP_MAX_TRIES`. A non-worker thread never runs it and just
-    pays the bounded retries, which is harmless.
+    One wait is not proof of a drain, though. An idle worker can steal the
+    no-op and finish it before this thread reaches the wait, which then
+    returns at once without touching the local list. So the no-op records
+    which thread ran it; if it was THIS thread, the run loop was entered and
+    the local list drained first, otherwise retry, up to
+    `_BARRIER_PUMP_MAX_TRIES`. In practice the no-op almost never runs here
+    (measured ~0.5% from inside 4 ranks, for this and for the earlier
+    `_run`-based pump alike), so a pump almost always makes all 8 round trips,
+    a few microseconds each. The check is cheap insurance, not the mechanism.
 
-    `std.runtime._asyncrt` is private API (the stdlib says async is unstable);
-    there is no public way to yield to the runtime. If it moves, the
-    regression test `test_barrier_does_not_strand_parked_asyncrt_work` in
-    tests/test_zero.mojo is what tells you.
+    PUBLIC API ONLY, ON PURPOSE. The first version of this fix called the
+    private `std.runtime._asyncrt._run` (the stdlib marks Mojo async as
+    unstable, and the compiler warns on `async def`). `enqueue_cpu_function`
+    and `synchronize` are public MAX `DeviceContext` API, and the probe
+    showed the same scheduling behaviour. What neither version makes public
+    is the RUNTIME BEHAVIOUR it relies on: that a worker waiting in
+    `synchronize` re-enters the run loop and drains its local list first. If
+    an upgrade changes that, this compiles and silently stops working. The
+    guard is `test_barrier_does_not_strand_parked_asyncrt_work` in
+    tests/test_zero.mojo, which uses `CpuBarrier.timeout_ns` to fail with a
+    message pointing here rather than hang. See docs/ai/test_zero_hang.md.
     """
     var me = external_call["pthread_self", UInt]()
+    var ran_on = heap_alloc[UInt](1)
     for _ in range(_BARRIER_PUMP_MAX_TRIES):
-        if _run(_asyncrt_thread_id()) == me:
-            return
+        ran_on[] = 0
+
+        def _record_thread() {imm}:
+            ran_on[] = external_call["pthread_self", UInt]()
+
+        pump_ctx.enqueue_cpu_function(_record_thread)
+        pump_ctx.synchronize()
+        if ran_on[] == me:
+            break
+    ran_on.unsafe_free()
 
 
 struct CpuCoordinator:
@@ -216,11 +263,12 @@ struct CpuCoordinator:
     # averaging, global grad-norm partial sums across shards).
     var shared_scalars: Pointer[Float64, MutUntrackedOrigin]
 
-    def __init__(out self, num_threads: Int):
+    def __init__(out self, num_threads: Int, barrier_timeout_ns: Int = 0):
+        """`barrier_timeout_ns`: see `CpuBarrier.timeout_ns` (tests only)."""
         self.barrier1 = heap_alloc[CpuBarrier](1)
-        self.barrier1[] = CpuBarrier(num_threads)
+        self.barrier1[] = CpuBarrier(num_threads, barrier_timeout_ns)
         self.barrier2 = heap_alloc[CpuBarrier](1)
-        self.barrier2[] = CpuBarrier(num_threads)
+        self.barrier2[] = CpuBarrier(num_threads, barrier_timeout_ns)
         self.shared_inputs = heap_alloc[Pointer[UInt8, MutUntrackedOrigin]](
             num_threads
         )

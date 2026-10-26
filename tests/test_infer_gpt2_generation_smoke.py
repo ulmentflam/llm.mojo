@@ -75,3 +75,44 @@ def test_generation_does_not_crash(seed: int) -> None:
     )
     assert "CUDA_ERROR" not in res.stderr
     assert "generating:" in res.stdout
+
+
+# End-to-end correctness guard for the stale-upper-triangle attention bug
+# (docs/ai/attention_stale_upper_triangle_generation_bug.md): token-by-token
+# generation walks T = 1, 2, 3, ..., and the persistent causal probability
+# plane kept stale values from the previous (larger) T, so every sample was
+# word salad while training/val loss looked fine. The crash test above cannot
+# see that -- it only checks the exit code.
+#
+# Reference: Hugging Face `gpt2` (transformers, CPU fp32), sampled with the
+# same xorshift* RNG (seed 1337) and llm.c sample_softmax semantics as
+# max_gpt2_common.py, starting from <|endoftext|>. Its first 8 tokens are
+# [51, 615, 396, 735, 5451, 198, 50256, 3260]. Only 8 are pinned: at token 9
+# the coin lands close enough to a CDF boundary that TF32-vs-fp32 GEMM
+# differences pick a different token, after which the two runs legitimately
+# diverge. Pre-fix, llm.mojo's fp32 output started "ToughTough things all".
+_FP32_BIN = "build/infer_gpt2"
+_FP32_CHECKPOINT = "gpt2_124M.bin"
+_HF_REFERENCE_PREFIX = "Tavistock Island\n<|endoftext|>After"
+
+
+def test_fp32_generation_matches_hf_reference() -> None:
+    if not os.path.exists(_FP32_BIN):
+        pytest.skip(f"{_FP32_BIN} not built — run `make build-infer` first")
+    if not os.path.exists(_FP32_CHECKPOINT):
+        pytest.skip(f"{_FP32_CHECKPOINT} not present")
+
+    res = subprocess.run(
+        [_FP32_BIN, _FP32_CHECKPOINT, "9", "1337"],
+        env=_mojo_python_library_env(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    assert res.returncode == 0, res.stderr
+    sample = res.stdout.split("generating:\n---\n", 1)[-1]
+    assert sample.startswith(_HF_REFERENCE_PREFIX), (
+        f"fp32 generation diverged from the HF GPT-2 reference: {sample!r}"
+    )
