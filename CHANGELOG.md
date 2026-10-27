@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Side-by-side video against llm.c on CPU** (`docs/bench-vs-llmc.mp4`, real
+  time, with a 4x GIF preview in the README). llm.c's `train_gpt2.c` (OpenMP,
+  its fastest CPU build) and llm.mojo on CPU run the same training at the same
+  thread count. `make compare-llmc-cpu` / `make compare-llmm-cpu` run either
+  side through `scripts/log_view.py`, which renders both in the same compact
+  layout, computes tok/s the same way for both and streams the samples as they
+  are generated; `scripts/render_compare_video.sh` makes the video from the
+  tapes in `docs/bench/`. Each trainer runs alone on an idle machine with its
+  output and timing saved (`LOG_VIEW_RECORD`), and the tapes film those runs
+  replaying (`LOG_VIEW_REPLAY`): filming loads the CPU and slowed llm.c's
+  OpenMP threads by ~30% when recorded live, against ~2% for llm.mojo.
+  `scripts/train_log.py` now also reads llm.c's CPU step lines and the
+  `generating:` sample blocks.
+
+- **`-gc <float>`: the gradient-norm clip, 0 = off** (default 1.0, as before).
+  llm.mojo has always clipped at 1.0 like llm.c's `train_gpt2.cu`; llm.c's CPU
+  `train_gpt2.c` does not clip, so until now the two did not train the same
+  run. With `-gc 0` the per-step losses agree to ~0.002 instead of ~0.02. The
+  README's demo caption no longer calls its (clipped) Metal run a batch-for-
+  batch reproduction of llm.c's.
+
 - **GPT-2 inference scaffolds on MAX's Python APIs, one per API.**
   `infer_gpt2_max_graph.py` targets the stable graph API (`max.nn` modules,
   `max.graph.Graph`, `InferenceSession`); `infer_gpt2_max_eager.py` targets the
@@ -172,6 +193,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   docstring, which said it keeps the top 24 bits; it keeps the low 24.
 
 ### Fixed
+
+- **`make train-cpu` ignored `ARGS`.** It now passes them to the trainer like
+  `make train` does.
 
 - **Generated text after training was gibberish, and a mid-run sample
   corrupted every later training step.** Two bugs. The training loop's sampler

@@ -6097,6 +6097,7 @@ struct TrainArgs(Copyable, Movable):
     var warmup_iterations: Int  # -u
     var final_learning_rate_frac: Float32  # -q
     var weight_decay: Float32  # -c
+    var grad_clip: Float32  # -gc  max gradient norm (0 = no clipping)
     var val_loss_every: Int  # -v
     var val_max_steps: Int  # -m
     var sample_every: Int  # -s
@@ -6130,6 +6131,7 @@ def default_train_args() -> TrainArgs:
         warmup_iterations=0,
         final_learning_rate_frac=Float32(1.0),
         weight_decay=Float32(0.0),
+        grad_clip=Float32(1.0),
         val_loss_every=20,
         val_max_steps=20,
         sample_every=20,
@@ -6540,6 +6542,7 @@ def train[
         text("precision", String(PRECISION)),
         num("batch", total_batch_size, VERBOSE),
         num("grad_accum", grad_accum_steps, VERBOSE),
+        num("grad_clip", args.grad_clip, VERBOSE),
         num("world_size", WORLD_SIZE, VERBOSE),
         num("zero_stage", zero_stage, VERBOSE),
         text("lr_schedule", args.lr_scheduler_type, VERBOSE),
@@ -6737,12 +6740,15 @@ def train[
         var zloss = loss_detector.update(Float64(accumulated_loss))
         var step_learning_rate = learning_rate_scheduler.get_learning_rate(step)
 
-        # Gradient norm, its z-score, and clipping to a max norm of 1.0.
+        # Gradient norm, its z-score, and clipping to a max norm of -gc
+        # (1.0 by default, like llm.c's train_gpt2.cu; 0 turns it off, which
+        # is what llm.c's CPU train_gpt2.c does).
         var grad_norm = model.calculate_grad_norm()
         var zgrad = grad_norm_detector.update(Float64(grad_norm))
-        var grad_clip = Float32(1.0)
+        var grad_clip = args.grad_clip
         var grad_scale = (
-            grad_clip / grad_norm if grad_norm > grad_clip else Float32(1.0)
+            grad_clip / grad_norm if grad_clip > 0.0
+            and grad_norm > grad_clip else Float32(1.0)
         )
 
         model.update(
@@ -6947,6 +6953,10 @@ def _print_usage():
     print("  -u <int>    learning rate warmup iterations (default = 0)")
     print("  -q <float>  final learning rate fraction (default = 1.0)")
     print("  -c <float>  weight decay (default = 0.0)")
+    print(
+        "  -gc <float> clip the gradient norm to this, 0 = off (default = 1.0,"
+        " like train_gpt2.cu; llm.c's CPU train_gpt2.c does not clip)"
+    )
     print("  -v <int>    val_loss_every (default = 20)")
     print("  -m <int>    val_max_steps (default = 20)")
     print("  -s <int>    sample_every (default = 20)")
@@ -7030,6 +7040,8 @@ def _parse_train_args(
             args.final_learning_rate_frac = Float32(atof(val))
         elif flag == "-c":
             args.weight_decay = Float32(atof(val))
+        elif flag == "-gc":
+            args.grad_clip = Float32(atof(val))
         elif flag == "-v":
             args.val_loss_every = atol(val)
         elif flag == "-m":

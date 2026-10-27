@@ -177,6 +177,7 @@ $(PIXI_STAMP):
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures smoke gate \
+        compare-llmc-cpu compare-llmm-cpu \
         verify verify-cpu verify-gpu verify-gpu-tf32 \
         docs docs-clean
 
@@ -269,6 +270,8 @@ help:
 	@echo "  build-llmc-gpu  Build only the llm.c CUDA reference (needs nvcc)"
 	@echo "  benchmark     Histogram of train-loop time (auto: Metal on Apple, NVIDIA GPU on Linux)"
 	@echo "  benchmark-cpu Only the CPU comparison (no CUDA / Metal needed)"
+	@echo "  compare-llmc-cpu / compare-llmm-cpu  llm.c's CPU run / the same run in llm.mojo,"
+	@echo "                shown alike (scripts/render_compare_video.sh films the two)"
 	@echo "  benchmark-gpu Only the NVIDIA GPU comparison"
 	@echo "  benchmark-metal  Apple Silicon Metal GPU: llm.mojo vs PyTorch MPS vs MLX (fp32+bf16)"
 	@echo "                   (4 arms in one graph, mirroring benchmark-gpu's fp32+bf16 layout)"
@@ -486,7 +489,7 @@ train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@$(TRAIN_RUNNER) $(ARGS)
 
 train-cpu: $(TRAIN_BIN) $(TRAIN_RUNNER)
-	@LLMM_USE_CPU=1 $(TRAIN_RUNNER)
+	@LLMM_USE_CPU=1 $(TRAIN_RUNNER) $(ARGS)
 
 # Pass training flags via ARGS, e.g. `make train-bf16 ARGS="-i ... -j ... -e d12 ..."`
 train-bf16: $(TRAIN_BIN_BF16) $(TRAIN_RUNNER_BF16)
@@ -868,6 +871,42 @@ build-llmc: build-llmc-cpu build-llmc-gpu
 benchmark-cpu: $(PROFILE_BIN) build-llmc-cpu $(BENCH_SCRIPT)
 	$(PIXI) run python $(BENCH_SCRIPT) --device cpu $(BENCH_ARGS) \
 		--cpu-steps $(BENCH_CPU_STEPS)
+
+# llm.c comparison (docs/bench-vs-llmc.*, rendered by
+# scripts/render_compare_video.sh): llm.c's canonical CPU run next to the same
+# run in llm.mojo on CPU, at the same thread count. Both go through
+# scripts/log_view.py so the two read alike; it computes tok/s the same way for
+# both. llm.c's train_gpt2.c hardcodes B=4 T=64, lr 1e-4, 40 steps, a 5-batch
+# val every 10 steps, a 64-token sample every 20 and no gradient clipping;
+# COMPARE_ARGS asks llm.mojo for the same (-gc 0: its default clips at 1.0,
+# like train_gpt2.cu). Losses then agree to ~0.002; the samples still differ,
+# since a logit difference far below that flips a sampled token. llm.mojo's CPU kernels use every core, so llm.c gets
+# OMP_NUM_THREADS equal to the core count. Both evaluate and sample after the
+# same 40 updates; llm.c's loop (step <= 40) then trains one more step it never
+# evaluates, so its pane counts 41.
+COMPARE_THREADS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc)
+COMPARE_ARGS := -x 40 -b 4 -t 64 -l 1e-4 -v 10 -m 5 -s 20 -g 64 -gc 0
+LOG_VIEW = $(PIXI) run python scripts/log_view.py --tokens 256 --steps 40
+
+# llm.c's fastest CPU configuration is its OpenMP build (llm.c's Makefile
+# needs libomp for it). Its train_gpt2 target is .PHONY, so every
+# build-llmc-cpu recompiles; an existing binary is used as is.
+compare-llmc-cpu: $(BENCH_SCRIPT)
+	@test -x $(LLMC_CPU_BIN) || $(MAKE) build-llmc-cpu
+	@# A LOG_VIEW_REPLAY (the video's filming pass) runs nothing, so skip
+	@# staging and both panes start replaying alike.
+	@test -n "$$LOG_VIEW_REPLAY" \
+		|| $(PIXI) run python $(BENCH_SCRIPT) --stage-only --device cpu >/dev/null
+	@$(LOG_VIEW) --steps 41 --title llm.c \
+		--detail "train_gpt2.c · CPU · $(COMPARE_THREADS) threads" \
+		--cwd build/llmc --show "OMP_NUM_THREADS=$(COMPARE_THREADS) ./train_gpt2" \
+		-- env OMP_NUM_THREADS=$(COMPARE_THREADS) "$(CURDIR)/$(LLMC_CPU_BIN)"
+
+compare-llmm-cpu: $(TRAIN_BIN) $(TRAIN_RUNNER)
+	@LLMM_USE_CPU=1 $(LOG_VIEW) --title llm.mojo \
+		--detail "train_gpt2.mojo · CPU · $(COMPARE_THREADS) threads" \
+		--show "make train-cpu ARGS='$(COMPARE_ARGS)'" \
+		-- $(TRAIN_RUNNER) $(COMPARE_ARGS)
 
 # Runs in the cuda pixi env: the default env's torch has no CUDA, and the
 # harness *silently drops* arms whose subprocess fails ("Torch not compiled

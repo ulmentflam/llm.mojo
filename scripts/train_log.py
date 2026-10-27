@@ -71,6 +71,16 @@ class LogReader:
         self._sample: list[str] | None = None  # inside a generating: block
         self._sample_open = False  # past its opening ---
 
+    @property
+    def in_sample(self) -> bool:
+        """Inside a generating: block (its text may still be arriving)."""
+        return self._sample is not None
+
+    @property
+    def in_sample_text(self) -> bool:
+        """Past the block's opening ---, so new text is sample text."""
+        return self._sample is not None and self._sample_open
+
     def feed(self, raw: str) -> list[tuple[str, dict]]:
         line = _ANSI.sub("", raw).replace("\r", "").rstrip("\n")
         if self._sample is not None:

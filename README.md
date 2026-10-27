@@ -15,8 +15,24 @@ loading) trimmed, as the badges say; the output is the trainer's and `make verif
 format (see below), and the frame names the machine that recorded it. Regenerate with
 `scripts/render_bench_gif.sh` (tapes in `docs/bench/`). `make verify` checks every gradient
 tensor and a 10-step loss trajectory against PyTorch, then
-`make train ARGS='-x 40 -b 4 -t 64 -l 1e-4 -m 5 -s 40'` reproduces llm.c's canonical 40-step run
-batch-for-batch (same mt19937 shuffle order; val loss 5.3255 → 4.2924 vs llm.c's 5.3255 → 4.2915).*
+`make train ARGS='-x 40 -b 4 -t 64 -l 1e-4 -m 5 -s 40'` trains on llm.c's 40-step configuration on
+the Metal GPU, on the same batches in the same mt19937 shuffle order (val loss 5.3255 → 4.2924). It
+clips gradients at norm 1.0 like llm.c's CUDA trainer, which llm.c's CPU trainer does not, so it
+is not the same run as `train_gpt2.c`; the comparison below is, with `-gc 0`.*
+
+<img src="docs/bench-vs-llmc.gif" width="800" alt="llm.c's CPU trainer and llm.mojo on CPU side by side, running the same 40-step Tiny Shakespeare run; llm.mojo finishes in 19.3 s while llm.c takes 115.2 s" />
+
+*llm.c's `train_gpt2.c` (its fastest CPU build, OpenMP, 10 threads) next to llm.mojo on CPU (10
+cores) on an Apple M4, running the same training: B=4, T=64, lr 1e-4, no gradient clipping
+(`-gc 0`), the same batches. A step takes 1782 ms in llm.c and 318 ms in llm.mojo (5.6×); the run
+takes 115.2 s against 19.3 s. The losses agree to within 0.002 at every step and the final val loss
+to 0.0007 (4.2915 vs 4.2922), but the samples differ: a logit difference far below that flips a
+sampled token, after which the two texts continue from different contexts. Both panes print through
+`scripts/log_view.py`, which computes tok/s the same way for both. Each trainer ran alone on an
+idle machine and the panes replay those runs at their recorded pace, synced at launch, because
+filming loads the CPU and slows llm.c's OpenMP threads far more than llm.mojo. The GIF plays at 4×;
+[the MP4](docs/bench-vs-llmc.mp4) is real time. Regenerate with `scripts/render_compare_video.sh`;
+run either side with `make compare-llmc-cpu` / `make compare-llmm-cpu`.*
 
 ## Installation
 
