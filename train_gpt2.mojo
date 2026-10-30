@@ -3029,6 +3029,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var b = min(sg.flat_start + sg.len, b_hi)
                 if b <= a:
                     continue
+                # Full-buffer offset `a`: valid at ZeRO-1/2 only. Under ZeRO-3
+                # streaming params_memory is the flat shard, so lifting
+                # enable_qk_clip's ZeRO-2/3 raise needs `sg.shard_rel +
+                # (a - sg.flat_start)` here (S3 verification note).
                 qk_clip_bias_range[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](
                         self.params_memory.unsafe_offset(a)
@@ -5651,7 +5655,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     def _build_muon_ownership(mut self) raises:
         """Build the ownership table, this rank's owner-space groups, and the
         four owner-local buffers (params, momentum, master, grad), then seed
-        them from the full (consistent) `params_memory`. ZeRO-1 only."""
+        the owned params: from the full (consistent) `params_memory` at
+        ZeRO-1/2 and non-streaming ZeRO-3, or by a W-round gather from the
+        flat shards under ZeRO-3 streaming (only the shard is resident)."""
         comptime W = Self.WORLD_SIZE
         var L = self.config.num_layer
         var rank = self.zero_ctx.rank
@@ -5938,11 +5944,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         t: UInt32,
         config: AdamWConfig,
     ) raises:
-        """ZeRO-1/2/3 Muon step (params fully resident; ZeRO-1 grads were
-        all-reduced, ZeRO-2 grads were bucket-reduced to their owners):
-        pack the owned gradients (ZeRO-1 only), AdamW over this rank's flat-shard segments,
-        Muon over the owner-space groups, then propagate both parts. Never
-        goes through `_update_hybrid`, which assumes unsharded buffers."""
+        """ZeRO-1/2/3 Muon step (ZeRO-1 grads were all-reduced, ZeRO-2/3 grads
+        were bucket-reduced to their owners): pack the owned gradients (ZeRO-1
+        only), AdamW over this rank's flat-shard segments, Muon over the
+        owner-space groups, then propagate both parts at ZeRO-1/2. ZeRO-3 does
+        not propagate: under streaming `params_memory` is the flat shard only
+        (AdamW writes it shard-relative) and `muon_p_shard` is the source the
+        next forward gathers from. Never goes through `_update_hybrid`, which
+        assumes unsharded buffers."""
         comptime if Self.WORLD_SIZE > 1:
             var rank = self.zero_ctx.rank
             var lo = rank * self.optimizer_num_parameters

@@ -1139,6 +1139,50 @@ non-streaming).
     shard-relative offset (`a - rank*opt`, only if it lies in this rank's
     slice) or gather the bias. Clipping Q/K matrices must scale `muon_p_shard`
     (and `muon_master` under bf16), because that is the next forward's source.
+  - **Verification (fu/zs3, Opus reviewer, merged tree cc7d3b3):** no code
+    defects found; S3's delta (7578837, e09f725) and the merge resolution
+    were reviewed against 15f5064 (S2 itself was verified separately on
+    fu/zs2). Read: the streaming seed computes each round's range list from
+    the static slot table, so every rank passes identical lists (checked by
+    `assert_ranges_agree` inside `allgather_ranges`) and a round whose owner
+    holds no slots (W=8 L=1, ranks 6 and 7) is skipped by all ranks alike;
+    `ensure_comm_setup(max(opt, S))` runs before the seed; each round's gather
+    and the owner's copy out of the scratch are each followed by
+    `ctx.synchronize()`, and the bf16 master promotion runs after the final
+    synchronize. A slot never straddles an owner shard (`local_off + len <=
+    O_owner <= S` by construction). `_z3_stream_layer` maps k=0..5 to window
+    slots 2/4/8/10 with Q/K/V at `+k*C^2` and indexes `muon_slots[k*L +
+    layer]` ((k, l) order); `_z3_stream_embed`, `_lm_head_wte_tile` and the
+    `Z3_WTE_ONDEMAND` paths are untouched by the diff. The merge keeps the S5
+    clip block before the ZeRO-3 early return; `enable_qk_clip` still raises
+    for ZeRO >= 2 or streaming, so `_qk_clip_sharded`'s full-buffer bias
+    offset `params_memory.unsafe_offset(a)` is unreachable at ZeRO-3 (a
+    comment there now names the shard-relative fix needed when the raise is
+    lifted). Non-streaming ZeRO-3 (`params_memory` full, no propagation):
+    after an update the owned Muon matrices in `params_memory` are stale, and
+    forward's `allgather` is a no-op there and in any case reads the flat
+    layout, not the owner space. This is reachable only without a coordinator
+    (`_z3_want_streaming` is true whenever one is attached, so the trainer and
+    T2, which always pass one, take the streaming path); no test runs Muon in
+    that mode, so a multi-step non-streaming ZeRO-3 Muon harness would train
+    on stale matrices. That matches section 5's contract (the harness checks
+    `muon_p_shard` directly), but it is a trap for anyone adding such a test.
+    Mutation (in a scratch copy, not the worktree): `_z3_stream_layer` forced
+    to its pre-S3 single flat-shard gather -> all three ZeRO-3 T2 tests fail
+    with "streamed window != owner-space copy" on every rank (W=2, W=4, W=8).
+    Gates on the merged tree (binary mtimes checked after each `-B` build):
+    `make build-bf16` exit 0; `make -B build-train` + `make train ARGS="-opt
+    muon -x 5 -v 0 -s 0"` -> 4.287241, 3.985713, 4.111485, 3.619386, 3.700239,
+    `done steps=5`, exit 0; `make test-mojo` -> `tests result=pass files=26
+    files_skipped=0 files_failed=0 passed=215 skipped=1 failed=0` (exit 0;
+    test_zero_muon 11/11, test_qk_clip 8/8 incl. the W=2/W=4 ZeRO-1 and W=2
+    ZeRO-0 planted-clip cases); `make verify` -> `result gate=cpu
+    status=pass`, `result gate=gpu status=pass` (exit 0); `make -B
+    build-train WORLD_SIZE=2` + `make train-cpu WORLD_SIZE=2` (d6,
+    tinyshakespeare, -b 1 -t 64 -x 3 -pn 2): `-opt muon` at `-z 3`, `-z 2`,
+    `-z 1` -> 10.865850, 10.716245, 10.648577 each, exit 0; `-opt adamw -z 3`
+    -> 10.865850, 10.369871, 10.128281, exit 0. The commit adding this note
+    changes only comments/docstrings in train_gpt2.mojo.
 
 **S4: checkpoint** (llmm/checkpointing.mojo, `write_checkpoint`/`load_checkpoint`).
 
