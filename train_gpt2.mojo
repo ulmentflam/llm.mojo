@@ -77,6 +77,7 @@ from llmm.global_norm import (
     global_norm_aggregate_gpu,
 )
 from llmm.adamw import adamw_update, AdamWConfig
+from llmm.muon import muon_update, MuonConfig, MuonGroup
 from llmm.fused_classifier import (
     fused_classifier,
     chunked_ce_pass1,
@@ -235,6 +236,9 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #                              builds, which includes fp8/fp4).
 #   LLMM_OUTPUT_DIR=<path>     override output_log_dir.
 #   LLMM_SAVE_EVERY=<int>      override checkpoint_every.
+#   LLMM_OPTIMIZER=adamw|muon  override the -opt optimizer (default adamw).
+#   LLMM_MUON_MOMENTUM=<f>     override -mu, Muon momentum (default 0.95).
+#   LLMM_QK_CLIP=<f>           override -qk_clip, max attention logit (0=off).
 #   LLMM_RECOMPUTE=1           test_gpt2 only: activation-recompute build in
 #                              run_test. Not read by train_gpt2 (see docs).
 # Profiling (out of precision scope): LLMM_ATTN_PROFILE, LLMM_PROFILE_*,
@@ -1277,6 +1281,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var v_memory: MutMemPtr[MASTER_DTYPE]
     var master_memory: MutMemPtr[MASTER_DTYPE]
 
+    # Optimizer selection: 0 = AdamW everywhere, 1 = Muon on the 2-D block
+    # matrices (Q/K/V, attn-proj, fc, proj) with AdamW on everything else.
+    # Muon reuses `m_memory` as its momentum buffer. See `enable_muon`.
+    var optimizer_kind: Int
+    var muon_momentum: Float32
+    var muon_groups: List[MuonGroup]
+
     # Activations of the model, and their sizes
     var acts: ActivationTensors[GPT2_DTYPE]
     var act_sizes: List[Int]
@@ -1434,6 +1445,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.m_memory = NULL_MASTER_PTR
         self.v_memory = NULL_MASTER_PTR
         self.master_memory = NULL_MASTER_PTR
+        self.optimizer_kind = 0
+        self.muon_momentum = Float32(0.95)
+        self.muon_groups = List[MuonGroup]()
         self.acts_memory = NULL_DTYPE_PTR
         self.grad_acts_memory = NULL_DTYPE_PTR
         self.acts_stats_memory = NULL_MASTER_PTR
@@ -5109,6 +5123,121 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
             self.ctx.synchronize()
 
+    def param_offset(self, index: Int) -> Int:
+        """Element offset of parameter tensor `index` in the flat buffer."""
+        var off = 0
+        for i in range(index):
+            off += self.param_sizes[i]
+        return off
+
+    def enable_muon(mut self, momentum: Float32) raises:
+        """Switch `update()` to Muon for the 2-D block matrices (AdamW keeps
+        embeddings, biases and LayerNorm). Call after the parameter layout and
+        `allocate_optimizer_moments` exist.
+        """
+        comptime if Self.WORLD_SIZE > 1:
+            if self.zero_ctx.zero_stage >= 1 or self.z3_streaming:
+                raise Error("Muon phase 1 supports WORLD_SIZE=1 / ZeRO-0 only")
+        var L = self.config.num_layer
+        var C = self.config.channels
+        var qkv = self.param_offset(Parameters.qkv_weight)
+        var groups = List[MuonGroup]()
+        for k in range(3):  # Q, K, V row blocks of the fused [L, 3C, C]
+            groups.append(MuonGroup(qkv + k * C * C, C, C, L, 3 * C * C))
+        groups.append(
+            MuonGroup(
+                self.param_offset(Parameters.attn_proj_weight),
+                C,
+                C,
+                L,
+                C * C,
+            )
+        )
+        groups.append(
+            MuonGroup(
+                self.param_offset(Parameters.fc_weight), 4 * C, C, L, 4 * C * C
+            )
+        )
+        groups.append(
+            MuonGroup(
+                self.param_offset(Parameters.proj_weight),
+                C,
+                4 * C,
+                L,
+                4 * C * C,
+            )
+        )
+        self.muon_groups = groups^
+        self.muon_momentum = momentum
+        self.optimizer_kind = 1
+
+    def _adamw_ranges(self) -> List[Int]:
+        """[start0, end0, start1, end1, ...] of the flat-buffer ranges AdamW
+        owns when Muon is enabled: everything except the Muon matrices."""
+        var r = List[Int]()
+        r.append(0)
+        r.append(self.param_offset(Parameters.qkv_weight))
+        r.append(self.param_offset(Parameters.qkv_bias))
+        r.append(self.param_offset(Parameters.attn_proj_weight))
+        r.append(self.param_offset(Parameters.attn_proj_bias))
+        r.append(self.param_offset(Parameters.fc_weight))
+        r.append(self.param_offset(Parameters.fc_bias))
+        r.append(self.param_offset(Parameters.proj_weight))
+        r.append(self.param_offset(Parameters.proj_bias))
+        r.append(self.num_parameters)
+        return r^
+
+    def _update_hybrid(
+        mut self,
+        t: UInt32,
+        config: AdamWConfig,
+    ) raises:
+        """Muon step: AdamW over the non-matrix ranges, then one muon_update
+        over the Muon groups. Whole-buffer (unsharded) layouts only."""
+        var ranges = self._adamw_ranges()
+        for k in range(len(ranges) // 2):
+            var start = ranges[2 * k]
+            var n = ranges[2 * k + 1] - start
+            if n <= 0:
+                continue
+            adamw_update[GPT2_DTYPE, Self.target](
+                n,
+                as_mut_kernel[GPT2_DTYPE](
+                    self.params_memory.unsafe_offset(start)
+                ),
+                as_mut_kernel[GPT2_DTYPE](
+                    self.grads_memory.unsafe_offset(start)
+                ),
+                as_mut_kernel[MASTER_DTYPE](
+                    self.master_memory.unsafe_offset(start)
+                ),
+                USE_BF16,
+                as_mut_kernel[MASTER_DTYPE](self.m_memory.unsafe_offset(start)),
+                as_mut_kernel[MASTER_DTYPE](self.v_memory.unsafe_offset(start)),
+                t,
+                config,
+                self.ctx,
+            )
+        var muon_config = MuonConfig(
+            learning_rate=config.learning_rate,
+            momentum=self.muon_momentum,
+            weight_decay=config.weight_decay,
+            grad_scale=config.grad_scale,
+            ns_steps=5,
+            nesterov=True,
+        )
+        muon_update[GPT2_DTYPE, Self.target](
+            self.muon_groups,
+            as_mut_kernel[GPT2_DTYPE](self.params_memory),
+            as_immut_kernel_from_mut[GPT2_DTYPE](self.grads_memory),
+            as_mut_kernel[MASTER_DTYPE](self.master_memory),
+            USE_BF16,
+            as_mut_kernel[MASTER_DTYPE](self.m_memory),
+            t,
+            muon_config,
+            self.ctx,
+        )
+
     def update(
         mut self,
         t: UInt32,
@@ -5170,7 +5299,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         g_ptr = self.grad_shard_memory
                     update_num_params = local_num_params
 
-            if update_num_params > 0:
+            var hybrid_done = False
+            if self.optimizer_kind == 1:
+                self._update_hybrid(t, config)
+                hybrid_done = True
+            if update_num_params > 0 and not hybrid_done:
                 comptime simd_w = simd_width_of[GPT2_DTYPE]()
                 adamw_update[GPT2_DTYPE, Self.target, width=simd_w](
                     update_num_params,
@@ -5207,18 +5340,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             comptime if Self.WORLD_SIZE > 1:
                 if self.zero_ctx.zero_stage == 0:
                     # ZeRO-0 (DDP): every rank updates all params using full grads.
-                    adamw_update[GPT2_DTYPE, Self.target](
-                        self.num_parameters,
-                        as_mut_kernel[GPT2_DTYPE](self.params_memory),
-                        as_mut_kernel[GPT2_DTYPE](self.grads_memory),
-                        as_mut_kernel[MASTER_DTYPE](self.master_memory),
-                        USE_BF16,
-                        as_mut_kernel[MASTER_DTYPE](self.m_memory),
-                        as_mut_kernel[MASTER_DTYPE](self.v_memory),
-                        t,
-                        config,
-                        self.ctx,
-                    )
+                    if self.optimizer_kind == 1:
+                        self._update_hybrid(t, config)
+                    else:
+                        adamw_update[GPT2_DTYPE, Self.target](
+                            self.num_parameters,
+                            as_mut_kernel[GPT2_DTYPE](self.params_memory),
+                            as_mut_kernel[GPT2_DTYPE](self.grads_memory),
+                            as_mut_kernel[MASTER_DTYPE](self.master_memory),
+                            USE_BF16,
+                            as_mut_kernel[MASTER_DTYPE](self.m_memory),
+                            as_mut_kernel[MASTER_DTYPE](self.v_memory),
+                            t,
+                            config,
+                            self.ctx,
+                        )
                 elif self.zero_ctx.zero_stage == 1:
                     # ZeRO-1: grads were allreduced — read shard from grads_memory + offset.
                     var offset = (
@@ -5299,18 +5435,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         )
                         self.ctx.synchronize()
             else:
-                adamw_update[GPT2_DTYPE, Self.target](
-                    self.num_parameters,
-                    as_mut_kernel[GPT2_DTYPE](self.params_memory),
-                    as_mut_kernel[GPT2_DTYPE](self.grads_memory),
-                    as_mut_kernel[MASTER_DTYPE](self.master_memory),
-                    USE_BF16,
-                    as_mut_kernel[MASTER_DTYPE](self.m_memory),
-                    as_mut_kernel[MASTER_DTYPE](self.v_memory),
-                    t,
-                    config,
-                    self.ctx,
-                )
+                if self.optimizer_kind == 1:
+                    self._update_hybrid(t, config)
+                else:
+                    adamw_update[GPT2_DTYPE, Self.target](
+                        self.num_parameters,
+                        as_mut_kernel[GPT2_DTYPE](self.params_memory),
+                        as_mut_kernel[GPT2_DTYPE](self.grads_memory),
+                        as_mut_kernel[MASTER_DTYPE](self.master_memory),
+                        USE_BF16,
+                        as_mut_kernel[MASTER_DTYPE](self.m_memory),
+                        as_mut_kernel[MASTER_DTYPE](self.v_memory),
+                        t,
+                        config,
+                        self.ctx,
+                    )
 
     def calculate_grad_norm(mut self) raises -> Float32:
         """Global L2 norm of the parameter gradients (sqrt of the sum of squares
@@ -5739,7 +5878,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.ctx.synchronize()
         write_state_checkpoint[MASTER_DTYPE](
             state_path,
-            make_training_state(loader, step, sampler_rng_state),
+            make_training_state(
+                loader,
+                step,
+                sampler_rng_state,
+                optimizer_kind=self.optimizer_kind,
+            ),
             rebind_mut_mem[MASTER_DTYPE](
                 host_m.unsafe_ptr().as_unsafe_any_origin()
             ),
@@ -5849,6 +5993,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             ),
             n_opt,
         )
+        if state.optimizer_kind != self.optimizer_kind:
+            raise Error(
+                "Cannot resume: checkpoint was written with optimizer_kind="
+                + String(state.optimizer_kind)
+                + " (0=adamw, 1=muon) but this run uses "
+                + String(self.optimizer_kind)
+                + "; pass the matching -opt"
+            )
         self._copy_host_to_device[MASTER_DTYPE](self.m_memory, host_m, n_opt)
         self._copy_host_to_device[MASTER_DTYPE](self.v_memory, host_v, n_opt)
         self.ctx.synchronize()
@@ -6105,6 +6257,9 @@ struct TrainArgs(Copyable, Movable):
     var overfit_single_batch: Int  # -a
     var max_steps: Int  # -x  (-1 => run one epoch)
     var zero_stage: Int  # -z
+    var optimizer: String  # -opt  adamw|muon
+    var muon_momentum: Float32  # -mu  Muon momentum
+    var qk_clip_tau: Float32  # -qk_clip  max attention logit (0 = off)
 
 
 def default_train_args() -> TrainArgs:
@@ -6139,6 +6294,9 @@ def default_train_args() -> TrainArgs:
         overfit_single_batch=0,
         max_steps=-1,
         zero_stage=0,
+        optimizer="adamw",
+        muon_momentum=Float32(0.95),
+        qk_clip_tau=Float32(0.0),
     )
 
 
@@ -6344,6 +6502,11 @@ def train[
         _table_row("final LR fraction", String(args.final_learning_rate_frac)),
     )
     printf0(setup_rank, _table_row("weight decay", String(args.weight_decay)))
+    printf0(setup_rank, _table_row("optimizer", args.optimizer))
+    if args.optimizer == "muon":
+        printf0(
+            setup_rank, _table_row("muon momentum", String(args.muon_momentum))
+        )
     printf0(setup_rank, _table_row("max_steps", String(args.max_steps)))
     printf0(
         setup_rank, _table_row("val_loss_every", String(args.val_loss_every))
@@ -6366,6 +6529,8 @@ def train[
         ctx,
         cpu_coordinator_ptr=cpu_coord,
     )
+    if args.optimizer == "muon":
+        model.enable_muon(args.muon_momentum)
 
     printf0(setup_rank, bar)
     printf0(setup_rank, _table_row("weight init method", args.load_filename))
@@ -6538,11 +6703,13 @@ def train[
         num("T", T),
         num("steps", train_num_batches),
         num("lr", args.learning_rate),
+        text("opt", args.optimizer),
         text("device", device_name),
         text("precision", String(PRECISION)),
         num("batch", total_batch_size, VERBOSE),
         num("grad_accum", grad_accum_steps, VERBOSE),
         num("grad_clip", args.grad_clip, VERBOSE),
+        num("muon_momentum", args.muon_momentum, VERBOSE),
         num("world_size", WORLD_SIZE, VERBOSE),
         num("zero_stage", zero_stage, VERBOSE),
         text("lr_schedule", args.lr_scheduler_type, VERBOSE),
@@ -6966,6 +7133,9 @@ def _print_usage():
     print(
         "  -z <int>    zero_stage, ZeRO optimization stage 0/1/2/3 (default 0)"
     )
+    print("  -opt <str>  optimizer: adamw|muon (default = adamw)")
+    print("  -mu <float> Muon momentum (default = 0.95)")
+    print("  -qk_clip <float> max attention logit, 0 = off (default = 0)")
     print("  -pn <int>   num_processes / world_size (default = 1)")
     print("  -pr <int>   process_rank (default = 0)")
 
@@ -6996,6 +7166,12 @@ def _parse_train_args(
         args.output_log_dir = getenv("LLMM_OUTPUT_DIR")
     if getenv("LLMM_SAVE_EVERY") != "":
         args.checkpoint_every = atol(getenv("LLMM_SAVE_EVERY"))
+    if getenv("LLMM_OPTIMIZER") != "":
+        args.optimizer = getenv("LLMM_OPTIMIZER")
+    if getenv("LLMM_MUON_MOMENTUM") != "":
+        args.muon_momentum = Float32(atof(getenv("LLMM_MUON_MOMENTUM")))
+    if getenv("LLMM_QK_CLIP") != "":
+        args.qk_clip_tau = Float32(atof(getenv("LLMM_QK_CLIP")))
 
     # Parse the flags. Each is "-x" or "-xy" followed by a value, like llm.c.
     var i = 1
@@ -7056,6 +7232,12 @@ def _parse_train_args(
             args.max_steps = atol(val)
         elif flag == "-z":
             args.zero_stage = atol(val)
+        elif flag == "-opt":
+            args.optimizer = val
+        elif flag == "-mu":
+            args.muon_momentum = Float32(atof(val))
+        elif flag == "-qk_clip":
+            args.qk_clip_tau = Float32(atof(val))
         elif flag == "-pn":
             world_size = atol(val)
         elif flag == "-pr":
@@ -7064,6 +7246,9 @@ def _parse_train_args(
             print("Unknown flag: " + flag)
             _error_usage()
         i += 2
+    if args.optimizer != "adamw" and args.optimizer != "muon":
+        print("Invalid -opt '" + args.optimizer + "': expected adamw or muon")
+        _error_usage()
     return True
 
 

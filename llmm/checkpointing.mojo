@@ -13,6 +13,13 @@ from llmm.rand import MT19937
 #                  position) lives in the header, exactly like llm.c's
 #                  `save_state` / `load_state`.
 #
+# Header slots used by the state file (Int32 indices): 0 magic, 1 version,
+# 2 num_processes, 3 process_rank, 4 use_master_weights, 5 should_shuffle,
+# 10 step, 20-21 sampler rng, 22-23 shuffle draws, 30-31 shard idx, 32-33
+# sample idx (all llm.c-compatible), and 40 optimizer_kind (0 AdamW, 1 Muon;
+# absent = 0 in files written before Muon). Muon keeps its momentum in the `m`
+# payload slot and leaves `v` unused for the matrices.
+#
 # Splitting the two means a finished run ships only the model file, while a
 # resumable run keeps the (much larger) state file alongside it.
 
@@ -126,6 +133,7 @@ struct TrainingState(Copyable, Movable):
     var shuffle_rng_state: UInt64  # Dataloader shuffle RNG state.
     var current_shard_idx: Int  # Dataloader shard position.
     var current_sample_idx: Int  # Dataloader intra-shard sample position.
+    var optimizer_kind: Int  # 0 = AdamW, 1 = Muon (header slot 40).
 
 
 # ===----------------------------------------------------------------------=== #
@@ -288,6 +296,7 @@ def write_state_checkpoint[
     header.unsafe_store(4, Int32(state.use_master_weights))
     header.unsafe_store(5, Int32(state.should_shuffle))
     header.unsafe_store(10, Int32(state.step))
+    header.unsafe_store(40, Int32(state.optimizer_kind))
 
     # 64-bit fields share the same buffer; an aligned UInt64 view writes pairs
     # of Int32 slots (index k => slots 2k, 2k+1), matching llm.c's byte offsets.
@@ -336,6 +345,7 @@ def read_state_header(mut file: FileHandle) raises -> TrainingState:
         shuffle_rng_state=u64_view.unsafe_load(11),
         current_shard_idx=Int(u64_view.unsafe_load(15)),
         current_sample_idx=Int(u64_view.unsafe_load(16)),
+        optimizer_kind=Int(header.unsafe_load(40)),
     )
     header.unsafe_free()
     return state^
@@ -371,6 +381,7 @@ def make_training_state(
     step: Int,
     sampler_rng_state: UInt64 = 0,
     use_master_weights: Int = 0,
+    optimizer_kind: Int = 0,
 ) raises -> TrainingState:
     """Snapshot a DataLoader's position into a `TrainingState` for checkpointing.
     """
@@ -386,6 +397,7 @@ def make_training_state(
         shuffle_rng_state=loader.shuffle_draws,
         current_shard_idx=loader.current_shard_idx,
         current_sample_idx=loader.current_sample_idx,
+        optimizer_kind=optimizer_kind,
     )
 
 
