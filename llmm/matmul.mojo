@@ -484,7 +484,13 @@ def _matmul_cublaslt[
     ld_a: Int = 0,
     ld_b: Int = 0,
     ld_d: Int = 0,
+    alpha: Float32 = 1.0,
+    beta: Optional[Float32] = None,
+    c_ptr: Optional[ImmutKernelPtr[dtype]] = None,
 ) raises:
+    # alpha/beta/c_ptr (Muon Newton-Schulz): D = alpha*op(A)op(B) + beta*C with
+    # a separate C operand (same layout as D) and a single fp32 epilogue.
+    # Defaults (beta=None -> accumulate, c_ptr=None -> C=D) are the old path.
     # General cuBLASLt matmul with fused epilogue, replicating llm.c's
     # matmul_cublaslt. Column-major D[m,n]=op(A)·op(B); the bias (epilogue&4) is
     # per-m and the aux/gelu (epilogue&128) uses ld=m. Descriptors are created/
@@ -665,13 +671,23 @@ def _matmul_cublaslt[
     )
 
     var ws = _cublaslt_workspace(ctx)
-    var alpha = Float32(1.0)
-    var beta = Float32(1.0) if accumulate else Float32(0.0)
+    var alpha_v = alpha
+    var beta_v = Float32(1.0) if accumulate else Float32(0.0)
+    if beta:
+        beta_v = beta.value()
+    var c_raw = d_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin()
+    if c_ptr:
+        c_raw = (
+            c_ptr.value()
+            .unsafe_bitcast[NoneType]()
+            .as_imm()
+            .as_unsafe_any_origin()
+        )
     check_cublas_error(
         cublasLtMatmul(
             lt,
             desc,
-            Pointer(to=alpha)
+            Pointer(to=alpha_v)
             .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
@@ -679,11 +695,11 @@ def _matmul_cublaslt[
             a_l,
             b_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
             b_l,
-            Pointer(to=beta)
+            Pointer(to=beta_v)
             .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
-            d_ptr.unsafe_bitcast[NoneType]().as_imm().as_unsafe_any_origin(),
+            c_raw,
             c_l,
             d_ptr.unsafe_bitcast[NoneType]().as_unsafe_any_origin(),
             d_l,
