@@ -50,6 +50,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`docs/ai/muon_muonclip_implementation_2026-10-29.md`](docs/ai/muon_muonclip_implementation_2026-10-29.md);
   convergence results in
   [`docs/ai/muon_vs_adamw_124m_2026-10-29.md`](docs/ai/muon_vs_adamw_124m_2026-10-29.md).
+  The scope sentence above (Muon raises with ZeRO >= 1) and the QK-clip
+  WORLD_SIZE > 1 raise are superseded by the next entry.
+
+- **Sharded Muon under ZeRO-1/2/3 (2026-10-30, `1d1c67e` .. `3482c54`).**
+  `-opt muon` now runs at WORLD_SIZE > 1 with ZeRO-1, ZeRO-2 and ZeRO-3
+  (streaming and non-streaming). Muon matrices are owned matrix-granularly,
+  `owner(k, l) = (k*L + l) mod W`, in a per-rank owner space (the flat ZeRO
+  shards misalign with the matrices: at 124M W=4 rank 0's shard is all `wte`).
+  Slices: S1 ZeRO-1 (`1d1c67e`), S2 ZeRO-2 (`95a5a2e`; the clip norm adds the
+  owner-space gradient), S3 ZeRO-3 (`7578837`), S4 checkpoints (`021a720`,
+  `2105d06`), S5 QK-clip (`44517a7`, `1a22677`, `a7e1b97`). **QK-clip** now
+  works at WORLD_SIZE > 1: the per-head maxima are made global by a new
+  `ZeroContext.allreduce_max_host`, then the clip runs inside the sharded
+  update (owner-space Q/K and the shard-relative qkv bias) at every ZeRO stage.
+  `enable_qk_clip` still raises for AdamW with ZeRO >= 1 and on the CPU target.
+  `-opt muon -z N` is untested on GPU at WORLD_SIZE > 1: this machine has one
+  GPU, so the GPU collective arms are compile-checked only (a 2-GPU runbook is
+  in the design doc). Verified on the threaded CPU multi-rank harness: ZeRO-1
+  is bit-exact against ZeRO-0 at W=2/4/8; ZeRO-2/3 are bit-exact at step 1
+  except `wte` and within `1e-4` relative over 3 steps (they cannot be
+  bit-exact against ZeRO-0, because `wte` is reduced in two parts); save/resume
+  at W=2 is `cmp`-identical to a continuous run at ZeRO-1/2/3. Per-rank
+  optimizer state at 124M W=4 bf16 falls from 1494 MB (Muon ZeRO-0) to at most
+  586 MB; per-rank traffic is not balanced (rank 0 carries up to +68% in the
+  collectives) and is unmeasured. Open: S6 (2-GPU verification) and S7 (state
+  trim). Design, status and the Opus verification notes per slice:
+  [`docs/ai/zero_sharded_muon_design_2026-10-30.md`](docs/ai/zero_sharded_muon_design_2026-10-30.md);
+  summary and gotchas: section 8 of the campaign report.
+  - **Compact `v` (`b43bfe5`, `684de0c`).** Under Muon, `v` is allocated and
+    checkpointed only for the non-matrix ranges (124M: 497.9 MB to 158.2 MB).
+    `684de0c` adds a state-file size check, and a pre-compact full-`v` Muon
+    file still resumes.
+  - **State-file layout (S4).** A sharded-Muon rank file is header, `m`,
+    compact `v` (`A_r`), then `muon_m` (owner momentum, S elements), with
+    header slots 41 (zero stage), 42 (ownership version) and 43 (S). Length is
+    checked exactly in both directions. AdamW and W=1 / ZeRO-0 Muon files are
+    byte-identical to before (slots 41-43 are zero). Masters are not saved, as
+    for AdamW: fp32 resume is exact, bf16 resume is not bit-exact.
+  - **Resume refusals.** `read_state_checkpoint` refuses a different world size
+    or rank (`89a176c`; this changes AdamW resume for mismatched world sizes),
+    a ZeRO-0 file at ZeRO >= 1 and the reverse, a different ownership version or
+    S, and a truncated or over-long file (`021a720`), all before reading any
+    payload.
+  - **Tuned recipe (sweep, `42a5fbc`, `b05cce0`).** At 300 steps on 124M the
+    best config is `-opt muon -l 4.8e-3 -mu 0.9 -c 0 -gc 0` (val 5.012 against
+    6.118 for an untuned AdamW control); the lr, 8x AdamW's, is the robust
+    finding. For a long run keep `-c 0.1 -gc 1.0` unless re-tested. Single
+    seed. [`docs/ai/muon_hparam_sweep_124m_2026-10-30.md`](docs/ai/muon_hparam_sweep_124m_2026-10-30.md).
+  - **`-D LLMM_INIT_SEED` and `MOJO_DEFINES` (`27975e3`).** The from-scratch
+    init seed is a build-time override (default 42, unchanged), and train and
+    profile builds take `MOJO_DEFINES="-D LLMM_INIT_SEED=1"`.
+  - **`weight_decay` in the trainer setup event (`fc68e8c`).** Run logs now
+    record which `-c` was used.
 
 - **Side-by-side video against llm.c on CPU** (`docs/bench-vs-llmc.mp4`, real
   time, with a 4x GIF preview in the README). llm.c's `train_gpt2.c` (OpenMP,
@@ -235,6 +288,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   docstring, which said it keeps the top 24 bits; it keeps the low 24.
 
 ### Fixed
+
+- **Collective, launcher and resume bugs found while designing sharded Muon
+  (2026-10-30).**
+  - `allgather_ranges` at N > 1 without a coordinator (the sequential-rank
+    harness) treated the local shard as the whole vector and read out of
+    bounds; it now copies only the intersection with its own shard (`7255440`).
+    It also copied a rank's own range onto itself when the destination aliased
+    the shard buffer; that self copy is now skipped on all arms.
+  - `_reducescatter_buckets_gpu` never checked the scratch size. A host-side
+    pre-pass now checks the largest bucket/shard overlap, and a bucket leaving
+    the padded vector raises instead of dropping its tail (`7255440`). The
+    bound is the max over every rank's shard, so all ranks raise together
+    instead of one raising while a peer hangs in the barrier (`02bf799`).
+  - A multi-rank run where a rank failed **exited 0**: both threaded launchers
+    printed `Rank r failed:`, aborted and returned normally, so any exit-code
+    gate passed a dead W > 1 run. They now raise after the join (exit 2)
+    (`ce9f12c`).
+  - Resume silently read a prefix of a state file written at a different world
+    size or at ZeRO-0: `v` was filled from the file's `m` bytes. Resume now
+    refuses a world size or rank mismatch (`89a176c`), any trailing bytes
+    (`02bf799`) and, for every file, a length other than the exact expected one
+    (`021a720`). AdamW resume behaviour changes only for such mismatched files.
 
 - **`make train-cpu` ignored `ARGS`.** It now passes them to the trainer like
   `make train` does.
