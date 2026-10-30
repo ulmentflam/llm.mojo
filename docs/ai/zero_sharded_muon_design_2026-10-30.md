@@ -1009,6 +1009,44 @@ sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.
   tensors; 3 steps at rtol ~1e-4, see T2); T5 at `-z 2`.
 - Also run with grad accumulation (`-d` = 2·B·T·W) in T5 or T2. The owner
   accumulator must `+=` across micro-steps and be zeroed once per step.
+- **Status (fu/zs2, implemented):** `backward`'s per-layer bucket now makes
+  two reduce-scatters when `optimizer_kind == 1`: Call A (the 8 non-Muon
+  tensors, flat shard) and Call B (the 6 matrices, `dest = owner_idx` into
+  `muon_g`, Q/K/V at `pool_slot[qkv] + k*C^2`). The wte two-part reduce is
+  untouched. Details and deviations:
+  - `zero_gradients` zeroes `muon_g_buf` next to `grad_shard_buf` (bucketed
+    path). `enable_muon` now raises only for ZeRO-3 / streaming.
+  - `_update_sharded_muon`: with bucketing, no pack; AdamW reads
+    `grad_shard + shard_rel` (the flat shard's Muon positions stay zero, since
+    Call A skips them); Muon reads `muon_g` as at ZeRO-1. Propagation is the
+    ZeRO-1 pair of `allgather_ranges` calls.
+  - **The grad norm needed the "two-term" fix** (`calculate_grad_norm`): at
+    ZeRO-2 Muon the clip norm is `sumsq(grad_shard) + sumsq(muon_g)` before the
+    scalar allreduce (`_grad_sumsq` helper). Without it the Muon matrices
+    would be missing from the norm.
+  - T2 (`tests/test_zero_muon.mojo`, threaded CPU, different batch per rank):
+    step 1 bit-exact vs ZeRO-0 for every tensor except wte (wte max rel diff
+    1.0e-7 to 4.1e-7); 3 steps pass `|a-b| <= 1e-4|a| + 1e-6`. Measured:
+    W=2: max rel (|p| >= 1e-2) 1.8e-7, max abs 1.5e-8; W=4: 3.4e-5, 6.6e-7;
+    W=8 L=1 (ranks 6, 7 own nothing): 4.1e-6, 1.3e-7. **A pure rtol 1e-4 does
+    not hold**: at W=4 element 1884 (a qkv weight that happens to sit near 0,
+    4.7887e-5 vs 4.7831e-5) is off by 5.6e-8 absolute, 1.2e-3 relative. That
+    is fp32 cancellation noise after the wte difference feeds step 2/3
+    gradients (step 1 is exact elsewhere, and ZeRO-1 stays bit-exact); the
+    absolute gate of 1e-6 is ~100x below one lr=1e-3 step, so a wrong gradient
+    still fails it.
+  - T5 at `-z 2 -opt muon` (W=2, d6, 3 steps): 10.865850, 10.716245,
+    10.648577, identical to `-z 0`/`-z 1`. `-opt adamw -z 2` unchanged
+    (10.865850, 10.369871, 10.128281).
+  - Not done: the grad-accumulation case (`-d`); `+=` across micro-steps is
+    the existing reduce-scatter semantics, but no test covers it with Muon.
+  - **For S3 (streaming):** during `update`, params live in `params_memory`
+    (fully resident at ZeRO-1/2; the owner's authoritative copy of its
+    matrices is `muon_p_shard`, and `params_memory` is refreshed from it by the
+    owner-space gather). At ZeRO-3 streaming only the flat shard
+    `params_memory[0:opt]` is resident, so the owner must hold current params
+    (and the bf16 fp32 master) in `muon_p_shard` / `muon_master` seeded by the
+    W-round gather; there is no propagation after the update.
 
 **S3: ZeRO-3** (`_z3_stream_layer` split, `_z3_gather_full` split, W-round
 streaming seed, the ZeRO-3 arms of `_update_sharded_muon` for streaming and
