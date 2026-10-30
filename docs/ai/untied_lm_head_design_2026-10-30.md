@@ -916,6 +916,35 @@ S2 generation 2 (tests and GPU gates):
 - S3 inherits: ZeRO-1 at W>1 with the head active is untested; ZeRO >= 2 is
   refused until S6.
 
+S2 independent verification (2026-10-30, separate agent, rebuilt and rerun):
+- Code read of `ea49594..e9f4051`: every LM-head forward/backward branch
+  (K=1, vocab-tiled, chunked CE) reads `_head_param_ptr()` / `_lm_head_tile`
+  and writes `_head_grad_ptr()`; remaining `params.wte`/`grads.wte` uses are
+  the encoder, the encoder bucket, the ZeRO-3 embed window (refused while the
+  head trains), and the debug non-finite probe (scans `wte` only; debug
+  build). The five `update()` sites pass the right `flat_lo`; Muon ranges
+  and sharded segments never straddle the head offset. Tied build: helpers
+  fall through to `wte` and the 4-config tied 3-step CPU run (AdamW gc 1,
+  gc 1e-3, gc 1e-3 + wd 0.1, Muon gc 1e-3) is `cmp`-identical (model and
+  state) to the fe3312a binary.
+- Gaps found and closed with tests: nothing tested `-l_head` or the
+  17-tensor clip norm (new `test_untied_head_lr_mult`,
+  `test_untied_grad_norm_covers_head`); the planted split test's inputs were
+  exactly vocab tile 0, so a tile-0 misroute into `grads.wte` passed it
+  (inputs now leave absent rows in every tile). Mutants: `_head_grad_ptr ->
+  grads.wte` fails the split test, lr-mult and norm tests and verify-untied-cpu;
+  body lr on the head in `_adamw_flat` fails `test_untied_head_lr_mult` (and a
+  2-step `-l_head 0` run moves 19.3M head elements vs 0); tile-0 misroute fails
+  the split test and verify-untied-cpu; 16-tensor norm fails
+  `test_untied_grad_norm_covers_head` only (verify-untied-cpu passes it).
+- Threaded CPU W=2 smoke (d6 from a trained tied start, 3 steps, gc 1e-3,
+  wd 0.1): ZeRO-1 == ZeRO-0 bit-exact for all 17 tensors, AdamW and Muon.
+  W=2 vs W=1 with the same -d differs by ~1.7e-3 max abs in the tied build
+  too (the two runs do not see the same micro-batch order), so that pair is
+  not an equivalence check.
+- `LLMM_LOG_LEVEL=quiet` prints the `result` verdict of test_gpt2 with no
+  fields (gate/status are NORMAL-level fields); exit codes still gate.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Opus agent), directed by Evan Owen.
