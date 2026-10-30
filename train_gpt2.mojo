@@ -225,6 +225,7 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #   LLMM_FP4_NO_RHT=1          ablation: disable the Wgrad random Hadamard
 #                              transform. llmm/matmul.mojo.
 # Stochastic rounding
+#   LLMM_INIT_SEED=<int>       from-scratch weight-init seed, default 42.
 #   LLMM_SR_MASTER=1           SR on the master->bf16 param store (llmm/adamw.mojo).
 #   LLMM_SR_SEED=<int>         shared SR seed, default 1746221221 (adamw +
 #                              nvfp4; decorrelated by stream id, see
@@ -344,7 +345,7 @@ comptime UNROLL = 4
 # From-scratch init draws the same random numbers as llm.c (and PyTorch) so the
 # initial weights are bit-identical: seed 42, weights ~N(0, 0.02), the residual
 # projections additionally scaled by 1/sqrt(2*L). See gpt_build_from_descriptor.
-comptime INIT_RNG_SEED = 42
+comptime INIT_RNG_SEED = get_defined_int["LLMM_INIT_SEED", 42]()
 comptime INIT_WEIGHT_STD = Float32(0.02)
 # GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
 comptime SCRATCH_VOCAB_SIZE = 50257
