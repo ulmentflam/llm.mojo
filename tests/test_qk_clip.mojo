@@ -540,7 +540,12 @@ def test_gpt2_qk_clip_end_to_end() raises:
 # ---------------------------------------------------------------------------
 
 comptime MT = 16
-comptime MV = 64
+# MV = 192 puts a rank boundary of the flat optimizer shard (n / 2 at W=2,
+# n / 4 * 2 at W=4, n = 9920) INSIDE the [L, 3C] qkv bias, so one rank's bias
+# slice starts mid-bias (nonzero rel_start, beginning on layer 0's V rows):
+# the sharded bias clip's layer/row arithmetic is exercised, not just a
+# whole-bias slice at rel_start 0.
+comptime MV = 192
 comptime ML = 2
 comptime MNH = 2
 comptime MC = 16
@@ -705,6 +710,13 @@ def _mclip_case[W: Int](stage: Int) raises:
     var C = MC
     var w_off = MV * C + MT * C + 2 * ML * C
     var b_off = w_off + ML * 3 * C * C
+    # Keep the straddle described at MV (shards are n / W rounded up to the
+    # SIMD width; n / W is a multiple of 16 here so the rounding is a no-op).
+    var boundary = (W // 2) * ((n + W - 1) // W)
+    assert_true(
+        b_off < boundary and boundary < b_off + ML * 3 * C,
+        "qkv bias no longer straddles a shard boundary",
+    )
     var want = heap_alloc[Float32](n)
     for i in range(n):
         want[unsafe_offset=i] = unclipped[unsafe_offset=i]
@@ -730,7 +742,6 @@ def _mclip_case[W: Int](stage: Int) raises:
     # Hot heads (0,1) and (1,0): Q and K rows (hd rows x (C weights + bias)).
     assert_equal(n_changed, 2 * 2 * hd * (C + 1))
     for r in range(W):
-        assert_equal(qmax[unsafe_offset=r], Float32(20.0))
         for i in range(n):
             var a = want[unsafe_offset=i]
             var b = got[unsafe_offset=r * n + i]
@@ -749,6 +760,10 @@ def _mclip_case[W: Int](stage: Int) raises:
                     + " vs "
                     + String(b)
                 )
+    # After the bit-exact params check, so a local-max collective is reported
+    # by the params mismatch first; qk_max() must also be the GLOBAL max.
+    for r in range(W):
+        assert_equal(qmax[unsafe_offset=r], Float32(20.0))
     want.unsafe_free()
     gmax.unsafe_free()
     unclipped.unsafe_free()
