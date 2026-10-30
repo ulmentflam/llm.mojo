@@ -1001,6 +1001,55 @@ sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.
     sequential harness) was not extended; T2 covers the same ground with real
     collectives, and the harness cannot see propagation bugs. The multi-GPU
     arms stay compile-checked only.
+- **Verification (fu/zs1, Opus reviewer):** the implementation conforms to
+  sections 2 to 6. Two defects outside the update path are fixed on top, and
+  one test was added.
+  - **Checks that held.** Ownership, S, `O_r` and `A_r` match an independent
+    Python model at 124M W=2/4/8, d6 and the tiny configs (L=1 W=8 rank 5,
+    L=2 W=8 ranks 4 and 6 have `A_r = 0`). A new test,
+    `test_ownership_sizes_tiny_w8`, pins those values. It also checks the
+    segment invariants: nonempty, ascending, `shard_rel = flat_start - lo`,
+    `compact_off` is the prefix sum. Neither `_update_hybrid` nor
+    `v_compact_bases` is on the sharded path. The SR counter is
+    `sr_offset + mat*sr_stride + i` on both CPU and GPU, and
+    `sr_offset + j*sr_stride` is the flat offset of the owner's j-th matrix.
+    This is confirmed by reading and by a compile of
+    `-D LLMM_BF16=1 -D LLMM_SR_MASTER=1 -D WORLD_SIZE=2`. A bf16 SR
+    W=1-vs-W>1 run is still UNVERIFIED. The ZeRO-1 owners pack the
+    all-reduced `grads_memory` with the same scaled `grad_scale` as AdamW.
+  - **The synchronize after the pack is a real fence.** CPU `adamw_update`
+    and the CPU Muon path run directly on the calling thread, but CPU
+    `enqueue_copy` is queued. Removing the synchronize failed T2 in 8 of 10
+    runs, at W=2, 4 and 8. With it in place, T2 passed 20 of 20 runs.
+  - **T2 mutants.** These were caught: owner gather skipped (all three
+    sizes); `compact_off` not advanced (W=2 and W=4); a wrong `l0` in the
+    owned groups (W=4, plus the ownership-table test). The W=8 L=1 case has
+    at most one AdamW segment per rank, so it cannot see segment-offset bugs.
+    Indexing `m` by `compact_off` instead of `shard_rel` passes, but that is
+    an equivalent mutant under fp32 with no checkpoint: it is a consistent,
+    disjoint relayout. It would break bf16 (`master` seeding is by
+    `shard_rel`) and S4/S7 state files.
+  - **Fixed: sharded Muon failed only at the first save.** With `-n`, the
+    run trained up to the first save step and then raised. With `-y`, it
+    raised at load. `train()` now refuses `-opt muon -z >= 1` at W>1 with
+    `-o` plus `-n > 0` or `-y 1` up front. The method-level raises in
+    `write_checkpoint` and `load_checkpoint` stay.
+  - **Fixed: a failed threaded multi-rank run exited 0.** Both
+    `sync_parallelize` launchers in `main` (CPU and GPU) printed
+    `Rank r failed:`, aborted the coordinator and returned normally, so
+    every exit-code gate passed on a dead W>1 run. This predates S1.
+    `_raise_if_rank_failed` now raises after the join (exit 2).
+  - Gates, rerun at `ce9f12c` with the binary mtime checked after each
+    `make -B build-train`: `make test-mojo` gave `tests result=pass files=26
+    passed=204 skipped=1 failed=0`, with test_zero_muon at 5 passed.
+    `make verify` gave `result gate=cpu status=pass` and
+    `result gate=gpu status=pass`. `make lint` passed, and
+    `tests/test_muon_equivalence.py` gave 89 passed on the GPU. T5 losses
+    reproduced exactly (`-opt muon -z 1` and `-z 0`: 10.865850, 10.716245,
+    10.648577; `-opt adamw -z 1`: 10.865850, 10.369871, 10.128281; AdamW
+    `-z 1` save at step 2 then `-y 1` gives step 3 = 10.128281). W=1 GPU
+    Muon (d6, B=4, T=256, 5 steps) prints the same losses as main's
+    `e4d91d3` binary.
 
 **S2: ZeRO-2** (`backward` per-layer bucket split; `zero_gradients`;
 `calculate_grad_norm` two-term norm; the ZeRO-2 arm of `_update_sharded_muon`).
@@ -1113,3 +1162,5 @@ The prior-art table was compiled by a research subagent from the cited papers
 and repository source.
 The independent review (generations 1 and 2) was done with AI assistance
 (Claude Code, Opus agents), directed by Evan Owen.
+The S1 implementation (Sonnet agent) and its verification (Opus agent) were
+done with AI assistance (Claude Code), directed by Evan Owen.
