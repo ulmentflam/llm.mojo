@@ -93,5 +93,40 @@ def test_wsd_defaults_match_original_formula() raises:
             assert_equal(_lr(s, step), expect)
 
 
+def test_cooldown_one_decays_from_step_zero() raises:
+    # cooldown 1.0 -> decay_point 0: linear from step 0, r = step/10, floor 0.
+    var s = LearningRateScheduler("wsd", 1.0, 0, 10, 0.0, 1.0, "linear")
+    assert_almost_equal(_lr(s, 0), 1.0, atol=1e-6)
+    assert_almost_equal(_lr(s, 5), 0.5, atol=1e-6)
+    assert_almost_equal(_lr(s, 9), 0.1, atol=1e-6)
+
+
+def test_single_step_run() raises:
+    # N=1: decay_point 0 under the default cooldown, ratio 0 -> full lr.
+    var s = LearningRateScheduler("wsd", 1.0, 0, 1, 0.0)
+    assert_almost_equal(_lr(s, 0), 1.0, atol=1e-6)
+    var t = LearningRateScheduler("wsd", 1.0, 0, 1, 0.0, 0.4, "linear")
+    assert_almost_equal(_lr(t, 0), 1.0, atol=1e-6)
+
+
+def test_linear_matches_speedrun_form_at_ranking_configs() raises:
+    # The W3 ranking runs (N=300, cooldown 0.4 and 0.45, floor 0.1) against
+    # modded-nanogpt's multiplier, computed independently here in Float64:
+    # w = min((1 - step/N) / cooldown, 1); mult = w + (1 - w) * floor.
+    # N*cooldown is an integer for both, so the curves agree to f32 rounding
+    # at every step; an off-by-one decay point moves some step by >= 1/120 of
+    # the 0.9 range (~7.5e-3), a dropped floor or a sqrt shape by far more.
+    var cds = [0.4, 0.45]
+    for ci in range(2):
+        var cd = cds[ci]
+        var s = LearningRateScheduler(
+            "wsd", 1.0, 0, 300, 0.1, Float32(cd), "linear"
+        )
+        for step in range(300):
+            var w = min((1.0 - Float64(step) / 300.0) / cd, 1.0)
+            var expect = w + (1.0 - w) * 0.1
+            assert_almost_equal(Float64(_lr(s, step)), expect, atol=1e-6)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
