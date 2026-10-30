@@ -113,16 +113,29 @@ training log back from any of the four formats.
 Optimizer: AdamW is the default and its path is unchanged. `-opt muon` (env `LLMM_OPTIMIZER`) is
 opt-in and switches the attention and MLP weight matrices to Muon (Newton-Schulz-orthogonalized
 momentum, Moonlight scaling, so `-l` and `-c` are shared with AdamW; `-mu` sets the momentum,
-default 0.95) and keeps embeddings, biases and LayerNorm on AdamW. Muon is single-GPU/ZeRO-0 (it
-raises with WORLD_SIZE > 1 and ZeRO >= 1) and its GPU path needs cuBLASLt (NVIDIA); the CPU path is
-a naive reference (~124 s/step at 30M params), not for training. `-qk_clip <tau>` (env
-`LLMM_QK_CLIP`, 0 = off) rescales any attention head whose max logit exceeds `tau`, with either
-optimizer; it is GPU-only and WORLD_SIZE 1, and `qk_max=` is printed only at verbose level. The
-pretrained GPT-2 124M already exceeds `tau=100` (max logit ~110), so it clips on step 1 of a
-fine-tune. A checkpoint cannot be resumed with the other optimizer. The overhead is a fixed cost per
-step: ~1% at 131k tokens/step (29% only at the 4k-token smoke config). Implementation, verification
-against three references and the perf pass:
+default 0.95) and keeps embeddings, biases and LayerNorm on AdamW. The GPU path needs cuBLASLt
+(NVIDIA); the CPU path is a naive reference (~124 s/step at 30M params), not for training. Muon
+works with ZeRO-1, 2 and 3 (matrix-granular ownership, so each rank orthogonalizes whole matrices).
+That is verified on the CPU multi-rank harness on one box, which exercises it without a second GPU:
+`make train-cpu WORLD_SIZE=2 ARGS="... -pn 2 -z N -opt muon"`. GPU at WORLD_SIZE > 1 is
+compile-checked only and a 2-GPU smoke is pending (a runbook is in the design doc). Tuned recipe
+(124M, 300 steps, ranking study at one seed): `-opt muon -l 4.8e-3 -mu 0.9 -c 0 -gc 0` reached val
+5.01 against 6.12 for an untuned AdamW control; the lr (8x AdamW's) is the robust part. For a long
+run keep `-c 0.1 -gc 1.0` unless you re-test. `-qk_clip <tau>` (env `LLMM_QK_CLIP`, 0 = off)
+rescales any attention head whose max logit exceeds `tau`; it is GPU-only, works with Muon at every
+ZeRO stage and with either optimizer at ZeRO-0, and still raises for AdamW with ZeRO >= 1. `qk_max=`
+is printed only at verbose level. The pretrained GPT-2 124M already exceeds `tau=100` (max logit
+~110), so it clips on step 1 of a fine-tune. Checkpoints: a state file cannot be resumed with the
+other optimizer, at another world size or rank, or across ZeRO-0 and ZeRO >= 1 for sharded Muon
+(each is refused before any state is read); AdamW and single-GPU Muon files are byte-identical to
+before. The overhead is a fixed cost per step: ~1% at 131k tokens/step (29% only at the 4k-token
+smoke config). `-D LLMM_INIT_SEED=N` (via `MOJO_DEFINES="-D LLMM_INIT_SEED=N"`) overrides the
+from-scratch init seed for multi-seed runs. Implementation, verification and the perf pass:
 [`docs/ai/muon_muonclip_implementation_2026-10-29.md`](docs/ai/muon_muonclip_implementation_2026-10-29.md);
+sharded design and per-slice verification:
+[`docs/ai/zero_sharded_muon_design_2026-10-30.md`](docs/ai/zero_sharded_muon_design_2026-10-30.md);
+hyperparameter sweep:
+[`docs/ai/muon_hparam_sweep_124m_2026-10-30.md`](docs/ai/muon_hparam_sweep_124m_2026-10-30.md);
 convergence vs AdamW:
 [`docs/ai/muon_vs_adamw_124m_2026-10-29.md`](docs/ai/muon_vs_adamw_124m_2026-10-29.md).
 

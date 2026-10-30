@@ -14,8 +14,17 @@ marked **UNVERIFIED**.
 
 ## Status
 
-- **DESIGN ONLY.** No code changed.
-- **Run on this box (fp32 CPU build, `make build WORLD_SIZE=2`, binary mtime
+- **IMPLEMENTED (2026-10-30), merged to `main` at `3482c54`.** This document
+  began as design only; the intro paragraph above ("Nothing here has been
+  implemented yet") and the bullets below dated to that point describe the
+  state at `2e1913d`. Slices S0 to S5 (S5 including the ZeRO-2/3 lift in
+  `fu/qklift`) landed, each with a status and an independent verification note
+  in section 9. Verified on the threaded CPU multi-rank harness only; GPU at
+  WORLD_SIZE > 1 is compile-checked, and S6 (2-GPU verification) and S7 (state
+  trim; its section 9 bullet is being edited separately) are open. Summary and
+  lessons: section 8 of
+  [`muon_muonclip_implementation_2026-10-29.md`](muon_muonclip_implementation_2026-10-29.md).
+- **Run on this box, at `2e1913d` before any slice (fp32 CPU build, `make build WORLD_SIZE=2`, binary mtime
   checked after the build):**
   - `make train-cpu WORLD_SIZE=2 ARGS="-e d6 -i <tinyshakespeare> -b 1 -t 64 -x 3 -z {0,3} -pn 2 -v 0 -s 0"`
     and `-x 2 -z {1,2}` all run, at about 0.25 to 0.4 s/step. Steps 1 and 2
@@ -24,8 +33,8 @@ marked **UNVERIFIED**.
     including ZeRO-3 streaming (a coordinator is present, so
     `_z3_want_streaming` is true), works here end to end. It is the
     integration gate for every slice.
-  - `-z 1 -opt muon` at WORLD_SIZE=2 fails on both ranks with the phase-1
-    error, as expected.
+  - `-z 1 -opt muon` at WORLD_SIZE=2 failed on both ranks with the phase-1
+    error, as expected (no longer true: it runs).
 - **Cannot run here:** any GPU collective at N >= 2. `ensure_comm_setup` needs
   a coordinator and builds `DeviceContext(device_id=i)` for every rank
   (llmm/zero.mojo:`ensure_comm_setup`), and this box has one GPU. See section 8.
