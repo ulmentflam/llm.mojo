@@ -143,7 +143,7 @@ def _train[
                 # vector (collective: every rank) and check that the owner
                 # space and the next forward's gathered windows agree
                 # bit-exactly for the Muon matrices.
-                // Sized to the live model: an untied build gathers N16 + head.
+                # Sized to the live model: an untied build gathers N16 + head.
                 var full = model.ctx.enqueue_create_buffer[GPT2_DTYPE](
                     model.num_parameters
                 )
