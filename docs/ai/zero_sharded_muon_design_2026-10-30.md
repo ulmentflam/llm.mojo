@@ -1304,6 +1304,122 @@ non-streaming).
   fu/zs0's `num_processes`/`process_rank` check is already on main, keep it
   and add only the remaining refusals.
 - Gate: T6.
+- **Status (fu/zs4): implemented.** Layout of a sharded-Muon rank file:
+  header (slots 2 W, 3 rank, 40 kind=1, **41 zero_stage, 42
+  muon_ownership_version=1, 43 S**) + `m` (opt, fp32) + `v` (A_r, compact) +
+  `muon_m` (S, fp32). Length `256*4 + (opt + A_r + S)*4`. AdamW and W=1 /
+  ZeRO-0 Muon files write zeros in 41-43 and are byte-identical to before.
+  **Master policy: `muon_master` is not saved** (as `master_buf` is not); on
+  resume `muon_p_shard` is re-seeded from the loaded full params and
+  `muon_master` is rebuilt from it, so bf16 resume is not bit-exact and fp32 is.
+  `read_state_checkpoint` takes `muon_m_out` + `expect_muon_shard_elems`,
+  refuses owner/replicated layout mismatch (so ZeRO-0 file at ZeRO>=1 and the
+  reverse), ownership version or S mismatch, and checks the file length exactly
+  (header + m + v [+ muon_m]) in both directions with actual vs expected bytes;
+  this replaced the "Failed to read enough bytes" and trailing-byte messages.
+  `load_checkpoint` keeps the legacy full-v copy-down at ZeRO-0 only. The stage
+  recorded in slot 41 is informational; ZeRO-1/2/3 share the layout.
+  Verified: unit T6 `test_state_checkpoint_sharded_muon_t6` (stage list
+  `[1, 2, 3]`; S2/S3 need no change here), and end to end at threaded CPU W=2
+  `-z 1`: `-x 2` then `-y 1 -x 4` gives losses 10.648577, 10.410458 for steps
+  3-4, equal to a continuous `-x 4` run, and the step-4 model and both state
+  files are byte-identical (`cmp`). Refused: `-z 0` resume of the `-z 1` files,
+  W=1 resume of W=2 files, a file 4 bytes short (both byte counts printed).
+- **Verification (fu/zs4, Opus reviewer, 2026-10-30).** Rebuilt and reran
+  everything below on fu/zs4 (2105d06 + comment fixes); binary mtimes checked
+  after each `make -B`.
+  - Gates: `make lint` exit 0; `make test-mojo` exit 0, `tests result=pass
+    files=26 passed=211 skipped=1 failed=0` (test_checkpointing 14/14; T6 =
+    `test_state_checkpoint_sharded_muon_t6`, plus
+    `test_state_header_plain_files_unchanged`, each also run alone with
+    `--only`); `make verify` exit 0, `result gate=cpu status=pass`,
+    `result gate=gpu status=pass`; `make -B build-bf16` exit 0.
+  - Byte identity vs main: trainers built from 20c4769 sources (`git archive`,
+    same toolchain) and from fu/zs4, CPU d6 `-x 2 -n 2`. `cmp` of
+    `model_2.bin` and `state_2_0.bin`: identical for AdamW W=1, Muon W=1 and
+    AdamW W=2 `-z 1` (both rank files). Slots 41-43 are 0 in all of them.
+  - Sharded layout: W=2 `-z 1` rank files have slots (2,3,40,41,42,43) =
+    (2,r,1,1,1,5308416) and sizes 142664704 / 100197376 bytes; rank 1 is
+    `1024 + (15178752 + 4561920 + 5308416)*4` exactly.
+  - Save/resume, threaded CPU W=2 `-z 1` Muon: `-x 2` then `-y 1 -x 4` gives
+    steps 3-4 = 10.648577, 10.410458, exit 0; continuous `-x 4` prints the same
+    and `model_4.bin`, `state_4_0.bin`, `state_4_1.bin` are `cmp`-identical.
+    AdamW W=2 `-z 1`: resumed steps 3-4 = 10.128281, 9.916376, identical files.
+    W=1 Muon: 10.794926, 10.554329, files identical to continuous. A legacy
+    full-v file (2e1913d sources, 242861056 bytes, i.e. `1024 + 2*opt*4`)
+    resumes with the same two losses and a `model_4.bin` identical to the
+    continuous run. Note: `-y 1` re-saves the resume step at loop start, so the
+    step-N files in a resumed dir are rewritten (in the current layout).
+  - Refusals (make exit 2; direct binary exit 1): `-z 0` resume of `-z 1`
+    files ("holds owner-local Muon momentum ... expects the replicated
+    layout"); W=1 resume of W=2 files ("written by rank 0 of 2 process(es) but
+    this run is rank 0 of 1"); rank 1 file 4 bytes short ("is 100197372 bytes,
+    expected 100197376 (m=15178752, v=4561920, muon_m=5308416 elements)").
+    Reverse direction: a W=2 `-z 0` Muon file at `-z 1` ("has no owner-local
+    Muon momentum"), and a W=2 `-z 0` AdamW file at `-z 1` ("is 242861056
+    bytes, expected 121431040"), which is the AdamW behaviour change.
+  - Mutant: one `muon_m` element of rank 0's step-2 file set from 4.6e-7 to
+    1.0. The resumed run exits 0; steps 3-4 print the same losses (step 3's
+    loss is computed before the step-3 update, and one warmup-lr step moves
+    the loss below print precision) but `model_4.bin` differs from continuous
+    in 19,861,728 of 30,357,504 params (max |diff| 1.8e-3, largest in layer 0's
+    qkv), and the step-4 `muon_m[0]` is 0.9029 vs -1.29e-5. The blob is read
+    and used.
+  - bf16 (W=1, GPU, gpt2_124M_bf16): Muon `-x 4 -n 2` then `-y 1 -x 6` exit 0,
+    steps 5-6 = 3.756170, 3.979250, `done steps=6`; AdamW the same, 3.673406,
+    3.937004. The sharded bf16 path (`_load_muon_owner_state`'s master rebuild)
+    needs W > 1 on GPU and is not run here.
+  - Code order in `load_checkpoint`: model file read and copied to device
+    first (unchanged from main), then the optimizer_kind peek, then
+    `read_state_checkpoint`: world/rank, owner layout, version/S, exact length,
+    and only then the m, v, muon_m blobs. No state payload is read before a
+    refusal; params are already overwritten when a refusal raises, which only
+    matters to in-process callers that catch the error (train() exits).
+  - Master policy confirmed: `_load_muon_owner_state` re-seeds `muon_p_shard`
+    from the loaded host vector `host_params` (not `params_memory`), runs after
+    `enable_muon` (train() calls it before `load_checkpoint`), and rebuilds
+    `muon_master` from the same vector under bf16 (padding zeroed).
+  - Fixes in this pass: two stale comments (the legacy copy-down pointed at a
+    size check that moved into `read_state_checkpoint`; the trailing-byte
+    read is now a backstop behind the exact length check). No behaviour
+    change.
+  - Integration with S2/S3 (not on this branch): S2 needs no checkpoint
+    change. S3 makes the owner space authoritative at ZeRO-3 and drops the
+    post-update propagation, so the flat shard's Muon ranges go stale.
+    `write_checkpoint` under streaming still gets correct full params because
+    S3's `_z3_gather_full` gathers the matrices from `muon_p` (second gather).
+    `load_checkpoint` under streaming copies only the flat shard into
+    `params_memory`, but must keep passing the full host vector `host_params`
+    to `_load_muon_owner_state`; never `params_memory`. The merge must also
+    keep S3's `enable_muon` seeding (W rounds under streaming) before the
+    load, and the T6 stage list stays `[1, 2, 3]`. End to end, the merge must
+    add threaded CPU W=2 `-z 2` and `-z 3` Muon save/resume runs (`-x 2`, then
+    `-y 1 -x 4`, vs continuous `-x 4`, `cmp` model and both state files), and
+    a cross-stage resume (`-z 1` files at `-z 3`), which the layout allows.
+- **Integration (fu/zs4int, S4 onto main 537a850 with S2+S3, 2026-10-30).**
+  Merge resolutions: `enable_muon` = S3's (W-round seeding, `ensure_comm_setup`
+  before the seed, no raise); `write_checkpoint`/`load_checkpoint` = S4's logic
+  (streaming `write_checkpoint` goes through S3's split `_z3_gather_full`;
+  `_load_muon_owner_state(host_params, host_mu)` gets the full host vector
+  after seeding); train() refusal block stays removed; `_update_sharded_muon`
+  = S3+S5; `llmm/checkpointing.mojo` and `tests/test_checkpointing.mojo` = S4;
+  `tests/test_zero_muon.mojo` = main. Git merged without textual conflicts.
+  Gates on the merged tree: `make test-mojo` `tests result=pass files=26
+  passed=219 skipped=1 failed=0` (test_checkpointing 14/14, test_zero_muon
+  13/13); `make verify` cpu+gpu pass; `make lint` exit 0; `make build-bf16`
+  exit 0. Threaded CPU W=2 d6 Muon `-x 2 -n 2` then `-y 1 -x 4` vs continuous
+  `-x 4`: `-z 1`, `-z 2` and `-z 3` give step 3 = 10.648577 in resumed and
+  continuous runs; step 4 prints 10.410458 resumed vs 10.410459 continuous at
+  `-z 2`/`-z 3` (1e-6 print-level difference in the logged loss; `-z 1` is
+  10.410458 in both) and `cmp` of model_4.bin, state_4_0.bin, state_4_1.bin is identical
+  in all three. Cross-stage: `-z 1` step-2 files resumed at `-z 3` load and
+  give 10.648577, 10.410458, the same as the `-z 1` continuous run. Regression:
+  AdamW W=2 `-z 2` resume bit-exact (cmp), W=1 Muon resume bit-exact (cmp),
+  W=1 GPU Muon 5 steps 4.287241, 3.985745, 4.111457, 3.619328, 3.700196.
+  Observed flake (pre-existing, not S4): a resume with `-n k` dividing the
+  resume step rewrites that step's `model_k.bin` while the other rank may
+  still be reading it; one run under heavy parallel load failed rank 1 with
+  "Failed to read enough bytes" and passed on rerun.
 
 **S5: QK-clip multi-rank** (`allreduce_max_host`; the clip inside
 `_update_sharded_muon`; `enable_qk_clip` scope).
