@@ -230,19 +230,58 @@ MUON_CASES: tuple[MuonCase, ...] = (
 def newton_schulz(
     u: torch.Tensor, steps: int = 5, ns_dtype: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
-    """Orthogonalise fp32 `u` (rows x cols); returns fp32 O of the same shape."""
+    """Orthogonalise fp32 `u` (rows x cols); returns fp32 O of the same shape.
+
+    Models what the kernel does with cuBLAS(Lt) bf16 GEMMs: operands are bf16,
+    products accumulate in fp32, the `b*A + c*A@A` / `a*X + B@X` epilogues
+    (GEMM beta) are fp32, and each GEMM output is rounded to bf16 once. The
+    1/(||X||+eps) scale is fp32 applied to bf16 X and rounded once (the norm
+    itself is never rounded to bf16). With ns_dtype=float32 nothing rounds.
+    """
     rows, cols = u.shape
-    x = u.to(ns_dtype)
-    x = x / (x.float().norm() + 1e-7).to(ns_dtype)
+
+    def rnd(t: torch.Tensor) -> torch.Tensor:
+        return t.to(ns_dtype).float()
+
+    x = rnd(u)
+    x = rnd(x / (x.norm() + 1e-7))
     if rows > cols:
         x = x.T
     for _ in range(steps):
-        a = x @ x.T
-        b = NS_B * a + NS_C * (a @ a)
-        x = NS_A * x + b @ x
+        a = rnd(x @ x.T)
+        b = rnd(NS_B * a + NS_C * (a @ a))
+        x = rnd(NS_A * x + b @ x)
     if rows > cols:
         x = x.T
-    return x.float()
+    return x.contiguous()
+
+
+def effective_hp(case: MuonCase) -> MuonParams:
+    """Hyperparameters as the kernel sees them.
+
+    The op contract passes lr/momentum/weight_decay/grad_scale as
+    `Scalar[dtype]`, so a bf16 case hands the kernel bf16-rounded values
+    (momentum 0.95 -> 0.94921875) that it then promotes to fp32. The reference
+    must use the same values or a correct kernel fails the momentum check.
+    """
+    hp = case.hp
+
+    def rnd(v: float) -> float:
+        return float(torch.tensor(v).to(case.torch_dtype).float())
+
+    return MuonParams(
+        lr=rnd(hp.lr),
+        momentum=rnd(hp.momentum),
+        weight_decay=rnd(hp.weight_decay),
+        grad_scale=rnd(hp.grad_scale),
+        ns_steps=hp.ns_steps,
+        nesterov=hp.nesterov,
+    )
+
+
+def muon_scale(rows: int, cols: int) -> float:
+    """Moonlight RMS rule."""
+    return 0.2 * max(rows, cols) ** 0.5
 
 
 def _muon_inputs(case: MuonCase) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -257,10 +296,10 @@ def _muon_inputs(case: MuonCase) -> tuple[torch.Tensor, list[torch.Tensor]]:
 
 def _muon_run(case: MuonCase, ns_dtype: torch.dtype):
     init, grads = _muon_inputs(case)
-    hp = case.hp
+    hp = effective_hp(case)
     w = init.clone()
     m = torch.zeros(case.rows, case.cols, dtype=torch.float32)
-    scale = 0.2 * (max(case.rows, case.cols) ** 0.5)
+    scale = muon_scale(case.rows, case.cols)
     traj, moms = [], []
     for G in grads:
         g = hp.grad_scale * G.float()
@@ -295,16 +334,63 @@ def simulate_muon(case: MuonCase) -> dict[str, np.ndarray]:
 
 
 def muon_tolerance(case: MuonCase, ref: dict[str, np.ndarray]) -> float:
-    """atol = 2*max(spread_bf16_vs_fp32, 1e-6) + rtol*max|W|.
+    """Trajectory atol = 2*max(spread_bf16_vs_fp32, 1e-6) + rtol*max|W|.
 
-    The kernel's bf16 GEMMs round differently from torch's, so the allowed
-    error is derived from how far torch's own bf16 NS already sits from fp32 NS.
-    rtol is 1e-3 (fp32) / 8e-3 (bf16: one param ulp).
+    rtol is 1e-3 (fp32) / 8e-3 (bf16: one param ulp). This is a whole-loop
+    smoke test (momentum feedback, weight decay, store path), NOT the NS gate:
+    with lr=0.02 one Muon step moves W by less than a bf16 ulp at |W|~2, so in
+    bf16 a kernel that skips Newton-Schulz or uses the wrong scale stays inside
+    this atol. `muon_direction_tolerance` is what pins the update direction.
     """
     rtol = 8e-3 if case.dtype == "bfloat16" else 1e-3
     spread = float(ref["spread"])
     wmax = float(np.max(np.abs(ref["trajectory"])))
     return 2 * max(spread, 1e-6) + rtol * wmax
+
+
+def muon_direction_inputs(
+    case: MuonCase, k: int
+) -> tuple[np.ndarray, np.ndarray, torch.Tensor]:
+    """(m before step k, grad k in storage dtype, fp32 U of step k) under the
+    kernel's effective hyperparameters. k >= 1 makes M != g, so a kernel that
+    drops the Nesterov term points somewhere else (at k=0 U is just (1+mu)g)."""
+    hp = effective_hp(case)
+    _, grads = _muon_inputs(case)
+    m = torch.zeros(case.rows, case.cols, dtype=torch.float32)
+    for G in grads[:k]:
+        m = hp.momentum * m + hp.grad_scale * G.float()
+    g = hp.grad_scale * grads[k].float()
+    m_new = hp.momentum * m + g
+    u = g + hp.momentum * m_new if hp.nesterov else m_new
+    return m.numpy().copy(), _to_storable(grads[k], case), u  # type: ignore[arg-type]
+
+
+def direction_metrics(got: np.ndarray, ref: np.ndarray) -> tuple[float, float]:
+    """(cosine similarity, relative Frobenius error ||got-ref||/||ref||), fp64."""
+    a = np.asarray(got, dtype=np.float64).ravel()
+    b = np.asarray(ref, dtype=np.float64).ravel()
+    cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+    return cos, float(np.linalg.norm(a - b) / np.linalg.norm(b))
+
+
+MUON_MIN_COS = 0.995
+
+
+def muon_direction_tolerance(u: torch.Tensor, ns_steps: int = 5) -> float:
+    """Allowed relative-Frobenius error of the kernel's O against bf16 NS.
+
+    Five bf16 NS iterations amplify rounding (a=3.44): this reference sits
+    ~0.01-0.015 from fp32 NS, but a correct NS that merely rounds at other
+    points (bf16 norm, every elementwise op rounded, as plain torch bf16 code
+    does) sits 0.03-0.04 from it (measured on MUON_CASES). So the bound is
+    max(0.10, 5 * spread_vs_fp32), ~2.5x above that. Measured wrong kernels
+    sit far outside: 4 NS steps ~0.30, no Nesterov ~0.38-0.60, no NS ~0.85,
+    transpose not undone ~1.4, a wrong scale rule >= 0.278 (sqrt(min/max)
+    or Keller's max(1, r/c)^0.5).
+    """
+    o16 = newton_schulz(u, ns_steps, torch.bfloat16)
+    o32 = newton_schulz(u, ns_steps, torch.float32)
+    return max(0.10, 5.0 * direction_metrics(o16.numpy(), o32.numpy())[1])
 
 
 def dump_muon(out_dir: Path = FIXTURES_DIR) -> None:
