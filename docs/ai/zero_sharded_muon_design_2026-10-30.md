@@ -1054,6 +1054,42 @@ non-streaming).
 
 - Gate: T1 and T2 at ZeRO-3 (streaming, via the coordinator; same
   tolerances as ZeRO-2); T5 at `-z 3`.
+- **Status (fu/zs3, implemented):**
+  - `enable_muon` no longer raises for ZeRO-3 / streaming. Under streaming
+    `_build_muon_ownership` seeds `muon_p_shard` (and the bf16 `muon_master`)
+    with the W-round gather of section 2 (scratch of S elements, freed
+    afterwards); `ensure_comm_setup` now runs before the seed, not after.
+  - `_z3_stream_layer` and `_z3_gather_full` make two `allgather_ranges` when
+    Muon is on: the 8 non-Muon tensors from the flat shard, the 6 matrices
+    from `(muon_p_memory, S)` with `flat_starts = owner_idx` (Q/K/V land at
+    `dst_offsets[qkv] + k*C^2`). `self.params.*` re-pointing is unchanged.
+  - `_update_sharded_muon` at ZeRO-3: AdamW writes `params_memory + shard_rel`
+    under streaming (`flat_start` otherwise), then returns before any
+    propagation. Non-streaming ZeRO-3 only updates `muon_p_shard`; it does not
+    write the matrices back into `params_memory` (no peers in the harness).
+  - T2 (`tests/test_zero_muon.mojo`, `_t2_z2[W](..., stage=3)`, threaded CPU):
+    step 1 bit-exact vs ZeRO-0 except wte (rel 4.1e-7 / 1.1e-7 / 1.1e-7 at
+    W=2/4/8); 3 steps pass `|a-b| <= 1e-4|a| + 1e-6`: step3 max rel
+    (|p|>=1e-2) 1.8e-7, 3.4e-5, 4.1e-6 and max abs 1.5e-8, 6.6e-7, 1.3e-7 at
+    W=2, W=4, W=8 L=1 (identical to ZeRO-2). The streaming assertion: after
+    the last update, `_z3_gather_full` agrees bit-exactly with the owner's
+    `muon_p_shard` on its slots, and each layer's `_z3_stream_layer` window
+    agrees bit-exactly with the gathered vector for all 6 matrices.
+  - T5 `-z 3 -opt muon` (W=2 d6, 3 steps): 10.865850, 10.716245, 10.648577
+    (= `-z 0`/`-z 2`); `-opt adamw -z 3`: 10.865850, 10.369871, 10.128281
+    unchanged. `LLMM_MEM_REPORT=1` shows `muon_p_buf`/`muon_g_buf`/`muon_m_buf`
+    at 21233664 B each on both ranks. (CPU Muon at `-z 0` takes ~250 s/step,
+    ~66 s/step sharded; the `-z 0` losses were not re-run here.)
+  - **For S4 (checkpoint):** under streaming the authoritative Muon params are
+    `muon_p_shard`; `params_memory[0:opt]` holds stale values at the Muon
+    positions. `write_checkpoint` must go through `_z3_gather_full` (already
+    split) and a resume must re-seed `muon_p_shard` from the loaded host vector,
+    not from `params_memory`.
+  - **For S5 (QK-clip):** under streaming the flat shard holds no bias at
+    `params_memory.unsafe_offset(a)` for a global offset `a`; use the
+    shard-relative offset (`a - rank*opt`, only if it lies in this rank's
+    slice) or gather the bias. Clipping Q/K matrices must scale `muon_p_shard`
+    (and `muon_master` under bf16), because that is the next forward's source.
 
 **S4: checkpoint** (llmm/checkpointing.mojo, `write_checkpoint`/`load_checkpoint`).
 
