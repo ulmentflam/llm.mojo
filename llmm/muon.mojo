@@ -80,8 +80,9 @@ def muon_momentum_at(
 
     frac = min(step / warmup, 1); mu_eff = (1 - frac) * mu_start + frac * mu.
     `warmup <= 0` returns `mu` untouched (bit-identical to a run without the
-    ramp), and so does any step >= warmup (frac == 1 exactly)."""
-    if warmup <= 0 or step >= warmup:
+    ramp), and so does any step >= warmup (frac == 1 exactly) or mu_start == mu
+    (the lerp is not exact in fp32 even for equal endpoints)."""
+    if warmup <= 0 or step >= warmup or mu_start == mu:
         return mu
     var frac = Float32(step) / Float32(warmup)
     return (Float32(1.0) - frac) * mu_start + frac * mu
