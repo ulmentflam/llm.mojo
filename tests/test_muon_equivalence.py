@@ -32,7 +32,6 @@ from tests.reference import (
     direction_metrics,
     effective_hp,
     keller_direction,
-    keller_wd0_case,
     muon_direction_inputs,
     muon_direction_tolerance,
     muon_scale,
@@ -45,7 +44,7 @@ from tests.reference import (
 )
 
 # Expected-value source: our reference | stock torch.optim.Muon | Keller Jordan's
-# SingleDeviceMuon (trajectory: wd=0 only, see test_muon_crosscheck_keller.py). The id of the
+# SingleDeviceMuon (lr/wd rescaled, see test_muon_crosscheck_keller.py). The id of the
 # first is "ours" so `-k reference` still selects only the kernel-free tests.
 SOURCES = [pytest.param("reference", id="ours"), "torch_muon", "keller"]
 
@@ -57,10 +56,9 @@ def test_matches_torch_trajectory(case: MuonCase, expected_source: str):
 
     expected_source="torch_muon": expectation from stock torch.optim.Muon
     (atol widens to 2x the measured torch-vs-reference gap).
-    expected_source="keller": Keller's SingleDeviceMuon, weight decay 0 for both
-    kernel and expectation (his decay uses the rescaled lr, so it is not comparable)."""
+    expected_source="keller": Keller's SingleDeviceMuon with lr and weight decay
+    rescaled to our scale rule (same 2x-measured-gap atol widening)."""
     if expected_source == "keller":
-        case = keller_wd0_case(case)
         ref = simulate_muon_keller(case)
     elif expected_source == "reference":
         ref = simulate_muon(case)
@@ -229,9 +227,13 @@ def test_tolerance_not_absurd(case: MuonCase, expected_source: str):
 
     # Trajectory gate: dropping weight decay must fail it in fp32. (In bf16
     # the per-step change is sub-ulp, which is why the direction gate exists.)
-    # (Not for keller: its trajectory reference has wd=0 by construction.)
-    if case.dtype == "float32" and expected_source != "keller":
-        ref = simulate_muon_torch_optim(case) if torch_src else simulate_muon(case)
+    if case.dtype == "float32":
+        if torch_src:
+            ref = simulate_muon_torch_optim(case)
+        elif expected_source == "keller":
+            ref = simulate_muon_keller(case)
+        else:
+            ref = simulate_muon(case)
         atol = muon_tolerance(case, ref)
         hp = effective_hp(case)
         w = torch.from_numpy(ref["init_params"].copy())

@@ -16,8 +16,9 @@ Facts, quoted from `inspect.getsource(muon)`:
             X = a * X + B @ X
         (transpose back if rows > cols; returns bf16). `steps` has no default
         (we pass 5) and eps is hard-coded 1e-7 -- same as ours. Unlike ours,
-        EVERY op is a separate bf16 tensor op (norm rounded to bf16, the
-        division, b*A, c*A@A, their sum, a*X, ... each round), whereas our
+        EVERY op is a separate bf16 tensor op (norm rounded to bf16, +eps,
+        the division, b*A, c*A, (c*A)@A -- `c * A @ A` parses left to right --,
+        their sum, a*X, B@X, a*X + B@X: each rounds), whereas our
         reference/kernel round once per GEMM epilogue with an fp32 norm.
   * muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
         momentum.lerp_(grad, 1 - beta)                 # buf = mu*buf + (1-mu)*g
@@ -39,18 +40,29 @@ Convention differences (documented, NOT bugs):
      factor, and the trajectory check hands SingleDeviceMuon
          lr_keller = lr * 0.2*sqrt(max(r,c)) / max(1, r/c)^0.5
      so that the per-step update magnitude equals ours.
-  2. Weight decay. Keller decays by (1 - lr_keller*wd); ours by (1 - lr*wd).
-     With the rescaled lr_keller these differ (lr_keller/lr = 0.2*sqrt(max)/
-     max(1,r/c)^0.5, e.g. 1.6 at 64x64), so the trajectory comparison runs with
-     wd = 0 for BOTH sides. Weight decay is covered by the fp32 trajectory gate
-     against our own reference and torch.optim.Muon (identical decay rule),
-     and by the no-weight-decay mutant in test_muon_equivalence.
+  2. Weight decay. Keller decays by (1 - lr_keller*wd_keller); ours by
+     (1 - lr*wd), both applied to the old W before the update is added. Since
+     lr_keller != lr (ratio 0.2*sqrt(max)/max(1,r/c)^0.5, e.g. 1.6 at 64x64),
+     the harness passes wd_keller = wd * lr / lr_keller, which makes the decay
+     factor identical. Measured: the fp32 trajectory gap is then the same as
+     at wd=0 (1.3e-3..1.7e-3), whereas passing wd unscaled gives 8.6e-3..6.2e-2,
+     so weight decay is genuinely compared (and the no-weight-decay mutant in
+     test_muon_equivalence is rejected by the keller trajectory gate).
   3. Rounding. Keller's all-bf16 NS differs from our single-rounding NS by
      ~0.03-0.04 rel-Frobenius (the same band tests/reference.py documents for
      "other rounding points"), larger than vs torch.optim.Muon (0.009-0.015),
-     which keeps GEMM epilogues fused. That is why the NS ceiling below is
-     8e-2, not the 2e-2 used for torch.optim.Muon: 2x the measured gap
-     (0.027-0.038) is 0.054-0.076.
+     which keeps GEMM epilogues fused. Attribution was isolated: a copy of our
+     newton_schulz that rounds exactly where Keller's does (bf16 norm, +eps,
+     every elementwise op, (c*A)@A) and uses torch's bf16 GEMM is bit-identical
+     to zeropower_via_newtonschulz5 on all NS_SHAPES plus 64x192/192x64; with
+     fp32-emulated GEMMs (different accumulation order) it sits 0-2.2e-2 away,
+     the same as fp64- vs fp32-accumulated emulation of itself -- one bf16 ulp
+     flip in one GEMM output is amplified that far by 5 NS steps. Ours vs fp32
+     NS is ~0.013, Keller vs fp32 NS ~0.03; ours vs Keller (0.027-0.038, up to
+     0.043 over 20 seeds) is what roughly independent errors of those sizes
+     give. So the per-shape gates are 2x measured and the hard ceiling is
+     7.6e-2 (2x the worst measured, 0.038), not the 2e-2 used for
+     torch.optim.Muon.
 """
 
 from __future__ import annotations
@@ -66,7 +78,6 @@ from tests.reference import (
     direction_metrics,
     effective_hp,
     keller_direction,
-    keller_wd0_case,
     muon_direction_inputs,
     newton_schulz,
     simulate_muon,
@@ -84,7 +95,7 @@ NS_SHAPES = [(48, 96), (96, 48), (256, 768), (64, 64)]
 # 0.0195 / 0.0098 / 0.0146. Tolerance = 2x measured.
 NS_REL_TOL = {(48, 96): 0.0364, (96, 48): 0.0380, (256, 768): 0.0270, (64, 64): 0.0308}
 NS_ABS_TOL = {(48, 96): 0.0176, (96, 48): 0.0195, (256, 768): 0.0098, (64, 64): 0.0146}
-HARD_REL_CEILING = 8e-2  # see header, point 3
+HARD_REL_CEILING = 7.6e-2  # see header, point 3
 
 
 def _u(shape: tuple[int, int]) -> torch.Tensor:
@@ -120,8 +131,8 @@ def test_muon_update_scale_rule():
         assert ratio == pytest.approx(max(1.0, r / c) ** 0.5, rel=2e-2)
 
 
-# 2x measured max|ours - keller| over the wd=0 trajectory (rescaled lr). fp32
-# measured 1.34e-3 / 1.71e-3 / 1.57e-3 / 1.27e-3; bf16 = 1 ulp (floored at 2 ulp
+# 2x measured max|ours - keller| over the trajectory (rescaled lr and wd). fp32
+# measured 1.33e-3 / 1.70e-3 / 1.56e-3 / 1.27e-3; bf16 = 1 ulp (floored at 2 ulp
 # below, since a one-step bf16 flip is rounding, not a bug).
 TRAJ_TOL = {
     "muon_fp32_64x64": 2.7e-3,
@@ -134,8 +145,7 @@ MOM_TOL = 1e-5  # measured ~1e-6 after rescaling by 1/(1-mu)
 
 @pytest.mark.parametrize("case", MUON_CASES, ids=lambda c: c.name)
 def test_trajectory_vs_keller(case: MuonCase):
-    case0 = keller_wd0_case(case)
-    ours = simulate_muon(case0)
+    ours = simulate_muon(case)
     theirs = simulate_muon_keller(case)
     d = np.abs(ours["trajectory"] - theirs["trajectory"])
     per_step = d.reshape(case.steps, -1).max(axis=1)
@@ -167,7 +177,7 @@ DIR_REL_TOL = {
 @pytest.mark.parametrize("k", [0, 1])
 @pytest.mark.parametrize("case", MUON_CASES, ids=lambda c: c.name)
 def test_direction_vs_keller(case: MuonCase, k: int):
-    """One SingleDeviceMuon step from W=0, wd=0; O recovered with Keller's own
+    """One SingleDeviceMuon step from W=0 (wd*W vanishes); O recovered with Keller's own
     scale (convention difference 1), compared with our NS of the same U."""
     _, _, u = muon_direction_inputs(case, k)
     o_ours = newton_schulz(u, case.hp.ns_steps).numpy()
@@ -189,7 +199,9 @@ def test_hp_rounding_is_shared():
 def test_keller_direction_gate_rejects_mutants(case: MuonCase):
     """The Keller-sourced direction gate (the one test_muon_equivalence applies
     with expected_source="keller") accepts a correct kernel with other rounding
-    points and rejects skip-NS, 4-step NS, no-Nesterov, transpose-not-undone."""
+    points and rejects skip-NS, 4-step NS, no-Nesterov, transpose-not-undone
+    and the wrong scale rules (Keller's own, sqrt(min)). Measured margins: the
+    correct kernel sits at 0.3-0.4x the bound, every mutant at >= 2.8x."""
     _, _, u = muon_direction_inputs(case, 1)
     o_ref = keller_direction(case, 1)
     _check_direction(
@@ -199,9 +211,11 @@ def test_keller_direction_gate_rejects_mutants(case: MuonCase):
         "correct kernel with other rounding points",
         o_ref,
     )
-    mutants = ["skip_ns", "ns4", "no_nesterov"]
+    mutants = ["skip_ns", "ns4", "no_nesterov", "scale_keller"]
     if case.rows > case.cols:
         mutants.append("transpose_not_undone")
+    if case.rows != case.cols:
+        mutants.append("scale_min")
     for variant in mutants:
         o_got = _recover_direction(_mutant_step(case, 1, variant), case)
         with pytest.raises(AssertionError):

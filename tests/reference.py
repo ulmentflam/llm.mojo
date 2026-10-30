@@ -14,7 +14,7 @@ are guaranteed to match what an in-process pytest run would compute.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, asdict, replace
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
 
@@ -410,10 +410,11 @@ def _keller_scale(rows: int, cols: int) -> float:
 def _keller_run(case: MuonCase, direction_k: int | None = None):
     """Drive Keller Jordan's `muon.SingleDeviceMuon` (package `muon-optimizer`).
 
-    Weight decay is ALWAYS 0 here (Keller decays by 1 - lr_keller*wd, which
-    differs from ours once lr is rescaled; see tests/test_muon_crosscheck_keller.py).
     lr_keller = lr * 0.2*sqrt(max(r,c)) / max(1, r/c)^0.5, so Keller's per-step
     update lr_keller * max(1, r/c)^0.5 * O equals ours, lr * muon_scale * O.
+    Keller decays by (1 - lr_keller*wd_keller) before the update, ours by
+    (1 - lr*wd) on the same old W, so wd_keller = wd * lr / lr_keller makes the
+    decay identical (see tests/test_muon_crosscheck_keller.py, point 2).
     Same fp32-param-holding-storage-values harness as `_torch_muon_run`.
     With `direction_k`, W is zeroed before that step and W1 returned.
     """
@@ -424,8 +425,9 @@ def _keller_run(case: MuonCase, direction_k: int | None = None):
     lr_k = (
         hp.lr * muon_scale(case.rows, case.cols) / _keller_scale(case.rows, case.cols)
     )
+    wd_k = hp.weight_decay * hp.lr / lr_k
     p = torch.nn.Parameter(init.float().clone())
-    opt = SingleDeviceMuon([p], lr=lr_k, weight_decay=0.0, momentum=hp.momentum)
+    opt = SingleDeviceMuon([p], lr=lr_k, weight_decay=wd_k, momentum=hp.momentum)
     traj, moms, w1 = [], [], None
     for k, G in enumerate(grads):
         if direction_k == k:
@@ -441,18 +443,12 @@ def _keller_run(case: MuonCase, direction_k: int | None = None):
     return init, grads, np.stack(traj), np.stack(moms), w1
 
 
-def keller_wd0_case(case: MuonCase) -> MuonCase:
-    """The case with weight decay removed (the only one Keller can be compared on)."""
-    return replace(case, hp=replace(case.hp, weight_decay=0.0))
-
-
 def simulate_muon_keller(case: MuonCase) -> dict[str, np.ndarray]:
-    """Same keys as `simulate_muon`, from Keller's SingleDeviceMuon, for the
-    wd=0 version of `case` (use `keller_wd0_case(case)` for the kernel too).
+    """Same keys as `simulate_muon`, from Keller's SingleDeviceMuon (lr and wd
+    rescaled as in `_keller_run`, so weight decay is compared too).
     `spread` = max(our NS spread, measured Keller-vs-ours trajectory gap)."""
-    case0 = keller_wd0_case(case)
-    _, _, traj, moms, _ = _keller_run(case0)
-    ours = simulate_muon(case0)
+    _, _, traj, moms, _ = _keller_run(case)
+    ours = simulate_muon(case)
     gap = float(np.max(np.abs(traj - ours["trajectory"])))
     out = dict(ours)
     out.update(
