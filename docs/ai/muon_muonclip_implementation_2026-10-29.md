@@ -260,9 +260,19 @@ all slower than the top pick.
   ms/step (-23 ms); overhead over AdamW there fell 96 to 72 ms. 10-step
   losses differ in the third decimal (rounding change).
 
-See the measurement below for an uncontended A/B.
+**Uncontended A/B** (final tree, both binaries rebuilt after the last
+source edit, GPU idle apart from the resident 37 GB vLLM tenant, interleaved
+runs, steady-state means; smoke = steps 4-10, realistic = steps 2-4):
 
-<!-- TODO: clean A/B -->
+| config | AdamW ms/step | Muon ms/step | Muon overhead |
+|---|---:|---:|---:|
+| bf16 smoke, B=4 T=1024, 1 micro-step (2 runs each) | 138.4 | 167.9 | +29.5 ms, +21.3% |
+| bf16 realistic, B=32 T=1024, 131k tokens/step (2 runs each) | 3832.8 | 3872.0 | +39.2 ms, +1.0% |
+| fp32 smoke, B=4 T=1024 (1 run each) | 283.6 | 315.3 | +31.7 ms, +11.2% |
+
+The two AdamW realistic runs differ by about 1% between themselves, the same
+size as the Muon overhead there. Before the perf pass the bf16 smoke overhead
+was +41 ms (+30%).
 
 **Amortization.** The overhead is a fixed cost per optimizer step. In the
 600-step FineWeb comparison (B=32, T=1024, 4 grad-accum micro-steps, 131k
