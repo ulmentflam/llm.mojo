@@ -1,6 +1,6 @@
 from std.math import sqrt, ceildiv, isnan, isfinite, nan, exp, log
 from std.os import getenv, listdir, makedirs
-from std.os.path import isdir
+from std.os.path import isdir, getsize
 from std.sys import (
     argv,
     has_accelerator,
@@ -38,6 +38,8 @@ from llmm.checkpointing import (
     read_model_checkpoint,
     write_state_checkpoint,
     read_state_checkpoint,
+    read_state_header,
+    CHECKPOINT_HEADER_SIZE,
     make_training_state,
     restore_dataloader_state,
 )
@@ -60,7 +62,12 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
-from llmm.qk_clip import qk_clip_apply, qk_head_max_fold
+from llmm.qk_clip import (
+    qk_clip_apply,
+    qk_clip_bias_range,
+    qk_clip_matrix,
+    qk_head_max_fold,
+)
 from llmm.matmul import (
     fp8_mutex_preseed,
     matmul_fwd,
@@ -1195,6 +1202,34 @@ def _mem_str_array(names: List[String]) -> String:
 # two largest per-layer activation buffers (each B*T*4C), trading one FC GEMM
 # per layer in backward for the memory. That activation-memory cut is what makes
 # ZeRO-3 tractable (ZeRO-3 shards params/grads/optimizer but not activations).
+@fieldwise_init
+struct MuonSlot(Copyable, Movable):
+    """One Muon matrix (group k, layer l) and where it lives in the owner space.
+
+    `owner_idx = owner * S + local_off`: its index in the conceptual owner
+    vector of W shards of S elements each (see `_build_muon_ownership`)."""
+
+    var k: Int
+    var l: Int
+    var flat_off: Int  # offset in the flat parameter buffer
+    var len: Int
+    var owner: Int
+    var local_off: Int  # offset inside the owner's shard
+    var owner_idx: Int
+
+
+@fieldwise_init
+struct AdamSeg(Copyable, Movable):
+    """A nonempty intersection of this rank's flat optimizer shard with one of
+    the AdamW ranges (`_adamw_ranges`). `shard_rel` indexes the shard-sized
+    m / master / grad-shard buffers, `compact_off` the compact Muon `v`."""
+
+    var flat_start: Int
+    var len: Int
+    var shard_rel: Int
+    var compact_off: Int
+
+
 struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var ctx: DeviceContext
     var config: GPT2Config
@@ -1292,6 +1327,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var head_max_memory: MutMemPtr[DType.float32]
     var head_max_fwd_memory: MutMemPtr[DType.float32]
     var qk_clip_tau: Float32  # <= 0 disables QK-clip
+    # WORLD_SIZE > 1: `head_max_buf` already holds the cross-rank max for this
+    # step (set by _qk_sync_head_max, cleared by the backward fold), and the
+    # clip was already applied inside the sharded Muon update().
+    var qk_head_max_global: Bool
+    var qk_clip_applied: Bool
 
     # Optimizer selection: 0 = AdamW everywhere, 1 = Muon on the 2-D block
     # matrices (Q/K/V, attn-proj, fc, proj) with AdamW on everything else.
@@ -1299,6 +1339,29 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var optimizer_kind: Int
     var muon_momentum: Float32
     var muon_groups: List[MuonGroup]
+    # Muon only: v (AdamW second moment) is compact -- just the AdamW-owned
+    # ranges, concatenated. v_compact_bases[k] is range k's offset in v_memory;
+    # v_num_parameters is its length. AdamW: v is full-size (== optimizer_num_parameters).
+    var v_compact_bases: List[Int]
+    var v_num_parameters: Int
+    # Sharded Muon (WORLD_SIZE > 1, zero_stage >= 1): matrix-granular ownership
+    # with owner-local buffers; see docs/ai/zero_sharded_muon_design_*.md.
+    # muon_slots lists all 6L matrices in (k, l) order; muon_owned_groups are
+    # this rank's <= 6 owner-space groups; muon_shard_elems is S (the per-rank
+    # owner shard size) and muon_owned_elems is O_r <= S. The four buffers are
+    # S-element (1-element placeholders until enable_muon allocates them).
+    var muon_slots: List[MuonSlot]
+    var muon_owned_groups: List[MuonGroup]
+    var muon_shard_elems: Int
+    var muon_owned_elems: Int
+    var muon_p_buf: DeviceBuffer[GPT2_DTYPE]
+    var muon_p_memory: MutMemPtr[GPT2_DTYPE]
+    var muon_g_buf: DeviceBuffer[GPT2_DTYPE]
+    var muon_g_memory: MutMemPtr[GPT2_DTYPE]
+    var muon_m_buf: DeviceBuffer[MASTER_DTYPE]
+    var muon_m_memory: MutMemPtr[MASTER_DTYPE]
+    var muon_master_buf: DeviceBuffer[MASTER_DTYPE]
+    var muon_master_memory: MutMemPtr[MASTER_DTYPE]
 
     # Activations of the model, and their sizes
     var acts: ActivationTensors[GPT2_DTYPE]
@@ -1460,9 +1523,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.optimizer_kind = 0
         self.muon_momentum = Float32(0.95)
         self.muon_groups = List[MuonGroup]()
+        self.v_compact_bases = List[Int]()
+        self.v_num_parameters = 0
+        self.muon_slots = List[MuonSlot]()
+        self.muon_owned_groups = List[MuonGroup]()
+        self.muon_shard_elems = 0
+        self.muon_owned_elems = 0
+        self.muon_p_memory = NULL_DTYPE_PTR
+        self.muon_g_memory = NULL_DTYPE_PTR
+        self.muon_m_memory = NULL_MASTER_PTR
+        self.muon_master_memory = NULL_MASTER_PTR
         self.head_max_memory = NULL_MASTER_PTR
         self.head_max_fwd_memory = NULL_MASTER_PTR
         self.qk_clip_tau = 0.0
+        self.qk_head_max_global = False
+        self.qk_clip_applied = False
         self.acts_memory = NULL_DTYPE_PTR
         self.grad_acts_memory = NULL_DTYPE_PTR
         self.acts_stats_memory = NULL_MASTER_PTR
@@ -1511,6 +1586,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.v_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
+        self.muon_p_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.muon_g_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
+        self.muon_m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
+        self.muon_master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.head_max_fwd_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
@@ -1933,16 +2012,70 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var wbase = rebind_mut_mem[GPT2_DTYPE](
             self.param_window_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-        self.zero_ctx.allgather_ranges[GPT2_DTYPE](
-            self._z3_shard_ptr(),
-            self.optimizer_num_parameters,
-            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                wbase.as_unsafe_any_origin()
-            ),
-            dst_offsets,
-            flat_starts,
-            lengths,
+        var wptr = rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            wbase.as_unsafe_any_origin()
         )
+        if self.optimizer_kind == 1 and len(self.muon_slots) > 0:
+            # Sharded Muon: the 6 matrices live in the owner space, the other
+            # 8 tensors in the flat AdamW shard. Two gathers, same window.
+            var a_dst = List[Int]()
+            var a_src = List[Int]()
+            var a_len = List[Int]()
+            for k in range(len(idxs)):
+                var t = idxs[k]
+                if (
+                    t == Parameters.qkv_weight
+                    or t == Parameters.attn_proj_weight
+                    or t == Parameters.fc_weight
+                    or t == Parameters.proj_weight
+                ):
+                    continue
+                a_dst.append(dst_offsets[k])
+                a_src.append(flat_starts[k])
+                a_len.append(lengths[k])
+            var m_dst = List[Int]()
+            var m_src = List[Int]()
+            var m_len = List[Int]()
+            var cc = self.config.channels * self.config.channels
+            for k in range(6):
+                ref sl = self.muon_slots[k * L + layer]
+                var wi = 2  # qkv_weight (Q, K, V row blocks)
+                if k == 3:
+                    wi = 4
+                elif k == 4:
+                    wi = 8
+                elif k == 5:
+                    wi = 10
+                m_dst.append(dst_offsets[wi] + (k * cc if k < 3 else 0))
+                m_src.append(sl.owner_idx)
+                m_len.append(sl.len)
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                self._z3_shard_ptr(),
+                self.optimizer_num_parameters,
+                wptr,
+                a_dst,
+                a_src,
+                a_len,
+            )
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.muon_p_memory.as_unsafe_any_origin()
+                ),
+                self.muon_shard_elems,
+                wptr,
+                m_dst,
+                m_src,
+                m_len,
+            )
+        else:
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                self._z3_shard_ptr(),
+                self.optimizer_num_parameters,
+                wptr,
+                dst_offsets,
+                flat_starts,
+                lengths,
+            )
 
         # Re-base so the existing `<ptr> + layer*stride` addressing in
         # forward/backward lands on this layer's window slot.
@@ -1992,7 +2125,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var dst_offsets = List[Int]()
         var flat_starts = List[Int]()
         var lengths = List[Int]()
+        var sharded_muon = self.optimizer_kind == 1 and len(self.muon_slots) > 0
         for t in range(NUM_PARAMETER_TENSORS):
+            if sharded_muon and (
+                t == Parameters.qkv_weight
+                or t == Parameters.attn_proj_weight
+                or t == Parameters.fc_weight
+                or t == Parameters.proj_weight
+            ):
+                continue  # gathered from the owner space below
             var o = self._z3_param_offset(t)
             dst_offsets.append(o)
             flat_starts.append(o)
@@ -2005,6 +2146,25 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             flat_starts,
             lengths,
         )
+        if sharded_muon:
+            var m_dst = List[Int]()
+            var m_src = List[Int]()
+            var m_len = List[Int]()
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                m_dst.append(sl.flat_off)
+                m_src.append(sl.owner_idx)
+                m_len.append(sl.len)
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.muon_p_memory.as_unsafe_any_origin()
+                ),
+                self.muon_shard_elems,
+                dst,
+                m_dst,
+                m_src,
+                m_len,
+            )
 
     def _compute_param_sizes(mut self) raises:
         """Fill param_sizes, num_parameters, and the optimizer sharding counts
@@ -2703,21 +2863,40 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.has_allocated_grads = True
 
-    def enable_qk_clip(mut self, tau: Float32) raises:
+    def enable_qk_clip(
+        mut self, tau: Float32, planted_head_max_only: Bool = False
+    ) raises:
         """Track per-(layer, head) max attention logits during forward and
-        allow `qk_clip_step` to rescale Q/K rows. tau <= 0 disables."""
+        allow `qk_clip_step` to rescale Q/K rows. tau <= 0 disables.
+
+        `planted_head_max_only` (tests) lifts the CPU-target raise: the CPU
+        attention path records no logits, so the caller must plant
+        `head_max_memory` itself or the clip never fires."""
         if tau <= 0.0:
             self.qk_clip_tau = 0.0
             return
         # The logit max is recorded only by the GPU causal-softmax kernel; the
         # CPU attention path has no hook, so QK-clip there would silently never
-        # fire. Multi-rank would need an allreduce-max of the per-head maxima
-        # (each rank sees different data) or ranks' Q/K weights diverge, and
-        # ZeRO>=1 shards the master copy this kernel indexes in full.
+        # fire.
         comptime if is_cpu[Self.target]():
-            raise Error("QK-clip needs a GPU target (no CPU logit-max hook)")
+            if not planted_head_max_only:
+                raise Error(
+                    "QK-clip needs a GPU target (no CPU logit-max hook)"
+                )
+        # Multi-rank: the per-head maxima are allreduce-maxed so every rank
+        # applies the same clip (docs/ai/zero_sharded_muon_design_*.md, S5).
+        # Supported: ZeRO-0 with either optimizer (full-buffer clip) and
+        # ZeRO-1 Muon (clip applied in owner space inside update()). AdamW
+        # with ZeRO >= 1 keeps Q/K rows in flat shards (a third layout), and
+        # sharded Muon is ZeRO-0/1 only so far.
         comptime if Self.WORLD_SIZE > 1:
-            raise Error("QK-clip supports WORLD_SIZE=1 only")
+            if self.zero_ctx.zero_stage >= 1 and self.optimizer_kind != 1:
+                raise Error(
+                    "QK-clip with WORLD_SIZE > 1 and ZeRO >= 1 needs -opt muon"
+                    " (AdamW keeps Q/K rows in flat shards)"
+                )
+            if self.zero_ctx.zero_stage >= 2 or self.z3_streaming:
+                raise Error("QK-clip supports ZeRO-0 and ZeRO-1 only so far")
         var n = self.config.num_layer * self.config.num_heads
         self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](n)
         self.head_max_buf.enqueue_fill(Scalar[DType.float32](0.0))
@@ -2734,9 +2913,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
     def qk_clip_step(mut self) raises:
         """Call after the optimizer step: rescale Q/K projection rows (and
-        biases) of every head whose step-max logit exceeded tau."""
+        biases) of every head whose step-max logit exceeded tau. At
+        WORLD_SIZE > 1 with sharded Muon the clip already ran inside
+        `update()` (see `_qk_clip_sharded`), so this is a no-op there."""
         if self.qk_clip_tau <= 0.0:
             return
+        if self.qk_clip_applied:
+            self.qk_clip_applied = False
+            return
+        self._qk_sync_head_max()
         var w_off = 0
         for i in range(Parameters.qkv_weight):
             w_off += self.param_sizes[i]
@@ -2761,9 +2946,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         """Max attention logit over all (layer, head) and all training
         micro-steps of the current optimizer step. Valid from the step's last
         backward until the next step's first backward (eval/generation
-        forwards in between do not change it). Syncs the device."""
+        forwards in between do not change it). Syncs the device. At
+        WORLD_SIZE > 1 this is the GLOBAL max (a collective: every rank must
+        call it)."""
         if self.qk_clip_tau <= 0.0:
             return 0.0
+        self._qk_sync_head_max()
         var n = self.config.num_layer * self.config.num_heads
         var host = self.ctx.enqueue_create_host_buffer[DType.float32](n)
         self.ctx.enqueue_copy(host, self.head_max_buf)
@@ -2772,6 +2960,100 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for i in range(n):
             best = max(best, host[i])
         return best
+
+    def _qk_sync_head_max(mut self) raises:
+        """WORLD_SIZE > 1: replace `head_max_buf` by the cross-rank elementwise
+        max (each rank saw different data; clipping on local maxima would let
+        the replicas' Q/K diverge). Idempotent within a step; a collective, so
+        every rank must reach it. No-op at WORLD_SIZE == 1."""
+        comptime if Self.WORLD_SIZE > 1:
+            if self.qk_head_max_global:
+                return
+            var n = self.config.num_layer * self.config.num_heads
+            var src = self.ctx.enqueue_create_host_buffer[DType.float32](n)
+            var dst = self.ctx.enqueue_create_host_buffer[DType.float32](n)
+            self.ctx.enqueue_copy(src, self.head_max_buf)
+            self.ctx.synchronize()
+            self.zero_ctx.allreduce_max_host[DType.float32](
+                rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+                    src.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+                    dst.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                n,
+            )
+            self.ctx.enqueue_copy(self.head_max_buf, dst)
+            self.ctx.synchronize()
+            self.qk_head_max_global = True
+
+    def _qk_clip_sharded(mut self) raises:
+        """ZeRO-1 sharded Muon: apply QK-clip where the data lives, between the
+        local updates and the gathers of `_update_sharded_muon`. Q/K rows of
+        the matrices this rank owns are scaled in the owner-space param (and
+        master) copy; the qkv-bias entries inside this rank's flat optimizer
+        shard are scaled in params and the flat master shard. The gathers then
+        carry the clipped values to every rank. A collective (max-reduce)."""
+        comptime if Self.WORLD_SIZE > 1:
+            self._qk_sync_head_max()
+            var C = self.config.channels
+            var NH = self.config.num_heads
+            var head_max = as_immut_kernel_from_mut[DType.float32](
+                self.head_max_memory
+            )
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                # Group 0 = Q, group 1 = K of the fused qkv weight.
+                if sl.owner != self.zero_ctx.rank or sl.k > 1:
+                    continue
+                qk_clip_matrix[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.muon_p_memory.unsafe_offset(sl.local_off)
+                    ),
+                    as_mut_kernel[MASTER_DTYPE](
+                        self.muon_master_memory.unsafe_offset(sl.local_off)
+                    ),
+                    USE_BF16,
+                    sl.l,
+                    head_max,
+                    NH,
+                    C,
+                    self.qk_clip_tau,
+                    self.ctx,
+                )
+            var b_lo = self.param_offset(Parameters.qkv_bias)
+            var b_hi = b_lo + self.config.num_layer * 3 * C
+            var segs = self._adamw_shard_segments()
+            for i in range(len(segs)):
+                ref sg = segs[i]
+                var a = max(sg.flat_start, b_lo)
+                var b = min(sg.flat_start + sg.len, b_hi)
+                if b <= a:
+                    continue
+                # Full-buffer offset `a`: valid at ZeRO-1/2 only. Under ZeRO-3
+                # streaming params_memory is the flat shard, so lifting
+                # enable_qk_clip's ZeRO-2/3 raise needs `sg.shard_rel +
+                # (a - sg.flat_start)` here (S3 verification note).
+                qk_clip_bias_range[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.params_memory.unsafe_offset(a)
+                    ),
+                    as_mut_kernel[MASTER_DTYPE](
+                        self.master_memory.unsafe_offset(
+                            sg.shard_rel + (a - sg.flat_start)
+                        )
+                    ),
+                    USE_BF16,
+                    a - b_lo,
+                    b - a,
+                    head_max,
+                    NH,
+                    C,
+                    self.qk_clip_tau,
+                    self.ctx,
+                )
+            self.ctx.synchronize()
+            self.qk_clip_applied = True
 
     def allocate_optimizer_moments(mut self) raises:
         var n = self.optimizer_num_parameters
@@ -4027,6 +4309,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 # grad-accum loop, and backward zeroes each pool slice itself
                 # before its bucket's kernels run.
                 self.grad_shard_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+                if self.optimizer_kind == 1:
+                    # Owner-space accumulator for the Muon matrices (S2).
+                    self.muon_g_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
             else:
                 self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
 
@@ -4140,6 +4425,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 micro_step == 0,
                 self.ctx,
             )
+            self.qk_head_max_global = False
 
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
@@ -5103,11 +5389,54 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var d = List[Int]()
                 var po = List[Int]()
                 var ln = List[Int]()
+                var muon_split = self.optimizer_kind == 1
                 for i in range(Parameters.ln_1_gamma, Parameters.proj_bias + 1):
+                    if muon_split and (
+                        i == Parameters.qkv_weight
+                        or i == Parameters.attn_proj_weight
+                        or i == Parameters.fc_weight
+                        or i == Parameters.proj_weight
+                    ):
+                        continue  # Call B below: routed to the owner
                     d.append(flat_base[i] + layer * layer_grad_stride[i])
                     po.append(pool_slot[i])
                     ln.append(layer_grad_stride[i])
                 self._reduce_grad_bucket(d, po, ln)
+                if muon_split:
+                    # Call B: this layer's 6 Muon matrices (Q, K, V are row
+                    # blocks of the fused qkv weight, contiguous in the pool)
+                    # go to their owners' slots in the owner-space gradient
+                    # buffer. Identical lists on every rank (static table).
+                    var md = List[Int]()
+                    var mpo = List[Int]()
+                    var mln = List[Int]()
+                    var cc = channels * channels
+                    for k in range(6):
+                        ref sl = self.muon_slots[k * num_layers + layer]
+                        md.append(sl.owner_idx)
+                        mln.append(sl.len)
+                        if k < 3:
+                            mpo.append(
+                                pool_slot[Parameters.qkv_weight] + k * cc
+                            )
+                        elif k == 3:
+                            mpo.append(pool_slot[Parameters.attn_proj_weight])
+                        elif k == 4:
+                            mpo.append(pool_slot[Parameters.fc_weight])
+                        else:
+                            mpo.append(pool_slot[Parameters.proj_weight])
+                    self.zero_ctx.reducescatter_buckets[GPT2_DTYPE](
+                        rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                            self.grad_pool_memory.as_unsafe_any_origin()
+                        ),
+                        md,
+                        mpo,
+                        mln,
+                        rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                            self.muon_g_memory.as_unsafe_any_origin()
+                        ),
+                        self.muon_shard_elems,
+                    )
 
         # Bucket 4 — wte (encoder contribution, accumulates onto the shard via
         # reduce-scatter linearity) + wpe.
@@ -5247,10 +5576,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         """Switch `update()` to Muon for the 2-D block matrices (AdamW keeps
         embeddings, biases and LayerNorm). Call after the parameter layout and
         `allocate_optimizer_moments` exist.
+
+        At WORLD_SIZE > 1 and ZeRO-1 the Muon matrices are sharded by
+        matrix-granular ownership into owner-local buffers (see
+        `_build_muon_ownership`); ZeRO-2 reduce-scatters each matrix's
+        gradient straight to its owner; ZeRO-3 (streaming and not) additionally
+        keeps the owner copy as the authoritative parameters.
         """
-        comptime if Self.WORLD_SIZE > 1:
-            if self.zero_ctx.zero_stage >= 1 or self.z3_streaming:
-                raise Error("Muon phase 1 supports WORLD_SIZE=1 / ZeRO-0 only")
         var L = self.config.num_layer
         var C = self.config.channels
         var qkv = self.param_offset(Parameters.qkv_weight)
@@ -5283,6 +5615,251 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.muon_groups = groups^
         self.muon_momentum = momentum
         self.optimizer_kind = 1
+        # The constructor already allocated a full-size v; Muon matrices never
+        # read it, so replace it with a compact one covering only this rank's
+        # AdamW segments (allocating here, not in the constructor, keeps the
+        # AdamW path untouched). Assigning drops the full buffer.
+        var segs = self._adamw_shard_segments()
+        var total = 0
+        for i in range(len(segs)):
+            total += segs[i].len
+        var sharded = False
+        comptime if Self.WORLD_SIZE > 1:
+            sharded = self.zero_ctx.zero_stage >= 1
+        # v_compact_bases is the whole-buffer (ZeRO-0) layout used by
+        # _update_hybrid: one entry per AdamW range. Sharded paths index v by
+        # AdamSeg.compact_off instead and never read it.
+        var bases = List[Int]()
+        if not sharded:
+            var ranges = self._adamw_ranges()
+            var acc = 0
+            for k in range(len(ranges) // 2):
+                bases.append(acc)
+                acc += max(ranges[2 * k + 1] - ranges[2 * k], 0)
+        self.v_compact_bases = bases^
+        self.v_num_parameters = total
+        # A_r can be 0 on tiny configs; never ask for a 0-element buffer.
+        self.v_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](max(total, 1))
+        self.v_buf.enqueue_fill(Scalar[MASTER_DTYPE](0.0))
+        self.ctx.synchronize()
+        self.v_memory = rebind_mut_mem[MASTER_DTYPE](
+            self.v_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        comptime if Self.WORLD_SIZE > 1:
+            if self.zero_ctx.zero_stage >= 1:
+                self._build_muon_ownership()
+
+    def _owner_of(self, k: Int, l: Int) -> Int:
+        """Rank that owns Muon matrix (group k, layer l): (k*L + l) mod W."""
+        return (k * self.config.num_layer + l) % Self.WORLD_SIZE
+
+    def _build_muon_ownership(mut self) raises:
+        """Build the ownership table, this rank's owner-space groups, and the
+        four owner-local buffers (params, momentum, master, grad), then seed
+        the owned params: from the full (consistent) `params_memory` at
+        ZeRO-1/2 and non-streaming ZeRO-3, or by a W-round gather from the
+        flat shards under ZeRO-3 streaming (only the shard is resident)."""
+        comptime W = Self.WORLD_SIZE
+        var L = self.config.num_layer
+        var rank = self.zero_ctx.rank
+        var ng = len(self.muon_groups)
+        # Pass 1: per-owner running offsets in (k asc, l asc) order.
+        var running = List[Int](length=W, fill=0)
+        var slots = List[MuonSlot]()
+        for k in range(ng):
+            ref g = self.muon_groups[k]
+            var n = g.rows * g.cols
+            for l in range(L):
+                var o = self._owner_of(k, l)
+                slots.append(
+                    MuonSlot(
+                        k=k,
+                        l=l,
+                        flat_off=g.offset + l * g.stride,
+                        len=n,
+                        owner=o,
+                        local_off=running[o],
+                        owner_idx=0,
+                    )
+                )
+                running[o] += n
+        var max_o = 0
+        for r in range(W):
+            max_o = max(max_o, running[r])
+        comptime simd_w = simd_width_of[GPT2_DTYPE]()
+        var S = max(((max_o + simd_w - 1) // simd_w) * simd_w, simd_w)
+        for i in range(len(slots)):
+            slots[i].owner_idx = slots[i].owner * S + slots[i].local_off
+        self.muon_shard_elems = S
+        self.muon_owned_elems = running[rank]
+
+        # This rank's groups: group k's share is the arithmetic progression
+        # l0, l0+W, ... (consecutive in the owner space), so it stays one
+        # strided-batched MuonGroup.
+        var owned = List[MuonGroup]()
+        for k in range(ng):
+            ref g = self.muon_groups[k]
+            var l0 = (rank - (k * L) % W + W) % W
+            if l0 >= L:
+                continue
+            var count = (L - l0 + W - 1) // W
+            var local_off = 0
+            for i in range(len(slots)):
+                if slots[i].k == k and slots[i].l == l0:
+                    local_off = slots[i].local_off
+            owned.append(
+                MuonGroup(
+                    offset=local_off,
+                    rows=g.rows,
+                    cols=g.cols,
+                    count=count,
+                    stride=g.rows * g.cols,
+                    sr_offset=g.offset + l0 * g.stride,
+                    sr_stride=W * g.stride,
+                )
+            )
+        self.muon_slots = slots^
+        self.muon_owned_groups = owned^
+
+        self.muon_p_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](S)
+        self.muon_g_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](S)
+        self.muon_m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](S)
+        self.muon_p_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        self.muon_g_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+        self.muon_m_buf.enqueue_fill(Scalar[MASTER_DTYPE](0.0))
+        comptime if USE_BF16:
+            self.muon_master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](
+                S
+            )
+            self.muon_master_buf.enqueue_fill(Scalar[MASTER_DTYPE](0.0))
+        self.ctx.synchronize()
+        self.muon_p_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.muon_p_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.muon_g_memory = rebind_mut_mem[GPT2_DTYPE](
+            self.muon_g_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.muon_m_memory = rebind_mut_mem[MASTER_DTYPE](
+            self.muon_m_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.muon_master_memory = rebind_mut_mem[MASTER_DTYPE](
+            self.muon_master_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        # The owner gathers (and reduce-scatters) stage up to one matrix, at
+        # most S elements, through the comm scratch. Size it before seeding.
+        self.zero_ctx.ensure_comm_setup(
+            max(self.optimizer_num_parameters, S) * size_of[GPT2_DTYPE]()
+        )
+        if self.z3_streaming:
+            # ZeRO-3 streaming: only the flat shard is resident, so the owned
+            # matrices are collected in W rounds. In round o every rank
+            # gathers owner o's slots into a scratch laid out as owner o's
+            # shard; only rank o keeps it. The lists come from the static
+            # table, so they agree on all ranks.
+            var scratch = self.ctx.enqueue_create_buffer[GPT2_DTYPE](S)
+            scratch.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+            self.ctx.synchronize()
+            var sp = rebind_mut_mem[GPT2_DTYPE](
+                scratch.unsafe_ptr().as_unsafe_any_origin()
+            )
+            for o in range(W):
+                var r_dst = List[Int]()
+                var r_src = List[Int]()
+                var r_len = List[Int]()
+                for i in range(len(self.muon_slots)):
+                    ref sl = self.muon_slots[i]
+                    if sl.owner != o:
+                        continue
+                    r_dst.append(sl.local_off)
+                    r_src.append(sl.flat_off)
+                    r_len.append(sl.len)
+                if len(r_len) == 0:
+                    continue
+                self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                    self._z3_shard_ptr(),
+                    self.optimizer_num_parameters,
+                    rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        sp.as_unsafe_any_origin()
+                    ),
+                    r_dst,
+                    r_src,
+                    r_len,
+                )
+                self.ctx.synchronize()
+                if o == rank:
+                    self.ctx.enqueue_copy(
+                        dst_ptr=rebind[
+                            Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+                        ](self.muon_p_memory.as_unsafe_any_origin()),
+                        src_ptr=rebind[
+                            Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                        ](sp.as_unsafe_any_origin()),
+                        size=self.muon_owned_elems,
+                    )
+                self.ctx.synchronize()
+        else:
+            # Seed the owned params from the full buffer (consistent).
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                if sl.owner != rank:
+                    continue
+                self.ctx.enqueue_copy(
+                    dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.muon_p_memory.unsafe_offset(
+                            sl.local_off
+                        ).as_unsafe_any_origin()
+                    ),
+                    src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                        self.params_memory.unsafe_offset(
+                            sl.flat_off
+                        ).as_unsafe_any_origin()
+                    ),
+                    size=sl.len,
+                )
+        self.ctx.synchronize()
+        comptime if USE_BF16:
+            var host_p = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](S)
+            var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](S)
+            self.ctx.synchronize()
+            self._copy_device_to_host[GPT2_DTYPE](host_p, self.muon_p_memory, S)
+            self.ctx.synchronize()
+            for i in range(S):
+                host_m[i] = host_p[i].cast[MASTER_DTYPE]()
+            self._copy_host_to_device[MASTER_DTYPE](
+                self.muon_master_memory, host_m, S
+            )
+            self.ctx.synchronize()
+
+    def _adamw_shard_segments(self) -> List[AdamSeg]:
+        """Nonempty intersections of this rank's flat optimizer shard
+        [lo, hi) with the 5 AdamW ranges, ascending. `compact_off` is the
+        prefix sum of the lengths (the compact Muon `v` layout). At W=1 or
+        ZeRO-0, [lo, hi) = [0, N) and these are exactly `_adamw_ranges()`."""
+        var lo = 0
+        var hi = self.num_parameters
+        comptime if Self.WORLD_SIZE > 1:
+            if self.zero_ctx.zero_stage >= 1:
+                lo = self.zero_ctx.rank * self.optimizer_num_parameters
+                hi = min(
+                    lo + self.optimizer_num_parameters, self.num_parameters
+                )
+        var ranges = self._adamw_ranges()
+        var segs = List[AdamSeg]()
+        var acc = 0
+        for k in range(len(ranges) // 2):
+            var a = max(ranges[2 * k], lo)
+            var b = min(ranges[2 * k + 1], hi)
+            if b <= a:
+                continue
+            segs.append(AdamSeg(a, b - a, a - lo, acc))
+            acc += b - a
+        return segs^
+
+    def _v_count(self) -> Int:
+        """Element count of the v blob in state files: compact under Muon."""
+        if self.optimizer_kind == 1:
+            return self.v_num_parameters
+        return self.optimizer_num_parameters
 
     def _adamw_ranges(self) -> List[Int]:
         """[start0, end0, start1, end1, ...] of the flat-buffer ranges AdamW
@@ -5326,7 +5903,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 ),
                 USE_BF16,
                 as_mut_kernel[MASTER_DTYPE](self.m_memory.unsafe_offset(start)),
-                as_mut_kernel[MASTER_DTYPE](self.v_memory.unsafe_offset(start)),
+                as_mut_kernel[MASTER_DTYPE](
+                    self.v_memory.unsafe_offset(self.v_compact_bases[k])
+                ),
                 t,
                 config,
                 self.ctx,
@@ -5350,6 +5929,154 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             muon_config,
             self.ctx,
         )
+
+    def _muon_config(self, config: AdamWConfig) -> MuonConfig:
+        return MuonConfig(
+            learning_rate=config.learning_rate,
+            momentum=self.muon_momentum,
+            weight_decay=config.weight_decay,
+            grad_scale=config.grad_scale,
+            ns_steps=5,
+            nesterov=True,
+        )
+
+    def _update_sharded_muon(
+        mut self,
+        t: UInt32,
+        config: AdamWConfig,
+    ) raises:
+        """ZeRO-1/2/3 Muon step (ZeRO-1 grads were all-reduced, ZeRO-2/3 grads
+        were bucket-reduced to their owners): pack the owned gradients (ZeRO-1
+        only), AdamW over this rank's flat-shard segments, Muon over the
+        owner-space groups, then propagate both parts at ZeRO-1/2. ZeRO-3 does
+        not propagate: under streaming `params_memory` is the flat shard only
+        (AdamW writes it shard-relative) and `muon_p_shard` is the source the
+        next forward gathers from. Never goes through `_update_hybrid`, which
+        assumes unsharded buffers."""
+        comptime if Self.WORLD_SIZE > 1:
+            var rank = self.zero_ctx.rank
+            var lo = rank * self.optimizer_num_parameters
+            # ZeRO-2 (bucketed): backward already reduce-scattered the Muon
+            # gradients into muon_g and the AdamW ones into grad_shard.
+            var bucketed = self._use_bucketing()
+            # Pack owned gradients into the owner-space gradient shard.
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                if sl.owner != rank or bucketed:
+                    continue
+                self.ctx.enqueue_copy(
+                    dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.muon_g_memory.unsafe_offset(
+                            sl.local_off
+                        ).as_unsafe_any_origin()
+                    ),
+                    src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                        self.grads_memory.unsafe_offset(
+                            sl.flat_off
+                        ).as_unsafe_any_origin()
+                    ),
+                    size=sl.len,
+                )
+            # The CPU Muon reference reads the packed gradients directly on
+            # the host, so the (queued) pack copies must have landed first.
+            self.ctx.synchronize()
+            var segs = self._adamw_shard_segments()
+            for i in range(len(segs)):
+                ref sg = segs[i]
+                var g_seg = self.grads_memory.unsafe_offset(sg.flat_start)
+                if bucketed:
+                    g_seg = self.grad_shard_memory.unsafe_offset(sg.shard_rel)
+                adamw_update[GPT2_DTYPE, Self.target](
+                    sg.len,
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.params_memory.unsafe_offset(
+                            sg.shard_rel if self.z3_streaming else sg.flat_start
+                        )
+                    ),
+                    as_mut_kernel[GPT2_DTYPE](g_seg),
+                    as_mut_kernel[MASTER_DTYPE](
+                        self.master_memory.unsafe_offset(sg.shard_rel)
+                    ),
+                    USE_BF16,
+                    as_mut_kernel[MASTER_DTYPE](
+                        self.m_memory.unsafe_offset(sg.shard_rel)
+                    ),
+                    as_mut_kernel[MASTER_DTYPE](
+                        self.v_memory.unsafe_offset(sg.compact_off)
+                    ),
+                    t,
+                    config,
+                    self.ctx,
+                )
+            if len(self.muon_owned_groups) > 0:
+                muon_update[GPT2_DTYPE, Self.target](
+                    self.muon_owned_groups,
+                    as_mut_kernel[GPT2_DTYPE](self.muon_p_memory),
+                    as_immut_kernel_from_mut[GPT2_DTYPE](self.muon_g_memory),
+                    as_mut_kernel[MASTER_DTYPE](self.muon_master_memory),
+                    USE_BF16,
+                    as_mut_kernel[MASTER_DTYPE](self.muon_m_memory),
+                    t,
+                    self._muon_config(config),
+                    self.ctx,
+                )
+            self.ctx.synchronize()
+
+            # S5 QK-clip block: after every local write, before the gathers.
+            if self.qk_clip_tau > 0.0:
+                self._qk_clip_sharded()
+
+            # ZeRO-3: no propagation. Streaming re-gathers from the flat shard
+            # (AdamW tensors) and the owner space (Muon matrices) in the next
+            # forward; the non-streaming harness has no peers to propagate to.
+            if self.zero_ctx.zero_stage >= 3:
+                return
+
+            # Propagate AdamW: own slice stays in place (self-copy skipped as
+            # dst == shard address); peers' AdamW regions are pulled.
+            var a_dst = List[Int]()
+            var a_len = List[Int]()
+            var ranges = self._adamw_ranges()
+            for k in range(len(ranges) // 2):
+                var n = ranges[2 * k + 1] - ranges[2 * k]
+                if n <= 0:
+                    continue
+                a_dst.append(ranges[2 * k])
+                a_len.append(n)
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.params_memory.unsafe_offset(lo).as_unsafe_any_origin()
+                ),
+                self.optimizer_num_parameters,
+                rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.params_memory.as_unsafe_any_origin()
+                ),
+                a_dst,
+                a_dst,
+                a_len,
+            )
+            # Propagate Muon matrices from their owners' owner-space shards.
+            var m_dst = List[Int]()
+            var m_src = List[Int]()
+            var m_len = List[Int]()
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                m_dst.append(sl.flat_off)
+                m_src.append(sl.owner_idx)
+                m_len.append(sl.len)
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.muon_p_memory.as_unsafe_any_origin()
+                ),
+                self.muon_shard_elems,
+                rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.params_memory.as_unsafe_any_origin()
+                ),
+                m_dst,
+                m_src,
+                m_len,
+            )
+            self.ctx.synchronize()
 
     def update(
         mut self,
@@ -5375,6 +6102,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             weight_decay=weight_decay,
             grad_scale=scaled_grad_scale,
         )
+
+        comptime if Self.WORLD_SIZE > 1:
+            if self.optimizer_kind == 1 and self.zero_ctx.zero_stage >= 1:
+                # Sharded Muon owns its own propagation (it must not fall into
+                # the flat allgather below, which would overwrite the fresh
+                # Muon matrices with stale flat copies).
+                self._update_sharded_muon(t, config)
+                return
 
         # The optimizer reads/writes the fp32 master copy when USE_BF16; in pure
         # fp32 `master_memory` is null and `has_master=USE_BF16` is False, so the
@@ -5606,6 +6341,23 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 if self._use_bucketing():
                     grads_src = self.grad_shard_memory
                 sharded = True
+        var sumsq = self._grad_sumsq(grads_src, n)
+        if self.optimizer_kind == 1:
+            comptime if Self.WORLD_SIZE > 1:
+                # ZeRO-2 Muon: the matrices' reduced gradients live in the
+                # owner-space accumulator; the flat shard holds zeros there.
+                if self._use_bucketing():
+                    sumsq += self._grad_sumsq(
+                        self.muon_g_memory, self.muon_shard_elems
+                    )
+        if sharded:
+            sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
+        return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
+
+    def _grad_sumsq(
+        mut self, src: MutMemPtr[GPT2_DTYPE], n: Int
+    ) raises -> Float32:
+        """Sum of squares of `n` gradient elements at `src` (this rank only)."""
         comptime width = simd_width_of[GPT2_DTYPE]()
 
         comptime if is_cpu[Self.target]():
@@ -5615,14 +6367,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 rebind[MutKernelPtr[DType.float32]](
                     host_out.as_unsafe_any_origin()
                 ),
-                as_immut_kernel_from_mut[GPT2_DTYPE](grads_src),
+                as_immut_kernel_from_mut[GPT2_DTYPE](src),
                 n,
             )
             var sumsq = host_out[unsafe_offset=0]
             host_out.unsafe_free()
-            if sharded:
-                sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
-            return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
+            return sumsq
         else:
             comptime BLOCK_SIZE = 512
             var grid_x = self.grad_norm_grid_x
@@ -5650,7 +6400,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx.enqueue_function(
                 compiled_norm,
                 as_mut_kernel[DType.float32](out_ptr),
-                as_immut_kernel_from_mut[GPT2_DTYPE](grads_src),
+                as_immut_kernel_from_mut[GPT2_DTYPE](src),
                 Int64(n),  # count (single slice)
                 Int64(n),  # stride (unused with one slice)
                 grid_dim=(grid_x, 1),
@@ -5684,9 +6434,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             self.ctx.synchronize()
             var sumsq = self.grad_norm_host_buf[0]
-            if sharded:
-                sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
-            return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
+            return sumsq
 
     def _debug_grad_nanscan(
         mut self, rank: Int, step: Int, micro_step: Int
@@ -5932,6 +6680,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         shard (m, v) to its `state_path`. Mirrors llm.c's split of model_*.bin
         (shared) and state_*_rank.bin (per-process).
         """
+        comptime if Self.WORLD_SIZE > 1:
+            if self.optimizer_kind == 1 and self.zero_ctx.zero_stage >= 1:
+                raise Error(
+                    "Checkpointing sharded Muon (ZeRO>=1) is not implemented"
+                    " yet: the owner-space momentum is not in the state file"
+                )
         # ZeRO-3 keeps only this rank's parameter shard resident in
         # params_memory after update() (the next forward re-gathers it). Gather
         # the full parameter set before snapshotting the model. Under streaming
@@ -5984,10 +6738,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # precision, so the state file stores them in fp32 (matching llm.c).
         var n_opt = self.optimizer_num_parameters
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
-        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
+        var n_v = self._v_count()
+        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v)
         self.ctx.synchronize()
         self._copy_device_to_host[MASTER_DTYPE](host_m, self.m_memory, n_opt)
-        self._copy_device_to_host[MASTER_DTYPE](host_v, self.v_memory, n_opt)
+        self._copy_device_to_host[MASTER_DTYPE](host_v, self.v_memory, n_v)
         self.ctx.synchronize()
         write_state_checkpoint[MASTER_DTYPE](
             state_path,
@@ -6004,6 +6759,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 host_v.unsafe_ptr().as_unsafe_any_origin()
             ),
             n_opt,
+            n_v,
         )
 
     def load_checkpoint(
@@ -6016,6 +6772,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         checkpoint (build it from the same base checkpoint first). Each rank
         reads the shared model file plus its own optimizer-state shard.
         """
+        comptime if Self.WORLD_SIZE > 1:
+            if self.optimizer_kind == 1 and self.zero_ctx.zero_stage >= 1:
+                raise Error(
+                    "Checkpointing sharded Muon (ZeRO>=1) is not implemented"
+                    " yet: the owner-space momentum is not in the state file"
+                )
         var host_params = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )
@@ -6094,7 +6856,50 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # AdamW moments are fp32 (MASTER_DTYPE); read them back in fp32.
         var n_opt = self.optimizer_num_parameters
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
-        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
+        var n_v = self._v_count()
+        # Peek the header first: the v blob length depends on optimizer_kind,
+        # so refuse a cross-optimizer resume before reading mis-sized blobs.
+        var peek_file = open(state_path, "r")
+        var peek_kind = read_state_header(peek_file).optimizer_kind
+        peek_file.close()
+        if peek_kind != self.optimizer_kind:
+            raise Error(
+                "Cannot resume: checkpoint was written with optimizer_kind="
+                + String(peek_kind)
+                + " (0=adamw, 1=muon) but this run uses "
+                + String(self.optimizer_kind)
+                + "; pass the matching -opt"
+            )
+        # The header does not record the v length, so check the file size:
+        # reading fewer bytes than the file holds would succeed silently. A
+        # Muon state file written before v went compact holds a full-size v
+        # (zeros at the Muon matrices); accept it and compact it below.
+        var elem = size_of[MASTER_DTYPE]()
+        var head_bytes = CHECKPOINT_HEADER_SIZE * size_of[DType.int32]()
+        var file_bytes = Int(getsize(state_path))
+        var n_v_read = n_v
+        if file_bytes != head_bytes + (n_opt + n_v) * elem:
+            if (
+                self.optimizer_kind == 1
+                and self.zero_ctx.zero_stage == 0
+                and file_bytes == head_bytes + 2 * n_opt * elem
+            ):
+                n_v_read = n_opt  # legacy full-size Muon v
+            else:
+                raise Error(
+                    "Cannot resume: state file "
+                    + state_path
+                    + " is "
+                    + String(file_bytes)
+                    + " bytes, expected "
+                    + String(head_bytes + (n_opt + n_v) * elem)
+                    + " (m="
+                    + String(n_opt)
+                    + ", v="
+                    + String(n_v)
+                    + " fp32 elements)"
+                )
+        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v_read)
         self.ctx.synchronize()
         var state = read_state_checkpoint[MASTER_DTYPE](
             state_path,
@@ -6105,7 +6910,22 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 host_v.unsafe_ptr().as_unsafe_any_origin()
             ),
             n_opt,
+            v_num_parameters=n_v_read,
+            expect_num_processes=Self.WORLD_SIZE,
+            expect_process_rank=self.zero_ctx.rank,
         )
+        if n_v_read != n_v:
+            # Legacy full-size v (ZeRO-0 layouts only; the size check above
+            # raises for anything else): gather each AdamW segment to its
+            # compact offset. compact_off <= shard_rel for disjoint ascending
+            # segments, so an ascending in-place copy never overwrites an
+            # element before it is read.
+            var segs = self._adamw_shard_segments()
+            for k in range(len(segs)):
+                for i in range(segs[k].len):
+                    host_v[segs[k].compact_off + i] = host_v[
+                        segs[k].shard_rel + i
+                    ]
         if state.optimizer_kind != self.optimizer_kind:
             raise Error(
                 "Cannot resume: checkpoint was written with optimizer_kind="
@@ -6115,7 +6935,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 + "; pass the matching -opt"
             )
         self._copy_host_to_device[MASTER_DTYPE](self.m_memory, host_m, n_opt)
-        self._copy_host_to_device[MASTER_DTYPE](self.v_memory, host_v, n_opt)
+        self._copy_host_to_device[MASTER_DTYPE](self.v_memory, host_v, n_v)
         self.ctx.synchronize()
         return state^
 
@@ -6156,6 +6976,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var b_m = _mem_bytes(self.m_buf)
         var b_v = _mem_bytes(self.v_buf)
         var b_master = _mem_bytes(self.master_buf)
+        var b_muon_p = _mem_bytes(self.muon_p_buf)
+        var b_muon_g = _mem_bytes(self.muon_g_buf)
+        var b_muon_m = _mem_bytes(self.muon_m_buf)
+        var b_muon_master = _mem_bytes(self.muon_master_buf)
         var b_param_window = _mem_bytes(self.param_window_buf)
         var b_embed_window = _mem_bytes(self.embed_window_buf)
         var b_acts = _mem_bytes(self.acts_buf)
@@ -6172,7 +6996,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         var c_params = b_params
         var c_grads = b_grads_full + b_grad_pool + b_grad_shard
-        var c_optimizer = b_m + b_v + b_master
+        var c_optimizer = (
+            b_m
+            + b_v
+            + b_master
+            + b_muon_p
+            + b_muon_g
+            + b_muon_m
+            + b_muon_master
+        )
         var c_z3_windows = b_param_window + b_embed_window
         var c_activations = (
             b_acts + b_acts_stats + b_grad_acts + b_grad_acts_stats + b_ce_stats
@@ -6240,6 +7072,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         s += "," + _mem_kv("m_buf", b_m)
         s += "," + _mem_kv("v_buf", b_v)
         s += "," + _mem_kv("master_buf", b_master)
+        s += "," + _mem_kv("muon_p_buf", b_muon_p)
+        s += "," + _mem_kv("muon_g_buf", b_muon_g)
+        s += "," + _mem_kv("muon_m_buf", b_muon_m)
+        s += "," + _mem_kv("muon_master_buf", b_muon_master)
         s += "," + _mem_kv("param_window_buf", b_param_window)
         s += "," + _mem_kv("embed_window_buf", b_embed_window)
         s += "," + _mem_kv("acts_buf", b_acts)
@@ -6266,6 +7102,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         _mem_mark(inactive, self.m_buf, "m_buf")
         _mem_mark(inactive, self.v_buf, "v_buf")
         _mem_mark(inactive, self.master_buf, "master_buf")
+        _mem_mark(inactive, self.muon_p_buf, "muon_p_buf")
+        _mem_mark(inactive, self.muon_g_buf, "muon_g_buf")
+        _mem_mark(inactive, self.muon_m_buf, "muon_m_buf")
+        _mem_mark(inactive, self.muon_master_buf, "muon_master_buf")
         _mem_mark(inactive, self.param_window_buf, "param_window_buf")
         _mem_mark(inactive, self.embed_window_buf, "embed_window_buf")
         _mem_mark(inactive, self.acts_buf, "acts_buf")
@@ -6645,6 +7485,18 @@ def train[
     )
     if args.optimizer == "muon":
         model.enable_muon(args.muon_momentum)
+        # Sharded Muon (W > 1, ZeRO >= 1) cannot write or read a state file
+        # until the owner-space momentum is in it (slice S4). Refuse up front:
+        # write_checkpoint would otherwise raise only at the first save step,
+        # after all the training before it.
+        comptime if WORLD_SIZE > 1:
+            if model.zero_ctx.zero_stage >= 1 and args.output_log_dir != "":
+                if args.checkpoint_every > 0 or args.resume == 1:
+                    raise Error(
+                        "-opt muon with -z >= 1 at WORLD_SIZE > 1 cannot"
+                        " checkpoint or resume yet (sharded-Muon state is"
+                        " not in the state file); drop -n / -y, or use -z 0"
+                    )
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
 
@@ -7402,6 +8254,9 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
         else:
             var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
             cpu_coord_ptr[] = CpuCoordinator(world_size)
+            var rank_failed = heap_alloc[Int](world_size)
+            for r in range(world_size):
+                rank_failed[unsafe_offset=r] = 0
 
             def _run_rank(rank: Int) {imm}:
                 try:
@@ -7410,6 +8265,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
                     )
                 except e:
                     print("Rank", rank, "failed:", e)
+                    rank_failed[unsafe_offset=rank] = 1
                     # Release the peers. Without this they rendezvous with a
                     # cohort permanently one short and spin forever: the run
                     # wedges with idle devices instead of exiting, and the
@@ -7421,6 +8277,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
             sync_parallelize(_run_rank, world_size)
             cpu_coord_ptr[].free()
             cpu_coord_ptr.unsafe_free()
+            _raise_if_rank_failed(rank_failed, world_size)
 
 
 def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
@@ -7473,12 +8330,16 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             # ignored here — all ranks live in this process.
             var coord_ptr = heap_alloc[CpuCoordinator](1)
             coord_ptr[] = CpuCoordinator(world_size)
+            var rank_failed = heap_alloc[Int](world_size)
+            for i in range(world_size):
+                rank_failed[unsafe_offset=i] = 0
 
             def _run_rank(r: Int) {imm}:
                 try:
                     _dispatch_world_size["gpu"](args, r, world_size, coord_ptr)
                 except e:
                     print("Rank", r, "failed:", e)
+                    rank_failed[unsafe_offset=r] = 1
                     # See the CPU path above: a rank that leaves without
                     # aborting hangs every peer on the next barrier.
                     coord_ptr[].abort()
@@ -7487,9 +8348,25 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             sync_parallelize(_run_rank, world_size)
             coord_ptr[].free()
             coord_ptr.unsafe_free()
+            _raise_if_rank_failed(rank_failed, world_size)
         return True
     else:
         return False
+
+
+def _raise_if_rank_failed(
+    failed: Pointer[Int, MutUntrackedOrigin], world_size: Int
+) raises:
+    """After a threaded multi-rank run: frees `failed` and raises if any rank
+    caught an error, so the process exits nonzero. The per-rank handlers only
+    print and abort the coordinator; without this a W>1 run whose ranks all
+    failed still exited 0, which made exit-code gates pass on a dead run."""
+    var n = 0
+    for r in range(world_size):
+        n += failed[unsafe_offset=r]
+    failed.unsafe_free()
+    if n > 0:
+        raise Error(String(n) + " of " + String(world_size) + " ranks failed")
 
 
 def main() raises:
