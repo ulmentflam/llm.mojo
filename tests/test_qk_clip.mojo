@@ -636,6 +636,12 @@ def _mclip_train[
                     Pointer[CpuCoordinator, MutUntrackedOrigin]
                 ](coord),
             )
+            comptime if UNTIED_HEAD:
+                # S2 refuses ZeRO-2/3 while the head trains (S6 adds the head
+                # bucketing/streaming). These ZeRO-2/3 checks exercise the
+                # tied-phase layout: head block present in the 17-tensor
+                # buffer but idle (neither reduced, updated nor read).
+                model.head_tied = stage >= 2
             model.enable_muon(Scalar[DType.float32](0.95))
             if clip:
                 model.enable_qk_clip(MTAU, True)

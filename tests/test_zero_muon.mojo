@@ -81,6 +81,7 @@ def _train[
     accum: Int = 1,
     same_batch: Bool = False,
     mu_ramp: Bool = False,
+    idle_head: Bool = False,
 ) raises:
     """Run `steps` steps on W threaded ranks at `stage`; rank r's final params
     go to result[r*n : (r+1)*n]. `accum` micro-steps per step (gradient
@@ -105,6 +106,12 @@ def _train[
                     Pointer[CpuCoordinator, MutUntrackedOrigin]
                 ](coord),
             )
+            comptime if UNTIED_HEAD:
+                # S2 refuses ZeRO-2/3 while the head trains (S6 adds the head
+                # bucketing/streaming). These ZeRO-2/3 checks exercise the
+                # tied-phase layout: head block present in the 17-tensor
+                # buffer but idle (neither reduced, updated nor read).
+                model.head_tied = idle_head
             model.enable_muon(Scalar[DType.float32](0.95))
             var x = heap_alloc[SIMD[DType.int32, 1]](BB * TT)
             var y = heap_alloc[SIMD[DType.int32, 1]](BB * TT)
@@ -297,10 +304,10 @@ def _t2_z2[W: Int](L: Int, NH: Int, C: Int, stage: Int = 2) raises:
     var ref3 = heap_alloc[Float32](W * n)
     var got3 = heap_alloc[Float32](W * n)
     try:
-        _train[W](path, n, 0, 1, ref1)
-        _train[W](path, n, stage, 1, got1)
-        _train[W](path, n, 0, STEPS, ref3)
-        _train[W](path, n, stage, STEPS, got3)
+        _train[W](path, n, 0, 1, ref1, idle_head=True)
+        _train[W](path, n, stage, 1, got1, idle_head=True)
+        _train[W](path, n, 0, STEPS, ref3, idle_head=True)
+        _train[W](path, n, stage, STEPS, got3, idle_head=True)
     except e:
         _remove(path)
         raise e^
@@ -398,8 +405,12 @@ def _t2_z2_same[W: Int](L: Int, NH: Int, C: Int) raises:
     var ref_p = heap_alloc[Float32](W * n)
     var got = heap_alloc[Float32](W * n)
     try:
-        _train[W](path, n, 0, STEPS, ref_p, accum=2, same_batch=True)
-        _train[W](path, n, 2, STEPS, got, accum=2, same_batch=True)
+        _train[W](
+            path, n, 0, STEPS, ref_p, accum=2, same_batch=True, idle_head=True
+        )
+        _train[W](
+            path, n, 2, STEPS, got, accum=2, same_batch=True, idle_head=True
+        )
     except e:
         _remove(path)
         ref_p.unsafe_free()

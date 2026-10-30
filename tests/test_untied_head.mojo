@@ -20,6 +20,7 @@ from std.python import Python
 from max.gpu.host import DeviceContext
 
 from llmm.checkpointing import write_model_checkpoint
+from llmm.memory import MutMemPtr, heap_alloc
 from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD, NUM_PARAMETER_TENSORS
 
 comptime CKPT = "gpt2_tiny_untied_head.bin"
@@ -198,6 +199,117 @@ def test_wrong_length_files_refused_in_both_builds() raises:
         _remove(CKPT)
         assert_true(uext, "extended untied file was accepted")
         assert_true(trunc, "untied file without a head block was accepted")
+
+
+comptime GB = 2
+comptime GT = 8
+
+
+def _fwd_bwd(
+    mut model: GPT2["cpu", 1],
+    x: MutMemPtr[DType.int32],
+    y: MutMemPtr[DType.int32],
+    grads: MutMemPtr[DType.float32],
+) raises -> Float32:
+    """One forward + zero_gradients + backward; copies the flat gradient buffer
+    (same layout as the parameters) to `grads` and returns the loss."""
+    model.forward(x, y, GB, GT)
+    model.zero_gradients()
+    model.backward()
+    model.ctx.synchronize()
+    var host = model.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
+        model.num_parameters
+    )
+    model.grads_buf.enqueue_copy_to(host)
+    model.ctx.synchronize()
+    for i in range(model.num_parameters):
+        grads[unsafe_offset=i] = host[i].cast[DType.float32]()
+    _ = host^
+    return model.mean_loss
+
+
+def test_untied_head_gradient_split_matches_tied() raises:
+    """Planted unit test for the S2 routing, mirroring
+    tests/test_untied_reference.py::test_untied_copy_of_wte_matches_tied_
+    forward_and_grad_split. Start from a tied .bin, so head == wte bitwise.
+    The tied reference is the same build with the head idle (`head_tied`
+    True; `make check-untied-idle` proves that equals the tied build's
+    process bitwise). Expect:
+      * loss bitwise equal (the head reads a bitwise copy of wte);
+      * rows of the batch's INPUT tokens (encoder) are 'present';
+      * absent rows: untied dwte == 0 exactly and dlm_head == tied dwte;
+      * present rows: untied dwte + dlm_head == tied dwte within 1e-6, and
+        dwte != 0 so the check is not vacuous.
+    A head gradient routed into wte (mutant) makes untied dwte nonzero on the
+    absent rows and fails the zero check."""
+    comptime if not UNTIED_HEAD:
+        print("SKIP test_untied_head_gradient_split: tied build")
+        return
+    _write_file(CKPT, 3, False, 0)
+    var x = heap_alloc[Scalar[DType.int32]](GB * GT)
+    var y = heap_alloc[Scalar[DType.int32]](GB * GT)
+    var present = heap_alloc[Int](VP)
+    for r in range(VP):
+        present[unsafe_offset=r] = 0
+    for i in range(GB * GT):
+        # inputs from 8 distinct rows, targets spread over the whole vocab
+        x[unsafe_offset=i] = Int32((i * 7) % 8)
+        y[unsafe_offset=i] = Int32((i * 29 + 11) % V)
+        present[unsafe_offset=Int(x[unsafe_offset=i])] = 1
+    var ctx = DeviceContext(api="cpu")
+    var tied = GPT2["cpu", 1](CKPT, rank=0, zero_stage=0, ctx=ctx)
+    var untied = GPT2["cpu", 1](CKPT, rank=0, zero_stage=0, ctx=ctx)
+    _remove(CKPT)
+    tied.head_tied = True
+    assert_true(not untied.head_tied, "untied model has an idle head")
+    var gt = heap_alloc[Float32](tied.num_parameters)
+    var gu = heap_alloc[Float32](untied.num_parameters)
+    var loss_t = _fwd_bwd(tied, x, y, gt)
+    var loss_u = _fwd_bwd(untied, x, y, gu)
+    assert_true(loss_t == loss_u, "untied loss != tied loss for head == wte")
+
+    var abs_rows = 0
+    var pres_rows = 0
+    var abs_head_nonzero = 0
+    for r in range(VP):
+        for c in range(C):
+            var i = r * C + c
+            var dwte_t = gt[unsafe_offset=i]
+            var dwte_u = gu[unsafe_offset=i]
+            var dhead_u = gu[unsafe_offset=N16 + i]
+            if present[unsafe_offset=r] == 0:
+                assert_true(
+                    dwte_u == 0.0, "absent row has encoder gradient in wte"
+                )
+                assert_true(
+                    dhead_u == dwte_t, "absent row: dlm_head != tied dwte"
+                )
+                if dhead_u != 0.0:
+                    abs_head_nonzero += 1
+            else:
+                assert_true(
+                    abs(dwte_u + dhead_u - dwte_t) <= 1e-6,
+                    "present row: dwte + dlm_head != tied dwte",
+                )
+        if present[unsafe_offset=r] == 0:
+            abs_rows += 1
+        else:
+            pres_rows += 1
+    # Non-vacuity: the planted batch has both kinds of rows, the head gradient
+    # is real on absent rows, and the encoder gradient is real on present rows.
+    assert_equal(pres_rows, 8)
+    assert_true(abs_head_nonzero > 100, "head gradient on absent rows is empty")
+    var enc_nonzero = 0
+    for r in range(8):
+        for c in range(C):
+            if gu[unsafe_offset=r * C + c] != 0.0:
+                enc_nonzero += 1
+    assert_true(enc_nonzero > 8 * C // 2, "encoder gradient on wte is empty")
+    x.unsafe_free()
+    y.unsafe_free()
+    present.unsafe_free()
+    gt.unsafe_free()
+    gu.unsafe_free()
 
 
 def main() raises:

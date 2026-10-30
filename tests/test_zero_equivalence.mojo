@@ -6,7 +6,7 @@ from std.python import Python
 
 from llmm.memory import MutMemPtr, heap_alloc
 
-from train_gpt2 import GPT2, GPT2_DTYPE
+from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD
 
 comptime NUM_PARAMS = 4592
 comptime B = 2
@@ -139,6 +139,10 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
             zero_stage=0,
             ctx=ctx,
         )
+        comptime if UNTIED_HEAD:
+            # Stage >= 2 runs below use the idle head (S2 refuses a training
+            # head there until S6); the baseline must match them.
+            baseline_model.head_tied = stage >= 2
 
         baseline_model.forward(
             rebind[MutMemPtr[DType.int32]](x),
@@ -194,6 +198,8 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
             ctx=ctx,
             cpu_coordinator_ptr=None,
         )
+        comptime if UNTIED_HEAD:
+            model.head_tied = stage >= 2  # see baseline above
         model.forward(
             rebind[MutMemPtr[DType.int32]](x),
             rebind[MutMemPtr[DType.int32]](y),
