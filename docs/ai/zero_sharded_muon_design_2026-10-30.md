@@ -1083,12 +1083,14 @@ sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.
     is fp32 cancellation noise after the wte difference feeds step 2/3
     gradients (step 1 is exact elsewhere, and ZeRO-1 stays bit-exact); the
     absolute gate of 1e-6 is ~100x below one lr=1e-3 step, so a wrong gradient
-    still fails it.
+    still fails it. *(Reviewer: the noise claim holds, but the last clause
+    does not. Small gradient errors pass this gate; see Verification below.)*
   - T5 at `-z 2 -opt muon` (W=2, d6, 3 steps): 10.865850, 10.716245,
     10.648577, identical to `-z 0`/`-z 1`. `-opt adamw -z 2` unchanged
     (10.865850, 10.369871, 10.128281).
   - Not done: the grad-accumulation case (`-d`); `+=` across micro-steps is
     the existing reduce-scatter semantics, but no test covers it with Muon.
+    *(Reviewer: now covered, see Verification below.)*
   - **For S3 (streaming):** during `update`, params live in `params_memory`
     (fully resident at ZeRO-1/2; the owner's authoritative copy of its
     matrices is `muon_p_shard`, and `params_memory` is refreshed from it by the
@@ -1096,6 +1098,98 @@ sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.
     `params_memory[0:opt]` is resident, so the owner must hold current params
     (and the bf16 fp32 master) in `muon_p_shard` / `muon_master` seeded by the
     W-round gather; there is no propagation after the update.
+
+- **Verification (fu/zs2, Opus reviewer):** the routing, zeroing, grad norm
+  and update path conform to section 5. No code defect was found. The test
+  overclaimed what its 3-step tolerance catches and had no
+  grad-accumulation coverage. Both are fixed in 9852e0d.
+  - **Routing (read and mutated).** Call A plus call B cover exactly the old
+    single call: the 4 skipped tensors are qkv (3C², split into 3 C² blocks
+    at `pool_slot[qkv] + k*C²`), attn_proj (C²), fc (4C²) and proj (4C²).
+    `muon_slots[k*L + l]` is the slot for (k, l) because pass 1 of
+    `_build_muon_ownership` appends k-major. Each slot's `len` equals the
+    pool length, and `owner_idx = owner*S + local_off` with
+    `local_off + len <= S`, so every element reaches exactly one owner. The
+    wte/wpe bucket is untouched. `muon_g` is zeroed only on the bucketed
+    branch of `zero_gradients`, which runs on micro-step 0 before any bucket.
+    ZeRO-1 still packs, which overwrites `muon_g`.
+  - **Grad norm.** Call A never writes the flat shard's Muon positions
+    (zero-filled), so `sumsq(grad_shard) + sumsq(muon_g)` counts every
+    element once. At ZeRO-1 the second term is off (`_use_bucketing()` is
+    false) and the full all-reduced buffer is summed once. The GPU kernel
+    is grid-strided over a fixed grid, so reusing it with `n = S` is fine.
+    The step-1 `norm=` at W=2, d6: `-z 0` and `-z 1` print 14.0608,
+    `-z 2` Muon 14.0610, and `-z 2` AdamW 14.0609. That is 1.4e-5 relative,
+    so not equal to printed precision. The CPU kernel accumulates fp32 per
+    worker chunk, and the chunks differ by stage (one buffer vs. shard +
+    `muon_g`, plus the cross-rank sum). In the threaded harness (L=2 C=16),
+    `calculate_grad_norm` at step 1 prints 0.08311849 (W=2) and 0.06502338
+    (W=4) for ZeRO-0, -1 and -2 alike. A missing or double-counted tensor
+    would show there.
+  - **Update path.** With bucketing the pack is skipped and AdamW reads
+    `grad_shard + shard_rel`. The synchronize before the CPU AdamW/Muon
+    calls is still there. Muon reads `muon_g`. The device-to-host copy in
+    `_grad_sumsq` is followed by `ctx.synchronize()`.
+  - **The tolerance claim is half right.** With every rank on the same batch,
+    ZeRO-2 vs ZeRO-0 is bit-exact for all 3 steps at W=2 and W=4, with and
+    without 2 micro-steps. So the different-batch 3-step drift comes only
+    from the reduction order (the wte two-part sum, plus the per-micro-step
+    reduce under accumulation). It is not a routing error, and `1e-4|a| +
+    1e-6` is a fair bound for that drift. But the gate does not catch "any
+    wrong gradient". These are the mutants (all ranks, applied to the pool
+    before call B), as max `|a-b| / (1e-4|a| + 1e-6)` over 3 steps, at W=2 /
+    W=4:
+
+    | mutant | 3-step ratio | caught by step-1 exact? |
+    |---|---|---|
+    | none (baseline noise) | 0.0011 / 0.18 | n/a |
+    | x1.001 on layer-0 Q block | 0.19 / 0.36 (pass) | yes (448 / 960 elems) |
+    | x1.001 on one row of it | 1.65 (fail) / 0.49 (pass) | yes |
+    | x1.001 on one element | 0.39 / 0.32 (pass) | yes |
+    | x1.001 on ln_1 gamma (call A) | 1.16 (fail) / 0.35 (pass) | yes (4 elems) |
+    | Q/K pool offsets swapped | 1090 / 1277 | yes |
+    | last layer's call B dropped | 820 / 1126 | yes |
+    | `muon_g` never zeroed | 693 (W=2) | **no** (step 1 is unaffected) |
+
+    AdamW and Muon are nearly invariant to gradient scale, so a 1e-3 relative
+    gradient error moves params by about as much as the reduction-order
+    noise. No tolerance separates the two. Routing is pinned by the step-1
+    exact check, and the per-step zero by the 3-step tolerance (693x). The
+    margin is thin with accumulation: different-batch, 2 micro-steps, W=2
+    reaches 0.84x, unmutated.
+  - **Added:** `test_t2_zero2_same_batch_accum_bit_exact_w{2,4}`. Same
+    batch on every rank, 2 micro-steps, 3 steps, ZeRO-2 == ZeRO-0
+    bit-exactly. The one-element scale, never-zeroed and dropped-call-B
+    mutants all fail it. It is the strong gate for accumulation and
+    zeroing. The 3-step tolerance comment now says what that check can and
+    cannot catch.
+  - **Gates.** These ran on the tree with main merged in (20c4769, so S1 and
+    S5 are included). Since ce9f12c a failed rank exits 2, so the rc=0 below
+    is a real pass.
+    - `make test-mojo`: `tests result=pass files=26 files_failed=0
+      passed=214 skipped=1 failed=0`, exit 0. test_zero_muon passed 10/10.
+    - `make verify`: `result gate=cpu status=pass` and
+      `result gate=gpu status=pass`, exit 0.
+    - `make lint`: pass.
+    - `make build-bf16`: rc=0.
+    - W=2 CPU, d6, 3 steps (`make -B build-train WORLD_SIZE=2`, mtime
+      checked): `-opt muon -z {0,1,2}` all give 10.865850, 10.716245,
+      10.648577, rc=0. `-opt adamw -z 2` gives 10.865850, 10.369871,
+      10.128281.
+    - Grad accumulation `-d 256` (2 micro-steps), `-opt muon`: `-z 2` and
+      `-z 0` both give 10.851870, 10.717384.
+    - W=1 GPU (`make -B build-train`, then
+      `make train ARGS="-opt muon -x 5 -v 0 -s 0"`): 4.287241, 3.985736,
+      4.111536, 3.619405, 3.700305.
+  - **For S3:** call B's lists come from the static `muon_slots` table, so
+    they are rank-invariant by construction. Keep that true for the ZeRO-3
+    backward, which goes through the same bucket code. `muon_g` is zeroed
+    only by `zero_gradients(zero_param_grads=True)`. A ZeRO-3 path that
+    zeroes `grad_shard_buf` anywhere else must zero `muon_g` there too, or
+    `_t2_z2_same`-style tests catch it only at step >= 2. QK-clip at
+    ZeRO-2 still raises (`enable_qk_clip`). `_qk_clip_sharded` touches only
+    params, so lifting that raise for ZeRO-2 should need only a T2-style
+    test.
 
 **S3: ZeRO-3** (`_z3_stream_layer` split, `_z3_gather_full` split, W-round
 streaming seed, the ZeRO-3 arms of `_update_sharded_muon` for streaming and
