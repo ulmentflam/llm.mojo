@@ -167,6 +167,7 @@ $(PIXI_STAMP):
 
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
+        verify-untied-cpu verify-untied-gpu check-untied-idle \
         typecheck check compile-rest clean figures figure-precision build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
@@ -1352,6 +1353,11 @@ endif
 # NVIDIA-gated early returns as skipped; a failing file prints its full output.
 # LLMM_LOG_LEVEL=verbose lists every test case; LLMM_LOG=plain passes the raw
 # TestSuite output through.
+# Extra comptime defines for every test build, e.g.
+# `make test-mojo TEST_DEFINES="-D LLMM_UNTIED_HEAD=1"` builds the whole suite
+# against the untied-LM-head trainer. Empty by default (command line unchanged).
+TEST_DEFINES ?=
+
 test-mojo: | $(PIXI_STAMP)
 	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
 		fail=0; \
@@ -1363,7 +1369,7 @@ test-mojo: | $(PIXI_STAMP)
 			bin="$$bindir/$$(basename "$$f" .mojo)"; \
 			if ! $(PIXI) run python scripts/test_log.py --build "$$f" -- \
 				timeout $(TEST_FILE_TIMEOUT) mojo build \
-				$(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o "$$bin" "$$f"; then \
+				$(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(TEST_DEFINES) -o "$$bin" "$$f"; then \
 				fail=1; \
 				continue; \
 			fi; \
@@ -1500,6 +1506,19 @@ test-fixtures:
 # We run them as separate processes because initializing both CPU and GPU standard
 # DeviceContexts in the same process leads to a MAX multi-context conflict/crash.
 verify: verify-cpu verify-gpu
+
+# Untied-LM-head references (docs/ai/untied_lm_head_design_2026-10-30.md).
+# STUBS until slice S2: they need the untied fixtures from S1 and the untied
+# forward/backward; they fail loudly rather than pass vacuously.
+verify-untied-cpu verify-untied-gpu:
+	@echo "$@: not implemented yet (slice S2 of the untied-head work)" >&2; exit 1
+
+# Slice S0 gate: -D LLMM_UNTIED_HEAD=1 with the head idle must reproduce the
+# tied build's 3-step CPU run (see scripts/check_untied_idle.py).
+check-untied-idle: | $(PIXI_STAMP)
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_tiedchk
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_untiedchk MOJO_DEFINES="-D LLMM_UNTIED_HEAD=1"
+	$(PIXI) run python scripts/check_untied_idle.py build/train_gpt2_tiedchk build/train_gpt2_untiedchk
 
 verify-cpu: | $(PIXI_STAMP)
 	$(PIXI) run mojo test_gpt2.mojo cpu

@@ -1,3 +1,4 @@
+from std.os.path import getsize
 from std.python import Python
 from std.testing import assert_equal, assert_almost_equal, TestSuite
 
@@ -16,6 +17,8 @@ from llmm.checkpointing import (
     MODEL_MAGIC,
     STATE_MAGIC,
     VERSION_FP32,
+    VERSION_FP32_UNTIED,
+    VERSION_BF16_UNTIED,
 )
 
 
@@ -150,6 +153,114 @@ def test_model_checkpoint_buffer_too_small() raises:
     params.unsafe_free()
     out.unsafe_free()
     _remove(path)
+
+
+def _untied_config() -> CheckpointConfig:
+    return CheckpointConfig(
+        max_seq_len=4,
+        vocab_size=8,
+        num_layer=2,
+        num_heads=2,
+        channels=4,
+        padded_vocab_size=8,
+        untied_head=1,
+    )
+
+
+def test_untied_num_parameters_and_equality() raises:
+    var tied = _tiny_config()
+    var untied = _untied_config()
+    # The head is one more [padded_vocab, channels] block: 8 * 4 = 32.
+    assert_equal(untied.num_parameters(), tied.num_parameters() + 32)
+    assert_equal(untied.num_parameters(), 576)
+    assert_equal(tied == untied, False)
+    assert_equal(untied == _untied_config(), True)
+
+
+def test_untied_model_checkpoint_roundtrip_planted() raises:
+    """An untied file with a head distinct from wte (planted 1000 + index)
+    round-trips bit-exactly, is version 13, and reports untied_head."""
+    var path = String("test_ckpt_untied.bin")
+    var config = _untied_config()
+    var n = config.num_parameters()
+    var body = _tiny_config().num_parameters()
+    var params = heap_alloc[Float32](n)
+    for i in range(n):
+        params.unsafe_store(i, Float32(i) * 0.5 - 1.0)
+    for i in range(32):  # head block: planted, != wte (wte is the first 32)
+        params.unsafe_store(body + i, Float32(1000 + i))
+
+    write_model_checkpoint(path, config, params, n)
+    var header = peek_model_header(path)
+    assert_equal(header.version, VERSION_FP32_UNTIED)
+    assert_equal(header.version, 13)
+    assert_equal(header.config.untied_head, 1)
+    assert_equal(header.config == config, True)
+
+    var restored = heap_alloc[Float32](n)
+    _ = read_model_checkpoint(path, restored, n)
+    for i in range(n):
+        assert_equal(restored.unsafe_load(i), params.unsafe_load(i))
+    for i in range(32):
+        assert_equal(restored.unsafe_load(body + i), Float32(1000 + i))
+    assert_equal(VERSION_BF16_UNTIED, 15)
+
+    params.unsafe_free()
+    restored.unsafe_free()
+    _remove(path)
+
+
+def _append_bytes(path: String, k: Int) raises:
+    var builtins = Python.import_module("builtins")
+    var f = builtins.open(path, "ab")
+    _ = f.write(builtins.bytes(k))
+    f.close()
+
+
+def _truncate_bytes(path: String, k: Int) raises:
+    var os = Python.import_module("os")
+    var size = Int(getsize(path))
+    _ = os.truncate(path, size - k)
+
+
+def _read_refused(path: String, n: Int) -> Bool:
+    var out = heap_alloc[Float32](n)
+    var raised = False
+    try:
+        _ = read_model_checkpoint(path, out, n)
+    except e:
+        raised = "expected" in String(e)
+    out.unsafe_free()
+    return raised
+
+
+def test_model_checkpoint_wrong_length_refused() raises:
+    """read_model_checkpoint used to ignore trailing bytes, so an untied blob
+    behind a tied header (or any padded/extended file) loaded silently."""
+    for untied in range(2):
+        var config = _untied_config() if untied == 1 else _tiny_config()
+        var n = config.num_parameters()
+        var params = heap_alloc[Float32](n)
+        _fill_pattern(params, n, 0.25)
+        var path = String("test_ckpt_len.bin")
+
+        write_model_checkpoint(path, config, params, n)
+        assert_equal(_read_refused(path, n), False)  # exact length reads fine
+
+        _append_bytes(path, 4)  # one extra element
+        assert_equal(_read_refused(path, n), True)
+
+        write_model_checkpoint(path, config, params, n)
+        _truncate_bytes(path, 4)  # one element short
+        assert_equal(_read_refused(path, n), True)
+
+        # A tied header over an untied-sized blob: the actual failure mode.
+        write_model_checkpoint(path, _tiny_config(), params, n)
+        assert_equal(
+            _read_refused(path, _tiny_config().num_parameters()), untied == 1
+        )
+        params.unsafe_free()
+        _remove(path)
 
 
 # ===----------------------------------------------------------------------=== #

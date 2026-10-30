@@ -22,7 +22,7 @@ from llmm.attention import attention_fwd
 from llmm.qk_clip import qk_clip_apply
 from llmm.zero import CpuCoordinator
 from _gpu_test_common import shared_gpu_ctx
-from train_gpt2 import GPT2, GPT2_DTYPE
+from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD
 
 
 def has_gpu_accelerator() -> Bool:
@@ -341,6 +341,9 @@ comptime NUM_PARAMS = (
     + GL * GC
     + 2 * GC
 )
+# Parameters in the live model: the tied .bin above plus, in an
+# LLMM_UNTIED_HEAD build, the head block the loader copies from wte.
+comptime MODEL_PARAMS = NUM_PARAMS + (GV * GC if UNTIED_HEAD else 0)
 comptime HOT_L = 1
 comptime HOT_H = 1
 
@@ -414,11 +417,11 @@ def test_gpt2_qk_clip_end_to_end() raises:
         var ctx = shared_gpu_ctx()
         var model = GPT2["gpu", 1](CKPT, rank=0, zero_stage=0, ctx=ctx)
         _remove_tiny_checkpoint()
-        assert_equal(model.num_parameters, NUM_PARAMS)
+        assert_equal(model.num_parameters, MODEL_PARAMS)
         model.enable_qk_clip(TAU)
         comptime NHM = GL * GNH
         var hm = ctx.enqueue_create_host_buffer[DType.float32](NHM)
-        var params = ctx.enqueue_create_host_buffer[GPT2_DTYPE](NUM_PARAMS)
+        var params = ctx.enqueue_create_host_buffer[GPT2_DTYPE](MODEL_PARAMS)
         ctx.synchronize()
 
         @__parameter
