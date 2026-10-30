@@ -50,10 +50,10 @@ comptime CHUNK = BLOCK * ELEMS
 
 # Mirrors llmm/adamw.mojo's opt-in stochastic rounding of the low-precision
 # param store (same macros, same seed), but with its own rng_device stream id
-# (see the registry at the top of adamw.mojo) so the substreams are independent.
+# (registry in llmm/rng_device.mojo) so the substreams are independent.
 comptime SR_MASTER_ENABLED = is_defined["LLMM_SR_MASTER"]()
 comptime SR_MASTER_SEED = UInt64(get_defined_int["LLMM_SR_SEED", 1746221221]())
-comptime SR_MUON_STREAM = UInt64(2)
+comptime SR_MUON_STREAM = UInt64(6)
 
 
 @fieldwise_init
