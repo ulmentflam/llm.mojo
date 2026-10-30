@@ -139,6 +139,17 @@ hyperparameter sweep:
 convergence vs AdamW:
 [`docs/ai/muon_vs_adamw_124m_2026-10-29.md`](docs/ai/muon_vs_adamw_124m_2026-10-29.md).
 
+**Rotary position embeddings (opt-in, `MOJO_DEFINES="-D LLMM_ROTARY=1"`).** The modded-nanogpt
+half-truncated rotary on the q and k thirds of qkv replaces the learned `wpe` add: `wpe` stays in
+the parameter layout (checkpoint tensor list, ZeRO shards and Muon owner-space unchanged) but is
+not added, gets no gradient, is zero from a from-scratch init and is left out of the Muon-mode
+AdamW ranges. A rotary checkpoint is only meaningful in a rotary build: the flag is stored in the
+checkpoint headers, a rotary model `.bin` is refused by a non-rotary build, and resuming refuses a
+mismatch in either direction (a non-rotary `.bin`, e.g. pretrained GPT-2, still initialises a
+rotary run, with the obvious loss jump). Default-build checkpoints are byte-identical to before.
+Reference (`GPT2_ROTARY=1` in `train_gpt2.py`), gates and results:
+[`docs/ai/rotary_embeddings_w8_2026-10-30.md`](docs/ai/rotary_embeddings_w8_2026-10-30.md).
+
 Muon vs AdamW on this box (GPT-2 124M from scratch, FineWeb, bf16, B=32 T=1024 at 131k tokens/step,
 600 steps = 79M tokens, cosine to zero, same init per seed; val loss at step 600, three init seeds):
 

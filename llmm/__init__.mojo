@@ -8,6 +8,8 @@ from .attention import (
     KVCachePtr,
 )
 from .checkpointing import (
+    ARCH_FLAG_ROTARY,
+    MODEL_FLAGS_SLOT,
     CheckpointConfig,
     ModelHeader,
     TrainingState,

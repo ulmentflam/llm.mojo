@@ -81,9 +81,14 @@ import torch
 # train_gpt2.py guards its training driver behind `if __name__ == "__main__"`,
 # so importing it for the model definition is side-effect free.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from train_gpt2 import GPT  # noqa: E402
+from train_gpt2 import GPT, ROTARY  # noqa: E402
 
-STATE_FILE = "gpt2_124M_debug_state.bin"
+# GPT2_ROTARY=1 selects the rotary reference: the same weights, rotary on q/k,
+# no wpe add, and the rotary debug state written by `GPT2_ROTARY=1 python
+# train_gpt2.py` (the list is then pasted as `expected_losses_rotary`).
+STATE_FILE = (
+    "gpt2_124M_rotary_debug_state.bin" if ROTARY else "gpt2_124M_debug_state.bin"
+)
 MAGIC_EXPECTED = 20240520
 VERSION_EXPECTED = 3
 NUM_STEPS = 10
@@ -211,7 +216,8 @@ def main() -> int:
     print("OK: step 0 reproduces the stored reference loss.")
 
     print("\nPaste into test_gpt2.mojo:\n")
-    print("    var expected_losses: List[Float32] = [")
+    name = "expected_losses_rotary" if ROTARY else "expected_losses"
+    print(f"    var {name}: List[Float32] = [")
     for value in losses:
         print(f"        {value!r},")
     print("    ]")
