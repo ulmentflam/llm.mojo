@@ -332,6 +332,17 @@ def run_test[
         and is_gpu[target]()
         and GPT2_DTYPE == DType.float32
     )
+    # relu2 exception (-D LLMM_MLP_ACT=relu2): the gradient checks above stay at
+    # full strength (GPU: all 16 tensors agree with the PyTorch relu2 reference to
+    # l2_ratio 0.9996, maxdiff ~1e-3 against thresholds of 1e-2..4e-1), but the
+    # 10-step overfit loss trajectory drifts monotonically (0.00001 at step 0 ->
+    # 0.0118 at step 9) because relu2 on GELU-pretrained weights starts at loss
+    # 7.18 and falls to 3.4 in 10 steps (gelu: 5.27 -> 0.38 with 3e-4 drift), so
+    # a 4e-4 relative gradient difference is compounded by AdamW at lr 1e-4.
+    # 0.02 = ~1.7x the measured max drift. A wrong relu2 backward fails the
+    # gradient checks first (verify-cpu under relu2 does, see docs/ai).
+    comptime if MLP_RELU2:
+        LOSS_STEP_TOL = 0.02
     var log = Log()
     var gate = String(target)
     var checked = 0
