@@ -1043,6 +1043,27 @@ non-streaming).
   fu/zs0's `num_processes`/`process_rank` check is already on main, keep it
   and add only the remaining refusals.
 - Gate: T6.
+- **Status (fu/zs4): implemented.** Layout of a sharded-Muon rank file:
+  header (slots 2 W, 3 rank, 40 kind=1, **41 zero_stage, 42
+  muon_ownership_version=1, 43 S**) + `m` (opt, fp32) + `v` (A_r, compact) +
+  `muon_m` (S, fp32). Length `256*4 + (opt + A_r + S)*4`. AdamW and W=1 /
+  ZeRO-0 Muon files write zeros in 41-43 and are byte-identical to before.
+  **Master policy: `muon_master` is not saved** (as `master_buf` is not); on
+  resume `muon_p_shard` is re-seeded from the loaded full params and
+  `muon_master` is rebuilt from it, so bf16 resume is not bit-exact and fp32 is.
+  `read_state_checkpoint` takes `muon_m_out` + `expect_muon_shard_elems`,
+  refuses owner/replicated layout mismatch (so ZeRO-0 file at ZeRO>=1 and the
+  reverse), ownership version or S mismatch, and checks the file length exactly
+  (header + m + v [+ muon_m]) in both directions with actual vs expected bytes;
+  this replaced the "Failed to read enough bytes" and trailing-byte messages.
+  `load_checkpoint` keeps the legacy full-v copy-down at ZeRO-0 only. The stage
+  recorded in slot 41 is informational; ZeRO-1/2/3 share the layout.
+  Verified: unit T6 `test_state_checkpoint_sharded_muon_t6` (stage list
+  `[1, 2, 3]`; S2/S3 need no change here), and end to end at threaded CPU W=2
+  `-z 1`: `-x 2` then `-y 1 -x 4` gives losses 10.648577, 10.410458 for steps
+  3-4, equal to a continuous `-x 4` run, and the step-4 model and both state
+  files are byte-identical (`cmp`). Refused: `-z 0` resume of the `-z 1` files,
+  W=1 resume of W=2 files, a file 4 bytes short (both byte counts printed).
 
 **S5: QK-clip multi-rank** (`allreduce_max_host`; the clip inside
 `_update_sharded_muon`; `enable_qk_clip` scope).
