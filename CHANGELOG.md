@@ -22,20 +22,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-(layer, head) max post-scale attention logit in the softmax kernel and,
   after each update, scales hot heads' Q and K rows and biases by
   `sqrt(tau / S_max)`; the setup log shows `opt=`, verbose adds
-  `muon_momentum=` / `qk_clip=` and each step prints `qk_max=`. Scope limits:
-  phase 1 supports WORLD_SIZE 1 / ZeRO-0 only (`-opt muon` and `-qk_clip` raise
-  otherwise); QK-clip also raises on CPU; Muon on CPU is a naive fp32 reference
-  (tests only) and Metal raises. State checkpoints record `optimizer_kind` in
-  header slot 40 and resuming with the other optimizer raises. Verification:
-  `tests/test_muon.mojo`, `tests/test_muon_equivalence.py` (against a torch
-  reference and stock `torch.optim.Muon` 2.13; 33/33 on CPU and on GPU),
-  `tests/test_muon_crosscheck.py` (mutants rejected) and
-  `tests/test_qk_clip.mojo` (including end-to-end). First 10-step runs on the
-  pretrained 124M end within ~0.03 loss of AdamW; step time is +18% fp32 /
-  +29% bf16, not yet optimized. The default AdamW path is unchanged: a
-  deterministic CPU run is bit-identical to before and GPU runs are within
-  run-to-run noise. Details and reviewer-found fixes in
-  [`docs/ai/muon_muonclip_implementation_2026-10-29.md`](docs/ai/muon_muonclip_implementation_2026-10-29.md).
+  `muon_momentum=` / `qk_clip=` and `qk_max=` appears in the verbose step
+  line. Scope: `-opt muon` raises only when WORLD_SIZE > 1 with ZeRO >= 1 or
+  ZeRO-3 streaming (at WORLD_SIZE 1 `-z` is a no-op). The GPU path needs
+  cuBLASLt (NVIDIA); Metal/AMD raise at the first `update()`. Muon on CPU is a
+  naive fp32 host Newton-Schulz, correct but about 124 s/step at 30M params,
+  so a reference only. `-qk_clip` raises on CPU and when WORLD_SIZE > 1. The
+  OpenAI-pretrained GPT-2 124M already has max attention logits of about 110
+  at step 1, so `-qk_clip 100` rescales Q/K on step 1 of a fine-tune (the
+  plan's "never triggers at 124M" holds only from scratch). State checkpoints
+  record `optimizer_kind` in header slot 40; resuming across optimizers is
+  refused in both directions. Verification: `tests/test_muon.mojo`,
+  `tests/test_muon_equivalence.py`, `tests/test_muon_crosscheck.py` and
+  `tests/test_muon_crosscheck_keller.py` check the kernel against three
+  independent references (our torch reference, stock `torch.optim.Muon` 2.13
+  and Keller Jordan's `muon-optimizer`; 151 passed, with a mutant catalogue
+  rejected by every source; run with `MAX_USE_ACCELERATOR=1`, the bridge
+  otherwise defaults to the CPU op path), plus `tests/test_qk_clip.mojo`
+  (including end-to-end). The default AdamW path is unchanged: a deterministic
+  CPU run is bit-identical to before and GPU runs are within run-to-run noise.
+  Performance: Muon first cost +41 ms/step (+30%, bf16 B=4 T=1024 on GB10);
+  vectorized elementwise kernels and folding the Newton-Schulz axpby into
+  cuBLASLt alpha/beta epilogues (`_matmul_cublaslt` gained optional
+  alpha/beta/c_ptr, existing call sites unchanged) cut it, and the overhead is
+  a fixed per-step cost, about 1% at 131k tokens/step. Details, reviewer-found
+  fixes and the perf attribution in
+  [`docs/ai/muon_muonclip_implementation_2026-10-29.md`](docs/ai/muon_muonclip_implementation_2026-10-29.md);
+  convergence results in
+  [`docs/ai/muon_vs_adamw_124m_2026-10-29.md`](docs/ai/muon_vs_adamw_124m_2026-10-29.md).
 
 - **Side-by-side video against llm.c on CPU** (`docs/bench-vs-llmc.mp4`, real
   time, with a 4x GIF preview in the README). llm.c's `train_gpt2.c` (OpenMP,
