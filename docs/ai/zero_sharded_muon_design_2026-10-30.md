@@ -644,6 +644,17 @@ Check binary mtimes. Run the trainer only through `make`.
 - `_reducescatter_buckets_gpu`: `_check_scratch[dtype](seg)` per segment.
 - Gate: T3 (minus `allreduce_max_host`); existing test_zero and
   test_zero_equivalence green.
+- **Status (fu/zs0):** all of the above reproduced on the pre-fix binary and
+  fixed (7255440, 89a176c). Notes for later slices: (1) the scratch check runs
+  as a host-side pre-pass (`_bucket_overlap_max`) before any barrier, and also
+  raises on CPU for buckets outside `[0, N*opt)`; with `ensure_comm_setup`
+  sized to `comm_shard` the overlap cannot exceed scratch, so the check is a
+  guard, not a live failure. (2) The self-copy skip compares addresses, so
+  callers must pass `dst_base`/`shard_base` that alias exactly. (3) Resume
+  now raises on `num_processes`/`process_rank` mismatch (AdamW and Muon alike);
+  `read_state_checkpoint` takes optional `expect_num_processes` /
+  `expect_process_rank`. (4) The multi-GPU arms are compile-checked only on
+  this 1-GPU box.
 
 **S1: ownership + owner buffers + ZeRO-1** (llmm/muon.mojo `MuonGroup`
 sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.mojo).
