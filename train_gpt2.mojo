@@ -6183,7 +6183,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 host_v.unsafe_ptr().as_unsafe_any_origin()
             ),
             n_opt,
-            n_v_read,
+            v_num_parameters=n_v_read,
+            expect_num_processes=Self.WORLD_SIZE,
+            expect_process_rank=self.zero_ctx.rank,
         )
         if n_v_read != n_v:
             # Legacy full-size v: gather the AdamW ranges to their compact

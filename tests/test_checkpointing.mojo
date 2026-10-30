@@ -247,6 +247,64 @@ def test_state_checkpoint_compact_v_roundtrip() raises:
     _remove(path)
 
 
+def test_state_checkpoint_world_size_mismatch_raises() raises:
+    # A state file written by rank 1 of 2 must not load at world size 1 (it
+    # used to read a silent prefix), nor into the wrong rank; the matching
+    # world/rank and the unchecked default still load.
+    var path = String("test_ckpt_state_world.bin")
+    var n = 8
+    var m = heap_alloc[Float32](n)
+    var v = heap_alloc[Float32](n)
+    _fill_pattern(m, n, 0.1)
+    _fill_pattern(v, n, 0.3)
+    var state = TrainingState(
+        step=5,
+        num_processes=2,
+        process_rank=1,
+        use_master_weights=0,
+        should_shuffle=0,
+        sampler_rng_state=UInt64(0),
+        shuffle_rng_state=UInt64(0),
+        current_shard_idx=0,
+        current_sample_idx=0,
+        optimizer_kind=0,
+    )
+    write_state_checkpoint(path, state, m, v, n)
+    var m_out = heap_alloc[Float32](n)
+    var v_out = heap_alloc[Float32](n)
+
+    var raised_world = False
+    try:
+        _ = read_state_checkpoint(
+            path, m_out, v_out, n, expect_num_processes=1, expect_process_rank=0
+        )
+    except e:
+        raised_world = "world size" in String(e)
+    assert_equal(raised_world, True)
+
+    var raised_rank = False
+    try:
+        _ = read_state_checkpoint(
+            path, m_out, v_out, n, expect_num_processes=2, expect_process_rank=0
+        )
+    except e:
+        raised_rank = "rank 1 of 2" in String(e)
+    assert_equal(raised_rank, True)
+
+    var ok = read_state_checkpoint(
+        path, m_out, v_out, n, expect_num_processes=2, expect_process_rank=1
+    )
+    assert_equal(ok.step, 5)
+    var unchecked = read_state_checkpoint(path, m_out, v_out, n)
+    assert_equal(unchecked.num_processes, 2)
+
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
+    _remove(path)
+
+
 def test_state_checkpoint_bad_magic() raises:
     # A model checkpoint must not read back as a state checkpoint.
     var path = String("test_ckpt_state_badmagic.bin")
