@@ -70,8 +70,8 @@
 #
 # Stream registry (one id per SR call site, all sharing LLMM_SR_SEED): 1 =
 # adamw SR-master; 2/3 = nvfp4 forward A/B operands; 4/5 = nvfp4
-# dgrad/wgrad d_output. New SR call sites take the next id and record it
-# here.
+# dgrad/wgrad d_output; 6 = muon param store. New SR call sites take the next
+# id and record it here.
 #
 # All functions here are plain `def`s over scalar `UInt64`/`UInt32`/`Float32`
 # math — no `is_gpu[target]()`/`is_cpu[target]()` branching, unlike the
