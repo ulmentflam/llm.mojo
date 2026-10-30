@@ -12,6 +12,7 @@ from llmm.memory import MutMemPtr, heap_alloc
 from llmm.log import Field, Log, num, text, DEBUG, NORMAL, QUIET, VERBOSE
 from llmm.term import pad_right
 from llmm.vendor import HAS_CUBLAS, USE_TF32
+from llmm.gelu import MLP_RELU2
 
 from train_gpt2 import (
     GPT2,
@@ -21,6 +22,18 @@ from train_gpt2 import (
     _ffmt,
 )
 
+# -D LLMM_MLP_ACT=relu2 swaps the MLP activation, so the reference state and the
+# loss trajectory come from the PyTorch reference run with GPT2_ACT=relu2
+# (train_gpt2.py writes gpt2_124M_relu2_debug_state.bin; the trajectory is
+# scripts/gen_expected_losses.py's output under the same env var).
+# -D LLMM_ROTARY=1 reads the rotary reference (same weights, rotary q/k, no wpe
+# add; written by `make rotary-reference`). Rotary and relu2 together have no
+# PyTorch trajectory here, so that combination is refused at compile time.
+comptime STATE_FILE = (
+    "gpt2_124M_rotary_debug_state.bin" if ROTARY else (
+        "gpt2_124M_relu2_debug_state.bin" if MLP_RELU2 else "gpt2_124M_debug_state.bin"
+    )
+)
 comptime SIZEOF_INT = size_of[DType.int32]()
 comptime SIZEOF_FLOAT = size_of[DType.float32]()
 
@@ -372,10 +385,13 @@ def run_test[
 
     # load additional information that we will use for debugging and error checking
 
-    # Rotary builds read the rotary reference (same weights, rotary q/k, no
-    # wpe add; zero wpe gradient), written by `make rotary-reference`.
-    comptime STATE_PATH = "gpt2_124M_rotary_debug_state.bin" if ROTARY else "gpt2_124M_debug_state.bin"
-    var state_file = open(STATE_PATH, "r")
+    comptime assert not (
+        ROTARY and MLP_RELU2
+    ), "test_gpt2 has no reference for LLMM_ROTARY=1 with LLMM_MLP_ACT=relu2"
+
+    # STATE_FILE selects the reference by build flag (default, relu2 or rotary),
+    # all written by train_gpt2.py / `make rotary-reference`.
+    var state_file = open(STATE_FILE, "r")
 
     var state_header = heap_alloc[Int32](256)
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
@@ -484,6 +500,27 @@ def run_test[
             3.70202374458313,
             3.3840603828430176,
             3.0682621002197266,
+        ]
+    elif MLP_RELU2:
+        # relu2 trajectory: torch FLOAT64 (GPT2_ACT=relu2 scripts/gen_expected_losses.py
+        # --dtype float64), not fp32. relu2 on GELU-pretrained weights is
+        # ill-conditioned (residual stream ~1.2e5 from layer 3), and torch's own fp32
+        # run drifts from its fp64 run by 0.0126 at step 9 (3.367974 vs 3.380598),
+        # more than LOSS_STEP_TOL. Mojo fp32 (GPU 3.37966, CPU 3.38055) lands within
+        # 1e-3 of fp64, so the gate keeps the full-strength 0.01 against the true
+        # trajectory. Step 0 differs from the debug state's fp32 loss by 1e-5 (the
+        # stale-state guard allows 1e-3). See docs/ai/w5_w6_zero_init_proj_and_relu2_2026-10-30.md.
+        expected_losses = [
+            7.184733928491164,
+            6.57912622894239,
+            6.156180415699619,
+            5.7834021372001345,
+            5.452741764643019,
+            5.0208772006836355,
+            4.616522495663473,
+            4.157646495279576,
+            3.7607664251102446,
+            3.380597985334229,
         ]
     else:
         expected_losses = [

@@ -72,6 +72,7 @@ from llmm.qk_clip import (
     qk_clip_matrix,
     qk_head_max_fold,
 )
+from llmm.gelu import MLP_RELU2
 from llmm.matmul import (
     fp8_mutex_preseed,
     matmul_fwd,
@@ -230,6 +231,11 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #                              transform. llmm/matmul.mojo.
 # Stochastic rounding
 #   LLMM_INIT_SEED=<int>       from-scratch weight-init seed, default 42.
+#   LLMM_MLP_ACT=gelu|relu2    MLP activation (default gelu). relu2 = relu(x)^2;
+#                              forces the unfused (non-cuBLASLt-epilogue) path.
+#                              llmm/gelu.mojo, llmm/matmul.mojo.
+#   LLMM_ZERO_INIT_PROJ=0|1|2  residual-projection init: 0 GPT-2 scaled normal
+#                              (default), 1 zeros, 2 N(0, 0.02*0.1).
 #   LLMM_SR_MASTER=1           SR on the master->bf16 param store (llmm/adamw.mojo).
 #   LLMM_SR_SEED=<int>         shared SR seed, default 1746221221 (adamw +
 #                              nvfp4; decorrelated by stream id, see
@@ -353,6 +359,26 @@ comptime UNROLL = 4
 # projections additionally scaled by 1/sqrt(2*L). See gpt_build_from_descriptor.
 comptime INIT_RNG_SEED = get_defined_int["LLMM_INIT_SEED", 42]()
 comptime INIT_WEIGHT_STD = Float32(0.02)
+# Residual-projection init (attn_proj_weight, proj_weight), -D LLMM_ZERO_INIT_PROJ:
+#   0 (default)  N(0, 0.02/sqrt(2L))  -- GPT-2 / llm.c
+#   1            all zeros            -- modded-nanogpt (every block starts as the
+#                                       identity on the residual stream)
+#   2            N(0, 0.02*0.1)       -- "small nonzero" arm
+# The RNG draw is performed in every mode and only the VALUE written changes, so
+# the stream position of every later tensor (and wte/wpe/qkv/fc) is identical
+# across modes. wte (tied LM head) is never touched. See allocate_parameters_random.
+comptime ZERO_INIT_PROJ = get_defined_int["LLMM_ZERO_INIT_PROJ", 0]()
+# Attention exp on the soft-exp targets (CPU, and Metal's attention_fwd_gpu /
+# backward kernels; the cuBLAS GEMM attention path ignores it): the default is
+# the FA4 degree-4 2^f polynomial (llmm/attention.mojo software_emulated_exp),
+# max relative error 7.8e-4. Harmless for the default model (verify-cpu passes),
+# but -D LLMM_MLP_ACT=relu2 on GELU-pretrained GPT-2 weights grows the residual
+# stream to ~1.2e5 by layer 3, and that 7.8e-4 then fails verify-cpu: loss
+# 7.1832 vs 7.1847, 13/16 gradients at l2_ratio ~0.8. With libm exp the same
+# build matches a float64 forward to ~1e-6 per activation and passes all 16
+# gradients. So relu2 builds use exact exp; the default stays bit-identical.
+# See docs/ai/w5_w6_zero_init_proj_and_relu2_2026-10-30.md.
+comptime ATTN_SOFT_EXP = not MLP_RELU2
 # -D LLMM_ROTARY=1: modded-nanogpt half-truncated rotary on q/k, no learned
 # position embedding. `wpe` stays in the parameter layout (descriptor,
 # checkpoint tensor list, ZeRO shards, Muon owner-space unchanged) but is not
@@ -2396,12 +2422,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         layer_offset = l * n
                     # Residual-stream projections get the 1/sqrt(2*L) scaling.
                     var scale = INIT_WEIGHT_STD
-                    if (
+                    var is_proj = (
                         i == Parameters.attn_proj_weight
                         or i == Parameters.proj_weight
-                    ):
+                    )
+                    if is_proj:
                         scale = INIT_WEIGHT_STD * residual_scale
+                        comptime if ZERO_INIT_PROJ == 2:
+                            scale = INIT_WEIGHT_STD * Float32(0.1)
+                    # Always draw, even when the projection is zeroed below, so
+                    # the RNG stream (and every other tensor) is unchanged.
                     normal_(rng, fp32_ptr, n, Float32(0.0), scale)
+                    comptime if ZERO_INIT_PROJ == 1:
+                        if is_proj:
+                            for j in range(n):
+                                fp32_ptr[unsafe_offset=j] = Float32(0.0)
                     # ROTARY: the wpe draw is still consumed so every later
                     # tensor gets the same values as in a non-rotary build with
                     # this seed, but the (already zeroed) wpe is left at zero.
@@ -3921,7 +3956,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     head_dim,
                     self.ctx,
                 )
-            attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
+            attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=ATTN_SOFT_EXP](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](l_q),
                 as_mut_kernel[GPT2_DTYPE](l_k),
@@ -5328,7 +5363,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
-            attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
+            attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=ATTN_SOFT_EXP](
                 as_mut_kernel[GPT2_DTYPE](d_l_qkv),
                 as_mut_kernel[GPT2_DTYPE](d_l_q),
                 as_mut_kernel[GPT2_DTYPE](d_l_k),
@@ -7793,6 +7828,12 @@ def train[
         >= 0.0 else args.muon_momentum
     )
     printf0(setup_rank, _table_row("optimizer", args.optimizer))
+    comptime if ZERO_INIT_PROJ != 0:
+        printf0(
+            setup_rank, _table_row("zero_init_proj", String(ZERO_INIT_PROJ))
+        )
+    comptime if MLP_RELU2:
+        printf0(setup_rank, _table_row("mlp_act", "relu2"))
     printf0(setup_rank, _table_row("qk clip tau", String(args.qk_clip_tau)))
     if args.optimizer == "muon":
         printf0(
@@ -8046,6 +8087,12 @@ def train[
         num("cooldown", args.cooldown_frac, VERBOSE),
         text("decay_shape", args.decay_shape, VERBOSE),
     ]
+    # Opt-in architecture/init flags are recorded only when non-default so the
+    # default run's setup event stays byte-identical.
+    comptime if ZERO_INIT_PROJ != 0:
+        setup_fields.append(num("zero_init_proj", ZERO_INIT_PROJ))
+    comptime if MLP_RELU2:
+        setup_fields.append(text("mlp_act", "relu2"))
     run_log.emit(
         "setup",
         NORMAL,

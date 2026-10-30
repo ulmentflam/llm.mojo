@@ -238,6 +238,27 @@ class GeLU(nn.Module):
         )
 
 
+class ReLU2(nn.Module):
+    """relu(x)^2, the modded-nanogpt MLP activation (GPT2_ACT=relu2)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.relu(x).square()
+
+
+def mlp_activation() -> nn.Module:
+    """MLP activation selected by GPT2_ACT=gelu|relu2 (default gelu), the
+    reference counterpart of the Mojo build constant -D LLMM_MLP_ACT."""
+    act = os.environ.get("GPT2_ACT", "gelu")
+    if act == "gelu":
+        return GeLU()
+    if act == "relu2":
+        return ReLU2()
+    raise ValueError(f"GPT2_ACT must be gelu or relu2, got {act!r}")
+
+
 class Sequential(nn.Module):
     def __init__(self, *args) -> None:
         super().__init__()
@@ -301,7 +322,7 @@ class MLP(nn.Module):
         self.out_dim = out_dim
         ordered_layers: list[nn.Module] = [
             Linear(input_dim, hidden_dim),
-            GeLU(),
+            mlp_activation(),
             Linear(hidden_dim, input_dim),
         ]
         if dropout:
@@ -329,7 +350,7 @@ class KarpathyMLP(nn.Module):
         self.hidden_dim = hidden_dim
         self.out_dim = out_dim
         self.c_fc = Linear(input_dim, hidden_dim)
-        self.gelu = GeLU()
+        self.gelu = mlp_activation()
         self.c_proj = Linear(hidden_dim, out_dim)
         setattr(
             self.c_proj, "LLMC_RESIDUAL_SCALE_FLAG", 1
@@ -598,9 +619,19 @@ class GPT(nn.Module):
             )
             # We skip initilizing lm_head that shares params with wte
             if not hasattr(module, "LLMC_SKIP_INIT"):
+                # GPT2_ZERO_INIT_PROJ (mirrors the Mojo build constant
+                # -D LLMM_ZERO_INIT_PROJ): 0 = GPT-2 scaled normal (default),
+                # 1 = zero the residual projections, 2 = N(0, 0.02*0.1). The
+                # draw happens in every mode so the RNG stream of every later
+                # tensor is unchanged; only the written value differs.
+                zero_mode = int(os.environ.get("GPT2_ZERO_INIT_PROJ", "0"))
+                if hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG") and zero_mode == 2:
+                    std = 0.02 * 0.1
                 torch.nn.init.normal_(
                     module.weight, mean=0.0, std=std, generator=self.init_rng
                 )
+                if hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG") and zero_mode == 1:
+                    torch.nn.init.zeros_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -2192,7 +2223,12 @@ if __name__ == "__main__":
             logits,
             loss,
             activations,
-            f"gpt2_{model_size_str}{state_suffix}_debug_state.bin",
+            # Rotary and a non-default activation each get their own debug state
+            # (the pretrained weights files are independent of both and keep
+            # their names); the suffixes compose: _rotary, _relu2, _rotary_relu2.
+            f"gpt2_{model_size_str}{state_suffix}"
+            + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
+            + "_debug_state.bin",
         )
         # Reset the train_loader for the optimization below
         train_loader.reset()

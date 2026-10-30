@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 def forward(
     *,
+    kernel_name: str = "gelu_fwd",
     x: np.ndarray,  # (rows, cols) kernel dtype (storage form)
     dtype_name: str,
     output: np.ndarray | None = None,
@@ -26,7 +27,7 @@ def forward(
     if output is None:
         output = np.zeros_like(x)
     (out,) = run_custom_op(
-        kernel_name="gelu_fwd",
+        kernel_name=kernel_name,
         args=[
             MutableBuf(output, dtype_name),
             ReadTensor(x, dtype_name),
@@ -38,6 +39,7 @@ def forward(
 
 def backward(
     *,
+    kernel_name: str = "gelu_bwd",
     x: np.ndarray,  # (rows, cols) PRE-activation, kernel dtype (storage form)
     dtype_name: str,
     output: np.ndarray | None = None,
@@ -52,7 +54,7 @@ def backward(
     if output is None:
         output = np.zeros_like(x)
     (out,) = run_custom_op(
-        kernel_name="gelu_bwd",
+        kernel_name=kernel_name,
         args=[
             MutableBuf(output, dtype_name),
             ReadTensor(x, dtype_name),
