@@ -16,13 +16,13 @@ cd "$(dirname "$0")/.."
 tag=$1; shift
 jobs_dir=${SWEEP_JOBS:-/tmp/llmm_sweep}
 mkdir -p "$jobs_dir" sweeps
-# Match running trainer binaries by exact process name (pgrep -f would also
-# match sibling compiles and shell wrappers that merely mention train_gpt2).
-# Wait up to ~15 min for a sibling's short test to finish before giving up.
+# Only a trainer that holds the GPU blocks us (sibling CPU-target jobs never
+# appear in nvidia-smi). Wait up to ~15 min for a GPU trainer to exit.
+gpu_busy() { nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | grep -q train_gpt2; }
 for i in $(seq 15); do
-  pgrep -x train_gpt2 >/dev/null || pgrep -x train_gpt2_bf16 >/dev/null || break
-  [ "$i" = 15 ] && { echo "refusing: a train_gpt2 process is still running" >&2; exit 1; }
-  echo "trainer running, retry $i/15 in 60s"; sleep 60
+  gpu_busy || break
+  [ "$i" = 15 ] && { echo "refusing: a train_gpt2 process is using the GPU" >&2; exit 1; }
+  echo "GPU trainer running, retry $i/15 in 60s"; sleep 60
 done
 bin=build/train_gpt2_bf16
 ls -l --time-style=full-iso "$bin" | sed 's/^/binary: /'
