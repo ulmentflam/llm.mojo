@@ -6,7 +6,7 @@ Muon is on `main` (`2e1913d`) for WORLD_SIZE=1 and ZeRO-0 only:
 when `zero_stage >= 1` or `z3_streaming` (train_gpt2.mojo:`enable_muon`).
 This document designs Muon for ZeRO stages 1, 2 and 3 (streaming included). It
 is written so a coding agent can implement it in slices (section 9) without
-re-deriving anything. Slices S0-S5 have since been implemented and verified (see Status and section 9); S7 is in progress.
+re-deriving anything. Slices S0-S5 have since been implemented and verified (see Status and section 9); the S7 flat m/master trim has landed too (rebalancing by traffic remains proposed).
 
 All line references are to `fu/zdesign` at `2e1913d`. File:function citations
 come from reading the code. Facts I could not confirm by reading or running are

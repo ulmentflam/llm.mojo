@@ -510,15 +510,18 @@ forward and per backward re-stream at ZeRO-3) may be latency-bound on GPU
 
 - **S6, 2-GPU verification (open):** the runbook above, plus per-rank
   collective time and bytes. This is the only way to claim GPU W>1 works.
-- **S7, trim the flat `m` / `master` (and `v`) to the AdamW segments (in
-  progress):** the last column of the memory table. Also open there: optional
-  memory-aware ownership, coalesced owner gathers via staging, and merging the
-  two per-layer bucket calls into one.
+- **S7, trim the flat `m` / `master` to the AdamW segments: landed** (flat
+  `m`/bf16 `master` are now `A_r`-sized in the compact-v layout; state files
+  shrink accordingly and pre-trim files are refused; Opus-verified, see the
+  design doc §9 S7). Still open there: memory-aware ownership (proposed with
+  numbers, needs ownership version 2), coalesced owner gathers via staging,
+  and merging the two per-layer bucket calls into one.
 - **Resume-rewrite race on `-y` with `-n` dividing the resume step:** `-y 1`
   re-saves the resume step at loop start, so a `model_k.bin` the other rank may
   still be reading is rewritten. Observed once, under heavy parallel load (rank
   1 failed with "Failed to read enough bytes", passed on rerun). Pre-existing,
-  not caused by S4; a fix is in progress.
+  not caused by S4; fixed by mirroring llm.c (the resumed step is not
+  re-saved) plus a cross-rank barrier after loading, verified bit-exact.
 - **bf16 master paths under streaming are untested:** bf16 owner-master
   seeding, re-seeding on resume and the streaming QK-clip master offset have
   only been compile-checked (`-D LLMM_BF16=1 -D LLMM_SR_MASTER=1 -D WORLD_SIZE=2`).
