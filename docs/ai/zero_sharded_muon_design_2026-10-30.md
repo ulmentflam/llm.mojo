@@ -1089,6 +1089,42 @@ non-streaming).
     W=2 ZeRO-0 with per-rank-different planted maxima; every rank's final params
     are bit-equal to (unclipped step + `qk_clip_apply` with the global maxima).
     Not run: a multi-GPU run (one GPU here); the W=2 GPU-target build compiles.
+  - **Verification (fu/zs5, Opus reviewer):** one test gap fixed (d076235),
+    no code defects found. Read: `allreduce_max_host` is `allreduce_or_host`
+    with `max` (same barrier1/barrier2 pair, so a rank that raises first is
+    released by the trainer's `CpuCoordinator.abort()`; nothing raises between
+    the barriers); on GPU `_qk_sync_head_max` copies `head_max_buf` to a host
+    buffer and synchronizes before the reduce, then copies back and
+    synchronizes. The clip block sits after the post-update `synchronize()`
+    and before both gathers; Q is group 0 and K group 1 (`enable_muon`), so
+    `sl.k > 1` skips V; bias layer = r // 3C, Q/K = row < 2C. `qk_max()` is
+    called unconditionally on every rank (only the `qk_max` log field is
+    verbose-gated); `planted_head_max_only` has no CLI path. The trainer's step
+    loop is byte-identical to 6fa563b. Gap: with MV=64 every rank's flat shard
+    held all or none of the qkv bias, so `qk_clip_bias_range` only ever ran
+    with `rel_start = 0`, and the mutation `r = i` (drop `rel_start`) PASSED
+    all three multi-rank tests. MV=192 puts the shard boundary at flat 4960
+    inside the bias [4928, 5024) at W=2 and W=4 (asserted in the test). The
+    `qk_max == 20` check moved after the params comparison. Mutations (each
+    applied, run, reverted): collective returns the local copy -> W=4 ZeRO-1
+    and W=2 ZeRO-0 params mismatch (idx 3520), test_multi_cpu_allreduce_max_host
+    fails; `_qk_clip_sharded` skips the sync (clips on local max, `qk_max`
+    still global) -> mismatch idx 1472; bias clip skipped -> idx 2888 (W=2,
+    W=4, pre-MV change); V bias rows scaled -> idx 2920; V matrices scaled
+    (`k > 2`) -> idx 1984; clip moved after the gathers -> idx 1472; `r = i`
+    -> idx 4968 (W=2, W=4) after the MV change. Not covered by any test: the
+    bf16 master offsets in `_qk_clip_sharded` (`sg.shard_rel + (a -
+    sg.flat_start)`, `muon_master_memory + local_off`), since CPU builds are
+    fp32 (has_master=False) and a multi-rank GPU run needs two GPUs; read and
+    consistent with `_update_sharded_muon`'s own AdamW/Muon master indexing.
+    Gates at d076235: `tests result=pass files=26 passed=208 skipped=1
+    failed=0` (test_qk_clip 8/8 incl. the three multi-rank cases, test_zero
+    21 pass incl. the two `allreduce_max_host` tests), `result gate=cpu
+    status=pass`, `result gate=gpu status=pass`, `make lint` and `make
+    build-bf16` clean, W=1 forced clip qk_max 110.63404 / 6.28879 / 5.8591275 / 5.617808 / 5.2096047,
+    W=1 Muon losses 4.287241 / 3.985745 / 4.111457 / 3.619319 / 3.700221, W=2
+    CPU ZeRO-1 Muon 10.865850 / 10.716245 / 10.648577, W=2 CPU `-qk_clip 5`
+    raises "QK-clip needs a GPU target" on both ranks).
 
 **S6: GPU multi-rank verification** (configs `zero/muon_z*_w2.json`, the
 runbook in section 8). No new code paths are expected: S1 to S3 are
