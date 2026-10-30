@@ -1356,6 +1356,168 @@ def test_multi_cpu_allgather_ranges() raises:
     cpu_coord_ptr.unsafe_free()
 
 
+def test_allgather_ranges_no_coordinator_gathers_own_shard_only() raises:
+    """Sequential-rank harness (N > 1, no coordinator): `allgather_ranges` can
+    only see its own shard, so it must copy just the intersection of each
+    range with [rank*shard, (rank+1)*shard). It used to treat the local shard
+    as the whole vector (`shard_base[flat_start + j]`), reading out of bounds
+    and overwriting window slots that belong to other ranks.
+    """
+    var ctx = DeviceContext(api="cpu")
+    comptime WORLD_SIZE = 4
+    comptime DTYPE = DType.float32
+    comptime shard = 16
+    comptime lenA = 16  # [8, 24): rank 1 owns [16, 24)
+    comptime lenB = 20  # [30, 50): rank 1 owns [30, 32)
+    comptime win = lenA + lenB
+    comptime SENTINEL = Float32(-1.0)
+
+    var z_ctx = ZeroContext["cpu", WORLD_SIZE](rank=1, zero_stage=3, ctx=ctx)
+    var shard_buf = ctx.enqueue_create_buffer[DTYPE](shard)
+    var host_shard = ctx.enqueue_create_host_buffer[DTYPE](shard)
+    for j in range(shard):
+        host_shard.unsafe_ptr()[unsafe_offset=j] = Float32(shard + j)
+    shard_buf.enqueue_copy_from(host_shard)
+    var win_buf = ctx.enqueue_create_buffer[DTYPE](win)
+    var host_win = ctx.enqueue_create_host_buffer[DTYPE](win)
+    for j in range(win):
+        host_win.unsafe_ptr()[unsafe_offset=j] = SENTINEL
+    win_buf.enqueue_copy_from(host_win)
+    ctx.synchronize()
+
+    var dst_offsets: List[Int] = [0, lenA]
+    var flat_starts: List[Int] = [8, 30]
+    var lengths: List[Int] = [lenA, lenB]
+    z_ctx.allgather_ranges[DTYPE](
+        rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
+            shard_buf.unsafe_ptr().as_unsafe_any_origin()
+        ),
+        shard,
+        rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
+            win_buf.unsafe_ptr().as_unsafe_any_origin()
+        ),
+        dst_offsets,
+        flat_starts,
+        lengths,
+    )
+    win_buf.enqueue_copy_to(host_win)
+    ctx.synchronize()
+    var w = host_win.unsafe_ptr()
+    for j in range(win):
+        var expect = SENTINEL
+        if j >= 8 and j < lenA:  # global 16..23
+            expect = Float32(8 + j)
+        elif j >= lenA and j < lenA + 2:  # global 30, 31
+            expect = Float32(30 + (j - lenA))
+        assert_equal(w[unsafe_offset=j], expect)
+
+
+def test_allgather_ranges_self_range_is_identity() raises:
+    """Gathering a rank's own range into the buffer that holds the shard
+    (ZeRO-1/2 propagation: `shard_base = params + rank*opt`, `dst_base =
+    params`) is a src == dst copy; it is skipped and the data is untouched.
+    Covers N == 1 and the no-coordinator N > 1 harness.
+    """
+    var ctx = DeviceContext(api="cpu")
+    comptime DTYPE = DType.float32
+    comptime shard = 16
+
+    # N == 1: whole vector at offset 0, dst == shard_base.
+    var z1 = ZeroContext["cpu", 1](rank=0, zero_stage=1, ctx=ctx)
+    var buf1 = ctx.enqueue_create_buffer[DTYPE](shard)
+    var h1 = ctx.enqueue_create_host_buffer[DTYPE](shard)
+    for j in range(shard):
+        h1.unsafe_ptr()[unsafe_offset=j] = Float32(100 + j)
+    buf1.enqueue_copy_from(h1)
+    ctx.synchronize()
+    var p1 = rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
+        buf1.unsafe_ptr().as_unsafe_any_origin()
+    )
+    var offs1: List[Int] = [4]
+    var starts1: List[Int] = [4]
+    var lens1: List[Int] = [8]
+    z1.allgather_ranges[DTYPE](p1, shard, p1, offs1, starts1, lens1)
+
+    # N == 4, rank 2, no coordinator: params buffer holds the full vector and
+    # the shard is its slice [2*shard, 3*shard); the gather targets params.
+    comptime N = 4
+    var z4 = ZeroContext["cpu", N](rank=2, zero_stage=1, ctx=ctx)
+    var full = ctx.enqueue_create_buffer[DTYPE](N * shard)
+    var h4 = ctx.enqueue_create_host_buffer[DTYPE](N * shard)
+    for j in range(N * shard):
+        h4.unsafe_ptr()[unsafe_offset=j] = Float32(j)
+    full.enqueue_copy_from(h4)
+    ctx.synchronize()
+    var base = rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
+        full.unsafe_ptr().as_unsafe_any_origin()
+    )
+    var offs4: List[Int] = [2 * shard, 0]
+    var starts4: List[Int] = [2 * shard, 0]
+    var lens4: List[Int] = [shard, N * shard]
+    z4.allgather_ranges[DTYPE](
+        base.unsafe_offset(2 * shard), shard, base, offs4, starts4, lens4
+    )
+    ctx.synchronize()
+
+    buf1.enqueue_copy_to(h1)
+    full.enqueue_copy_to(h4)
+    ctx.synchronize()
+    for j in range(shard):
+        assert_equal(h1.unsafe_ptr()[unsafe_offset=j], Float32(100 + j))
+    for j in range(N * shard):
+        assert_equal(h4.unsafe_ptr()[unsafe_offset=j], Float32(j))
+
+
+def test_reducescatter_buckets_scratch_and_bounds_checks() raises:
+    """`reducescatter_buckets` validates host-side, before any barrier:
+    a bucket outside the padded vector raises (CPU path; it used to be dropped
+    silently), and the GPU staging check `_check_scratch` raises with a clear
+    message when the comm scratch is smaller than a bucket-shard overlap `S`
+    (a CPU ZeroContext never ran ensure_comm_setup, so its scratch is empty).
+    """
+    var ctx = DeviceContext(api="cpu")
+    comptime DTYPE = DType.float32
+    comptime N = 2
+    comptime opt = 8
+    var z = ZeroContext["cpu", N](rank=0, zero_stage=2, ctx=ctx)
+    var pool = ctx.enqueue_create_buffer[DTYPE](32)
+    var shard_buf = ctx.enqueue_create_buffer[DTYPE](opt)
+    var pool_p = rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
+        pool.unsafe_ptr().as_unsafe_any_origin()
+    )
+    var shard_p = rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
+        shard_buf.unsafe_ptr().as_unsafe_any_origin()
+    )
+
+    # In-range bucket straddling the shard boundary is fine.
+    var ok_dest: List[Int] = [4]
+    var ok_off: List[Int] = [0]
+    var ok_len: List[Int] = [8]
+    z.reducescatter_buckets[DTYPE](
+        pool_p, ok_dest, ok_off, ok_len, shard_p, opt
+    )
+
+    # Bucket running past N*opt = 16 must raise.
+    var bad_dest: List[Int] = [12]
+    var bad_len: List[Int] = [8]
+    var raised_bounds = False
+    try:
+        z.reducescatter_buckets[DTYPE](
+            pool_p, bad_dest, ok_off, bad_len, shard_p, opt
+        )
+    except e:
+        raised_bounds = "outside the padded vector" in String(e)
+    assert_equal(raised_bounds, True)
+
+    # Scratch check: needs S * 4 bytes, scratch has none.
+    var raised_scratch = False
+    try:
+        z._check_scratch[DTYPE](opt)
+    except e:
+        raised_scratch = "comm scratch too small" in String(e)
+    assert_equal(raised_scratch, True)
+
+
 def main() raises:
     # Probe BEFORE building the suite: `_gpu_multirank_available` can raise,
     # and a TestSuite must be consumed by `run()` on every path, so it must
