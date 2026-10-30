@@ -1580,6 +1580,34 @@ not bitwise (section 4).
 
 **S7 (follow-up, not this phase)**:
 
+- **Status (fu/zs7, 2026-10-30): flat `m`/`master` trim DONE; rebalancing
+  measured and proposed only, not implemented.** Under sharded Muon
+  (W>1, ZeRO>=1) `enable_muon` (`_trim_flat_m_master`) replaces the
+  shard-sized `m` and bf16 `master` with `A_r`-element buffers in the
+  `compact_off` layout of the compact `v`. AdamW reads/writes `m`/`master` at
+  `AdamSeg.compact_off` and the S5 qkv-bias QK-clip writes `master` at
+  `compact_off + (a - flat_start)`. The state file's `m` blob is `A_r`
+  elements (`_m_count()`; header unchanged; `muon_ownership_version` stays 1
+  because the ownership rule did not change). A pre-trim sharded file is
+  refused by the exact-length check (message names the trim); W=1, ZeRO-0 and
+  AdamW buffers/files are untouched (byte-identical to a 3482c54 build).
+  Memory at W=2 `-z 1` d6 Muon (fp32, `LLMM_MEM_REPORT=1`): rank 1 `m_buf`
+  60,715,008 -> 18,247,680 B and `optimizer` class 142,663,688 -> 100,196,360
+  B; rank 0 is unchanged (60,715,008 / 185,131,016) because its whole shard is
+  AdamW (`A_0 = opt`: wte/wpe sit in rank 0), so the per-job peak is rank 0's
+  and only improves when `A_r < opt` there (W>=4 at 124M: A_0 = 31.12M of
+  31.12M still, so rank 0 does not shrink either; ranks 1+ do).
+  **Rebalancing finding:** the imbalance is the flat layout's `A_r`, not the
+  owner rule (O_r is already even: 21.23M per rank at W=4, 10.62M at W=8).
+  124M `A_r + O_r` (M elements): W=4 52.35/29.58/21.26/21.28 and W=8
+  26.18/26.18/18.94/10.64/10.64/10.62/10.65/10.63, max/mean 1.68 in both.
+  Proposal: owner = greedy longest-processing-time assignment of the 6L
+  matrices (largest first) to the rank with the smallest running `A_r + O_r`,
+  seeded with `A_r`; offline model gives W=4 31.12/30.76/31.29/31.31 (max/mean
+  1.006) and W=8 max/mean 1.024. It needs a new rule, so bump
+  `MUON_OWNERSHIP_VERSION` to 2 and refuse version-1 files, and update the
+  `exp_o`/`exp_a` tables in test_zero_muon. Muon updates are per-matrix, so
+  bit-exactness should hold, but it must be re-proven with T2 before landing.
 - Trim flat `m`/`master` (and `v` with fu/vfree) to `_adamw_shard_segments`.
 - Optional memory-aware ownership. Bump the ownership version. Weigh each
   rank's `A_r + O_r` (traffic and state), not NS cost alone. Under
