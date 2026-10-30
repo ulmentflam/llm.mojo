@@ -1314,7 +1314,7 @@ non-streaming).
   per-rank head maxima (different per rank) vs ZeRO-0 + global max: params
   bit-equal.
 - If S5 slips, keep the raise and document it.
-- **Status (fu/zs5, ZeRO-0/1 implemented; ZeRO-2/3 deferred):**
+- **Status (fu/zs5, ZeRO-0/1 implemented; ZeRO-2/3 done in fu/qklift, below):**
   - `ZeroContext.allreduce_max_host` (llmm/zero.mojo) is a host-side copy of
     `allreduce_or_host` with `max`; one code path for every target (the
     coordinator's shared-inputs registry or, without a coordinator, a copy).
@@ -1386,6 +1386,24 @@ non-streaming).
     W=1 Muon losses 4.287241 / 3.985745 / 4.111457 / 3.619319 / 3.700221, W=2
     CPU ZeRO-1 Muon 10.865850 / 10.716245 / 10.648577, W=2 CPU `-qk_clip 5`
     raises "QK-clip needs a GPU target" on both ranks).
+  - **Status (fu/qklift, ZeRO-2/3 lifted):** `enable_qk_clip` no longer
+    raises for ZeRO-2 or ZeRO-3/streaming (AdamW + ZeRO >= 1 and the
+    CPU-target-without-planted-maxima raise stay). `_qk_clip_sharded`'s qkv-bias
+    write is layout-aware: under `z3_streaming` it indexes the resident flat
+    shard with `sg.shard_rel + (a - sg.flat_start)`; ZeRO-1/2 keep the
+    full-buffer offset `a`; the master offset was already shard-relative. The
+    clip block already ran after the post-update synchronize and before the
+    ZeRO-3 early return, so the owner-space Q/K clip lands before the next
+    forward's gather. Tests: `test_qk_clip_multirank_zero{2,3}_w{2,4}`
+    (MV=192 shard boundary inside the bias) compare every rank's params (ZeRO-3:
+    `_z3_gather_full`) bit-exactly against an unclipped step AT THE SAME STAGE
+    + `qk_clip_apply` with the global maxima (the stage-0 reference differs by
+    1 ulp in unrelated rows because reduce-scatter and allreduce sum in a
+    different order), assert the exact changed-element count, and at ZeRO-3
+    also check the owner-space copies. Mutant (full-buffer bias offset under
+    streaming) fails `test_qk_clip_multirank_zero3_w2` with the gathered-params
+    bit-exact assertion ("multi-rank QK-clip != reference ... stage 3").
+
 
 **S6: GPU multi-rank verification** (configs `zero/muon_z*_w2.json`, the
 runbook in section 8). No new code paths are expected: S1 to S3 are
