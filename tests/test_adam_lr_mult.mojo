@@ -1,12 +1,15 @@
 """W1: `adam_lr_mult` (the -l_adam flag) under Muon, planted-value style.
 
 One Muon step on a tiny CPU model with identical weights and batch, at
-multiplier 1 and multiplier 4 (and 0.5 for a non-integer case). Expected:
+multiplier 1 and multiplier 4 (and 0.5 for a non-integer case, 0 for the
+frozen case). Expected:
   * every Muon-matrix element is BIT-IDENTICAL across multipliers (a mutant
     that applies the multiplier to the Muon lr fails here);
   * every AdamW-range element that moved moves by exactly mult x its mult-1
     displacement (wd included: AdamW decay is lr-scaled too), so a mutant that
     forgets the multiplier (delta4 == delta1) fails here;
+  * at multiplier 0 every AdamW element is BIT-IDENTICAL to its initial
+    value (frozen: lr-scaled decay included; the moments still advance);
   * the Muon matrices did move and many AdamW elements moved (the checks are
     not vacuous).
 Covers the unsharded path (`_update_hybrid`, ZeRO-0) and the sharded path
@@ -189,6 +192,12 @@ def _check[W: Int](stage: Int, mult: Float32) raises:
             if d1 != 0.0:
                 muon_moved += 1
         else:
+            if mult == 0.0 and a2[unsafe_offset=i] != init1[unsafe_offset=i]:
+                # lr 0 must freeze exactly: the decoupled decay is lr-scaled
+                # too, so not even wd may move an AdamW element.
+                raise Error(
+                    "AdamW element " + String(i) + " moved under mult 0"
+                )
             var ad1 = d1 if d1 >= 0 else -d1
             if ad1 > 1e-5:
                 adam_moved += 1
@@ -221,6 +230,10 @@ def test_adam_lr_mult_unsharded_x4() raises:
 
 def test_adam_lr_mult_unsharded_x0p5() raises:
     _check[1](0, Float32(0.5))
+
+
+def test_adam_lr_mult_unsharded_x0_frozen() raises:
+    _check[1](0, Float32(0.0))
 
 
 def test_adam_lr_mult_sharded_zero1_w2_x4() raises:
