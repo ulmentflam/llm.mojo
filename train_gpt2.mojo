@@ -5585,6 +5585,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         gradient straight to its owner; ZeRO-3 (streaming and not) additionally
         keeps the owner copy as the authoritative parameters.
         """
+        # S7: under sharded Muon this trims m/master to A_r and builds the
+        # owner buffers; a second call would read the trimmed buffers as if
+        # they were still shard-sized (out of bounds), so refuse it.
+        if self.optimizer_kind == 1:
+            raise Error("GPT2 error: enable_muon called twice")
         var L = self.config.num_layer
         var C = self.config.channels
         var qkv = self.param_offset(Parameters.qkv_weight)
