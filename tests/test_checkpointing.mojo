@@ -426,7 +426,8 @@ def test_state_checkpoint_sharded_muon_t6() raises:
     var stages: List[Int] = [1, 2, 3]
     for si in range(len(stages)):
         var path = String("test_ckpt_state_owner.bin")
-        var n = 8
+        # S7: under sharded Muon m, v are both compact (A_r elements).
+        var n = 5
         var nv = 5
         var S = 12
         var m = heap_alloc[Float32](n)
@@ -571,6 +572,35 @@ def test_state_checkpoint_sharded_muon_t6() raises:
                 path, m_out, v_out, mu_out, n, nv, S, True, "bytes, expected"
             ),
             True,
+        )
+        # A pre-S7 owner file (flat shard-sized m, 8 elements) at a trimmed
+        # run (m = A_r = 5) must be refused by length, not read as a prefix.
+        var m_old = heap_alloc[Float32](8)
+        _fill_pattern(m_old, 8, 0.1)
+        write_state_checkpoint(
+            path,
+            st,
+            m_old,
+            v,
+            8,
+            nv,
+            muon_m_memory=Optional[MutMemPtr[DType.float32]](mu),
+        )
+        assert_equal(
+            _raises_with(
+                path, m_out, v_out, mu_out, n, nv, S, True, "bytes, expected"
+            ),
+            True,
+        )
+        m_old.unsafe_free()
+        write_state_checkpoint(
+            path,
+            st,
+            m,
+            v,
+            n,
+            nv,
+            muon_m_memory=Optional[MutMemPtr[DType.float32]](mu),
         )
         # Truncated by one element.
         var short = open(path, "r").read_bytes()

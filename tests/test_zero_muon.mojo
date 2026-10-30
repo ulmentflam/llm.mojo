@@ -519,6 +519,11 @@ def test_ownership_table() raises:
                 a_r += segs[i].len
             if a_r != model.v_num_parameters:
                 raise Error("A_r != v_num_parameters")
+            # S7: flat m (and master, bf16 builds) are compact like v.
+            if len(model.m_buf) != max(a_r, 1):
+                raise Error("m_buf is not compact (A_r)")
+            if model._m_count() != a_r:
+                raise Error("_m_count != A_r")
         except e:
             print("rank", rank, "failed:", e)
             errors[unsafe_offset=rank] = 1
