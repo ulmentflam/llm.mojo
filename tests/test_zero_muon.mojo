@@ -77,9 +77,12 @@ def _train[
     stage: Int,
     steps: Int,
     result: MutMemPtr[DType.float32],
+    accum: Int = 1,
+    same_batch: Bool = False,
 ) raises:
-    """Run STEPS steps on W threaded ranks at `stage`; rank r's final params go
-    to result[r*n : (r+1)*n]."""
+    """Run `steps` steps on W threaded ranks at `stage`; rank r's final params
+    go to result[r*n : (r+1)*n]. `accum` micro-steps per step (gradient
+    accumulation); `same_batch` gives every rank the same batch."""
     var coord = heap_alloc[CpuCoordinator](1)
     coord[] = CpuCoordinator(W)
     var errors = heap_alloc[Int](W)
@@ -101,25 +104,31 @@ def _train[
             model.enable_muon(Scalar[DType.float32](0.95))
             var x = heap_alloc[SIMD[DType.int32, 1]](BB * TT)
             var y = heap_alloc[SIMD[DType.int32, 1]](BB * TT)
+            var rk = 0 if same_batch else rank
             for step in range(steps):
-                # A different planted batch per rank and per step.
-                for i in range(BB * TT):
-                    x[unsafe_offset=i] = Int32(
-                        (rank * 7919 + i * 31 + step * 13 + 5) % VOCAB
+                for ms in range(accum):
+                    # A different planted batch per rank (unless same_batch),
+                    # step and micro-step.
+                    for i in range(BB * TT):
+                        x[unsafe_offset=i] = Int32(
+                            (rk * 7919 + i * 31 + step * 13 + ms * 11 + 5)
+                            % VOCAB
+                        )
+                        y[unsafe_offset=i] = Int32(
+                            (rk * 17 + i * 5 + step * 3 + ms * 7 + 1) % VOCAB
+                        )
+                    model.forward(
+                        rebind[MutMemPtr[DType.int32]](x),
+                        rebind[MutMemPtr[DType.int32]](y),
+                        BB,
+                        TT,
+                        accum,
                     )
-                    y[unsafe_offset=i] = Int32(
-                        (rank * 17 + i * 5 + step * 3 + 1) % VOCAB
-                    )
-                model.forward(
-                    rebind[MutMemPtr[DType.int32]](x),
-                    rebind[MutMemPtr[DType.int32]](y),
-                    BB,
-                    TT,
-                )
-                model.ctx.synchronize()
-                model.zero_gradients()
-                model.backward()
-                model.ctx.synchronize()
+                    model.ctx.synchronize()
+                    if ms == 0:
+                        model.zero_gradients()
+                    model.backward(accum, ms, step)
+                    model.ctx.synchronize()
                 model.update(
                     t=UInt32(step + 1),
                     learning_rate=Scalar[DType.float32](1e-3),
@@ -238,8 +247,14 @@ def _t2_z2[W: Int](L: Int, NH: Int, C: Int) raises:
                 )
     # 3 steps: |a-b| <= 1e-4*|a| + 1e-6 everywhere. A pure rtol is ill-posed
     # for near-zero parameters (init std 0.08, so an element that lands near 0
-    # carries ~1e-8 absolute fp32 noise from the cancellation); the atol is
-    # about 100x below a single lr=1e-3 optimizer step, so a wrong gradient on any matrix or tensor still fails. The
+    # carries ~1e-8 absolute fp32 noise from the cancellation). This is a
+    # coarse multi-step check only: it catches gross errors (a skipped muon_g
+    # zero lands at ~700x the tolerance, a dropped call B ~800x, swapped Q/K
+    # ~1100x) but NOT small gradient errors, because AdamW and Muon are nearly
+    # scale-invariant: a 1.001 scale on a routed Q block (all of it, one row
+    # or one element) lands at 0.19x to 1.65x the tolerance, mostly passing,
+    # while the W=4 baseline noise is 0.18x. Routing is pinned by the
+    # step-1 bit-exact check above and by `_t2_z2_same` (S2 review). The
     # reported rel number is over elements with |a| >= 1e-2 (a true rtol).
     var max_rel = Float32(0.0)
     var max_abs = Float32(0.0)
@@ -277,6 +292,61 @@ def _t2_z2[W: Int](L: Int, NH: Int, C: Int) raises:
     got1.unsafe_free()
     ref3.unsafe_free()
     got3.unsafe_free()
+
+
+def _t2_z2_same[W: Int](L: Int, NH: Int, C: Int) raises:
+    """ZeRO-2 vs ZeRO-0, every rank on the SAME batch, 2 micro-steps per step,
+    3 steps: bit-exact for every parameter.
+
+    With identical per-rank gradients x, both reduction orders are exact
+    multiples of x (ZeRO-0's W*(lm+enc) vs ZeRO-2's W*lm + W*enc, and the
+    per-micro-step += vs the local accumulate-then-reduce), so the only source
+    of the different-batch test's 3-step drift is gone and any routing,
+    accumulation or zeroing error shows up as a hard mismatch. Measured during
+    the S2 review: a 1.001 scale on ONE element of one routed Q gradient fails
+    this, while `_t2_z2`'s 3-step tolerance passes it at 0.65x of the
+    tolerance (only its step-1 bit-exact check catches it there).
+    """
+    var path = String("gpt2_zm2s_w") + String(W) + "_l" + String(L) + ".bin"
+    var n = _write_checkpoint(path, L, NH, C)
+    var ref_p = heap_alloc[Float32](W * n)
+    var got = heap_alloc[Float32](W * n)
+    try:
+        _train[W](path, n, 0, STEPS, ref_p, accum=2, same_batch=True)
+        _train[W](path, n, 2, STEPS, got, accum=2, same_batch=True)
+    except e:
+        _remove(path)
+        ref_p.unsafe_free()
+        got.unsafe_free()
+        raise e^
+    _remove(path)
+    for r in range(W):
+        for i in range(n):
+            var a = ref_p[unsafe_offset=r * n + i]
+            var b = got[unsafe_offset=r * n + i]
+            if a != b:
+                raise Error(
+                    "ZeRO-2 same-batch accum != ZeRO-0 at W="
+                    + String(W)
+                    + " rank "
+                    + String(r)
+                    + " idx "
+                    + String(i)
+                    + ": "
+                    + String(a)
+                    + " vs "
+                    + String(b)
+                )
+    ref_p.unsafe_free()
+    got.unsafe_free()
+
+
+def test_t2_zero2_same_batch_accum_bit_exact_w2() raises:
+    _t2_z2_same[2](2, 2, 16)
+
+
+def test_t2_zero2_same_batch_accum_bit_exact_w4() raises:
+    _t2_z2_same[4](2, 2, 16)
 
 
 def test_t2_zero2_w2() raises:
