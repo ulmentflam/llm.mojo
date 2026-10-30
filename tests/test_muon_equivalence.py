@@ -31,19 +31,23 @@ from tests.reference import (
     MuonParams,
     direction_metrics,
     effective_hp,
+    keller_direction,
+    keller_wd0_case,
     muon_direction_inputs,
     muon_direction_tolerance,
     muon_scale,
     muon_tolerance,
     newton_schulz,
     simulate_muon,
+    simulate_muon_keller,
     simulate_muon_torch_optim,
     torch_optim_direction,
 )
 
-# Expected-value source: our reference | stock torch.optim.Muon. The id of the
+# Expected-value source: our reference | stock torch.optim.Muon | Keller Jordan's
+# SingleDeviceMuon (trajectory: wd=0 only, see test_muon_crosscheck_keller.py). The id of the
 # first is "ours" so `-k reference` still selects only the kernel-free tests.
-SOURCES = [pytest.param("reference", id="ours"), "torch_muon"]
+SOURCES = [pytest.param("reference", id="ours"), "torch_muon", "keller"]
 
 
 @pytest.mark.parametrize("expected_source", SOURCES)
@@ -52,12 +56,16 @@ def test_matches_torch_trajectory(case: MuonCase, expected_source: str):
     """Stepwise diff against torch — fails on the first step that drifts.
 
     expected_source="torch_muon": expectation from stock torch.optim.Muon
-    (atol widens to 2x the measured torch-vs-reference gap)."""
-    ref = (
-        simulate_muon(case)
-        if expected_source == "reference"
-        else simulate_muon_torch_optim(case)
-    )
+    (atol widens to 2x the measured torch-vs-reference gap).
+    expected_source="keller": Keller's SingleDeviceMuon, weight decay 0 for both
+    kernel and expectation (his decay uses the rescaled lr, so it is not comparable)."""
+    if expected_source == "keller":
+        case = keller_wd0_case(case)
+        ref = simulate_muon_keller(case)
+    elif expected_source == "reference":
+        ref = simulate_muon(case)
+    else:
+        ref = simulate_muon_torch_optim(case)
     atol = muon_tolerance(case, ref)
 
     params = ref["init_params"].copy()
@@ -124,7 +132,11 @@ def test_update_direction(case: MuonCase, k: int, expected_source: str):
         dtype_name=case.dtype,
     )
     o_got = _recover_direction(from_storage(out.params, case.dtype), case)
-    o_ref = torch_optim_direction(case, k) if expected_source == "torch_muon" else None
+    o_ref = None
+    if expected_source == "torch_muon":
+        o_ref = torch_optim_direction(case, k)
+    elif expected_source == "keller":
+        o_ref = keller_direction(case, k)
     _check_direction(o_got, u, case, f"{case.name} step {k + 1}", o_ref)
 
 
@@ -193,7 +205,11 @@ def test_tolerance_not_absurd(case: MuonCase, expected_source: str):
     once buried three real backward bugs)."""
     torch_src = expected_source == "torch_muon"
     _, _, u = muon_direction_inputs(case, 1)
-    o_ref = torch_optim_direction(case, 1) if torch_src else None
+    o_ref = None
+    if torch_src:
+        o_ref = torch_optim_direction(case, 1)
+    elif expected_source == "keller":
+        o_ref = keller_direction(case, 1)
     _check_direction(
         _recover_direction(_mutant_step(case, 1, "correct_other_rounding"), case),
         u,
@@ -213,7 +229,8 @@ def test_tolerance_not_absurd(case: MuonCase, expected_source: str):
 
     # Trajectory gate: dropping weight decay must fail it in fp32. (In bf16
     # the per-step change is sub-ulp, which is why the direction gate exists.)
-    if case.dtype == "float32":
+    # (Not for keller: its trajectory reference has wd=0 by construction.)
+    if case.dtype == "float32" and expected_source != "keller":
         ref = simulate_muon_torch_optim(case) if torch_src else simulate_muon(case)
         atol = muon_tolerance(case, ref)
         hp = effective_hp(case)
