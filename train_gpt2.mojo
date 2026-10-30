@@ -62,7 +62,12 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
-from llmm.qk_clip import qk_clip_apply, qk_head_max_fold
+from llmm.qk_clip import (
+    qk_clip_apply,
+    qk_clip_bias_range,
+    qk_clip_matrix,
+    qk_head_max_fold,
+)
 from llmm.matmul import (
     fp8_mutex_preseed,
     matmul_fwd,
@@ -1323,6 +1328,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var head_max_memory: MutMemPtr[DType.float32]
     var head_max_fwd_memory: MutMemPtr[DType.float32]
     var qk_clip_tau: Float32  # <= 0 disables QK-clip
+    # WORLD_SIZE > 1: `head_max_buf` already holds the cross-rank max for this
+    # step (set by _qk_sync_head_max, cleared by the backward fold), and the
+    # clip was already applied inside the sharded Muon update().
+    var qk_head_max_global: Bool
+    var qk_clip_applied: Bool
 
     # Optimizer selection: 0 = AdamW everywhere, 1 = Muon on the 2-D block
     # matrices (Q/K/V, attn-proj, fc, proj) with AdamW on everything else.
@@ -1527,6 +1537,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.head_max_memory = NULL_MASTER_PTR
         self.head_max_fwd_memory = NULL_MASTER_PTR
         self.qk_clip_tau = 0.0
+        self.qk_head_max_global = False
+        self.qk_clip_applied = False
         self.acts_memory = NULL_DTYPE_PTR
         self.grad_acts_memory = NULL_DTYPE_PTR
         self.acts_stats_memory = NULL_MASTER_PTR
@@ -2771,21 +2783,40 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.has_allocated_grads = True
 
-    def enable_qk_clip(mut self, tau: Float32) raises:
+    def enable_qk_clip(
+        mut self, tau: Float32, planted_head_max_only: Bool = False
+    ) raises:
         """Track per-(layer, head) max attention logits during forward and
-        allow `qk_clip_step` to rescale Q/K rows. tau <= 0 disables."""
+        allow `qk_clip_step` to rescale Q/K rows. tau <= 0 disables.
+
+        `planted_head_max_only` (tests) lifts the CPU-target raise: the CPU
+        attention path records no logits, so the caller must plant
+        `head_max_memory` itself or the clip never fires."""
         if tau <= 0.0:
             self.qk_clip_tau = 0.0
             return
         # The logit max is recorded only by the GPU causal-softmax kernel; the
         # CPU attention path has no hook, so QK-clip there would silently never
-        # fire. Multi-rank would need an allreduce-max of the per-head maxima
-        # (each rank sees different data) or ranks' Q/K weights diverge, and
-        # ZeRO>=1 shards the master copy this kernel indexes in full.
+        # fire.
         comptime if is_cpu[Self.target]():
-            raise Error("QK-clip needs a GPU target (no CPU logit-max hook)")
+            if not planted_head_max_only:
+                raise Error(
+                    "QK-clip needs a GPU target (no CPU logit-max hook)"
+                )
+        # Multi-rank: the per-head maxima are allreduce-maxed so every rank
+        # applies the same clip (docs/ai/zero_sharded_muon_design_*.md, S5).
+        # Supported: ZeRO-0 with either optimizer (full-buffer clip) and
+        # ZeRO-1 Muon (clip applied in owner space inside update()). AdamW
+        # with ZeRO >= 1 keeps Q/K rows in flat shards (a third layout), and
+        # sharded Muon is ZeRO-0/1 only so far.
         comptime if Self.WORLD_SIZE > 1:
-            raise Error("QK-clip supports WORLD_SIZE=1 only")
+            if self.zero_ctx.zero_stage >= 1 and self.optimizer_kind != 1:
+                raise Error(
+                    "QK-clip with WORLD_SIZE > 1 and ZeRO >= 1 needs -opt muon"
+                    " (AdamW keeps Q/K rows in flat shards)"
+                )
+            if self.zero_ctx.zero_stage >= 2 or self.z3_streaming:
+                raise Error("QK-clip supports ZeRO-0 and ZeRO-1 only so far")
         var n = self.config.num_layer * self.config.num_heads
         self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](n)
         self.head_max_buf.enqueue_fill(Scalar[DType.float32](0.0))
@@ -2802,9 +2833,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
     def qk_clip_step(mut self) raises:
         """Call after the optimizer step: rescale Q/K projection rows (and
-        biases) of every head whose step-max logit exceeded tau."""
+        biases) of every head whose step-max logit exceeded tau. At
+        WORLD_SIZE > 1 with sharded Muon the clip already ran inside
+        `update()` (see `_qk_clip_sharded`), so this is a no-op there."""
         if self.qk_clip_tau <= 0.0:
             return
+        if self.qk_clip_applied:
+            self.qk_clip_applied = False
+            return
+        self._qk_sync_head_max()
         var w_off = 0
         for i in range(Parameters.qkv_weight):
             w_off += self.param_sizes[i]
@@ -2829,9 +2866,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         """Max attention logit over all (layer, head) and all training
         micro-steps of the current optimizer step. Valid from the step's last
         backward until the next step's first backward (eval/generation
-        forwards in between do not change it). Syncs the device."""
+        forwards in between do not change it). Syncs the device. At
+        WORLD_SIZE > 1 this is the GLOBAL max (a collective: every rank must
+        call it)."""
         if self.qk_clip_tau <= 0.0:
             return 0.0
+        self._qk_sync_head_max()
         var n = self.config.num_layer * self.config.num_heads
         var host = self.ctx.enqueue_create_host_buffer[DType.float32](n)
         self.ctx.enqueue_copy(host, self.head_max_buf)
@@ -2840,6 +2880,96 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for i in range(n):
             best = max(best, host[i])
         return best
+
+    def _qk_sync_head_max(mut self) raises:
+        """WORLD_SIZE > 1: replace `head_max_buf` by the cross-rank elementwise
+        max (each rank saw different data; clipping on local maxima would let
+        the replicas' Q/K diverge). Idempotent within a step; a collective, so
+        every rank must reach it. No-op at WORLD_SIZE == 1."""
+        comptime if Self.WORLD_SIZE > 1:
+            if self.qk_head_max_global:
+                return
+            var n = self.config.num_layer * self.config.num_heads
+            var src = self.ctx.enqueue_create_host_buffer[DType.float32](n)
+            var dst = self.ctx.enqueue_create_host_buffer[DType.float32](n)
+            self.ctx.enqueue_copy(src, self.head_max_buf)
+            self.ctx.synchronize()
+            self.zero_ctx.allreduce_max_host[DType.float32](
+                rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+                    src.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+                    dst.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                n,
+            )
+            self.ctx.enqueue_copy(self.head_max_buf, dst)
+            self.ctx.synchronize()
+            self.qk_head_max_global = True
+
+    def _qk_clip_sharded(mut self) raises:
+        """ZeRO-1 sharded Muon: apply QK-clip where the data lives, between the
+        local updates and the gathers of `_update_sharded_muon`. Q/K rows of
+        the matrices this rank owns are scaled in the owner-space param (and
+        master) copy; the qkv-bias entries inside this rank's flat optimizer
+        shard are scaled in params and the flat master shard. The gathers then
+        carry the clipped values to every rank. A collective (max-reduce)."""
+        comptime if Self.WORLD_SIZE > 1:
+            self._qk_sync_head_max()
+            var C = self.config.channels
+            var NH = self.config.num_heads
+            var head_max = as_immut_kernel_from_mut[DType.float32](
+                self.head_max_memory
+            )
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                # Group 0 = Q, group 1 = K of the fused qkv weight.
+                if sl.owner != self.zero_ctx.rank or sl.k > 1:
+                    continue
+                qk_clip_matrix[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.muon_p_memory.unsafe_offset(sl.local_off)
+                    ),
+                    as_mut_kernel[MASTER_DTYPE](
+                        self.muon_master_memory.unsafe_offset(sl.local_off)
+                    ),
+                    USE_BF16,
+                    sl.l,
+                    head_max,
+                    NH,
+                    C,
+                    self.qk_clip_tau,
+                    self.ctx,
+                )
+            var b_lo = self.param_offset(Parameters.qkv_bias)
+            var b_hi = b_lo + self.config.num_layer * 3 * C
+            var segs = self._adamw_shard_segments()
+            for i in range(len(segs)):
+                ref sg = segs[i]
+                var a = max(sg.flat_start, b_lo)
+                var b = min(sg.flat_start + sg.len, b_hi)
+                if b <= a:
+                    continue
+                qk_clip_bias_range[GPT2_DTYPE, Self.target](
+                    as_mut_kernel[GPT2_DTYPE](
+                        self.params_memory.unsafe_offset(a)
+                    ),
+                    as_mut_kernel[MASTER_DTYPE](
+                        self.master_memory.unsafe_offset(
+                            sg.shard_rel + (a - sg.flat_start)
+                        )
+                    ),
+                    USE_BF16,
+                    a - b_lo,
+                    b - a,
+                    head_max,
+                    NH,
+                    C,
+                    self.qk_clip_tau,
+                    self.ctx,
+                )
+            self.ctx.synchronize()
+            self.qk_clip_applied = True
 
     def allocate_optimizer_moments(mut self) raises:
         var n = self.optimizer_num_parameters
@@ -4208,6 +4338,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 micro_step == 0,
                 self.ctx,
             )
+            self.qk_head_max_global = False
 
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)
@@ -5704,6 +5835,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
             self.ctx.synchronize()
+
+            # S5 QK-clip block: after every local write, before the gathers.
+            if self.qk_clip_tau > 0.0:
+                self._qk_clip_sharded()
 
             # Propagate AdamW: own slice stays in place (self-copy skipped as
             # dst == shard address); peers' AdamW regions are pulled.
@@ -7212,6 +7347,18 @@ def train[
     )
     if args.optimizer == "muon":
         model.enable_muon(args.muon_momentum)
+        # Sharded Muon (W > 1, ZeRO >= 1) cannot write or read a state file
+        # until the owner-space momentum is in it (slice S4). Refuse up front:
+        # write_checkpoint would otherwise raise only at the first save step,
+        # after all the training before it.
+        comptime if WORLD_SIZE > 1:
+            if model.zero_ctx.zero_stage >= 1 and args.output_log_dir != "":
+                if args.checkpoint_every > 0 or args.resume == 1:
+                    raise Error(
+                        "-opt muon with -z >= 1 at WORLD_SIZE > 1 cannot"
+                        " checkpoint or resume yet (sharded-Muon state is"
+                        " not in the state file); drop -n / -y, or use -z 0"
+                    )
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
 
@@ -7969,6 +8116,9 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
         else:
             var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
             cpu_coord_ptr[] = CpuCoordinator(world_size)
+            var rank_failed = heap_alloc[Int](world_size)
+            for r in range(world_size):
+                rank_failed[unsafe_offset=r] = 0
 
             def _run_rank(rank: Int) {imm}:
                 try:
@@ -7977,6 +8127,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
                     )
                 except e:
                     print("Rank", rank, "failed:", e)
+                    rank_failed[unsafe_offset=rank] = 1
                     # Release the peers. Without this they rendezvous with a
                     # cohort permanently one short and spin forever: the run
                     # wedges with idle devices instead of exiting, and the
@@ -7988,6 +8139,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
             sync_parallelize(_run_rank, world_size)
             cpu_coord_ptr[].free()
             cpu_coord_ptr.unsafe_free()
+            _raise_if_rank_failed(rank_failed, world_size)
 
 
 def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
@@ -8040,12 +8192,16 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             # ignored here — all ranks live in this process.
             var coord_ptr = heap_alloc[CpuCoordinator](1)
             coord_ptr[] = CpuCoordinator(world_size)
+            var rank_failed = heap_alloc[Int](world_size)
+            for i in range(world_size):
+                rank_failed[unsafe_offset=i] = 0
 
             def _run_rank(r: Int) {imm}:
                 try:
                     _dispatch_world_size["gpu"](args, r, world_size, coord_ptr)
                 except e:
                     print("Rank", r, "failed:", e)
+                    rank_failed[unsafe_offset=r] = 1
                     # See the CPU path above: a rank that leaves without
                     # aborting hangs every peer on the next barrier.
                     coord_ptr[].abort()
@@ -8054,9 +8210,25 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             sync_parallelize(_run_rank, world_size)
             coord_ptr[].free()
             coord_ptr.unsafe_free()
+            _raise_if_rank_failed(rank_failed, world_size)
         return True
     else:
         return False
+
+
+def _raise_if_rank_failed(
+    failed: Pointer[Int, MutUntrackedOrigin], world_size: Int
+) raises:
+    """After a threaded multi-rank run: frees `failed` and raises if any rank
+    caught an error, so the process exits nonzero. The per-rank handlers only
+    print and abort the coordinator; without this a W>1 run whose ranks all
+    failed still exited 0, which made exit-code gates pass on a dead run."""
+    var n = 0
+    for r in range(world_size):
+        n += failed[unsafe_offset=r]
+    failed.unsafe_free()
+    if n > 0:
+        raise Error(String(n) + " of " + String(world_size) + " ranks failed")
 
 
 def main() raises:
