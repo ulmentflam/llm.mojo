@@ -865,6 +865,36 @@ for W in (2,4,8):
 print("tile rows", tile_rows(), "tile MiB fp32", tile_rows()*C*4/MiB)
 ```
 
+## S2 implementation notes (2026-10-30)
+
+What S2 landed (W=1, ZeRO-0/1 layouts): the LM-head forward (all three
+branches) reads `_head_param_ptr()`; Bucket 1 writes `_head_grad_ptr()` and
+re-points the gradient pool through `_set_head_grad_ptr()` (never `grads.wte`
+once untied, so the encoder stays the only writer of dwte);
+`_lm_head_wte_tile` is now `_lm_head_tile` and gathers `_head_t()`. The head
+has its own `AdamWConfig` (`_head_config`: lr * `-l_head`, sentinel < 0 means
+`adam_lr_mult`, so the default trains every AdamW tensor at one rate) at all
+five `update()` sites (`_adamw_flat` splits the slice at the head offset),
+`_update_hybrid` and `_update_sharded_muon`. Step counter is `t` (no tie phase
+yet). The grad norm covers all 17 tensors once the head trains; body-only only
+while `head_tied`. `-l_head 0` (frozen head) is accepted.
+
+Decisions and caveats:
+- ZeRO >= 2 with a trained head is refused at the top of `forward()` with a
+  clear message (bucketing and the ZeRO-3 window re-point `grads.wte` /
+  `params.wte` and know nothing of the head until S6). The idle head
+  (`head_tied`) is unaffected, which is why the S0 multi-rank tests still run.
+- `LLMM_UNTIED_IDLE_HEAD=1` is a test hook that keeps the head tied and idle
+  (`scripts/check_untied_idle.py` uses it; `-untie_at` in S4 supersedes it).
+  Note an idle head keeps its *loaded* value in the model file, not the trained
+  wte (S4 must write head := wte for tied-phase checkpoints).
+- Gates: `make verify-untied-cpu/gpu` (17 tensors; the loss trajectory cannot
+  tell tied from untied, see the Makefile comment), `make check-untied-idle`,
+  `make check-untied-head` (head moves, m/v nonzero, idle head frozen with
+  weight decay > 0). A mutant pointing the K=1 forward at `params.wte` passes
+  the 17-tensor check at step 0 (head == wte there) and fails the 10-step
+  trajectory (`steps failed=9`), so the trajectory is not useless for the head.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Opus agent), directed by Evan Owen.
