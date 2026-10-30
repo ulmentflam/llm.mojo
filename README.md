@@ -148,13 +148,15 @@ Muon vs AdamW on this box (GPT-2 124M from scratch, FineWeb, bf16, B=32 T=1024 a
 | Muon, AdamW's recipe | `-opt muon -l 6e-4 -c 0.1 -gc 1.0` | 5.112 | 5.107 | 5.120 | 5.113 | step 300-400 |
 | Muon, tuned | `-opt muon -l 4.8e-3 -mu 0.9 -c 0 -gc 0` | 4.364 | 4.358 | 4.361 | 4.361 | step 200 |
 
-Step time is the same for all three arms in this configuration (the Muon step is a fixed ~30 ms
-amortized over 3.9 s of compute). Seed spread is 0.03 for AdamW and under 0.015 for the Muon arms,
+Step time is within a few percent across arms (median 3.88-4.01 s/step over all twelve runs; at
+600 steps the per-seed Muon-minus-AdamW gap ranges from -1.3% to +2.7% with no consistent sign, at
+2000 steps Muon was 1.4% and 2.9% slower by median, partly contention): the Muon optimizer step is a
+fixed ~20-40 ms amortized over ~3.9 s of forward/backward. Seed spread is 0.03 for AdamW and under 0.015 for the Muon arms,
 far below the gaps between arms. On a 2000-step schedule (262M tokens, seed 42, same recipe with
 `-u 150`), val at step 2000 is AdamW 4.226, Muon at AdamW's recipe 4.005, tuned Muon 3.804; the
 tuned arm passes AdamW's final value between steps 600 and 800. Caveats: early-training horizons,
 one seed for the 2000-step runs, init seed varied but data order fixed, the tuned recipe came from a
-300-step single-seed sweep and the AdamW control was not re-tuned. Logs and per-step tables: the
+300-step single-seed sweep (seed 42, so partly in-sample) and the AdamW control was not re-tuned. Logs and per-step tables: the
 convergence doc above.
 
 Multi-GPU training: build with `WORLD_SIZE=N` (one rank per GPU, compile-time)
