@@ -155,7 +155,7 @@ def muon_momentum_gpu[
     mu: Scalar[DType.float32],
     nesterov: UInt8,
 ) -> None:
-    """grid = (ceil(n / CHUNK), count). M = mu*M + g; X = bf16(U); accumulates
+    """Grid (ceil(n / CHUNK), count). M = mu*M + g; X = bf16(U); accumulates
     sum(X^2) per matrix into norms (pre-zeroed) with one atomic per block."""
     var n = Int(n_arg)
     var mat = Int(block_idx.y)
@@ -208,7 +208,7 @@ def muon_axpby_gpu(
     alpha: Scalar[DType.float32],
     beta: Scalar[DType.float32],
 ) -> None:
-    """y = bf16(alpha * y + beta * x), flat."""
+    """Flat y = bf16(alpha * y + beta * x)."""
     var i = Int(block_idx.x * 256 + thread_idx.x)
     if i < Int(n_arg):
         var yv = y_ptr[unsafe_offset=i].cast[DType.float32]()
