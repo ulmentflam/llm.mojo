@@ -402,6 +402,77 @@ def torch_optim_direction(case: MuonCase, k: int) -> np.ndarray:
     return -w1 / (hp.lr * muon_scale(case.rows, case.cols))
 
 
+def _keller_scale(rows: int, cols: int) -> float:
+    """Keller's shape factor, applied inside `muon_update`."""
+    return max(1.0, rows / cols) ** 0.5
+
+
+def _keller_run(case: MuonCase, direction_k: int | None = None):
+    """Drive Keller Jordan's `muon.SingleDeviceMuon` (package `muon-optimizer`).
+
+    lr_keller = lr * 0.2*sqrt(max(r,c)) / max(1, r/c)^0.5, so Keller's per-step
+    update lr_keller * max(1, r/c)^0.5 * O equals ours, lr * muon_scale * O.
+    Keller decays by (1 - lr_keller*wd_keller) before the update, ours by
+    (1 - lr*wd) on the same old W, so wd_keller = wd * lr / lr_keller makes the
+    decay identical (see tests/test_muon_crosscheck_keller.py, point 2).
+    Same fp32-param-holding-storage-values harness as `_torch_muon_run`.
+    With `direction_k`, W is zeroed before that step and W1 returned.
+    """
+    from muon import SingleDeviceMuon
+
+    init, grads = _muon_inputs(case)
+    hp = effective_hp(case)
+    lr_k = (
+        hp.lr * muon_scale(case.rows, case.cols) / _keller_scale(case.rows, case.cols)
+    )
+    wd_k = hp.weight_decay * hp.lr / lr_k
+    p = torch.nn.Parameter(init.float().clone())
+    opt = SingleDeviceMuon([p], lr=lr_k, weight_decay=wd_k, momentum=hp.momentum)
+    traj, moms, w1 = [], [], None
+    for k, G in enumerate(grads):
+        if direction_k == k:
+            p.data.zero_()
+        p.grad = hp.grad_scale * G.float()
+        opt.step()
+        p.data = p.data.to(case.torch_dtype).float()
+        if direction_k == k:
+            w1 = p.data.numpy().copy()
+        traj.append(p.data.numpy().copy())
+        buf = opt.state[p]["momentum_buffer"]
+        moms.append((buf / (1.0 - hp.momentum)).numpy().copy())
+    return init, grads, np.stack(traj), np.stack(moms), w1
+
+
+def simulate_muon_keller(case: MuonCase) -> dict[str, np.ndarray]:
+    """Same keys as `simulate_muon`, from Keller's SingleDeviceMuon (lr and wd
+    rescaled as in `_keller_run`, so weight decay is compared too).
+    `spread` = max(our NS spread, measured Keller-vs-ours trajectory gap)."""
+    _, _, traj, moms, _ = _keller_run(case)
+    ours = simulate_muon(case)
+    gap = float(np.max(np.abs(traj - ours["trajectory"])))
+    out = dict(ours)
+    out.update(
+        trajectory=traj,
+        momentum=moms,
+        spread=np.asarray(max(float(ours["spread"]), gap), dtype=np.float32),
+    )
+    return out
+
+
+def keller_direction(case: MuonCase, k: int) -> np.ndarray:
+    """Orthogonalised update O of step k from Keller's SingleDeviceMuon:
+    O = -W1 / (lr_keller * max(1, r/c)^0.5) with W zeroed before the step.
+    (Keller's scale rule differs from our Moonlight rule by design, so O is
+    recovered with Keller's own factor.)"""
+    hp = effective_hp(case)
+    *_, w1 = _keller_run(case, direction_k=k)
+    assert w1 is not None
+    lr_k = (
+        hp.lr * muon_scale(case.rows, case.cols) / _keller_scale(case.rows, case.cols)
+    )
+    return -w1 / (lr_k * _keller_scale(case.rows, case.cols))
+
+
 def muon_tolerance(case: MuonCase, ref: dict[str, np.ndarray]) -> float:
     """Trajectory atol = 2*max(spread_bf16_vs_fp32, 1e-6) + rtol*max|W|.
 
