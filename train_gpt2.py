@@ -533,6 +533,22 @@ class Transformer(nn.Module):
         self.ln_f = LayerNorm(config.n_embd)
 
 
+def untied_head_requested() -> bool:
+    """GPT2_UNTIED=1 builds the model with a separate, zero-initialised LM head.
+
+    Read when a GPT is constructed (not at import), so callers and tests can set
+    the env var around construction. Unset or "0" keeps the tied model, whose
+    code path and dump files are unchanged. Design:
+    docs/ai/untied_lm_head_design_2026-10-30.md (slice S1).
+    """
+    return os.environ.get("GPT2_UNTIED", "0") not in ("", "0")
+
+
+def is_untied(model: Any) -> bool:
+    """True when the model's LM head is its own parameter (not tied to wte)."""
+    return model.lm_head.weight is not model.transformer.wte.weight
+
+
 class GPT(nn.Module):
     transformer: Transformer
     lm_head: Linear
@@ -547,11 +563,20 @@ class GPT(nn.Module):
         setattr(
             self.lm_head, "LLMC_SKIP_INIT", 1
         )  # Don't init this one, we tie weights.
-        self.transformer.wte.weight = self.lm_head.weight  # paperswithcode weight tying
+        if not untied_head_requested():
+            self.transformer.wte.weight = (
+                self.lm_head.weight
+            )  # paperswithcode weight tying
 
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(43)
         self.apply(self._init_weights)
+        if untied_head_requested():
+            # Untied head starts at zero (modded-nanogpt). The head keeps
+            # LLMC_SKIP_INIT, so it draws nothing from init_rng and the other 16
+            # tensors get exactly the tied model's init.
+            with torch.no_grad():
+                torch.nn.init.zeros_(self.lm_head.weight)
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, Linear):
@@ -1488,6 +1513,8 @@ def write_tensor(
         write_fn(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
     write_fn(model_tensors["transformer.ln_f.gamma"], file)  # [C, ]
     write_fn(model_tensors["transformer.ln_f.beta"], file)  # [C, ]
+    if "lm_head.weight" in model_tensors:  # untied head: 17th tensor, [V_p, C]
+        write_fn(model_tensors["lm_head.weight"], file)
 
 
 def write_activations(
@@ -1556,6 +1583,10 @@ def write_model(model: Any, file: str, dtype: str) -> None:
         "float16": 7,  # 7: all tensors are fp16, padded vocab
         "float8": 9,  # 9: all tensors are fp8 (e4m3fn), padded vocab
     }[dtype]
+    if is_untied(model):
+        # +10: the untied blob has a 17th tensor; tied readers must refuse it
+        # loudly instead of silently dropping the head.
+        version += 10
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = MAGIC_NUMBER
     header[1] = version
@@ -1571,6 +1602,8 @@ def write_model(model: Any, file: str, dtype: str) -> None:
     wte_padded = pad_vocab(wte)  # [V_p, C]
     params["transformer.wte.weight"] = wte_padded  # [V_p, C]
     print(f"Padded vocab size from {wte.shape[0]} to {wte_padded.shape[0]}")
+    if "lm_head.weight" in params:
+        params["lm_head.weight"] = pad_vocab(params["lm_head.weight"])  # [V_p, C]
     header[7] = wte_padded.shape[0]  # Padded vocabsize stored in the header
 
     # 3) Write the parameters to the file
@@ -1600,6 +1633,7 @@ def write_state(
     )
     header[2] = x.shape[0]  # Batch size
     header[3] = x.shape[1]  # Temporal extent of the batch (seq_len)
+    header[4] = 1 if is_untied(model) else 0  # 1: grads carry a 17th (lm_head) tensor
     grads = {
         name: param.grad.cpu()
         for name, param in model.named_parameters()
@@ -1612,6 +1646,8 @@ def write_state(
     print(
         f"Padded vocab size in reference grads from {wte_grad.shape[0]} to {wte_grad_padded.shape[0]}"
     )
+    if "lm_head.weight" in grads:
+        grads["lm_head.weight"] = pad_vocab(grads["lm_head.weight"], value=0)
 
     # Write the file
     with open(file, "wb") as f:
@@ -2131,10 +2167,12 @@ if __name__ == "__main__":
         }
         model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
         model_size_str = model_to_size[args.model]  # e.g. "124M", or "d12"
-        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
-        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
-        write_model(model, f"gpt2_{model_size_str}_fp16.bin", dtype="float16")
-        write_model(model, f"gpt2_{model_size_str}_fp8.bin", dtype="float8")
+        # Untied dumps get their own names: never overwrite the tied starter pack.
+        out_stem = f"gpt2_{model_size_str}" + ("_untied" if is_untied(model) else "")
+        write_model(model, f"{out_stem}.bin", dtype="float32")
+        write_model(model, f"{out_stem}_bf16.bin", dtype="bfloat16")
+        write_model(model, f"{out_stem}_fp16.bin", dtype="float16")
+        write_model(model, f"{out_stem}_fp8.bin", dtype="float8")
         # Save x, y, logits, loss, and parameter gradients, for debugging C
         # Always store these in fp32 to have an accurate reference (?)
         write_state(
@@ -2144,7 +2182,7 @@ if __name__ == "__main__":
             logits,
             loss,
             activations,
-            f"gpt2_{model_size_str}_debug_state.bin",
+            f"{out_stem}_debug_state.bin",
         )
         # Reset the train_loader for the optimization below
         train_loader.reset()
