@@ -1999,16 +1999,70 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var wbase = rebind_mut_mem[GPT2_DTYPE](
             self.param_window_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-        self.zero_ctx.allgather_ranges[GPT2_DTYPE](
-            self._z3_shard_ptr(),
-            self.optimizer_num_parameters,
-            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                wbase.as_unsafe_any_origin()
-            ),
-            dst_offsets,
-            flat_starts,
-            lengths,
+        var wptr = rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+            wbase.as_unsafe_any_origin()
         )
+        if self.optimizer_kind == 1 and len(self.muon_slots) > 0:
+            # Sharded Muon: the 6 matrices live in the owner space, the other
+            # 8 tensors in the flat AdamW shard. Two gathers, same window.
+            var a_dst = List[Int]()
+            var a_src = List[Int]()
+            var a_len = List[Int]()
+            for k in range(len(idxs)):
+                var t = idxs[k]
+                if (
+                    t == Parameters.qkv_weight
+                    or t == Parameters.attn_proj_weight
+                    or t == Parameters.fc_weight
+                    or t == Parameters.proj_weight
+                ):
+                    continue
+                a_dst.append(dst_offsets[k])
+                a_src.append(flat_starts[k])
+                a_len.append(lengths[k])
+            var m_dst = List[Int]()
+            var m_src = List[Int]()
+            var m_len = List[Int]()
+            var cc = self.config.channels * self.config.channels
+            for k in range(6):
+                ref sl = self.muon_slots[k * L + layer]
+                var wi = 2  # qkv_weight (Q, K, V row blocks)
+                if k == 3:
+                    wi = 4
+                elif k == 4:
+                    wi = 8
+                elif k == 5:
+                    wi = 10
+                m_dst.append(dst_offsets[wi] + (k * cc if k < 3 else 0))
+                m_src.append(sl.owner_idx)
+                m_len.append(sl.len)
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                self._z3_shard_ptr(),
+                self.optimizer_num_parameters,
+                wptr,
+                a_dst,
+                a_src,
+                a_len,
+            )
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.muon_p_memory.as_unsafe_any_origin()
+                ),
+                self.muon_shard_elems,
+                wptr,
+                m_dst,
+                m_src,
+                m_len,
+            )
+        else:
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                self._z3_shard_ptr(),
+                self.optimizer_num_parameters,
+                wptr,
+                dst_offsets,
+                flat_starts,
+                lengths,
+            )
 
         # Re-base so the existing `<ptr> + layer*stride` addressing in
         # forward/backward lands on this layer's window slot.
@@ -2058,7 +2112,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var dst_offsets = List[Int]()
         var flat_starts = List[Int]()
         var lengths = List[Int]()
+        var sharded_muon = self.optimizer_kind == 1 and len(self.muon_slots) > 0
         for t in range(NUM_PARAMETER_TENSORS):
+            if sharded_muon and (
+                t == Parameters.qkv_weight
+                or t == Parameters.attn_proj_weight
+                or t == Parameters.fc_weight
+                or t == Parameters.proj_weight
+            ):
+                continue  # gathered from the owner space below
             var o = self._z3_param_offset(t)
             dst_offsets.append(o)
             flat_starts.append(o)
@@ -2071,6 +2133,25 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             flat_starts,
             lengths,
         )
+        if sharded_muon:
+            var m_dst = List[Int]()
+            var m_src = List[Int]()
+            var m_len = List[Int]()
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                m_dst.append(sl.flat_off)
+                m_src.append(sl.owner_idx)
+                m_len.append(sl.len)
+            self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.muon_p_memory.as_unsafe_any_origin()
+                ),
+                self.muon_shard_elems,
+                dst,
+                m_dst,
+                m_src,
+                m_len,
+            )
 
     def _compute_param_sizes(mut self) raises:
         """Fill param_sizes, num_parameters, and the optimizer sharding counts
@@ -5363,14 +5444,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         At WORLD_SIZE > 1 and ZeRO-1 the Muon matrices are sharded by
         matrix-granular ownership into owner-local buffers (see
         `_build_muon_ownership`); ZeRO-2 reduce-scatters each matrix's
-        gradient straight to its owner; ZeRO-3 is not implemented yet.
+        gradient straight to its owner; ZeRO-3 (streaming and not) additionally
+        keeps the owner copy as the authoritative parameters.
         """
-        comptime if Self.WORLD_SIZE > 1:
-            if self.zero_ctx.zero_stage >= 3 or self.z3_streaming:
-                raise Error(
-                    "Sharded Muon supports ZeRO-0, ZeRO-1 and ZeRO-2 only"
-                    " (ZeRO-3 lands in a later slice)"
-                )
         var L = self.config.num_layer
         var C = self.config.channels
         var qkv = self.param_offset(Parameters.qkv_weight)
@@ -5531,24 +5607,77 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.muon_master_memory = rebind_mut_mem[MASTER_DTYPE](
             self.muon_master_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-        # Seed the owned params from the full buffer (ZeRO-1: consistent).
-        for i in range(len(self.muon_slots)):
-            ref sl = self.muon_slots[i]
-            if sl.owner != rank:
-                continue
-            self.ctx.enqueue_copy(
-                dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                    self.muon_p_memory.unsafe_offset(
-                        sl.local_off
-                    ).as_unsafe_any_origin()
-                ),
-                src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
-                    self.params_memory.unsafe_offset(
-                        sl.flat_off
-                    ).as_unsafe_any_origin()
-                ),
-                size=sl.len,
+        # The owner gathers (and reduce-scatters) stage up to one matrix, at
+        # most S elements, through the comm scratch. Size it before seeding.
+        self.zero_ctx.ensure_comm_setup(
+            max(self.optimizer_num_parameters, S) * size_of[GPT2_DTYPE]()
+        )
+        if self.z3_streaming:
+            # ZeRO-3 streaming: only the flat shard is resident, so the owned
+            # matrices are collected in W rounds. In round o every rank
+            # gathers owner o's slots into a scratch laid out as owner o's
+            # shard; only rank o keeps it. The lists come from the static
+            # table, so they agree on all ranks.
+            var scratch = self.ctx.enqueue_create_buffer[GPT2_DTYPE](S)
+            scratch.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+            self.ctx.synchronize()
+            var sp = rebind_mut_mem[GPT2_DTYPE](
+                scratch.unsafe_ptr().as_unsafe_any_origin()
             )
+            for o in range(W):
+                var r_dst = List[Int]()
+                var r_src = List[Int]()
+                var r_len = List[Int]()
+                for i in range(len(self.muon_slots)):
+                    ref sl = self.muon_slots[i]
+                    if sl.owner != o:
+                        continue
+                    r_dst.append(sl.local_off)
+                    r_src.append(sl.flat_off)
+                    r_len.append(sl.len)
+                if len(r_len) == 0:
+                    continue
+                self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                    self._z3_shard_ptr(),
+                    self.optimizer_num_parameters,
+                    rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        sp.as_unsafe_any_origin()
+                    ),
+                    r_dst,
+                    r_src,
+                    r_len,
+                )
+                self.ctx.synchronize()
+                if o == rank:
+                    self.ctx.enqueue_copy(
+                        dst_ptr=rebind[
+                            Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+                        ](self.muon_p_memory.as_unsafe_any_origin()),
+                        src_ptr=rebind[
+                            Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]
+                        ](sp.as_unsafe_any_origin()),
+                        size=self.muon_owned_elems,
+                    )
+                self.ctx.synchronize()
+        else:
+            # Seed the owned params from the full buffer (consistent).
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                if sl.owner != rank:
+                    continue
+                self.ctx.enqueue_copy(
+                    dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.muon_p_memory.unsafe_offset(
+                            sl.local_off
+                        ).as_unsafe_any_origin()
+                    ),
+                    src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                        self.params_memory.unsafe_offset(
+                            sl.flat_off
+                        ).as_unsafe_any_origin()
+                    ),
+                    size=sl.len,
+                )
         self.ctx.synchronize()
         comptime if USE_BF16:
             var host_p = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](S)
@@ -5562,11 +5691,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.muon_master_memory, host_m, S
             )
             self.ctx.synchronize()
-        # The owner gather (and reduce-scatter in later slices) stages up to
-        # one matrix, at most S elements, through the comm scratch.
-        self.zero_ctx.ensure_comm_setup(
-            max(self.optimizer_num_parameters, S) * size_of[GPT2_DTYPE]()
-        )
 
     def _adamw_shard_segments(self) -> List[AdamSeg]:
         """Nonempty intersections of this rank's flat optimizer shard
@@ -5683,7 +5807,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         t: UInt32,
         config: AdamWConfig,
     ) raises:
-        """ZeRO-1/2 Muon step (params fully resident; ZeRO-1 grads were
+        """ZeRO-1/2/3 Muon step (params fully resident; ZeRO-1 grads were
         all-reduced, ZeRO-2 grads were bucket-reduced to their owners):
         pack the owned gradients (ZeRO-1 only), AdamW over this rank's flat-shard segments,
         Muon over the owner-space groups, then propagate both parts. Never
@@ -5724,7 +5848,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 adamw_update[GPT2_DTYPE, Self.target](
                     sg.len,
                     as_mut_kernel[GPT2_DTYPE](
-                        self.params_memory.unsafe_offset(sg.flat_start)
+                        self.params_memory.unsafe_offset(
+                            sg.shard_rel if self.z3_streaming else sg.flat_start
+                        )
                     ),
                     as_mut_kernel[GPT2_DTYPE](g_seg),
                     as_mut_kernel[MASTER_DTYPE](
@@ -5754,6 +5880,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.ctx,
                 )
             self.ctx.synchronize()
+
+            # ZeRO-3: no propagation. Streaming re-gathers from the flat shard
+            # (AdamW tensors) and the owner space (Muon matrices) in the next
+            # forward; the non-streaming harness has no peers to propagate to.
+            if self.zero_ctx.zero_stage >= 3:
+                return
 
             # Propagate AdamW: own slice stays in place (self-copy skipped as
             # dst == shard address); peers' AdamW regions are pulled.

@@ -129,10 +129,73 @@ def _train[
                     weight_decay=Scalar[DType.float32](0.01),
                 )
                 model.ctx.synchronize()
-            for i in range(n):
-                result[unsafe_offset=rank * n + i] = model.params_memory[
-                    unsafe_offset=i
-                ].cast[DType.float32]()
+            if stage == 3:
+                # Streaming: only the flat shard is resident. Gather the full
+                # vector (collective: every rank) and check that the owner
+                # space and the next forward's gathered windows agree
+                # bit-exactly for the Muon matrices.
+                var full = model.ctx.enqueue_create_buffer[GPT2_DTYPE](n)
+                model.ctx.synchronize()
+                var fp = rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    full.unsafe_ptr().as_unsafe_any_origin()
+                )
+                model._z3_gather_full(fp)
+                model.ctx.synchronize()
+                for i in range(len(model.muon_slots)):
+                    ref sl = model.muon_slots[i]
+                    if sl.owner != rank:
+                        continue
+                    for j in range(sl.len):
+                        if (
+                            full.unsafe_ptr()[unsafe_offset=sl.flat_off + j]
+                            != model.muon_p_memory[
+                                unsafe_offset=sl.local_off + j
+                            ]
+                        ):
+                            raise Error("gather_full != owner shard")
+                var Lc = model.config.num_layer
+                var Cc = model.config.channels
+                for layer in range(Lc):
+                    model._z3_stream_layer(layer)
+                    model.ctx.synchronize()
+                    for i in range(len(model.muon_slots)):
+                        ref sl = model.muon_slots[i]
+                        if sl.l != layer:
+                            continue
+                        var wp = model.params.qkv_weight.unsafe_offset(
+                            layer * 3 * Cc * Cc + sl.k * Cc * Cc
+                        )
+                        if sl.k == 3:
+                            wp = model.params.attn_proj_weight.unsafe_offset(
+                                layer * Cc * Cc
+                            )
+                        elif sl.k == 4:
+                            wp = model.params.fc_weight.unsafe_offset(
+                                layer * 4 * Cc * Cc
+                            )
+                        elif sl.k == 5:
+                            wp = model.params.proj_weight.unsafe_offset(
+                                layer * 4 * Cc * Cc
+                            )
+                        for j in range(sl.len):
+                            if (
+                                wp[unsafe_offset=j]
+                                != full.unsafe_ptr()[
+                                    unsafe_offset=sl.flat_off + j
+                                ]
+                            ):
+                                raise Error(
+                                    "streamed window != owner-space copy"
+                                )
+                for i in range(n):
+                    result[unsafe_offset=rank * n + i] = full.unsafe_ptr()[
+                        unsafe_offset=i
+                    ].cast[DType.float32]()
+            else:
+                for i in range(n):
+                    result[unsafe_offset=rank * n + i] = model.params_memory[
+                        unsafe_offset=i
+                    ].cast[DType.float32]()
             x.unsafe_free()
             y.unsafe_free()
         except e:
@@ -197,8 +260,16 @@ def _t2[W: Int](L: Int, NH: Int, C: Int) raises:
     got.unsafe_free()
 
 
-def _t2_z2[W: Int](L: Int, NH: Int, C: Int) raises:
-    var path = String("gpt2_zm2_w") + String(W) + "_l" + String(L) + ".bin"
+def _t2_z2[W: Int](L: Int, NH: Int, C: Int, stage: Int = 2) raises:
+    var path = (
+        String("gpt2_zm")
+        + String(stage)
+        + "_w"
+        + String(W)
+        + "_l"
+        + String(L)
+        + ".bin"
+    )
     var n = _write_checkpoint(path, L, NH, C)
     var wte_n = VOCAB * C
     var ref1 = heap_alloc[Float32](W * n)
@@ -207,9 +278,9 @@ def _t2_z2[W: Int](L: Int, NH: Int, C: Int) raises:
     var got3 = heap_alloc[Float32](W * n)
     try:
         _train[W](path, n, 0, 1, ref1)
-        _train[W](path, n, 2, 1, got1)
+        _train[W](path, n, stage, 1, got1)
         _train[W](path, n, 0, STEPS, ref3)
-        _train[W](path, n, 2, STEPS, got3)
+        _train[W](path, n, stage, STEPS, got3)
     except e:
         _remove(path)
         raise e^
@@ -225,7 +296,9 @@ def _t2_z2[W: Int](L: Int, NH: Int, C: Int) raises:
                 continue
             if a != b:
                 raise Error(
-                    "ZeRO-2 step 1 != ZeRO-0 at W="
+                    "ZeRO-"
+                    + String(stage)
+                    + " step 1 != ZeRO-0 at W="
                     + String(W)
                     + " rank "
                     + String(r)
@@ -252,7 +325,9 @@ def _t2_z2[W: Int](L: Int, NH: Int, C: Int) raises:
                 max_rel = max(max_rel, abs(a - b) / abs(a))
             if abs(a - b) > 1e-4 * abs(a) + 1e-6:
                 raise Error(
-                    "ZeRO-2 3-step beyond rtol 1e-4 + atol 1e-6 at W="
+                    "ZeRO-"
+                    + String(stage)
+                    + " 3-step beyond rtol 1e-4 + atol 1e-6 at W="
                     + String(W)
                     + " rank "
                     + String(r)
@@ -266,9 +341,9 @@ def _t2_z2[W: Int](L: Int, NH: Int, C: Int) raises:
     for r in range(1, W):
         for i in range(n):
             if got3[unsafe_offset=r * n + i] != got3[unsafe_offset=i]:
-                raise Error("ZeRO-2 ranks disagree at idx " + String(i))
+                raise Error("ranks disagree at idx " + String(i))
     print(
-        "t2_z2 W=" + String(W) + " L=" + String(L),
+        "t2_z" + String(stage) + " W=" + String(W) + " L=" + String(L),
         "step1_wte_max_rel=" + String(max_wte1),
         "step3_max_rel(|p|>=1e-2)=" + String(max_rel),
         "step3_max_abs=" + String(max_abs),
@@ -289,6 +364,18 @@ def test_t2_zero2_w4() raises:
 
 def test_t2_zero2_w8_rank_owns_nothing() raises:
     _t2_z2[8](1, 1, 16)
+
+
+def test_t2_zero3_w2() raises:
+    _t2_z2[2](2, 2, 16, 3)
+
+
+def test_t2_zero3_w4() raises:
+    _t2_z2[4](2, 2, 16, 3)
+
+
+def test_t2_zero3_w8_rank_owns_nothing() raises:
+    _t2_z2[8](1, 1, 16, 3)
 
 
 def test_t2_zero1_bit_exact_w2() raises:
