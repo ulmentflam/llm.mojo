@@ -3042,7 +3042,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     ),
                     as_mut_kernel[MASTER_DTYPE](
                         self.master_memory.unsafe_offset(
-                            sg.shard_rel + (a - sg.flat_start)
+                            sg.compact_off + (a - sg.flat_start)
                         )
                     ),
                     USE_BF16,
@@ -5585,6 +5585,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         gradient straight to its owner; ZeRO-3 (streaming and not) additionally
         keeps the owner copy as the authoritative parameters.
         """
+        # S7: under sharded Muon this trims m/master to A_r and builds the
+        # owner buffers; a second call would read the trimmed buffers as if
+        # they were still shard-sized (out of bounds), so refuse it.
+        if self.optimizer_kind == 1:
+            raise Error("GPT2 error: enable_muon called twice")
         var L = self.config.num_layer
         var C = self.config.channels
         var qkv = self.param_offset(Parameters.qkv_weight)
@@ -5647,9 +5652,77 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.v_memory = rebind_mut_mem[MASTER_DTYPE](
             self.v_buf.unsafe_ptr().as_unsafe_any_origin()
         )
+        if sharded:
+            self._trim_flat_m_master(segs)
         comptime if Self.WORLD_SIZE > 1:
             if self.zero_ctx.zero_stage >= 1:
                 self._build_muon_ownership()
+
+    def _trim_flat_m_master(mut self, segs: List[AdamSeg]) raises:
+        """S7: sharded Muon only. Replace the shard-sized flat `m` and `master`
+        with buffers of A_r elements (the same layout as the compact `v`):
+        AdamW segment k moves from `shard_rel` to `compact_off`. The Muon
+        matrix positions of the old buffers were never read (momentum and
+        master for those live in the owner-space buffers)."""
+        var n = self.optimizer_num_parameters
+        var total = self.v_num_parameters
+        var n_alloc = max(total, 1)
+        var old_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n)
+        var new_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_alloc)
+        self.ctx.synchronize()
+        self._copy_device_to_host[MASTER_DTYPE](old_m, self.m_memory, n)
+        self.ctx.synchronize()
+        for i in range(n_alloc):
+            new_m[i] = Scalar[MASTER_DTYPE](0)
+        self._compact_copy(old_m, new_m, segs)
+        self.m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](n_alloc)
+        self.ctx.synchronize()
+        self.m_memory = rebind_mut_mem[MASTER_DTYPE](
+            self.m_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self._copy_host_to_device[MASTER_DTYPE](self.m_memory, new_m, n_alloc)
+        comptime if USE_BF16:
+            var old_ms = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n)
+            var new_ms = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
+                n_alloc
+            )
+            self.ctx.synchronize()
+            self._copy_device_to_host[MASTER_DTYPE](
+                old_ms, self.master_memory, n
+            )
+            self.ctx.synchronize()
+            for i in range(n_alloc):
+                new_ms[i] = Scalar[MASTER_DTYPE](0)
+            self._compact_copy(old_ms, new_ms, segs)
+            self.master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](
+                n_alloc
+            )
+            self.ctx.synchronize()
+            self.master_memory = rebind_mut_mem[MASTER_DTYPE](
+                self.master_buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+            self._copy_host_to_device[MASTER_DTYPE](
+                self.master_memory, new_ms, n_alloc
+            )
+        self.ctx.synchronize()
+
+    def _compact_copy(
+        self,
+        src: HostBuffer[MASTER_DTYPE],
+        dst: HostBuffer[MASTER_DTYPE],
+        segs: List[AdamSeg],
+    ):
+        """dst[compact_off + i] = src[shard_rel + i] for every segment."""
+        for k in range(len(segs)):
+            for i in range(segs[k].len):
+                dst[segs[k].compact_off + i] = src[segs[k].shard_rel + i]
+
+    def _m_count(self) -> Int:
+        """Element count of the m blob in state files: compact (A_r) under
+        sharded Muon, the full shard otherwise."""
+        if self._sharded_muon():
+            return self.v_num_parameters
+        return self.optimizer_num_parameters
 
     def _owner_of(self, k: Int, l: Int) -> Int:
         """Rank that owns Muon matrix (group k, layer l): (k*L + l) mod W."""
@@ -5997,11 +6070,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     ),
                     as_mut_kernel[GPT2_DTYPE](g_seg),
                     as_mut_kernel[MASTER_DTYPE](
-                        self.master_memory.unsafe_offset(sg.shard_rel)
+                        self.master_memory.unsafe_offset(sg.compact_off)
                     ),
                     USE_BF16,
                     as_mut_kernel[MASTER_DTYPE](
-                        self.m_memory.unsafe_offset(sg.shard_rel)
+                        self.m_memory.unsafe_offset(sg.compact_off)
                     ),
                     as_mut_kernel[MASTER_DTYPE](
                         self.v_memory.unsafe_offset(sg.compact_off)
@@ -6740,7 +6813,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         # AdamW moments are fp32 (MASTER_DTYPE), independent of the parameter
         # precision, so the state file stores them in fp32 (matching llm.c).
-        var n_opt = self.optimizer_num_parameters
+        var n_opt = self._m_count()
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
         var n_v = self._v_count()
         var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v)
@@ -6869,13 +6942,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 if src < self.num_parameters:
                     val = host_params[src]
                 host_master[i] = val.cast[MASTER_DTYPE]()
+            var n_master_copy = n_master
+            if self._sharded_muon():
+                # S7: master is compact (A_r elements, `compact_off` layout);
+                # gather the AdamW segments from the shard-relative seed. The
+                # ascending in-place copy is safe (compact_off <= shard_rel).
+                var msegs = self._adamw_shard_segments()
+                self._compact_copy(host_master, host_master, msegs)
+                n_master_copy = self.v_num_parameters
             self._copy_host_to_device[MASTER_DTYPE](
-                self.master_memory, host_master, n_master
+                self.master_memory, host_master, n_master_copy
             )
             self.ctx.synchronize()
 
         # AdamW moments are fp32 (MASTER_DTYPE); read them back in fp32.
-        var n_opt = self.optimizer_num_parameters
+        var n_opt = self._m_count()
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
         var n_v = self._v_count()
         # Peek the header first: the v blob length depends on optimizer_kind,

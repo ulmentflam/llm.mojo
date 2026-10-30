@@ -522,7 +522,9 @@ def read_state_checkpoint[
             + ", muon_m="
             + String(n_mu)
             + " elements); it was written with a different optimizer shard"
-            " layout (ZeRO stage or world size)"
+            " layout (ZeRO stage or world size, or by a sharded-Muon build"
+            " before the flat m/master trim, whose m blob was shard-sized"
+            " instead of A_r)"
         )
     read_and_copy[dtype](file, m_out, shard_num_parameters)
     read_and_copy[dtype](file, v_out, n_v)

@@ -1429,6 +1429,14 @@ non-streaming).
   resume step rewrites that step's `model_k.bin` while the other rank may
   still be reading it; one run under heavy parallel load failed rank 1 with
   "Failed to read enough bytes" and passed on rerun.
+  **Fixed on main in d67386a (resume race):** the save condition now skips
+  `step == start_step` after a resume (llm.c's `resuming` flag), and an
+  `allreduce_scalar(0.0)` barrier after every rank's `load_checkpoint` keeps
+  any rank from writing before all ranks finished reading. Verified on
+  fu/zs7 (merged main 55d4c1c): W=2 `-z 1`/`-z 3` resumed dirs keep the
+  step-2 files `cmp`-identical with unchanged mtimes; resuming at the last
+  step (`-y 1 -x 4` with step-4 files present) trains nothing, writes
+  nothing and exits 0.
 
 **S5: QK-clip multi-rank** (`allreduce_max_host`; the clip inside
 `_update_sharded_muon`; `enable_qk_clip` scope).
@@ -1589,6 +1597,94 @@ not bitwise (section 4).
 
 **S7 (follow-up, not this phase)**:
 
+- **Status (fu/zs7, 2026-10-30): flat `m`/`master` trim DONE; rebalancing
+  measured and proposed only, not implemented.** Under sharded Muon
+  (W>1, ZeRO>=1) `enable_muon` (`_trim_flat_m_master`) replaces the
+  shard-sized `m` and bf16 `master` with `A_r`-element buffers in the
+  `compact_off` layout of the compact `v`. AdamW reads/writes `m`/`master` at
+  `AdamSeg.compact_off` and the S5 qkv-bias QK-clip writes `master` at
+  `compact_off + (a - flat_start)`. The state file's `m` blob is `A_r`
+  elements (`_m_count()`; header unchanged; `muon_ownership_version` stays 1
+  because the ownership rule did not change). A pre-trim sharded file is
+  refused by the exact-length check (message names the trim); W=1, ZeRO-0 and
+  AdamW buffers/files are untouched (byte-identical to a 3482c54 build).
+  Memory at W=2 `-z 1` d6 Muon (fp32, `LLMM_MEM_REPORT=1`): rank 1 `m_buf`
+  60,715,008 -> 18,247,680 B and `optimizer` class 142,663,688 -> 100,196,360
+  B; rank 0 is unchanged (60,715,008 / 185,131,016) because its whole shard is
+  AdamW (`A_0 = opt`: wte/wpe sit in rank 0), so the per-job peak is rank 0's
+  and only improves when `A_r < opt` there (W>=4 at 124M: A_0 = 31.12M of
+  31.12M still, so rank 0 does not shrink either; ranks 1+ do).
+  **Rebalancing finding:** the imbalance is the flat layout's `A_r`, not the
+  owner rule (O_r is already even: 21.23M per rank at W=4, 10.62M at W=8).
+  124M `A_r + O_r` (M elements): W=4 52.35/29.58/21.26/21.28 and W=8
+  26.18/26.18/18.94/10.64/10.64/10.62/10.65/10.63, max/mean 1.68 in both.
+  Proposal: owner = greedy longest-processing-time assignment of the 6L
+  matrices (largest first) to the rank with the smallest running `A_r + O_r`,
+  seeded with `A_r`; offline model gives W=4 31.12/30.76/31.29/31.31 (max/mean
+  1.006) and W=8 max/mean 1.024. It needs a new rule, so bump
+  `MUON_OWNERSHIP_VERSION` to 2 and refuse version-1 files, and update the
+  `exp_o`/`exp_a` tables in test_zero_muon. Muon updates are per-matrix, so
+  bit-exactness should hold, but it must be re-proven with T2 before landing.
+- **Verification (fu/zs7, Opus reviewer, 2026-10-30).** Merged main 55d4c1c
+  (resume fix d67386a) into fu/zs7 with no conflicts; all gates on the merged
+  tree.
+  - Reading: `_trim_flat_m_master` runs only from `enable_muon` under
+    `sharded` (W>1, ZeRO>=1); device-to-host copies are fenced by
+    `ctx.synchronize()` before the host reads, each AdamW segment moves
+    `shard_rel -> compact_off`, and reassigning `m_buf`/`master_buf` drops the
+    shard-sized buffers. Every sharded-path consumer of `m`/`master` now uses
+    `compact_off` (`_update_sharded_muon` AdamW segments, the QK-clip bias
+    master write, the bf16 master reseed in `load_checkpoint`, the state-file
+    `m` blob via `_m_count()`); the remaining `shard_rel` uses index params
+    (ZeRO-3 streaming), `grad_shard_memory`, or the host source of a compact
+    copy. The in-place host compactions are safe because the segments are
+    ascending and disjoint, so `compact_off <= shard_rel`. W=1, ZeRO-0 and
+    AdamW never call the trim. One hardening fix: `enable_muon` now raises on
+    a second call, because the trim would read the trimmed buffers as
+    shard-sized. No caller does that today.
+  - Equal-length pre-trim files: a pre-trim file has the same length as a
+    post-trim one exactly when `A_r == opt`. Then the rank's whole shard
+    `[lo, lo+opt)` lies inside AdamW ranges. The AdamW ranges are separated by
+    Muon tensors of nonzero size, and `A_r == opt` also rules out the last
+    rank's padding. So there is a single segment with
+    `shard_rel = compact_off = 0`, the two layouts are the identity, and the
+    pre-trim `m` blob holds the same bytes. Accepting such a file is
+    therefore correct and `muon_ownership_version` stays 1. Measured at W=2
+    `-z 1` d6, where rank 0 has `A_0 = opt`: the pre-trim (3482c54 build)
+    `state_2_0.bin` is `cmp`-identical to the post-trim one. Every rank with
+    `A_r < opt` is refused by length. Resuming the pre-trim directory gives
+    rank 1 "... is 100197376 bytes, expected 57730048 (m=4561920, v=4561920,
+    muon_m=5308416 elements) ... before the flat m/master trim ..." (direct
+    binary rc=1).
+  - Gates (this tree): `make test-mojo` -> `tests result=pass files=26
+    files_skipped=0 files_failed=0 passed=223 skipped=1 failed=0`
+    (test_zero_muon 13/13, test_checkpointing 14/14, test_qk_clip 12/12);
+    `make verify` -> `result gate=cpu status=pass`, `result gate=gpu
+    status=pass`; `make lint` exit 0; `make -B build-bf16` exit 0, plus a
+    `-D WORLD_SIZE=2 -D LLMM_BF16=1` compile (the trim's master branch).
+  - Runs. These use `make -B build-train WORLD_SIZE=2` and `WORLD_SIZE=1`
+    binaries, mtime-checked and built before the guard commit, which only
+    adds a raise. All are CPU d6 `-b 1 -t 64`. W=2 Muon `-z 1/2/3 -x 3`:
+    10.865850, 10.716245, 10.648577 each, rc=0. For W=2 `-z 1` and `-z 3`,
+    `-x 2 -n 2` then `-y 1 -x 4` gives steps 3-4 = 10.648577 and
+    10.410458 (`-z 1`) or 10.410459 (`-z 3`), the same as continuous `-x 4`.
+    `model_4`, `state_4_0` and `state_4_1` are `cmp`-identical, and the step-2
+    files are unchanged by the resume. Rank-file sizes are 142664704 (rank 0)
+    and 57730048 (rank 1, `1024 + (2*4561920 + 5308416)*4`). W=1 (`-pn 1`)
+    Muon and AdamW `model_2.bin`/`state_2_0.bin` are `cmp`-identical to a
+    main-55d4c1c build's. W=2 ZeRO-0 Muon and AdamW (`-pn 2`, all three files)
+    are identical too. W=1 Muon resume gives 10.794926, 10.554329 and is
+    bit-exact against continuous. `LLMM_MEM_REPORT=1` at W=2 `-z 1`:
+    main has rank 0 `m_buf` 60,715,008 and rank 1 60,715,008, optimizer
+    185,131,016 / 142,663,688. fu/zs7 has rank 0 60,715,008
+    (`A_0 = opt`, unchanged) and rank 1 18,247,680, optimizer
+    185,131,016 / 100,196,360.
+  - Note: `-pn` sets the CPU world size at run time, independent of the
+    binary's `WORLD_SIZE`. A "W=1" CPU run needs `-pn 1`.
+  - Pre-existing and left alone: a rank with `A_r = 0` (tiny configs, e.g.
+    L=1 C=16 W=8) asks for 0-element host buffers for `m` and `v` in the
+    state-file paths. `v` already did this before S7.
+  - Verdict: merge.
 - Trim flat `m`/`master` (and `v` with fu/vfree) to `_adamw_shard_segments`.
 - Optional memory-aware ownership. Bump the ownership version. Weigh each
   rank's `A_r + O_r` (traffic and state), not NS cost alone. Under
@@ -1639,3 +1735,5 @@ The independent review (generations 1 and 2) was done with AI assistance
 (Claude Code, Opus agents), directed by Evan Owen.
 The S1 implementation (Sonnet agent) and its verification (Opus agent) were
 done with AI assistance (Claude Code), directed by Evan Owen.
+The S7 verification (fu/zs7) was done with AI assistance (Claude Code, Opus
+agent), directed by Evan Owen.
