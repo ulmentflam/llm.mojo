@@ -117,8 +117,16 @@ the fix, verify-cpu under relu2: loss 7.1847253 vs 7.184724, 16/16 gradients pas
 Mutant/planted checks that this gate now has teeth:
 * soft exp restored under relu2 (the pre-fix build): verify-cpu fails, 13/16 tensors.
 * relu2 forward with the gelu derivative in the backward (`mlp_act_grad` mutated
-  in a scratch copy): verify-gpu must fail at the gradient check (result in the
-  final report of the verifying agent, logs in the campaign scratchpad).
+  in a scratch copy): verify-gpu fails, 14/16 gradient tensors (dfcb l2_ratio
+  0.07), trajectory off by 0.47 at step 9.
+
+Post-fix gate results (2026-10-30): verify-gpu relu2 loss 7.1847344, 16/16
+gradients, trajectory max |diff| vs fp64 0.0014 (step 8); verify-cpu relu2 loss
+7.1847253, 16/16, max |diff| 0.0016 (step 7); flags-off verify-cpu/-gpu,
+verify-init 0/1/2, test-mojo (flags off and relu2: 223 passed, 1 skipped) and
+the 18 equivalence tests all pass. W5 RNG claim checked directly: FNV hashes of
+all 16 d6 init tensors are identical across ZERO_INIT_PROJ=0/1/2 except
+attn_proj_weight and proj_weight.
 
 ## Why the relu2 trajectory reference is float64
 
@@ -137,8 +145,9 @@ So the drift was torch fp32's own rounding on an ill-conditioned model, not a Mo
 backward error (a wrong activation derivative fails the gradient check instead,
 see the mutant above). The relu2 expected list in `test_gpt2.mojo` is now
 `GPT2_ACT=relu2 scripts/gen_expected_losses.py --dtype float64` and the
-tolerance stays at 0.01. For gelu, torch fp32 and fp64 agree closely and the
-existing fp32 list is kept.
+tolerance stays at 0.01. For gelu, torch fp32 and fp64 differ by at most
+3.4e-4 over the 10 steps (step 9: 0.376818 vs 0.376489), 30x inside the
+tolerance, so the existing fp32 list is kept.
 
 ## Not verified
 
