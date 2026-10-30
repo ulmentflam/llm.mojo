@@ -312,6 +312,171 @@ def test_untied_head_gradient_split_matches_tied() raises:
     gu.unsafe_free()
 
 
+def _head_step(
+    opt: String,
+    head_mult: Float32,
+    adam_mult: Float32,
+    x: MutMemPtr[DType.int32],
+    y: MutMemPtr[DType.int32],
+    dst: MutMemPtr[DType.float32],
+) raises -> Int:
+    """One forward/backward/update from the tied CKPT (head == wte copy) with
+    `-l_head head_mult` (and `-l_adam adam_mult` under Muon); the updated flat
+    parameters go to `dst`. Weight decay is nonzero so a head the optimizer
+    touched at lr 0 would still have to stay put (decay is lr-scaled)."""
+    var ctx = DeviceContext(api="cpu")
+    var model = GPT2["cpu", 1](CKPT, rank=0, zero_stage=0, ctx=ctx)
+    if opt == "muon":
+        model.enable_muon(Float32(0.95), adam_mult)
+    model.head_lr_mult = head_mult
+    var g = heap_alloc[Float32](model.num_parameters)
+    _ = _fwd_bwd(model, x, y, g)
+    g.unsafe_free()
+    model.update(
+        t=UInt32(1),
+        learning_rate=Scalar[DType.float32](1e-3),
+        weight_decay=Scalar[DType.float32](0.1),
+    )
+    model.ctx.synchronize()
+    var n = model.num_parameters
+    for i in range(n):
+        dst[unsafe_offset=i] = model.params_memory[unsafe_offset=i].cast[
+            DType.float32
+        ]()
+    return n
+
+
+def test_untied_head_lr_mult() raises:
+    """-l_head reaches the head's optimizer step and only the head, under both
+    AdamW (`_adamw_flat`) and Muon (`_update_hybrid`), W=1:
+      * -l_head 0 freezes the head bitwise (wd > 0, so a head updated with the
+        body lr would move) while the body moves;
+      * the body is bitwise independent of -l_head;
+      * the sentinel (-1) equals an explicit -l_head 1 bitwise (AdamW) and an
+        explicit -l_head equal to -l_adam bitwise (Muon, -l_adam 2);
+      * -l_head 2 moves every head element twice as far as -l_head 1 (one
+        AdamW step from zero moments is linear in the lr, decay included)."""
+    comptime if not UNTIED_HEAD:
+        print("SKIP test_untied_head_lr_mult: tied build")
+        return
+    _write_file(CKPT, 3, False, 0)
+    var x = heap_alloc[Scalar[DType.int32]](GB * GT)
+    var y = heap_alloc[Scalar[DType.int32]](GB * GT)
+    for i in range(GB * GT):
+        x[unsafe_offset=i] = Int32((i * 7) % 8)
+        y[unsafe_offset=i] = Int32((i * 29 + 11) % V)
+    var NT = N16 + HEAD_N
+    var p0 = heap_alloc[Float32](NT)  # -l_head 0
+    var p1 = heap_alloc[Float32](NT)  # sentinel
+    var p1e = heap_alloc[Float32](NT)  # explicit 1 (or = l_adam under Muon)
+    var p2 = heap_alloc[Float32](NT)  # -l_head 2 (AdamW) / 4 (Muon, l_adam 2)
+    var init = heap_alloc[Float32](N16)
+    var ctx0 = DeviceContext(api="cpu")
+    var m0 = GPT2["cpu", 1](CKPT, rank=0, zero_stage=0, ctx=ctx0)
+    for i in range(N16):
+        init[unsafe_offset=i] = m0.params_memory[unsafe_offset=i].cast[
+            DType.float32
+        ]()
+        # The loader copied the tied file's wte into the head.
+        if i < HEAD_N:
+            assert_true(
+                m0.params_memory[unsafe_offset=N16 + i]
+                == m0.params_memory[unsafe_offset=i],
+                "head != wte copy at load",
+            )
+    _ = m0^
+    for o in range(2):
+        var opt = "adamw" if o == 0 else "muon"
+        var am = Float32(1.0) if o == 0 else Float32(2.0)
+        assert_equal(_head_step(opt, Float32(0.0), am, x, y, p0), NT)
+        _ = _head_step(opt, Float32(-1.0), am, x, y, p1)
+        _ = _head_step(opt, am, am, x, y, p1e)
+        _ = _head_step(opt, Float32(2.0) * am, am, x, y, p2)
+        var body_moved = 0
+        var head_moved = 0
+        for i in range(N16):
+            assert_true(
+                p0[unsafe_offset=i] == p1[unsafe_offset=i]
+                and p2[unsafe_offset=i] == p1[unsafe_offset=i],
+                opt + ": body depends on -l_head",
+            )
+            if p1[unsafe_offset=i] != init[unsafe_offset=i]:
+                body_moved += 1
+        for i in range(HEAD_N):
+            var h0 = init[unsafe_offset=i]  # head starts as the wte copy
+            var j = N16 + i
+            assert_true(
+                p0[unsafe_offset=j] == h0, opt + ": -l_head 0 moved the head"
+            )
+            assert_true(
+                p1e[unsafe_offset=j] == p1[unsafe_offset=j],
+                opt + ": sentinel -l_head != explicit equal multiplier",
+            )
+            var d1 = p1[unsafe_offset=j] - h0
+            var d2 = p2[unsafe_offset=j] - h0
+            if d1 != 0.0:
+                head_moved += 1
+            assert_true(
+                abs(d2 - 2.0 * d1) <= 1e-3 * abs(d1) + 1e-9,
+                opt + ": -l_head 2x did not move the head 2x",
+            )
+        assert_true(body_moved > N16 // 2, opt + ": body did not move")
+        # Real rows only; the 4 padding rows have zero gradient and value.
+        assert_true(head_moved > (V * C) // 2, opt + ": head did not move")
+    _remove(CKPT)
+    x.unsafe_free()
+    y.unsafe_free()
+    p0.unsafe_free()
+    p1.unsafe_free()
+    p1e.unsafe_free()
+    p2.unsafe_free()
+    init.unsafe_free()
+
+
+def test_untied_grad_norm_covers_head() raises:
+    """With the head training, the clip norm is the L2 norm over all 17
+    gradient tensors; with the head idle it is the body-only norm (S0's
+    bit-identity with the tied build). The planted batch makes the two differ
+    by far more than the tolerance, so a 16-tensor norm cannot pass."""
+    comptime if not UNTIED_HEAD:
+        print("SKIP test_untied_grad_norm_covers_head: tied build")
+        return
+    _write_file(CKPT, 3, False, 0)
+    var x = heap_alloc[Scalar[DType.int32]](GB * GT)
+    var y = heap_alloc[Scalar[DType.int32]](GB * GT)
+    for i in range(GB * GT):
+        x[unsafe_offset=i] = Int32((i * 7) % 8)
+        y[unsafe_offset=i] = Int32((i * 29 + 11) % V)
+    var ctx = DeviceContext(api="cpu")
+    var NT = N16 + HEAD_N
+    for idle in range(2):
+        var model = GPT2["cpu", 1](CKPT, rank=0, zero_stage=0, ctx=ctx)
+        model.head_tied = idle == 1
+        var g = heap_alloc[Float32](NT)
+        _ = _fwd_bwd(model, x, y, g)
+        var body = Float64(0.0)
+        var head = Float64(0.0)
+        for i in range(N16):
+            body += Float64(g[unsafe_offset=i]) ** 2
+        for i in range(HEAD_N):
+            head += Float64(g[unsafe_offset=N16 + i]) ** 2
+        var norm = Float64(model.calculate_grad_norm())
+        var want = (body + head) ** 0.5 if idle == 0 else body**0.5
+        var other = body**0.5 if idle == 0 else (body + head) ** 0.5
+        assert_true(head == 0.0 if idle == 1 else head > 0.0, "head grad")
+        if idle == 0:
+            assert_true(abs(other - want) > 1e-2 * want, "norms not separable")
+        assert_true(
+            abs(norm - want) <= 1e-5 * want,
+            "grad norm " + String(norm) + " != " + String(want),
+        )
+        g.unsafe_free()
+        _ = model^
+    _remove(CKPT)
+    x.unsafe_free()
+    y.unsafe_free()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
     _remove(CKPT)
