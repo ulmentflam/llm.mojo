@@ -642,6 +642,11 @@ def _mclip_train[
                 # tied-phase layout: head block present in the 17-tensor
                 # buffer but idle (neither reduced, updated nor read).
                 model.head_tied = stage >= 2
+                # The model really carries the 17-tensor layout (head block
+                # after the 16 tied tensors), so the shard map differs from the
+                # tied build's even with the head idle.
+                assert_equal(model.num_parameters, n + model.param_sizes[0])
+                assert_equal(model.param_sizes[16], model.param_sizes[0])
             model.enable_muon(Scalar[DType.float32](0.95))
             if clip:
                 model.enable_qk_clip(MTAU, True)

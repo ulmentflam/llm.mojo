@@ -1,4 +1,4 @@
-from std.testing import assert_almost_equal, TestSuite
+from std.testing import assert_almost_equal, assert_equal, TestSuite
 from std.sys.info import size_of
 
 from max.gpu.host import DeviceContext
@@ -200,6 +200,11 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
         )
         comptime if UNTIED_HEAD:
             model.head_tied = stage >= 2  # see baseline above
+            # 17-tensor layout: the shard map is the untied one, head idle.
+            assert_equal(
+                model.num_parameters, NUM_PARAMS + model.param_sizes[0]
+            )
+            assert_equal(model.param_sizes[16], model.param_sizes[0])
         model.forward(
             rebind[MutMemPtr[DType.int32]](x),
             rebind[MutMemPtr[DType.int32]](y),
