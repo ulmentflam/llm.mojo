@@ -279,13 +279,17 @@ def write_state_checkpoint[
     m_memory: MutMemPtr[dtype],
     v_memory: MutMemPtr[dtype],
     shard_num_parameters: Int,
+    v_num_parameters: Int = -1,
 ) raises:
     """Write the optimizer/training state: 256-int header + AdamW m & v moments.
 
     `shard_num_parameters` is the per-rank moment count
     (`GPT2.optimizer_num_parameters`); under ZeRO each rank writes its own shard
     to its own `state_<step>_<rank>.bin`, matching llm.c.
+    `v_num_parameters` is the v blob length; -1 (default) means the same as m.
+    Muon stores a compact v (AdamW-owned ranges only), so it passes less.
     """
+    var n_v = shard_num_parameters if v_num_parameters < 0 else v_num_parameters
     var header = heap_alloc[Int32](CHECKPOINT_HEADER_SIZE)
     for i in range(CHECKPOINT_HEADER_SIZE):
         header.unsafe_store(i, Int32(0))
@@ -309,7 +313,7 @@ def write_state_checkpoint[
     var file = open(path, "w")
     write_buffer[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
     write_buffer[dtype](file, m_memory, shard_num_parameters)
-    write_buffer[dtype](file, v_memory, shard_num_parameters)
+    write_buffer[dtype](file, v_memory, n_v)
     file.close()
     header.unsafe_free()
 
@@ -358,15 +362,18 @@ def read_state_checkpoint[
     m_out: MutMemPtr[dtype],
     v_out: MutMemPtr[dtype],
     shard_num_parameters: Int,
+    v_num_parameters: Int = -1,
 ) raises -> TrainingState:
     """Read the optimizer state into `m_out`/`v_out`; return the TrainingState.
 
-    Both buffers must hold at least `shard_num_parameters` elements.
+    `m_out` must hold `shard_num_parameters` elements, `v_out`
+    `v_num_parameters` (-1 = same as m).
     """
+    var n_v = shard_num_parameters if v_num_parameters < 0 else v_num_parameters
     var file = open(path, "r")
     var state = read_state_header(file)
     read_and_copy[dtype](file, m_out, shard_num_parameters)
-    read_and_copy[dtype](file, v_out, shard_num_parameters)
+    read_and_copy[dtype](file, v_out, n_v)
     file.close()
     return state^
 
