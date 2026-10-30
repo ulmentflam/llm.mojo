@@ -6728,11 +6728,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             expect_muon_shard_elems=n_mu,
         )
         if n_v_read != n_v:
-            # Legacy full-size v (ZeRO-0 layouts only; the size check above
-            # raises for anything else): gather each AdamW segment to its
-            # compact offset. compact_off <= shard_rel for disjoint ascending
-            # segments, so an ascending in-place copy never overwrites an
-            # element before it is read.
+            # Legacy full-size v (ZeRO-0 layouts only; the exact length check
+            # in read_state_checkpoint raises for anything else): gather each
+            # AdamW segment to its compact offset. compact_off <= shard_rel
+            # for disjoint ascending segments, so an ascending in-place copy
+            # never overwrites an element before it is read.
             var segs = self._adamw_shard_segments()
             for k in range(len(segs)):
                 for i in range(segs[k].len):

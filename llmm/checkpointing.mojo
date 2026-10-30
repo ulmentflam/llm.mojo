@@ -528,11 +528,10 @@ def read_state_checkpoint[
     read_and_copy[dtype](file, v_out, n_v)
     if want_owner:
         read_and_copy[dtype](file, muon_m_out.value(), n_mu)
-    # A short file already raises in read_and_copy; a LONG one must too. The
-    # header records world size and rank but not the shard length, so a state
-    # written at ZeRO-0 (full-size moments) and resumed at ZeRO>=1 with the
-    # same world size passes the checks above and would otherwise load just a
-    # prefix of m and v, silently.
+    # Backstop only: the exact getsize() check above already rejects a short
+    # or long file (e.g. a ZeRO-0 state resumed at ZeRO>=1 at the same world
+    # size, which would otherwise load a prefix of m and v silently). This
+    # catches a file that grew between the size check and the read.
     var trailing = file.read_bytes(1)
     file.close()
     if len(trailing) != 0:
