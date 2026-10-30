@@ -7676,6 +7676,7 @@ def train[
         num("batch", total_batch_size, VERBOSE),
         num("grad_accum", grad_accum_steps, VERBOSE),
         num("grad_clip", args.grad_clip, VERBOSE),
+        num("weight_decay", args.weight_decay, VERBOSE),
         num("qk_clip", args.qk_clip_tau, VERBOSE),
         num("muon_momentum", args.muon_momentum, VERBOSE),
         num("world_size", WORLD_SIZE, VERBOSE),
