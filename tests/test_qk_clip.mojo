@@ -550,6 +550,7 @@ comptime ML = 2
 comptime MNH = 2
 comptime MC = 16
 comptime MTAU = Float32(5.0)
+comptime NOT_OWNED = Float32(-1.0e30)
 
 
 def _planted(rank: Int, i: Int) -> Float32:
@@ -605,11 +606,15 @@ def _mclip_train[
     clip: Bool,
     result: MutMemPtr[DType.float32],
     qmax: MutMemPtr[DType.float32],
+    owner: MutMemPtr[DType.float32],
 ) raises:
     """One Muon step on W threaded CPU ranks at `stage`. With `clip`, QK-clip
     is enabled and each rank plants `_planted(rank, .)` after backward; the
     trainer's `qk_max()` + `qk_clip_step()` sequence follows `update()`.
-    result[r*n:(r+1)*n] = rank r's params; qmax[r] = rank r's qk_max()."""
+    result[r*n:(r+1)*n] = rank r's params (ZeRO-3: the full vector gathered by
+    `_z3_gather_full`); qmax[r] = rank r's qk_max(). At ZeRO-3 owner[r*n:..]
+    holds rank r's owner-space Muon matrices at their natural flat offsets
+    (`NOT_OWNED` elsewhere)."""
     var coord = heap_alloc[CpuCoordinator](1)
     coord[] = CpuCoordinator(W)
     var errors = heap_alloc[Int](W)
@@ -661,10 +666,39 @@ def _mclip_train[
             qmax[unsafe_offset=rank] = model.qk_max()
             model.qk_clip_step()
             model.ctx.synchronize()
-            for i in range(n):
-                result[unsafe_offset=rank * n + i] = model.params_memory[
-                    unsafe_offset=i
-                ].cast[DType.float32]()
+            if stage == 3:
+                # Streaming: params_memory is only the flat shard. Gather the
+                # full vector (collective) and export the owner-space copies.
+                var full = model.ctx.enqueue_create_buffer[GPT2_DTYPE](n)
+                model.ctx.synchronize()
+                model._z3_gather_full(
+                    rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        full.unsafe_ptr().as_unsafe_any_origin()
+                    )
+                )
+                model.ctx.synchronize()
+                for i in range(n):
+                    result[unsafe_offset=rank * n + i] = full.unsafe_ptr()[
+                        unsafe_offset=i
+                    ].cast[DType.float32]()
+                    owner[unsafe_offset=rank * n + i] = NOT_OWNED
+                for i in range(len(model.muon_slots)):
+                    ref sl = model.muon_slots[i]
+                    if sl.owner != rank:
+                        continue
+                    for j in range(sl.len):
+                        owner[
+                            unsafe_offset=rank * n + sl.flat_off + j
+                        ] = model.muon_p_memory[
+                            unsafe_offset=sl.local_off + j
+                        ].cast[
+                            DType.float32
+                        ]()
+            else:
+                for i in range(n):
+                    result[unsafe_offset=rank * n + i] = model.params_memory[
+                        unsafe_offset=i
+                    ].cast[DType.float32]()
             x.unsafe_free()
             y.unsafe_free()
         except e:
@@ -692,15 +726,19 @@ def _mclip_case[W: Int](stage: Int) raises:
     var got = heap_alloc[Float32](W * n)
     var qmax = heap_alloc[Float32](W)
     var qmax_ref = heap_alloc[Float32](W)
+    var owner = heap_alloc[Float32](W * n)
+    var owner_ref = heap_alloc[Float32](W * n)
     try:
-        _mclip_train[W](path, n, 0, False, unclipped, qmax_ref)
-        _mclip_train[W](path, n, stage, True, got, qmax)
+        _mclip_train[W](path, n, stage, False, unclipped, qmax_ref, owner_ref)
+        _mclip_train[W](path, n, stage, True, got, qmax, owner)
     except e:
         _remove(path)
         raise e^
     _remove(path)
 
-    # Reference: the unclipped step clipped by the single-process kernel.
+    # Reference: the unclipped step at the SAME stage (reduce-scatter vs
+    # allreduce differ in the last ulp elsewhere) clipped by the
+    # single-process kernel.
     var gmax = heap_alloc[Float32](ML * MNH)
     for i in range(ML * MNH):
         var m = _planted(0, i)
@@ -760,6 +798,30 @@ def _mclip_case[W: Int](stage: Int) raises:
                     + " vs "
                     + String(b)
                 )
+    if stage == 3:
+        # Owner-space copies carry the clip too (the next forward gathers the
+        # Muon matrices from there): every owned element equals the reference
+        # (bit-exact), each Muon element is owned exactly once, and exactly
+        # the hot heads' Q and K matrix rows differ from the unclipped step.
+        var owned = 0
+        var owned_changed = 0
+        for r in range(W):
+            for i in range(n):
+                var o = owner[unsafe_offset=r * n + i]
+                if o == NOT_OWNED:
+                    continue
+                owned += 1
+                if o != want[unsafe_offset=i]:
+                    raise Error(
+                        "owner-space != reference at rank "
+                        + String(r)
+                        + " idx "
+                        + String(i)
+                    )
+                if o != unclipped[unsafe_offset=i]:
+                    owned_changed += 1
+        assert_equal(owned, ML * 12 * C * C)
+        assert_equal(owned_changed, 2 * 2 * hd * C)
     # After the bit-exact params check, so a local-max collective is reported
     # by the params mismatch first; qk_max() must also be the GLOBAL max.
     for r in range(W):
@@ -770,6 +832,8 @@ def _mclip_case[W: Int](stage: Int) raises:
     got.unsafe_free()
     qmax.unsafe_free()
     qmax_ref.unsafe_free()
+    owner.unsafe_free()
+    owner_ref.unsafe_free()
 
 
 def test_qk_clip_multirank_zero1_w2() raises:
@@ -782,6 +846,22 @@ def test_qk_clip_multirank_zero1_w4() raises:
 
 def test_qk_clip_multirank_zero0_w2() raises:
     _mclip_case[2](0)
+
+
+def test_qk_clip_multirank_zero2_w2() raises:
+    _mclip_case[2](2)
+
+
+def test_qk_clip_multirank_zero2_w4() raises:
+    _mclip_case[4](2)
+
+
+def test_qk_clip_multirank_zero3_w2() raises:
+    _mclip_case[2](3)
+
+
+def test_qk_clip_multirank_zero3_w4() raises:
+    _mclip_case[4](3)
 
 
 def _remove(path: String) raises:

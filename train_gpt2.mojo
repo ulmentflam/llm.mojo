@@ -175,6 +175,8 @@ comptime LM_HEAD_CHUNKED_CE = (
 # embeddings, not fail loudly — do not enable it standalone.
 comptime Z3_WTE_ONDEMAND = is_defined["LLMM_Z3_WTE_ONDEMAND"]()
 
+comptime MUON_OWNERSHIP_VERSION = 1  # state header slot 42: (k*L + l) mod W
+
 comptime NUM_PARAMETER_TENSORS = 16
 comptime NUM_ACTIVATION_TENSORS = 26
 
@@ -2886,17 +2888,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # Multi-rank: the per-head maxima are allreduce-maxed so every rank
         # applies the same clip (docs/ai/zero_sharded_muon_design_*.md, S5).
         # Supported: ZeRO-0 with either optimizer (full-buffer clip) and
-        # ZeRO-1 Muon (clip applied in owner space inside update()). AdamW
-        # with ZeRO >= 1 keeps Q/K rows in flat shards (a third layout), and
-        # sharded Muon is ZeRO-0/1 only so far.
+        # ZeRO-1/2/3 Muon (clip applied in owner space inside update(); the
+        # qkv bias is clipped in the resident params, or the flat shard under
+        # ZeRO-3 streaming). AdamW with ZeRO >= 1 keeps Q/K rows in flat
+        # shards (a third layout), so it stays unsupported.
         comptime if Self.WORLD_SIZE > 1:
             if self.zero_ctx.zero_stage >= 1 and self.optimizer_kind != 1:
                 raise Error(
                     "QK-clip with WORLD_SIZE > 1 and ZeRO >= 1 needs -opt muon"
                     " (AdamW keeps Q/K rows in flat shards)"
                 )
-            if self.zero_ctx.zero_stage >= 2 or self.z3_streaming:
-                raise Error("QK-clip supports ZeRO-0 and ZeRO-1 only so far")
         var n = self.config.num_layer * self.config.num_heads
         self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](n)
         self.head_max_buf.enqueue_fill(Scalar[DType.float32](0.0))
@@ -2988,7 +2989,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.qk_head_max_global = True
 
     def _qk_clip_sharded(mut self) raises:
-        """ZeRO-1 sharded Muon: apply QK-clip where the data lives, between the
+        """ZeRO-1/2/3 sharded Muon: apply QK-clip where the data lives, between the
         local updates and the gathers of `_update_sharded_muon`. Q/K rows of
         the matrices this rank owns are scaled in the owner-space param (and
         master) copy; the qkv-bias entries inside this rank's flat optimizer
@@ -3030,17 +3031,19 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var b = min(sg.flat_start + sg.len, b_hi)
                 if b <= a:
                     continue
-                # Full-buffer offset `a`: valid at ZeRO-1/2 only. Under ZeRO-3
-                # streaming params_memory is the flat shard, so lifting
-                # enable_qk_clip's ZeRO-2/3 raise needs `sg.shard_rel +
-                # (a - sg.flat_start)` here (S3 verification note).
+                # ZeRO-1/2 (and non-streaming ZeRO-3): params_memory is the
+                # full buffer, offset `a`. ZeRO-3 streaming: params_memory is
+                # only this rank's flat shard, so index shard-relative.
+                var p_off = a
+                if self.z3_streaming:
+                    p_off = sg.shard_rel + (a - sg.flat_start)
                 qk_clip_bias_range[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](
-                        self.params_memory.unsafe_offset(a)
+                        self.params_memory.unsafe_offset(p_off)
                     ),
                     as_mut_kernel[MASTER_DTYPE](
                         self.master_memory.unsafe_offset(
-                            sg.shard_rel + (a - sg.flat_start)
+                            sg.compact_off + (a - sg.flat_start)
                         )
                     ),
                     USE_BF16,
@@ -5583,6 +5586,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         gradient straight to its owner; ZeRO-3 (streaming and not) additionally
         keeps the owner copy as the authoritative parameters.
         """
+        # S7: under sharded Muon this trims m/master to A_r and builds the
+        # owner buffers; a second call would read the trimmed buffers as if
+        # they were still shard-sized (out of bounds), so refuse it.
+        if self.optimizer_kind == 1:
+            raise Error("GPT2 error: enable_muon called twice")
         var L = self.config.num_layer
         var C = self.config.channels
         var qkv = self.param_offset(Parameters.qkv_weight)
@@ -5645,9 +5653,77 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.v_memory = rebind_mut_mem[MASTER_DTYPE](
             self.v_buf.unsafe_ptr().as_unsafe_any_origin()
         )
+        if sharded:
+            self._trim_flat_m_master(segs)
         comptime if Self.WORLD_SIZE > 1:
             if self.zero_ctx.zero_stage >= 1:
                 self._build_muon_ownership()
+
+    def _trim_flat_m_master(mut self, segs: List[AdamSeg]) raises:
+        """S7: sharded Muon only. Replace the shard-sized flat `m` and `master`
+        with buffers of A_r elements (the same layout as the compact `v`):
+        AdamW segment k moves from `shard_rel` to `compact_off`. The Muon
+        matrix positions of the old buffers were never read (momentum and
+        master for those live in the owner-space buffers)."""
+        var n = self.optimizer_num_parameters
+        var total = self.v_num_parameters
+        var n_alloc = max(total, 1)
+        var old_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n)
+        var new_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_alloc)
+        self.ctx.synchronize()
+        self._copy_device_to_host[MASTER_DTYPE](old_m, self.m_memory, n)
+        self.ctx.synchronize()
+        for i in range(n_alloc):
+            new_m[i] = Scalar[MASTER_DTYPE](0)
+        self._compact_copy(old_m, new_m, segs)
+        self.m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](n_alloc)
+        self.ctx.synchronize()
+        self.m_memory = rebind_mut_mem[MASTER_DTYPE](
+            self.m_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self._copy_host_to_device[MASTER_DTYPE](self.m_memory, new_m, n_alloc)
+        comptime if USE_BF16:
+            var old_ms = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n)
+            var new_ms = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
+                n_alloc
+            )
+            self.ctx.synchronize()
+            self._copy_device_to_host[MASTER_DTYPE](
+                old_ms, self.master_memory, n
+            )
+            self.ctx.synchronize()
+            for i in range(n_alloc):
+                new_ms[i] = Scalar[MASTER_DTYPE](0)
+            self._compact_copy(old_ms, new_ms, segs)
+            self.master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](
+                n_alloc
+            )
+            self.ctx.synchronize()
+            self.master_memory = rebind_mut_mem[MASTER_DTYPE](
+                self.master_buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+            self._copy_host_to_device[MASTER_DTYPE](
+                self.master_memory, new_ms, n_alloc
+            )
+        self.ctx.synchronize()
+
+    def _compact_copy(
+        self,
+        src: HostBuffer[MASTER_DTYPE],
+        dst: HostBuffer[MASTER_DTYPE],
+        segs: List[AdamSeg],
+    ):
+        """dst[compact_off + i] = src[shard_rel + i] for every segment."""
+        for k in range(len(segs)):
+            for i in range(segs[k].len):
+                dst[segs[k].compact_off + i] = src[segs[k].shard_rel + i]
+
+    def _m_count(self) -> Int:
+        """Element count of the m blob in state files: compact (A_r) under
+        sharded Muon, the full shard otherwise."""
+        if self._sharded_muon():
+            return self.v_num_parameters
+        return self.optimizer_num_parameters
 
     def _owner_of(self, k: Int, l: Int) -> Int:
         """Rank that owns Muon matrix (group k, layer l): (k*L + l) mod W."""
@@ -5995,11 +6071,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     ),
                     as_mut_kernel[GPT2_DTYPE](g_seg),
                     as_mut_kernel[MASTER_DTYPE](
-                        self.master_memory.unsafe_offset(sg.shard_rel)
+                        self.master_memory.unsafe_offset(sg.compact_off)
                     ),
                     USE_BF16,
                     as_mut_kernel[MASTER_DTYPE](
-                        self.m_memory.unsafe_offset(sg.shard_rel)
+                        self.m_memory.unsafe_offset(sg.compact_off)
                     ),
                     as_mut_kernel[MASTER_DTYPE](
                         self.v_memory.unsafe_offset(sg.compact_off)
@@ -6666,6 +6742,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             size=n,
         )
 
+    def _sharded_muon(self) -> Bool:
+        """True when Muon momentum lives in the owner-local buffers (W > 1,
+        ZeRO >= 1); the state file then carries a `muon_m` blob."""
+        comptime if Self.WORLD_SIZE > 1:
+            return self.optimizer_kind == 1 and self.zero_ctx.zero_stage >= 1
+        else:
+            return False
+
     def write_checkpoint(
         mut self,
         model_path: String,
@@ -6680,12 +6764,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         shard (m, v) to its `state_path`. Mirrors llm.c's split of model_*.bin
         (shared) and state_*_rank.bin (per-process).
         """
-        comptime if Self.WORLD_SIZE > 1:
-            if self.optimizer_kind == 1 and self.zero_ctx.zero_stage >= 1:
-                raise Error(
-                    "Checkpointing sharded Muon (ZeRO>=1) is not implemented"
-                    " yet: the owner-space momentum is not in the state file"
-                )
         # ZeRO-3 keeps only this rank's parameter shard resident in
         # params_memory after update() (the next forward re-gathers it). Gather
         # the full parameter set before snapshotting the model. Under streaming
@@ -6736,7 +6814,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         # AdamW moments are fp32 (MASTER_DTYPE), independent of the parameter
         # precision, so the state file stores them in fp32 (matching llm.c).
-        var n_opt = self.optimizer_num_parameters
+        var n_opt = self._m_count()
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
         var n_v = self._v_count()
         var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v)
@@ -6744,14 +6822,34 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self._copy_device_to_host[MASTER_DTYPE](host_m, self.m_memory, n_opt)
         self._copy_device_to_host[MASTER_DTYPE](host_v, self.v_memory, n_v)
         self.ctx.synchronize()
+        var tstate = make_training_state(
+            loader,
+            step,
+            sampler_rng_state,
+            optimizer_kind=self.optimizer_kind,
+        )
+        var n_mu = 0
+        if self._sharded_muon():
+            # Owner-local momentum (S elements) rides after m and v. The fp32
+            # muon_master is not saved: like `master_buf` it is rebuilt from
+            # the loaded params on resume (bf16 resume is therefore not
+            # bit-exact; fp32 is).
+            n_mu = self.muon_shard_elems
+            tstate.zero_stage = self.zero_ctx.zero_stage
+            tstate.muon_ownership_version = MUON_OWNERSHIP_VERSION
+            tstate.muon_shard_elems = n_mu
+        var host_mu = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
+            max(n_mu, 1)
+        )
+        self.ctx.synchronize()
+        if n_mu > 0:
+            self._copy_device_to_host[MASTER_DTYPE](
+                host_mu, self.muon_m_memory, n_mu
+            )
+            self.ctx.synchronize()
         write_state_checkpoint[MASTER_DTYPE](
             state_path,
-            make_training_state(
-                loader,
-                step,
-                sampler_rng_state,
-                optimizer_kind=self.optimizer_kind,
-            ),
+            tstate,
             rebind_mut_mem[MASTER_DTYPE](
                 host_m.unsafe_ptr().as_unsafe_any_origin()
             ),
@@ -6760,6 +6858,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             ),
             n_opt,
             n_v,
+            muon_m_memory=rebind_mut_mem[MASTER_DTYPE](
+                host_mu.unsafe_ptr().as_unsafe_any_origin()
+            ),
         )
 
     def load_checkpoint(
@@ -6772,12 +6873,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         checkpoint (build it from the same base checkpoint first). Each rank
         reads the shared model file plus its own optimizer-state shard.
         """
-        comptime if Self.WORLD_SIZE > 1:
-            if self.optimizer_kind == 1 and self.zero_ctx.zero_stage >= 1:
-                raise Error(
-                    "Checkpointing sharded Muon (ZeRO>=1) is not implemented"
-                    " yet: the owner-space momentum is not in the state file"
-                )
         var host_params = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )
@@ -6848,13 +6943,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 if src < self.num_parameters:
                     val = host_params[src]
                 host_master[i] = val.cast[MASTER_DTYPE]()
+            var n_master_copy = n_master
+            if self._sharded_muon():
+                # S7: master is compact (A_r elements, `compact_off` layout);
+                # gather the AdamW segments from the shard-relative seed. The
+                # ascending in-place copy is safe (compact_off <= shard_rel).
+                var msegs = self._adamw_shard_segments()
+                self._compact_copy(host_master, host_master, msegs)
+                n_master_copy = self.v_num_parameters
             self._copy_host_to_device[MASTER_DTYPE](
-                self.master_memory, host_master, n_master
+                self.master_memory, host_master, n_master_copy
             )
             self.ctx.synchronize()
 
         # AdamW moments are fp32 (MASTER_DTYPE); read them back in fp32.
-        var n_opt = self.optimizer_num_parameters
+        var n_opt = self._m_count()
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
         var n_v = self._v_count()
         # Peek the header first: the v blob length depends on optimizer_kind,
@@ -6870,35 +6973,28 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 + String(self.optimizer_kind)
                 + "; pass the matching -opt"
             )
-        # The header does not record the v length, so check the file size:
-        # reading fewer bytes than the file holds would succeed silently. A
-        # Muon state file written before v went compact holds a full-size v
-        # (zeros at the Muon matrices); accept it and compact it below.
+        # The header does not record the m/v lengths. A Muon state file
+        # written before v went compact holds a full-size v (zeros at the
+        # Muon matrices); accept it (ZeRO-0 layouts only) and compact it
+        # below. Every other layout is checked exactly by
+        # read_state_checkpoint (header + m + v [+ muon_m], both directions).
         var elem = size_of[MASTER_DTYPE]()
         var head_bytes = CHECKPOINT_HEADER_SIZE * size_of[DType.int32]()
         var file_bytes = Int(getsize(state_path))
         var n_v_read = n_v
-        if file_bytes != head_bytes + (n_opt + n_v) * elem:
-            if (
-                self.optimizer_kind == 1
-                and self.zero_ctx.zero_stage == 0
-                and file_bytes == head_bytes + 2 * n_opt * elem
-            ):
-                n_v_read = n_opt  # legacy full-size Muon v
-            else:
-                raise Error(
-                    "Cannot resume: state file "
-                    + state_path
-                    + " is "
-                    + String(file_bytes)
-                    + " bytes, expected "
-                    + String(head_bytes + (n_opt + n_v) * elem)
-                    + " (m="
-                    + String(n_opt)
-                    + ", v="
-                    + String(n_v)
-                    + " fp32 elements)"
-                )
+        if (
+            file_bytes != head_bytes + (n_opt + n_v) * elem
+            and self.optimizer_kind == 1
+            and not self._sharded_muon()
+            and self.zero_ctx.zero_stage == 0
+            and file_bytes == head_bytes + 2 * n_opt * elem
+        ):
+            n_v_read = n_opt  # legacy full-size Muon v
+        var sharded = self._sharded_muon()
+        var n_mu = self.muon_shard_elems if sharded else 0
+        var host_mu = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
+            max(n_mu, 1)
+        )
         var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v_read)
         self.ctx.synchronize()
         var state = read_state_checkpoint[MASTER_DTYPE](
@@ -6913,13 +7009,19 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             v_num_parameters=n_v_read,
             expect_num_processes=Self.WORLD_SIZE,
             expect_process_rank=self.zero_ctx.rank,
+            muon_m_out=Optional[MutMemPtr[MASTER_DTYPE]](
+                rebind_mut_mem[MASTER_DTYPE](
+                    host_mu.unsafe_ptr().as_unsafe_any_origin()
+                )
+            ) if sharded else Optional[MutMemPtr[MASTER_DTYPE]](None),
+            expect_muon_shard_elems=n_mu,
         )
         if n_v_read != n_v:
-            # Legacy full-size v (ZeRO-0 layouts only; the size check above
-            # raises for anything else): gather each AdamW segment to its
-            # compact offset. compact_off <= shard_rel for disjoint ascending
-            # segments, so an ascending in-place copy never overwrites an
-            # element before it is read.
+            # Legacy full-size v (ZeRO-0 layouts only; the exact length check
+            # in read_state_checkpoint raises for anything else): gather each
+            # AdamW segment to its compact offset. compact_off <= shard_rel
+            # for disjoint ascending segments, so an ascending in-place copy
+            # never overwrites an element before it is read.
             var segs = self._adamw_shard_segments()
             for k in range(len(segs)):
                 for i in range(segs[k].len):
@@ -6936,8 +7038,57 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
         self._copy_host_to_device[MASTER_DTYPE](self.m_memory, host_m, n_opt)
         self._copy_host_to_device[MASTER_DTYPE](self.v_memory, host_v, n_v)
+        if sharded:
+            self._load_muon_owner_state(host_params, host_mu)
         self.ctx.synchronize()
         return state^
+
+    def _load_muon_owner_state(
+        mut self,
+        host_params: HostBuffer[GPT2_DTYPE],
+        host_mu: HostBuffer[MASTER_DTYPE],
+    ) raises:
+        """Resume the owner-local Muon buffers: momentum from the state file;
+        params re-seeded from the loaded full vector (the owner buffer is the
+        source of truth for owned matrices); fp32 master (bf16 builds) rebuilt
+        from those params, as `master_buf` is."""
+        var S = self.muon_shard_elems
+        var rank = self.zero_ctx.rank
+        self._copy_host_to_device[MASTER_DTYPE](self.muon_m_memory, host_mu, S)
+        for i in range(len(self.muon_slots)):
+            ref sl = self.muon_slots[i]
+            if sl.owner != rank:
+                continue
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.muon_p_memory.unsafe_offset(
+                        sl.local_off
+                    ).as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                    (
+                        host_params.unsafe_ptr().unsafe_offset(sl.flat_off)
+                    ).as_unsafe_any_origin()
+                ),
+                size=sl.len,
+            )
+        comptime if USE_BF16:
+            var host_ms = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](S)
+            self.ctx.synchronize()
+            for i in range(S):
+                host_ms[i] = Scalar[MASTER_DTYPE](0)
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                if sl.owner != rank:
+                    continue
+                for e in range(sl.len):
+                    host_ms[sl.local_off + e] = host_params[
+                        sl.flat_off + e
+                    ].cast[MASTER_DTYPE]()
+            self._copy_host_to_device[MASTER_DTYPE](
+                self.muon_master_memory, host_ms, S
+            )
+        self.ctx.synchronize()
 
     # ===------------------------------------------------------------------=== #
     # Exact in-process memory accounting (LLMM_MEM_REPORT)
@@ -7485,18 +7636,6 @@ def train[
     )
     if args.optimizer == "muon":
         model.enable_muon(args.muon_momentum)
-        # Sharded Muon (W > 1, ZeRO >= 1) cannot write or read a state file
-        # until the owner-space momentum is in it (slice S4). Refuse up front:
-        # write_checkpoint would otherwise raise only at the first save step,
-        # after all the training before it.
-        comptime if WORLD_SIZE > 1:
-            if model.zero_ctx.zero_stage >= 1 and args.output_log_dir != "":
-                if args.checkpoint_every > 0 or args.resume == 1:
-                    raise Error(
-                        "-opt muon with -z >= 1 at WORLD_SIZE > 1 cannot"
-                        " checkpoint or resume yet (sharded-Muon state is"
-                        " not in the state file); drop -n / -y, or use -z 0"
-                    )
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
 
@@ -7643,6 +7782,10 @@ def train[
                 + style.dim("resumed from step " + String(start_step)),
                 plain="Resumed from checkpoint at step " + String(start_step),
             )
+            # Barrier: every rank must finish READING its model/state files
+            # before any rank may write. Combined with the no-resave below this
+            # is belt and braces; allreduce_scalar is a no-op at WORLD_SIZE 1.
+            _ = model.zero_ctx.allreduce_scalar(Float64(0.0))
 
     #####################################################################################
     # Training Loop
@@ -7677,6 +7820,7 @@ def train[
         num("batch", total_batch_size, VERBOSE),
         num("grad_accum", grad_accum_steps, VERBOSE),
         num("grad_clip", args.grad_clip, VERBOSE),
+        num("weight_decay", args.weight_decay, VERBOSE),
         num("qk_clip", args.qk_clip_tau, VERBOSE),
         num("muon_momentum", args.muon_momentum, VERBOSE),
         num("world_size", WORLD_SIZE, VERBOSE),
@@ -7806,6 +7950,11 @@ def train[
         if (
             save_every > 0
             and output_dir != ""
+            # Do not re-save the step we just resumed from (llm.c: `resuming ==
+            # 0`). It already exists on disk and is identical; rewriting it
+            # raced with peer ranks still reading model_k.bin (truncate-then-
+            # write => "Failed to read enough bytes").
+            and not (start_step > 0 and step == start_step)
             and ((step > 0 and step % save_every == 0) or last_step)
         ):
             var model_path = output_dir + "/model_" + String(step) + ".bin"

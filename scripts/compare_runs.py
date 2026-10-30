@@ -1,6 +1,7 @@
 """Compare two trainer logs (e.g. AdamW vs Muon) as markdown tables.
 
     pixi run python scripts/compare_runs.py A.jsonl B.jsonl [--names adamw muon]
+    pixi run python scripts/compare_runs.py --table RUN1.jsonl RUN2.jsonl ...   # N-run sweep summary
 
 Parsing is delegated to scripts/train_log.py (any LLMM_LOG format). Prints: val
 loss at each eval step, train loss averaged over fixed step windows, mean
@@ -22,7 +23,60 @@ def load(path):
     return steps, vals
 
 
+def table(paths, tail=50, skip=2):
+    """One row per run: val losses, mean train loss over the last `tail` steps, ms/step, status."""
+    rows = []
+    for p in paths:
+        steps, vals = load(p)
+        name = Path(p).stem.removeprefix("muon_")
+        vd = {v["step"]: v["loss"] for v in vals}
+        evals = sorted(vd)
+        last = max((r["step"] for r in steps), default=0)
+        losses = [r["loss"] for r in steps]
+        bad = any(x != x for x in losses) or any(
+            r["loss"] > 8 for r in steps if r["step"] > 50
+        )
+        total = steps[0]["steps"] if steps and "steps" in steps[0] else None
+        status = (
+            "diverged"
+            if bad
+            else ("ok" if total and last >= total else f"partial@{last}")
+        )
+        tl = [r["loss"] for r in steps if r["step"] > last - tail]
+        ms = [r["ms"] for r in steps if r["step"] > skip]
+        rows.append(
+            (
+                name,
+                [vd.get(s) for s in evals],
+                evals,
+                statistics.mean(tl) if tl else None,
+                statistics.mean(ms) if ms else None,
+                status,
+            )
+        )
+    steps_all = sorted({s for r in rows for s in r[2]})
+
+    def f(x, d=4):
+        return "" if x is None else f"{x:.{d}f}"
+
+    print(
+        "| run | "
+        + " | ".join(f"val@{s}" for s in steps_all)
+        + " | train last50 | ms/step | status |"
+    )
+    print("|---|" + "---:|" * (len(steps_all) + 2) + "---|")
+    for name, v, ev, tl, ms, st in rows:
+        d = dict(zip(ev, v))
+        print(
+            f"| {name} | "
+            + " | ".join(f(d.get(s)) for s in steps_all)
+            + f" | {f(tl)} | {f(ms, 1)} | {st} |"
+        )
+
+
 def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--table":
+        return table(sys.argv[2:])
     ap = argparse.ArgumentParser()
     ap.add_argument("a")
     ap.add_argument("b")

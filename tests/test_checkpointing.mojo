@@ -307,14 +307,14 @@ def test_state_checkpoint_shard_size_mismatch_raises() raises:
             expect_process_rank=0,
         )
     except e:
-        raised_long = "different optimizer shard size" in String(e)
+        raised_long = "bytes, expected" in String(e)
     assert_equal(raised_long, True)
 
     var raised_short = False
     try:
         _ = read_state_checkpoint(path, m_out, v_out, n + 1)
     except e:
-        raised_short = "Failed to read enough bytes" in String(e)
+        raised_short = "bytes, expected" in String(e)
     assert_equal(raised_short, True)
 
     var ok = read_state_checkpoint(
@@ -358,6 +358,297 @@ def test_state_checkpoint_compact_v_roundtrip() raises:
     v.unsafe_free()
     m_out.unsafe_free()
     v_out.unsafe_free()
+    _remove(path)
+
+
+def _owner_state(zero_stage: Int, rank: Int, S: Int) -> TrainingState:
+    return TrainingState(
+        step=3,
+        num_processes=2,
+        process_rank=rank,
+        use_master_weights=0,
+        should_shuffle=0,
+        sampler_rng_state=UInt64(1),
+        shuffle_rng_state=UInt64(2),
+        current_shard_idx=0,
+        current_sample_idx=4,
+        optimizer_kind=1,
+        zero_stage=zero_stage,
+        muon_ownership_version=1,
+        muon_shard_elems=S,
+    )
+
+
+def _raises_with(
+    path: String,
+    m_out: MutMemPtr[DType.float32],
+    v_out: MutMemPtr[DType.float32],
+    mu_out: MutMemPtr[DType.float32],
+    n: Int,
+    nv: Int,
+    S: Int,
+    owner: Bool,
+    needle: String,
+) -> Bool:
+    try:
+        if owner:
+            _ = read_state_checkpoint(
+                path,
+                m_out,
+                v_out,
+                n,
+                v_num_parameters=nv,
+                expect_num_processes=2,
+                expect_process_rank=1,
+                muon_m_out=Optional[MutMemPtr[DType.float32]](mu_out),
+                expect_muon_shard_elems=S,
+            )
+        else:
+            _ = read_state_checkpoint(
+                path,
+                m_out,
+                v_out,
+                n,
+                v_num_parameters=nv,
+                expect_num_processes=2,
+                expect_process_rank=1,
+            )
+    except e:
+        return needle in String(e)
+    return False
+
+
+def test_state_checkpoint_sharded_muon_t6() raises:
+    """T6 (S4), file level: owner-local muon_m roundtrips bit-exactly, and a
+    resume across ownership version, S, owner/replicated layout, or a file one
+    element longer or shorter raises. Runs for every ZeRO stage that shares the
+    owner layout (S2/S3 only need to be added to `stages`)."""
+    var stages: List[Int] = [1, 2, 3]
+    for si in range(len(stages)):
+        var path = String("test_ckpt_state_owner.bin")
+        # S7: under sharded Muon m, v are both compact (A_r elements).
+        var n = 5
+        var nv = 5
+        var S = 12
+        var m = heap_alloc[Float32](n)
+        var v = heap_alloc[Float32](nv)
+        var mu = heap_alloc[Float32](S)
+        _fill_pattern(m, n, 0.1)
+        _fill_pattern(v, nv, 0.3)
+        _fill_pattern(mu, S, 0.7)
+        var st = _owner_state(stages[si], 1, S)
+        write_state_checkpoint(
+            path,
+            st,
+            m,
+            v,
+            n,
+            nv,
+            muon_m_memory=Optional[MutMemPtr[DType.float32]](mu),
+        )
+        var m_out = heap_alloc[Float32](n)
+        var v_out = heap_alloc[Float32](nv)
+        var mu_out = heap_alloc[Float32](S)
+        var r = read_state_checkpoint(
+            path,
+            m_out,
+            v_out,
+            n,
+            v_num_parameters=nv,
+            expect_num_processes=2,
+            expect_process_rank=1,
+            muon_m_out=Optional[MutMemPtr[DType.float32]](mu_out),
+            expect_muon_shard_elems=S,
+        )
+        assert_equal(r.muon_ownership_version, 1)
+        assert_equal(r.muon_shard_elems, S)
+        assert_equal(r.zero_stage, stages[si])
+        for i in range(S):
+            assert_almost_equal(
+                mu_out.unsafe_load(i), mu.unsafe_load(i), atol=0.0
+            )
+        for i in range(nv):
+            assert_almost_equal(
+                v_out.unsafe_load(i), v.unsafe_load(i), atol=0.0
+            )
+        # Wrong S, wrong layout expectation (replicated reader on owner file).
+        assert_equal(
+            _raises_with(
+                path, m_out, v_out, mu_out, n, nv, S + 4, True, "shard_elems"
+            ),
+            True,
+        )
+        assert_equal(
+            _raises_with(
+                path, m_out, v_out, mu_out, n, nv, S, False, "replicated layout"
+            ),
+            True,
+        )
+        # Different ownership version in the header.
+        var bad = _owner_state(stages[si], 1, S)
+        bad.muon_ownership_version = 2
+        write_state_checkpoint(
+            path,
+            bad,
+            m,
+            v,
+            n,
+            nv,
+            muon_m_memory=Optional[MutMemPtr[DType.float32]](mu),
+        )
+        assert_equal(
+            _raises_with(
+                path,
+                m_out,
+                v_out,
+                mu_out,
+                n,
+                nv,
+                S,
+                True,
+                "muon_ownership_version=2",
+            ),
+            True,
+        )
+        # A file with no owner payload (ZeRO-0 / W=1 Muon, AdamW) at an owner run.
+        var plain = _owner_state(0, 1, 0)
+        plain.muon_ownership_version = 0
+        write_state_checkpoint(path, plain, m, v, n, nv)
+        assert_equal(
+            _raises_with(
+                path,
+                m_out,
+                v_out,
+                mu_out,
+                n,
+                nv,
+                S,
+                True,
+                "no owner-local Muon momentum",
+            ),
+            True,
+        )
+        # Exact length: one element (4 bytes) longer / shorter, both directions.
+        write_state_checkpoint(
+            path,
+            st,
+            m,
+            v,
+            n,
+            nv,
+            muon_m_memory=Optional[MutMemPtr[DType.float32]](mu),
+        )
+        assert_equal(
+            _raises_with(
+                path,
+                m_out,
+                v_out,
+                mu_out,
+                n,
+                nv + 1,
+                S,
+                True,
+                "bytes, expected",
+            ),
+            True,
+        )
+        assert_equal(
+            _raises_with(
+                path, m_out, v_out, mu_out, n, nv, S + 1, True, "shard_elems"
+            ),
+            True,
+        )
+        write_state_checkpoint(
+            path,
+            st,
+            m,
+            v,
+            n,
+            nv + 1,
+            muon_m_memory=Optional[MutMemPtr[DType.float32]](mu),
+        )  # a longer v blob
+        assert_equal(
+            _raises_with(
+                path, m_out, v_out, mu_out, n, nv, S, True, "bytes, expected"
+            ),
+            True,
+        )
+        # A pre-S7 owner file (flat shard-sized m, 8 elements) at a trimmed
+        # run (m = A_r = 5) must be refused by length, not read as a prefix.
+        var m_old = heap_alloc[Float32](8)
+        _fill_pattern(m_old, 8, 0.1)
+        write_state_checkpoint(
+            path,
+            st,
+            m_old,
+            v,
+            8,
+            nv,
+            muon_m_memory=Optional[MutMemPtr[DType.float32]](mu),
+        )
+        assert_equal(
+            _raises_with(
+                path, m_out, v_out, mu_out, n, nv, S, True, "bytes, expected"
+            ),
+            True,
+        )
+        m_old.unsafe_free()
+        write_state_checkpoint(
+            path,
+            st,
+            m,
+            v,
+            n,
+            nv,
+            muon_m_memory=Optional[MutMemPtr[DType.float32]](mu),
+        )
+        # Truncated by one element.
+        var short = open(path, "r").read_bytes()
+        var f = open(path, "w")
+        f.write_bytes(short[: len(short) - 4])
+        f.close()
+        assert_equal(
+            _raises_with(
+                path,
+                m_out,
+                v_out,
+                mu_out,
+                n,
+                nv + 1,
+                S,
+                True,
+                "bytes, expected",
+            ),
+            True,
+        )
+        m.unsafe_free()
+        v.unsafe_free()
+        mu.unsafe_free()
+        m_out.unsafe_free()
+        v_out.unsafe_free()
+        mu_out.unsafe_free()
+        _remove(path)
+
+
+def test_state_header_plain_files_unchanged() raises:
+    """AdamW / replicated-Muon files carry zeros in slots 41-43 (byte-identical
+    to the pre-S4 layout) and are exactly header + (m + v) * 4 bytes."""
+    var path = String("test_ckpt_state_plain_hdr.bin")
+    var n = 6
+    var m = heap_alloc[Float32](n)
+    var v = heap_alloc[Float32](n)
+    _fill_pattern(m, n, 0.1)
+    _fill_pattern(v, n, 0.3)
+    var st = _owner_state(0, 0, 0)
+    st.muon_ownership_version = 0
+    st.num_processes = 1
+    write_state_checkpoint(path, st, m, v, n)
+    var bytes = open(path, "r").read_bytes()
+    assert_equal(len(bytes), 256 * 4 + 2 * n * 4)
+    for k in range(41 * 4, 44 * 4):
+        assert_equal(Int(bytes[k]), 0)
+    m.unsafe_free()
+    v.unsafe_free()
     _remove(path)
 
 

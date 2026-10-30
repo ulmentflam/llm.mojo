@@ -6,7 +6,7 @@ Muon is on `main` (`2e1913d`) for WORLD_SIZE=1 and ZeRO-0 only:
 when `zero_stage >= 1` or `z3_streaming` (train_gpt2.mojo:`enable_muon`).
 This document designs Muon for ZeRO stages 1, 2 and 3 (streaming included). It
 is written so a coding agent can implement it in slices (section 9) without
-re-deriving anything. Nothing here has been implemented yet.
+re-deriving anything. Slices S0-S5 have since been implemented and verified (see Status and section 9); the S7 flat m/master trim has landed too (rebalancing by traffic remains proposed).
 
 All line references are to `fu/zdesign` at `2e1913d`. File:function citations
 come from reading the code. Facts I could not confirm by reading or running are
@@ -14,8 +14,17 @@ marked **UNVERIFIED**.
 
 ## Status
 
-- **DESIGN ONLY.** No code changed.
-- **Run on this box (fp32 CPU build, `make build WORLD_SIZE=2`, binary mtime
+- **IMPLEMENTED (2026-10-30), merged to `main` at `3482c54`.** This document
+  began as design only; the intro paragraph above ("Nothing here has been
+  implemented yet") and the bullets below dated to that point describe the
+  state at `2e1913d`. Slices S0 to S5 (S5 including the ZeRO-2/3 lift in
+  `fu/qklift`) landed, each with a status and an independent verification note
+  in section 9. Verified on the threaded CPU multi-rank harness only; GPU at
+  WORLD_SIZE > 1 is compile-checked, and S6 (2-GPU verification) and S7 (state
+  trim; its section 9 bullet is being edited separately) are open. Summary and
+  lessons: section 8 of
+  [`muon_muonclip_implementation_2026-10-29.md`](muon_muonclip_implementation_2026-10-29.md).
+- **Run on this box, at `2e1913d` before any slice (fp32 CPU build, `make build WORLD_SIZE=2`, binary mtime
   checked after the build):**
   - `make train-cpu WORLD_SIZE=2 ARGS="-e d6 -i <tinyshakespeare> -b 1 -t 64 -x 3 -z {0,3} -pn 2 -v 0 -s 0"`
     and `-x 2 -z {1,2}` all run, at about 0.25 to 0.4 s/step. Steps 1 and 2
@@ -24,8 +33,8 @@ marked **UNVERIFIED**.
     including ZeRO-3 streaming (a coordinator is present, so
     `_z3_want_streaming` is true), works here end to end. It is the
     integration gate for every slice.
-  - `-z 1 -opt muon` at WORLD_SIZE=2 fails on both ranks with the phase-1
-    error, as expected.
+  - `-z 1 -opt muon` at WORLD_SIZE=2 failed on both ranks with the phase-1
+    error, as expected (no longer true: it runs).
 - **Cannot run here:** any GPU collective at N >= 2. `ensure_comm_setup` needs
   a coordinator and builds `DeviceContext(device_id=i)` for every rank
   (llmm/zero.mojo:`ensure_comm_setup`), and this box has one GPU. See section 8.
@@ -1304,6 +1313,130 @@ non-streaming).
   fu/zs0's `num_processes`/`process_rank` check is already on main, keep it
   and add only the remaining refusals.
 - Gate: T6.
+- **Status (fu/zs4): implemented.** Layout of a sharded-Muon rank file:
+  header (slots 2 W, 3 rank, 40 kind=1, **41 zero_stage, 42
+  muon_ownership_version=1, 43 S**) + `m` (opt, fp32) + `v` (A_r, compact) +
+  `muon_m` (S, fp32). Length `256*4 + (opt + A_r + S)*4`. AdamW and W=1 /
+  ZeRO-0 Muon files write zeros in 41-43 and are byte-identical to before.
+  **Master policy: `muon_master` is not saved** (as `master_buf` is not); on
+  resume `muon_p_shard` is re-seeded from the loaded full params and
+  `muon_master` is rebuilt from it, so bf16 resume is not bit-exact and fp32 is.
+  `read_state_checkpoint` takes `muon_m_out` + `expect_muon_shard_elems`,
+  refuses owner/replicated layout mismatch (so ZeRO-0 file at ZeRO>=1 and the
+  reverse), ownership version or S mismatch, and checks the file length exactly
+  (header + m + v [+ muon_m]) in both directions with actual vs expected bytes;
+  this replaced the "Failed to read enough bytes" and trailing-byte messages.
+  `load_checkpoint` keeps the legacy full-v copy-down at ZeRO-0 only. The stage
+  recorded in slot 41 is informational; ZeRO-1/2/3 share the layout.
+  Verified: unit T6 `test_state_checkpoint_sharded_muon_t6` (stage list
+  `[1, 2, 3]`; S2/S3 need no change here), and end to end at threaded CPU W=2
+  `-z 1`: `-x 2` then `-y 1 -x 4` gives losses 10.648577, 10.410458 for steps
+  3-4, equal to a continuous `-x 4` run, and the step-4 model and both state
+  files are byte-identical (`cmp`). Refused: `-z 0` resume of the `-z 1` files,
+  W=1 resume of W=2 files, a file 4 bytes short (both byte counts printed).
+- **Verification (fu/zs4, Opus reviewer, 2026-10-30).** Rebuilt and reran
+  everything below on fu/zs4 (2105d06 + comment fixes); binary mtimes checked
+  after each `make -B`.
+  - Gates: `make lint` exit 0; `make test-mojo` exit 0, `tests result=pass
+    files=26 passed=211 skipped=1 failed=0` (test_checkpointing 14/14; T6 =
+    `test_state_checkpoint_sharded_muon_t6`, plus
+    `test_state_header_plain_files_unchanged`, each also run alone with
+    `--only`); `make verify` exit 0, `result gate=cpu status=pass`,
+    `result gate=gpu status=pass`; `make -B build-bf16` exit 0.
+  - Byte identity vs main: trainers built from 20c4769 sources (`git archive`,
+    same toolchain) and from fu/zs4, CPU d6 `-x 2 -n 2`. `cmp` of
+    `model_2.bin` and `state_2_0.bin`: identical for AdamW W=1, Muon W=1 and
+    AdamW W=2 `-z 1` (both rank files). Slots 41-43 are 0 in all of them.
+  - Sharded layout: W=2 `-z 1` rank files have slots (2,3,40,41,42,43) =
+    (2,r,1,1,1,5308416) and sizes 142664704 / 100197376 bytes; rank 1 is
+    `1024 + (15178752 + 4561920 + 5308416)*4` exactly.
+  - Save/resume, threaded CPU W=2 `-z 1` Muon: `-x 2` then `-y 1 -x 4` gives
+    steps 3-4 = 10.648577, 10.410458, exit 0; continuous `-x 4` prints the same
+    and `model_4.bin`, `state_4_0.bin`, `state_4_1.bin` are `cmp`-identical.
+    AdamW W=2 `-z 1`: resumed steps 3-4 = 10.128281, 9.916376, identical files.
+    W=1 Muon: 10.794926, 10.554329, files identical to continuous. A legacy
+    full-v file (2e1913d sources, 242861056 bytes, i.e. `1024 + 2*opt*4`)
+    resumes with the same two losses and a `model_4.bin` identical to the
+    continuous run. Note: `-y 1` re-saves the resume step at loop start, so the
+    step-N files in a resumed dir are rewritten (in the current layout).
+  - Refusals (make exit 2; direct binary exit 1): `-z 0` resume of `-z 1`
+    files ("holds owner-local Muon momentum ... expects the replicated
+    layout"); W=1 resume of W=2 files ("written by rank 0 of 2 process(es) but
+    this run is rank 0 of 1"); rank 1 file 4 bytes short ("is 100197372 bytes,
+    expected 100197376 (m=15178752, v=4561920, muon_m=5308416 elements)").
+    Reverse direction: a W=2 `-z 0` Muon file at `-z 1` ("has no owner-local
+    Muon momentum"), and a W=2 `-z 0` AdamW file at `-z 1` ("is 242861056
+    bytes, expected 121431040"), which is the AdamW behaviour change.
+  - Mutant: one `muon_m` element of rank 0's step-2 file set from 4.6e-7 to
+    1.0. The resumed run exits 0; steps 3-4 print the same losses (step 3's
+    loss is computed before the step-3 update, and one warmup-lr step moves
+    the loss below print precision) but `model_4.bin` differs from continuous
+    in 19,861,728 of 30,357,504 params (max |diff| 1.8e-3, largest in layer 0's
+    qkv), and the step-4 `muon_m[0]` is 0.9029 vs -1.29e-5. The blob is read
+    and used.
+  - bf16 (W=1, GPU, gpt2_124M_bf16): Muon `-x 4 -n 2` then `-y 1 -x 6` exit 0,
+    steps 5-6 = 3.756170, 3.979250, `done steps=6`; AdamW the same, 3.673406,
+    3.937004. The sharded bf16 path (`_load_muon_owner_state`'s master rebuild)
+    needs W > 1 on GPU and is not run here.
+  - Code order in `load_checkpoint`: model file read and copied to device
+    first (unchanged from main), then the optimizer_kind peek, then
+    `read_state_checkpoint`: world/rank, owner layout, version/S, exact length,
+    and only then the m, v, muon_m blobs. No state payload is read before a
+    refusal; params are already overwritten when a refusal raises, which only
+    matters to in-process callers that catch the error (train() exits).
+  - Master policy confirmed: `_load_muon_owner_state` re-seeds `muon_p_shard`
+    from the loaded host vector `host_params` (not `params_memory`), runs after
+    `enable_muon` (train() calls it before `load_checkpoint`), and rebuilds
+    `muon_master` from the same vector under bf16 (padding zeroed).
+  - Fixes in this pass: two stale comments (the legacy copy-down pointed at a
+    size check that moved into `read_state_checkpoint`; the trailing-byte
+    read is now a backstop behind the exact length check). No behaviour
+    change.
+  - Integration with S2/S3 (not on this branch): S2 needs no checkpoint
+    change. S3 makes the owner space authoritative at ZeRO-3 and drops the
+    post-update propagation, so the flat shard's Muon ranges go stale.
+    `write_checkpoint` under streaming still gets correct full params because
+    S3's `_z3_gather_full` gathers the matrices from `muon_p` (second gather).
+    `load_checkpoint` under streaming copies only the flat shard into
+    `params_memory`, but must keep passing the full host vector `host_params`
+    to `_load_muon_owner_state`; never `params_memory`. The merge must also
+    keep S3's `enable_muon` seeding (W rounds under streaming) before the
+    load, and the T6 stage list stays `[1, 2, 3]`. End to end, the merge must
+    add threaded CPU W=2 `-z 2` and `-z 3` Muon save/resume runs (`-x 2`, then
+    `-y 1 -x 4`, vs continuous `-x 4`, `cmp` model and both state files), and
+    a cross-stage resume (`-z 1` files at `-z 3`), which the layout allows.
+- **Integration (fu/zs4int, S4 onto main 537a850 with S2+S3, 2026-10-30).**
+  Merge resolutions: `enable_muon` = S3's (W-round seeding, `ensure_comm_setup`
+  before the seed, no raise); `write_checkpoint`/`load_checkpoint` = S4's logic
+  (streaming `write_checkpoint` goes through S3's split `_z3_gather_full`;
+  `_load_muon_owner_state(host_params, host_mu)` gets the full host vector
+  after seeding); train() refusal block stays removed; `_update_sharded_muon`
+  = S3+S5; `llmm/checkpointing.mojo` and `tests/test_checkpointing.mojo` = S4;
+  `tests/test_zero_muon.mojo` = main. Git merged without textual conflicts.
+  Gates on the merged tree: `make test-mojo` `tests result=pass files=26
+  passed=219 skipped=1 failed=0` (test_checkpointing 14/14, test_zero_muon
+  13/13); `make verify` cpu+gpu pass; `make lint` exit 0; `make build-bf16`
+  exit 0. Threaded CPU W=2 d6 Muon `-x 2 -n 2` then `-y 1 -x 4` vs continuous
+  `-x 4`: `-z 1`, `-z 2` and `-z 3` give step 3 = 10.648577 in resumed and
+  continuous runs; step 4 prints 10.410458 resumed vs 10.410459 continuous at
+  `-z 2`/`-z 3` (1e-6 print-level difference in the logged loss; `-z 1` is
+  10.410458 in both) and `cmp` of model_4.bin, state_4_0.bin, state_4_1.bin is identical
+  in all three. Cross-stage: `-z 1` step-2 files resumed at `-z 3` load and
+  give 10.648577, 10.410458, the same as the `-z 1` continuous run. Regression:
+  AdamW W=2 `-z 2` resume bit-exact (cmp), W=1 Muon resume bit-exact (cmp),
+  W=1 GPU Muon 5 steps 4.287241, 3.985745, 4.111457, 3.619328, 3.700196.
+  Observed flake (pre-existing, not S4): a resume with `-n k` dividing the
+  resume step rewrites that step's `model_k.bin` while the other rank may
+  still be reading it; one run under heavy parallel load failed rank 1 with
+  "Failed to read enough bytes" and passed on rerun.
+  **Fixed on main in d67386a (resume race):** the save condition now skips
+  `step == start_step` after a resume (llm.c's `resuming` flag), and an
+  `allreduce_scalar(0.0)` barrier after every rank's `load_checkpoint` keeps
+  any rank from writing before all ranks finished reading. Verified on
+  fu/zs7 (merged main 55d4c1c): W=2 `-z 1`/`-z 3` resumed dirs keep the
+  step-2 files `cmp`-identical with unchanged mtimes; resuming at the last
+  step (`-y 1 -x 4` with step-4 files present) trains nothing, writes
+  nothing and exits 0.
 
 **S5: QK-clip multi-rank** (`allreduce_max_host`; the clip inside
 `_update_sharded_muon`; `enable_qk_clip` scope).
@@ -1314,7 +1447,7 @@ non-streaming).
   per-rank head maxima (different per rank) vs ZeRO-0 + global max: params
   bit-equal.
 - If S5 slips, keep the raise and document it.
-- **Status (fu/zs5, ZeRO-0/1 implemented; ZeRO-2/3 deferred):**
+- **Status (fu/zs5, ZeRO-0/1 implemented; ZeRO-2/3 done in fu/qklift, below):**
   - `ZeroContext.allreduce_max_host` (llmm/zero.mojo) is a host-side copy of
     `allreduce_or_host` with `max`; one code path for every target (the
     coordinator's shared-inputs registry or, without a coordinator, a copy).
@@ -1386,6 +1519,72 @@ non-streaming).
     W=1 Muon losses 4.287241 / 3.985745 / 4.111457 / 3.619319 / 3.700221, W=2
     CPU ZeRO-1 Muon 10.865850 / 10.716245 / 10.648577, W=2 CPU `-qk_clip 5`
     raises "QK-clip needs a GPU target" on both ranks).
+  - **Status (fu/qklift, ZeRO-2/3 lifted):** `enable_qk_clip` no longer
+    raises for ZeRO-2 or ZeRO-3/streaming (AdamW + ZeRO >= 1 and the
+    CPU-target-without-planted-maxima raise stay). `_qk_clip_sharded`'s qkv-bias
+    write is layout-aware: under `z3_streaming` it indexes the resident flat
+    shard with `sg.shard_rel + (a - sg.flat_start)`; ZeRO-1/2 keep the
+    full-buffer offset `a`; the master offset was already shard-relative. The
+    clip block already ran after the post-update synchronize and before the
+    ZeRO-3 early return, so the owner-space Q/K clip lands before the next
+    forward's gather. Tests: `test_qk_clip_multirank_zero{2,3}_w{2,4}`
+    (MV=192 shard boundary inside the bias) compare every rank's params (ZeRO-3:
+    `_z3_gather_full`) bit-exactly against an unclipped step AT THE SAME STAGE
+    + `qk_clip_apply` with the global maxima (the stage-0 reference differs by
+    1 ulp in unrelated rows because reduce-scatter and allreduce sum in a
+    different order), assert the exact changed-element count, and at ZeRO-3
+    also check the owner-space copies. Mutant (full-buffer bias offset under
+    streaming) fails `test_qk_clip_multirank_zero3_w2` with the gathered-params
+    bit-exact assertion ("multi-rank QK-clip != reference ... stage 3").
+  - **Verification (fu/qklift, Opus reviewer, 2026-10-30):** independent
+    read of `git diff 537a850..b44fa52` plus reruns; no defects found.
+    - Bias write: `p_off` is shard-relative only under `z3_streaming`, the
+      same indexing `adamw_update` uses for `params_memory` in
+      `_update_sharded_muon`; ZeRO-1/2 and non-streaming ZeRO-3 keep `a`;
+      the master offset is unchanged. Each segment `[a, b)` is clamped to
+      this rank's flat shard, so a bias range that straddles a shard boundary
+      is split, and each rank clips only its own part with the same global
+      maxima (`a - b_lo` gives the kernel the bias-relative row). Note: the
+      `(a - sg.flat_start)` term is always 0 in the current layout (the AdamW
+      range holding the bias starts exactly at `b_lo`, so `a` is either
+      `b_lo` or the shard start, and either one equals `flat_start`). It is
+      correct as written, but no test can tell it apart from `+ 0`.
+    - Ordering: the clip block still runs after the post-update
+      `synchronize` and before the ZeRO-3 early return. `_qk_sync_head_max`
+      runs once per step on every rank, because the `qk_clip_tau > 0` gate is
+      rank-invariant. The later `qk_max()` hits the `qk_head_max_global` latch
+      and makes no second collective, and `qk_clip_step()` returns on
+      `qk_clip_applied`.
+    - Remaining raises: AdamW + ZeRO >= 1 is unchanged (read).
+      `planted_head_max_only` is reachable only from tests: the one trainer
+      call site, `enable_qk_clip(args.qk_clip_tau)`, uses the default. The CPU
+      raise was confirmed by running `make train-cpu WORLD_SIZE=2 ARGS="... -opt muon
+      -z 3 -qk_clip 5"`. Both ranks printed "QK-clip needs a GPU target (no CPU
+      logit-max hook)" and the run exited 2.
+    - Tests: the changed-element count `2*2*hd*(C+1)` is asserted on the
+      reference (Q/K weight rows plus their bias entries), and every rank
+      bit-equals the reference, so the count carries over. The ZeRO-3
+      owner-space check counts `2*2*hd*C` (matrices only; the bias is not in
+      owner space) and requires each Muon element to be owned exactly once.
+      A same-stage reference is required. With the reference forced to stage
+      0, `zero2_w2` and `zero3_w2` fail at idx 1240 (wte) by 1 ulp
+      (-0.15410821 vs -0.1541082), so the author's ulp claim holds.
+    - Mutants on `test_qk_clip_multirank_zero3_w2`, built from scratch
+      copies: (1) the author's full-buffer offset `p_off = a` under streaming,
+      and (2) the bias clip skipped on every rank except 0. Both FAIL with
+      "multi-rank QK-clip != reference at W=2 stage 3 rank 0 idx 4976"
+      (layer-1 Q bias of hot head (1,0), in rank 1's shard).
+    - Gates: `make test-mojo` -> `tests result=pass files=26 files_skipped=0
+      files_failed=0 passed=221 skipped=1 failed=0` (test_qk_clip 12/12);
+      `make verify` -> `result gate=cpu status=pass`, `result gate=gpu
+      status=pass` (exit 0); `make lint` passes; `make -B build-bf16` builds.
+      `make -B build-train` plus `LLMM_LOG_LEVEL=verbose make train
+      ARGS="-opt muon -qk_clip 5 -x 5 -v 0 -s 0"` gives qk_max 110.63404 /
+      6.2860556 / 5.8567953 / 5.619182 / 5.2094717. `make -B build-train
+      WORLD_SIZE=2` (mtime checked) plus `make train-cpu WORLD_SIZE=2` (d6,
+      -b 1 -t 64 -x 3 -pn 2) with `-opt muon -z 2` and `-z 3` give 10.865850 /
+      10.716245 / 10.648577 for each, exit 0.
+
 
 **S6: GPU multi-rank verification** (configs `zero/muon_z*_w2.json`, the
 runbook in section 8). No new code paths are expected: S1 to S3 are
@@ -1398,6 +1597,94 @@ not bitwise (section 4).
 
 **S7 (follow-up, not this phase)**:
 
+- **Status (fu/zs7, 2026-10-30): flat `m`/`master` trim DONE; rebalancing
+  measured and proposed only, not implemented.** Under sharded Muon
+  (W>1, ZeRO>=1) `enable_muon` (`_trim_flat_m_master`) replaces the
+  shard-sized `m` and bf16 `master` with `A_r`-element buffers in the
+  `compact_off` layout of the compact `v`. AdamW reads/writes `m`/`master` at
+  `AdamSeg.compact_off` and the S5 qkv-bias QK-clip writes `master` at
+  `compact_off + (a - flat_start)`. The state file's `m` blob is `A_r`
+  elements (`_m_count()`; header unchanged; `muon_ownership_version` stays 1
+  because the ownership rule did not change). A pre-trim sharded file is
+  refused by the exact-length check (message names the trim); W=1, ZeRO-0 and
+  AdamW buffers/files are untouched (byte-identical to a 3482c54 build).
+  Memory at W=2 `-z 1` d6 Muon (fp32, `LLMM_MEM_REPORT=1`): rank 1 `m_buf`
+  60,715,008 -> 18,247,680 B and `optimizer` class 142,663,688 -> 100,196,360
+  B; rank 0 is unchanged (60,715,008 / 185,131,016) because its whole shard is
+  AdamW (`A_0 = opt`: wte/wpe sit in rank 0), so the per-job peak is rank 0's
+  and only improves when `A_r < opt` there (W>=4 at 124M: A_0 = 31.12M of
+  31.12M still, so rank 0 does not shrink either; ranks 1+ do).
+  **Rebalancing finding:** the imbalance is the flat layout's `A_r`, not the
+  owner rule (O_r is already even: 21.23M per rank at W=4, 10.62M at W=8).
+  124M `A_r + O_r` (M elements): W=4 52.35/29.58/21.26/21.28 and W=8
+  26.18/26.18/18.94/10.64/10.64/10.62/10.65/10.63, max/mean 1.68 in both.
+  Proposal: owner = greedy longest-processing-time assignment of the 6L
+  matrices (largest first) to the rank with the smallest running `A_r + O_r`,
+  seeded with `A_r`; offline model gives W=4 31.12/30.76/31.29/31.31 (max/mean
+  1.006) and W=8 max/mean 1.024. It needs a new rule, so bump
+  `MUON_OWNERSHIP_VERSION` to 2 and refuse version-1 files, and update the
+  `exp_o`/`exp_a` tables in test_zero_muon. Muon updates are per-matrix, so
+  bit-exactness should hold, but it must be re-proven with T2 before landing.
+- **Verification (fu/zs7, Opus reviewer, 2026-10-30).** Merged main 55d4c1c
+  (resume fix d67386a) into fu/zs7 with no conflicts; all gates on the merged
+  tree.
+  - Reading: `_trim_flat_m_master` runs only from `enable_muon` under
+    `sharded` (W>1, ZeRO>=1); device-to-host copies are fenced by
+    `ctx.synchronize()` before the host reads, each AdamW segment moves
+    `shard_rel -> compact_off`, and reassigning `m_buf`/`master_buf` drops the
+    shard-sized buffers. Every sharded-path consumer of `m`/`master` now uses
+    `compact_off` (`_update_sharded_muon` AdamW segments, the QK-clip bias
+    master write, the bf16 master reseed in `load_checkpoint`, the state-file
+    `m` blob via `_m_count()`); the remaining `shard_rel` uses index params
+    (ZeRO-3 streaming), `grad_shard_memory`, or the host source of a compact
+    copy. The in-place host compactions are safe because the segments are
+    ascending and disjoint, so `compact_off <= shard_rel`. W=1, ZeRO-0 and
+    AdamW never call the trim. One hardening fix: `enable_muon` now raises on
+    a second call, because the trim would read the trimmed buffers as
+    shard-sized. No caller does that today.
+  - Equal-length pre-trim files: a pre-trim file has the same length as a
+    post-trim one exactly when `A_r == opt`. Then the rank's whole shard
+    `[lo, lo+opt)` lies inside AdamW ranges. The AdamW ranges are separated by
+    Muon tensors of nonzero size, and `A_r == opt` also rules out the last
+    rank's padding. So there is a single segment with
+    `shard_rel = compact_off = 0`, the two layouts are the identity, and the
+    pre-trim `m` blob holds the same bytes. Accepting such a file is
+    therefore correct and `muon_ownership_version` stays 1. Measured at W=2
+    `-z 1` d6, where rank 0 has `A_0 = opt`: the pre-trim (3482c54 build)
+    `state_2_0.bin` is `cmp`-identical to the post-trim one. Every rank with
+    `A_r < opt` is refused by length. Resuming the pre-trim directory gives
+    rank 1 "... is 100197376 bytes, expected 57730048 (m=4561920, v=4561920,
+    muon_m=5308416 elements) ... before the flat m/master trim ..." (direct
+    binary rc=1).
+  - Gates (this tree): `make test-mojo` -> `tests result=pass files=26
+    files_skipped=0 files_failed=0 passed=223 skipped=1 failed=0`
+    (test_zero_muon 13/13, test_checkpointing 14/14, test_qk_clip 12/12);
+    `make verify` -> `result gate=cpu status=pass`, `result gate=gpu
+    status=pass`; `make lint` exit 0; `make -B build-bf16` exit 0, plus a
+    `-D WORLD_SIZE=2 -D LLMM_BF16=1` compile (the trim's master branch).
+  - Runs. These use `make -B build-train WORLD_SIZE=2` and `WORLD_SIZE=1`
+    binaries, mtime-checked and built before the guard commit, which only
+    adds a raise. All are CPU d6 `-b 1 -t 64`. W=2 Muon `-z 1/2/3 -x 3`:
+    10.865850, 10.716245, 10.648577 each, rc=0. For W=2 `-z 1` and `-z 3`,
+    `-x 2 -n 2` then `-y 1 -x 4` gives steps 3-4 = 10.648577 and
+    10.410458 (`-z 1`) or 10.410459 (`-z 3`), the same as continuous `-x 4`.
+    `model_4`, `state_4_0` and `state_4_1` are `cmp`-identical, and the step-2
+    files are unchanged by the resume. Rank-file sizes are 142664704 (rank 0)
+    and 57730048 (rank 1, `1024 + (2*4561920 + 5308416)*4`). W=1 (`-pn 1`)
+    Muon and AdamW `model_2.bin`/`state_2_0.bin` are `cmp`-identical to a
+    main-55d4c1c build's. W=2 ZeRO-0 Muon and AdamW (`-pn 2`, all three files)
+    are identical too. W=1 Muon resume gives 10.794926, 10.554329 and is
+    bit-exact against continuous. `LLMM_MEM_REPORT=1` at W=2 `-z 1`:
+    main has rank 0 `m_buf` 60,715,008 and rank 1 60,715,008, optimizer
+    185,131,016 / 142,663,688. fu/zs7 has rank 0 60,715,008
+    (`A_0 = opt`, unchanged) and rank 1 18,247,680, optimizer
+    185,131,016 / 100,196,360.
+  - Note: `-pn` sets the CPU world size at run time, independent of the
+    binary's `WORLD_SIZE`. A "W=1" CPU run needs `-pn 1`.
+  - Pre-existing and left alone: a rank with `A_r = 0` (tiny configs, e.g.
+    L=1 C=16 W=8) asks for 0-element host buffers for `m` and `v` in the
+    state-file paths. `v` already did this before S7.
+  - Verdict: merge.
 - Trim flat `m`/`master` (and `v` with fu/vfree) to `_adamw_shard_segments`.
 - Optional memory-aware ownership. Bump the ownership version. Weigh each
   rank's `A_r + O_r` (traffic and state), not NS cost alone. Under
@@ -1448,3 +1735,5 @@ The independent review (generations 1 and 2) was done with AI assistance
 (Claude Code, Opus agents), directed by Evan Owen.
 The S1 implementation (Sonnet agent) and its verification (Opus agent) were
 done with AI assistance (Claude Code), directed by Evan Owen.
+The S7 verification (fu/zs7) was done with AI assistance (Claude Code, Opus
+agent), directed by Evan Owen.
