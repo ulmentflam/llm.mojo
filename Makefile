@@ -167,7 +167,7 @@ $(PIXI_STAMP):
 
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        verify-untied-cpu verify-untied-gpu check-untied-idle \
+        verify-untied-cpu verify-untied-gpu check-untied-idle check-untied-head \
         typecheck check compile-rest clean figures figure-precision build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
@@ -1529,6 +1529,13 @@ check-untied-idle: | $(PIXI_STAMP)
 	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_tiedchk
 	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_untiedchk MOJO_DEFINES="-D LLMM_UNTIED_HEAD=1"
 	$(PIXI) run python scripts/check_untied_idle.py build/train_gpt2_tiedchk build/train_gpt2_untiedchk
+
+# Slice S2 gate: the untied head trains (differs from wte, nonzero m/v) and
+# stays equal to wte with m/v == 0 while idle, from a .bin with weight decay.
+check-untied-head: | $(PIXI_STAMP)
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_tiedchk
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_untiedchk MOJO_DEFINES="-D LLMM_UNTIED_HEAD=1"
+	$(PIXI) run python scripts/check_untied_head.py build/train_gpt2_tiedchk build/train_gpt2_untiedchk
 
 verify-cpu: | $(PIXI_STAMP)
 	$(PIXI) run mojo test_gpt2.mojo cpu

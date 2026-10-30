@@ -31,7 +31,7 @@ STEPS = 3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def run(binary, out):
+def run(binary, out, idle=False):
     os.makedirs(out, exist_ok=True)
     log = os.path.join(out, "log.jsonl")
     if os.path.exists(log):
@@ -50,6 +50,11 @@ def run(binary, out):
         LLMM_LOG_LEVEL="verbose",
         LLMM_LOG_FILE=log,
     )
+    if idle:
+        # The untied build trains its head by default (slice S2); this hook
+        # keeps it tied to wte and idle, the S0 contract this gate checks.
+        env["LLMM_UNTIED_IDLE_HEAD"] = "1"
+
     args = [
         binary,
         "-e",
@@ -99,7 +104,7 @@ def main():
     tied, untied = sys.argv[1], sys.argv[2]
     work = sys.argv[3] if len(sys.argv) > 3 else os.path.join(ROOT, "build/untied_idle")
     st = run(tied, os.path.join(work, "tied"))
-    su = run(untied, os.path.join(work, "untied"))
+    su = run(untied, os.path.join(work, "untied"), idle=True)
     ok = True
     print("tied   steps:", st)
     print("untied steps:", su)

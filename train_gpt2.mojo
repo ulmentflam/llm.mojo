@@ -1449,6 +1449,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # tensor exists, is loaded, saved and sharded, but is idle (no forward, no
     # gradient, no optimizer update). See `_head_t`.
     var head_tied: Bool
+    # -l_head: lr multiplier of the untied head's AdamW range; < 0 = same as
+    # `adam_lr_mult` (the other AdamW ranges).
+    var head_lr_mult: Float32
     # The model .bin being loaded carries its own head block (version 13/15).
     var file_untied: Bool
     var enc_num_rows: Int
@@ -1598,7 +1601,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.enc_bitmap_union = NULL_UINT32_PTR
         self.enc_row_of_token = NULL_INT32_PTR
         self.enc_row_sparse = False
-        self.head_tied = True
+        # Untied build: the head trains from construction (S2). The tie phase
+        # (-untie_at, S4) and the idle-head test hook set this True again.
+        self.head_tied = not UNTIED_HEAD
+        self.head_lr_mult = Float32(-1.0)
         self.file_untied = False
         self.enc_num_rows = 0
         self.enc_run_first = List[Int]()
@@ -1988,7 +1994,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.params.ln_f_gamma = wbase.unsafe_offset(dst_offsets[b + 1])
         self.params.ln_f_beta = wbase.unsafe_offset(dst_offsets[b + 2])
 
-    def _lm_head_wte_tile(
+    def _lm_head_tile(
         mut self, tile_start: Int, tile_rows: Int
     ) raises -> MutMemPtr[GPT2_DTYPE]:
         """Address of vocab rows `[tile_start, tile_start+tile_rows)` of `wte`
@@ -2004,7 +2010,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var c = self.config.channels
                 var dst_offsets: List[Int] = [0]
                 var flat_starts: List[Int] = [
-                    self._z3_param_offset(Parameters.wte) + tile_start * c
+                    self._z3_param_offset(self._head_t()) + tile_start * c
                 ]
                 var lengths: List[Int] = [tile_rows * c]
                 var tbase = rebind_mut_mem[GPT2_DTYPE](
@@ -2021,7 +2027,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     lengths,
                 )
                 return tbase
-        return self.params.wte.unsafe_offset(tile_start * self.config.channels)
+        return self._head_param_ptr().unsafe_offset(
+            tile_start * self.config.channels
+        )
 
     def _z3_stream_layer(mut self, layer: Int) raises:
         """Gather transformer `layer`'s 12 tensors into `param_window_buf` and
@@ -3577,6 +3585,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             or self.v_memory == NULL_MASTER_PTR
         ):
             raise Error("GPT2 error: Optimizer moments not allocated")
+        comptime if UNTIED_HEAD and Self.WORLD_SIZE > 1:
+            # Slice S2 routes the head's forward/gradient/update for the
+            # unsharded layouts only. At ZeRO-2/3 the gradient bucketing and the
+            # ZeRO-3 window/streaming pointers are not yet head-aware (S6), so a
+            # trained head would silently read or reduce garbage. The idle head
+            # (tied phase) is unaffected.
+            if not self.head_tied and self.zero_ctx.zero_stage >= 2:
+                raise Error(
+                    "GPT2 error: the untied LM head supports ZeRO stages 0 and"
+                    " 1 only for now (ZeRO-2/3 head bucketing and streaming"
+                    " land in a later slice); use -z 0/1 or the tied build"
+                )
 
         var vocab_size = self.config.vocab_size
         var vocab_size_padded = self.config.padded_vocab_size
@@ -4189,7 +4209,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var first = True
             while t0 < vocab_size_padded:
                 var oc = min(lm_tile_rows, vocab_size_padded - t0)
-                var w_tile = self._lm_head_wte_tile(t0, oc)
+                var w_tile = self._lm_head_tile(t0, oc)
                 matmul_lm_head_fwd_tile[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](self.acts.logits),
                     oc,  # packed: the tile IS the buffer
@@ -4229,7 +4249,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_mut_kernel[GPT2_DTYPE](self.acts.logits),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
-                as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
+                as_immut_kernel_from_mut[GPT2_DTYPE](self._head_param_ptr()),
                 as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
                 Int64(batch_size),
                 Int64(seq_len),
@@ -4241,7 +4261,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var t0 = 0
             while t0 < vocab_size_padded:
                 var oc = min(lm_tile_rows, vocab_size_padded - t0)
-                var w_tile = self._lm_head_wte_tile(t0, oc)
+                var w_tile = self._lm_head_tile(t0, oc)
                 matmul_lm_head_fwd_tile[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](
                         self.acts.logits.unsafe_offset(t0)
@@ -4624,12 +4644,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             while t0 < vocab_size_padded:
                 var oc = min(lm_tile_rows, vocab_size_padded - t0)
                 if bucketing:
-                    self.grads.wte = pool  # pool[0 : oc*C], recycled per tile
+                    self._set_head_grad_ptr(pool)  # pool[0 : oc*C], recycled per tile
                     self._zero_grad_pool(oc * channels)
                 var dw = pool if bucketing else (
-                    self.grads.wte.unsafe_offset(t0 * channels)
+                    self._head_grad_ptr().unsafe_offset(t0 * channels)
                 )
-                var w_tile = self._lm_head_wte_tile(t0, oc)
+                var w_tile = self._lm_head_tile(t0, oc)
 
                 # Recompute this tile's logits into the packed scratch. The
                 # inputs (`ln_f`, `wte`) have not changed since forward, so this
@@ -4678,7 +4698,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
                 if bucketing:
                     var d = List[Int]()
-                    d.append(flat_base[Parameters.wte] + t0 * channels)
+                    d.append(flat_base[self._head_t()] + t0 * channels)
                     var po = List[Int]()
                     po.append(0)
                     var ln = List[Int]()
@@ -4688,17 +4708,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 t0 += lm_tile_rows
         elif self._lm_head_num_tiles() == 1:
             if bucketing:
-                self.grads.wte = pool  # pool[0 : wte_size]
+                self._set_head_grad_ptr(pool)  # pool[0 : wte_size]
                 self._zero_grad_pool(wte_size)
 
             # LM head matmul backward (wte has no bias).
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
                 as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
-                as_mut_kernel[GPT2_DTYPE](self.grads.wte),
+                as_mut_kernel[GPT2_DTYPE](self._head_grad_ptr()),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](self.acts.logits),
                 as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
-                as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
+                as_immut_kernel_from_mut[GPT2_DTYPE](self._head_param_ptr()),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](self.grad_acts.logits),
                 Int64(batch_size),
@@ -4710,7 +4730,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
             if bucketing:
                 var d = List[Int]()
-                d.append(flat_base[Parameters.wte])
+                d.append(flat_base[self._head_t()])
                 var po = List[Int]()
                 po.append(0)
                 var ln = List[Int]()
@@ -4730,12 +4750,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             while t0 < vocab_size_padded:
                 var oc = min(lm_tile_rows, vocab_size_padded - t0)
                 if bucketing:
-                    self.grads.wte = pool  # pool[0 : oc*C], recycled per tile
+                    self._set_head_grad_ptr(pool)  # pool[0 : oc*C], recycled per tile
                     self._zero_grad_pool(oc * channels)
                 var dw = pool if bucketing else (
-                    self.grads.wte.unsafe_offset(t0 * channels)
+                    self._head_grad_ptr().unsafe_offset(t0 * channels)
                 )
-                var w_tile = self._lm_head_wte_tile(t0, oc)
+                var w_tile = self._lm_head_tile(t0, oc)
                 matmul_lm_head_bwd_tile[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
                     as_mut_kernel[GPT2_DTYPE](dw),
@@ -4754,7 +4774,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
                 if bucketing:
                     var d = List[Int]()
-                    d.append(flat_base[Parameters.wte] + t0 * channels)
+                    d.append(flat_base[self._head_t()] + t0 * channels)
                     var po = List[Int]()
                     po.append(0)
                     var ln = List[Int]()
@@ -6089,6 +6109,34 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 return self.grads.lm_head
         return self.grads.wte
 
+    @always_inline
+    def _set_head_grad_ptr(mut self, p: MutMemPtr[GPT2_DTYPE]):
+        """Re-point the LM head's gradient base (gradient pool / bucketing).
+        Writes the live field of whichever tensor the head reads, so the
+        encoder's `grads.wte` is untouched once the head is untied."""
+        comptime if UNTIED_HEAD:
+            if not self.head_tied:
+                self.grads.lm_head = p
+                return
+        self.grads.wte = p
+
+    def _head_config(self, config: AdamWConfig) -> AdamWConfig:
+        """AdamW config for the untied head range: the scheduler lr times
+        `-l_head` (sentinel < 0: same multiplier as the other AdamW ranges,
+        `adam_lr_mult`). Betas, eps, weight decay and grad_scale are shared
+        with the body. Step counter: `t` (no tie phase yet; S4 offsets it)."""
+        var mult = self.head_lr_mult
+        if mult < Float32(0.0):
+            mult = self.adam_lr_mult
+        return AdamWConfig(
+            learning_rate=config.learning_rate * mult,
+            beta1=config.beta1,
+            beta2=config.beta2,
+            eps=config.eps,
+            weight_decay=config.weight_decay,
+            grad_scale=config.grad_scale,
+        )
+
     def _head_idle_from(self, flat_start: Int) -> Bool:
         """True when a flat range starting at `flat_start` lies in the untied
         head and the head is not being trained (tied phase / slice S0). The
@@ -6116,12 +6164,29 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         starting at flat index `flat_lo`; p/g/master/m/v already point at that
         slice. Tied build: exactly the single whole-slice `adamw_update` the
         five update() sites always made. Untied build: the slice is cut at the
-        head offset and only the body part is updated (the head is idle until
-        slice S2 gives it its own config and step counter)."""
+        head offset: the body part uses `config`, the head part (unless the
+        head is tied/idle) uses `_head_config(config)`."""
         var n_use = n
         comptime if UNTIED_HEAD:
             var head_off = self.param_offset(Parameters.lm_head)
             n_use = min(n, max(head_off - flat_lo, 0))
+            # Head part of the slice: [max(flat_lo, head_off), flat_lo + n),
+            # own lr multiplier; skipped while the head is tied (idle).
+            var head_skip = max(head_off - flat_lo, 0)
+            var n_head = n - head_skip
+            if n_head > 0 and not self.head_tied:
+                adamw_update[GPT2_DTYPE, Self.target](
+                    n_head,
+                    p.unsafe_offset(head_skip),
+                    g.unsafe_offset(head_skip),
+                    master.unsafe_offset(head_skip),
+                    USE_BF16,
+                    m.unsafe_offset(head_skip),
+                    v.unsafe_offset(head_skip),
+                    t,
+                    self._head_config(config),
+                    self.ctx,
+                )
         if n_use <= 0:
             return
         adamw_update[GPT2_DTYPE, Self.target](
@@ -6142,6 +6207,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var n = ranges[2 * k + 1] - start
             if n <= 0 or self._head_idle_from(start):
                 continue
+            var range_config = self._adam_config(config)
+            comptime if UNTIED_HEAD:
+                if start >= self.param_offset(Parameters.lm_head):
+                    range_config = self._head_config(config)
             adamw_update[GPT2_DTYPE, Self.target](
                 n,
                 as_mut_kernel[GPT2_DTYPE](
@@ -6159,7 +6228,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.v_memory.unsafe_offset(self.v_compact_bases[k])
                 ),
                 t,
-                adam_config,
+                range_config,
                 self.ctx,
             )
         var muon_config = MuonConfig(
@@ -6253,6 +6322,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var g_seg = self.grads_memory.unsafe_offset(sg.flat_start)
                 if bucketed:
                     g_seg = self.grad_shard_memory.unsafe_offset(sg.shard_rel)
+                var seg_config = self._adam_config(config)
+                comptime if UNTIED_HEAD:
+                    if sg.flat_start >= self.param_offset(Parameters.lm_head):
+                        seg_config = self._head_config(config)
                 adamw_update[GPT2_DTYPE, Self.target](
                     sg.len,
                     as_mut_kernel[GPT2_DTYPE](
@@ -6272,7 +6345,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.v_memory.unsafe_offset(sg.compact_off)
                     ),
                     t,
-                    adam_config,
+                    seg_config,
                     self.ctx,
                 )
             if len(self.muon_owned_groups) > 0:
@@ -7582,6 +7655,8 @@ struct TrainArgs(Copyable, Movable):
     var beta2: Float32  # -b2  AdamW beta2
     var eps: Float32  # -eps  AdamW epsilon
     var adam_lr_mult: Float32  # -l_adam  lr multiplier, AdamW ranges under Muon
+    var head_lr_mult: Float32  # -l_head  untied head lr multiplier (< 0: l_adam)
+    var idle_head: Bool  # LLMM_UNTIED_IDLE_HEAD=1 test hook: head stays tied/idle
     var muon_momentum_start: Float32  # -mu_start  (< 0: unset, use -mu)
     var muon_momentum_warmup: Int  # -mu_warmup  ramp steps (0 = off)
     var qk_clip_tau: Float32  # -qk_clip  max attention logit (0 = off)
@@ -7627,6 +7702,8 @@ def default_train_args() -> TrainArgs:
         beta2=Float32(0.999),
         eps=Float32(1e-8),
         adam_lr_mult=Float32(1.0),
+        head_lr_mult=Float32(-1.0),
+        idle_head=False,
         muon_momentum_start=Float32(-1.0),
         muon_momentum_warmup=0,
         qk_clip_tau=Float32(0.0),
@@ -7916,6 +7993,11 @@ def train[
     )
     if args.optimizer == "muon":
         model.enable_muon(args.muon_momentum, args.adam_lr_mult)
+    comptime if UNTIED_HEAD:
+        model.head_lr_mult = args.head_lr_mult
+        # Test hook (superseded by -untie_at in a later slice): keep the head
+        # tied to wte and idle, so the untied build must reproduce the tied one.
+        model.head_tied = args.idle_head
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
 
@@ -8115,6 +8197,12 @@ def train[
         num("cooldown", args.cooldown_frac, VERBOSE),
         text("decay_shape", args.decay_shape, VERBOSE),
     ]
+    comptime if UNTIED_HEAD:
+        setup_fields.append(num("untied_head", 1, VERBOSE))
+        setup_fields.append(num("l_head", args.head_lr_mult, VERBOSE))
+        setup_fields.append(
+            num("head_idle", 1 if args.idle_head else 0, VERBOSE)
+        )
     run_log.emit(
         "setup",
         NORMAL,
@@ -8568,6 +8656,10 @@ def _print_usage():
         "  -l_adam <float> lr multiplier for the AdamW ranges (wte, wpe, LN,"
         " biases) under -opt muon (default = 1.0; refused with -opt adamw)"
     )
+    print(
+        "  -l_head <float> lr multiplier for the untied LM head, needs a build"
+        " with -D LLMM_UNTIED_HEAD=1 (default = same as -l_adam)"
+    )
     print("  -b1 <float> AdamW beta1 (default = 0.9)")
     print("  -b2 <float> AdamW beta2 (default = 0.999)")
     print("  -eps <float> AdamW epsilon (default = 1e-8)")
@@ -8613,6 +8705,10 @@ def _parse_train_args(
         args.optimizer = getenv("LLMM_OPTIMIZER")
     if getenv("LLMM_MUON_MOMENTUM") != "":
         args.muon_momentum = Float32(atof(getenv("LLMM_MUON_MOMENTUM")))
+    if getenv("LLMM_LR_HEAD_MULT") != "":
+        args.head_lr_mult = Float32(atof(getenv("LLMM_LR_HEAD_MULT")))
+    if getenv("LLMM_UNTIED_IDLE_HEAD") == "1":
+        args.idle_head = True
     if getenv("LLMM_LR_ADAM_MULT") != "":
         args.adam_lr_mult = Float32(atof(getenv("LLMM_LR_ADAM_MULT")))
     if getenv("LLMM_MUON_MOMENTUM_START") != "":
@@ -8699,6 +8795,8 @@ def _parse_train_args(
             args.eps = Float32(atof(val))
         elif flag == "-l_adam":
             args.adam_lr_mult = Float32(atof(val))
+        elif flag == "-l_head":
+            args.head_lr_mult = Float32(atof(val))
         elif flag == "-mu_start":
             args.muon_momentum_start = Float32(atof(val))
         elif flag == "-mu_warmup":
@@ -8721,6 +8819,16 @@ def _parse_train_args(
             "-l_adam / LLMM_LR_ADAM_MULT only applies with -opt muon (AdamW"
             " already uses -l for every parameter); refusing"
         )
+        _error_usage()
+    comptime if not UNTIED_HEAD:
+        if args.head_lr_mult != Float32(-1.0) or args.idle_head:
+            print(
+                "-l_head / LLMM_LR_HEAD_MULT / LLMM_UNTIED_IDLE_HEAD need the"
+                " untied-head build (-D LLMM_UNTIED_HEAD=1); refusing"
+            )
+            _error_usage()
+    if args.head_lr_mult < 0.0 and args.head_lr_mult != Float32(-1.0):
+        print("Invalid -l_head: must be >= 0 (0 freezes the head)")
         _error_usage()
     if args.adam_lr_mult < 0.0:
         print("Invalid -l_adam: must be >= 0 (0 freezes the AdamW ranges)")
