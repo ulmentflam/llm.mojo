@@ -68,6 +68,7 @@ from llmm.qk_clip import (
     qk_clip_matrix,
     qk_head_max_fold,
 )
+from llmm.gelu import MLP_RELU2
 from llmm.matmul import (
     fp8_mutex_preseed,
     matmul_fwd,
@@ -226,6 +227,9 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #                              transform. llmm/matmul.mojo.
 # Stochastic rounding
 #   LLMM_INIT_SEED=<int>       from-scratch weight-init seed, default 42.
+#   LLMM_MLP_ACT=gelu|relu2    MLP activation (default gelu). relu2 = relu(x)^2;
+#                              forces the unfused (non-cuBLASLt-epilogue) path.
+#                              llmm/gelu.mojo, llmm/matmul.mojo.
 #   LLMM_ZERO_INIT_PROJ=0|1|2  residual-projection init: 0 GPT-2 scaled normal
 #                              (default), 1 zeros, 2 N(0, 0.02*0.1).
 #   LLMM_SR_MASTER=1           SR on the master->bf16 param store (llmm/adamw.mojo).
@@ -7631,6 +7635,8 @@ def train[
         printf0(
             setup_rank, _table_row("zero_init_proj", String(ZERO_INIT_PROJ))
         )
+    comptime if MLP_RELU2:
+        printf0(setup_rank, _table_row("mlp_act", "relu2"))
     printf0(setup_rank, _table_row("qk clip tau", String(args.qk_clip_tau)))
     if args.optimizer == "muon":
         printf0(
@@ -7855,6 +7861,8 @@ def train[
     # default run's setup event stays byte-identical.
     comptime if ZERO_INIT_PROJ != 0:
         setup_fields.append(num("zero_init_proj", ZERO_INIT_PROJ))
+    comptime if MLP_RELU2:
+        setup_fields.append(text("mlp_act", "relu2"))
     run_log.emit(
         "setup",
         NORMAL,

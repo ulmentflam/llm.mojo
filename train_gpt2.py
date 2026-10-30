@@ -205,6 +205,27 @@ class GeLU(nn.Module):
         )
 
 
+class ReLU2(nn.Module):
+    """relu(x)^2, the modded-nanogpt MLP activation (GPT2_ACT=relu2)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.relu(x).square()
+
+
+def mlp_activation() -> nn.Module:
+    """MLP activation selected by GPT2_ACT=gelu|relu2 (default gelu), the
+    reference counterpart of the Mojo build constant -D LLMM_MLP_ACT."""
+    act = os.environ.get("GPT2_ACT", "gelu")
+    if act == "gelu":
+        return GeLU()
+    if act == "relu2":
+        return ReLU2()
+    raise ValueError(f"GPT2_ACT must be gelu or relu2, got {act!r}")
+
+
 class Sequential(nn.Module):
     def __init__(self, *args) -> None:
         super().__init__()
@@ -268,7 +289,7 @@ class MLP(nn.Module):
         self.out_dim = out_dim
         ordered_layers: list[nn.Module] = [
             Linear(input_dim, hidden_dim),
-            GeLU(),
+            mlp_activation(),
             Linear(hidden_dim, input_dim),
         ]
         if dropout:
@@ -296,7 +317,7 @@ class KarpathyMLP(nn.Module):
         self.hidden_dim = hidden_dim
         self.out_dim = out_dim
         self.c_fc = Linear(input_dim, hidden_dim)
-        self.gelu = GeLU()
+        self.gelu = mlp_activation()
         self.c_proj = Linear(hidden_dim, out_dim)
         setattr(
             self.c_proj, "LLMC_RESIDUAL_SCALE_FLAG", 1
@@ -2154,7 +2175,11 @@ if __name__ == "__main__":
             logits,
             loss,
             activations,
-            f"gpt2_{model_size_str}_debug_state.bin",
+            # A non-default activation gets its own debug state (the pretrained
+            # weights files are activation-independent and keep their names).
+            f"gpt2_{model_size_str}"
+            + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
+            + "_debug_state.bin",
         )
         # Reset the train_loader for the optimization below
         train_loader.reset()

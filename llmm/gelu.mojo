@@ -1,7 +1,7 @@
 from extensibility import register
 from extensibility import InputTensor
 from max.gpu.host import DeviceContext
-from std.sys import simd_width_of, align_of
+from std.sys import simd_width_of, align_of, get_defined_string
 from std.math import sqrt, ceildiv, tanh, pi
 from max.gpu.host.info import is_cpu, is_gpu
 from extensibility.managed_tensor_slice import (
@@ -25,6 +25,14 @@ comptime SQRT_TWO_OVER_PI = 0.7978845608028654
 # NOTE: Apple Silicon has issues with comptime computing sqrt(2.0 / pi) so we hardcode the value.
 # comptime SQRT_TWO_OVER_PI = sqrt(2.0 / pi)
 
+# MLP activation of the trainer, -D LLMM_MLP_ACT=gelu|relu2 (default gelu).
+# `mlp_act` / `mlp_act_grad` below are what matmul.mojo's fused-bias/epilogue
+# paths call; with the default they ARE `gelu` / `gelu_grad` (identical code).
+# relu2 = relu(x)^2 (modded-nanogpt): same shapes and parameters, backward reads
+# the same saved pre-activation.
+comptime MLP_ACT = get_defined_string["LLMM_MLP_ACT", "gelu"]()
+comptime MLP_RELU2 = MLP_ACT == "relu2"
+
 
 # ===----------------------------------------------------------------------=== #
 # GELU Forward
@@ -47,10 +55,59 @@ def gelu[
 
 
 @always_inline
+def relu2[
+    dtype: DType,
+    width: Int,
+](x: SIMD[dtype, width],) -> SIMD[dtype, width]:
+    """Squared ReLU, relu(x)^2."""
+    comptime assert (
+        dtype.is_floating_point()
+    ), "relu2 requires a floating point dtype"
+    var r = max(x, SIMD[dtype, width](0))
+    return r * r
+
+
+@always_inline
+def mlp_act[
+    dtype: DType,
+    width: Int,
+](x: SIMD[dtype, width],) -> SIMD[dtype, width]:
+    """The trainer's MLP activation (build constant LLMM_MLP_ACT)."""
+    comptime assert (
+        MLP_ACT == "gelu" or MLP_ACT == "relu2"
+    ), "LLMM_MLP_ACT must be gelu or relu2"
+    comptime if MLP_RELU2:
+        return relu2(x)
+    else:
+        return gelu(x)
+
+
+@always_inline
+def _act_fwd[
+    act_relu2: Bool, width: Int
+](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    comptime if act_relu2:
+        return relu2(x)
+    else:
+        return gelu(x)
+
+
+@always_inline
+def _act_bwd[
+    act_relu2: Bool, width: Int
+](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    comptime if act_relu2:
+        return relu2_grad(x)
+    else:
+        return gelu_grad(x)
+
+
+@always_inline
 def _gelu_fwd[
     dtype: DType,
     width: Int,
     aligned: Bool = False,
+    act_relu2: Bool = False,
 ](
     idx: Int,
     out_ptr: MutKernelPtr[dtype],
@@ -68,7 +125,7 @@ def _gelu_fwd[
             .cast[DType.float32]()
         )
         (out_ptr.unsafe_offset(idx)).unsafe_store[width=width, alignment=align](
-            gelu(x).cast[dtype]()
+            _act_fwd[act_relu2](x).cast[dtype]()
         )
     else:
         var x = (
@@ -76,12 +133,15 @@ def _gelu_fwd[
             .unsafe_load[width=width]()
             .cast[DType.float32]()
         )
-        (out_ptr.unsafe_offset(idx)).unsafe_store(gelu(x).cast[dtype]())
+        (out_ptr.unsafe_offset(idx)).unsafe_store(
+            _act_fwd[act_relu2](x).cast[dtype]()
+        )
 
 
 def gelu_fwd_gpu[
     dtype: DType,
     width: Int,
+    act_relu2: Bool = False,
 ](
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
@@ -90,16 +150,19 @@ def gelu_fwd_gpu[
     var num_params = Int(num_params_arg)
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
     if idx + width <= num_params:
-        _gelu_fwd[dtype, width, aligned=True](idx, out_ptr, x_ptr)
+        _gelu_fwd[dtype, width, aligned=True, act_relu2=act_relu2](
+            idx, out_ptr, x_ptr
+        )
     elif idx < num_params:
         # Last vector straddles num_params so handle the remainder one element at a time.
         for i in range(idx, num_params):
-            _gelu_fwd[dtype, 1](i, out_ptr, x_ptr)
+            _gelu_fwd[dtype, 1, act_relu2=act_relu2](i, out_ptr, x_ptr)
 
 
 def gelu_fwd_cpu[
     dtype: DType,
     width: Int,
+    act_relu2: Bool = False,
 ](
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
@@ -118,7 +181,9 @@ def gelu_fwd_cpu[
         def _simd[
             w: Int,
         ](local: Int) {out_ptr, x_ptr, base}:
-            _gelu_fwd[dtype, w](base + local, out_ptr, x_ptr)
+            _gelu_fwd[dtype, w, act_relu2=act_relu2](
+                base + local, out_ptr, x_ptr
+            )
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
@@ -128,6 +193,7 @@ def gelu_fwd_cpu[
 def gelu_fwd[
     dtype: DType,
     target: StaticString,
+    act_relu2: Bool = False,
 ](
     output: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
     x: InputTensor[dtype=dtype, rank=2, static_spec=...],
@@ -135,7 +201,7 @@ def gelu_fwd[
 ) raises -> None:
     comptime width = simd_width_of[dtype]()
     comptime if is_cpu[target]():
-        gelu_fwd_cpu[dtype, width](
+        gelu_fwd_cpu[dtype, width, act_relu2](
             output.unsafe_ptr(), x.unsafe_ptr(), x.size()
         )
     elif is_gpu[target]():
@@ -146,7 +212,7 @@ def gelu_fwd[
         var num_threads = ceildiv(x.size(), width)
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
-        comptime gpu_kernel = gelu_fwd_gpu[dtype, width]
+        comptime gpu_kernel = gelu_fwd_gpu[dtype, width, act_relu2]
         var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
@@ -222,7 +288,7 @@ def _bias_gelu_kernel_vec[
         comptime if use_gelu:
             (pre_gelu_ptr.unsafe_offset(i_base)).unsafe_store(v.cast[dtype]())
             (out_ptr.unsafe_offset(i_base)).unsafe_store(
-                gelu[DType.float32, vec](v).cast[dtype]()
+                mlp_act[DType.float32, vec](v).cast[dtype]()
             )
         else:
             (out_ptr.unsafe_offset(i_base)).unsafe_store(v.cast[dtype]())
@@ -245,7 +311,7 @@ def _bias_gelu_kernel_vec[
                 (
                     (pre_gelu_ptr.unsafe_offset(i_base)).unsafe_offset(k)
                 )[] = v.cast[dtype]()
-                ((out_ptr.unsafe_offset(i_base)).unsafe_offset(k))[] = gelu[
+                ((out_ptr.unsafe_offset(i_base)).unsafe_offset(k))[] = mlp_act[
                     DType.float32, 1
                 ](v).cast[dtype]()
             else:
@@ -280,7 +346,7 @@ def bias_gelu_fwd[
                 )
             comptime if use_gelu:
                 pre_gelu_ptr[unsafe_offset=i] = v.cast[dtype]()
-                out_ptr[unsafe_offset=i] = gelu[DType.float32, 1](v).cast[
+                out_ptr[unsafe_offset=i] = mlp_act[DType.float32, 1](v).cast[
                     dtype
                 ]()
             else:
@@ -352,10 +418,36 @@ def gelu_grad[
 
 
 @always_inline
+def relu2_grad[
+    dtype: DType,
+    width: Int,
+](x: SIMD[dtype, width],) -> SIMD[dtype, width]:
+    """Derivative of relu(x)^2: 2 * relu(x), 0 at x <= 0 like torch autograd."""
+    comptime assert (
+        dtype.is_floating_point()
+    ), "relu2_grad requires a floating point dtype"
+    return SIMD[dtype, width](2) * max(x, SIMD[dtype, width](0))
+
+
+@always_inline
+def mlp_act_grad[
+    dtype: DType,
+    width: Int,
+](x: SIMD[dtype, width],) -> SIMD[dtype, width]:
+    """Derivative of the trainer's MLP activation (build constant LLMM_MLP_ACT).
+    """
+    comptime if MLP_RELU2:
+        return relu2_grad(x)
+    else:
+        return gelu_grad(x)
+
+
+@always_inline
 def _gelu_bwd[
     dtype: DType,
     width: Int,
     aligned: Bool = False,
+    act_relu2: Bool = False,
 ](
     idx: Int,
     out_ptr: MutKernelPtr[dtype],
@@ -370,7 +462,7 @@ def _gelu_bwd[
             .cast[DType.float32]()
         )
         (out_ptr.unsafe_offset(idx)).unsafe_store[width=width, alignment=align](
-            gelu_grad(x).cast[dtype]()
+            _act_bwd[act_relu2](x).cast[dtype]()
         )
     else:
         var x = (
@@ -378,12 +470,15 @@ def _gelu_bwd[
             .unsafe_load[width=width]()
             .cast[DType.float32]()
         )
-        (out_ptr.unsafe_offset(idx)).unsafe_store(gelu_grad(x).cast[dtype]())
+        (out_ptr.unsafe_offset(idx)).unsafe_store(
+            _act_bwd[act_relu2](x).cast[dtype]()
+        )
 
 
 def gelu_bwd_gpu[
     dtype: DType,
     width: Int,
+    act_relu2: Bool = False,
 ](
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
@@ -392,16 +487,19 @@ def gelu_bwd_gpu[
     var num_params = Int(num_params_arg)
     var idx = Int((block_idx.x * block_dim.x + thread_idx.x) * width)
     if idx + width <= num_params:
-        _gelu_bwd[dtype, width, aligned=True](idx, out_ptr, x_ptr)
+        _gelu_bwd[dtype, width, aligned=True, act_relu2=act_relu2](
+            idx, out_ptr, x_ptr
+        )
     elif idx < num_params:
         # Last vector straddles num_params so handle the remainder one element at a time.
         for i in range(idx, num_params):
-            _gelu_bwd[dtype, 1](i, out_ptr, x_ptr)
+            _gelu_bwd[dtype, 1, act_relu2=act_relu2](i, out_ptr, x_ptr)
 
 
 def gelu_bwd_cpu[
     dtype: DType,
     width: Int,
+    act_relu2: Bool = False,
 ](
     out_ptr: MutKernelPtr[dtype],
     x_ptr: ImmutKernelPtr[dtype],
@@ -420,7 +518,9 @@ def gelu_bwd_cpu[
         def _simd[
             w: Int,
         ](local: Int) {out_ptr, x_ptr, base}:
-            _gelu_bwd[dtype, w](base + local, out_ptr, x_ptr)
+            _gelu_bwd[dtype, w, act_relu2=act_relu2](
+                base + local, out_ptr, x_ptr
+            )
 
         vectorize[width, unroll_factor=UNROLL](count, _simd)
 
@@ -430,6 +530,7 @@ def gelu_bwd_cpu[
 def gelu_bwd[
     dtype: DType,
     target: StaticString,
+    act_relu2: Bool = False,
 ](
     output: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
     x: InputTensor[dtype=dtype, rank=2, static_spec=...],
@@ -437,7 +538,7 @@ def gelu_bwd[
 ) raises -> None:
     comptime width = simd_width_of[dtype]()
     comptime if is_cpu[target]():
-        gelu_bwd_cpu[dtype, width](
+        gelu_bwd_cpu[dtype, width, act_relu2](
             output.unsafe_ptr(), x.unsafe_ptr(), x.size()
         )
     elif is_gpu[target]():
@@ -448,7 +549,7 @@ def gelu_bwd[
         var num_threads = ceildiv(x.size(), width)
         var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
 
-        comptime gpu_kernel = gelu_bwd_gpu[dtype, width]
+        comptime gpu_kernel = gelu_bwd_gpu[dtype, width, act_relu2]
         var compiled = device_ctx.compile_function[gpu_kernel]()
         device_ctx.enqueue_function(
             compiled,
@@ -476,3 +577,38 @@ struct GeluBwd:
         if output.size() != x.size():
             raise Error("output and x must have the same size")
         gelu_bwd[dtype, target](output, x, ctx)
+
+
+# relu2 siblings of the registered ops: always compiled (independent of
+# LLMM_MLP_ACT) so tests/test_gelu_equivalence.py covers them in the default
+# build; same signatures as gelu_fwd / gelu_bwd.
+@register("relu2_fwd")
+struct Relu2Fwd:
+    @staticmethod
+    def execute[
+        dtype: DType,
+        target: StaticString,
+    ](
+        output: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
+        x: InputTensor[dtype=dtype, rank=2, static_spec=...],
+        ctx: DeviceContext,
+    ) capturing raises:
+        if output.size() != x.size():
+            raise Error("output and x must have the same size")
+        gelu_fwd[dtype, target, True](output, x, ctx)
+
+
+@register("relu2_bwd")
+struct Relu2Bwd:
+    @staticmethod
+    def execute[
+        dtype: DType,
+        target: StaticString,
+    ](
+        output: MutableInputTensor[dtype=dtype, rank=2, static_spec=...],
+        x: InputTensor[dtype=dtype, rank=2, static_spec=...],
+        ctx: DeviceContext,
+    ) capturing raises:
+        if output.size() != x.size():
+            raise Error("output and x must have the same size")
+        gelu_bwd[dtype, target, True](output, x, ctx)

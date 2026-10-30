@@ -1503,7 +1503,7 @@ test-fixtures:
 verify: verify-cpu verify-gpu
 
 verify-cpu: | $(PIXI_STAMP)
-	$(PIXI) run mojo test_gpt2.mojo cpu
+	$(PIXI) run mojo $(MOJO_DEFINES) test_gpt2.mojo cpu
 
 # fp32 GEMMs default to TF32 tensor cores (llmm/vendor.mojo's USE_TF32), which
 # is the right choice for training but wrong for a strict-IEEE reference
@@ -1515,7 +1515,7 @@ verify-cpu: | $(PIXI_STAMP)
 # -D LLMM_NO_TF32=1 so this gate keeps checking true IEEE fp32 math at the
 # tight LOSS_STEP_TOL=0.01; see verify-gpu-tf32 below for the TF32 path.
 verify-gpu: | $(PIXI_STAMP)
-	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 test_gpt2.mojo gpu
+	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 $(MOJO_DEFINES) test_gpt2.mojo gpu
 
 # From-scratch init equivalence (the pretrained-weights gates above never run
 # the init code). ZERO_INIT_PROJ selects the residual-projection init on BOTH

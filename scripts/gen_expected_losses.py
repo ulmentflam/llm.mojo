@@ -71,6 +71,7 @@ Configuration (must stay in sync with ``model.update()`` in test_gpt2.mojo)
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 import sys
 from pathlib import Path
@@ -83,7 +84,15 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt2 import GPT  # noqa: E402
 
-STATE_FILE = "gpt2_124M_debug_state.bin"
+# GPT2_ACT=relu2 (the reference's MLP activation switch, mirroring the Mojo build
+# constant -D LLMM_MLP_ACT=relu2) reads/produces the *_relu2_debug_state.bin
+# written by train_gpt2.py under the same env var, and the list it prints is the
+# relu2 trajectory for test_gpt2.mojo.
+STATE_FILE = (
+    "gpt2_124M_debug_state.bin"
+    if os.environ.get("GPT2_ACT", "gelu") == "gelu"
+    else "gpt2_124M_relu2_debug_state.bin"
+)
 MAGIC_EXPECTED = 20240520
 VERSION_EXPECTED = 3
 NUM_STEPS = 10

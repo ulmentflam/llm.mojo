@@ -12,6 +12,7 @@ from llmm.memory import MutMemPtr, heap_alloc
 from llmm.log import Field, Log, num, text, DEBUG, NORMAL, QUIET, VERBOSE
 from llmm.term import pad_right
 from llmm.vendor import HAS_CUBLAS, USE_TF32
+from llmm.gelu import MLP_RELU2
 
 from train_gpt2 import (
     GPT2,
@@ -20,6 +21,11 @@ from train_gpt2 import (
     _ffmt,
 )
 
+# -D LLMM_MLP_ACT=relu2 swaps the MLP activation, so the reference state and the
+# loss trajectory come from the PyTorch reference run with GPT2_ACT=relu2
+# (train_gpt2.py writes gpt2_124M_relu2_debug_state.bin; the trajectory is
+# scripts/gen_expected_losses.py's output under the same env var).
+comptime STATE_FILE = "gpt2_124M_relu2_debug_state.bin" if MLP_RELU2 else "gpt2_124M_debug_state.bin"
 comptime SIZEOF_INT = size_of[DType.int32]()
 comptime SIZEOF_FLOAT = size_of[DType.float32]()
 
@@ -371,7 +377,7 @@ def run_test[
 
     # load additional information that we will use for debugging and error checking
 
-    var state_file = open("gpt2_124M_debug_state.bin", "r")
+    var state_file = open(STATE_FILE, "r")
 
     var state_header = heap_alloc[Int32](256)
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
@@ -475,6 +481,20 @@ def run_test[
         0.6243725419044495,
         0.37682223320007324,
     ]
+    # PyTorch relu2 trajectory (GPT2_ACT=relu2 scripts/gen_expected_losses.py).
+    comptime if MLP_RELU2:
+        expected_losses = [
+            7.184723854064941,
+            6.579202651977539,
+            6.155612468719482,
+            5.782768249511719,
+            5.452462673187256,
+            5.018465042114258,
+            4.612589359283447,
+            4.149394512176514,
+            3.748042583465576,
+            3.367974042892456,
+        ]
 
     # Stale-state guard. Step 0 of the list is a plain forward pass on the debug
     # state's own batch, so the loss stored in the state file must equal it
