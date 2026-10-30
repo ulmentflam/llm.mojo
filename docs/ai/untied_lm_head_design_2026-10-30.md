@@ -895,6 +895,27 @@ Decisions and caveats:
   the 17-tensor check at step 0 (head == wte there) and fails the 10-step
   trajectory (`steps failed=9`), so the trajectory is not useless for the head.
 
+S2 generation 2 (tests and GPU gates):
+- `make test-mojo TEST_DEFINES="-D LLMM_UNTIED_HEAD=1"` first failed in four
+  files: `test_zero_equivalence`, `test_zero_muon` and `test_qk_clip` train at
+  ZeRO-2/3 with the head live (refused until S6), and `test_adam_lr_mult`
+  segfaulted because its comparison buffers held 16 tensors while the model has
+  17. The ZeRO-2/3 cases now run the idle head (`model.head_tied = True`, for
+  reference and candidate alike) under `comptime if UNTIED_HEAD`; ZeRO-0/1
+  cases keep the trained head. Result: tied `tests result=pass files=29
+  passed=250`, untied `passed=250`, both failed=0.
+- Planted test `test_untied_head_gradient_split_matches_tied`
+  (tests/test_untied_head.mojo): untied model vs the same build with the head
+  idle, from a tied .bin. Loss bitwise equal; absent rows dwte == 0 and
+  dlm_head == tied dwte; present rows dwte + dlm_head == tied dwte within 1e-6.
+  Mutant (`_head_grad_ptr` returns `grads.wte`) fails it with "absent row has
+  encoder gradient in wte".
+- 5-step bf16 smokes (B=4, T=1024): tied loss 3.609831 3.668198 3.438826
+  3.279619 3.634629; untied 3.609831 3.670668 3.440166 3.283439 3.632877
+  (identical at step 1, diverge after the head trains separately).
+- S3 inherits: ZeRO-1 at W>1 with the head active is untested; ZeRO >= 2 is
+  refused until S6.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Opus agent), directed by Evan Owen.
