@@ -1396,6 +1396,30 @@ non-streaming).
     add threaded CPU W=2 `-z 2` and `-z 3` Muon save/resume runs (`-x 2`, then
     `-y 1 -x 4`, vs continuous `-x 4`, `cmp` model and both state files), and
     a cross-stage resume (`-z 1` files at `-z 3`), which the layout allows.
+- **Integration (fu/zs4int, S4 onto main 537a850 with S2+S3, 2026-10-30).**
+  Merge resolutions: `enable_muon` = S3's (W-round seeding, `ensure_comm_setup`
+  before the seed, no raise); `write_checkpoint`/`load_checkpoint` = S4's logic
+  (streaming `write_checkpoint` goes through S3's split `_z3_gather_full`;
+  `_load_muon_owner_state(host_params, host_mu)` gets the full host vector
+  after seeding); train() refusal block stays removed; `_update_sharded_muon`
+  = S3+S5; `llmm/checkpointing.mojo` and `tests/test_checkpointing.mojo` = S4;
+  `tests/test_zero_muon.mojo` = main. Git merged without textual conflicts.
+  Gates on the merged tree: `make test-mojo` `tests result=pass files=26
+  passed=219 skipped=1 failed=0` (test_checkpointing 14/14, test_zero_muon
+  13/13); `make verify` cpu+gpu pass; `make lint` exit 0; `make build-bf16`
+  exit 0. Threaded CPU W=2 d6 Muon `-x 2 -n 2` then `-y 1 -x 4` vs continuous
+  `-x 4`: `-z 1`, `-z 2` and `-z 3` give step 3 = 10.648577 in resumed and
+  continuous runs; step 4 prints 10.410458 resumed vs 10.410459 continuous at
+  `-z 2`/`-z 3` (1e-6 print-level difference in the logged loss; `-z 1` is
+  10.410458 in both) and `cmp` of model_4.bin, state_4_0.bin, state_4_1.bin is identical
+  in all three. Cross-stage: `-z 1` step-2 files resumed at `-z 3` load and
+  give 10.648577, 10.410458, the same as the `-z 1` continuous run. Regression:
+  AdamW W=2 `-z 2` resume bit-exact (cmp), W=1 Muon resume bit-exact (cmp),
+  W=1 GPU Muon 5 steps 4.287241, 3.985745, 4.111457, 3.619328, 3.700196.
+  Observed flake (pre-existing, not S4): a resume with `-n k` dividing the
+  resume step rewrites that step's `model_k.bin` while the other rank may
+  still be reading it; one run under heavy parallel load failed rank 1 with
+  "Failed to read enough bytes" and passed on rerun.
 
 **S5: QK-clip multi-rank** (`allreduce_max_host`; the clip inside
 `_update_sharded_muon`; `enable_qk_clip` scope).
