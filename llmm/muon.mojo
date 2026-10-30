@@ -68,18 +68,67 @@ struct MuonConfig(Copyable, Movable):
     var nesterov: Bool
 
 
-@fieldwise_init
 struct MuonGroup(Copyable, Movable):
     """`count` equally strided row-major [rows, cols] matrices inside the flat
     parameter buffer: matrix i starts at element `offset + i * stride`.
     `stride >= rows * cols`; for the Q/K/V row blocks of the fused
-    [L, 3C, C] qkv weight, rows = cols = C and stride = 3*C*C."""
+    [L, 3C, C] qkv weight, rows = cols = C and stride = 3*C*C.
+
+    `sr_offset` / `sr_stride` give the stochastic-rounding counter its own
+    indexing: matrix i element j rounds with counter `sr_offset + i *
+    sr_stride + j`. For a group inside the flat parameter buffer they equal
+    `offset` / `stride` (the 5-argument constructor); for an owner-space group
+    (sharded Muon) they stay the GLOBAL flat index, so SR matches W=1."""
 
     var offset: Int
     var rows: Int
     var cols: Int
     var count: Int
     var stride: Int
+    var sr_offset: Int
+    var sr_stride: Int
+
+    def __init__(
+        out self,
+        offset: Int,
+        rows: Int,
+        cols: Int,
+        count: Int,
+        stride: Int,
+    ):
+        """Flat layout: the SR counter indexes like the buffers do."""
+        self.offset = offset
+        self.rows = rows
+        self.cols = cols
+        self.count = count
+        self.stride = stride
+        self.sr_offset = offset
+        self.sr_stride = stride
+
+    @staticmethod
+    def flat(
+        offset: Int, rows: Int, cols: Int, count: Int, stride: Int
+    ) -> Self:
+        """Flat layout, spelled out: SR counters index like the buffers."""
+        return Self(offset, rows, cols, count, stride)
+
+    def __init__(
+        out self,
+        offset: Int,
+        rows: Int,
+        cols: Int,
+        count: Int,
+        stride: Int,
+        sr_offset: Int,
+        sr_stride: Int,
+    ):
+        self.offset = offset
+        self.rows = rows
+        self.cols = cols
+        self.count = count
+        self.stride = stride
+        self.sr_offset = sr_offset
+        self.sr_stride = sr_stride
 
 
 # ===----------------------------------------------------------------------=== #
@@ -224,7 +273,8 @@ def muon_apply_gpu[
     has_master: UInt8,
     n_arg: Int64,
     stride_arg: Int64,
-    offset_arg: Int64,
+    sr_offset_arg: Int64,
+    sr_stride_arg: Int64,
     lr: Scalar[DType.float32],
     wd: Scalar[DType.float32],
     scale: Scalar[DType.float32],
@@ -262,7 +312,7 @@ def muon_apply_gpu[
             "LLMM_SR_MASTER=1 requires a bf16 low-precision param store"
             " (dtype == DType.bfloat16)"
         )
-        var pidx = Int(offset_arg) + mat * Int(stride_arg) + i
+        var pidx = Int(sr_offset_arg) + mat * Int(sr_stride_arg) + i
         var q = SIMD[dtype, W]()
         comptime for k in range(W):
             var counter = rng_step_counter(UInt64(t), UInt64(pidx + k))
@@ -518,7 +568,8 @@ def _muon_group_gpu[
         UInt8(1) if has_master else UInt8(0),
         Int64(n),
         Int64(g.stride),
-        Int64(g.offset),
+        Int64(g.sr_offset),
+        Int64(g.sr_stride),
         config.learning_rate,
         config.weight_decay,
         scale,
@@ -708,7 +759,7 @@ def _muon_update_cpu[
             for i in range(n):
                 _muon_store[dtype](
                     base + i,
-                    base + i,
+                    g.sr_offset + mat * g.sr_stride + i,
                     params_ptr,
                     master_ptr,
                     has_master,
