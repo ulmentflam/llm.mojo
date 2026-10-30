@@ -672,7 +672,10 @@ def _mclip_train[
             if stage == 3:
                 # Streaming: params_memory is only the flat shard. Gather the
                 # full vector (collective) and export the owner-space copies.
-                var full = model.ctx.enqueue_create_buffer[GPT2_DTYPE](n)
+                // Sized to the live model: an untied build gathers N16 + head.
+                var full = model.ctx.enqueue_create_buffer[GPT2_DTYPE](
+                    model.num_parameters
+                )
                 model.ctx.synchronize()
                 model._z3_gather_full(
                     rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
