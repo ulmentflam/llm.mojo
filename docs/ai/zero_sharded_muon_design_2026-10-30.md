@@ -30,6 +30,81 @@ marked **UNVERIFIED**.
   a coordinator and builds `DeviceContext(device_id=i)` for every rank
   (llmm/zero.mojo:`ensure_comm_setup`), and this box has one GPU. See section 8.
 
+### Review notes (2026-10-30, independent review, PARTIAL: interrupted by a reboot)
+
+Reviewed against the code at `7d68ac1`. Items 7 (fu/vfree) and 8 (prior-art
+spot check) were not finished. Verdicts so far:
+
+- **Ownership rule (section 2): CONFIRMED.** I recomputed it with my own model
+  of `_compute_param_sizes`/`enable_muon`. At 124M, W in {2, 4, 8} gives
+  max/ideal NS cost 1.000, W=5 gives 1.042, W=7 gives 1.108. Each rank's share
+  of a group is the arithmetic progression `l0, l0+W, ...` (asserted for every
+  rank and group). Finding 1's A_r values match. "d6" is C=384 (gpt2-30M).
+  Also note that tiny L=2 at W=8 has S=1280 > opt=984, not only L=1.
+- **Traffic claim (sections 1 and 6): WRONG per rank, correct in aggregate.**
+  The total bytes moved equal plain ZeRO, and are slightly fewer because there
+  is no padding. Per rank they are not equal, because rank r handles
+  `A_r + O_r` elements instead of `opt`. At 124M W=4, rank 0 reduce-scatters
+  52.35M elements (plain: 31.12M, +68%) and sends 314 MB in the gathers (plain:
+  187 MB). Ranks 2 and 3 receive 206 MB (plain: 187 MB). At W=8, ranks 0 and 1
+  are +68%. The slowest rank sets the collective time, so the "+0 extra" column
+  in section 6 should read "+0 total; the critical-path rank carries up to
+  +68%". This does not block S0 to S3, but S6 must measure it, and S7's
+  ownership work should weigh `A_r + O_r`, not NS alone.
+- **S0 (a) allgather_ranges no-coordinator OOB: CONFIRMED by a run.** I
+  compiled a standalone repro with `ZeroContext["cpu", 4]`, rank 2, shard 16,
+  range [32, 40). Today's code copies `shard_base[32:40]`, which is out of
+  bounds for a 16-element shard. The correct source is `shard_base[0:8]`.
+- **S0 (b) self-copy alias: CONFIRMED by reading.** With `shard_base =
+  params_memory + r*opt` and `dst = params_memory`, the GPU `p == self.rank`
+  arm copies from and to the same address. No current caller does this; it is
+  a hazard for the new callers.
+- **S0 (c) missing scratch check: CONFIRMED.** `_reducescatter_buckets_gpu`
+  never calls `_check_scratch`. Today a segment is at most opt, which equals
+  the scratch size, so it is a missing guard, not a live bug.
+- **S0 (d) resume world-size check: CONFIRMED, but finding 4 has the
+  direction backwards.** Resuming at a *larger* W (smaller opt), or with a
+  ZeRO-0 state at ZeRO >= 1, reads a prefix silently. The `v` read then starts
+  inside the file's `m` block, so `v` is loaded from `m` data. Resuming at a
+  smaller W raises "Failed to read enough bytes". S4's exact-length check
+  covers both cases.
+- **Section 4 SR change: CONFIRMED necessary, with two corrections.**
+  (1) `muon_apply_gpu` uses `stride_arg` both for indexing and for `pidx`, so
+  it needs a new `sr_stride` kernel argument. `offset_arg` is used only for
+  `pidx`, so it can carry `sr_offset`. (2) It is **not sufficient** for W=1 vs
+  W>1 bit-equality on GPU, for two reasons. `muon_momentum_gpu` accumulates
+  per-matrix norms with float atomics across blocks, and the block order is
+  nondeterministic once a matrix has more than BLOCK*VEC = 2048 elements. The
+  cuBLASLt batched GEMMs also run with a different `batch_count`. T4 is
+  bit-exact only for matrices of at most 2048 elements and equal group counts.
+- **Section 8 T2 bit-exactness: WRONG for ZeRO-2/3.** ZeRO-0 forms
+  `wte_grad = lm_k + enc_k` locally and then allreduces. Bucketed ZeRO-2/3
+  reduce-scatters the LM-head part and the encoder part separately:
+  `(lm_0+lm_1) + (enc_0+enc_1)`. fp32 addition is not associative, so wte
+  (an AdamW tensor) differs by ulps after step 1, and from step 2 every tensor
+  differs. zero_grad_bucketing_design already states about 1e-4 vs z0/z1.
+  Expected results:
+  - ZeRO-1 vs ZeRO-0 (grad_scale=1, no accumulation): bit-exact.
+  - ZeRO-2/3 step 1: bit-exact for all Muon matrices and every non-wte tensor.
+  - ZeRO-2/3 multi-step: tolerance-based: keep the step-1 exact check and
+    use rtol ~1e-4 over 3 steps.
+  Grad accumulation also breaks exactness: `sum_k(g_k1 + g_k2)` vs
+  `sum_k g_k1 + sum_k g_k2`.
+- **T5 / trainer runs: CONFIRMED, with a caveat.** I rebuilt
+  `make build-train WORLD_SIZE=2` (binary mtime 23:05, fresh) and ran d6 for
+  3 steps at -z 2 and -z 0. Losses were 10.865850, 10.369871, 10.128281 at
+  both stages, matching the doc. The step-1 grad norm already differs
+  (14.0609 vs 14.0608, from the sharded sumsq order), and the clip is active,
+  so "identical" in T5 means identical to printed precision only.
+- **Section 5 data flow: CONFIRMED by reading.** This covers the
+  `_update_hybrid` guard for the CPU W>1 branch, ZeRO-1 pack from allreduced
+  grads with the same grad_scale as AdamW, ZeRO-2 Call A/B splits with Q/K/V
+  at `pool_slot[qkv] + k*C²`, and the wte two-part reduce, which stays in
+  Call A and is untouched. It also covers the `_z3_stream_layer` split: the
+  window `dst_offsets` are unchanged, so the `self.params.*` re-basing is
+  unchanged.
+- **Items 7 and 8: UNVERIFIED** (not reached).
+
 ## Critical findings (read these first)
 
 1. **The flat shards and Muon matrices are badly misaligned.** At 124M and W=4,
