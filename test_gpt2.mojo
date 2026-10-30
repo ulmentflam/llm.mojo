@@ -509,6 +509,14 @@ def run_test[
         expected_losses = List[Float32]()
         for tok in getenv("LLMM_EXPECTED_LOSSES").split(","):
             expected_losses.append(Float32(atof(String(tok))))
+    # The trajectory loop indexes expected_losses[0..9]: a short list would read
+    # past the end instead of failing, so reject it here.
+    if len(expected_losses) != 10:
+        print(
+            "LLMM_EXPECTED_LOSSES must hold 10 comma-separated losses, got",
+            len(expected_losses),
+        )
+        return False
 
     # Stale-state guard. Step 0 of the list is a plain forward pass on the debug
     # state's own batch, so the loss stored in the state file must equal it
