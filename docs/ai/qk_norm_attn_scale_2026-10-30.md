@@ -48,7 +48,28 @@ the 10-step trajectory are the real gates.
 
 ## Verification
 
-See the report section appended below when results are in.
+All on branch `mn/w7`, fp32 gates with `-D LLMM_NO_TF32=1`:
+
+| check | result |
+|---|---|
+| `make verify-gpu`, flag off, untouched debug state | pass: loss 5.2700114 vs 5.2699833, 16/16 gradient tensors, 10-step trajectory within 0.01 (same numbers as before the change) |
+| `make verify-gpu MOJO_DEFINES="-D LLMM_QK_NORM=1"` (qknorm state, PyTorch trajectory) | pass: loss 5.7229743 vs 5.722967, 16/16 gradient tensors (incl. qkv weight/bias, both attn weights), steps within 0.01 |
+| same, `LLMM_ATTN_SCALE=0.12` + the 0.12 state | pass: loss 5.7112312 vs 5.7112207, 16/16, steps within 0.01 |
+| `tests/test_attention_equivalence.py` + `test_split_merge_equivalence.py` on GPU (`MAX_USE_ACCELERATOR=1`) | 66 passed, includes 10 new `qkn_*`/`scale_only` chain cases (fwd out, dq, dk, dv vs torch autograd; fp32 and bf16; T=7, 9, 17, 37, 64) |
+| mutant: backward without the `-u*mean(dy*u)` term | the 3 fp32 `qkn_*` cases at hd 32/64 fail, so the gate can see a wrong norm backward |
+| `make test-mojo` | `tests result=pass files=26 passed=223 failed=0` |
+| bf16 generation, `-D LLMM_QK_NORM=1` infer build, `gpt2_124M_bf16.bin`, seeds 1-8 and `LLMM_ATTN_SCALE=0.12`, every T = 1..39 (the f0da883 crash was at t=9) | all exit 0, no CUDA_ERROR |
+| bf16 5-step smoke, qknorm build, `-attn_scale 0.12` | runs; `qk_max` logged (about 5.0 at init) |
+
+Not verified: Metal path compile (flag-off code is unchanged except new default
+arguments), multi-rank, fp8/fp4 builds with the flag on, and any interaction with
+W8 rotary (not yet on main when this was written).
+
+## Ranking jobs
+
+`w7_qknorm.sh` (QK-norm, default scale) and `w7_qknorm_s012.sh` (QK-norm,
+`-attn_scale 0.12`): base recipe plus `-qk_log 1`; logs `sweeps/w7_qknorm*.jsonl`,
+per-step `qk_max` in the verbose log. Results to be added after the runs.
 
 ## AI use statement
 
