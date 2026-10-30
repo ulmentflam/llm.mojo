@@ -60,6 +60,7 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
+from llmm.qk_clip import qk_clip_apply
 from llmm.matmul import (
     fp8_mutex_preseed,
     matmul_fwd,
@@ -1201,6 +1202,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # fp32 master copy of the weights (size #params) for bf16/fp8 training; a
     # size-1 placeholder under fp32, where the params are their own master.
     var master_buf: DeviceBuffer[MASTER_DTYPE]
+    # QK-clip: [L*NH] fp32 per-head max attention logit of the current step.
+    var head_max_buf: DeviceBuffer[DType.float32]
     var acts_buf: DeviceBuffer[GPT2_DTYPE]
     var grad_acts_buf: DeviceBuffer[GPT2_DTYPE]
     # fp32 statistics/losses, split out from the main (param-precision) acts.
@@ -1276,6 +1279,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var m_memory: MutMemPtr[MASTER_DTYPE]
     var v_memory: MutMemPtr[MASTER_DTYPE]
     var master_memory: MutMemPtr[MASTER_DTYPE]
+    var head_max_memory: MutMemPtr[DType.float32]
+    var qk_clip_tau: Float32  # <= 0 disables QK-clip
 
     # Activations of the model, and their sizes
     var acts: ActivationTensors[GPT2_DTYPE]
@@ -1434,6 +1439,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.m_memory = NULL_MASTER_PTR
         self.v_memory = NULL_MASTER_PTR
         self.master_memory = NULL_MASTER_PTR
+        self.head_max_memory = NULL_MASTER_PTR
+        self.qk_clip_tau = 0.0
         self.acts_memory = NULL_DTYPE_PTR
         self.grad_acts_memory = NULL_DTYPE_PTR
         self.acts_stats_memory = NULL_MASTER_PTR
@@ -1482,6 +1489,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.v_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
+        self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](1)
@@ -2672,6 +2680,60 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.has_allocated_grads = True
 
+    def enable_qk_clip(mut self, tau: Float32) raises:
+        """Track per-(layer, head) max attention logits during forward and
+        allow `qk_clip_step` to rescale Q/K rows. tau <= 0 disables."""
+        if tau <= 0.0:
+            self.qk_clip_tau = 0.0
+            return
+        var n = self.config.num_layer * self.config.num_heads
+        self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](n)
+        self.head_max_buf.enqueue_fill(Scalar[DType.float32](0.0))
+        self.ctx.synchronize()
+        self.head_max_memory = rebind_mut_mem[DType.float32](
+            self.head_max_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.qk_clip_tau = tau
+
+    def qk_clip_step(mut self) raises:
+        """Call after the optimizer step: rescale Q/K projection rows (and
+        biases) of every head whose step-max logit exceeded tau."""
+        if self.qk_clip_tau <= 0.0:
+            return
+        var w_off = 0
+        for i in range(Parameters.qkv_weight):
+            w_off += self.param_sizes[i]
+        var b_off = 0
+        for i in range(Parameters.qkv_bias):
+            b_off += self.param_sizes[i]
+        qk_clip_apply[GPT2_DTYPE, Self.target](
+            as_mut_kernel[GPT2_DTYPE](self.params_memory),
+            as_mut_kernel[MASTER_DTYPE](self.master_memory),
+            USE_BF16,
+            w_off,
+            b_off,
+            as_immut_kernel_from_mut[DType.float32](self.head_max_memory),
+            self.config.num_layer,
+            self.config.num_heads,
+            self.config.channels,
+            self.qk_clip_tau,
+            self.ctx,
+        )
+
+    def qk_max(mut self) raises -> Float32:
+        """Max attention logit over all (layer, head) of the last step(s)
+        (call before the next zero_gradients). Syncs the device."""
+        if self.qk_clip_tau <= 0.0:
+            return 0.0
+        var n = self.config.num_layer * self.config.num_heads
+        var host = self.ctx.enqueue_create_host_buffer[DType.float32](n)
+        self.ctx.enqueue_copy(host, self.head_max_buf)
+        self.ctx.synchronize()
+        var best = Float32(0.0)
+        for i in range(n):
+            best = max(best, host[i])
+        return best
+
     def allocate_optimizer_moments(mut self) raises:
         var n = self.optimizer_num_parameters
         # Adam moments are always fp32 (MASTER_DTYPE), independent of param dtype.
@@ -3453,6 +3515,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 Int64(head_dim),
                 self.ctx,
                 cache=rebind[KVCachePtr](Pointer(to=self.kv_cache)),
+                head_max=Optional[MutKernelPtr[DType.float32]](
+                    as_mut_kernel[DType.float32](
+                        self.head_max_memory.unsafe_offset(layer * num_heads)
+                    )
+                ) if self.qk_clip_tau
+                > 0.0 else None,
             )
 
             # Matmul Attn Proj. Always bf16 under fp4 (same rationale as the
@@ -3906,6 +3974,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         comptime if is_cpu[Self.target]():
             if self.debug_stall_cpu_queue:
                 stall_cpu_queue(self.ctx)
+        if self.qk_clip_tau > 0.0:
+            # Per-optimizer-step maxima: reset before each step's first micro-step.
+            if zero_param_grads:
+                self.head_max_buf.enqueue_fill(Scalar[DType.float32](0.0))
         if zero_param_grads and self.has_allocated_grads:
             if self._use_bucketing():
                 # No monolithic gradient buffer exists under bucketing: zero the
