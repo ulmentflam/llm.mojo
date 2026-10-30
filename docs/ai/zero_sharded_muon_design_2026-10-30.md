@@ -1053,6 +1053,42 @@ non-streaming).
   per-rank head maxima (different per rank) vs ZeRO-0 + global max: params
   bit-equal.
 - If S5 slips, keep the raise and document it.
+- **Status (fu/zs5, ZeRO-0/1 implemented; ZeRO-2/3 deferred):**
+  - `ZeroContext.allreduce_max_host` (llmm/zero.mojo) is a host-side copy of
+    `allreduce_or_host` with `max`; one code path for every target (the
+    coordinator's shared-inputs registry or, without a coordinator, a copy).
+    Tested threaded at W=4 and without a coordinator (tests/test_zero.mojo).
+  - `enable_qk_clip(tau, planted_head_max_only=False)`: the WORLD_SIZE > 1 raise
+    is gone for ZeRO-0 (either optimizer) and ZeRO-1 Muon. It still raises for
+    AdamW + ZeRO >= 1 (flat-shard Q/K rows) and for ZeRO-2/3 (sharded Muon
+    itself raises there until S2/S3). The CPU-target raise STAYS: the CPU
+    attention path has no logit-max hook, so `planted_head_max_only=True` is the
+    test-only escape and the caller plants `head_max_memory`.
+  - `_qk_sync_head_max` (all-reduce-max of `head_max_buf`, idempotent per step,
+    flag cleared by the backward fold) is called from `qk_max()`,
+    `qk_clip_step()` and `_qk_clip_sharded`; so `qk_max()` logs the global max
+    and is a collective at W>1 (every rank calls it, as the trainer does).
+  - ZeRO-1 Muon: `_qk_clip_sharded()` is invoked from ONE delimited block in
+    `_update_sharded_muon`, after the `synchronize()` that follows the AdamW and
+    Muon local updates and BEFORE the "Propagate AdamW" gather. It scales (a)
+    the owner's owner-space Q/K C x C blocks (`muon_p_memory`, and
+    `muon_master_memory` under bf16) with the new `qk_clip_matrix`, and (b) the
+    qkv-bias entries inside this rank's flat shard (params + flat master shard)
+    with `qk_clip_bias_range`; the two existing gathers then carry the result.
+    It sets `qk_clip_applied`, which turns the trainer's later `qk_clip_step()`
+    into a no-op. ZeRO-0 at W>1 only runs the sync, then the existing full-buffer
+    `qk_clip_step`. W=1 is untouched.
+  - Merge note for S2/S3: the block is the 3 lines
+    `if self.qk_clip_tau > 0.0: self._qk_clip_sharded()` in
+    `_update_sharded_muon`. For ZeRO-2/3 it must stay after the last local write
+    and before the gathers (ZeRO-3: the owner-space Q/K clip is enough, the next
+    forward's gather carries it, but the bias clip needs the flat shard under
+    the ZeRO-3 params layout, so `_qk_clip_sharded`'s `params_memory.unsafe_offset(a)`
+    must be revisited for streaming), and `enable_qk_clip`'s ZeRO-2/3 raise lifted.
+  - Verified: tests/test_qk_clip.mojo threaded CPU W=2 ZeRO-1, W=4 ZeRO-1 and
+    W=2 ZeRO-0 with per-rank-different planted maxima; every rank's final params
+    are bit-equal to (unclipped step + `qk_clip_apply` with the global maxima).
+    Not run: a multi-GPU run (one GPU here); the W=2 GPU-target build compiles.
 
 **S6: GPU multi-rank verification** (configs `zero/muon_z*_w2.json`, the
 runbook in section 8). No new code paths are expected: S1 to S3 are
