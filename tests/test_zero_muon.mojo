@@ -465,5 +465,103 @@ def test_ownership_table() raises:
     assert_equal(bad, 0)
 
 
+def _sizes_w8(
+    L: Int, exp_s: Int, exp_opt: Int, exp_o: List[Int], exp_a: List[Int]
+) raises:
+    """Run enable_muon on 8 threaded ZeRO-1 ranks of an L-layer C=16 model and
+    compare S, opt, O_r and A_r against values computed independently of the
+    trainer (a Python model of _compute_param_sizes / owner (k*L+l) mod W /
+    [r*opt, (r+1)*opt) intersected with the AdamW ranges). Also checks the
+    segment invariants: nonempty, ascending, shard_rel = flat_start - lo,
+    compact_off = prefix sum, all inside [lo, lo+opt)."""
+    comptime W = 8
+    var path = String("gpt2_zm_sz_l") + String(L) + ".bin"
+    _ = _write_checkpoint(path, L, 1, 16)
+    var coord = heap_alloc[CpuCoordinator](1)
+    coord[] = CpuCoordinator(W)
+    var errors = heap_alloc[Int](W)
+    var got = heap_alloc[Int](4 * W)
+    for r in range(W):
+        errors[unsafe_offset=r] = 0
+
+    def _run_rank(rank: Int) {imm}:
+        try:
+            var ctx = DeviceContext(api="cpu")
+            var model = GPT2["cpu", W](
+                path,
+                rank,
+                1,
+                ctx,
+                cpu_coordinator_ptr=Optional[
+                    Pointer[CpuCoordinator, MutUntrackedOrigin]
+                ](coord),
+            )
+            model.enable_muon(Scalar[DType.float32](0.95))
+            var opt = model.optimizer_num_parameters
+            var lo = rank * opt
+            var segs = model._adamw_shard_segments()
+            var acc = 0
+            var prev_end = lo
+            for i in range(len(segs)):
+                ref sg = segs[i]
+                if sg.len <= 0:
+                    raise Error("empty segment")
+                if sg.flat_start < prev_end:
+                    raise Error("segments not ascending/disjoint")
+                if sg.shard_rel != sg.flat_start - lo:
+                    raise Error("shard_rel != flat_start - lo")
+                if sg.compact_off != acc:
+                    raise Error("compact_off is not the prefix sum")
+                if sg.flat_start + sg.len > lo + opt:
+                    raise Error("segment beyond the shard")
+                acc += sg.len
+                prev_end = sg.flat_start + sg.len
+            got[unsafe_offset=4 * rank] = model.muon_shard_elems
+            got[unsafe_offset=4 * rank + 1] = opt
+            got[unsafe_offset=4 * rank + 2] = model.muon_owned_elems
+            got[unsafe_offset=4 * rank + 3] = model.v_num_parameters
+            if acc != model.v_num_parameters:
+                raise Error("sum of segment lengths != v_num_parameters")
+        except e:
+            print("rank", rank, "failed:", e)
+            errors[unsafe_offset=rank] = 1
+            coord[].abort()
+
+    sync_parallelize(_run_rank, W)
+    coord[].free()
+    coord.unsafe_free()
+    _remove(path)
+    var bad = 0
+    for r in range(W):
+        bad += errors[unsafe_offset=r]
+    errors.unsafe_free()
+    assert_equal(bad, 0)
+    for r in range(W):
+        assert_equal(got[unsafe_offset=4 * r], exp_s)
+        assert_equal(got[unsafe_offset=4 * r + 1], exp_opt)
+        assert_equal(got[unsafe_offset=4 * r + 2], exp_o[r])
+        assert_equal(got[unsafe_offset=4 * r + 3], exp_a[r])
+    got.unsafe_free()
+
+
+def test_ownership_sizes_tiny_w8() raises:
+    """The review-flagged tiny W=8 configs: L=1 has ranks owning no matrix
+    (O_r = 0) and S > opt; both L=1 and L=2 have a rank with A_r = 0."""
+    _sizes_w8(
+        1,
+        1024,
+        576,
+        [256, 256, 256, 256, 1024, 1024, 0, 0],
+        [576, 576, 160, 48, 48, 0, 64, 48],
+    )
+    _sizes_w8(
+        2,
+        1280,
+        984,
+        [1280, 1280, 1280, 1280, 256, 256, 256, 256],
+        [984, 360, 72, 120, 0, 128, 0, 64],
+    )
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
