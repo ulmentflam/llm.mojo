@@ -6634,6 +6634,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var b_m = _mem_bytes(self.m_buf)
         var b_v = _mem_bytes(self.v_buf)
         var b_master = _mem_bytes(self.master_buf)
+        var b_muon_p = _mem_bytes(self.muon_p_buf)
+        var b_muon_g = _mem_bytes(self.muon_g_buf)
+        var b_muon_m = _mem_bytes(self.muon_m_buf)
+        var b_muon_master = _mem_bytes(self.muon_master_buf)
         var b_param_window = _mem_bytes(self.param_window_buf)
         var b_embed_window = _mem_bytes(self.embed_window_buf)
         var b_acts = _mem_bytes(self.acts_buf)
@@ -6650,7 +6654,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         var c_params = b_params
         var c_grads = b_grads_full + b_grad_pool + b_grad_shard
-        var c_optimizer = b_m + b_v + b_master
+        var c_optimizer = (
+            b_m
+            + b_v
+            + b_master
+            + b_muon_p
+            + b_muon_g
+            + b_muon_m
+            + b_muon_master
+        )
         var c_z3_windows = b_param_window + b_embed_window
         var c_activations = (
             b_acts + b_acts_stats + b_grad_acts + b_grad_acts_stats + b_ce_stats
@@ -6718,6 +6730,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         s += "," + _mem_kv("m_buf", b_m)
         s += "," + _mem_kv("v_buf", b_v)
         s += "," + _mem_kv("master_buf", b_master)
+        s += "," + _mem_kv("muon_p_buf", b_muon_p)
+        s += "," + _mem_kv("muon_g_buf", b_muon_g)
+        s += "," + _mem_kv("muon_m_buf", b_muon_m)
+        s += "," + _mem_kv("muon_master_buf", b_muon_master)
         s += "," + _mem_kv("param_window_buf", b_param_window)
         s += "," + _mem_kv("embed_window_buf", b_embed_window)
         s += "," + _mem_kv("acts_buf", b_acts)
@@ -6744,6 +6760,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         _mem_mark(inactive, self.m_buf, "m_buf")
         _mem_mark(inactive, self.v_buf, "v_buf")
         _mem_mark(inactive, self.master_buf, "master_buf")
+        _mem_mark(inactive, self.muon_p_buf, "muon_p_buf")
+        _mem_mark(inactive, self.muon_g_buf, "muon_g_buf")
+        _mem_mark(inactive, self.muon_m_buf, "muon_m_buf")
+        _mem_mark(inactive, self.muon_master_buf, "muon_master_buf")
         _mem_mark(inactive, self.param_window_buf, "param_window_buf")
         _mem_mark(inactive, self.embed_window_buf, "embed_window_buf")
         _mem_mark(inactive, self.acts_buf, "acts_buf")

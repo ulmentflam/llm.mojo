@@ -967,6 +967,40 @@ sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.
   `reducescatter_buckets` into an `S != opt` owner space.
 - Gate: T1 at stage 1, T2 at ZeRO-1 (**bit-exact**), T4 (matrices <= 2048
   elements, equal counts), T5 at `-z 1`, compile gates.
+- **Status (fu/zs1, implemented):** ownership table, owner buffers, the ZeRO-1
+  `_update_sharded_muon` and the S0 test gaps are in. Details and deviations:
+  - `MuonGroup` keeps its 5-argument constructor (flat: `sr_* = offset/stride`),
+    so no W=1 call site changed; the 7-argument form and `MuonGroup.flat` are
+    new. `muon_apply_gpu` takes `sr_offset_arg` and `sr_stride_arg`; `stride_arg`
+    only indexes.
+  - Owner buffers are allocated for `WORLD_SIZE > 1` and `zero_stage >= 1`
+    (ZeRO-0 W>1 keeps the replicated path and `v_compact_bases`). At ZeRO >= 1
+    `v_compact_bases` is empty and `v` is indexed by `AdamSeg.compact_off`;
+    `_v_count()` is `A_r`. The legacy full-`v` copy-down runs only at ZeRO-0
+    and loops over `_adamw_shard_segments()`.
+  - `update()` routes to `_update_sharded_muon` once, ahead of both target
+    branches, so neither flat allgather runs. AdamW propagation is
+    `allgather_ranges(params+lo, opt -> params)`; the self copy is skipped. The
+    owner gather uses `shard_size = S`. `ensure_comm_setup` gets
+    `max(opt, S)` elements.
+  - **Gotcha found by T2:** the CPU Muon reference reads `muon_g` on the host
+    right after the pack's queued `enqueue_copy`; without a `synchronize()` in
+    between, W=4 was nondeterministic (1-ulp differences in the proj matrices,
+    and then in everything). The fix is one synchronize before the optimizer
+    kernels. Any future pack/scatter into an owner buffer needs the same.
+  - `write_checkpoint` / `load_checkpoint` raise for sharded Muon until S4
+    (owner momentum is not in the state file yet).
+  - `memory_report_json` counts the four owner buffers under `optimizer`.
+  - Verified: T2 (`tests/test_zero_muon.mojo`, threaded CPU, different batch
+    per rank, 3 steps, atol 0) ZeRO-1 == ZeRO-0 at W=2, W=4 and W=8 with L=1
+    (ranks 6 and 7 own nothing). T4 (`test_owner_layout_matches_flat`, GPU) is
+    bit-identical for 32x32, 32x64, 64x32. T5 at `-z 1` (W=2, d6): losses
+    10.865850, 10.716245, 10.648577, equal to `-z 0` to all printed digits, and
+    the ZeRO-1 steps take about half the time (NS runs on one rank's half of the
+    matrices). `-opt adamw -z 1` is unchanged against main's binary. T1 (the
+    sequential harness) was not extended; T2 covers the same ground with real
+    collectives, and the harness cannot see propagation bugs. The multi-GPU
+    arms stay compile-checked only.
 
 **S2: ZeRO-2** (`backward` per-layer bucket split; `zero_gradients`;
 `calculate_grad_norm` two-term norm; the ZeRO-2 arm of `_update_sharded_muon`).
