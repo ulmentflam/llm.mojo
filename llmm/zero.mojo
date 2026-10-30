@@ -693,6 +693,43 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                 " ensure_comm_setup(max_shard_bytes) before GPU collectives"
             )
 
+    def _bucket_overlap_max(
+        self, dest_starts: List[Int], lengths: List[Int], opt: Int
+    ) raises -> Int:
+        """Host-side validation shared by every `reducescatter_buckets` path.
+
+        Raises if a bucket's global flat range leaves the padded vector
+        `[0, N*opt)` (the collective would otherwise silently drop the
+        out-of-range tail), and returns the largest bucket-shard overlap `S`
+        any bucket has with ANY rank's shard, which bounds what the GPU path
+        must stage through `comm_scratch`. Runs BEFORE any barrier so every
+        rank raises (identical lists) instead of stranding peers
+        mid-collective. The max is over all ranks, not just this one, so the
+        scratch check's verdict is rank-invariant: with a per-rank max one rank
+        could raise while a peer with a smaller overlap walked into the
+        barrier and hung.
+        """
+        var worst = 0
+        for b in range(len(dest_starts)):
+            var d = dest_starts[b]
+            if d < 0 or d + lengths[b] > Self.N * opt:
+                raise Error(
+                    "ZeroContext.reducescatter_buckets: bucket "
+                    + String(b)
+                    + " flat range ["
+                    + String(d)
+                    + ", "
+                    + String(d + lengths[b])
+                    + ") lies outside the padded vector [0, "
+                    + String(Self.N * opt)
+                    + ")"
+                )
+            for p in range(Self.N):
+                var lo = p * opt
+                var hi = lo + opt
+                worst = max(worst, min(d + lengths[b], hi) - max(d, lo))
+        return worst
+
     def signal_ptr(self) -> Pointer[Signal, MutUntrackedOrigin]:
         return rebind[Pointer[Signal, MutUntrackedOrigin]](
             self.signal_buffer.unsafe_ptr()
@@ -1060,6 +1097,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         self.assert_ranges_agree(
             "reducescatter_buckets", dest_starts, pool_offsets, lengths
         )
+        var max_overlap = self._bucket_overlap_max(dest_starts, lengths, opt)
         comptime if is_cpu[Self.target]():
             if Self.N == 1:
                 # Single rank: the whole vector is this rank's shard (opt ==
@@ -1121,6 +1159,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                         lengths,
                         shard_ptr,
                         opt,
+                        max_overlap,
                     )
                 else:
                     raise Error(
@@ -1138,6 +1177,7 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         lengths: List[Int],
         shard_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         opt: Int,
+        max_overlap: Int,
     ) raises:
         """Staged-copy GPU path for `reducescatter_buckets`.
 
@@ -1150,6 +1190,9 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         """
         var lo = self.rank * opt
         var hi = lo + opt
+        # Host-side, before any barrier: every rank has identical lists and
+        # scratch sizes, so all raise together rather than stranding peers.
+        self._check_scratch[dtype](max_overlap)
         # Flush this rank's pool writes (the backward kernels that filled the
         # bucket were enqueued on self.ctx before this call) BEFORE the host
         # barrier1 inside _register_and_sync, so that once every rank passes
@@ -1337,13 +1380,38 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         )
         var count = len(lengths)
         comptime if is_cpu[Self.target]():
-            if Self.N == 1 or not self.cpu_coordinator_ptr:
+            if Self.N == 1:
                 # Single rank owns the whole vector at local offset 0.
                 for i in range(count):
                     var fs = flat_starts[i]
                     var d = dst_base.unsafe_offset(dst_offsets[i])
+                    if Int(d) == Int(shard_base.unsafe_offset(fs)):
+                        continue  # in-place: identity, nothing to copy
                     for j in range(lengths[i]):
                         d[unsafe_offset=j] = shard_base[unsafe_offset=fs + j]
+                return
+            if not self.cpu_coordinator_ptr:
+                # N > 1 with no coordinator (the sequential-rank equivalence
+                # harness): only THIS rank's shard is addressable, so copy
+                # just the intersection of each range with
+                # [rank*shard_size, (rank+1)*shard_size), the same rule
+                # reducescatter_buckets uses in its no-coordinator branch.
+                # (This used to treat the local shard as the whole vector and
+                # read out of bounds.)
+                var my_lo = self.rank * shard_size
+                var my_hi = my_lo + shard_size
+                for i in range(count):
+                    var fs = flat_starts[i]
+                    var lo = max(fs, my_lo)
+                    var hi = min(fs + lengths[i], my_hi)
+                    if hi <= lo:
+                        continue
+                    var d = dst_base.unsafe_offset(dst_offsets[i] + (lo - fs))
+                    var src = shard_base.unsafe_offset(lo - my_lo)
+                    if Int(d) == Int(src):
+                        continue  # own shard already sits at the destination
+                    for j in range(hi - lo):
+                        d[unsafe_offset=j] = src[unsafe_offset=j]
                 return
             var coord_ptr = _register_and_sync[
                 dtype, MutAnyOrigin, MutAnyOrigin
@@ -1365,6 +1433,10 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     )
                     var d_off = lo - fs
                     var s_off = lo - p * shard_size
+                    if Int(d.unsafe_offset(d_off)) == Int(
+                        peer.unsafe_offset(s_off)
+                    ):
+                        continue  # own shard already at the destination
                     for j in range(hi - lo):
                         d[unsafe_offset=d_off + j] = peer[
                             unsafe_offset=s_off + j
@@ -1394,6 +1466,15 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                                 dst_base.unsafe_offset(dst_offsets[i])
                             ).unsafe_offset((lo - fs))
                             if p == self.rank:
+                                if Int(d) == Int(
+                                    shard_base.unsafe_offset(
+                                        (lo - p * shard_size)
+                                    )
+                                ):
+                                    # Own shard already at the destination
+                                    # (params_memory case): a src == dst
+                                    # memcpy is formally undefined; skip.
+                                    continue
                                 self.ctx.enqueue_copy(
                                     dst_ptr=d,
                                     src_ptr=rebind[
@@ -1440,6 +1521,10 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
             else:
                 # N == 1 GPU: own buffer holds the whole vector at offset 0.
                 for i in range(count):
+                    if Int(dst_base.unsafe_offset(dst_offsets[i])) == Int(
+                        shard_base.unsafe_offset(flat_starts[i])
+                    ):
+                        continue  # in-place: identity
                     self.ctx.enqueue_copy(
                         dst_ptr=dst_base.unsafe_offset(dst_offsets[i]),
                         src_ptr=rebind[Pointer[Scalar[dtype], ImmutAnyOrigin]](

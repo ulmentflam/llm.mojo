@@ -30,7 +30,7 @@ marked **UNVERIFIED**.
   a coordinator and builds `DeviceContext(device_id=i)` for every rank
   (llmm/zero.mojo:`ensure_comm_setup`), and this box has one GPU. See section 8.
 
-### Review notes (2026-10-30, independent review, PARTIAL: interrupted by a reboot)
+### Review notes, generation 1 (2026-10-30, independent review, PARTIAL: interrupted by a reboot; finished by generation 2 below)
 
 Reviewed against the code at `7d68ac1`. Items 7 (fu/vfree) and 8 (prior-art
 spot check) were not finished. Verdicts so far:
@@ -103,7 +103,35 @@ spot check) were not finished. Verdicts so far:
   Call A and is untouched. It also covers the `_z3_stream_layer` split: the
   window `dst_offsets` are unchanged, so the `self.params.*` re-basing is
   unchanged.
-- **Items 7 and 8: UNVERIFIED** (not reached).
+- **Items 7 and 8:** not reached by generation 1; see generation 2 below.
+
+### Review notes, generation 2 (2026-10-30, completes the review)
+
+Reviewed at `58dea3e`, plus fu/vfree `684de0c` and fu/zs0 `e2975e9`
+(read-only). Generation 1's corrections are now folded into the body,
+not just the notes above:
+
+- **Finding 4:** direction fixed. A larger W, or ZeRO-0 state at ZeRO >= 1,
+  reads silently with `v` taken from `m` bytes; a smaller W raises.
+- **Sections 1 and 6:** "zero extra bytes" now means total over ranks. The
+  per-rank `A_r + O_r` imbalance (+68% on rank 0 at 124M W=4) is stated, and
+  S6 and S7 act on it.
+- **Section 4:** the new `sr_stride_arg` kernel argument is required. The SR
+  fields do not give GPU W=1/W>1 bit-equality.
+- **Section 8:** T2 is exact for ZeRO-1 and for ZeRO-2/3 step 1, and rtol
+  ~1e-4 over 3 steps at ZeRO-2/3. T4 uses matrices of at most 2048 elements
+  with equal counts. T5 compares to printed precision. T6 checks the exact
+  length in both directions.
+- **Item 7 (fu/vfree): DONE.** The contract is in section 6. In short: one
+  segment list, per-rank compact `v` of `A_r` elements (0 on some tiny-config
+  ranks), copy-down only at ZeRO-0, `_update_hybrid` never on the sharded
+  path, and a positional-argument merge hazard with fu/zs0 in
+  `read_state_checkpoint`.
+- **Item 8 (prior art):** the Moonlight, DeepSpeed ZeRO-1/2 and DeepSpeed
+  ZeRO-3 rows are CONFIRMED against primary sources (section 1, with URLs).
+  The other rows were not spot-checked.
+- **S0 (fu/zs0):** conforms to the design. Two CPU-testable test gaps are
+  moved to S1 (section 9).
 
 ## Critical findings (read these first)
 
@@ -147,12 +175,20 @@ spot check) were not finished. Verdicts so far:
    destination pointer.
 
 4. **Resume does not check world size today.** `load_checkpoint` reads
-   `optimizer_num_parameters` elements per blob. `read_and_copy` raises only
-   when the file is short. A resume at a smaller W reads a prefix of a larger
-   shard file without error. Header slot 2 (`num_processes`) is written but
-   never compared (llmm/checkpointing.mojo:`read_state_header`,
-   train_gpt2.mojo:`load_checkpoint`). S4 adds the check, which also changes
-   AdamW resume behaviour.
+   `optimizer_num_parameters` (opt) elements per blob. `read_and_copy` raises
+   only when the file is short. So a resume at a **larger** W (smaller opt),
+   or a ZeRO-0 state file loaded at ZeRO >= 1, reads a prefix of the `m` blob
+   without error, and because `v` is read straight after an opt-length `m`,
+   `v` is filled from the file's `m` bytes. A resume at a **smaller** W
+   (larger opt) raises "Failed to read enough bytes". Header slot 2
+   (`num_processes`) is written but never compared
+   (llmm/checkpointing.mojo:`read_state_header`,
+   train_gpt2.mojo:`load_checkpoint`). S4 adds the check and an exact
+   file-length check, which also changes AdamW resume behaviour.
+   *(Direction corrected by review gen 2; the first version said a smaller W
+   reads a silent prefix. S0 on fu/zs0 already compares `num_processes` and
+   `process_rank`. That does not catch a ZeRO-0 state loaded at ZeRO >= 1 at
+   the same W, so the exact length check is still needed.)*
 
 5. **QK-clip cannot be exercised end to end on CPU.** The logit-max hook exists
    only in the GPU softmax, and `enable_qk_clip` raises on the CPU target. The
@@ -168,16 +204,55 @@ spot check) were not finished. Verdicts so far:
 
 ## 1. Prior art (researched 2026-10-29 from papers and repo source)
 
-| System | Where Newton-Schulz runs | What is communicated | Momentum | Ownership / balance | Overhead claimed | Stages | Source |
-|---|---|---|---|---|---|---|---|
-| Moonshot "Distributed Muon" (Moonlight, Alg. 1) | On the full matrix, on every DP rank whose flat partition intersects it | reduce-scatter G (fp32) → momentum on local shard → **DP gather** of momentum-applied shard (bf16) → NS → keep local partition → all-gather params | partitioned (flat shard), applied before the gather | inherits Megatron flat partition; no balancing | comms "(1, 1.25] of Distributed AdamW"; memory "half of Distributed AdamW" (1 buffer vs 2) | ZeRO-1 | arXiv 2502.16982; github.com/MoonshotAI/Moonlight |
-| Megatron PoC PR #1428 (linked from Moonlight; closed) | every rank holding a slice; a matrix split across k ranks is computed k times | momentum on 1-D shard, `all_gather_into_tensor` of whole bucket (bf16), slice local range | partitioned | flat buffer | none stated | ZeRO-1 + TP/PP | github.com/NVIDIA/Megatron-LM/pull/1428 |
-| Kimi K2 (MuonClip) | as Moonlight | not described | "optimizer states are distributed" | n/a | ~30 GB state/GPU | ZeRO-1 | arXiv 2507.20534. Cross-rank aggregation of the QK-clip max is **not stated (UNVERIFIED)** |
-| DeepSpeed ZeRO-1/2 (`stage_1_and_2.py`, `runtime/zero/muon/`) | full gradient of each param intersecting the partition; boundary-straddlers redundantly | normal reduce; straddling Muon params switch the bucket to all-reduce | flat buffer, full size of each intersecting param (duplicated for straddlers) | contiguous partition | Muon state 4 B/param vs Adam 8 B; 31.4 vs 34.5 GiB on Qwen2.5-3B | 0/1/2 | github.com/deepspeedai/DeepSpeed (blogs/muon-optimizer) |
-| DeepSpeed ZeRO-3 (`stage3.py`) | each rank a round-robin share of params, once per optimizer step | grads reduce-scattered, then **all-gathered back** with momentum; update + momentum all-gathered again | partitioned at rest, gathered transiently | round-robin in param order | none stated | 3 (rejects reduce_scatter / all2all modes) | same repo |
-| KellerJordan/Muon `Muon` | owner only | none for grads (assumes DDP all-reduce); padded `all_gather` per block of `world_size` params | owner only | sort by size desc, round-robin | n/a | DDP | github.com/KellerJordan/Muon/blob/master/muon.py |
-| modded-nanogpt NorMuon / ANVIL (current) | owner of a chunk of a stacked same-shape group, one batched NS | `reduce_scatter_tensor` of the stack straight into owners, then `all_gather_into_tensor` of updated params | owner-local chunk | same-shape stacks padded to a multiple of W | NorMuon paper: distributed NS +2.9% step vs +8.1% redundant | ZeRO-2-like | github.com/KellerJordan/modded-nanogpt (records 2025-12-11, `optim/anvil.py`); arXiv 2510.05491 |
-| Megatron `LayerWiseDistributedOptimizer` | whole params per DP rank | DDP all-reduce grads, all_gatherv updated params; newer layout makes buckets shard-aligned for reduce-scatter | owner | LPT by NS cost `m·n·min(m,n)`; legacy snake order | n/a | ZeRO-1-like | NVIDIA Megatron `layer_wise_optimizer.py`; NeMo emerging-optimizers docs |
+| System | Where Newton-Schulz runs | What is communicated | Momentum | Ownership / balance | Overhead claimed | Stages | Source | Spot check |
+|---|---|---|---|---|---|---|---|---|
+| Moonshot "Distributed Muon" (Moonlight, Alg. 1) | On the full matrix, on every DP rank whose flat partition intersects it | reduce-scatter G (fp32) → momentum on local shard → **DP gather** of momentum-applied shard (bf16) → NS → keep local partition → all-gather params | partitioned (flat shard), applied before the gather | inherits Megatron flat partition; no balancing | comms "(1, 1.25] of Distributed AdamW"; memory "half of Distributed AdamW" (1 buffer vs 2) | ZeRO-1 | arXiv 2502.16982; github.com/MoonshotAI/Moonlight | **CONFIRMED** (gen 2; see below) |
+| Megatron PoC PR #1428 (linked from Moonlight; closed) | every rank holding a slice; a matrix split across k ranks is computed k times | momentum on 1-D shard, `all_gather_into_tensor` of whole bucket (bf16), slice local range | partitioned | flat buffer | none stated | ZeRO-1 + TP/PP | github.com/NVIDIA/Megatron-LM/pull/1428 | not checked |
+| Kimi K2 (MuonClip) | as Moonlight | not described | "optimizer states are distributed" | n/a | ~30 GB state/GPU | ZeRO-1 | arXiv 2507.20534. Cross-rank aggregation of the QK-clip max is **not stated (UNVERIFIED)** | not checked |
+| DeepSpeed ZeRO-1/2 (`stage_1_and_2.py`, `runtime/zero/muon/`) | full gradient of each param intersecting the partition; boundary-straddlers redundantly | normal reduce; straddling Muon params switch the bucket to all-reduce | flat buffer, full size of each intersecting param (duplicated for straddlers) | contiguous partition | Muon state 4 B/param vs Adam 8 B; 31.4 vs 34.5 GiB on Qwen2.5-3B | 0/1/2 | github.com/deepspeedai/DeepSpeed (blogs/muon-optimizer) | **CONFIRMED** (gen 2; see below) |
+| DeepSpeed ZeRO-3 (`stage3.py`) | each rank a round-robin share of params, once per optimizer step | grads reduce-scattered, then **all-gathered back** with momentum; update + momentum all-gathered again | partitioned at rest, gathered transiently | round-robin in param order | none stated | 3 (rejects reduce_scatter / all2all modes) | same repo | **CONFIRMED** (gen 2; see below) |
+| KellerJordan/Muon `Muon` | owner only | none for grads (assumes DDP all-reduce); padded `all_gather` per block of `world_size` params | owner only | sort by size desc, round-robin | n/a | DDP | github.com/KellerJordan/Muon/blob/master/muon.py | not checked |
+| modded-nanogpt NorMuon / ANVIL (current) | owner of a chunk of a stacked same-shape group, one batched NS | `reduce_scatter_tensor` of the stack straight into owners, then `all_gather_into_tensor` of updated params | owner-local chunk | same-shape stacks padded to a multiple of W | NorMuon paper: distributed NS +2.9% step vs +8.1% redundant | ZeRO-2-like | github.com/KellerJordan/modded-nanogpt (records 2025-12-11, `optim/anvil.py`); arXiv 2510.05491 | not checked |
+| Megatron `LayerWiseDistributedOptimizer` | whole params per DP rank | DDP all-reduce grads, all_gatherv updated params; newer layout makes buckets shard-aligned for reduce-scatter | owner | LPT by NS cost `m·n·min(m,n)`; legacy snake order | n/a | ZeRO-1-like | NVIDIA Megatron `layer_wise_optimizer.py`; NeMo emerging-optimizers docs | not checked |
+
+**Spot checks (review gen 2, 2026-10-30, against primary sources):**
+
+- **Moonlight, CONFIRMED.** Source: arXiv 2502.16982 section 2.3
+  (https://arxiv.org/html/2502.16982), Algorithm 1. The order is
+  reduce-scatter G, momentum on the local partition, DP **gather of the
+  momentum-applied partition** (`G = gather(g', dp_group)`), Newton-Schulz on
+  the full matrix, keep the local slice, all-gather params. The paper says
+  "Distributed Muon follows ZeRO-1" and "the communication workload of
+  Distributed Muon is (1,1.25] of that of Distributed AdamW". The 1.25 is
+  (fp32 reduce-scatter 4 + bf16 Muon gather 2 + fp32 param gather 4) /
+  (4 + 4). Memory is "half of Distributed AdamW" (one buffer instead of two).
+  Two caveats from the paper itself: the Method prose says the gather
+  collects "partitioned gradients", which contradicts Algorithm 1 (this
+  table follows Algorithm 1). The empirical-overhead sentence ("closer to the
+  lower-bound") renders with a stray "1.44" in the HTML version. Treat the
+  empirical figure as unquantified.
+- **DeepSpeed ZeRO-1/2, CONFIRMED.** Source: deepspeedai/DeepSpeed at
+  9148ab2, `deepspeed/runtime/zero/stage_1_and_2.py` and
+  `blogs/muon-optimizer/README.md`
+  (https://github.com/deepspeedai/DeepSpeed/blob/9148ab22be812b563c345c20959ac399fdc6f7a5/deepspeed/runtime/zero/stage_1_and_2.py).
+  `muon_update` runs per whole (unflattened) parameter inside
+  `get_flat_partition`, after reduction and before flattening into the
+  partition. A Muon param whose `partition_ids` has more than one entry gets
+  `copy_ranks` > 1, which forces its bucket to `("allreduce", ...)` ("Split
+  Muon matrices require all-reduce"), so every rank that owns a slice runs NS
+  on the full matrix. The blog states support for stages 1 and 2 (not with
+  optimizer offload plus `reduce_scatter`), plus Muon 31.4 vs AdamW 34.5 GiB
+  on Qwen2.5-3B at ZeRO-2. Stage 0 uses `MuonWithAuxAdam.step` on full
+  `p.grad`.
+- **DeepSpeed ZeRO-3, CONFIRMED.** Source: `deepspeed/runtime/zero/stage3.py`
+  at the same commit. The constructor raises "Muon and reduce scatter cannot
+  be used together" and the same for all2all. Once per step (after the
+  overflow check; issue #8443 moved it off the micro-batch path), the
+  partitioned averaged gradients are all-gathered back to full
+  (`_partitioned_buffers_all_gather`). `_muon_update_sub_group` gathers
+  momentum, gives each rank `round_params[rank]` from each round of
+  `world_sz` params (round-robin in param order), and then all-gathers the
+  updates and the momentum.
 
 Two patterns appear. In **gather-to-all, compute redundantly** (Moonlight,
 DeepSpeed ZeRO-1/2), Newton-Schulz runs on every rank that touches a matrix.
@@ -185,8 +260,9 @@ This keeps the flat partition and the state format, and costs up to 1.25x
 traffic plus duplicated NS. In **owner computes** (KellerJordan,
 modded-nanogpt, NorMuon, Megatron layer-wise), each matrix has one owner,
 gradients reduce-scatter straight to that owner, and the params are
-all-gathered. Traffic is the same as AdamW ZeRO and NS is divided by W. It
-needs a balance rule and its own state layout.
+all-gathered. Total traffic is the same as AdamW ZeRO and NS is divided by
+W. It needs a balance rule and its own state layout, and the per-rank traffic
+follows the ownership, not the flat partition.
 
 **Recommendation for llm.mojo: owner computes, with a separate matrix-granular
 owner space** (sections 2 to 5). Four reasons:
@@ -198,8 +274,10 @@ owner space** (sections 2 to 5). Four reasons:
    `allgather_ranges` take a generic `(shard_ptr, shard_size)` and a list of
    global indices. Pointing them at an owner space of W equal shards of size S
    routes gradients to owners and params back to everyone, with **zero extra
-   bytes** over plain ZeRO (section 6). No new collective is needed except a
-   host max-reduce for QK-clip.
+   bytes in total** over plain ZeRO. Per rank it is not even: rank r handles
+   `A_r + O_r` elements instead of opt, so the most-loaded rank carries up to
+   +68% at 124M W=4 (section 6). No new collective is needed except a host
+   max-reduce for QK-clip.
 3. `muon_update` stays whole-matrix. A Moonlight-style split would have to cut
    `muon_update` into momentum (on shard), a collective, NS, then a partial
    apply over a sub-range of the matrix. The owner-space design needs only
@@ -356,8 +434,14 @@ The change:
 - Add a convenience constructor `MuonGroup.flat(offset, rows, cols, count, stride)`
   that sets `sr_* = offset/stride`. Update the existing call sites:
   `enable_muon`, the `@register("muon_update")` bridge, and `tests/test_muon.mojo`.
-- Pass `g.sr_offset` and `g.sr_stride` to `muon_apply_gpu` in place of
-  `g.offset` and the stride in the `pidx` expression.
+- `muon_apply_gpu` needs a **new `sr_stride_arg` kernel argument**. Today
+  `stride_arg` does two jobs: it indexes params and master
+  (`mat*stride_arg + i`) and it feeds `pidx = offset_arg + mat*stride_arg +
+  i`. In the owner space those two strides differ (`rows*cols` vs
+  `W*stride_k`), so they cannot share an argument. `offset_arg` is used only
+  in `pidx`, so it can carry `g.sr_offset` (rename it `sr_offset_arg`). The
+  result is `pidx = sr_offset_arg + mat*sr_stride_arg + i`. Do not pass
+  `sr_stride` as `stride_arg`.
 - In `_muon_update_cpu`, pass `pidx = g.sr_offset + mat*g.sr_stride + i`
   separately from `idx = base + i`.
 
@@ -367,6 +451,13 @@ Rank r's owned group k is:
 MuonGroup(offset = local_off(k, l0), rows, cols, count = count_rk,
           stride = rows*cols, sr_offset = flat_off(k, l0), sr_stride = W*stride_k)
 ```
+
+The SR fields make the rounding counter match W=1. They do **not** make GPU
+W>1 bit-identical to W=1, for two reasons. `muon_momentum_gpu` accumulates
+per-matrix norms with float atomics across blocks, so the order is
+nondeterministic once a matrix has more than BLOCK*VEC = 2048 elements. The
+cuBLASLt strided-batched GEMMs also run with a different `batch_count`.
+Expect bf16-noise agreement on GPU, not equality (T4, S6).
 
 The vector-path predicate (`n`, `stride`, `offset`, `r*r` multiple of 8) holds
 whenever C is a multiple of 8. The persistent scratch name already encodes its
@@ -394,7 +485,8 @@ matrices with stale flat copies). Today the CPU W>1 branch calls
    local only).
 3. **AdamW**: for each segment, `adamw_update(len, params_memory + flat_start,
    grads_memory + flat_start, master_memory + shard_rel, m + shard_rel,
-   v + shard_rel /* or compact_off under fu/vfree */)`.
+   v + compact_off)` when fu/vfree's compact `v` is on main, or
+   `v + shard_rel` while `v` is still opt-sized (the contract is in section 6).
 4. **Muon**: `muon_update(muon_owned_groups, muon_p_shard, muon_grad_shard,
    muon_master, USE_BF16, muon_m, t, cfg)`.
 5. *(S5)* QK-clip on owner/flat pieces (section 7).
@@ -478,8 +570,11 @@ harness checks `muon_p_shard` directly (section 8).
   (section 7). Today the trainer calls `qk_clip_step()` after `update()` has
   already all-gathered.
 - At W>1, `update()` must never call `_update_hybrid` for `zero_stage >= 1`.
-  It addresses `m_memory` and `master_memory` at full-buffer flat offsets,
-  which overruns opt-sized buffers.
+  It addresses params, grads, `m_memory` and `master_memory` at full-buffer
+  flat offsets (it assumes no sharding), which overruns opt-sized buffers.
+  Under fu/vfree it also indexes `v` by range number k (`v_compact_bases[k]`),
+  not by shard segment. Do not reuse or generalize it for the sharded path.
+  `_update_sharded_muon` gets its own loop over `_adamw_shard_segments()`.
 - `ensure_comm_setup(max(comm_shard, S) * size_of[GPT2_DTYPE]())` in
   `enable_muon`. The GPU `_reducescatter_buckets_gpu` stages each
   bucket/shard overlap (up to one matrix, at most S) through `comm_scratch`
@@ -513,24 +608,97 @@ How to read the table:
     positions remain in the flat param shard (22.8M, 31.1M, 31.1M elements on
     ranks 1 to 3).
 
-**fu/vfree composition.** fu/vfree compacts `v` to the AdamW ranges with bases
-from `_adamw_ranges()`. Ask it to express those bases as
-`_adamw_shard_segments()[i].compact_off` for the shard `[lo, hi)`; at
-W=1/ZeRO-0 the two are identical. The sharded path then indexes `v` with
-`compact_off` and `m`/`master` with `shard_rel`. S7 moves `m` and `master` to
-`compact_off` too.
+**fu/vfree composition (contract for S1; checked against fu/vfree at
+`684de0c` by review gen 2).** What fu/vfree does (commits b43bfe5 and
+684de0c), at ZeRO-0 only:
 
-**Traffic per rank per step** (bytes received, bf16; plain-ZeRO baselines use
-the padded N):
+- `enable_muon` drops the constructor's full-size `v` and allocates a compact
+  one. `v_compact_bases[k]` is the prefix sum over the 5 `_adamw_ranges()`
+  pairs, one entry per range k. `v_num_parameters` is the total.
+- `_update_hybrid` indexes `v` at `v_compact_bases[k]`, and params, grads,
+  `m` and `master` at the full-buffer `start`.
+- `_v_count()` returns `v_num_parameters` under Muon and opt otherwise.
+  `write_state_checkpoint` and `read_state_checkpoint` take an optional
+  trailing `v_num_parameters` (-1 means the same as m).
+- `load_checkpoint` peeks the header and refuses a different
+  `optimizer_kind`. It then requires `getsize == 256*4 + (opt + _v_count())*4`
+  for every optimizer. The one exception is a Muon file of exactly
+  `256*4 + 2*opt*4` (written before v went compact), which it reads at full
+  size and copies down in place, range by range, in ascending order
+  (`bases[k] <= start_k`).
 
-| stage | plain ZeRO | sharded Muon (this design) | extra |
+How S1 must adapt it (if fu/vfree is on main when S1 starts; otherwise S1
+keeps `v` opt-sized and indexed by `shard_rel`, and whichever branch merges
+second applies this):
+
+1. **One segment list.** `_adamw_shard_segments()` is the only source of
+   AdamW ranges for the update, the size of `v`, `_v_count()`, the
+   state-file length and the copy-down. Entries are
+   `(flat_start, len, shard_rel, compact_off)`: nonempty intersections of
+   `[lo, hi)` with the 5 ranges, in ascending order, with
+   `compact_off = sum of the earlier lens`. At W=1 or ZeRO-0 they are the 5
+   `_adamw_ranges()` (all nonempty for L >= 1), and `compact_off` equals
+   fu/vfree's `v_compact_bases[k]`.
+2. **Retire `v_compact_bases`**, or derive it from the segments. Indexing by
+   range number k is wrong at ZeRO >= 1. A rank's segment i is not range i:
+   empty intersections are dropped, and the first segment can start
+   mid-range at `lo`.
+3. **Per-rank compact `v`.** In `enable_muon`, set
+   `v_num_parameters = sum(seg.len) = A_r`. At 124M W=4 that is 31,118,976,
+   8,347,008, 27,648 and 47,616. Allocate `max(A_r, 1)` elements, because
+   A_r is **0** on some ranks in the tiny test configs (L=1 W=8 rank 5;
+   L=2 W=8 ranks 4 and 6). Whether a 0-element `enqueue_create_buffer` works
+   is UNVERIFIED, so don't depend on it.
+4. **AdamW per segment:** params and grads as in section 5,
+   `m + shard_rel`, `master + shard_rel`, `v + compact_off`.
+5. **`_v_count()`** returns `A_r` under Muon at every stage. The state file
+   is `256*4 + (opt + A_r)*4` bytes in S1 to S3, and
+   `256*4 + (opt + A_r + S)*4` once S4 appends `muon_m`.
+6. **`_update_hybrid` stays ZeRO-0 only** (section 5, order constraints).
+7. **The legacy full-`v` copy-down applies only at `zero_stage == 0`** (at
+   W=1 or ZeRO-0 W>1), the only layouts phase-1 Muon could write. Guard it
+   explicitly. At ZeRO >= 1 any length mismatch raises. Write the copy as a
+   loop over segments, `host[compact_off + i] = host[shard_rel + i]` in
+   ascending order. That is safe in place because
+   `compact_off <= shard_rel` for disjoint ascending segments.
+8. **Merge hazard with fu/zs0.** Both branches add trailing optional
+   arguments to `read_state_checkpoint` after `shard_num_parameters`
+   (fu/vfree: `v_num_parameters`; fu/zs0: `expect_num_processes`,
+   `expect_process_rank`), and both call sites in `load_checkpoint` pass
+   them positionally. Whoever merges second must pass them by keyword.
+   Otherwise `WORLD_SIZE` silently becomes the v length.
+
+**S7's trim helper should be the same function.** S7 moves `m` and `master`
+to `compact_off` using the same `_adamw_shard_segments()`. The copy-down
+becomes one helper, `_compact_copy_down(host_buf, segs)` (shard_rel to
+compact_off, ascending), used now for a legacy full `v` and in S7 for
+untrimmed `m`/`v` files. After S7, `A_r` is the length of `m`, `v` and
+`master` alike.
+
+**Traffic per step** (bytes received, bf16, **averaged over ranks**; plain-ZeRO
+baselines use the padded N). The last column is extra bytes **summed over
+all ranks**. It is not a per-rank figure; see the imbalance note below the
+table.
+
+| stage | plain ZeRO | sharded Muon (this design), rank average | extra (total over ranks) |
 |---|---:|---:|---:|
-| ZeRO-1 | allreduce 373.4 MB + allgather 186.7 MB | same allreduce; AdamW-range gather 59.3 MB + owner gather 127.4 MB = 186.7 MB | **0** |
-| ZeRO-2 | reduce-scatter 186.7 + allgather 186.7 | reduce-scatter split flat/owner (same total) + same gather | **0** |
-| ZeRO-3 | per-layer gathers + reduce-scatter | same bytes, split across two calls | **0** |
+| ZeRO-1 | allreduce 373.4 MB + allgather 186.7 MB | same allreduce; AdamW-range gather 59.3 MB + owner gather 127.4 MB = 186.7 MB | **0 total**; per-rank gather sends up to +68% |
+| ZeRO-2 | reduce-scatter 186.7 + allgather 186.7 | reduce-scatter split flat/owner (same total) + same gather | **0 total**; per rank up to +68% |
+| ZeRO-3 | per-layer gathers + reduce-scatter | same bytes, split across two calls | **0 total**; per rank up to +68% |
 | rejected: flat allgather + owner re-gather | | | +127.4 MB |
 | rejected: Moonlight-style gather of U to intersecting ranks (gather-all) | | | +127.4 MB (their 1.25x) |
 | rejected: owner broadcast via allreduce-with-zeros | | | +254.8 MB |
+
+**Per-rank imbalance (review gen 2 correction; the first version said "+0
+extra" per rank).** The total is unchanged, but rank r handles `A_r + O_r`
+elements instead of opt: its AdamW intersection plus its owned matrices. At
+124M W=4, `A_r + O_r` is 52.35M, 29.58M, 21.26M and 21.28M, against
+opt = 31.12M for every rank. So rank 0 reduce-scatters 52.35M elements
+instead of 31.12M (+68%), and sends `52.35M x 2 B x 3 = 314 MB` in the
+gathers instead of 187 MB. Ranks 2 and 3 receive 206 MB instead of 187 MB.
+At W=8, ranks 0 and 1 are +68%. The slowest rank sets the collective time.
+This does not block S0 to S3. S6 must measure it per rank, and S7's
+ownership work must weigh `A_r + O_r`, not NS cost alone.
 
 The extra **collective calls** (each one adds barriers and, on GPU, a
 synchronize):
@@ -629,12 +797,25 @@ tests/test_encoder_row_sparse.mojo uses for `ZeroContext`, is
 - Run: the same W, the same batches, ZeRO ∈ {1, 2, 3} (3 = streaming), 3 steps.
   Compare full params: `params_memory` for ZeRO-1/2, `_z3_gather_full` for
   ZeRO-3.
-- Expected: **bit-exact** (atol 0) for fp32 CPU. Every collective sums ranks
-  in the fixed order k = 0..N-1 (`_reducescatter_cpu`, the coordinator branch
-  of `reducescatter_buckets`), Muon runs on the same values whether owner or
-  replica, and AdamW is elementwise. The trainer evidence is that d6 losses
-  at `-z 0` and `-z 3` agree to 6 decimals over 3 steps. If exactness fails,
-  find out why before loosening anything (see the weak-gates memory note).
+- Expected (corrected by review gen 2; the first version said bit-exact at
+  every stage):
+  - **ZeRO-1 vs ZeRO-0: bit-exact** (atol 0) for fp32 CPU. Grads are
+    allreduced the same way, every collective sums ranks in the fixed order
+    k = 0..N-1, Muon runs on the same values whether owner or replica, and
+    AdamW is elementwise.
+  - **ZeRO-2/3, step 1: bit-exact** for every Muon matrix and every non-wte
+    tensor.
+  - **ZeRO-2/3, 3 steps: rtol ~1e-4.** ZeRO-0 forms `wte_grad = lm_k + enc_k`
+    locally, then allreduces. Bucketed ZeRO-2/3 reduce-scatters the LM-head
+    and encoder parts separately, giving `(lm_0+lm_1) + (enc_0+enc_1)`. fp32
+    addition is not associative, so wte differs by ulps after step 1, and
+    every tensor differs from step 2. zero_grad_bucketing_design already
+    states about 1e-4 vs z0/z1. Keep the step-1 exact check as the strong
+    gate.
+  - **Grad accumulation is not exact** at ZeRO-2/3 either:
+    `sum_k(g_k1 + g_k2)` vs `sum_k g_k1 + sum_k g_k2`.
+  - If an exact case fails, find out why before loosening anything (see the
+    weak-gates memory note).
 - Pass `grad_scale = 1`. The sharded `calculate_grad_norm` sums partials in a
   different order, so a clip-active comparison can differ by an ulp.
 - Also check W=1 with batch B·W (the concatenated batches) at atol 1e-5,
@@ -656,7 +837,11 @@ tests/test_encoder_row_sparse.mojo uses for `ZeroContext`, is
 **T4: GPU single-rank kernel test** (tests/test_muon.mojo, S1). On a flat
 layout of 3 matrices, `muon_update` with `MuonGroup.flat` must equal
 `muon_update` on compact owner-layout copies with `sr_offset`/`sr_stride` set,
-with params, master and m **bit-identical**. Repeat under a
+with params, master and m **bit-identical**. Bit-identity holds only when
+every matrix has at most 2048 elements (BLOCK*VEC; above that the float-atomic
+norm order is nondeterministic) and both sides use the same group `count`
+(cuBLASLt `batch_count`). Use e.g. 32x32 and 32x64 matrices, and give the
+owner side the same count as the flat side. Repeat under a
 `-D LLMM_SR_MASTER=1` bf16 build if the test target supports it (whether
 test-mojo builds an SR variant is **UNVERIFIED**). This is the only runtime
 coverage the owner-layout GPU kernels get on this box.
@@ -664,7 +849,10 @@ coverage the owner-layout GPU kernels get on this box.
 **T5: trainer smoke** (manual gate for S1 to S3). Run
 `make build WORLD_SIZE=2`, check the binary mtime, then
 `make train-cpu WORLD_SIZE=2 ARGS="-e d6 -i <tinyshakespeare train> -j <val> -b 1 -t 64 -x 2 -pn 2 -v 0 -s 0 -opt muon -z {0,1,2,3}"`.
-The step losses must be identical across all four stages. The fp32 CPU NS at
+The step losses must agree to printed precision (6 decimals) across all
+four stages. The step-1 grad norm already differs in the last digit (14.0609
+vs 14.0608, sharded sumsq order) and the clip is active, so this is not
+bit-equality. The fp32 CPU NS at
 d6 makes this about 1 to 2 min/step. `TRAIN_BIN` (`build/train_gpt2`) does
 not encode WORLD_SIZE, so rebuild after switching W.
 
@@ -673,8 +861,10 @@ not encode WORLD_SIZE, so rebuild after switching W.
 - Run 2 steps, `write_checkpoint`, then 1 more step to get P.
 - Build fresh models, `enable_muon`, `load_checkpoint`, run 1 step. The result
   must equal P bit-exactly (fp32).
-- Loading a W=2 state at W=4 must raise. So must loading a ZeRO-0 Muon state
-  at ZeRO >= 1, and the reverse.
+- Loading a W=2 state at W=4 must raise, and so must W=4 at W=2. So must
+  loading a ZeRO-0 Muon state at ZeRO >= 1 at the same W, and the reverse.
+  So must a state file one element longer or shorter than
+  `256*4 + (opt + A_r + S)*4`.
 
 **GPU at W > 1: what stays untested here.** All of the following run only
 with N >= 2 GPUs:
@@ -719,6 +909,43 @@ Check binary mtimes. Run the trainer only through `make`.
 - `_reducescatter_buckets_gpu`: `_check_scratch[dtype](seg)` per segment.
 - Gate: T3 (minus `allreduce_max_host`); existing test_zero and
   test_zero_equivalence green.
+- **Status (review gen 2, design conformance only; gates are run
+  separately):** fu/zs0 at `e2975e9` (7255440, 89a176c) **conforms**, with
+  two test gaps for S1 to close.
+  - (a) The no-coordinator intersection rule is implemented as specified.
+  - (b) The self-copy skip is present in all five arms: CPU N=1, CPU
+    no-coordinator, CPU coordinator, GPU N>1 `p == rank`, GPU N=1. It
+    compares exact addresses, so callers must pass `dst_base`/`shard_base`
+    that alias exactly.
+  - (c) The scratch check is a host-side pre-pass (`_bucket_overlap_max`)
+    over the largest bucket/shard overlap, run before any barrier. That is
+    stronger than the per-segment check the design asked for. It also adds
+    a CPU+GPU bounds check (`dest + len <= N*shard_size`), which suits the
+    owner space (`shard_size = S`).
+  - Beyond the design, 89a176c pulls S4's `num_processes` check forward and
+    also checks `process_rank`. It does not cover ZeRO-0 state loaded at
+    ZeRO >= 1 at the same W, so S4's exact length check is still required.
+  - Test gaps (all runnable on CPU):
+    - The alias test runs only at N=1 and in the no-coordinator arm. A CPU
+      self-copy gives the same bytes whether or not it is skipped, so the
+      test cannot see the skip. Add the threaded (coordinator) alias case.
+    - T3's `reducescatter_buckets` into an owner space with `S != opt` is
+      missing.
+- **Verification (fu/zs0, Opus reviewer):** two defects fixed on top. (a) The
+  `_bucket_overlap_max` scratch bound was the overlap with THIS rank's shard,
+  so with an undersized scratch one rank could raise while a peer walked into
+  the barrier and hung; it is now the max over every rank's shard, so the
+  verdict is rank-invariant. (b) The world-size/rank check does not catch
+  review item 4d's ZeRO-0 state resumed at ZeRO>=1 (same world size, same
+  rank, larger shard): it still read a silent prefix (probe on the 7d68ac1
+  sources: half-size read succeeded, `v[0]` held m's tail).
+  `read_state_checkpoint` now raises if any byte follows v. That composes with
+  fu/vfree's file-size check in `load_checkpoint` (its legacy-Muon path reads
+  the full v, so no trailing bytes remain), and the new arguments are passed
+  by keyword, since fu/vfree adds a positional `v_num_parameters` in the same
+  slot. End to end at WORLD_SIZE=2: a `-z 0` checkpoint resumed with `-z 1`
+  is refused on both ranks; `-z 1` written then resumed with `-z 1` gives step
+  3 = 10.128281, the same as a straight run.
 
 **S1: ownership + owner buffers + ZeRO-1** (llmm/muon.mojo `MuonGroup`
 sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.mojo).
@@ -730,12 +957,22 @@ sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.
 - New `_adamw_shard_segments` and `_update_sharded_muon` (the ZeRO-1 path).
   Route the CPU and GPU `update()` branches to it; skip their flat allgather.
 - `memory_report_json`: account for the owner buffers.
-- Gate: T1 at stage 1, T2 at ZeRO-1, T4, T5 at `-z 1`, compile gates.
+- `muon_apply_gpu`: new `sr_stride_arg` kernel argument (section 4).
+  `stride_arg` keeps indexing and must not carry `sr_stride`.
+- fu/vfree: follow the 8-point contract in section 6 (one segment list,
+  per-rank `A_r` compact `v`, copy-down only at ZeRO-0, keyword arguments for
+  `read_state_checkpoint`).
+- Tolerate `A_r == 0`, `O_r == 0` and `count_rk == 0` (tiny W=8 configs).
+- Close S0's test gaps: threaded `allgather_ranges` alias, and
+  `reducescatter_buckets` into an `S != opt` owner space.
+- Gate: T1 at stage 1, T2 at ZeRO-1 (**bit-exact**), T4 (matrices <= 2048
+  elements, equal counts), T5 at `-z 1`, compile gates.
 
 **S2: ZeRO-2** (`backward` per-layer bucket split; `zero_gradients`;
 `calculate_grad_norm` two-term norm; the ZeRO-2 arm of `_update_sharded_muon`).
 
-- Gate: T1 and T2 at ZeRO-2; T5 at `-z 2`.
+- Gate: T1 and T2 at ZeRO-2 (step 1 bit-exact for Muon and non-wte
+  tensors; 3 steps at rtol ~1e-4, see T2); T5 at `-z 2`.
 - Also run with grad accumulation (`-d` = 2·B·T·W) in T5 or T2. The owner
   accumulator must `+=` across micro-steps and be zeroed once per step.
 
@@ -743,7 +980,8 @@ sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.
 streaming seed, the ZeRO-3 arms of `_update_sharded_muon` for streaming and
 non-streaming).
 
-- Gate: T1 and T2 at ZeRO-3 (streaming, via the coordinator); T5 at `-z 3`.
+- Gate: T1 and T2 at ZeRO-3 (streaming, via the coordinator; same
+  tolerances as ZeRO-2); T5 at `-z 3`.
 
 **S4: checkpoint** (llmm/checkpointing.mojo, `write_checkpoint`/`load_checkpoint`).
 
@@ -762,8 +1000,14 @@ non-streaming).
     keeps Muon momentum in the full flat `m`.
 
   ZeRO-1, 2 and 3 share a layout, so a resume across those stages is allowed.
-- Also check the file length exactly, so a longer file cannot be silently
-  read as a prefix.
+- Also check the file length exactly against
+  `256*4 + (opt + _v_count() + S)*4` (S term only when slot 42 != 0), and
+  raise on any mismatch in either direction. A longer file must not be read
+  as a prefix, and a shorter one must fail with a clear message rather than
+  "Failed to read enough bytes". The only exception is fu/vfree's legacy
+  full-`v` file, at `zero_stage == 0` only (section 6, contract point 7). If
+  fu/zs0's `num_processes`/`process_rank` check is already on main, keep it
+  and add only the remaining refusals.
 - Gate: T6.
 
 **S5: QK-clip multi-rank** (`allreduce_max_host`; the clip inside
@@ -780,12 +1024,19 @@ non-streaming).
 runbook in section 8). No new code paths are expected: S1 to S3 are
 target-generic by construction. The GPU-only differences are inside
 ZeroContext, and S0 changes them. Gate here: compile gates. Gate on a 2-GPU
-box: the smoke list.
+box: the smoke list, plus **per-rank** collective time and bytes for the
+reduce-scatter and the gathers (rank 0 carries up to +68%, section 6). Report
+the slowest rank, not the average. Losses vs ZeRO-0 agree to bf16 noise,
+not bitwise (section 4).
 
 **S7 (follow-up, not this phase)**:
 
 - Trim flat `m`/`master` (and `v` with fu/vfree) to `_adamw_shard_segments`.
-- Optional memory-aware ownership. Bump the ownership version.
+- Optional memory-aware ownership. Bump the ownership version. Weigh each
+  rank's `A_r + O_r` (traffic and state), not NS cost alone. Under
+  round-robin, rank 0 already carries all of wte's AdamW elements.
+- Use the same `_adamw_shard_segments()` and `_compact_copy_down` helper
+  that fu/vfree's `v` uses (section 6).
 - Coalesced owner gathers via staging.
 - Combine the two per-layer bucket calls into one by interleaving the flat and
   owner spaces into a single `(opt + S)` shard space.
@@ -826,3 +1077,5 @@ rounded to 8, and `A_r = |[r*opt, (r+1)*opt) ∩ adamw_ranges|`. Selected rows:
 Written with AI assistance (Claude Code, Opus agent), directed by Evan Owen.
 The prior-art table was compiled by a research subagent from the cited papers
 and repository source.
+The independent review (generations 1 and 2) was done with AI assistance
+(Claude Code, Opus agents), directed by Evan Owen.
