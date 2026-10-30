@@ -139,6 +139,21 @@ hyperparameter sweep:
 convergence vs AdamW:
 [`docs/ai/muon_vs_adamw_124m_2026-10-29.md`](docs/ai/muon_vs_adamw_124m_2026-10-29.md).
 
+Muon vs AdamW on this box (GPT-2 124M from scratch, FineWeb, bf16, B=32 T=1024 at 131k tokens/step,
+600 steps = 79M tokens, cosine to zero, same init per seed; val loss at step 600, three init seeds):
+
+| optimizer | recipe | seed 42 | seed 1 | seed 2 | mean | first eval at or below AdamW's step-600 val |
+|---|---|---:|---:|---:|---:|---|
+| AdamW | `-l 6e-4 -c 0.1 -gc 1.0` | 5.469 | 5.499 | 5.484 | 5.484 | (600) |
+| Muon, AdamW's recipe | `-opt muon -l 6e-4 -c 0.1 -gc 1.0` | 5.112 | 5.107 | 5.120 | 5.113 | step 300-400 |
+| Muon, tuned | `-opt muon -l 4.8e-3 -mu 0.9 -c 0 -gc 0` | 4.364 | 4.358 | 4.361 | 4.361 | step 200 |
+
+Step time is the same for all three arms in this configuration (the Muon step is a fixed ~30 ms
+amortized over 3.9 s of compute). Seed spread is 0.03 for AdamW and under 0.015 for the Muon arms,
+far below the gaps between arms. Caveats: early training only (the 2000-step run is in progress),
+init seed varied but data order fixed, the tuned recipe came from a 300-step single-seed sweep and
+the AdamW control was not re-tuned. Logs and per-step tables: the convergence doc above.
+
 Multi-GPU training: build with `WORLD_SIZE=N` (one rank per GPU, compile-time)
 and choose a ZeRO sharding stage at runtime:
 
