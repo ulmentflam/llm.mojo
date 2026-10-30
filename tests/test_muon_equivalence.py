@@ -37,13 +37,27 @@ from tests.reference import (
     muon_tolerance,
     newton_schulz,
     simulate_muon,
+    simulate_muon_torch_optim,
+    torch_optim_direction,
 )
 
+# Expected-value source: our reference | stock torch.optim.Muon. The id of the
+# first is "ours" so `-k reference` still selects only the kernel-free tests.
+SOURCES = [pytest.param("reference", id="ours"), "torch_muon"]
 
+
+@pytest.mark.parametrize("expected_source", SOURCES)
 @pytest.mark.parametrize("case", MUON_CASES, ids=lambda c: c.name)
-def test_matches_torch_trajectory(case: MuonCase):
-    """Stepwise diff against torch — fails on the first step that drifts."""
-    ref = simulate_muon(case)
+def test_matches_torch_trajectory(case: MuonCase, expected_source: str):
+    """Stepwise diff against torch — fails on the first step that drifts.
+
+    expected_source="torch_muon": expectation from stock torch.optim.Muon
+    (atol widens to 2x the measured torch-vs-reference gap)."""
+    ref = (
+        simulate_muon(case)
+        if expected_source == "reference"
+        else simulate_muon_torch_optim(case)
+    )
     atol = muon_tolerance(case, ref)
 
     params = ref["init_params"].copy()
@@ -76,8 +90,15 @@ def _recover_direction(w1: np.ndarray, case: MuonCase) -> np.ndarray:
     return -w1 / (hp.lr * muon_scale(case.rows, case.cols))
 
 
-def _check_direction(o_got: np.ndarray, u: torch.Tensor, case: MuonCase, what: str):
-    o_ref = newton_schulz(u, case.hp.ns_steps, torch.bfloat16).numpy()
+def _check_direction(
+    o_got: np.ndarray,
+    u: torch.Tensor,
+    case: MuonCase,
+    what: str,
+    o_ref: np.ndarray | None = None,
+):
+    if o_ref is None:
+        o_ref = newton_schulz(u, case.hp.ns_steps, torch.bfloat16).numpy()
     cos, rel = direction_metrics(o_got, o_ref)
     rel_tol = muon_direction_tolerance(u, case.hp.ns_steps)
     assert np.all(np.isfinite(o_got)), f"{what}: non-finite update"
@@ -86,10 +107,12 @@ def _check_direction(o_got: np.ndarray, u: torch.Tensor, case: MuonCase, what: s
     )
 
 
+@pytest.mark.parametrize("expected_source", SOURCES)
 @pytest.mark.parametrize("k", [0, 1])
 @pytest.mark.parametrize("case", MUON_CASES, ids=lambda c: c.name)
-def test_update_direction(case: MuonCase, k: int):
-    """The kernel's orthogonalised update matches bf16 Newton-Schulz."""
+def test_update_direction(case: MuonCase, k: int, expected_source: str):
+    """The kernel's orthogonalised update matches bf16 Newton-Schulz, or the
+    update stock torch.optim.Muon produces for the same inputs."""
     m_prev, grad, u = muon_direction_inputs(case, k)
     zeros = np.zeros((case.rows, case.cols), dtype=np.float32)
     out = muon.step(
@@ -101,7 +124,8 @@ def test_update_direction(case: MuonCase, k: int):
         dtype_name=case.dtype,
     )
     o_got = _recover_direction(from_storage(out.params, case.dtype), case)
-    _check_direction(o_got, u, case, f"{case.name} step {k + 1}")
+    o_ref = torch_optim_direction(case, k) if expected_source == "torch_muon" else None
+    _check_direction(o_got, u, case, f"{case.name} step {k + 1}", o_ref)
 
 
 # --- gate self-test -------------------------------------------------------
@@ -158,18 +182,24 @@ def _mutant_step(case: MuonCase, k: int, variant: str) -> np.ndarray:
     return w1
 
 
+@pytest.mark.parametrize("expected_source", SOURCES)
 @pytest.mark.parametrize("case", MUON_CASES, ids=lambda c: c.name)
-def test_tolerance_not_absurd(case: MuonCase):
-    """Both gates reject known-wrong kernels and accept a correct one.
+def test_tolerance_not_absurd(case: MuonCase, expected_source: str):
+    """Both gates reject known-wrong kernels and accept a correct one, for
+    either expectation source (the torch_muon gate widens atol to the measured
+    torch-vs-reference gap, so it must be shown to still reject).
 
     A gate that cannot fail on these is decoration (a flat atol in this repo
     once buried three real backward bugs)."""
+    torch_src = expected_source == "torch_muon"
     _, _, u = muon_direction_inputs(case, 1)
+    o_ref = torch_optim_direction(case, 1) if torch_src else None
     _check_direction(
         _recover_direction(_mutant_step(case, 1, "correct_other_rounding"), case),
         u,
         case,
         "correct kernel with other rounding points",
+        o_ref,
     )
     mutants = ["skip_ns", "ns4", "no_nesterov", "scale_keller"]
     if case.rows > case.cols:
@@ -179,12 +209,12 @@ def test_tolerance_not_absurd(case: MuonCase):
     for variant in mutants:
         o_got = _recover_direction(_mutant_step(case, 1, variant), case)
         with pytest.raises(AssertionError):
-            _check_direction(o_got, u, case, variant)
+            _check_direction(o_got, u, case, variant, o_ref)
 
     # Trajectory gate: dropping weight decay must fail it in fp32. (In bf16
     # the per-step change is sub-ulp, which is why the direction gate exists.)
     if case.dtype == "float32":
-        ref = simulate_muon(case)
+        ref = simulate_muon_torch_optim(case) if torch_src else simulate_muon(case)
         atol = muon_tolerance(case, ref)
         hp = effective_hp(case)
         w = torch.from_numpy(ref["init_params"].copy())

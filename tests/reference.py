@@ -333,6 +333,75 @@ def simulate_muon(case: MuonCase) -> dict[str, np.ndarray]:
     }
 
 
+def _torch_muon_run(case: MuonCase, direction_k: int | None = None):
+    """Drive the stock `torch.optim.Muon` with our spec's hyperparameters.
+
+    torch convention differences (see tests/test_muon_crosscheck.py header):
+    its buffer is (1-mu)*ours (lerp form) and Nesterov update is (1-mu)*U, a
+    constant factor NS normalises away. Grads are pre-multiplied by grad_scale.
+    The torch param is fp32 holding storage-dtype values and is rounded to the
+    storage dtype after every step, so a bf16 case rounds once per step and
+    keeps an fp32 momentum buffer like the kernel (torch.optim.Muon on bf16
+    params would round W twice and store the buffer in bf16).
+    With `direction_k` set, W is zeroed before that step and its (W1 - 0) is
+    returned as the update (wd*W vanishes), else None.
+    """
+    init, grads = _muon_inputs(case)
+    hp = effective_hp(case)
+    p = torch.nn.Parameter(init.float().clone())
+    opt = torch.optim.Muon(
+        [p],
+        lr=hp.lr,
+        weight_decay=hp.weight_decay,
+        momentum=hp.momentum,
+        nesterov=hp.nesterov,
+        ns_steps=hp.ns_steps,
+        adjust_lr_fn="match_rms_adamw",
+    )
+    traj, moms, w1 = [], [], None
+    for k, G in enumerate(grads):
+        if direction_k == k:
+            p.data.zero_()
+        p.grad = hp.grad_scale * G.float()
+        opt.step()
+        p.data = p.data.to(case.torch_dtype).float()
+        if direction_k == k:
+            w1 = p.data.numpy().copy()
+        traj.append(p.data.numpy().copy())
+        buf = opt.state[p]["momentum_buffer"]
+        moms.append((buf / (1.0 - hp.momentum)).numpy().copy())
+    return init, grads, np.stack(traj), np.stack(moms), w1
+
+
+def simulate_muon_torch_optim(case: MuonCase) -> dict[str, np.ndarray]:
+    """Same keys as `simulate_muon`, produced by stock `torch.optim.Muon`.
+
+    `momentum` is rescaled by 1/(1-mu) to our convention. `spread` is the
+    larger of our NS-rounding spread and the measured torch-vs-ours trajectory
+    gap, so `muon_tolerance` becomes 2x the observed independent-implementation
+    gap (+ the usual rtol term).
+    """
+    init, grads, traj, moms, _ = _torch_muon_run(case)
+    ours = simulate_muon(case)
+    gap = float(np.max(np.abs(traj - ours["trajectory"])))
+    out = dict(ours)
+    out.update(
+        trajectory=traj,
+        momentum=moms,
+        spread=np.asarray(max(float(ours["spread"]), gap), dtype=np.float32),
+    )
+    return out
+
+
+def torch_optim_direction(case: MuonCase, k: int) -> np.ndarray:
+    """Orthogonalised update O of step k from stock torch.optim.Muon
+    (W zeroed before the step; O = -W1 / (lr * 0.2*sqrt(max)))."""
+    hp = effective_hp(case)
+    *_, w1 = _torch_muon_run(case, direction_k=k)
+    assert w1 is not None
+    return -w1 / (hp.lr * muon_scale(case.rows, case.cols))
+
+
 def muon_tolerance(case: MuonCase, ref: dict[str, np.ndarray]) -> float:
     """Trajectory atol = 2*max(spread_bf16_vs_fp32, 1e-6) + rtol*max|W|.
 
