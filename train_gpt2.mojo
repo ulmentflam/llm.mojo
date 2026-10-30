@@ -7352,6 +7352,8 @@ struct TrainArgs(Copyable, Movable):
     var lr_scheduler_type: String  # -k  cosine|linear|constant|wsd
     var warmup_iterations: Int  # -u
     var final_learning_rate_frac: Float32  # -q
+    var cooldown_frac: Float32  # -cooldown  wsd decay-phase fraction
+    var decay_shape: String  # -decay_shape  wsd: sqrt|linear
     var weight_decay: Float32  # -c
     var grad_clip: Float32  # -gc  max gradient norm (0 = no clipping)
     var val_loss_every: Int  # -v
@@ -7389,6 +7391,8 @@ def default_train_args() -> TrainArgs:
         lr_scheduler_type="cosine",
         warmup_iterations=0,
         final_learning_rate_frac=Float32(1.0),
+        cooldown_frac=Float32(0.2),
+        decay_shape="sqrt",
         weight_decay=Float32(0.0),
         grad_clip=Float32(1.0),
         val_loss_every=20,
@@ -7435,12 +7439,30 @@ def _build_lr_scheduler(
             final_learning_rate_fraction=args.final_learning_rate_frac,
         )
     elif k == "wsd":
+        if args.decay_shape != "sqrt" and args.decay_shape != "linear":
+            raise Error(
+                "Invalid -decay_shape (sqrt|linear): " + args.decay_shape
+            )
+        if args.cooldown_frac < 0.0 or args.cooldown_frac > 1.0:
+            raise Error("-cooldown must be in [0, 1]")
+        if args.decay_shape == "linear":
+            return LearningRateScheduler(
+                "wsd",
+                learning_rate=args.learning_rate,
+                warmup_steps=args.warmup_iterations,
+                train_num_batches=train_num_batches,
+                final_learning_rate_fraction=args.final_learning_rate_frac,
+                cooldown_fraction=args.cooldown_frac,
+                decay_shape="linear",
+            )
         return LearningRateScheduler(
             "wsd",
             learning_rate=args.learning_rate,
             warmup_steps=args.warmup_iterations,
             train_num_batches=train_num_batches,
             final_learning_rate_fraction=args.final_learning_rate_frac,
+            cooldown_fraction=args.cooldown_frac,
+            decay_shape="sqrt",
         )
     raise Error("Invalid scheduler type: " + k)
 
@@ -7605,6 +7627,11 @@ def train[
         setup_rank,
         _table_row("final LR fraction", String(args.final_learning_rate_frac)),
     )
+    printf0(
+        setup_rank,
+        _table_row("wsd cooldown fraction", String(args.cooldown_frac)),
+    )
+    printf0(setup_rank, _table_row("wsd decay shape", args.decay_shape))
     printf0(setup_rank, _table_row("weight decay", String(args.weight_decay)))
     printf0(setup_rank, _table_row("optimizer", args.optimizer))
     printf0(setup_rank, _table_row("qk clip tau", String(args.qk_clip_tau)))
@@ -7826,6 +7853,8 @@ def train[
         num("world_size", WORLD_SIZE, VERBOSE),
         num("zero_stage", zero_stage, VERBOSE),
         text("lr_schedule", args.lr_scheduler_type, VERBOSE),
+        num("cooldown", args.cooldown_frac, VERBOSE),
+        text("decay_shape", args.decay_shape, VERBOSE),
     ]
     run_log.emit(
         "setup",
@@ -8244,6 +8273,8 @@ def _print_usage():
     print("  -k <string> learning rate scheduler (default = cosine)")
     print("  -u <int>    learning rate warmup iterations (default = 0)")
     print("  -q <float>  final learning rate fraction (default = 1.0)")
+    print("  -cooldown <float> wsd: decay-phase fraction (default = 0.2)")
+    print("  -decay_shape <string> wsd: sqrt|linear (default = sqrt)")
     print("  -c <float>  weight decay (default = 0.0)")
     print(
         "  -gc <float> clip the gradient norm to this, 0 = off (default = 1.0,"
@@ -8339,6 +8370,10 @@ def _parse_train_args(
             args.warmup_iterations = atol(val)
         elif flag == "-q":
             args.final_learning_rate_frac = Float32(atof(val))
+        elif flag == "-cooldown":
+            args.cooldown_frac = Float32(atof(val))
+        elif flag == "-decay_shape":
+            args.decay_shape = val
         elif flag == "-c":
             args.weight_decay = Float32(atof(val))
         elif flag == "-gc":
