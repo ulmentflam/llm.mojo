@@ -214,35 +214,6 @@ def muon_normalize_gpu[
         )
 
 
-def muon_axpby_gpu[
-    W: Int
-](
-    y_ptr: MutKernelPtr[DType.bfloat16],
-    x_ptr: MutKernelPtr[DType.bfloat16],
-    n_arg: Int64,
-    alpha: Scalar[DType.float32],
-    beta: Scalar[DType.float32],
-) -> None:
-    """Flat y = bf16(alpha * y + beta * x); W elements per thread (n % W == 0
-    when W > 1, host-checked)."""
-    comptime al_x = align_of[SIMD[DType.bfloat16, W]]()
-    var i = Int(block_idx.x * 256 + thread_idx.x) * W
-    if i < Int(n_arg):
-        var yv = (
-            y_ptr.unsafe_offset(i)
-            .unsafe_load[width=W, alignment=al_x]()
-            .cast[DType.float32]()
-        )
-        var xv = (
-            x_ptr.unsafe_offset(i)
-            .unsafe_load[width=W, alignment=al_x]()
-            .cast[DType.float32]()
-        )
-        y_ptr.unsafe_offset(i).unsafe_store[alignment=al_x](
-            (alpha * yv + beta * xv).cast[DType.bfloat16]()
-        )
-
-
 def muon_apply_gpu[
     dtype: DType,
     W: Int,
@@ -328,8 +299,15 @@ def _gemm_bf16(
     stride_b: Int,
     stride_d: Int,
     ctx: DeviceContext,
+    alpha: Float32 = 1.0,
+    beta: Optional[Float32] = None,
+    c: Optional[MutKernelPtr[DType.bfloat16]] = None,
 ) raises:
-    """Batched column-major D[m,n] = op(A) op(B), bf16 in/out, fp32 accum."""
+    """Batched column-major D[m,n] = alpha op(A) op(B) + beta C, bf16 in/out,
+    one fp32 epilogue (C defaults to D; C shares D's layout/stride)."""
+    var c_imm = Optional[ImmutKernelPtr[DType.bfloat16]]()
+    if c:
+        c_imm = Optional(_imm_bf16(c.value()))
     comptime bf = DType.bfloat16
     if trans_a:
         _matmul_cublaslt[bf, True, False](
@@ -348,6 +326,9 @@ def _gemm_bf16(
             stride_a=stride_a,
             stride_b=stride_b,
             stride_d=stride_d,
+            alpha=alpha,
+            beta=beta,
+            c_ptr=c_imm,
         )
     elif trans_b:
         _matmul_cublaslt[bf, False, True](
@@ -366,6 +347,9 @@ def _gemm_bf16(
             stride_a=stride_a,
             stride_b=stride_b,
             stride_d=stride_d,
+            alpha=alpha,
+            beta=beta,
+            c_ptr=c_imm,
         )
     else:
         _matmul_cublaslt[bf, False, False](
@@ -384,6 +368,9 @@ def _gemm_bf16(
             stride_a=stride_a,
             stride_b=stride_b,
             stride_d=stride_d,
+            alpha=alpha,
+            beta=beta,
+            c_ptr=c_imm,
         )
 
 
@@ -409,7 +396,6 @@ def _muon_group_gpu[
     var k_zero = ctx.compile_function[muon_zero_gpu]()
     var k_mom = ctx.compile_function[muon_momentum_gpu[dtype, W]]()
     var k_norm = ctx.compile_function[muon_normalize_gpu[W]]()
-    var k_axpby = ctx.compile_function[muon_axpby_gpu[W]]()
     var k_apply = ctx.compile_function[muon_apply_gpu[dtype, W]]()
     var rows = g.rows
     var cols = g.cols
@@ -451,46 +437,84 @@ def _muon_group_gpu[
         block_dim=(BLOCK,),
     )
 
+    # Ping-pong X between x and y: the second GEMM's fp32 epilogue writes
+    # X' = a*X + B@X into the other buffer (C = X), so track which holds X.
+    var xp = x
+    var yp = y
     for _ in range(config.ns_steps):
         # A = X X^T  (R x R). Wide/square: memory is the col-major C x R
         # matrix X^T -> A = op(T)(X^T) * X^T. Tall: memory is the
         # col-major R x C matrix X' (= X^T) -> A = X' * op(T)(X').
-        _gemm_bf16(a, x, x, R, R, C, not tall, tall, count, n, n, gs, ctx)
-        _gemm_bf16(a2, a, a, R, R, R, False, False, count, gs, gs, gs, ctx)
-        # A = b*A + c*A2 (this is the "B" polynomial matrix).
-        ctx.enqueue_function(
-            k_axpby,
-            a,
+        _gemm_bf16(a, xp, xp, R, R, C, not tall, tall, count, n, n, gs, ctx)
+        # B = b*A + c*(A A), single fp32 epilogue (D=a2, C=a).
+        _gemm_bf16(
             a2,
-            Int64(count * gs),
-            NS_B,
-            NS_C,
-            grid_dim=(ceildiv(count * gs, 256 * W),),
-            block_dim=(256,),
+            a,
+            a,
+            R,
+            R,
+            R,
+            False,
+            False,
+            count,
+            gs,
+            gs,
+            gs,
+            ctx,
+            alpha=NS_C,
+            beta=NS_B,
+            c=a,
         )
-        # Y = B X. Wide/square: Xc * B (C x R); tall: B * Xc' (R x C).
+        # X' = a*X + B X (D=yp, C=xp). Wide/square: Xc * B (C x R); tall:
+        # B * Xc' (R x C).
         if tall:
-            _gemm_bf16(y, a, x, R, C, R, False, False, count, gs, n, n, ctx)
+            _gemm_bf16(
+                yp,
+                a2,
+                xp,
+                R,
+                C,
+                R,
+                False,
+                False,
+                count,
+                gs,
+                n,
+                n,
+                ctx,
+                alpha=1.0,
+                beta=NS_A,
+                c=xp,
+            )
         else:
-            _gemm_bf16(y, x, a, C, R, R, False, False, count, n, gs, n, ctx)
-        # X = a*X + Y
-        ctx.enqueue_function(
-            k_axpby,
-            x,
-            y,
-            Int64(count * n),
-            NS_A,
-            Float32(1),
-            grid_dim=(ceildiv(count * n, 256 * W),),
-            block_dim=(256,),
-        )
+            _gemm_bf16(
+                yp,
+                xp,
+                a2,
+                C,
+                R,
+                R,
+                False,
+                False,
+                count,
+                n,
+                gs,
+                n,
+                ctx,
+                alpha=1.0,
+                beta=NS_A,
+                c=xp,
+            )
+        var t_ = xp
+        xp = yp
+        yp = t_
 
     var scale = Float32(0.2) * sqrt(Float32(C))
     ctx.enqueue_function(
         k_apply,
         params_ptr.unsafe_offset(g.offset),
         master_ptr.unsafe_offset(g.offset),
-        x,
+        xp,
         UInt8(1) if has_master else UInt8(0),
         Int64(n),
         Int64(g.stride),
