@@ -78,6 +78,75 @@ Timing: step 1 excluded plus step 2 (warmup). The AdamW mean is inflated by 40 s
 - Step times were measured under GPU contention (vLLM tenant), with bursty slowdowns in the AdamW run.
 - Muon kernel is unoptimized (a separate track covers that).
 
+## Seed spread (3 seeds x 600 steps)
+
+Same matched recipe as above (131k tokens/step, 600 steps, warmup 50, 6e-4 cosine, wd 0.1, clip 1.0), repeated at init seeds 42, 1 and 2 (build-time `-D LLMM_INIT_SEED=<n>`; seed 42 is the default build and its AdamW/Muon pair is the original run above). A third arm, **Muon tuned**, uses the recipe from the 300-step Muon sweep: `-opt muon -l 4.8e-3 -mu 0.9 -c 0 -gc 0` (everything else as the base args). Both optimizers of a seed ran on the same binary, sequentially on one GPU. Logs: `data/muon_vs_adamw_{adamw,muon}.jsonl` (seed 42 matched) and `data/muon_seeds_s<seed>_<arm>_600.jsonl` (the rest).
+
+**Seed 42** (val loss)
+
+| step | AdamW | Muon matched | Muon tuned |
+|---:|---:|---:|---:|
+| 100 | 6.5674 | 6.2045 | 5.9737 |
+| 200 | 6.1798 | 5.7955 | 5.2618 |
+| 300 | 5.9016 | 5.4905 | 4.8125 |
+| 400 | 5.6607 | 5.2565 | 4.5248 |
+| 500 | 5.5044 | 5.1361 | 4.3944 |
+| 600 | 5.4690 | 5.1115 | 4.3642 |
+
+**Seed 1** (val loss)
+
+| step | AdamW | Muon matched | Muon tuned |
+|---:|---:|---:|---:|
+| 100 | 6.5423 | 6.2020 | 5.9738 |
+| 200 | 6.1761 | 5.7958 | 5.2535 |
+| 300 | 5.9074 | 5.4877 | 4.7785 |
+| 400 | 5.6847 | 5.2525 | 4.5158 |
+| 500 | 5.5355 | 5.1320 | 4.3873 |
+| 600 | 5.4994 | 5.1074 | 4.3575 |
+
+**Seed 2** (val loss)
+
+| step | AdamW | Muon matched | Muon tuned |
+|---:|---:|---:|---:|
+| 100 | 6.5443 | 6.2066 | 5.9883 |
+| 200 | 6.1671 | 5.7987 | 5.2644 |
+| 300 | 5.8931 | 5.4989 | 4.8070 |
+| 400 | 5.6720 | 5.2683 | 4.5206 |
+| 500 | 5.5195 | 5.1450 | 4.3912 |
+| 600 | 5.4839 | 5.1202 | 4.3605 |
+
+**Step 600 across seeds** (val loss)
+
+| arm | seed 42 | seed 1 | seed 2 | mean | min-max |
+|---|---:|---:|---:|---:|---:|
+| AdamW | 5.4690 | 5.4994 | 5.4839 | 5.4841 | 5.4690-5.4994 |
+| Muon matched | 5.1115 | 5.1074 | 5.1202 | 5.1130 | 5.1074-5.1202 |
+| Muon tuned | 4.3642 | 4.3575 | 4.3605 | 4.3607 | 4.3575-4.3642 |
+
+**Train loss, mean of steps 551-600**
+
+| arm | seed 42 | seed 1 | seed 2 | mean |
+|---|---:|---:|---:|---:|
+| AdamW | 5.4133 | 5.4451 | 5.4273 | 5.4286 |
+| Muon matched | 5.0573 | 5.0529 | 5.0665 | 5.0589 |
+| Muon tuned | 4.3389 | 4.3341 | 4.3364 | 4.3365 |
+
+**First eval step at which Muon val <= that seed's AdamW final val (step 600)** (evals are every 100 steps)
+
+| arm | seed 42 | seed 1 | seed 2 |
+|---|---:|---:|---:|
+| Muon matched | 400 | 300 | 400 |
+| Muon tuned | 200 | 200 | 200 |
+
+
+Reading: the init-seed spread at step 600 is small (AdamW 0.030, Muon matched 0.013, Muon tuned 0.007 val-loss range), far below the gaps between arms (matched Muon -0.37 and tuned Muon -1.12 vs AdamW on the mean), so the single-seed conclusion holds. Matched Muon reaches AdamW's final val 200-300 steps early; tuned Muon does so by step 200 in every seed.
+
+Caveats: only the init seed varied, the data order is fixed, so this does not capture data-order variance; n=3 is a spread estimate, not a confidence interval. The tuned recipe came from a 300-step single-seed sweep (seed 42), so seed 42 is partly in-sample for the tuned arm; seeds 1 and 2 are the out-of-sample check. Single GPU; parts of the chain shared the GPU with sibling agents' tests, so timings are not reported here (only losses).
+
+## 2000-step run (pending)
+
+To be filled when the 2000-step AdamW / Muon matched / Muon tuned runs at seed 42 (`-x 2000 -u 150 -v 200`) finish.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Sonnet agent), directed by Evan Owen.
