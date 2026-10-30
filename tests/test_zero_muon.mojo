@@ -1,4 +1,4 @@
-"""Sharded Muon under ZeRO-1 (design: docs/ai/zero_sharded_muon_design_*.md).
+"""Sharded Muon under ZeRO-1/2 (design: docs/ai/zero_sharded_muon_design_*.md).
 
 T2: threaded multi-rank CPU run through the real collectives. Every rank gets
 a DIFFERENT planted batch. ZeRO-1 sharded Muon (matrix-granular owner space)
@@ -7,6 +7,12 @@ same world size after 3 steps: the gradients are all-reduced identically, Muon
 runs on identical values on the owner as on a replica, and AdamW is
 elementwise. Plus the ownership/segment bookkeeping (A_r, O_r, S) including
 the tiny configs where a rank owns nothing.
+
+ZeRO-2 (S2, bucketed reduce-scatter straight to the owners): bit-exact against
+ZeRO-0 at step 1 for every tensor except wte, and within rtol 1e-4 over 3
+steps for all params. wte differs because ZeRO-0 forms lm_k + enc_k locally
+before the all-reduce, while the bucketed path reduces the two parts
+separately, (lm_0+lm_1) + (enc_0+enc_1): fp32 addition is not associative.
 """
 
 from std.testing import assert_equal, assert_true, TestSuite
@@ -189,6 +195,100 @@ def _t2[W: Int](L: Int, NH: Int, C: Int) raises:
                 )
     ref_p.unsafe_free()
     got.unsafe_free()
+
+
+def _t2_z2[W: Int](L: Int, NH: Int, C: Int) raises:
+    var path = String("gpt2_zm2_w") + String(W) + "_l" + String(L) + ".bin"
+    var n = _write_checkpoint(path, L, NH, C)
+    var wte_n = VOCAB * C
+    var ref1 = heap_alloc[Float32](W * n)
+    var got1 = heap_alloc[Float32](W * n)
+    var ref3 = heap_alloc[Float32](W * n)
+    var got3 = heap_alloc[Float32](W * n)
+    try:
+        _train[W](path, n, 0, 1, ref1)
+        _train[W](path, n, 2, 1, got1)
+        _train[W](path, n, 0, STEPS, ref3)
+        _train[W](path, n, 2, STEPS, got3)
+    except e:
+        _remove(path)
+        raise e^
+    _remove(path)
+    # Step 1: bit-exact everywhere except wte.
+    var max_wte1 = Float32(0.0)
+    for r in range(W):
+        for i in range(n):
+            var a = ref1[unsafe_offset=r * n + i]
+            var b = got1[unsafe_offset=r * n + i]
+            if i < wte_n:
+                max_wte1 = max(max_wte1, abs(a - b) / max(abs(a), 1e-6))
+                continue
+            if a != b:
+                raise Error(
+                    "ZeRO-2 step 1 != ZeRO-0 at W="
+                    + String(W)
+                    + " rank "
+                    + String(r)
+                    + " idx "
+                    + String(i)
+                    + ": "
+                    + String(a)
+                    + " vs "
+                    + String(b)
+                )
+    # 3 steps: |a-b| <= 1e-4*|a| + 1e-6 everywhere. A pure rtol is ill-posed
+    # for near-zero parameters (init std 0.08, so an element that lands near 0
+    # carries ~1e-8 absolute fp32 noise from the cancellation); the atol is
+    # about 100x below a single lr=1e-3 optimizer step, so a wrong gradient on any matrix or tensor still fails. The
+    # reported rel number is over elements with |a| >= 1e-2 (a true rtol).
+    var max_rel = Float32(0.0)
+    var max_abs = Float32(0.0)
+    for r in range(W):
+        for i in range(n):
+            var a = ref3[unsafe_offset=r * n + i]
+            var b = got3[unsafe_offset=r * n + i]
+            max_abs = max(max_abs, abs(a - b))
+            if abs(a) >= 1e-2:
+                max_rel = max(max_rel, abs(a - b) / abs(a))
+            if abs(a - b) > 1e-4 * abs(a) + 1e-6:
+                raise Error(
+                    "ZeRO-2 3-step beyond rtol 1e-4 + atol 1e-6 at W="
+                    + String(W)
+                    + " rank "
+                    + String(r)
+                    + " idx "
+                    + String(i)
+                    + ": "
+                    + String(a)
+                    + " vs "
+                    + String(b)
+                )
+    for r in range(1, W):
+        for i in range(n):
+            if got3[unsafe_offset=r * n + i] != got3[unsafe_offset=i]:
+                raise Error("ZeRO-2 ranks disagree at idx " + String(i))
+    print(
+        "t2_z2 W=" + String(W) + " L=" + String(L),
+        "step1_wte_max_rel=" + String(max_wte1),
+        "step3_max_rel(|p|>=1e-2)=" + String(max_rel),
+        "step3_max_abs=" + String(max_abs),
+    )
+    ref1.unsafe_free()
+    got1.unsafe_free()
+    ref3.unsafe_free()
+    got3.unsafe_free()
+
+
+def test_t2_zero2_w2() raises:
+    _t2_z2[2](2, 2, 16)
+
+
+def test_t2_zero2_w4() raises:
+    _t2_z2[4](2, 2, 16)
+
+
+def test_t2_zero2_w8_rank_owns_nothing() raises:
+    _t2_z2[8](1, 1, 16)
 
 
 def test_t2_zero1_bit_exact_w2() raises:

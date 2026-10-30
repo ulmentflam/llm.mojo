@@ -4093,6 +4093,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 # grad-accum loop, and backward zeroes each pool slice itself
                 # before its bucket's kernels run.
                 self.grad_shard_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
+                if self.optimizer_kind == 1:
+                    # Owner-space accumulator for the Muon matrices (S2).
+                    self.muon_g_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
             else:
                 self.grads_buf.enqueue_fill(Scalar[GPT2_DTYPE](0.0))
 
@@ -5169,11 +5172,54 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var d = List[Int]()
                 var po = List[Int]()
                 var ln = List[Int]()
+                var muon_split = self.optimizer_kind == 1
                 for i in range(Parameters.ln_1_gamma, Parameters.proj_bias + 1):
+                    if muon_split and (
+                        i == Parameters.qkv_weight
+                        or i == Parameters.attn_proj_weight
+                        or i == Parameters.fc_weight
+                        or i == Parameters.proj_weight
+                    ):
+                        continue  # Call B below: routed to the owner
                     d.append(flat_base[i] + layer * layer_grad_stride[i])
                     po.append(pool_slot[i])
                     ln.append(layer_grad_stride[i])
                 self._reduce_grad_bucket(d, po, ln)
+                if muon_split:
+                    # Call B: this layer's 6 Muon matrices (Q, K, V are row
+                    # blocks of the fused qkv weight, contiguous in the pool)
+                    # go to their owners' slots in the owner-space gradient
+                    # buffer. Identical lists on every rank (static table).
+                    var md = List[Int]()
+                    var mpo = List[Int]()
+                    var mln = List[Int]()
+                    var cc = channels * channels
+                    for k in range(6):
+                        ref sl = self.muon_slots[k * num_layers + layer]
+                        md.append(sl.owner_idx)
+                        mln.append(sl.len)
+                        if k < 3:
+                            mpo.append(
+                                pool_slot[Parameters.qkv_weight] + k * cc
+                            )
+                        elif k == 3:
+                            mpo.append(pool_slot[Parameters.attn_proj_weight])
+                        elif k == 4:
+                            mpo.append(pool_slot[Parameters.fc_weight])
+                        else:
+                            mpo.append(pool_slot[Parameters.proj_weight])
+                    self.zero_ctx.reducescatter_buckets[GPT2_DTYPE](
+                        rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                            self.grad_pool_memory.as_unsafe_any_origin()
+                        ),
+                        md,
+                        mpo,
+                        mln,
+                        rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                            self.muon_g_memory.as_unsafe_any_origin()
+                        ),
+                        self.muon_shard_elems,
+                    )
 
         # Bucket 4 — wte (encoder contribution, accumulates onto the shard via
         # reduce-scatter linearity) + wpe.
@@ -5316,13 +5362,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         At WORLD_SIZE > 1 and ZeRO-1 the Muon matrices are sharded by
         matrix-granular ownership into owner-local buffers (see
-        `_build_muon_ownership`); ZeRO-2/3 are not implemented yet.
+        `_build_muon_ownership`); ZeRO-2 reduce-scatters each matrix's
+        gradient straight to its owner; ZeRO-3 is not implemented yet.
         """
         comptime if Self.WORLD_SIZE > 1:
-            if self.zero_ctx.zero_stage >= 2 or self.z3_streaming:
+            if self.zero_ctx.zero_stage >= 3 or self.z3_streaming:
                 raise Error(
-                    "Sharded Muon supports ZeRO-0 and ZeRO-1 only (ZeRO-2/3"
-                    " land in later slices)"
+                    "Sharded Muon supports ZeRO-0, ZeRO-1 and ZeRO-2 only"
+                    " (ZeRO-3 lands in a later slice)"
                 )
         var L = self.config.num_layer
         var C = self.config.channels
@@ -5636,17 +5683,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         t: UInt32,
         config: AdamWConfig,
     ) raises:
-        """ZeRO-1 Muon step (grads were all-reduced, params fully resident):
-        pack the owned gradients, AdamW over this rank's flat-shard segments,
+        """ZeRO-1/2 Muon step (params fully resident; ZeRO-1 grads were
+        all-reduced, ZeRO-2 grads were bucket-reduced to their owners):
+        pack the owned gradients (ZeRO-1 only), AdamW over this rank's flat-shard segments,
         Muon over the owner-space groups, then propagate both parts. Never
         goes through `_update_hybrid`, which assumes unsharded buffers."""
         comptime if Self.WORLD_SIZE > 1:
             var rank = self.zero_ctx.rank
             var lo = rank * self.optimizer_num_parameters
+            # ZeRO-2 (bucketed): backward already reduce-scattered the Muon
+            # gradients into muon_g and the AdamW ones into grad_shard.
+            var bucketed = self._use_bucketing()
             # Pack owned gradients into the owner-space gradient shard.
             for i in range(len(self.muon_slots)):
                 ref sl = self.muon_slots[i]
-                if sl.owner != rank:
+                if sl.owner != rank or bucketed:
                     continue
                 self.ctx.enqueue_copy(
                     dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
@@ -5667,14 +5718,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var segs = self._adamw_shard_segments()
             for i in range(len(segs)):
                 ref sg = segs[i]
+                var g_seg = self.grads_memory.unsafe_offset(sg.flat_start)
+                if bucketed:
+                    g_seg = self.grad_shard_memory.unsafe_offset(sg.shard_rel)
                 adamw_update[GPT2_DTYPE, Self.target](
                     sg.len,
                     as_mut_kernel[GPT2_DTYPE](
                         self.params_memory.unsafe_offset(sg.flat_start)
                     ),
-                    as_mut_kernel[GPT2_DTYPE](
-                        self.grads_memory.unsafe_offset(sg.flat_start)
-                    ),
+                    as_mut_kernel[GPT2_DTYPE](g_seg),
                     as_mut_kernel[MASTER_DTYPE](
                         self.master_memory.unsafe_offset(sg.shard_rel)
                     ),
@@ -6012,6 +6064,23 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 if self._use_bucketing():
                     grads_src = self.grad_shard_memory
                 sharded = True
+        var sumsq = self._grad_sumsq(grads_src, n)
+        if self.optimizer_kind == 1:
+            comptime if Self.WORLD_SIZE > 1:
+                # ZeRO-2 Muon: the matrices' reduced gradients live in the
+                # owner-space accumulator; the flat shard holds zeros there.
+                if self._use_bucketing():
+                    sumsq += self._grad_sumsq(
+                        self.muon_g_memory, self.muon_shard_elems
+                    )
+        if sharded:
+            sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
+        return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
+
+    def _grad_sumsq(
+        mut self, src: MutMemPtr[GPT2_DTYPE], n: Int
+    ) raises -> Float32:
+        """Sum of squares of `n` gradient elements at `src` (this rank only)."""
         comptime width = simd_width_of[GPT2_DTYPE]()
 
         comptime if is_cpu[Self.target]():
@@ -6021,14 +6090,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 rebind[MutKernelPtr[DType.float32]](
                     host_out.as_unsafe_any_origin()
                 ),
-                as_immut_kernel_from_mut[GPT2_DTYPE](grads_src),
+                as_immut_kernel_from_mut[GPT2_DTYPE](src),
                 n,
             )
             var sumsq = host_out[unsafe_offset=0]
             host_out.unsafe_free()
-            if sharded:
-                sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
-            return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
+            return sumsq
         else:
             comptime BLOCK_SIZE = 512
             var grid_x = self.grad_norm_grid_x
@@ -6056,7 +6123,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx.enqueue_function(
                 compiled_norm,
                 as_mut_kernel[DType.float32](out_ptr),
-                as_immut_kernel_from_mut[GPT2_DTYPE](grads_src),
+                as_immut_kernel_from_mut[GPT2_DTYPE](src),
                 Int64(n),  # count (single slice)
                 Int64(n),  # stride (unused with one slice)
                 grid_dim=(grid_x, 1),
@@ -6090,9 +6157,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
             self.ctx.synchronize()
             var sumsq = self.grad_norm_host_buf[0]
-            if sharded:
-                sumsq = Float32(self.zero_ctx.allreduce_scalar(Float64(sumsq)))
-            return sqrt(sumsq) / Float32(Self.WORLD_SIZE)
+            return sumsq
 
     def _debug_grad_nanscan(
         mut self, rank: Int, step: Int, micro_step: Int
