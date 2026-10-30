@@ -18,6 +18,9 @@ MOJO_INCLUDES := -I .
 # noise via sinf/cosf, which the backend fuses into sincosf — a libm symbol that
 # the AOT linker otherwise reports as "DSO missing from command line".
 MOJO_LINK_FLAGS := -Xlinker -lm
+# Extra comptime defines for the train/profile builds, e.g. MOJO_DEFINES="-D LLMM_INIT_SEED=1".
+# Binaries are rebuilt only when sources change, so rm the binary when changing this.
+MOJO_DEFINES ?=
 LLMM_SOURCES := $(shell find llmm -name '*.mojo' 2>/dev/null)
 WORLD_SIZE ?= 1
 
@@ -212,6 +215,7 @@ help:
 	@echo "  train-cpu     Build and run build/train_gpt2 on CPU (LLMM_USE_CPU=1)"
 	@echo "  train-metal   Build (WORLD_SIZE=1) and run on Apple Metal GPU (experimental)"
 	@echo "  build-bf16    Compile train_gpt2.mojo (-D LLMM_BF16) to build/train_gpt2_bf16"
+	@echo "                MOJO_DEFINES=\"-D LLMM_INIT_SEED=1\" adds extra -D flags to train/profile builds"
 	@echo "  train-bf16    Build and run build/train_gpt2_bf16 (ARGS=\"...\" for training flags)"
 	@echo "  build-fp8     Compile train_gpt2.mojo (-D LLMM_PRECISION=fp8) to build/train_gpt2_fp8"
 	@echo "                (full fp8 mixed-precision training: e4m3 fwd / e5m2 grads via"
@@ -440,7 +444,7 @@ build: build-mojo
 
 $(TRAIN_BIN): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES) | $(PIXI_STAMP)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(TRAIN_BIN) $(TRAIN_MOJO_SRC)
 
 # bf16 mixed-precision training binary (GPU-only — see the bf16-build-needs-
 # gpu-only-dispatch guard in train_gpt2.mojo). All training flags are passed
@@ -452,7 +456,7 @@ build-bf16: $(TRAIN_BIN_BF16)
 
 $(TRAIN_BIN_BF16): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_BF16) $(TRAIN_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(TRAIN_BIN_BF16) $(TRAIN_MOJO_SRC)
 
 # fp8 mixed-precision training binary (GPU-only, same policy as bf16 — see the
 # bf16-build-needs-gpu-only-dispatch guard in train_gpt2.mojo, which also
@@ -467,7 +471,7 @@ build-fp8: $(TRAIN_BIN_FP8)
 
 $(TRAIN_BIN_FP8): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_FP8) $(TRAIN_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(TRAIN_BIN_FP8) $(TRAIN_MOJO_SRC)
 
 # fp4 (NVFP4) mixed-precision training binary (GPU-only, same policy as
 # bf16/fp8 above). docs/ai/fp4_training_recipes_research.md: -D
@@ -483,7 +487,7 @@ build-fp4: $(TRAIN_BIN_FP4)
 
 $(TRAIN_BIN_FP4): $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(TRAIN_BIN_FP4) $(TRAIN_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(TRAIN_BIN_FP4) $(TRAIN_MOJO_SRC)
 
 train: $(TRAIN_BIN) $(TRAIN_RUNNER)
 	@$(TRAIN_RUNNER) $(ARGS)
@@ -551,7 +555,7 @@ build-profile: $(PROFILE_BIN)
 
 $(PROFILE_BIN): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES) | $(PIXI_STAMP)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(PROFILE_BIN) $(PROFILE_MOJO_SRC)
 
 # bf16 mixed-precision build of the harness (params/acts/grads bf16, fp32 master
 # weights + optimizer moments). GPU-only by policy; see profile_gpt2.mojo.
@@ -559,7 +563,7 @@ build-profile-bf16: $(PROFILE_BIN_BF16)
 
 $(PROFILE_BIN_BF16): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_BF16) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(PROFILE_BIN_BF16) $(PROFILE_MOJO_SRC)
 
 # fp8 build of the profiling harness (see build-fp8 above for the Chunk A
 # inert-flag caveat).
@@ -567,7 +571,7 @@ build-profile-fp8: $(PROFILE_BIN_FP8)
 
 $(PROFILE_BIN_FP8): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP8) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(PROFILE_BIN_FP8) $(PROFILE_MOJO_SRC)
 
 # A1 static-scales profiling harness (docs/ai/speedrun_techniques_
 # research.md A1) -- same binary shape as PROFILE_BIN_FP8, `-D
@@ -579,14 +583,14 @@ build-profile-fp8-static: $(PROFILE_BIN_FP8_STATIC)
 
 $(PROFILE_BIN_FP8_STATIC): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 -D LLMM_FP8_STATIC_SCALES=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP8_STATIC) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 -D LLMM_FP8_STATIC_SCALES=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(PROFILE_BIN_FP8_STATIC) $(PROFILE_MOJO_SRC)
 
 # fp4 build of the profiling harness (see build-fp4 above).
 build-profile-fp4: $(PROFILE_BIN_FP4)
 
 $(PROFILE_BIN_FP4): $(PROFILE_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(PROFILE_BIN_FP4) $(PROFILE_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp4 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(PROFILE_BIN_FP4) $(PROFILE_MOJO_SRC)
 
 build-infer: $(INFER_BIN)
 
