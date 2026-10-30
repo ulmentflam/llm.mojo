@@ -22,9 +22,10 @@ from max.algorithm import sync_parallelize
 from max.gpu.host import DeviceContext
 
 from llmm.memory import MutMemPtr, heap_alloc
+from llmm.muon import muon_momentum_at
 from llmm.zero import CpuCoordinator
 
-from train_gpt2 import GPT2, GPT2_DTYPE
+from train_gpt2 import GPT2, GPT2_DTYPE, ROTARY
 
 comptime TT = 16
 comptime BB = 1
@@ -79,10 +80,13 @@ def _train[
     result: MutMemPtr[DType.float32],
     accum: Int = 1,
     same_batch: Bool = False,
+    mu_ramp: Bool = False,
 ) raises:
     """Run `steps` steps on W threaded ranks at `stage`; rank r's final params
     go to result[r*n : (r+1)*n]. `accum` micro-steps per step (gradient
-    accumulation); `same_batch` gives every rank the same batch."""
+    accumulation); `same_batch` gives every rank the same batch. `mu_ramp`
+    writes model.muon_momentum = muon_momentum_at(step, 0.5, 0.95, STEPS)
+    before each update, as the trainer's step loop does."""
     var coord = heap_alloc[CpuCoordinator](1)
     coord[] = CpuCoordinator(W)
     var errors = heap_alloc[Int](W)
@@ -129,6 +133,10 @@ def _train[
                         model.zero_gradients()
                     model.backward(accum, ms, step)
                     model.ctx.synchronize()
+                if mu_ramp:
+                    model.muon_momentum = muon_momentum_at(
+                        step, Float32(0.5), Float32(0.95), STEPS
+                    )
                 model.update(
                     t=UInt32(step + 1),
                     learning_rate=Scalar[DType.float32](1e-3),
@@ -461,6 +469,56 @@ def test_t2_zero1_bit_exact_w8_rank_owns_nothing() raises:
     _t2[8](1, 1, 16)
 
 
+def test_t2_mu_ramp_reaches_hybrid_and_sharded_w2() raises:
+    """W2 momentum warmup: the per-step model.muon_momentum the trainer writes
+    must reach both the replicated (_update_hybrid, ZeRO-0) and the sharded
+    (_update_sharded_muon via _muon_config, ZeRO-1) Muon paths. A ramp from
+    0.5 must change the params vs the constant 0.95 of enable_muon (so update
+    reads the field, not a value cached at enable time), and ZeRO-1 must stay
+    bit-exact against ZeRO-0 under the ramp (so both paths read the same
+    value each step)."""
+    comptime W = 2
+    var path = String("gpt2_zm_ramp_w2.bin")
+    var n = _write_checkpoint(path, 2, 2, 16)
+    var flat = heap_alloc[Float32](W * n)
+    var z0 = heap_alloc[Float32](W * n)
+    var z1 = heap_alloc[Float32](W * n)
+    try:
+        _train[W](path, n, 0, STEPS, flat)
+        _train[W](path, n, 0, STEPS, z0, mu_ramp=True)
+        _train[W](path, n, 1, STEPS, z1, mu_ramp=True)
+    except e:
+        _remove(path)
+        flat.unsafe_free()
+        z0.unsafe_free()
+        z1.unsafe_free()
+        raise e^
+    _remove(path)
+    var max_diff = Float32(0.0)
+    for i in range(W * n):
+        max_diff = max(
+            max_diff, abs(z0[unsafe_offset=i] - flat[unsafe_offset=i])
+        )
+        if z0[unsafe_offset=i] != z1[unsafe_offset=i]:
+            raise Error(
+                "mu ramp: ZeRO-1 != ZeRO-0 at idx "
+                + String(i)
+                + ": "
+                + String(z0[unsafe_offset=i])
+                + " vs "
+                + String(z1[unsafe_offset=i])
+            )
+    flat.unsafe_free()
+    z0.unsafe_free()
+    z1.unsafe_free()
+    if not (max_diff > 1e-6):
+        raise Error(
+            "mu ramp had no effect on params (max diff "
+            + String(max_diff)
+            + "): update() is not reading model.muon_momentum"
+        )
+
+
 def test_ownership_table() raises:
     """Ownership bookkeeping at W=4, L=2 (threaded, so the coordinator-backed
     constructor works): O_r sums to 6*L matrices' elements, every slot has
@@ -615,7 +673,18 @@ def _sizes_w8(
         assert_equal(got[unsafe_offset=4 * r], exp_s)
         assert_equal(got[unsafe_offset=4 * r + 1], exp_opt)
         assert_equal(got[unsafe_offset=4 * r + 2], exp_o[r])
-        assert_equal(got[unsafe_offset=4 * r + 3], exp_a[r])
+        var want_a = exp_a[r]
+        comptime if ROTARY:
+            # -D LLMM_ROTARY=1 leaves wpe out of the AdamW ranges: subtract its
+            # overlap with this rank's shard [r*opt, (r+1)*opt). wpe is the
+            # [maxT=TT, C=16] block right after wte ([VOCAB, 16]), derived here
+            # independently of the trainer.
+            var wpe_lo = VOCAB * 16
+            var wpe_hi = wpe_lo + TT * 16
+            var lo = max(wpe_lo, r * exp_opt)
+            var hi = min(wpe_hi, (r + 1) * exp_opt)
+            want_a -= max(0, hi - lo)
+        assert_equal(got[unsafe_offset=4 * r + 3], want_a)
     got.unsafe_free()
 
 

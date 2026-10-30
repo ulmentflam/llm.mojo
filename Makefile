@@ -179,7 +179,7 @@ $(PIXI_STAMP):
         benchmark-collectives \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
-        test test-cpu test-cuda test-python test-mojo test-fixtures smoke gate \
+        test test-cpu test-cuda test-python test-mojo test-fixtures rotary-reference smoke gate \
         compare-llmc-cpu compare-llmm-cpu \
         verify verify-cpu verify-gpu verify-gpu-tf32 verify-init \
         docs docs-clean
@@ -603,7 +603,7 @@ build-infer-bf16: $(INFER_BIN_BF16)
 
 $(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
 
 # GPT-2 inference on MAX's Python APIs: the stable graph API (max.nn +
 # max.graph) and the experimental eager API (max.experimental), sharing
@@ -1496,6 +1496,15 @@ smoke: lint build-mojo
 
 test-fixtures:
 	$(PIXI) run python -m tests.reference dump
+
+# PyTorch reference for the -D LLMM_ROTARY=1 build (GPT2_ROTARY=1): writes
+# gpt2_124M_rotary_debug_state.bin (same weights, rotary q/k, zero wpe grad;
+# the flag-off model/debug-state files are not touched) and prints the 10-step
+# loss list for test_gpt2.mojo's `expected_losses_rotary`. Then gate with
+#   make verify-gpu MOJO_DEFINES="-D LLMM_ROTARY=1"
+rotary-reference:
+	GPT2_ROTARY=1 $(PIXI) run python train_gpt2.py --device cpu --num_iterations 0
+	GPT2_ROTARY=1 $(PIXI) run python scripts/gen_expected_losses.py
 
 # Run verification of activations, losses, and gradients against gpt2_124M_debug_state.bin.
 # We run them as separate processes because initializing both CPU and GPU standard

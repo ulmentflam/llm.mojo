@@ -19,7 +19,8 @@ from llmm.rand import MT19937
 # 2 num_processes, 3 process_rank, 4 use_master_weights, 5 should_shuffle,
 # 10 step, 20-21 sampler rng, 22-23 shuffle draws, 30-31 shard idx, 32-33
 # sample idx (all llm.c-compatible), and 40 optimizer_kind (0 AdamW, 1 Muon;
-# absent = 0 in files written before Muon). Muon keeps its momentum in the `m`
+# absent = 0 in files written before Muon), 44 architecture flags (bit 0
+# rotary; version-2 files only, see STATE_VERSION_FLAGS). Muon keeps its momentum in the `m`
 # payload slot and leaves `v` unused for the matrices.
 #
 # Splitting the two means a finished run ships only the model file, while a
@@ -42,6 +43,16 @@ comptime VERSION_BF16 = 5
 # State checkpoint header. 20240527 is llm.c's `save_state` magic.
 comptime STATE_MAGIC = 20240527
 comptime STATE_VERSION = 1
+# Version 2 adds the architecture-flags word (header slot 44). A state file is
+# written as version 1 when flags == 0 (byte-identical to before the flags
+# existed) and as version 2 only when a flag is set, so default-build files are
+# unchanged and any older reader refuses a flagged file by its version.
+comptime STATE_VERSION_FLAGS = 2
+# Architecture flags (bit set), stored in state header slot 44 and model
+# header slot 20. Bit 0: rotary position embeddings (-D LLMM_ROTARY=1).
+comptime ARCH_FLAG_ROTARY = 1
+comptime STATE_FLAGS_SLOT = 44
+comptime MODEL_FLAGS_SLOT = 20
 
 comptime AUTO_VERSION = -1  # Sentinel: derive the version from the param dtype.
 
@@ -116,6 +127,7 @@ struct ModelHeader(Copyable, Movable):
 
     var config: CheckpointConfig
     var version: Int
+    var arch_flags: Int  # header slot 20; 0 in files without flags.
 
 
 struct TrainingState(Copyable, Movable):
@@ -143,6 +155,9 @@ struct TrainingState(Copyable, Movable):
     # blob of `muon_shard_elems` fp32 elements follows m and v.
     var muon_ownership_version: Int
     var muon_shard_elems: Int  # slot 43: S, the per-rank owner shard.
+    # Slot 44 (version-2 files): architecture flags, ARCH_FLAG_*. 0 for every
+    # default-build file, which is then still written as version 1.
+    var flags: Int
 
     def __init__(
         out self,
@@ -159,6 +174,7 @@ struct TrainingState(Copyable, Movable):
         zero_stage: Int = 0,
         muon_ownership_version: Int = 0,
         muon_shard_elems: Int = 0,
+        flags: Int = 0,
     ):
         self.step = step
         self.num_processes = num_processes
@@ -173,6 +189,7 @@ struct TrainingState(Copyable, Movable):
         self.zero_stage = zero_stage
         self.muon_ownership_version = muon_ownership_version
         self.muon_shard_elems = muon_shard_elems
+        self.flags = flags
 
 
 # ===----------------------------------------------------------------------=== #
@@ -200,6 +217,7 @@ def write_model_checkpoint[
     params: MutMemPtr[dtype],
     num_parameters: Int,
     version: Int = AUTO_VERSION,
+    arch_flags: Int = 0,
 ) raises:
     """Write a model checkpoint: 256-int header followed by the parameter blob.
 
@@ -223,6 +241,8 @@ def write_model_checkpoint[
     header.unsafe_store(5, Int32(config.num_heads))
     header.unsafe_store(6, Int32(config.channels))
     header.unsafe_store(7, Int32(config.padded_vocab_size))
+    if arch_flags != 0:  # slot stays 0 (byte-identical file) by default
+        header.unsafe_store(MODEL_FLAGS_SLOT, Int32(arch_flags))
 
     var file = open(path, "w")
     write_buffer[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
@@ -259,8 +279,9 @@ def read_model_header(mut file: FileHandle) raises -> ModelHeader:
         channels=Int(header.unsafe_load(6)),
         padded_vocab_size=Int(header.unsafe_load(7)),
     )
+    var arch_flags = Int(header.unsafe_load(MODEL_FLAGS_SLOT))
     header.unsafe_free()
-    return ModelHeader(config^, version)
+    return ModelHeader(config^, version, arch_flags)
 
 
 def peek_model_header(path: String) raises -> ModelHeader:
@@ -338,7 +359,10 @@ def write_state_checkpoint[
     for i in range(CHECKPOINT_HEADER_SIZE):
         header.unsafe_store(i, Int32(0))
     header.unsafe_store(0, Int32(STATE_MAGIC))
-    header.unsafe_store(1, Int32(STATE_VERSION))
+    header.unsafe_store(
+        1,
+        Int32(STATE_VERSION_FLAGS if state.flags != 0 else STATE_VERSION),
+    )
     header.unsafe_store(2, Int32(state.num_processes))
     header.unsafe_store(3, Int32(state.process_rank))
     header.unsafe_store(4, Int32(state.use_master_weights))
@@ -348,6 +372,8 @@ def write_state_checkpoint[
     header.unsafe_store(41, Int32(state.zero_stage))
     header.unsafe_store(42, Int32(state.muon_ownership_version))
     header.unsafe_store(43, Int32(state.muon_shard_elems))
+    if state.flags != 0:
+        header.unsafe_store(STATE_FLAGS_SLOT, Int32(state.flags))
 
     # 64-bit fields share the same buffer; an aligned UInt64 view writes pairs
     # of Int32 slots (index k => slots 2k, 2k+1), matching llm.c's byte offsets.
@@ -387,7 +413,7 @@ def read_state_header(mut file: FileHandle) raises -> TrainingState:
             "Checkpoint error: bad state magic number in header: "
             + String(magic)
         )
-    if version != STATE_VERSION:
+    if version != STATE_VERSION and version != STATE_VERSION_FLAGS:
         header.unsafe_free()
         raise Error(
             "Checkpoint error: unsupported state version in header: "
@@ -409,6 +435,8 @@ def read_state_header(mut file: FileHandle) raises -> TrainingState:
         zero_stage=Int(header.unsafe_load(41)),
         muon_ownership_version=Int(header.unsafe_load(42)),
         muon_shard_elems=Int(header.unsafe_load(43)),
+        flags=Int(header.unsafe_load(STATE_FLAGS_SLOT)) if version
+        == STATE_VERSION_FLAGS else 0,
     )
     header.unsafe_free()
     return state^
@@ -559,6 +587,7 @@ def make_training_state(
     sampler_rng_state: UInt64 = 0,
     use_master_weights: Int = 0,
     optimizer_kind: Int = 0,
+    flags: Int = 0,
 ) raises -> TrainingState:
     """Snapshot a DataLoader's position into a `TrainingState` for checkpointing.
     """
@@ -575,6 +604,7 @@ def make_training_state(
         current_shard_idx=loader.current_shard_idx,
         current_sample_idx=loader.current_sample_idx,
         optimizer_kind=optimizer_kind,
+        flags=flags,
     )
 
 

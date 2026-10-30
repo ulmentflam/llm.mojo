@@ -34,6 +34,9 @@ from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
 from llmm.checkpointing import (
     CheckpointConfig,
     TrainingState,
+    ARCH_FLAG_ROTARY,
+    MODEL_FLAGS_SLOT,
+    peek_model_header,
     write_model_checkpoint,
     read_model_checkpoint,
     write_state_checkpoint,
@@ -62,6 +65,7 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
+from llmm.rotary import rotary_qk_rows, rotary_table_host
 from llmm.qk_clip import (
     qk_clip_apply,
     qk_clip_bias_range,
@@ -86,7 +90,7 @@ from llmm.global_norm import (
     global_norm_aggregate_gpu,
 )
 from llmm.adamw import adamw_update, AdamWConfig
-from llmm.muon import muon_update, MuonConfig, MuonGroup
+from llmm.muon import muon_update, muon_momentum_at, MuonConfig, MuonGroup
 from llmm.fused_classifier import (
     fused_classifier,
     chunked_ce_pass1,
@@ -255,6 +259,8 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #   LLMM_SAVE_EVERY=<int>      override checkpoint_every.
 #   LLMM_OPTIMIZER=adamw|muon  override the -opt optimizer (default adamw).
 #   LLMM_MUON_MOMENTUM=<f>     override -mu, Muon momentum (default 0.95).
+#   LLMM_MUON_MOMENTUM_START=<f>  override -mu_start (default: equal to -mu).
+#   LLMM_MUON_MOMENTUM_WARMUP=<n> override -mu_warmup steps (default 0 = off).
 #   LLMM_QK_CLIP=<f>           override -qk_clip, max attention logit (0=off).
 #   LLMM_RECOMPUTE=1           test_gpt2 only: activation-recompute build in
 #                              run_test. Not read by train_gpt2 (see docs).
@@ -373,6 +379,39 @@ comptime ZERO_INIT_PROJ = get_defined_int["LLMM_ZERO_INIT_PROJ", 0]()
 # gradients. So relu2 builds use exact exp; the default stays bit-identical.
 # See docs/ai/w5_w6_zero_init_proj_and_relu2_2026-10-30.md.
 comptime ATTN_SOFT_EXP = not MLP_RELU2
+# -D LLMM_ROTARY=1: modded-nanogpt half-truncated rotary on q/k, no learned
+# position embedding. `wpe` stays in the parameter layout (descriptor,
+# checkpoint tensor list, ZeRO shards, Muon owner-space unchanged) but is not
+# added in the forward, gets no gradient, is zero in a from-scratch init and is
+# excluded from the AdamW ranges. See docs/ai/rotary_embeddings_w8_2026-10-30.md.
+comptime ROTARY = get_defined_int["LLMM_ROTARY", 0]() != 0
+# Architecture flags word persisted in checkpoint headers (0 = default build).
+comptime ARCH_FLAGS = ARCH_FLAG_ROTARY if ROTARY else 0
+
+
+def check_arch_flags(what: String, got: Int, strict: Bool) raises:
+    """Refuse a checkpoint whose architecture flags disagree with this build.
+
+    `strict` (resume: state file and the model file saved with it) requires
+    equality in both directions. Non-strict (initializing from a model .bin)
+    refuses only a flagged file in a build without that flag: a flag-0 file is
+    an ordinary pretrained init (the speedrun-style conversion of GPT-2
+    weights), while a rotary-trained file is meaningless without rotary.
+    """
+    if got == ARCH_FLAGS:
+        return
+    if strict or (got & ~ARCH_FLAGS) != 0:
+        raise Error(
+            "Cannot load "
+            + what
+            + ": it was written with architecture flags="
+            + String(got)
+            + " (1=rotary) but this binary was built with flags="
+            + String(ARCH_FLAGS)
+            + "; rebuild with the matching -D LLMM_ROTARY"
+        )
+
+
 # GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
 comptime SCRATCH_VOCAB_SIZE = 50257
 comptime SCRATCH_PADDED_VOCAB_SIZE = 50304
@@ -1354,6 +1393,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var master_memory: MutMemPtr[MASTER_DTYPE]
     var head_max_memory: MutMemPtr[DType.float32]
     var head_max_fwd_memory: MutMemPtr[DType.float32]
+    # ROTARY only: fp32 [cos | sin] table, each [rotary_rows, head_dim/4].
+    var rotary_table_buf: DeviceBuffer[DType.float32]
+    var rotary_table: MutMemPtr[DType.float32]
+    var rotary_rows: Int
     var qk_clip_tau: Float32  # <= 0 disables QK-clip
     # WORLD_SIZE > 1: `head_max_buf` already holds the cross-rank max for this
     # step (set by _qk_sync_head_max, cleared by the backward fold), and the
@@ -1366,6 +1409,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # Muon reuses `m_memory` as its momentum buffer. See `enable_muon`.
     var optimizer_kind: Int
     var muon_momentum: Float32
+    # Muon only: multiplier on the scheduler lr for the AdamW-managed ranges
+    # (wte, wpe, LayerNorm, biases); the Muon matrices keep the scheduler lr.
+    var adam_lr_mult: Float32
     var muon_groups: List[MuonGroup]
     # Muon only: v (AdamW second moment) is compact -- just the AdamW-owned
     # ranges, concatenated. v_compact_bases[k] is range k's offset in v_memory;
@@ -1550,6 +1596,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.master_memory = NULL_MASTER_PTR
         self.optimizer_kind = 0
         self.muon_momentum = Float32(0.95)
+        self.adam_lr_mult = Float32(1.0)
         self.muon_groups = List[MuonGroup]()
         self.v_compact_bases = List[Int]()
         self.v_num_parameters = 0
@@ -1563,6 +1610,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.muon_master_memory = NULL_MASTER_PTR
         self.head_max_memory = NULL_MASTER_PTR
         self.head_max_fwd_memory = NULL_MASTER_PTR
+        self.rotary_table = NULL_MASTER_PTR
+        self.rotary_rows = 0
         self.qk_clip_tau = 0.0
         self.qk_head_max_global = False
         self.qk_clip_applied = False
@@ -1620,6 +1669,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.muon_master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.head_max_fwd_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
+        self.rotary_table_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](1)
@@ -1687,6 +1737,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var model_header = heap_alloc[Int32](256)
             read_and_copy[DType.int32](model_file, model_header, 256)
 
+            var init_flags = Int(model_header.unsafe_load(MODEL_FLAGS_SLOT))
             var model_magic = model_header.unsafe_load(0)
             if model_magic != GPT2_MAGIC and model_magic != GPT2_MAGIC_LEGACY:
                 print("Bad magic number in header: " + String(model_magic))
@@ -1701,6 +1752,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
                 model_header.unsafe_free()
                 raise Error("GPT2 error: Invalid version in header")
+            check_arch_flags(self.checkpoint_path, init_flags, False)
 
             self.config = GPT2Config(
                 max_seq_len=Int(model_header.unsafe_load(2)),
@@ -2385,7 +2437,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         if is_proj:
                             for j in range(n):
                                 fp32_ptr[unsafe_offset=j] = Float32(0.0)
-                    for j in range(n):
+                    # ROTARY: the wpe draw is still consumed so every later
+                    # tensor gets the same values as in a non-rotary build with
+                    # this seed, but the (already zeroed) wpe is left at zero.
+                    var keep = True
+                    comptime if ROTARY:
+                        keep = i != Parameters.wpe
+                    for j in range(n if keep else 0):
                         hp[unsafe_offset=offset + layer_offset + j] = fp32_ptr[
                             unsafe_offset=j
                         ].cast[GPT2_DTYPE]()
@@ -2818,7 +2876,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 seq_len,
                 channels,
                 self.ctx,
-                include_wpe=first_chunk,
+                include_wpe=first_chunk and not ROTARY,
             )
 
             # Map this chunk's compact rows back to flat `wte` ranges. Compact
@@ -3182,6 +3240,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.has_allocated_optimizer_moments = True
 
+    def _allocate_rotary_table(mut self) raises:
+        """Build the [cos | sin] fp32 table once, sized to the model's max
+        sequence length (the wpe row count), which also covers generation."""
+        if self.rotary_rows > 0:
+            return
+        var T_max = self.config.max_seq_len
+        var hd = self.config.channels // self.config.num_heads
+        var tbl = rotary_table_host(T_max, hd)
+        var host = self.ctx.enqueue_create_host_buffer[DType.float32](len(tbl))
+        for i in range(len(tbl)):
+            host[i] = tbl[i]
+        self.rotary_table_buf = self.ctx.enqueue_create_buffer[DType.float32](
+            len(tbl)
+        )
+        self.ctx.enqueue_copy(self.rotary_table_buf, host)
+        self.ctx.synchronize()
+        self.rotary_table = rebind_mut_mem[DType.float32](
+            self.rotary_table_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.rotary_rows = T_max
+
     def allocate_activations(mut self, batch_size: Int, seq_len: Int) raises:
         self.batch_size = batch_size
         self.seq_len = seq_len
@@ -3418,6 +3497,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.grad_acts_stats_memory,
         )
         self.has_allocated_acts = True
+        comptime if ROTARY:
+            self._allocate_rotary_table()
 
     def build_encoder_buckets(mut self, batch_size: Int, seq_len: Int) raises:
         if self.enc_row_sparse:
@@ -3632,7 +3713,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         #########################################################
 
         var residual: MutMemPtr[GPT2_DTYPE]
-        encoder_fwd[GPT2_DTYPE, Self.target](
+        encoder_fwd[GPT2_DTYPE, Self.target, use_wpe=not ROTARY](
             as_mut_kernel[GPT2_DTYPE](self.acts.encoded),
             as_immut_kernel_from_mut[DType.int32](enc_inputs),
             as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
@@ -3864,6 +3945,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
+            comptime if ROTARY:
+                rotary_qk_rows[GPT2_DTYPE, Self.target, inverse=False](
+                    as_mut_kernel[GPT2_DTYPE](l_qkv),
+                    as_immut_kernel_from_mut[DType.float32](self.rotary_table),
+                    batch_size,
+                    seq_len,
+                    self.rotary_rows,
+                    num_heads,
+                    head_dim,
+                    self.ctx,
+                )
             attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=ATTN_SOFT_EXP](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](l_q),
@@ -5290,6 +5382,20 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx,
                 cache=rebind[KVCachePtr](Pointer(to=self.kv_cache)),
             )
+            # ROTARY: d_qkv now holds the gradient w.r.t. the ROTATED q/k;
+            # apply the inverse rotation to its q and k thirds (v untouched)
+            # before the qkv matmul backward.
+            comptime if ROTARY:
+                rotary_qk_rows[GPT2_DTYPE, Self.target, inverse=True](
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                    as_immut_kernel_from_mut[DType.float32](self.rotary_table),
+                    batch_size,
+                    seq_len,
+                    self.rotary_rows,
+                    num_heads,
+                    head_dim,
+                    self.ctx,
+                )
 
             # QKV matmul backward.
             # fp8 site: C=channels, OC=3*channels; input=l_ln_1,
@@ -5520,6 +5626,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 seq_len,
                 channels,
                 self.ctx,
+                include_wpe=not ROTARY,
             )
 
             if bucketing:
@@ -5610,7 +5717,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             off += self.param_sizes[i]
         return off
 
-    def enable_muon(mut self, momentum: Float32) raises:
+    def enable_muon(
+        mut self, momentum: Float32, adam_lr_mult: Float32 = Float32(1.0)
+    ) raises:
         """Switch `update()` to Muon for the 2-D block matrices (AdamW keeps
         embeddings, biases and LayerNorm). Call after the parameter layout and
         `allocate_optimizer_moments` exist.
@@ -5657,6 +5766,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
         self.muon_groups = groups^
         self.muon_momentum = momentum
+        self.adam_lr_mult = adam_lr_mult
         self.optimizer_kind = 1
         # The constructor already allocated a full-size v; Muon matrices never
         # read it, so replace it with a compact one covering only this rank's
@@ -5976,7 +6086,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         """[start0, end0, start1, end1, ...] of the flat-buffer ranges AdamW
         owns when Muon is enabled: everything except the Muon matrices."""
         var r = List[Int]()
-        r.append(0)
+        comptime if ROTARY:
+            # wpe is unused under rotary: leave it out of the AdamW ranges
+            # (the range split is wte | skip wpe | ln_1.. .. qkv_weight).
+            r.append(0)
+            r.append(self.param_offset(Parameters.wpe))
+            r.append(self.param_offset(Parameters.ln_1_gamma))
+        else:
+            r.append(0)
         r.append(self.param_offset(Parameters.qkv_weight))
         r.append(self.param_offset(Parameters.qkv_bias))
         r.append(self.param_offset(Parameters.attn_proj_weight))
@@ -5995,6 +6112,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     ) raises:
         """Muon step: AdamW over the non-matrix ranges, then one muon_update
         over the Muon groups. Whole-buffer (unsharded) layouts only."""
+        var adam_config = self._adam_config(config)
         var ranges = self._adamw_ranges()
         for k in range(len(ranges) // 2):
             var start = ranges[2 * k]
@@ -6018,7 +6136,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.v_memory.unsafe_offset(self.v_compact_bases[k])
                 ),
                 t,
-                config,
+                adam_config,
                 self.ctx,
             )
         var muon_config = MuonConfig(
@@ -6039,6 +6157,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             t,
             muon_config,
             self.ctx,
+        )
+
+    def _adam_config(self, config: AdamWConfig) -> AdamWConfig:
+        """AdamW config for the AdamW-managed ranges under Muon: scheduler lr
+        times `adam_lr_mult` (applied after the scheduler; 1.0 is exact)."""
+        return AdamWConfig(
+            learning_rate=config.learning_rate * self.adam_lr_mult,
+            beta1=config.beta1,
+            beta2=config.beta2,
+            eps=config.eps,
+            weight_decay=config.weight_decay,
+            grad_scale=config.grad_scale,
         )
 
     def _muon_config(self, config: AdamWConfig) -> MuonConfig:
@@ -6091,6 +6221,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # The CPU Muon reference reads the packed gradients directly on
             # the host, so the (queued) pack copies must have landed first.
             self.ctx.synchronize()
+            var adam_config = self._adam_config(config)
             var segs = self._adamw_shard_segments()
             for i in range(len(segs)):
                 ref sg = segs[i]
@@ -6116,7 +6247,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.v_memory.unsafe_offset(sg.compact_off)
                     ),
                     t,
-                    config,
+                    adam_config,
                     self.ctx,
                 )
             if len(self.muon_owned_groups) > 0:
@@ -6845,6 +6976,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     host_params.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 self.num_parameters,
+                arch_flags=ARCH_FLAGS,
             )
 
         # AdamW moments are fp32 (MASTER_DTYPE), independent of the parameter
@@ -6862,6 +6994,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             step,
             sampler_rng_state,
             optimizer_kind=self.optimizer_kind,
+            flags=ARCH_FLAGS,
         )
         var n_mu = 0
         if self._sharded_muon():
@@ -6908,6 +7041,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         checkpoint (build it from the same base checkpoint first). Each rank
         reads the shared model file plus its own optimizer-state shard.
         """
+        # Resume must match the architecture flags exactly, in both
+        # directions, before any tensor is read.
+        var arch_peek = open(state_path, "r")
+        var state_flags = read_state_header(arch_peek).flags
+        arch_peek.close()
+        check_arch_flags(state_path, state_flags, True)
+        check_arch_flags(
+            model_path, peek_model_header(model_path).arch_flags, True
+        )
         var host_params = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )
@@ -7387,6 +7529,8 @@ struct TrainArgs(Copyable, Movable):
     var lr_scheduler_type: String  # -k  cosine|linear|constant|wsd
     var warmup_iterations: Int  # -u
     var final_learning_rate_frac: Float32  # -q
+    var cooldown_frac: Float32  # -cooldown  wsd decay-phase fraction
+    var decay_shape: String  # -decay_shape  wsd: sqrt|linear
     var weight_decay: Float32  # -c
     var grad_clip: Float32  # -gc  max gradient norm (0 = no clipping)
     var val_loss_every: Int  # -v
@@ -7398,6 +7542,12 @@ struct TrainArgs(Copyable, Movable):
     var zero_stage: Int  # -z
     var optimizer: String  # -opt  adamw|muon
     var muon_momentum: Float32  # -mu  Muon momentum
+    var beta1: Float32  # -b1  AdamW beta1 (AdamW ranges under Muon)
+    var beta2: Float32  # -b2  AdamW beta2
+    var eps: Float32  # -eps  AdamW epsilon
+    var adam_lr_mult: Float32  # -l_adam  lr multiplier, AdamW ranges under Muon
+    var muon_momentum_start: Float32  # -mu_start  (< 0: unset, use -mu)
+    var muon_momentum_warmup: Int  # -mu_warmup  ramp steps (0 = off)
     var qk_clip_tau: Float32  # -qk_clip  max attention logit (0 = off)
 
 
@@ -7424,6 +7574,8 @@ def default_train_args() -> TrainArgs:
         lr_scheduler_type="cosine",
         warmup_iterations=0,
         final_learning_rate_frac=Float32(1.0),
+        cooldown_frac=Float32(0.2),
+        decay_shape="sqrt",
         weight_decay=Float32(0.0),
         grad_clip=Float32(1.0),
         val_loss_every=20,
@@ -7435,6 +7587,12 @@ def default_train_args() -> TrainArgs:
         zero_stage=0,
         optimizer="adamw",
         muon_momentum=Float32(0.95),
+        beta1=Float32(0.9),
+        beta2=Float32(0.999),
+        eps=Float32(1e-8),
+        adam_lr_mult=Float32(1.0),
+        muon_momentum_start=Float32(-1.0),
+        muon_momentum_warmup=0,
         qk_clip_tau=Float32(0.0),
     )
 
@@ -7470,12 +7628,30 @@ def _build_lr_scheduler(
             final_learning_rate_fraction=args.final_learning_rate_frac,
         )
     elif k == "wsd":
+        if args.decay_shape != "sqrt" and args.decay_shape != "linear":
+            raise Error(
+                "Invalid -decay_shape (sqrt|linear): " + args.decay_shape
+            )
+        if args.cooldown_frac < 0.0 or args.cooldown_frac > 1.0:
+            raise Error("-cooldown must be in [0, 1]")
+        if args.decay_shape == "linear":
+            return LearningRateScheduler(
+                "wsd",
+                learning_rate=args.learning_rate,
+                warmup_steps=args.warmup_iterations,
+                train_num_batches=train_num_batches,
+                final_learning_rate_fraction=args.final_learning_rate_frac,
+                cooldown_fraction=args.cooldown_frac,
+                decay_shape="linear",
+            )
         return LearningRateScheduler(
             "wsd",
             learning_rate=args.learning_rate,
             warmup_steps=args.warmup_iterations,
             train_num_batches=train_num_batches,
             final_learning_rate_fraction=args.final_learning_rate_frac,
+            cooldown_fraction=args.cooldown_frac,
+            decay_shape="sqrt",
         )
     raise Error("Invalid scheduler type: " + k)
 
@@ -7640,7 +7816,17 @@ def train[
         setup_rank,
         _table_row("final LR fraction", String(args.final_learning_rate_frac)),
     )
+    printf0(
+        setup_rank,
+        _table_row("wsd cooldown fraction", String(args.cooldown_frac)),
+    )
+    printf0(setup_rank, _table_row("wsd decay shape", args.decay_shape))
     printf0(setup_rank, _table_row("weight decay", String(args.weight_decay)))
+    # -mu_start < 0 means unset: ramp starts at -mu (no ramp).
+    var muon_mu_start = (
+        args.muon_momentum_start if args.muon_momentum_start
+        >= 0.0 else args.muon_momentum
+    )
     printf0(setup_rank, _table_row("optimizer", args.optimizer))
     comptime if ZERO_INIT_PROJ != 0:
         printf0(
@@ -7653,6 +7839,31 @@ def train[
         printf0(
             setup_rank, _table_row("muon momentum", String(args.muon_momentum))
         )
+        printf0(
+            setup_rank,
+            _table_row("adam lr mult (l_adam)", String(args.adam_lr_mult)),
+        )
+        printf0(
+            setup_rank,
+            _table_row("muon momentum start", String(muon_mu_start)),
+        )
+        printf0(
+            setup_rank,
+            _table_row(
+                "muon momentum warmup", String(args.muon_momentum_warmup)
+            ),
+        )
+    printf0(
+        setup_rank,
+        _table_row(
+            "adam b1/b2/eps",
+            String(args.beta1)
+            + "/"
+            + String(args.beta2)
+            + "/"
+            + String(args.eps),
+        ),
+    )
     printf0(setup_rank, _table_row("max_steps", String(args.max_steps)))
     printf0(
         setup_rank, _table_row("val_loss_every", String(args.val_loss_every))
@@ -7676,7 +7887,7 @@ def train[
         cpu_coordinator_ptr=cpu_coord,
     )
     if args.optimizer == "muon":
-        model.enable_muon(args.muon_momentum)
+        model.enable_muon(args.muon_momentum, args.adam_lr_mult)
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
 
@@ -7864,9 +8075,17 @@ def train[
         num("weight_decay", args.weight_decay, VERBOSE),
         num("qk_clip", args.qk_clip_tau, VERBOSE),
         num("muon_momentum", args.muon_momentum, VERBOSE),
+        num("adam_lr_mult", args.adam_lr_mult, VERBOSE),
+        num("adam_beta1", args.beta1, VERBOSE),
+        num("adam_beta2", args.beta2, VERBOSE),
+        num("adam_eps", args.eps, VERBOSE),
+        num("muon_momentum_start", muon_mu_start, VERBOSE),
+        num("muon_momentum_warmup", args.muon_momentum_warmup, VERBOSE),
         num("world_size", WORLD_SIZE, VERBOSE),
         num("zero_stage", zero_stage, VERBOSE),
         text("lr_schedule", args.lr_scheduler_type, VERBOSE),
+        num("cooldown", args.cooldown_frac, VERBOSE),
+        text("decay_shape", args.decay_shape, VERBOSE),
     ]
     # Opt-in architecture/init flags are recorded only when non-default so the
     # default run's setup event stays byte-identical.
@@ -8071,6 +8290,16 @@ def train[
 
         var zloss = loss_detector.update(Float64(accumulated_loss))
         var step_learning_rate = learning_rate_scheduler.get_learning_rate(step)
+        # Muon momentum ramp: computed once per step (0-based `step`, so a
+        # resumed run at start_step lands on the same value as a continuous
+        # one); update()/_muon_config read the field.
+        var step_muon_momentum = muon_momentum_at(
+            step,
+            muon_mu_start,
+            args.muon_momentum,
+            args.muon_momentum_warmup,
+        )
+        model.muon_momentum = step_muon_momentum
 
         # Gradient norm, its z-score, and clipping to a max norm of -gc
         # (1.0 by default, like llm.c's train_gpt2.cu; 0 turns it off, which
@@ -8086,6 +8315,9 @@ def train[
         model.update(
             UInt32(step + 1),
             step_learning_rate,
+            beta1=args.beta1,
+            beta2=args.beta2,
+            eps=args.eps,
             weight_decay=args.weight_decay,
             grad_scale=grad_scale,
         )
@@ -8194,6 +8426,7 @@ def train[
             num("tok_s", _ffmt(bias_corrected_ema, 0)),
             num("norm", _ffmt(Float64(grad_norm), 4), VERBOSE),
             num("lr", step_learning_rate, VERBOSE),
+            num("muon_mu", step_muon_momentum, VERBOSE),
             num("zloss", zloss, VERBOSE),
             num("zgrad", zgrad, VERBOSE),
             num(
@@ -8291,6 +8524,8 @@ def _print_usage():
     print("  -k <string> learning rate scheduler (default = cosine)")
     print("  -u <int>    learning rate warmup iterations (default = 0)")
     print("  -q <float>  final learning rate fraction (default = 1.0)")
+    print("  -cooldown <float> wsd: decay-phase fraction (default = 0.2)")
+    print("  -decay_shape <string> wsd: sqrt|linear (default = sqrt)")
     print("  -c <float>  weight decay (default = 0.0)")
     print(
         "  -gc <float> clip the gradient norm to this, 0 = off (default = 1.0,"
@@ -8307,6 +8542,21 @@ def _print_usage():
     )
     print("  -opt <str>  optimizer: adamw|muon (default = adamw)")
     print("  -mu <float> Muon momentum (default = 0.95)")
+    print(
+        "  -l_adam <float> lr multiplier for the AdamW ranges (wte, wpe, LN,"
+        " biases) under -opt muon (default = 1.0; refused with -opt adamw)"
+    )
+    print("  -b1 <float> AdamW beta1 (default = 0.9)")
+    print("  -b2 <float> AdamW beta2 (default = 0.999)")
+    print("  -eps <float> AdamW epsilon (default = 1e-8)")
+    print(
+        "  -mu_start <float> Muon momentum at step 0 of the ramp (default ="
+        " -mu)"
+    )
+    print(
+        "  -mu_warmup <int> steps to ramp momentum mu_start -> mu (default 0 ="
+        " off)"
+    )
     print("  -qk_clip <float> max attention logit, 0 = off (default = 0)")
     print("  -pn <int>   num_processes / world_size (default = 1)")
     print("  -pr <int>   process_rank (default = 0)")
@@ -8342,6 +8592,14 @@ def _parse_train_args(
         args.optimizer = getenv("LLMM_OPTIMIZER")
     if getenv("LLMM_MUON_MOMENTUM") != "":
         args.muon_momentum = Float32(atof(getenv("LLMM_MUON_MOMENTUM")))
+    if getenv("LLMM_LR_ADAM_MULT") != "":
+        args.adam_lr_mult = Float32(atof(getenv("LLMM_LR_ADAM_MULT")))
+    if getenv("LLMM_MUON_MOMENTUM_START") != "":
+        args.muon_momentum_start = Float32(
+            atof(getenv("LLMM_MUON_MOMENTUM_START"))
+        )
+    if getenv("LLMM_MUON_MOMENTUM_WARMUP") != "":
+        args.muon_momentum_warmup = atol(getenv("LLMM_MUON_MOMENTUM_WARMUP"))
     if getenv("LLMM_QK_CLIP") != "":
         args.qk_clip_tau = Float32(atof(getenv("LLMM_QK_CLIP")))
 
@@ -8386,6 +8644,10 @@ def _parse_train_args(
             args.warmup_iterations = atol(val)
         elif flag == "-q":
             args.final_learning_rate_frac = Float32(atof(val))
+        elif flag == "-cooldown":
+            args.cooldown_frac = Float32(atof(val))
+        elif flag == "-decay_shape":
+            args.decay_shape = val
         elif flag == "-c":
             args.weight_decay = Float32(atof(val))
         elif flag == "-gc":
@@ -8408,6 +8670,18 @@ def _parse_train_args(
             args.optimizer = val
         elif flag == "-mu":
             args.muon_momentum = Float32(atof(val))
+        elif flag == "-b1":
+            args.beta1 = Float32(atof(val))
+        elif flag == "-b2":
+            args.beta2 = Float32(atof(val))
+        elif flag == "-eps":
+            args.eps = Float32(atof(val))
+        elif flag == "-l_adam":
+            args.adam_lr_mult = Float32(atof(val))
+        elif flag == "-mu_start":
+            args.muon_momentum_start = Float32(atof(val))
+        elif flag == "-mu_warmup":
+            args.muon_momentum_warmup = atol(val)
         elif flag == "-qk_clip":
             args.qk_clip_tau = Float32(atof(val))
         elif flag == "-pn":
@@ -8420,6 +8694,15 @@ def _parse_train_args(
         i += 2
     if args.optimizer != "adamw" and args.optimizer != "muon":
         print("Invalid -opt '" + args.optimizer + "': expected adamw or muon")
+        _error_usage()
+    if args.adam_lr_mult != Float32(1.0) and args.optimizer != "muon":
+        print(
+            "-l_adam / LLMM_LR_ADAM_MULT only applies with -opt muon (AdamW"
+            " already uses -l for every parameter); refusing"
+        )
+        _error_usage()
+    if args.adam_lr_mult < 0.0:
+        print("Invalid -l_adam: must be >= 0 (0 freezes the AdamW ranges)")
         _error_usage()
     return True
 

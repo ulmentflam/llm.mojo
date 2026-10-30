@@ -5,6 +5,9 @@ First controlled AdamW-vs-Muon comparison in `llm.mojo`, run on the `muon-int` b
 tokens/step = 78.6M tokens, one seed per optimizer. The Muon implementation itself was
 verified against torch on other tracks; this document reports only the convergence run.
 Format follows [`gpt2_124m_fineweb_training_run.md`](gpt2_124m_fineweb_training_run.md).
+Two follow-ups were added later: a three-seed repeat with a tuned-Muon arm ("Seed spread") and
+a 2000-step run at seed 42 ("2000-step run"); the sections up to "Caveats" describe the original
+single-seed pair.
 
 **Validation gate:** the runs' own val-loss curves. Both runs share the same init (step-0
 val loss is identical, 11.009493, and step-1 train loss is identical, 11.013952), data order
@@ -71,7 +74,7 @@ Timing: step 1 excluded plus step 2 (warmup). The AdamW mean is inflated by 40 s
 
 ## Caveats
 
-- Single seed per optimizer; no variance estimate. A 0.36 val-loss gap this large and consistent across all evals and 50-step train windows is unlikely to be seed noise, but it is not quantified.
+- Single seed per optimizer in this original pair (the "Seed spread" section below repeats it at three init seeds). A 0.36 val-loss gap this large and consistent across all evals and 50-step train windows is unlikely to be seed noise, but it is not quantified.
 - 600 steps / 79M tokens is early training with a cosine schedule compressed to that length. The gap peaked (-0.41 at step 300) and was narrowing (-0.36 at step 600); this says nothing about the converged gap (the AdamW 524k-token run reached val 3.28).
 - Muon used AdamW's lr and weight decay without tuning; AdamW used the recipe from the earlier full run, scaled down. Neither was tuned for this short horizon.
 - Muon's first 50 steps had higher train loss (+0.22) than AdamW, then crossed over.
@@ -139,14 +142,39 @@ Same matched recipe as above (131k tokens/step, 600 steps, warmup 50, 6e-4 cosin
 | Muon tuned | 200 | 200 | 200 |
 
 
-Reading: the init-seed spread at step 600 is small (AdamW 0.030, Muon matched 0.013, Muon tuned 0.007 val-loss range), far below the gaps between arms (matched Muon -0.37 and tuned Muon -1.12 vs AdamW on the mean), so the single-seed conclusion holds. Matched Muon reaches AdamW's final val 200-300 steps early; tuned Muon does so by step 200 in every seed.
+Reading: the init-seed spread at step 600 is small (AdamW 0.030, Muon matched 0.013, Muon tuned 0.007 val-loss range), far below the gaps between arms (matched Muon -0.37 and tuned Muon -1.12 vs AdamW on the mean), so the single-seed conclusion holds. Matched Muon reaches AdamW's final val 200-300 steps early (first at step 400, 300, 400 for seeds 42, 1, 2); tuned Muon does so by step 200 in every seed.
 
-Caveats: only the init seed varied, the data order is fixed, so this does not capture data-order variance; n=3 is a spread estimate, not a confidence interval. The tuned recipe came from a 300-step single-seed sweep (seed 42), so seed 42 is partly in-sample for the tuned arm; seeds 1 and 2 are the out-of-sample check. Single GPU; parts of the chain shared the GPU with sibling agents' tests, so timings are not reported here (only losses).
+Caveats: only the init seed varied, the data order is fixed, so this does not capture data-order variance; n=3 is a spread estimate, not a confidence interval. The tuned recipe came from a 300-step single-seed sweep (seed 42), so seed 42 is partly in-sample for the tuned arm; seeds 1 and 2 are the out-of-sample check. The comparison is asymmetric in tuning effort: Muon tuned had its lr, momentum, weight decay and clip swept, while the AdamW control kept the recipe scaled down from the earlier full run and was not re-tuned for this horizon, so the tuned-vs-AdamW gap mixes optimizer and tuning effort (the matched arm is the like-for-like comparison). Single GPU; parts of the chain shared the GPU with sibling agents' tests, so timings are not reported here (only losses).
 
-## 2000-step run (pending)
+## 2000-step run (seed 42)
 
-To be filled when the 2000-step AdamW / Muon matched / Muon tuned runs at seed 42 (`-x 2000 -u 150 -v 200`) finish.
+Same recipe family at 2000 steps (131k tokens/step, 262M tokens): `-x 2000 -u 150 -v 200`, cosine to zero, init seed 42, AdamW and Muon matched with the base args above, Muon tuned with `-opt muon -l 4.8e-3 -mu 0.9 -c 0 -gc 0`. Logs: `data/muon_seeds_s42_{adamw,muon,muon_tuned}_2000.jsonl`. Val loss every 200 steps:
+
+| step | AdamW | Muon matched | Muon tuned | matched - AdamW | tuned - AdamW |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 11.0095 | 11.0095 | 11.0095 | +0.0000 | +0.0000 |
+| 200 | 6.1969 | 5.9316 | 5.4575 | -0.2653 | -0.7394 |
+| 400 | 5.6119 | 5.2271 | 4.6201 | -0.3848 | -0.9918 |
+| 600 | 5.1474 | 4.6685 | 4.3446 | -0.4790 | -0.8028 |
+| 800 | 4.7509 | 4.3850 | 4.1772 | -0.3659 | -0.5736 |
+| 1000 | 4.5351 | 4.2441 | 4.0586 | -0.2910 | -0.4765 |
+| 1200 | 4.4443 | 4.1499 | 3.9710 | -0.2944 | -0.4733 |
+| 1400 | 4.3243 | 4.0774 | 3.8930 | -0.2469 | -0.4313 |
+| 1600 | 4.2640 | 4.0325 | 3.8402 | -0.2314 | -0.4237 |
+| 1800 | 4.2322 | 4.0097 | 3.8105 | -0.2225 | -0.4217 |
+| 2000 | 4.2259 | 4.0051 | 3.8045 | -0.2208 | -0.4215 |
+
+
+Train loss, mean of steps 1951-2000: AdamW 4.1793, Muon matched 3.9639, Muon tuned 3.7686.
+
+First eval at which a Muon arm is at or below AdamW's step-2000 val (4.2259): Muon matched at step 1200 (4.1499; step 1000 was 4.2441); Muon tuned at step 800 (4.1772; step 600 was 4.3446), so the tuned arm passes AdamW's final value between steps 600 and 800, i.e. within the first 30-40% of the steps (evals are every 200 steps, so the crossing is bracketed, not located exactly).
+
+Step time (steps 3-2000, from the logs): mean / median ms per step were AdamW 3892 / 3893, Muon matched 4020 / 3949, Muon tuned 4054 / 4006, i.e. Muon was 1.4% (matched) and 2.9% (tuned) slower by median. Only part of that is the optimizer: the expected Newton-Schulz cost is roughly 20-40 ms per step (0.5-1%), and the two Muon arms run identical optimizer code yet differ by 1.4% from each other. Both Muon logs show contention that the AdamW log does not: AdamW has no step above 4.5 s, matched Muon has 59 (all from step 1566 on, where its median rises to about 4.10 s, max 10.8 s) and tuned Muon has 48 spread through the run (max 9.6 s). Over steps 3-1500, before the matched arm's slow stretch, matched Muon was 1.3% slower by median. Read the step-time gap as at most 1-3% and partly noise from sibling work on the GPU, not as a measured optimizer cost.
+
+Reading: the matched-Muon lead is -0.265 at step 200, widens to -0.479 at step 600, then narrows to -0.221 at step 2000 as both optimizers anneal. The tuned arm leads by -0.422 at step 2000 (narrowing from -0.992 at step 400). The lead shrinks but does not close within this horizon.
+
+Caveats: single seed for the 2000-step runs; the AdamW control was not re-tuned for this horizon either; same cosine-to-zero schedule with 150 warmup steps for all arms; the tuned recipe came from a 300-step single-seed sweep, not re-tuned for 2000 steps (a lower lr might do better at this horizon, so the narrowing of the tuned lead is not evidence about its best case); 262M tokens is early training, far from the 524k-token-batch converged run, so this says nothing about the converged gap.
 
 ## AI use statement
 
-Written with AI assistance (Claude Code, Sonnet agent), directed by Evan Owen.
+Written with AI assistance (Claude Code, Sonnet agent; numbers re-verified against the committed logs by an Opus review agent), directed by Evan Owen.

@@ -19,8 +19,11 @@ import pytest
 # (`make build-infer-bf16`, a trained checkpoint), not something every CI
 # environment is expected to have built/downloaded.
 
-_BIN = "build/infer_gpt2_bf16"
-_CHECKPOINT = "log124M/model_19552.bin"
+# Overridable so the same guard can run against a variant build, e.g. a rotary
+# one: LLMM_SMOKE_BIN=build/infer_gpt2_bf16_rotary
+# LLMM_SMOKE_CHECKPOINT=<rotary run>/model_*.bin pytest -k generation_smoke
+_BIN = os.environ.get("LLMM_SMOKE_BIN", "build/infer_gpt2_bf16")
+_CHECKPOINT = os.environ.get("LLMM_SMOKE_CHECKPOINT", "log124M/model_19552.bin")
 _GEN_LENGTH = 24
 _SEEDS = (1, 2, 3, 4, 5)
 

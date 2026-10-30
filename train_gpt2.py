@@ -21,6 +21,39 @@ from torch.distributed import destroy_process_group, init_process_group
 
 
 """
+Rotary position embeddings (GPT2_ROTARY=1), the reference for the Mojo
+-D LLMM_ROTARY=1 build. modded-nanogpt's half-truncated form: per head of size
+hd, `(1/1024) ** linspace(0, 1, hd/4)` on the first hd/2 dims (rotate-half
+pairs (i, i + hd/2)), zero frequency (identity) on the second half. `wpe` is
+kept as a parameter (same dump layout) but is not added to the embeddings, so
+its gradient is exactly zero. The cos/sin table is built in float64 and rounded
+to float32 once, matching llmm/rotary.mojo's host table.
+"""
+
+ROTARY = os.environ.get("GPT2_ROTARY", "0") == "1"
+
+
+def rotary_cos_sin(
+    seq_len: int, head_dim: int, device: Any = None
+) -> tuple[Tensor, Tensor]:
+    """float32 [T, hd/2] cos and sin tables (second half identity)."""
+    n = head_dim // 4
+    expo = torch.linspace(0, 1, n, dtype=torch.float64)
+    freq = (1.0 / 1024.0) ** expo  # [n]
+    freq = torch.cat([freq, torch.zeros(head_dim // 2 - n, dtype=torch.float64)])
+    theta = torch.outer(torch.arange(seq_len, dtype=torch.float64), freq)
+    return theta.cos().float().to(device), theta.sin().float().to(device)
+
+
+def apply_rotary(x: Tensor) -> Tensor:
+    """x: [B, nh, T, hd]; rotate-half over the first hd/2 / last hd/2 split."""
+    T, hd = x.shape[-2], x.shape[-1]
+    cos, sin = rotary_cos_sin(T, hd, x.device)
+    x1, x2 = x[..., : hd // 2], x[..., hd // 2 :]
+    return torch.cat([x1 * cos + x2 * sin, x2 * cos - x1 * sin], dim=-1)
+
+
+"""
 Print Helper
 """
 
@@ -432,6 +465,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(
             1, 2
         )  # (B, nh, T, hs)
+        if ROTARY:
+            q, k = apply_rotary(q), apply_rotary(k)
         if FLASH:
             # Flash Attention via PyTorch
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -618,11 +653,14 @@ class GPT(nn.Module):
         token_emb = self.transformer.wte(
             idx
         )  # Token embeddings of shape [B, T, n_embd]
-        position_emb = self.transformer.wpe(
-            pos
-        )  # Positioning embeddings pf shape [t, n_embd]
+        if ROTARY:
+            x = token_emb  # positions enter through rotary on q/k instead
+        else:
+            position_emb = self.transformer.wpe(
+                pos
+            )  # Positioning embeddings pf shape [t, n_embd]
 
-        x = token_emb + position_emb
+            x = token_emb + position_emb
 
         for block in self.transformer.h:
             x = block(x)
@@ -1636,6 +1674,10 @@ def write_state(
         for name, param in model.named_parameters()
         if param.grad is not None
     }
+    if ROTARY:
+        # wpe is unused under rotary: autograd leaves its .grad as None, but the
+        # dump layout is unchanged and its gradient is exactly zero.
+        grads["transformer.wpe.weight"] = torch.zeros_like(model.transformer.wpe.weight)
     # Pad the vocab grads here as well, to mirror write_model
     wte_grad = grads["transformer.wte.weight"]  # [V, C]
     wte_grad_padded = pad_vocab(wte_grad, value=0)  # [V_p, C]
@@ -1710,9 +1752,10 @@ def capture_activations(model: GPT) -> tuple[dict[str, Tensor], list]:
 
     targets: dict[str, nn.Module] = {
         "transformer.wte": model.transformer.wte,
-        "transformer.wpe": model.transformer.wpe,
         "transformer.ln_f": model.transformer.ln_f,
     }
+    if not ROTARY:  # unused (no graph, no grad) under rotary
+        targets["transformer.wpe"] = model.transformer.wpe
     for i, block in enumerate(model.transformer.h):
         kblock = cast(KarpathyBlock, block)
         targets[f"transformer.h.{i}.ln_1"] = kblock.ln_1
@@ -2162,10 +2205,15 @@ if __name__ == "__main__":
         }
         model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
         model_size_str = model_to_size[args.model]  # e.g. "124M", or "d12"
-        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
-        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
-        write_model(model, f"gpt2_{model_size_str}_fp16.bin", dtype="float16")
-        write_model(model, f"gpt2_{model_size_str}_fp8.bin", dtype="float8")
+        # Rotary shares the exact same initial weights, so the model files are
+        # left alone (flag-off files stay byte-identical) and only the debug
+        # state, which holds rotary logits/grads, gets its own name.
+        if not ROTARY:
+            write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
+            write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
+            write_model(model, f"gpt2_{model_size_str}_fp16.bin", dtype="float16")
+            write_model(model, f"gpt2_{model_size_str}_fp8.bin", dtype="float8")
+        state_suffix = "_rotary" if ROTARY else ""
         # Save x, y, logits, loss, and parameter gradients, for debugging C
         # Always store these in fp32 to have an accurate reference (?)
         write_state(
@@ -2175,9 +2223,10 @@ if __name__ == "__main__":
             logits,
             loss,
             activations,
-            # A non-default activation gets its own debug state (the pretrained
-            # weights files are activation-independent and keep their names).
-            f"gpt2_{model_size_str}"
+            # Rotary and a non-default activation each get their own debug state
+            # (the pretrained weights files are independent of both and keep
+            # their names); the suffixes compose: _rotary, _relu2, _rotary_relu2.
+            f"gpt2_{model_size_str}{state_suffix}"
             + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
             + "_debug_state.bin",
         )

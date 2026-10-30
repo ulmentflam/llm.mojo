@@ -87,16 +87,21 @@ import torch
 # train_gpt2.py guards its training driver behind `if __name__ == "__main__"`,
 # so importing it for the model definition is side-effect free.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from train_gpt2 import GPT  # noqa: E402
+from train_gpt2 import GPT, ROTARY  # noqa: E402
 
 # GPT2_ACT=relu2 (the reference's MLP activation switch, mirroring the Mojo build
 # constant -D LLMM_MLP_ACT=relu2) reads/produces the *_relu2_debug_state.bin
 # written by train_gpt2.py under the same env var, and the list it prints is the
 # relu2 trajectory for test_gpt2.mojo.
+# GPT2_ROTARY=1 selects the rotary reference: the same weights, rotary on q/k,
+# no wpe add, and the rotary debug state written by `GPT2_ROTARY=1 python
+# train_gpt2.py` (the list is then pasted as `expected_losses` under ROTARY).
+# The suffixes compose exactly as in train_gpt2.py: _rotary then _relu2.
 STATE_FILE = (
-    "gpt2_124M_debug_state.bin"
-    if os.environ.get("GPT2_ACT", "gelu") == "gelu"
-    else "gpt2_124M_relu2_debug_state.bin"
+    "gpt2_124M"
+    + ("_rotary" if ROTARY else "")
+    + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
+    + "_debug_state.bin"
 )
 MAGIC_EXPECTED = 20240520
 VERSION_EXPECTED = 3
@@ -231,7 +236,8 @@ def main() -> int:
     print("OK: step 0 reproduces the stored reference loss.")
 
     print("\nPaste into test_gpt2.mojo:\n")
-    print("    var expected_losses: List[Float32] = [")
+    name = "expected_losses_rotary" if ROTARY else "expected_losses"
+    print(f"    var {name}: List[Float32] = [")
     for value in losses:
         print(f"        {value!r},")
     print("    ]")
