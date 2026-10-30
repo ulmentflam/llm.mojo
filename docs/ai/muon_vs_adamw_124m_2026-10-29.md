@@ -168,7 +168,7 @@ First eval at which a Muon arm is at or below AdamW's step-2000 val (4.2259): Mu
 
 Step time (steps 3-2000, from the logs): mean / median ms per step were AdamW 3892 / 3893, Muon matched 4020 / 3949, Muon tuned 4054 / 4006. So Muon was about 1.4% (matched) and 2.9% (tuned) slower by median, consistent with the fixed per-optimizer-step Newton-Schulz cost discussed above; the mean gaps are slightly larger because of occasional slow steps, so differences of this size should not be over-read (the GPU was not guaranteed idle of sibling work).
 
-Reading: the matched-Muon lead is -0.265 at step 200, widens to -0.479 at step 600, then narrows to -0.221 at step 2000 as both optimizers anneal. The tuned arm leads by -0.422 at step 2000 (narrowing from -0.992 at step 400), so a tuned Muon at 2000 steps is worth roughly the whole step range from 800 to 2000 of AdamW's final quality. The lead shrinks but does not close within this horizon.
+Reading: the matched-Muon lead is -0.265 at step 200, widens to -0.479 at step 600, then narrows to -0.221 at step 2000 as both optimizers anneal. The tuned arm leads by -0.422 at step 2000 (narrowing from -0.992 at step 400). The lead shrinks but does not close within this horizon.
 
 Caveats: single seed for the 2000-step runs; same cosine-to-zero schedule with 150 warmup steps for all arms; the tuned recipe came from a 300-step single-seed sweep, not re-tuned for 2000 steps (a lower lr might do better at this horizon, so the narrowing of the tuned lead is not evidence about its best case); 262M tokens is early training, far from the 524k-token-batch converged run, so this says nothing about the converged gap.
 
