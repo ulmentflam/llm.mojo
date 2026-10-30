@@ -6615,6 +6615,7 @@ def train[
     )
     printf0(setup_rank, _table_row("weight decay", String(args.weight_decay)))
     printf0(setup_rank, _table_row("optimizer", args.optimizer))
+    printf0(setup_rank, _table_row("qk clip tau", String(args.qk_clip_tau)))
     if args.optimizer == "muon":
         printf0(
             setup_rank, _table_row("muon momentum", String(args.muon_momentum))
@@ -6643,6 +6644,8 @@ def train[
     )
     if args.optimizer == "muon":
         model.enable_muon(args.muon_momentum)
+    if args.qk_clip_tau > 0:
+        model.enable_qk_clip(args.qk_clip_tau)
 
     printf0(setup_rank, bar)
     printf0(setup_rank, _table_row("weight init method", args.load_filename))
@@ -6821,6 +6824,7 @@ def train[
         num("batch", total_batch_size, VERBOSE),
         num("grad_accum", grad_accum_steps, VERBOSE),
         num("grad_clip", args.grad_clip, VERBOSE),
+        num("qk_clip", args.qk_clip_tau, VERBOSE),
         num("muon_momentum", args.muon_momentum, VERBOSE),
         num("world_size", WORLD_SIZE, VERBOSE),
         num("zero_stage", zero_stage, VERBOSE),
@@ -7037,6 +7041,11 @@ def train[
             grad_scale=grad_scale,
         )
         model.ctx.synchronize()
+        # Read the step's max logit BEFORE the clip so the log shows what the
+        # step produced; the clip then rescales W_q/W_k for the next forward.
+        var qk_max = model.qk_max()
+        model.qk_clip_step()
+        model.ctx.synchronize()
         var time_end = global_perf_counter_ns()
         # --------------- TRAINING SECTION END -------------------
 
@@ -7144,6 +7153,8 @@ def train[
                 VERBOSE,
             ),
         ]
+        if args.qk_clip_tau > 0:
+            step_fields.append(num("qk_max", qk_max, VERBOSE))
         run_log.emit(
             "step", NORMAL, step_fields, pretty=step_pretty, plain=step_plain
         )
