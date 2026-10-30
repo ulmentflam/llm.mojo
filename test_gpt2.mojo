@@ -16,6 +16,7 @@ from llmm.vendor import HAS_CUBLAS, USE_TF32
 from train_gpt2 import (
     GPT2,
     GPT2_DTYPE,
+    ROTARY,
     ParameterTensors,
     _ffmt,
 )
@@ -371,7 +372,10 @@ def run_test[
 
     # load additional information that we will use for debugging and error checking
 
-    var state_file = open("gpt2_124M_debug_state.bin", "r")
+    # Rotary builds read the rotary reference (same weights, rotary q/k, no
+    # wpe add; zero wpe gradient), written by `make rotary-reference`.
+    comptime STATE_PATH = "gpt2_124M_rotary_debug_state.bin" if ROTARY else "gpt2_124M_debug_state.bin"
+    var state_file = open(STATE_PATH, "r")
 
     var state_header = heap_alloc[Int32](256)
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
@@ -463,18 +467,37 @@ def run_test[
     # reference file said 5.2678394, so every one of these ten steps reported
     # LOSS MISMATCH on every commit, and `make verify-gpu` exited 1 for
     # everyone. See scripts/gen_expected_losses.py for the full story.
-    var expected_losses: List[Float32] = [
-        5.26998233795166,
-        4.059586048126221,
-        3.374852418899536,
-        2.8005142211914062,
-        2.315274715423584,
-        1.8489989042282104,
-        1.3946499824523926,
-        0.9988086223602295,
-        0.6243725419044495,
-        0.37682223320007324,
-    ]
+    var expected_losses: List[Float32]
+    comptime if ROTARY:
+        # PyTorch with GPT2_ROTARY=1 (same weights, rotary q/k, no wpe add),
+        # from `make rotary-reference`; step 0 is the rotary debug state's
+        # stored loss. Pretrained GPT-2 weights are not trained for rotary,
+        # hence the high start.
+        expected_losses = [
+            9.35813045501709,
+            6.650364875793457,
+            5.8415021896362305,
+            5.305992603302002,
+            4.834591388702393,
+            4.441601753234863,
+            4.0521063804626465,
+            3.70202374458313,
+            3.3840603828430176,
+            3.0682621002197266,
+        ]
+    else:
+        expected_losses = [
+            5.26998233795166,
+            4.059586048126221,
+            3.374852418899536,
+            2.8005142211914062,
+            2.315274715423584,
+            1.8489989042282104,
+            1.3946499824523926,
+            0.9988086223602295,
+            0.6243725419044495,
+            0.37682223320007324,
+        ]
 
     # Stale-state guard. Step 0 of the list is a plain forward pass on the debug
     # state's own batch, so the loss stored in the state file must equal it

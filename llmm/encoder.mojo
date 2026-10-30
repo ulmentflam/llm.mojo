@@ -57,6 +57,7 @@ def _encoder_fwd_vector_slice[
     dtype: DType,
     width: Int,
     aligned: Bool = False,
+    use_wpe: Bool = True,
 ](
     out_row_ptr: MutKernelPtr[dtype],
     wte_row_ptr: ImmutKernelPtr[dtype],
@@ -73,21 +74,32 @@ def _encoder_fwd_vector_slice[
         var wte_val = (wte_row_ptr.unsafe_offset(c)).unsafe_load[
             width=width, alignment=align
         ]()
-        var wpe_val = (wpe_row_ptr.unsafe_offset(c)).unsafe_load[
-            width=width, alignment=align
-        ]()
-        (out_row_ptr.unsafe_offset(c)).unsafe_store[
-            width=width, alignment=align
-        ](wte_val + wpe_val)
+        comptime if use_wpe:
+            var wpe_val = (wpe_row_ptr.unsafe_offset(c)).unsafe_load[
+                width=width, alignment=align
+            ]()
+            (out_row_ptr.unsafe_offset(c)).unsafe_store[
+                width=width, alignment=align
+            ](wte_val + wpe_val)
+        else:
+            (out_row_ptr.unsafe_offset(c)).unsafe_store[
+                width=width, alignment=align
+            ](wte_val)
     else:
         var wte_val = (wte_row_ptr.unsafe_offset(c)).unsafe_load[width=width]()
-        var wpe_val = (wpe_row_ptr.unsafe_offset(c)).unsafe_load[width=width]()
-        (out_row_ptr.unsafe_offset(c)).unsafe_store(wte_val + wpe_val)
+        comptime if use_wpe:
+            var wpe_val = (wpe_row_ptr.unsafe_offset(c)).unsafe_load[
+                width=width
+            ]()
+            (out_row_ptr.unsafe_offset(c)).unsafe_store(wte_val + wpe_val)
+        else:
+            (out_row_ptr.unsafe_offset(c)).unsafe_store(wte_val)
 
 
 def encoder_fwd_cpu[
     dtype: DType,
     width: Int,
+    use_wpe: Bool = True,
 ](
     out_ptr: MutKernelPtr[dtype],
     inp_ptr: ImmutKernelPtr[DType.int32],
@@ -118,7 +130,7 @@ def encoder_fwd_cpu[
 
             @always_inline
             def _simd[simd_w: Int](c: Int) {out_row, wte_row, wpe_row}:
-                _encoder_fwd_vector_slice[dtype, simd_w](
+                _encoder_fwd_vector_slice[dtype, simd_w, use_wpe=use_wpe](
                     out_row, wte_row, wpe_row, c
                 )
 
@@ -132,6 +144,7 @@ def encoder_fwd_gpu_kernel[
     dtype: DType,
     width: Int,
     aligned: Bool = True,
+    use_wpe: Bool = True,
 ](
     out_ptr: MutKernelPtr[dtype],
     inp_ptr: ImmutKernelPtr[DType.int32],
@@ -160,7 +173,9 @@ def encoder_fwd_gpu_kernel[
             return
 
         if c + width <= channels:
-            _encoder_fwd_vector_slice[dtype, width, aligned=True](
+            _encoder_fwd_vector_slice[
+                dtype, width, aligned=True, use_wpe=use_wpe
+            ](
                 out_ptr.unsafe_offset(bt * channels),
                 wte_ptr.unsafe_offset(ix * channels),
                 wpe_ptr.unsafe_offset(t * channels),
@@ -168,7 +183,7 @@ def encoder_fwd_gpu_kernel[
             )
         else:
             for i in range(c, channels):
-                _encoder_fwd_vector_slice[dtype, 1](
+                _encoder_fwd_vector_slice[dtype, 1, use_wpe=use_wpe](
                     out_ptr.unsafe_offset(bt * channels),
                     wte_ptr.unsafe_offset(ix * channels),
                     wpe_ptr.unsafe_offset(t * channels),
@@ -178,7 +193,7 @@ def encoder_fwd_gpu_kernel[
         var c = Int(block_idx.y) * Int(block_dim.x) + tid
         if c >= channels:
             return
-        _encoder_fwd_vector_slice[dtype, 1](
+        _encoder_fwd_vector_slice[dtype, 1, use_wpe=use_wpe](
             out_ptr.unsafe_offset(bt * channels),
             wte_ptr.unsafe_offset(ix * channels),
             wpe_ptr.unsafe_offset(t * channels),
@@ -191,6 +206,7 @@ def encoder_fwd_gpu[
     BLOCK_SIZE: Int,
     width: Int = 4,
     aligned: Bool = True,
+    use_wpe: Bool = True,
 ](
     out_ptr: MutKernelPtr[dtype],
     inp_ptr: ImmutKernelPtr[DType.int32],
@@ -201,7 +217,7 @@ def encoder_fwd_gpu[
 ) -> None:
     var seq_len = Int(seq_len_arg)
     var channels = Int(channels_arg)
-    encoder_fwd_gpu_kernel[dtype, width, aligned=aligned](
+    encoder_fwd_gpu_kernel[dtype, width, aligned=aligned, use_wpe=use_wpe](
         out_ptr, inp_ptr, wte_ptr, wpe_ptr, seq_len, channels
     )
 
@@ -214,6 +230,7 @@ def encoder_fwd_gpu[
 def encoder_fwd[
     dtype: DType,
     target: StaticString,
+    use_wpe: Bool = True,
 ](
     out_ptr: MutKernelPtr[dtype],
     inp_ptr: ImmutKernelPtr[DType.int32],
@@ -226,7 +243,7 @@ def encoder_fwd[
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime width = simd_width_of[dtype]()
-        encoder_fwd_cpu[dtype, width](
+        encoder_fwd_cpu[dtype, width, use_wpe=use_wpe](
             out_ptr,
             inp_ptr,
             wte_ptr,
@@ -246,7 +263,7 @@ def encoder_fwd[
         if channels % width == 0:
             var grid_y = ceildiv(channels, BLOCK_SIZE * width)
             comptime gpu_kernel = encoder_fwd_gpu[
-                dtype, BLOCK_SIZE, width, aligned=True
+                dtype, BLOCK_SIZE, width, aligned=True, use_wpe=use_wpe
             ]
             var compiled = device_ctx.compile_function[gpu_kernel]()
             device_ctx.enqueue_function(
@@ -263,7 +280,7 @@ def encoder_fwd[
         else:
             var grid_y_u = ceildiv(channels, BLOCK_SIZE)
             comptime gpu_kernel_u = encoder_fwd_gpu[
-                dtype, BLOCK_SIZE, width, aligned=False
+                dtype, BLOCK_SIZE, width, aligned=False, use_wpe=use_wpe
             ]
             var compiled_u = device_ctx.compile_function[gpu_kernel_u]()
             device_ctx.enqueue_function(

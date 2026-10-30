@@ -34,6 +34,9 @@ from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
 from llmm.checkpointing import (
     CheckpointConfig,
     TrainingState,
+    ARCH_FLAG_ROTARY,
+    MODEL_FLAGS_SLOT,
+    peek_model_header,
     write_model_checkpoint,
     read_model_checkpoint,
     write_state_checkpoint,
@@ -62,6 +65,7 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
+from llmm.rotary import rotary_qk_rows, rotary_table_host
 from llmm.qk_clip import (
     qk_clip_apply,
     qk_clip_bias_range,
@@ -349,6 +353,39 @@ comptime UNROLL = 4
 # projections additionally scaled by 1/sqrt(2*L). See gpt_build_from_descriptor.
 comptime INIT_RNG_SEED = get_defined_int["LLMM_INIT_SEED", 42]()
 comptime INIT_WEIGHT_STD = Float32(0.02)
+# -D LLMM_ROTARY=1: modded-nanogpt half-truncated rotary on q/k, no learned
+# position embedding. `wpe` stays in the parameter layout (descriptor,
+# checkpoint tensor list, ZeRO shards, Muon owner-space unchanged) but is not
+# added in the forward, gets no gradient, is zero in a from-scratch init and is
+# excluded from the AdamW ranges. See docs/ai/rotary_embeddings_w8_2026-10-30.md.
+comptime ROTARY = get_defined_int["LLMM_ROTARY", 0]() != 0
+# Architecture flags word persisted in checkpoint headers (0 = default build).
+comptime ARCH_FLAGS = ARCH_FLAG_ROTARY if ROTARY else 0
+
+
+def check_arch_flags(what: String, got: Int, strict: Bool) raises:
+    """Refuse a checkpoint whose architecture flags disagree with this build.
+
+    `strict` (resume: state file and the model file saved with it) requires
+    equality in both directions. Non-strict (initializing from a model .bin)
+    refuses only a flagged file in a build without that flag: a flag-0 file is
+    an ordinary pretrained init (the speedrun-style conversion of GPT-2
+    weights), while a rotary-trained file is meaningless without rotary.
+    """
+    if got == ARCH_FLAGS:
+        return
+    if strict or (got & ~ARCH_FLAGS) != 0:
+        raise Error(
+            "Cannot load "
+            + what
+            + ": it was written with architecture flags="
+            + String(got)
+            + " (1=rotary) but this binary was built with flags="
+            + String(ARCH_FLAGS)
+            + "; rebuild with the matching -D LLMM_ROTARY"
+        )
+
+
 # GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
 comptime SCRATCH_VOCAB_SIZE = 50257
 comptime SCRATCH_PADDED_VOCAB_SIZE = 50304
@@ -1330,6 +1367,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var master_memory: MutMemPtr[MASTER_DTYPE]
     var head_max_memory: MutMemPtr[DType.float32]
     var head_max_fwd_memory: MutMemPtr[DType.float32]
+    # ROTARY only: fp32 [cos | sin] table, each [rotary_rows, head_dim/4].
+    var rotary_table_buf: DeviceBuffer[DType.float32]
+    var rotary_table: MutMemPtr[DType.float32]
+    var rotary_rows: Int
     var qk_clip_tau: Float32  # <= 0 disables QK-clip
     # WORLD_SIZE > 1: `head_max_buf` already holds the cross-rank max for this
     # step (set by _qk_sync_head_max, cleared by the backward fold), and the
@@ -1543,6 +1584,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.muon_master_memory = NULL_MASTER_PTR
         self.head_max_memory = NULL_MASTER_PTR
         self.head_max_fwd_memory = NULL_MASTER_PTR
+        self.rotary_table = NULL_MASTER_PTR
+        self.rotary_rows = 0
         self.qk_clip_tau = 0.0
         self.qk_head_max_global = False
         self.qk_clip_applied = False
@@ -1600,6 +1643,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.muon_master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.head_max_fwd_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
+        self.rotary_table_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](1)
@@ -1667,6 +1711,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var model_header = heap_alloc[Int32](256)
             read_and_copy[DType.int32](model_file, model_header, 256)
 
+            var init_flags = Int(model_header.unsafe_load(MODEL_FLAGS_SLOT))
             var model_magic = model_header.unsafe_load(0)
             if model_magic != GPT2_MAGIC and model_magic != GPT2_MAGIC_LEGACY:
                 print("Bad magic number in header: " + String(model_magic))
@@ -1681,6 +1726,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
                 model_header.unsafe_free()
                 raise Error("GPT2 error: Invalid version in header")
+            check_arch_flags(self.checkpoint_path, init_flags, False)
 
             self.config = GPT2Config(
                 max_seq_len=Int(model_header.unsafe_load(2)),
@@ -2356,7 +2402,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     ):
                         scale = INIT_WEIGHT_STD * residual_scale
                     normal_(rng, fp32_ptr, n, Float32(0.0), scale)
-                    for j in range(n):
+                    # ROTARY: the wpe draw is still consumed so every later
+                    # tensor gets the same values as in a non-rotary build with
+                    # this seed, but the (already zeroed) wpe is left at zero.
+                    var keep = True
+                    comptime if ROTARY:
+                        keep = i != Parameters.wpe
+                    for j in range(n if keep else 0):
                         hp[unsafe_offset=offset + layer_offset + j] = fp32_ptr[
                             unsafe_offset=j
                         ].cast[GPT2_DTYPE]()
@@ -2789,7 +2841,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 seq_len,
                 channels,
                 self.ctx,
-                include_wpe=first_chunk,
+                include_wpe=first_chunk and not ROTARY,
             )
 
             # Map this chunk's compact rows back to flat `wte` ranges. Compact
@@ -3153,6 +3205,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.has_allocated_optimizer_moments = True
 
+    def _allocate_rotary_table(mut self) raises:
+        """Build the [cos | sin] fp32 table once, sized to the model's max
+        sequence length (the wpe row count), which also covers generation."""
+        if self.rotary_rows > 0:
+            return
+        var T_max = self.config.max_seq_len
+        var hd = self.config.channels // self.config.num_heads
+        var tbl = rotary_table_host(T_max, hd)
+        var host = self.ctx.enqueue_create_host_buffer[DType.float32](len(tbl))
+        for i in range(len(tbl)):
+            host[i] = tbl[i]
+        self.rotary_table_buf = self.ctx.enqueue_create_buffer[DType.float32](
+            len(tbl)
+        )
+        self.ctx.enqueue_copy(self.rotary_table_buf, host)
+        self.ctx.synchronize()
+        self.rotary_table = rebind_mut_mem[DType.float32](
+            self.rotary_table_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.rotary_rows = T_max
+
     def allocate_activations(mut self, batch_size: Int, seq_len: Int) raises:
         self.batch_size = batch_size
         self.seq_len = seq_len
@@ -3389,6 +3462,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.grad_acts_stats_memory,
         )
         self.has_allocated_acts = True
+        comptime if ROTARY:
+            self._allocate_rotary_table()
 
     def build_encoder_buckets(mut self, batch_size: Int, seq_len: Int) raises:
         if self.enc_row_sparse:
@@ -3603,7 +3678,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         #########################################################
 
         var residual: MutMemPtr[GPT2_DTYPE]
-        encoder_fwd[GPT2_DTYPE, Self.target](
+        encoder_fwd[GPT2_DTYPE, Self.target, use_wpe=not ROTARY](
             as_mut_kernel[GPT2_DTYPE](self.acts.encoded),
             as_immut_kernel_from_mut[DType.int32](enc_inputs),
             as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
@@ -3835,6 +3910,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
+            comptime if ROTARY:
+                rotary_qk_rows[GPT2_DTYPE, Self.target, inverse=False](
+                    as_mut_kernel[GPT2_DTYPE](l_qkv),
+                    as_immut_kernel_from_mut[DType.float32](self.rotary_table),
+                    batch_size,
+                    seq_len,
+                    self.rotary_rows,
+                    num_heads,
+                    head_dim,
+                    self.ctx,
+                )
             attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](l_q),
@@ -5261,6 +5347,20 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx,
                 cache=rebind[KVCachePtr](Pointer(to=self.kv_cache)),
             )
+            # ROTARY: d_qkv now holds the gradient w.r.t. the ROTATED q/k;
+            # apply the inverse rotation to its q and k thirds (v untouched)
+            # before the qkv matmul backward.
+            comptime if ROTARY:
+                rotary_qk_rows[GPT2_DTYPE, Self.target, inverse=True](
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                    as_immut_kernel_from_mut[DType.float32](self.rotary_table),
+                    batch_size,
+                    seq_len,
+                    self.rotary_rows,
+                    num_heads,
+                    head_dim,
+                    self.ctx,
+                )
 
             # QKV matmul backward.
             # fp8 site: C=channels, OC=3*channels; input=l_ln_1,
@@ -5491,6 +5591,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 seq_len,
                 channels,
                 self.ctx,
+                include_wpe=not ROTARY,
             )
 
             if bucketing:
@@ -5950,7 +6051,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         """[start0, end0, start1, end1, ...] of the flat-buffer ranges AdamW
         owns when Muon is enabled: everything except the Muon matrices."""
         var r = List[Int]()
-        r.append(0)
+        comptime if ROTARY:
+            # wpe is unused under rotary: leave it out of the AdamW ranges
+            # (the range split is wte | skip wpe | ln_1.. .. qkv_weight).
+            r.append(0)
+            r.append(self.param_offset(Parameters.wpe))
+            r.append(self.param_offset(Parameters.ln_1_gamma))
+        else:
+            r.append(0)
         r.append(self.param_offset(Parameters.qkv_weight))
         r.append(self.param_offset(Parameters.qkv_bias))
         r.append(self.param_offset(Parameters.attn_proj_weight))
@@ -6833,6 +6941,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     host_params.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 self.num_parameters,
+                arch_flags=ARCH_FLAGS,
             )
 
         # AdamW moments are fp32 (MASTER_DTYPE), independent of the parameter
@@ -6850,6 +6959,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             step,
             sampler_rng_state,
             optimizer_kind=self.optimizer_kind,
+            flags=ARCH_FLAGS,
         )
         var n_mu = 0
         if self._sharded_muon():
@@ -6896,6 +7006,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         checkpoint (build it from the same base checkpoint first). Each rank
         reads the shared model file plus its own optimizer-state shard.
         """
+        # Resume must match the architecture flags exactly, in both
+        # directions, before any tensor is read.
+        var arch_peek = open(state_path, "r")
+        var state_flags = read_state_header(arch_peek).flags
+        arch_peek.close()
+        check_arch_flags(state_path, state_flags, True)
+        check_arch_flags(
+            model_path, peek_model_header(model_path).arch_flags, True
+        )
         var host_params = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )

@@ -16,7 +16,11 @@ from llmm.checkpointing import (
     MODEL_MAGIC,
     STATE_MAGIC,
     VERSION_FP32,
+    ARCH_FLAG_ROTARY,
+    STATE_FLAGS_SLOT,
+    MODEL_FLAGS_SLOT,
 )
+from train_gpt2 import check_arch_flags, ARCH_FLAGS
 
 
 # ===----------------------------------------------------------------------=== #
@@ -805,6 +809,107 @@ def test_dataloader_capture_restore_shuffled() raises:
     loader.close()
     resumed.close()
     _remove(path)
+
+
+# ===----------------------------------------------------------------------=== #
+# Architecture flags word (rotary): state header slot 44 / model header slot 20
+# ===----------------------------------------------------------------------=== #
+
+
+def _header_word(path: String, slot: Int) raises -> Int:
+    var np = Python.import_module("numpy")
+    var h = np.fromfile(path, dtype=np.int32, count=256)
+    return Int(py=h[slot])
+
+
+def _tiny_state(flags: Int) raises -> TrainingState:
+    return TrainingState(
+        step=7,
+        num_processes=1,
+        process_rank=0,
+        use_master_weights=0,
+        should_shuffle=0,
+        sampler_rng_state=UInt64(1),
+        shuffle_rng_state=UInt64(2),
+        current_shard_idx=0,
+        current_sample_idx=0,
+        optimizer_kind=0,
+        flags=flags,
+    )
+
+
+def test_state_flags_roundtrip_and_default_stays_version_1() raises:
+    var path = String("test_ckpt_state_flags.bin")
+    var n = 5
+    var m = heap_alloc[Float32](n)
+    var v = heap_alloc[Float32](n)
+    _fill_pattern(m, n, 0.1)
+    _fill_pattern(v, n, 0.2)
+    var m_out = heap_alloc[Float32](n)
+    var v_out = heap_alloc[Float32](n)
+
+    # Flagged: version 2, slot 44 carries the bit, and it reads back.
+    write_state_checkpoint(path, _tiny_state(ARCH_FLAG_ROTARY), m, v, n)
+    assert_equal(_header_word(path, 1), 2)
+    assert_equal(_header_word(path, STATE_FLAGS_SLOT), ARCH_FLAG_ROTARY)
+    var restored = read_state_checkpoint(path, m_out, v_out, n)
+    assert_equal(restored.flags, ARCH_FLAG_ROTARY)
+    assert_equal(restored.step, 7)
+
+    # Default (flags 0): still the version-1 header with slot 44 untouched, so
+    # default-build files are byte-compatible with files from before the word.
+    write_state_checkpoint(path, _tiny_state(0), m, v, n)
+    assert_equal(_header_word(path, 1), 1)
+    assert_equal(_header_word(path, STATE_FLAGS_SLOT), 0)
+    assert_equal(read_state_checkpoint(path, m_out, v_out, n).flags, 0)
+
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
+    _remove(path)
+
+
+def test_model_flags_roundtrip() raises:
+    var path = String("test_ckpt_model_flags.bin")
+    var cfg = _tiny_config()
+    var n = cfg.num_parameters()
+    var params = heap_alloc[Float32](n)
+    _fill_pattern(params, n, 0.5)
+
+    write_model_checkpoint(path, cfg, params, n, arch_flags=ARCH_FLAG_ROTARY)
+    assert_equal(_header_word(path, MODEL_FLAGS_SLOT), ARCH_FLAG_ROTARY)
+    assert_equal(peek_model_header(path).arch_flags, ARCH_FLAG_ROTARY)
+
+    write_model_checkpoint(path, cfg, params, n)
+    assert_equal(_header_word(path, MODEL_FLAGS_SLOT), 0)
+    assert_equal(peek_model_header(path).arch_flags, 0)
+
+    params.unsafe_free()
+    _remove(path)
+
+
+def _refused(got: Int, strict: Bool) -> Bool:
+    try:
+        check_arch_flags("x", got, strict)
+    except:
+        return True
+    return False
+
+
+def test_arch_flag_mismatch_is_refused_for_this_build() raises:
+    # `ARCH_FLAGS` is this build's flags (1 under -D LLMM_ROTARY=1, else 0), so
+    # the same test file pins both directions when run under either build
+    # (`make test-mojo [MOJO_DEFINES="-D LLMM_ROTARY=1"]`).
+    var other = 1 - ARCH_FLAGS
+    assert_equal(_refused(ARCH_FLAGS, True), False)
+    assert_equal(_refused(ARCH_FLAGS, False), False)
+    # Resume (strict): a flag mismatch is refused in BOTH directions.
+    assert_equal(_refused(other, True), True)
+    # Initialising from a model .bin (non-strict): a flagged file is refused by
+    # a build without the flag; an unflagged (pretrained) file is accepted by a
+    # flagged build.
+    assert_equal(_refused(other, False), ARCH_FLAGS == 0)
 
 
 def _cleanup_loader_data():
