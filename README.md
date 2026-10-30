@@ -110,6 +110,14 @@ otherwise they print the compact `pretty` layout the demo above shows.
 A failing check or test file prints its full detail at every level. `scripts/train_log.py` reads a
 training log back from any of the four formats.
 
+Optimizer: AdamW is the default. `-opt muon` (env `LLMM_OPTIMIZER`) switches the attention and MLP
+weight matrices to Muon (Newton-Schulz-orthogonalized momentum, Moonlight scaling, so `-l` and `-c`
+are shared with AdamW; `-mu` sets the momentum, default 0.95) and keeps embeddings, biases and
+LayerNorm on AdamW. `-qk_clip <tau>` (env `LLMM_QK_CLIP`, 0 = off) rescales any attention head
+whose max logit exceeds `tau`, with either optimizer. Muon and QK-clip are single-GPU, CUDA-only
+(WORLD_SIZE 1 / ZeRO-0); see
+[`docs/ai/muon_muonclip_implementation_2026-10-29.md`](docs/ai/muon_muonclip_implementation_2026-10-29.md).
+
 Multi-GPU training: build with `WORLD_SIZE=N` (one rank per GPU, compile-time)
 and choose a ZeRO sharding stage at runtime:
 

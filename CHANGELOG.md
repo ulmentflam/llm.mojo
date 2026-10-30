@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Muon optimizer and QK-clip (MuonClip), opt-in.** `-opt adamw|muon`
+  (env `LLMM_OPTIMIZER`, default `adamw`) selects the optimizer; `-mu <float>`
+  (`LLMM_MUON_MOMENTUM`, default 0.95) sets Muon's momentum; `-qk_clip <tau>`
+  (`LLMM_QK_CLIP`, default 0 = off) enables QK-clip and works with either
+  optimizer. Muon runs on the Q, K, V (three C x C blocks), attention-proj, fc
+  and proj matrices: fp32 momentum (reusing `m_memory`), Nesterov, 5
+  Newton-Schulz steps (3.4445, -4.7750, 2.0315) in bf16 through strided-batched
+  cuBLASLt (one batch per tensor group), and Moonlight RMS scaling
+  `0.2*sqrt(max(rows, cols))`, so `-l` and `-c` are shared with AdamW. wte,
+  wpe, biases and LayerNorm parameters stay on AdamW. QK-clip tracks the
+  per-(layer, head) max post-scale attention logit in the softmax kernel and,
+  after each update, scales hot heads' Q and K rows and biases by
+  `sqrt(tau / S_max)`; the setup log shows `opt=`, verbose adds
+  `muon_momentum=` / `qk_clip=` and each step prints `qk_max=`. Scope limits:
+  phase 1 supports WORLD_SIZE 1 / ZeRO-0 only (`-opt muon` and `-qk_clip` raise
+  otherwise); QK-clip also raises on CPU; Muon on CPU is a naive fp32 reference
+  (tests only) and Metal raises. State checkpoints record `optimizer_kind` in
+  header slot 40 and resuming with the other optimizer raises. Verification:
+  `tests/test_muon.mojo`, `tests/test_muon_equivalence.py` (against a torch
+  reference and stock `torch.optim.Muon` 2.13; 33/33 on CPU and on GPU),
+  `tests/test_muon_crosscheck.py` (mutants rejected) and
+  `tests/test_qk_clip.mojo` (including end-to-end). First 10-step runs on the
+  pretrained 124M end within ~0.03 loss of AdamW; step time is +18% fp32 /
+  +29% bf16, not yet optimized. The default AdamW path is unchanged: a
+  deterministic CPU run is bit-identical to before and GPU runs are within
+  run-to-run noise. Details and reviewer-found fixes in
+  [`docs/ai/muon_muonclip_implementation_2026-10-29.md`](docs/ai/muon_muonclip_implementation_2026-10-29.md).
+
 - **Side-by-side video against llm.c on CPU** (`docs/bench-vs-llmc.mp4`, real
   time, with a 4x GIF preview in the README). llm.c's `train_gpt2.c` (OpenMP,
   its fastest CPU build) and llm.mojo on CPU run the same training at the same
