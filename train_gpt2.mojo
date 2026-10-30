@@ -7950,6 +7950,8 @@ def train[
             setup_rank,
             _table_row("adam lr mult (l_adam)", String(args.adam_lr_mult)),
         )
+        printf0(
+            setup_rank,
             _table_row("muon momentum start", String(muon_mu_start)),
         )
         printf0(
@@ -8663,6 +8665,7 @@ def _print_usage():
     print("  -b1 <float> AdamW beta1 (default = 0.9)")
     print("  -b2 <float> AdamW beta2 (default = 0.999)")
     print("  -eps <float> AdamW epsilon (default = 1e-8)")
+    print(
         "  -mu_start <float> Muon momentum at step 0 of the ramp (default ="
         " -mu)"
     )
