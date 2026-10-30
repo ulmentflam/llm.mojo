@@ -1403,6 +1403,54 @@ non-streaming).
     also check the owner-space copies. Mutant (full-buffer bias offset under
     streaming) fails `test_qk_clip_multirank_zero3_w2` with the gathered-params
     bit-exact assertion ("multi-rank QK-clip != reference ... stage 3").
+  - **Verification (fu/qklift, Opus reviewer, 2026-10-30):** independent
+    read of `git diff 537a850..b44fa52` plus reruns; no defects found.
+    - Bias write: `p_off` is shard-relative only under `z3_streaming`, the
+      same indexing `adamw_update` uses for `params_memory` in
+      `_update_sharded_muon`; ZeRO-1/2 and non-streaming ZeRO-3 keep `a`;
+      the master offset is unchanged. Each segment `[a, b)` is clamped to
+      this rank's flat shard, so a bias range that straddles a shard boundary
+      is split, and each rank clips only its own part with the same global
+      maxima (`a - b_lo` gives the kernel the bias-relative row). Note: the
+      `(a - sg.flat_start)` term is always 0 in the current layout (the AdamW
+      range holding the bias starts exactly at `b_lo`, so `a` is either
+      `b_lo` or the shard start, and either one equals `flat_start`). It is
+      correct as written, but no test can tell it apart from `+ 0`.
+    - Ordering: the clip block still runs after the post-update
+      `synchronize` and before the ZeRO-3 early return. `_qk_sync_head_max`
+      runs once per step on every rank, because the `qk_clip_tau > 0` gate is
+      rank-invariant. The later `qk_max()` hits the `qk_head_max_global` latch
+      and makes no second collective, and `qk_clip_step()` returns on
+      `qk_clip_applied`.
+    - Remaining raises: AdamW + ZeRO >= 1 is unchanged (read).
+      `planted_head_max_only` is reachable only from tests: the one trainer
+      call site, `enable_qk_clip(args.qk_clip_tau)`, uses the default. The CPU
+      raise was confirmed by running `make train-cpu WORLD_SIZE=2 ARGS="... -opt muon
+      -z 3 -qk_clip 5"`. Both ranks printed "QK-clip needs a GPU target (no CPU
+      logit-max hook)" and the run exited 2.
+    - Tests: the changed-element count `2*2*hd*(C+1)` is asserted on the
+      reference (Q/K weight rows plus their bias entries), and every rank
+      bit-equals the reference, so the count carries over. The ZeRO-3
+      owner-space check counts `2*2*hd*C` (matrices only; the bias is not in
+      owner space) and requires each Muon element to be owned exactly once.
+      A same-stage reference is required. With the reference forced to stage
+      0, `zero2_w2` and `zero3_w2` fail at idx 1240 (wte) by 1 ulp
+      (-0.15410821 vs -0.1541082), so the author's ulp claim holds.
+    - Mutants on `test_qk_clip_multirank_zero3_w2`, built from scratch
+      copies: (1) the author's full-buffer offset `p_off = a` under streaming,
+      and (2) the bias clip skipped on every rank except 0. Both FAIL with
+      "multi-rank QK-clip != reference at W=2 stage 3 rank 0 idx 4976"
+      (layer-1 Q bias of hot head (1,0), in rank 1's shard).
+    - Gates: `make test-mojo` -> `tests result=pass files=26 files_skipped=0
+      files_failed=0 passed=221 skipped=1 failed=0` (test_qk_clip 12/12);
+      `make verify` -> `result gate=cpu status=pass`, `result gate=gpu
+      status=pass` (exit 0); `make lint` passes; `make -B build-bf16` builds.
+      `make -B build-train` plus `LLMM_LOG_LEVEL=verbose make train
+      ARGS="-opt muon -qk_clip 5 -x 5 -v 0 -s 0"` gives qk_max 110.63404 /
+      6.2860556 / 5.8567953 / 5.619182 / 5.2094717. `make -B build-train
+      WORLD_SIZE=2` (mtime checked) plus `make train-cpu WORLD_SIZE=2` (d6,
+      -b 1 -t 64 -x 3 -pn 2) with `-opt muon -z 2` and `-z 3` give 10.865850 /
+      10.716245 / 10.648577 for each, exit 0.
 
 
 **S6: GPU multi-rank verification** (configs `zero/muon_z*_w2.json`, the
