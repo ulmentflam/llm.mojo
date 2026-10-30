@@ -423,7 +423,11 @@ To be filled by the item owners. One row per arm.
 
 | item | flag(s) | val@300 seed 42 | three-seed mean | step time | verdict |
 |---|---|---:|---:|---:|---|
-| base | `-opt muon -l 4.8e-3 -mu 0.9 -c 0.1 -gc 1.0` (sweep doc, wd/gc on) | | | | reference |
+| base | `-opt muon -l 4.8e-3 -mu 0.9 -c 0.1 -gc 1.0`, cosine, `-u 50` | 5.0347 | | 3936 | reference; reproduces the sweep doc's mu0.9 row (5.0343) |
+| W1 | base + `-l_adam 0.125` (AdamW ranges at 6e-4) | 5.3713 | | 3935 | +0.337: the AdamW ranges need the high rate; part of the sweep win was this side effect |
+| W1 | base + `-l_adam 2` | 5.0665 | | 3922 | +0.032, just outside single-seed noise |
+| W1 | base + `-l_adam 4` | 5.1987 | | 4029 | +0.164 |
+| W1 | base + `-l_adam 8` | 5.2074 | | 3948 | +0.173; ladder optimum is mult 1, i.e. the shared rate; no separate AdamW-range multiplier needed at 124M/300 steps. The flag stays for W9's `-l_head`. |
 
 ## 7. Not in scope (so nobody re-litigates)
 
