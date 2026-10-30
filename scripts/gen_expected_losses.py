@@ -63,7 +63,12 @@ Configuration (must stay in sync with ``model.update()`` in test_gpt2.mojo)
     steps          10, all on the SAME batch (deliberate overfit)
     batch          x/y read from gpt2_124M_debug_state.bin (B=4, T=64)
     dtype          float32, TF32 disabled (strict IEEE, matching
-                   `make verify-gpu`'s -D LLMM_NO_TF32=1)
+                   `make verify-gpu`'s -D LLMM_NO_TF32=1); --dtype float64
+                   for an ill-conditioned model where the fp32 reference
+                   itself drifts (GPT2_ACT=relu2: torch fp32 ends 0.0126 below
+                   torch fp64 at step 9, while Mojo fp32 lands within 1e-3 of
+                   fp64), so the list measures Mojo against the true
+                   trajectory rather than against torch's rounding
     init           GPT.from_pretrained("gpt2"), the same initialisation
                    train_gpt2.py uses to write the debug state
 """
@@ -153,6 +158,12 @@ def main() -> int:
         help="torch device (default: cpu, for reproducibility across boxes)",
     )
     parser.add_argument("--state-file", default=STATE_FILE)
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float64"],
+        default="float32",
+        help="reference precision (default float32; relu2 uses float64)",
+    )
     args = parser.parse_args()
 
     # Strict IEEE fp32. TF32 would drift the trajectory by ~1e-2, which is the
@@ -179,7 +190,7 @@ def main() -> int:
     model = GPT.from_pretrained("gpt2")
     model.to(device)
     model.train()
-    model.float()
+    model.to(getattr(torch, args.dtype))
 
     # Uniform weight decay over every parameter -- deliberately NOT the
     # split decay/no-decay grouping used for real training runs, because the

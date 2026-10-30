@@ -332,17 +332,6 @@ def run_test[
         and is_gpu[target]()
         and GPT2_DTYPE == DType.float32
     )
-    # relu2 exception (-D LLMM_MLP_ACT=relu2): the gradient checks above stay at
-    # full strength (GPU: all 16 tensors agree with the PyTorch relu2 reference to
-    # l2_ratio 0.9996, maxdiff ~1e-3 against thresholds of 1e-2..4e-1), but the
-    # 10-step overfit loss trajectory drifts monotonically (0.00001 at step 0 ->
-    # 0.0118 at step 9) because relu2 on GELU-pretrained weights starts at loss
-    # 7.18 and falls to 3.4 in 10 steps (gelu: 5.27 -> 0.38 with 3e-4 drift), so
-    # a 4e-4 relative gradient difference is compounded by AdamW at lr 1e-4.
-    # 0.02 = ~1.7x the measured max drift. A wrong relu2 backward fails the
-    # gradient checks first (verify-cpu under relu2 does, see docs/ai).
-    comptime if MLP_RELU2:
-        LOSS_STEP_TOL = 0.02
     var log = Log()
     var gate = String(target)
     var checked = 0
@@ -492,19 +481,26 @@ def run_test[
         0.6243725419044495,
         0.37682223320007324,
     ]
-    # PyTorch relu2 trajectory (GPT2_ACT=relu2 scripts/gen_expected_losses.py).
+    # relu2 trajectory: torch FLOAT64 (GPT2_ACT=relu2 scripts/gen_expected_losses.py
+    # --dtype float64), not fp32. relu2 on GELU-pretrained weights is
+    # ill-conditioned (residual stream ~1.2e5 from layer 3), and torch's own fp32
+    # run drifts from its fp64 run by 0.0126 at step 9 (3.367974 vs 3.380598),
+    # more than LOSS_STEP_TOL. Mojo fp32 (GPU 3.37966, CPU 3.38055) lands within
+    # 1e-3 of fp64, so the gate keeps the full-strength 0.01 against the true
+    # trajectory. Step 0 differs from the debug state's fp32 loss by 1e-5 (the
+    # stale-state guard allows 1e-3). See docs/ai/w5_w6_zero_init_proj_and_relu2_2026-10-30.md.
     comptime if MLP_RELU2:
         expected_losses = [
-            7.184723854064941,
-            6.579202651977539,
-            6.155612468719482,
-            5.782768249511719,
-            5.452462673187256,
-            5.018465042114258,
-            4.612589359283447,
-            4.149394512176514,
-            3.748042583465576,
-            3.367974042892456,
+            7.184733928491164,
+            6.57912622894239,
+            6.156180415699619,
+            5.7834021372001345,
+            5.452741764643019,
+            5.0208772006836355,
+            4.616522495663473,
+            4.157646495279576,
+            3.7607664251102446,
+            3.380597985334229,
         ]
 
     # Stale-state guard. Step 0 of the list is a plain forward pass on the debug

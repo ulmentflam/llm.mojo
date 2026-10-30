@@ -362,6 +362,17 @@ comptime INIT_WEIGHT_STD = Float32(0.02)
 # the stream position of every later tensor (and wte/wpe/qkv/fc) is identical
 # across modes. wte (tied LM head) is never touched. See allocate_parameters_random.
 comptime ZERO_INIT_PROJ = get_defined_int["LLMM_ZERO_INIT_PROJ", 0]()
+# Attention exp on the soft-exp targets (CPU, and Metal's attention_fwd_gpu /
+# backward kernels; the cuBLAS GEMM attention path ignores it): the default is
+# the FA4 degree-4 2^f polynomial (llmm/attention.mojo software_emulated_exp),
+# max relative error 7.8e-4. Harmless for the default model (verify-cpu passes),
+# but -D LLMM_MLP_ACT=relu2 on GELU-pretrained GPT-2 weights grows the residual
+# stream to ~1.2e5 by layer 3, and that 7.8e-4 then fails verify-cpu: loss
+# 7.1832 vs 7.1847, 13/16 gradients at l2_ratio ~0.8. With libm exp the same
+# build matches a float64 forward to ~1e-6 per activation and passes all 16
+# gradients. So relu2 builds use exact exp; the default stays bit-identical.
+# See docs/ai/w5_w6_zero_init_proj_and_relu2_2026-10-30.md.
+comptime ATTN_SOFT_EXP = not MLP_RELU2
 # GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
 comptime SCRATCH_VOCAB_SIZE = 50257
 comptime SCRATCH_PADDED_VOCAB_SIZE = 50304
@@ -3853,7 +3864,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
-            attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
+            attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=ATTN_SOFT_EXP](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](l_q),
                 as_mut_kernel[GPT2_DTYPE](l_k),
@@ -5260,7 +5271,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
-            attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
+            attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=ATTN_SOFT_EXP](
                 as_mut_kernel[GPT2_DTYPE](d_l_qkv),
                 as_mut_kernel[GPT2_DTYPE](d_l_q),
                 as_mut_kernel[GPT2_DTYPE](d_l_k),

@@ -1364,7 +1364,7 @@ test-mojo: | $(PIXI_STAMP)
 			bin="$$bindir/$$(basename "$$f" .mojo)"; \
 			if ! $(PIXI) run python scripts/test_log.py --build "$$f" -- \
 				timeout $(TEST_FILE_TIMEOUT) mojo build \
-				$(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o "$$bin" "$$f"; then \
+				$(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o "$$bin" "$$f"; then \
 				fail=1; \
 				continue; \
 			fi; \
