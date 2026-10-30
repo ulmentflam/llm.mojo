@@ -944,6 +944,42 @@ S2 independent verification (2026-10-30, separate agent, rebuilt and rerun):
   not an equivalence check.
 - `LLMM_LOG_LEVEL=quiet` prints the `result` verdict of test_gpt2 with no
   fields (gate/status are NORMAL-level fields); exit codes still gate.
+## S3 implementation notes (2026-10-30)
+
+tests/test_zero_untied.mojo (untied build; SKIP lines in the tied build), 18
+tests, threaded CPU, version-13 file with an independent random head
+(head != wte, nonzero). `pixi run` of the built binary: 18 passed.
+
+- ZeRO-1 == ZeRO-0, `==` per element, all 17 tensors, different batch per
+  rank, 1 and 3 steps, AdamW and Muon, W=2/4/8 (L=2) and W=8 L=1. Every wte
+  and head element must also have moved from the planted init.
+- Finding 6, measured: ZeRO-1 vs ZeRO-0 is bit-exact for all 17 tensors at
+  step 1, wte and head included (zero residual). That is the all-reduce of
+  the full flat gradient, so it does not exercise the finding's actual claim
+  (bucketed reduce-scatter keeps lm and encoder parts separate): ZeRO >= 2
+  with a trained head is refused until S6, so the ZeRO-2/3 step-1
+  different-batch check is NOT run. S6 must add it (tests assert the refusal
+  today, so they will fail loudly when S6 lifts it).
+- Ownership: opt, per-rank AdamW segments and head overlap vs values computed
+  in the test from the layout. L=2: the whole head is on rank W-1 at W=2/4/8
+  (asserted: exactly one head rank, `(W-1)*opt <= N16`). W=8 L=1: ranks 6 and
+  7 split the head (asserted: `7*opt` strictly inside the head, both sides
+  nonempty, sum == H).
+- Refusal: ZeRO-2 and ZeRO-3 with the head active raise the S2 error on every
+  rank. Idle head at ZeRO-2/3 == ZeRO-0 idle, same batch, accum 2, Muon, W=2
+  and 4, bit-exact; the idle head keeps its planted values.
+- W=8 same-batch idle-head ZeRO-2/3 is NOT bit-exact (1 ulp, first at wte[18]
+  and wpe[9]): 8 identical gradients are not an exact multiple under the
+  reduction orders, a property of the harness (tied-phase layout), not of the
+  head. Left out of this file; test_zero_muon covers W=8 at its tolerance.
+- Mutant (temporary, reverted): second `lm_head` entry of `_adamw_ranges`
+  shifted by one row (`+ channels`), i.e. the Muon-path head update skips row
+  0. ZeRO-1 == ZeRO-0 still PASSES (both layouts use the same ranges), which
+  is why the ownership and moved checks exist: 4 ownership tests fail on the
+  segment table and the 4 Muon ZeRO-1 tests fail with "head element did not
+  move at rank 0: lm_head[0]". AdamW tests are unaffected (that path uses
+  `_adamw_flat`). The design's Bucket-1 mutant is unreachable until S6.
+- No trainer change.
 
 ## AI use statement
 
