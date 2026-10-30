@@ -1678,6 +1678,91 @@ def test_reducescatter_buckets_scratch_and_bounds_checks() raises:
     assert_equal(raised_scratch, True)
 
 
+def test_multi_cpu_allreduce_max_host() raises:
+    """`allreduce_max_host` at threaded W=4: elementwise max of per-rank host
+    vectors, identical on every rank, `src` untouched (QK-clip global S_max)."""
+    var ctx = DeviceContext(api="cpu")
+    comptime WORLD_SIZE = 4
+    comptime size = 24
+
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
+    cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
+    var srcs = heap_alloc[Scalar[DType.float32]](WORLD_SIZE * size)
+    var dsts = heap_alloc[Scalar[DType.float32]](WORLD_SIZE * size)
+
+    # Element i is maximal on rank (i * 3) % WORLD_SIZE; others are smaller and
+    # one element is negative on all ranks (max must not clamp at 0).
+    def _val(r: Int, i: Int) -> Float32:
+        if i == 5:
+            return -Float32(10 + r)
+        if r == (i * 3) % WORLD_SIZE:
+            return Float32(100 + i)
+        return Float32(r * 2 + i % 7) * 0.5
+
+    for r in range(WORLD_SIZE):
+        for i in range(size):
+            srcs[unsafe_offset=r * size + i] = _val(r, i)
+            dsts[unsafe_offset=r * size + i] = -999.0
+
+    def _run_rank(rank: Int) {imm}:
+        try:
+            var z_ctx = ZeroContext["cpu", WORLD_SIZE](
+                rank=rank,
+                zero_stage=0,
+                ctx=ctx,
+                cpu_coord=cpu_coord_ptr,
+            )
+            z_ctx.allreduce_max_host[DType.float32](
+                rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+                    srcs.unsafe_offset(rank * size)
+                ),
+                rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+                    dsts.unsafe_offset(rank * size)
+                ),
+                size,
+            )
+        except e:
+            print("allreduce_max_host rank error:", e)
+
+    sync_parallelize(_run_rank, WORLD_SIZE)
+
+    for r in range(WORLD_SIZE):
+        for i in range(size):
+            var want = _val(0, i)
+            for q in range(1, WORLD_SIZE):
+                want = max(want, _val(q, i))
+            assert_equal(dsts[unsafe_offset=r * size + i], want)
+            assert_equal(srcs[unsafe_offset=r * size + i], _val(r, i))
+
+    srcs.unsafe_free()
+    dsts.unsafe_free()
+    cpu_coord_ptr[].free()
+    cpu_coord_ptr.unsafe_free()
+
+
+def test_allreduce_max_host_no_coordinator_is_copy() raises:
+    """N > 1 without a coordinator (sequential-rank harness): the max over the
+    one rank that exists is a copy, and `src` is left untouched."""
+    var ctx = DeviceContext(api="cpu")
+    comptime size = 9
+    var z_ctx = ZeroContext["cpu", 4](rank=2, zero_stage=1, ctx=ctx)
+    var src = heap_alloc[Scalar[DType.float32]](size)
+    var dst = heap_alloc[Scalar[DType.float32]](size)
+    for i in range(size):
+        src[unsafe_offset=i] = Float32(i) - 3.5
+        dst[unsafe_offset=i] = 77.0
+    z_ctx.allreduce_max_host[DType.float32](
+        rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](src),
+        rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](dst),
+        size,
+    )
+    for i in range(size):
+        assert_equal(dst[unsafe_offset=i], Float32(i) - 3.5)
+        assert_equal(src[unsafe_offset=i], Float32(i) - 3.5)
+    src.unsafe_free()
+    dst.unsafe_free()
+
+
 def main() raises:
     # Probe BEFORE building the suite: `_gpu_multirank_available` can raise,
     # and a TestSuite must be consumed by `run()` on every path, so it must
