@@ -7143,6 +7143,18 @@ def train[
     )
     if args.optimizer == "muon":
         model.enable_muon(args.muon_momentum)
+        # Sharded Muon (W > 1, ZeRO >= 1) cannot write or read a state file
+        # until the owner-space momentum is in it (slice S4). Refuse up front:
+        # write_checkpoint would otherwise raise only at the first save step,
+        # after all the training before it.
+        comptime if WORLD_SIZE > 1:
+            if model.zero_ctx.zero_stage >= 1 and args.output_log_dir != "":
+                if args.checkpoint_every > 0 or args.resume == 1:
+                    raise Error(
+                        "-opt muon with -z >= 1 at WORLD_SIZE > 1 cannot"
+                        " checkpoint or resume yet (sharded-Muon state is"
+                        " not in the state file); drop -n / -y, or use -z 0"
+                    )
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
 
@@ -7900,6 +7912,9 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
         else:
             var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
             cpu_coord_ptr[] = CpuCoordinator(world_size)
+            var rank_failed = heap_alloc[Int](world_size)
+            for r in range(world_size):
+                rank_failed[unsafe_offset=r] = 0
 
             def _run_rank(rank: Int) {imm}:
                 try:
@@ -7908,6 +7923,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
                     )
                 except e:
                     print("Rank", rank, "failed:", e)
+                    rank_failed[unsafe_offset=rank] = 1
                     # Release the peers. Without this they rendezvous with a
                     # cohort permanently one short and spin forever: the run
                     # wedges with idle devices instead of exiting, and the
@@ -7919,6 +7935,7 @@ def _dispatch_cpu(args: TrainArgs, world_size: Int) raises:
             sync_parallelize(_run_rank, world_size)
             cpu_coord_ptr[].free()
             cpu_coord_ptr.unsafe_free()
+            _raise_if_rank_failed(rank_failed, world_size)
 
 
 def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
@@ -7971,12 +7988,16 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             # ignored here — all ranks live in this process.
             var coord_ptr = heap_alloc[CpuCoordinator](1)
             coord_ptr[] = CpuCoordinator(world_size)
+            var rank_failed = heap_alloc[Int](world_size)
+            for i in range(world_size):
+                rank_failed[unsafe_offset=i] = 0
 
             def _run_rank(r: Int) {imm}:
                 try:
                     _dispatch_world_size["gpu"](args, r, world_size, coord_ptr)
                 except e:
                     print("Rank", r, "failed:", e)
+                    rank_failed[unsafe_offset=r] = 1
                     # See the CPU path above: a rank that leaves without
                     # aborting hangs every peer on the next barrier.
                     coord_ptr[].abort()
@@ -7985,9 +8006,25 @@ def _try_gpu(args: TrainArgs, rank: Int, world_size: Int) raises -> Bool:
             sync_parallelize(_run_rank, world_size)
             coord_ptr[].free()
             coord_ptr.unsafe_free()
+            _raise_if_rank_failed(rank_failed, world_size)
         return True
     else:
         return False
+
+
+def _raise_if_rank_failed(
+    failed: Pointer[Int, MutUntrackedOrigin], world_size: Int
+) raises:
+    """After a threaded multi-rank run: frees `failed` and raises if any rank
+    caught an error, so the process exits nonzero. The per-rank handlers only
+    print and abort the coordinator; without this a W>1 run whose ranks all
+    failed still exited 0, which made exit-code gates pass on a dead run."""
+    var n = 0
+    for r in range(world_size):
+        n += failed[unsafe_offset=r]
+    failed.unsafe_free()
+    if n > 0:
+        raise Error(String(n) + " of " + String(world_size) + " ranks failed")
 
 
 def main() raises:
