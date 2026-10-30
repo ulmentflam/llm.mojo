@@ -129,7 +129,8 @@ def test_untied_file_loads_planted_head() raises:
     assert_equal(model.num_parameters, N16 + HEAD_N)
     for i in range(V * C):
         assert_equal(
-            model.params_memory[unsafe_offset=N16 + i], Float32(1000 + i)
+            model.params_memory[unsafe_offset=N16 + i],
+            Scalar[GPT2_DTYPE](1000 + i),
         )
     for i in range(V * C, VP * C):
         assert_equal(model.params_memory[unsafe_offset=N16 + i], 0)
