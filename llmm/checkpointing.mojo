@@ -172,6 +172,12 @@ struct TrainingState(Copyable, Movable):
     # blob of `muon_shard_elems` fp32 elements follows m and v.
     var muon_ownership_version: Int
     var muon_shard_elems: Int  # slot 43: S, the per-rank owner shard.
+    # Slot 44: 1 = the writer was the untied-LM-head build (17-tensor layout),
+    # 0 = tied. Slot 45: that run's untie step s_u (-1 = never untie, 0 =
+    # untied from construction, >0 = untie at that step); always 0 in tied
+    # files, so they stay byte-identical.
+    var untied_layout: Int
+    var untie_step: Int
 
     def __init__(
         out self,
@@ -188,6 +194,8 @@ struct TrainingState(Copyable, Movable):
         zero_stage: Int = 0,
         muon_ownership_version: Int = 0,
         muon_shard_elems: Int = 0,
+        untied_layout: Int = 0,
+        untie_step: Int = 0,
     ):
         self.step = step
         self.num_processes = num_processes
@@ -202,6 +210,8 @@ struct TrainingState(Copyable, Movable):
         self.zero_stage = zero_stage
         self.muon_ownership_version = muon_ownership_version
         self.muon_shard_elems = muon_shard_elems
+        self.untied_layout = untied_layout
+        self.untie_step = untie_step
 
 
 # ===----------------------------------------------------------------------=== #
@@ -403,6 +413,8 @@ def write_state_checkpoint[
     header.unsafe_store(41, Int32(state.zero_stage))
     header.unsafe_store(42, Int32(state.muon_ownership_version))
     header.unsafe_store(43, Int32(state.muon_shard_elems))
+    header.unsafe_store(44, Int32(state.untied_layout))
+    header.unsafe_store(45, Int32(state.untie_step))
 
     # 64-bit fields share the same buffer; an aligned UInt64 view writes pairs
     # of Int32 slots (index k => slots 2k, 2k+1), matching llm.c's byte offsets.
@@ -464,6 +476,8 @@ def read_state_header(mut file: FileHandle) raises -> TrainingState:
         zero_stage=Int(header.unsafe_load(41)),
         muon_ownership_version=Int(header.unsafe_load(42)),
         muon_shard_elems=Int(header.unsafe_load(43)),
+        untied_layout=Int(header.unsafe_load(44)),
+        untie_step=Int(header.unsafe_load(45)),
     )
     header.unsafe_free()
     return state^
@@ -614,6 +628,8 @@ def make_training_state(
     sampler_rng_state: UInt64 = 0,
     use_master_weights: Int = 0,
     optimizer_kind: Int = 0,
+    untied_layout: Int = 0,
+    untie_step: Int = 0,
 ) raises -> TrainingState:
     """Snapshot a DataLoader's position into a `TrainingState` for checkpointing.
     """
@@ -630,6 +646,8 @@ def make_training_state(
         current_shard_idx=loader.current_shard_idx,
         current_sample_idx=loader.current_sample_idx,
         optimizer_kind=optimizer_kind,
+        untied_layout=untied_layout,
+        untie_step=untie_step,
     )
 
 

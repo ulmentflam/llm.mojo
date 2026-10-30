@@ -742,7 +742,7 @@ def test_state_checkpoint_sharded_muon_t6() raises:
 
 
 def test_state_header_plain_files_unchanged() raises:
-    """AdamW / replicated-Muon files carry zeros in slots 41-43 (byte-identical
+    """AdamW / replicated-Muon files carry zeros in slots 41-45 (byte-identical
     to the pre-S4 layout) and are exactly header + (m + v) * 4 bytes."""
     var path = String("test_ckpt_state_plain_hdr.bin")
     var n = 6
@@ -756,10 +756,49 @@ def test_state_header_plain_files_unchanged() raises:
     write_state_checkpoint(path, st, m, v, n)
     var bytes = open(path, "r").read_bytes()
     assert_equal(len(bytes), 256 * 4 + 2 * n * 4)
-    for k in range(41 * 4, 44 * 4):
+    for k in range(41 * 4, 46 * 4):
         assert_equal(Int(bytes[k]), 0)
     m.unsafe_free()
     v.unsafe_free()
+    _remove(path)
+
+
+def test_state_untie_fields_round_trip() raises:
+    """Slots 44/45 (untied layout, untie step) round trip, including the
+    negative "never untie" value, and default to 0 in a plain state."""
+    var path = String("test_ckpt_state_untie.bin")
+    var n = 6
+    var m = heap_alloc[Float32](n)
+    var v = heap_alloc[Float32](n)
+    _fill_pattern(m, n, 0.1)
+    _fill_pattern(v, n, 0.3)
+    var m_out = heap_alloc[Float32](n)
+    var v_out = heap_alloc[Float32](n)
+    var steps = List[Int]()
+    steps.append(-1)
+    steps.append(0)
+    steps.append(3)
+    for i in range(len(steps)):
+        var st = _owner_state(0, 0, 0)
+        st.muon_ownership_version = 0
+        st.num_processes = 1
+        st.untied_layout = 1
+        st.untie_step = steps[i]
+        write_state_checkpoint(path, st, m, v, n)
+        var r = read_state_checkpoint(path, m_out, v_out, n)
+        assert_equal(r.untied_layout, 1)
+        assert_equal(r.untie_step, steps[i])
+    var plain = _owner_state(0, 0, 0)
+    plain.muon_ownership_version = 0
+    plain.num_processes = 1
+    write_state_checkpoint(path, plain, m, v, n)
+    var r0 = read_state_checkpoint(path, m_out, v_out, n)
+    assert_equal(r0.untied_layout, 0)
+    assert_equal(r0.untie_step, 0)
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
     _remove(path)
 
 

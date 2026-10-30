@@ -11,8 +11,8 @@ requires:
     never fired and a wrong grad-norm range would be invisible),
   * the untied model file is the tied one plus a trailing head block: the
     untied header says version 13, the 16-tensor prefix is byte-identical to
-    the tied blob (`cmp`), and the head block is the zero init (idle: no
-    updates reached it),
+    the tied blob (`cmp`), and the head block equals the trained wte (head :=
+    wte is written while the head is tied; no update reached the idle head),
   * the optimizer state files agree on the 16-tensor prefix (m, v).
 
 Mutant check (manual, see docs/ai/untied_lm_head_design_2026-10-30.md S0): make
@@ -50,10 +50,11 @@ def run(binary, out, idle=False):
         LLMM_LOG_LEVEL="verbose",
         LLMM_LOG_FILE=log,
     )
+    extra = []
     if idle:
-        # The untied build trains its head by default (slice S2); this hook
-        # keeps it tied to wte and idle, the S0 contract this gate checks.
-        env["LLMM_UNTIED_IDLE_HEAD"] = "1"
+        # The untied build trains its head by default (slice S2); -untie_at 1.0
+        # keeps it tied to wte and idle (never untie), the S0 contract.
+        extra = ["-untie_at", "1.0"]
 
     args = [
         binary,
@@ -85,7 +86,7 @@ def run(binary, out, idle=False):
         "0",
         "-x",
         str(STEPS),
-    ]
+    ] + extra
     subprocess.run(args, cwd=ROOT, env=env, check=True, stdout=subprocess.DEVNULL)
     steps = []
     for line in open(log):
@@ -135,8 +136,10 @@ def main():
     if ub[: len(tb)][1024:] != tb[1024:]:
         print("FAIL: 16-tensor prefix of the model file differs")
         ok = False
-    if any(ub[len(tb) :]):
-        print("FAIL: idle head block is not all zero")
+    # Tied-phase files carry head := wte (the live tied weights), not the stale
+    # zero init, so infer/eval/export of the file run the model that trained.
+    if ub[len(tb) :] != tb[1024 : 1024 + head_bytes]:
+        print("FAIL: idle head block is not a copy of the trained wte")
         ok = False
     del body
 
