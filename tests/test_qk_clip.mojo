@@ -10,6 +10,9 @@ from std.python import Python
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
+from max.algorithm import sync_parallelize
+from max.gpu.host import DeviceContext
+
 from llmm.vendor import (
     has_nvidia_gpu_accelerator,
     has_apple_gpu_accelerator,
@@ -17,6 +20,7 @@ from llmm.vendor import (
 from llmm.memory import MutKernelPtr, ImmutKernelPtr, MutMemPtr, heap_alloc
 from llmm.attention import attention_fwd
 from llmm.qk_clip import qk_clip_apply
+from llmm.zero import CpuCoordinator
 from _gpu_test_common import shared_gpu_ctx
 from train_gpt2 import GPT2, GPT2_DTYPE
 
@@ -528,6 +532,249 @@ def test_gpt2_qk_clip_end_to_end() raises:
         yb.unsafe_free()
     else:
         print("SKIP test_gpt2_qk_clip_end_to_end: needs a GPU")
+
+
+# ---------------------------------------------------------------------------
+# S5: QK-clip at WORLD_SIZE > 1 (threaded CPU ranks; CPU attention records no
+# logits, so every rank PLANTS its own per-head maxima after backward).
+# ---------------------------------------------------------------------------
+
+comptime MT = 16
+comptime MV = 64
+comptime ML = 2
+comptime MNH = 2
+comptime MC = 16
+comptime MTAU = Float32(5.0)
+
+
+def _planted(rank: Int, i: Int) -> Float32:
+    """Rank `rank`'s planted max for head slot i = layer * NH + head. Differs
+    across ranks; the global max is [5, 20, 9, 4.5] at W=4 and [3, 20, 6, 4.5]
+    at W=2, so (0,1) and (1,0) are hot only because of a PEER's value and the
+    cold heads (0,0) (== tau at W=4: strict `>`) and (1,1) stay untouched."""
+    if rank == 0:
+        return SIMD[DType.float32, 4](3.0, 8.0, 2.0, 4.0)[i]
+    if rank == 1:
+        return SIMD[DType.float32, 4](1.0, 20.0, 6.0, 4.5)[i]
+    if rank == 2:
+        return SIMD[DType.float32, 4](5.0, 7.0, 9.0, 1.0)[i]
+    return Float32(2.0)
+
+
+def _write_mckpt(path: String) raises -> Int:
+    var np = Python.import_module("numpy")
+    var builtins = Python.import_module("builtins")
+    var L = ML
+    var C = MC
+    var n = (
+        MV * C
+        + MT * C
+        + L * (C + C + 3 * C * C + 3 * C + C * C + C + C + C)
+        + L * (4 * C * C + 4 * C + 4 * C * C + C)
+        + 2 * C
+    )
+    var header = np.zeros(256, dtype=np.int32)
+    header[0] = 20240520
+    header[1] = 3
+    header[2] = MT
+    header[3] = MV
+    header[4] = L
+    header[5] = MNH
+    header[6] = C
+    header[7] = MV
+    np.random.seed(11)
+    var weights = np.random.normal(0, 0.08, n).astype(np.float32)
+    var f = builtins.open(path, "wb")
+    _ = f.write(header.tobytes())
+    _ = f.write(weights.tobytes())
+    f.close()
+    return n
+
+
+def _mclip_train[
+    W: Int
+](
+    path: String,
+    n: Int,
+    stage: Int,
+    clip: Bool,
+    result: MutMemPtr[DType.float32],
+    qmax: MutMemPtr[DType.float32],
+) raises:
+    """One Muon step on W threaded CPU ranks at `stage`. With `clip`, QK-clip
+    is enabled and each rank plants `_planted(rank, .)` after backward; the
+    trainer's `qk_max()` + `qk_clip_step()` sequence follows `update()`.
+    result[r*n:(r+1)*n] = rank r's params; qmax[r] = rank r's qk_max()."""
+    var coord = heap_alloc[CpuCoordinator](1)
+    coord[] = CpuCoordinator(W)
+    var errors = heap_alloc[Int](W)
+    for r in range(W):
+        errors[unsafe_offset=r] = 0
+
+    def _run_rank(rank: Int) {imm}:
+        try:
+            var ctx = DeviceContext(api="cpu")
+            var model = GPT2["cpu", W](
+                path,
+                rank,
+                stage,
+                ctx,
+                cpu_coordinator_ptr=Optional[
+                    Pointer[CpuCoordinator, MutUntrackedOrigin]
+                ](coord),
+            )
+            model.enable_muon(Scalar[DType.float32](0.95))
+            if clip:
+                model.enable_qk_clip(MTAU, True)
+            var x = heap_alloc[SIMD[DType.int32, 1]](MT)
+            var y = heap_alloc[SIMD[DType.int32, 1]](MT)
+            for i in range(MT):
+                x[unsafe_offset=i] = Int32((rank * 7919 + i * 31 + 5) % MV)
+                y[unsafe_offset=i] = Int32((rank * 17 + i * 5 + 1) % MV)
+            model.forward(
+                rebind[MutMemPtr[DType.int32]](x),
+                rebind[MutMemPtr[DType.int32]](y),
+                1,
+                MT,
+            )
+            model.ctx.synchronize()
+            model.zero_gradients()
+            model.backward()
+            model.ctx.synchronize()
+            if clip:
+                for i in range(ML * MNH):
+                    model.head_max_memory[unsafe_offset=i] = _planted(rank, i)
+            model.update(
+                t=UInt32(1),
+                learning_rate=Scalar[DType.float32](1e-3),
+                beta1=Scalar[DType.float32](0.9),
+                beta2=Scalar[DType.float32](0.999),
+                eps=Scalar[DType.float32](1e-8),
+                weight_decay=Scalar[DType.float32](0.01),
+            )
+            model.ctx.synchronize()
+            qmax[unsafe_offset=rank] = model.qk_max()
+            model.qk_clip_step()
+            model.ctx.synchronize()
+            for i in range(n):
+                result[unsafe_offset=rank * n + i] = model.params_memory[
+                    unsafe_offset=i
+                ].cast[DType.float32]()
+            x.unsafe_free()
+            y.unsafe_free()
+        except e:
+            print("rank", rank, "failed:", e)
+            errors[unsafe_offset=rank] = 1
+            coord[].abort()
+
+    sync_parallelize(_run_rank, W)
+    coord[].free()
+    coord.unsafe_free()
+    var bad = 0
+    for r in range(W):
+        bad += errors[unsafe_offset=r]
+    errors.unsafe_free()
+    assert_equal(bad, 0)
+
+
+def _mclip_case[W: Int](stage: Int) raises:
+    """Clipped multi-rank step == unclipped step + W=1-style `qk_clip_apply`
+    with the GLOBAL maxima, bit-exact, identically on every rank."""
+    var path = String("gpt2_qkclip_w") + String(W) + "_z" + String(stage)
+    path += ".bin"
+    var n = _write_mckpt(path)
+    var unclipped = heap_alloc[Float32](W * n)
+    var got = heap_alloc[Float32](W * n)
+    var qmax = heap_alloc[Float32](W)
+    var qmax_ref = heap_alloc[Float32](W)
+    try:
+        _mclip_train[W](path, n, 0, False, unclipped, qmax_ref)
+        _mclip_train[W](path, n, stage, True, got, qmax)
+    except e:
+        _remove(path)
+        raise e^
+    _remove(path)
+
+    # Reference: the unclipped step clipped by the single-process kernel.
+    var gmax = heap_alloc[Float32](ML * MNH)
+    for i in range(ML * MNH):
+        var m = _planted(0, i)
+        for r in range(1, W):
+            m = max(m, _planted(r, i))
+        gmax[unsafe_offset=i] = m
+    var C = MC
+    var w_off = MV * C + MT * C + 2 * ML * C
+    var b_off = w_off + ML * 3 * C * C
+    var want = heap_alloc[Float32](n)
+    for i in range(n):
+        want[unsafe_offset=i] = unclipped[unsafe_offset=i]
+    var cctx = DeviceContext(api="cpu")
+    qk_clip_apply[DType.float32, "cpu"](
+        rebind[MutKernelPtr[DType.float32]](want.as_unsafe_any_origin()),
+        rebind[MutKernelPtr[DType.float32]](want.as_unsafe_any_origin()),
+        False,
+        w_off,
+        b_off,
+        rebind[ImmutKernelPtr[DType.float32]](gmax.as_unsafe_any_origin()),
+        ML,
+        MNH,
+        MC,
+        MTAU,
+        cctx,
+    )
+    var n_changed = 0
+    var hd = MC // MNH
+    for i in range(n):
+        if want[unsafe_offset=i] != unclipped[unsafe_offset=i]:
+            n_changed += 1
+    # Hot heads (0,1) and (1,0): Q and K rows (hd rows x (C weights + bias)).
+    assert_equal(n_changed, 2 * 2 * hd * (C + 1))
+    for r in range(W):
+        assert_equal(qmax[unsafe_offset=r], Float32(20.0))
+        for i in range(n):
+            var a = want[unsafe_offset=i]
+            var b = got[unsafe_offset=r * n + i]
+            if a != b:
+                raise Error(
+                    "multi-rank QK-clip != reference at W="
+                    + String(W)
+                    + " stage "
+                    + String(stage)
+                    + " rank "
+                    + String(r)
+                    + " idx "
+                    + String(i)
+                    + ": "
+                    + String(a)
+                    + " vs "
+                    + String(b)
+                )
+    want.unsafe_free()
+    gmax.unsafe_free()
+    unclipped.unsafe_free()
+    got.unsafe_free()
+    qmax.unsafe_free()
+    qmax_ref.unsafe_free()
+
+
+def test_qk_clip_multirank_zero1_w2() raises:
+    _mclip_case[2](1)
+
+
+def test_qk_clip_multirank_zero1_w4() raises:
+    _mclip_case[4](1)
+
+
+def test_qk_clip_multirank_zero0_w2() raises:
+    _mclip_case[2](0)
+
+
+def _remove(path: String) raises:
+    var os = Python.import_module("os")
+    try:
+        _ = os.remove(path)
+    except:
+        pass
 
 
 def main() raises:
