@@ -29,9 +29,6 @@ from train_gpt2 import (
 # -D LLMM_ROTARY=1 reads the rotary reference (same weights, rotary q/k, no wpe
 # add; written by `make rotary-reference`). Rotary and relu2 together have no
 # PyTorch trajectory here, so that combination is refused at compile time.
-comptime assert not (
-    ROTARY and MLP_RELU2
-), "test_gpt2 has no reference for LLMM_ROTARY=1 with LLMM_MLP_ACT=relu2"
 comptime STATE_FILE = (
     "gpt2_124M_rotary_debug_state.bin" if ROTARY else (
         "gpt2_124M_relu2_debug_state.bin" if MLP_RELU2 else "gpt2_124M_debug_state.bin"
@@ -387,6 +384,10 @@ def run_test[
     var V_p: Int = model.config.padded_vocab_size
 
     # load additional information that we will use for debugging and error checking
+
+    comptime assert not (
+        ROTARY and MLP_RELU2
+    ), "test_gpt2 has no reference for LLMM_ROTARY=1 with LLMM_MLP_ACT=relu2"
 
     # STATE_FILE selects the reference by build flag (default, relu2 or rotary),
     # all written by train_gpt2.py / `make rotary-reference`.
