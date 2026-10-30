@@ -105,6 +105,13 @@ struct MuonGroup(Copyable, Movable):
         self.sr_offset = offset
         self.sr_stride = stride
 
+    @staticmethod
+    def flat(
+        offset: Int, rows: Int, cols: Int, count: Int, stride: Int
+    ) -> Self:
+        """Flat layout, spelled out: SR counters index like the buffers."""
+        return Self(offset, rows, cols, count, stride)
+
     def __init__(
         out self,
         offset: Int,

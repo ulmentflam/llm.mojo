@@ -237,5 +237,82 @@ def test_momentum_and_update() raises:
             )
 
 
+def check_owner_layout_matches_flat(rows: Int, cols: Int) raises:
+    """T4: the owner-space layout (compact stride rows*cols, SR counters kept
+    global via sr_offset/sr_stride) must equal the flat layout bit for bit.
+    Bit-identity needs every matrix <= 2048 elements (the float-atomic norm
+    order is only deterministic below BLOCK*VEC) and the same group count
+    (cuBLASLt batch_count)."""
+    var n = rows * cols
+    var count = 2
+    var flat_off = 24
+    var flat_stride = 3 * n + 8  # W*stride_k: the owner's every-W-th matrix
+    var total = flat_off + (count - 1) * flat_stride + n + 16
+    var w_flat = randn(total, UInt64(11 + n))
+    var m_flat = List[Float32](length=total, fill=Float32(0))
+    var w_own = List[Float32](length=count * n, fill=Float32(0))
+    var m_own = List[Float32](length=count * n, fill=Float32(0))
+    for mat in range(count):
+        for i in range(n):
+            w_own[mat * n + i] = w_flat[flat_off + mat * flat_stride + i]
+    var g_flat_groups = List[MuonGroup]()
+    g_flat_groups.append(
+        MuonGroup.flat(flat_off, rows, cols, count, flat_stride)
+    )
+    var g_own_groups = List[MuonGroup]()
+    g_own_groups.append(
+        MuonGroup(0, rows, cols, count, n, flat_off, flat_stride)
+    )
+    for step in range(2):
+        var g_flat = randn(total, UInt64(500 + step * 7 + n))
+        var g_own = List[Float32](length=count * n, fill=Float32(0))
+        for mat in range(count):
+            for i in range(n):
+                g_own[mat * n + i] = g_flat[flat_off + mat * flat_stride + i]
+        run_muon(
+            g_flat_groups,
+            w_flat,
+            g_flat,
+            m_flat,
+            0.02,
+            0.95,
+            0.1,
+            0.5,
+            UInt32(step + 1),
+        )
+        run_muon(
+            g_own_groups,
+            w_own,
+            g_own,
+            m_own,
+            0.02,
+            0.95,
+            0.1,
+            0.5,
+            UInt32(step + 1),
+        )
+    for mat in range(count):
+        for i in range(n):
+            var f = w_flat[flat_off + mat * flat_stride + i]
+            var o = w_own[mat * n + i]
+            var fm = m_flat[flat_off + mat * flat_stride + i]
+            var om = m_own[mat * n + i]
+            assert_true(f == o)
+            assert_true(fm == om)
+    # Everything outside the group's matrices is untouched on the flat side.
+    var untouched = randn(total, UInt64(11 + n))
+    for i in range(flat_off):
+        assert_true(w_flat[i] == untouched[i])
+
+
+def test_owner_layout_matches_flat() raises:
+    if not has_nvidia_gpu_accelerator():
+        print("SKIP test_owner_layout_matches_flat: needs NVIDIA GPU")
+        return
+    check_owner_layout_matches_flat(32, 32)
+    check_owner_layout_matches_flat(32, 64)
+    check_owner_layout_matches_flat(64, 32)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

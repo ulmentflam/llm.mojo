@@ -1468,6 +1468,166 @@ def test_allgather_ranges_self_range_is_identity() raises:
         assert_equal(h4.unsafe_ptr()[unsafe_offset=j], Float32(j))
 
 
+def test_multi_cpu_allgather_ranges_dst_aliases_shard() raises:
+    """Threaded (coordinator) alias case, the ZeRO-1 AdamW propagation layout:
+    every rank holds the FULL vector buffer, its shard is the slice
+    `base + rank*shard`, and the gather destination is `base` itself. The own
+    slice is a src == dst copy (skipped; a CPU self-copy is byte-identical
+    either way, so this checks the result, not the skip); peers' slices are
+    pulled. Elements outside every requested range keep their sentinel.
+    """
+    var ctx = DeviceContext(api="cpu")
+    comptime WORLD_SIZE = 4
+    comptime DTYPE = DType.float32
+    comptime shard = 16
+    comptime total = shard * WORLD_SIZE
+
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
+    cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
+    var results = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * total)
+    for i in range(WORLD_SIZE * total):
+        results[unsafe_offset=i] = 0.0
+
+    def _run_rank(rank: Int) {imm}:
+        try:
+            var z_ctx = ZeroContext["cpu", WORLD_SIZE](
+                rank=rank, zero_stage=1, ctx=ctx, cpu_coord=cpu_coord_ptr
+            )
+            var buf = ctx.enqueue_create_buffer[DTYPE](total)
+            var host = ctx.enqueue_create_host_buffer[DTYPE](total)
+            for f in range(total):
+                var mine = f >= rank * shard and f < (rank + 1) * shard
+                host.unsafe_ptr()[unsafe_offset=f] = Float32(
+                    f
+                ) if mine else Float32(-1.0)
+            buf.enqueue_copy_from(host)
+            ctx.synchronize()
+            var base = rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
+                buf.unsafe_ptr().as_unsafe_any_origin()
+            )
+            # Two "AdamW-like" ranges; [40, 44) is left out.
+            var starts: List[Int] = [0, 44]
+            var lens: List[Int] = [40, total - 44]
+            z_ctx.allgather_ranges[DTYPE](
+                base.unsafe_offset(rank * shard),
+                shard,
+                base,
+                starts,
+                starts,
+                lens,
+            )
+            ctx.synchronize()
+            buf.enqueue_copy_to(host)
+            ctx.synchronize()
+            for f in range(total):
+                results[unsafe_offset=rank * total + f] = host.unsafe_ptr()[
+                    unsafe_offset=f
+                ]
+        except e:
+            print("allgather_ranges alias rank error:", e)
+
+    sync_parallelize(_run_rank, WORLD_SIZE)
+
+    for r in range(WORLD_SIZE):
+        for f in range(total):
+            var in_range = f < 40 or f >= 44
+            var mine = f >= r * shard and f < (r + 1) * shard
+            var expected = Float32(f) if (in_range or mine) else Float32(-1.0)
+            assert_equal(results[unsafe_offset=r * total + f], expected)
+
+    results.unsafe_free()
+    cpu_coord_ptr[].free()
+    cpu_coord_ptr.unsafe_free()
+
+
+def test_multi_cpu_reducescatter_buckets_owner_space() raises:
+    """`reducescatter_buckets` into an owner space: shard size S differs from
+    the flat optimizer shard (here S = 24 vs opt = 16) and every bucket lies
+    wholly inside one owner's shard, at its `owner*S + local_off` index. The
+    sharded-Muon gradient path (ZeRO-2/3) reduces into exactly this layout.
+    Padding between a rank's last slot and S must stay zero.
+    """
+    var ctx = DeviceContext(api="cpu")
+    comptime WORLD_SIZE = 4
+    comptime DTYPE = DType.float32
+    comptime S = 24
+
+    var cpu_coord_ptr = heap_alloc[CpuCoordinator](1)
+    cpu_coord_ptr[] = CpuCoordinator(WORLD_SIZE)
+
+    # (dest owner_idx, len): owner 0 holds [0,10) and [10,18); owner 1 holds
+    # [24,31); owner 2 holds [51,60); owner 3 holds [72,96) (a full shard).
+    var dest: List[Int] = [0, 10, 24, 51, 72]
+    var lens: List[Int] = [10, 8, 7, 9, 24]
+    var poff = List[Int]()
+    var pool_total = 0
+    for b in range(len(dest)):
+        poff.append(pool_total)
+        pool_total += lens[b]
+
+    var rank_shards = heap_alloc[Scalar[DTYPE]](WORLD_SIZE * S)
+    for i in range(WORLD_SIZE * S):
+        rank_shards[unsafe_offset=i] = 0.0
+
+    def _run_rank(rank: Int) {imm}:
+        try:
+            var z_ctx = ZeroContext["cpu", WORLD_SIZE](
+                rank=rank, zero_stage=2, ctx=ctx, cpu_coord=cpu_coord_ptr
+            )
+            var pool = ctx.enqueue_create_buffer[DTYPE](pool_total)
+            var host_pool = ctx.enqueue_create_host_buffer[DTYPE](pool_total)
+            for b in range(len(dest)):
+                for j in range(lens[b]):
+                    host_pool.unsafe_ptr()[unsafe_offset=poff[b] + j] = Float32(
+                        (rank + 1) * (dest[b] + j + 1)
+                    )
+            pool.enqueue_copy_from(host_pool)
+            var shard = ctx.enqueue_create_buffer[DTYPE](S)
+            shard.enqueue_fill(Float32(0.0))
+            ctx.synchronize()
+            z_ctx.reducescatter_buckets[DTYPE](
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
+                    pool.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                dest,
+                poff,
+                lens,
+                rebind[Pointer[Scalar[DTYPE], MutAnyOrigin]](
+                    shard.unsafe_ptr().as_unsafe_any_origin()
+                ),
+                S,
+            )
+            ctx.synchronize()
+            var host_shard = ctx.enqueue_create_host_buffer[DTYPE](S)
+            shard.enqueue_copy_to(host_shard)
+            ctx.synchronize()
+            for j in range(S):
+                rank_shards[
+                    unsafe_offset=rank * S + j
+                ] = host_shard.unsafe_ptr()[unsafe_offset=j]
+        except e:
+            print("reducescatter_buckets owner-space rank error:", e)
+
+    sync_parallelize(_run_rank, WORLD_SIZE)
+
+    # Covered owner indices sum (rank+1)*(f+1) over 4 ranks == 10*(f+1).
+    for r in range(WORLD_SIZE):
+        for j in range(S):
+            var f = r * S + j
+            var covered = False
+            for b in range(len(dest)):
+                if f >= dest[b] and f < dest[b] + lens[b]:
+                    covered = True
+            var expected = Float32(10 * (f + 1)) if covered else Float32(0.0)
+            assert_almost_equal[DTYPE](
+                rank_shards[unsafe_offset=r * S + j], expected, atol=1e-4
+            )
+
+    rank_shards.unsafe_free()
+    cpu_coord_ptr[].free()
+    cpu_coord_ptr.unsafe_free()
+
+
 def test_reducescatter_buckets_scratch_and_bounds_checks() raises:
     """`reducescatter_buckets` validates host-side, before any barrier:
     a bucket outside the padded vector raises (CPU path; it used to be dropped
