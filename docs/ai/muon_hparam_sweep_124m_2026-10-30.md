@@ -71,8 +71,8 @@ Under Moonlight RMS scaling Muon shares AdamW's lr scale, yet its optimum here (
 conventional 6e-4, and Muon at 6e-4 (5.74) is already 0.38 nats better than AdamW at 6e-4 (6.12) but
 still 0.67 nats short of Muon's best. So the first Muon-vs-AdamW comparison, which used 6e-4 for both,
 under-tuned Muon heavily. The AdamW control here was **not re-tuned**; its own optimum at this
-300-step horizon is likely above 6e-4 too (the 8-GPU tuning doc found higher lrs better for short
-horizons), so the 1.11 gap is an upper bound on the optimizer gap and not a fair tuned-vs-tuned number.
+300-step horizon is likely above 6e-4 too (not tested here)
+so the 1.11 gap is an upper bound on the optimizer gap and not a fair tuned-vs-tuned number.
 
 ## Caveats
 
