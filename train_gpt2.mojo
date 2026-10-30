@@ -8448,8 +8448,8 @@ def _parse_train_args(
             " already uses -l for every parameter); refusing"
         )
         _error_usage()
-    if args.adam_lr_mult <= 0.0:
-        print("Invalid -l_adam: must be > 0")
+    if args.adam_lr_mult < 0.0:
+        print("Invalid -l_adam: must be >= 0 (0 freezes the AdamW ranges)")
         _error_usage()
     return True
 
