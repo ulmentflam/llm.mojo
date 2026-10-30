@@ -1,6 +1,6 @@
 from std.math import sqrt, ceildiv, isnan, isfinite, nan, exp, log
 from std.os import getenv, listdir, makedirs
-from std.os.path import isdir
+from std.os.path import isdir, getsize
 from std.sys import (
     argv,
     has_accelerator,
@@ -39,6 +39,7 @@ from llmm.checkpointing import (
     write_state_checkpoint,
     read_state_checkpoint,
     read_state_header,
+    CHECKPOINT_HEADER_SIZE,
     make_training_state,
     restore_dataloader_state,
 )
@@ -6130,8 +6131,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var n_opt = self.optimizer_num_parameters
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
         var n_v = self._v_count()
-        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v)
-        self.ctx.synchronize()
         # Peek the header first: the v blob length depends on optimizer_kind,
         # so refuse a cross-optimizer resume before reading mis-sized blobs.
         var peek_file = open(state_path, "r")
@@ -6145,6 +6144,36 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 + String(self.optimizer_kind)
                 + "; pass the matching -opt"
             )
+        # The header does not record the v length, so check the file size:
+        # reading fewer bytes than the file holds would succeed silently. A
+        # Muon state file written before v went compact holds a full-size v
+        # (zeros at the Muon matrices); accept it and compact it below.
+        var elem = size_of[MASTER_DTYPE]()
+        var head_bytes = CHECKPOINT_HEADER_SIZE * size_of[DType.int32]()
+        var file_bytes = Int(getsize(state_path))
+        var n_v_read = n_v
+        if file_bytes != head_bytes + (n_opt + n_v) * elem:
+            if (
+                self.optimizer_kind == 1
+                and file_bytes == head_bytes + 2 * n_opt * elem
+            ):
+                n_v_read = n_opt  # legacy full-size Muon v
+            else:
+                raise Error(
+                    "Cannot resume: state file "
+                    + state_path
+                    + " is "
+                    + String(file_bytes)
+                    + " bytes, expected "
+                    + String(head_bytes + (n_opt + n_v) * elem)
+                    + " (m="
+                    + String(n_opt)
+                    + ", v="
+                    + String(n_v)
+                    + " fp32 elements)"
+                )
+        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v_read)
+        self.ctx.synchronize()
         var state = read_state_checkpoint[MASTER_DTYPE](
             state_path,
             rebind_mut_mem[MASTER_DTYPE](
@@ -6154,8 +6183,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 host_v.unsafe_ptr().as_unsafe_any_origin()
             ),
             n_opt,
-            n_v,
+            n_v_read,
         )
+        if n_v_read != n_v:
+            # Legacy full-size v: gather the AdamW ranges to their compact
+            # bases. bases[k] <= start_k, so an ascending in-place copy never
+            # overwrites an element before it is read.
+            var ranges = self._adamw_ranges()
+            for k in range(len(ranges) // 2):
+                var start = ranges[2 * k]
+                var base = self.v_compact_bases[k]
+                for i in range(ranges[2 * k + 1] - start):
+                    host_v[base + i] = host_v[start + i]
         if state.optimizer_kind != self.optimizer_kind:
             raise Error(
                 "Cannot resume: checkpoint was written with optimizer_kind="
