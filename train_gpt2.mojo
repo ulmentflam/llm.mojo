@@ -170,6 +170,8 @@ comptime LM_HEAD_CHUNKED_CE = (
 # embeddings, not fail loudly — do not enable it standalone.
 comptime Z3_WTE_ONDEMAND = is_defined["LLMM_Z3_WTE_ONDEMAND"]()
 
+comptime MUON_OWNERSHIP_VERSION = 1  # state header slot 42: (k*L + l) mod W
+
 comptime NUM_PARAMETER_TENSORS = 16
 comptime NUM_ACTIVATION_TENSORS = 26
 
@@ -6324,6 +6326,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             size=n,
         )
 
+    def _sharded_muon(self) -> Bool:
+        """True when Muon momentum lives in the owner-local buffers (W > 1,
+        ZeRO >= 1); the state file then carries a `muon_m` blob."""
+        comptime if Self.WORLD_SIZE > 1:
+            return self.optimizer_kind == 1 and self.zero_ctx.zero_stage >= 1
+        else:
+            return False
+
     def write_checkpoint(
         mut self,
         model_path: String,
@@ -6338,12 +6348,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         shard (m, v) to its `state_path`. Mirrors llm.c's split of model_*.bin
         (shared) and state_*_rank.bin (per-process).
         """
-        comptime if Self.WORLD_SIZE > 1:
-            if self.optimizer_kind == 1 and self.zero_ctx.zero_stage >= 1:
-                raise Error(
-                    "Checkpointing sharded Muon (ZeRO>=1) is not implemented"
-                    " yet: the owner-space momentum is not in the state file"
-                )
         # ZeRO-3 keeps only this rank's parameter shard resident in
         # params_memory after update() (the next forward re-gathers it). Gather
         # the full parameter set before snapshotting the model. Under streaming
@@ -6402,14 +6406,34 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self._copy_device_to_host[MASTER_DTYPE](host_m, self.m_memory, n_opt)
         self._copy_device_to_host[MASTER_DTYPE](host_v, self.v_memory, n_v)
         self.ctx.synchronize()
+        var tstate = make_training_state(
+            loader,
+            step,
+            sampler_rng_state,
+            optimizer_kind=self.optimizer_kind,
+        )
+        var n_mu = 0
+        if self._sharded_muon():
+            # Owner-local momentum (S elements) rides after m and v. The fp32
+            # muon_master is not saved: like `master_buf` it is rebuilt from
+            # the loaded params on resume (bf16 resume is therefore not
+            # bit-exact; fp32 is).
+            n_mu = self.muon_shard_elems
+            tstate.zero_stage = self.zero_ctx.zero_stage
+            tstate.muon_ownership_version = MUON_OWNERSHIP_VERSION
+            tstate.muon_shard_elems = n_mu
+        var host_mu = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
+            max(n_mu, 1)
+        )
+        self.ctx.synchronize()
+        if n_mu > 0:
+            self._copy_device_to_host[MASTER_DTYPE](
+                host_mu, self.muon_m_memory, n_mu
+            )
+            self.ctx.synchronize()
         write_state_checkpoint[MASTER_DTYPE](
             state_path,
-            make_training_state(
-                loader,
-                step,
-                sampler_rng_state,
-                optimizer_kind=self.optimizer_kind,
-            ),
+            tstate,
             rebind_mut_mem[MASTER_DTYPE](
                 host_m.unsafe_ptr().as_unsafe_any_origin()
             ),
@@ -6418,6 +6442,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             ),
             n_opt,
             n_v,
+            muon_m_memory=rebind_mut_mem[MASTER_DTYPE](
+                host_mu.unsafe_ptr().as_unsafe_any_origin()
+            ),
         )
 
     def load_checkpoint(
@@ -6430,12 +6457,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         checkpoint (build it from the same base checkpoint first). Each rank
         reads the shared model file plus its own optimizer-state shard.
         """
-        comptime if Self.WORLD_SIZE > 1:
-            if self.optimizer_kind == 1 and self.zero_ctx.zero_stage >= 1:
-                raise Error(
-                    "Checkpointing sharded Muon (ZeRO>=1) is not implemented"
-                    " yet: the owner-space momentum is not in the state file"
-                )
         var host_params = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )
@@ -6528,35 +6549,28 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 + String(self.optimizer_kind)
                 + "; pass the matching -opt"
             )
-        # The header does not record the v length, so check the file size:
-        # reading fewer bytes than the file holds would succeed silently. A
-        # Muon state file written before v went compact holds a full-size v
-        # (zeros at the Muon matrices); accept it and compact it below.
+        # The header does not record the m/v lengths. A Muon state file
+        # written before v went compact holds a full-size v (zeros at the
+        # Muon matrices); accept it (ZeRO-0 layouts only) and compact it
+        # below. Every other layout is checked exactly by
+        # read_state_checkpoint (header + m + v [+ muon_m], both directions).
         var elem = size_of[MASTER_DTYPE]()
         var head_bytes = CHECKPOINT_HEADER_SIZE * size_of[DType.int32]()
         var file_bytes = Int(getsize(state_path))
         var n_v_read = n_v
-        if file_bytes != head_bytes + (n_opt + n_v) * elem:
-            if (
-                self.optimizer_kind == 1
-                and self.zero_ctx.zero_stage == 0
-                and file_bytes == head_bytes + 2 * n_opt * elem
-            ):
-                n_v_read = n_opt  # legacy full-size Muon v
-            else:
-                raise Error(
-                    "Cannot resume: state file "
-                    + state_path
-                    + " is "
-                    + String(file_bytes)
-                    + " bytes, expected "
-                    + String(head_bytes + (n_opt + n_v) * elem)
-                    + " (m="
-                    + String(n_opt)
-                    + ", v="
-                    + String(n_v)
-                    + " fp32 elements)"
-                )
+        if (
+            file_bytes != head_bytes + (n_opt + n_v) * elem
+            and self.optimizer_kind == 1
+            and not self._sharded_muon()
+            and self.zero_ctx.zero_stage == 0
+            and file_bytes == head_bytes + 2 * n_opt * elem
+        ):
+            n_v_read = n_opt  # legacy full-size Muon v
+        var sharded = self._sharded_muon()
+        var n_mu = self.muon_shard_elems if sharded else 0
+        var host_mu = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
+            max(n_mu, 1)
+        )
         var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v_read)
         self.ctx.synchronize()
         var state = read_state_checkpoint[MASTER_DTYPE](
@@ -6571,6 +6585,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             v_num_parameters=n_v_read,
             expect_num_processes=Self.WORLD_SIZE,
             expect_process_rank=self.zero_ctx.rank,
+            muon_m_out=Optional[MutMemPtr[MASTER_DTYPE]](
+                rebind_mut_mem[MASTER_DTYPE](
+                    host_mu.unsafe_ptr().as_unsafe_any_origin()
+                )
+            ) if sharded else Optional[MutMemPtr[MASTER_DTYPE]](None),
+            expect_muon_shard_elems=n_mu,
         )
         if n_v_read != n_v:
             # Legacy full-size v (ZeRO-0 layouts only; the size check above
@@ -6594,8 +6614,57 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             )
         self._copy_host_to_device[MASTER_DTYPE](self.m_memory, host_m, n_opt)
         self._copy_host_to_device[MASTER_DTYPE](self.v_memory, host_v, n_v)
+        if sharded:
+            self._load_muon_owner_state(host_params, host_mu)
         self.ctx.synchronize()
         return state^
+
+    def _load_muon_owner_state(
+        mut self,
+        host_params: HostBuffer[GPT2_DTYPE],
+        host_mu: HostBuffer[MASTER_DTYPE],
+    ) raises:
+        """Resume the owner-local Muon buffers: momentum from the state file;
+        params re-seeded from the loaded full vector (the owner buffer is the
+        source of truth for owned matrices); fp32 master (bf16 builds) rebuilt
+        from those params, as `master_buf` is."""
+        var S = self.muon_shard_elems
+        var rank = self.zero_ctx.rank
+        self._copy_host_to_device[MASTER_DTYPE](self.muon_m_memory, host_mu, S)
+        for i in range(len(self.muon_slots)):
+            ref sl = self.muon_slots[i]
+            if sl.owner != rank:
+                continue
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.muon_p_memory.unsafe_offset(
+                        sl.local_off
+                    ).as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                    (
+                        host_params.unsafe_ptr().unsafe_offset(sl.flat_off)
+                    ).as_unsafe_any_origin()
+                ),
+                size=sl.len,
+            )
+        comptime if USE_BF16:
+            var host_ms = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](S)
+            self.ctx.synchronize()
+            for i in range(S):
+                host_ms[i] = Scalar[MASTER_DTYPE](0)
+            for i in range(len(self.muon_slots)):
+                ref sl = self.muon_slots[i]
+                if sl.owner != rank:
+                    continue
+                for e in range(sl.len):
+                    host_ms[sl.local_off + e] = host_params[
+                        sl.flat_off + e
+                    ].cast[MASTER_DTYPE]()
+            self._copy_host_to_device[MASTER_DTYPE](
+                self.muon_master_memory, host_ms, S
+            )
+        self.ctx.synchronize()
 
     # ===------------------------------------------------------------------=== #
     # Exact in-process memory accounting (LLMM_MEM_REPORT)
