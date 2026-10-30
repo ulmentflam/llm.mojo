@@ -181,7 +181,7 @@ $(PIXI_STAMP):
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
         test test-cpu test-cuda test-python test-mojo test-fixtures smoke gate \
         compare-llmc-cpu compare-llmm-cpu \
-        verify verify-cpu verify-gpu verify-gpu-tf32 \
+        verify verify-cpu verify-gpu verify-gpu-tf32 verify-init \
         docs docs-clean
 
 .DEFAULT_GOAL := help
@@ -322,6 +322,7 @@ help:
 	@echo "  test-metal       Apple Silicon: Mojo tests + pytest on the Metal GPU (MAX_USE_ACCELERATOR=1)"
 	@echo "  test-fixtures Regenerate tests/fixtures/*.npz from PyTorch reference"
 	@echo "  verify        Verify both CPU and GPU versions against reference state"
+	@echo "  verify-init   From-scratch d12 init vs PyTorch reference (ZERO_INIT_PROJ=0|1|2)"
 	@echo "  verify-cpu    Verify CPU version against reference state"
 	@echo "  verify-gpu    Verify GPU version against reference state (true fp32, TF32 off)"
 	@echo "  verify-gpu-tf32  Same gate for the default TF32-on fp32 path (TF32-calibrated loss tol)"
@@ -1515,6 +1516,20 @@ verify-cpu: | $(PIXI_STAMP)
 # tight LOSS_STEP_TOL=0.01; see verify-gpu-tf32 below for the TF32 path.
 verify-gpu: | $(PIXI_STAMP)
 	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 test_gpt2.mojo gpu
+
+# From-scratch init equivalence (the pretrained-weights gates above never run
+# the init code). ZERO_INIT_PROJ selects the residual-projection init on BOTH
+# sides: the reference's GPT2_ZERO_INIT_PROJ env and the Mojo build constant
+# -D LLMM_ZERO_INIT_PROJ. The reference checkpoint is written into build/ref_init
+# (NOT the repo root, whose gpt2_*.bin may be shared symlinks). The reference's
+# init generator is seeded 43 (train_gpt2.py GPT.__init__), the trainer's default
+# LLMM_INIT_SEED is 42 (llm.c's), so the gate pins 43 on the Mojo side.
+ZERO_INIT_PROJ ?= 0
+verify-init: | $(PIXI_STAMP)
+	@mkdir -p build/ref_init
+	cd build/ref_init && GPT2_ZERO_INIT_PROJ=$(ZERO_INIT_PROJ) $(PIXI) run python ../../train_gpt2.py \
+		--model d12 --device cpu --num_iterations 0 --input_bin ../../data/.tinyshakespeare/tiny_shakespeare_val.bin > ref.log 2>&1
+	$(PIXI) run mojo -D LLMM_ZERO_INIT_PROJ=$(ZERO_INIT_PROJ) -D LLMM_INIT_SEED=43 $(MOJO_DEFINES) test_init_gpt2.mojo build/ref_init/gpt2_d12.bin
 
 # Gates the default (TF32-on) fp32 training path against the same reference.
 # The gradient checks run at full strength (TF32 passes them with 30-100x

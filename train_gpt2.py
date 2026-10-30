@@ -563,9 +563,19 @@ class GPT(nn.Module):
             )
             # We skip initilizing lm_head that shares params with wte
             if not hasattr(module, "LLMC_SKIP_INIT"):
+                # GPT2_ZERO_INIT_PROJ (mirrors the Mojo build constant
+                # -D LLMM_ZERO_INIT_PROJ): 0 = GPT-2 scaled normal (default),
+                # 1 = zero the residual projections, 2 = N(0, 0.02*0.1). The
+                # draw happens in every mode so the RNG stream of every later
+                # tensor is unchanged; only the written value differs.
+                zero_mode = int(os.environ.get("GPT2_ZERO_INIT_PROJ", "0"))
+                if hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG") and zero_mode == 2:
+                    std = 0.02 * 0.1
                 torch.nn.init.normal_(
                     module.weight, mean=0.0, std=std, generator=self.init_rng
                 )
+                if hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG") and zero_mode == 1:
+                    torch.nn.init.zeros_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):

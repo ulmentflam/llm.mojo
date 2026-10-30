@@ -226,6 +226,8 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #                              transform. llmm/matmul.mojo.
 # Stochastic rounding
 #   LLMM_INIT_SEED=<int>       from-scratch weight-init seed, default 42.
+#   LLMM_ZERO_INIT_PROJ=0|1|2  residual-projection init: 0 GPT-2 scaled normal
+#                              (default), 1 zeros, 2 N(0, 0.02*0.1).
 #   LLMM_SR_MASTER=1           SR on the master->bf16 param store (llmm/adamw.mojo).
 #   LLMM_SR_SEED=<int>         shared SR seed, default 1746221221 (adamw +
 #                              nvfp4; decorrelated by stream id, see
@@ -347,6 +349,15 @@ comptime UNROLL = 4
 # projections additionally scaled by 1/sqrt(2*L). See gpt_build_from_descriptor.
 comptime INIT_RNG_SEED = get_defined_int["LLMM_INIT_SEED", 42]()
 comptime INIT_WEIGHT_STD = Float32(0.02)
+# Residual-projection init (attn_proj_weight, proj_weight), -D LLMM_ZERO_INIT_PROJ:
+#   0 (default)  N(0, 0.02/sqrt(2L))  -- GPT-2 / llm.c
+#   1            all zeros            -- modded-nanogpt (every block starts as the
+#                                       identity on the residual stream)
+#   2            N(0, 0.02*0.1)       -- "small nonzero" arm
+# The RNG draw is performed in every mode and only the VALUE written changes, so
+# the stream position of every later tensor (and wte/wpe/qkv/fc) is identical
+# across modes. wte (tied LM head) is never touched. See allocate_parameters_random.
+comptime ZERO_INIT_PROJ = get_defined_int["LLMM_ZERO_INIT_PROJ", 0]()
 # GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
 comptime SCRATCH_VOCAB_SIZE = 50257
 comptime SCRATCH_PADDED_VOCAB_SIZE = 50304
@@ -2344,12 +2355,21 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         layer_offset = l * n
                     # Residual-stream projections get the 1/sqrt(2*L) scaling.
                     var scale = INIT_WEIGHT_STD
-                    if (
+                    var is_proj = (
                         i == Parameters.attn_proj_weight
                         or i == Parameters.proj_weight
-                    ):
+                    )
+                    if is_proj:
                         scale = INIT_WEIGHT_STD * residual_scale
+                        comptime if ZERO_INIT_PROJ == 2:
+                            scale = INIT_WEIGHT_STD * Float32(0.1)
+                    # Always draw, even when the projection is zeroed below, so
+                    # the RNG stream (and every other tensor) is unchanged.
                     normal_(rng, fp32_ptr, n, Float32(0.0), scale)
+                    comptime if ZERO_INIT_PROJ == 1:
+                        if is_proj:
+                            for j in range(n):
+                                fp32_ptr[unsafe_offset=j] = Float32(0.0)
                     for j in range(n):
                         hp[unsafe_offset=offset + layer_offset + j] = fp32_ptr[
                             unsafe_offset=j
@@ -7607,6 +7627,10 @@ def train[
     )
     printf0(setup_rank, _table_row("weight decay", String(args.weight_decay)))
     printf0(setup_rank, _table_row("optimizer", args.optimizer))
+    comptime if ZERO_INIT_PROJ != 0:
+        printf0(
+            setup_rank, _table_row("zero_init_proj", String(ZERO_INIT_PROJ))
+        )
     printf0(setup_rank, _table_row("qk clip tau", String(args.qk_clip_tau)))
     if args.optimizer == "muon":
         printf0(
@@ -7827,6 +7851,10 @@ def train[
         num("zero_stage", zero_stage, VERBOSE),
         text("lr_schedule", args.lr_scheduler_type, VERBOSE),
     ]
+    # Opt-in architecture/init flags are recorded only when non-default so the
+    # default run's setup event stays byte-identical.
+    comptime if ZERO_INIT_PROJ != 0:
+        setup_fields.append(num("zero_init_proj", ZERO_INIT_PROJ))
     run_log.emit(
         "setup",
         NORMAL,
