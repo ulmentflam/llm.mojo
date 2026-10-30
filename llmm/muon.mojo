@@ -68,6 +68,25 @@ struct MuonConfig(Copyable, Movable):
     var nesterov: Bool
 
 
+def muon_momentum_at(
+    step: Int,
+    mu_start: Float32,
+    mu: Float32,
+    warmup: Int,
+) -> Float32:
+    """Effective Muon momentum for the optimizer step with 0-based index `step`
+    (the trainer's `step`; the first update uses step 0, so it sees exactly
+    `mu_start`, as in modded-nanogpt's `frac = min(step/300, 1)`).
+
+    frac = min(step / warmup, 1); mu_eff = (1 - frac) * mu_start + frac * mu.
+    `warmup <= 0` returns `mu` untouched (bit-identical to a run without the
+    ramp), and so does any step >= warmup (frac == 1 exactly)."""
+    if warmup <= 0 or step >= warmup:
+        return mu
+    var frac = Float32(step) / Float32(warmup)
+    return (Float32(1.0) - frac) * mu_start + frac * mu
+
+
 struct MuonGroup(Copyable, Movable):
     """`count` equally strided row-major [rows, cols] matrices inside the flat
     parameter buffer: matrix i starts at element `offset + i * stride`.

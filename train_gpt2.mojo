@@ -85,7 +85,7 @@ from llmm.global_norm import (
     global_norm_aggregate_gpu,
 )
 from llmm.adamw import adamw_update, AdamWConfig
-from llmm.muon import muon_update, MuonConfig, MuonGroup
+from llmm.muon import muon_update, muon_momentum_at, MuonConfig, MuonGroup
 from llmm.fused_classifier import (
     fused_classifier,
     chunked_ce_pass1,
@@ -249,6 +249,8 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #   LLMM_SAVE_EVERY=<int>      override checkpoint_every.
 #   LLMM_OPTIMIZER=adamw|muon  override the -opt optimizer (default adamw).
 #   LLMM_MUON_MOMENTUM=<f>     override -mu, Muon momentum (default 0.95).
+#   LLMM_MUON_MOMENTUM_START=<f>  override -mu_start (default: equal to -mu).
+#   LLMM_MUON_MOMENTUM_WARMUP=<n> override -mu_warmup steps (default 0 = off).
 #   LLMM_QK_CLIP=<f>           override -qk_clip, max attention logit (0=off).
 #   LLMM_RECOMPUTE=1           test_gpt2 only: activation-recompute build in
 #                              run_test. Not read by train_gpt2 (see docs).
@@ -7363,6 +7365,8 @@ struct TrainArgs(Copyable, Movable):
     var zero_stage: Int  # -z
     var optimizer: String  # -opt  adamw|muon
     var muon_momentum: Float32  # -mu  Muon momentum
+    var muon_momentum_start: Float32  # -mu_start  (< 0: unset, use -mu)
+    var muon_momentum_warmup: Int  # -mu_warmup  ramp steps (0 = off)
     var qk_clip_tau: Float32  # -qk_clip  max attention logit (0 = off)
 
 
@@ -7400,6 +7404,8 @@ def default_train_args() -> TrainArgs:
         zero_stage=0,
         optimizer="adamw",
         muon_momentum=Float32(0.95),
+        muon_momentum_start=Float32(-1.0),
+        muon_momentum_warmup=0,
         qk_clip_tau=Float32(0.0),
     )
 
@@ -7606,11 +7612,26 @@ def train[
         _table_row("final LR fraction", String(args.final_learning_rate_frac)),
     )
     printf0(setup_rank, _table_row("weight decay", String(args.weight_decay)))
+    # -mu_start < 0 means unset: ramp starts at -mu (no ramp).
+    var muon_mu_start = (
+        args.muon_momentum_start if args.muon_momentum_start
+        >= 0.0 else args.muon_momentum
+    )
     printf0(setup_rank, _table_row("optimizer", args.optimizer))
     printf0(setup_rank, _table_row("qk clip tau", String(args.qk_clip_tau)))
     if args.optimizer == "muon":
         printf0(
             setup_rank, _table_row("muon momentum", String(args.muon_momentum))
+        )
+        printf0(
+            setup_rank,
+            _table_row("muon momentum start", String(muon_mu_start)),
+        )
+        printf0(
+            setup_rank,
+            _table_row(
+                "muon momentum warmup", String(args.muon_momentum_warmup)
+            ),
         )
     printf0(setup_rank, _table_row("max_steps", String(args.max_steps)))
     printf0(
@@ -7823,6 +7844,8 @@ def train[
         num("weight_decay", args.weight_decay, VERBOSE),
         num("qk_clip", args.qk_clip_tau, VERBOSE),
         num("muon_momentum", args.muon_momentum, VERBOSE),
+        num("muon_momentum_start", muon_mu_start, VERBOSE),
+        num("muon_momentum_warmup", args.muon_momentum_warmup, VERBOSE),
         num("world_size", WORLD_SIZE, VERBOSE),
         num("zero_stage", zero_stage, VERBOSE),
         text("lr_schedule", args.lr_scheduler_type, VERBOSE),
@@ -8024,6 +8047,16 @@ def train[
 
         var zloss = loss_detector.update(Float64(accumulated_loss))
         var step_learning_rate = learning_rate_scheduler.get_learning_rate(step)
+        # Muon momentum ramp: computed once per step (0-based `step`, so a
+        # resumed run at start_step lands on the same value as a continuous
+        # one); update()/_muon_config read the field.
+        var step_muon_momentum = muon_momentum_at(
+            step,
+            muon_mu_start,
+            args.muon_momentum,
+            args.muon_momentum_warmup,
+        )
+        model.muon_momentum = step_muon_momentum
 
         # Gradient norm, its z-score, and clipping to a max norm of -gc
         # (1.0 by default, like llm.c's train_gpt2.cu; 0 turns it off, which
@@ -8147,6 +8180,7 @@ def train[
             num("tok_s", _ffmt(bias_corrected_ema, 0)),
             num("norm", _ffmt(Float64(grad_norm), 4), VERBOSE),
             num("lr", step_learning_rate, VERBOSE),
+            num("muon_mu", step_muon_momentum, VERBOSE),
             num("zloss", zloss, VERBOSE),
             num("zgrad", zgrad, VERBOSE),
             num(
@@ -8260,6 +8294,14 @@ def _print_usage():
     )
     print("  -opt <str>  optimizer: adamw|muon (default = adamw)")
     print("  -mu <float> Muon momentum (default = 0.95)")
+    print(
+        "  -mu_start <float> Muon momentum at step 0 of the ramp (default ="
+        " -mu)"
+    )
+    print(
+        "  -mu_warmup <int> steps to ramp momentum mu_start -> mu (default 0 ="
+        " off)"
+    )
     print("  -qk_clip <float> max attention logit, 0 = off (default = 0)")
     print("  -pn <int>   num_processes / world_size (default = 1)")
     print("  -pr <int>   process_rank (default = 0)")
@@ -8295,6 +8337,12 @@ def _parse_train_args(
         args.optimizer = getenv("LLMM_OPTIMIZER")
     if getenv("LLMM_MUON_MOMENTUM") != "":
         args.muon_momentum = Float32(atof(getenv("LLMM_MUON_MOMENTUM")))
+    if getenv("LLMM_MUON_MOMENTUM_START") != "":
+        args.muon_momentum_start = Float32(
+            atof(getenv("LLMM_MUON_MOMENTUM_START"))
+        )
+    if getenv("LLMM_MUON_MOMENTUM_WARMUP") != "":
+        args.muon_momentum_warmup = atol(getenv("LLMM_MUON_MOMENTUM_WARMUP"))
     if getenv("LLMM_QK_CLIP") != "":
         args.qk_clip_tau = Float32(atof(getenv("LLMM_QK_CLIP")))
 
@@ -8361,6 +8409,10 @@ def _parse_train_args(
             args.optimizer = val
         elif flag == "-mu":
             args.muon_momentum = Float32(atof(val))
+        elif flag == "-mu_start":
+            args.muon_momentum_start = Float32(atof(val))
+        elif flag == "-mu_warmup":
+            args.muon_momentum_warmup = atol(val)
         elif flag == "-qk_clip":
             args.qk_clip_tau = Float32(atof(val))
         elif flag == "-pn":
