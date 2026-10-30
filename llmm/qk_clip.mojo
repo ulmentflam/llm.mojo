@@ -151,3 +151,50 @@ def qk_clip_apply[
         )
     else:
         raise Error("Invalid target")
+
+
+def qk_head_max_fold_gpu(
+    step_ptr: MutKernelPtr[DType.float32],
+    fwd_ptr: ImmutKernelPtr[DType.float32],
+    n_arg: Int64,
+    reset: UInt8,
+) -> None:
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if i < Int(n_arg):
+        var v = fwd_ptr[unsafe_offset=i]
+        if reset == 0:
+            v = max(v, step_ptr[unsafe_offset=i])
+        step_ptr[unsafe_offset=i] = v
+
+
+def qk_head_max_fold[
+    target: StaticString,
+](
+    step_ptr: MutKernelPtr[DType.float32],
+    fwd_ptr: ImmutKernelPtr[DType.float32],
+    n: Int,
+    reset: Bool,
+    ctx: DeviceContext,
+) raises:
+    """`step = fwd` if reset else `step = max(step, fwd)`, elementwise over the
+    [L*NH] per-head logit maxima (one forward's into the optimizer step's)."""
+    comptime if is_cpu[target]():
+        for i in range(n):
+            var v = fwd_ptr[unsafe_offset=i]
+            if not reset:
+                v = max(v, step_ptr[unsafe_offset=i])
+            step_ptr[unsafe_offset=i] = v
+    elif is_gpu[target]():
+        comptime BLOCK = 128
+        var compiled = ctx.compile_function[qk_head_max_fold_gpu]()
+        ctx.enqueue_function(
+            compiled,
+            step_ptr,
+            fwd_ptr,
+            Int64(n),
+            UInt8(1) if reset else UInt8(0),
+            grid_dim=((n + BLOCK - 1) // BLOCK,),
+            block_dim=(BLOCK,),
+        )
+    else:
+        raise Error("Invalid target")
