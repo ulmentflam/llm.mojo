@@ -602,7 +602,7 @@ build-infer-bf16: $(INFER_BIN_BF16)
 
 $(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
 
 # GPT-2 inference on MAX's Python APIs: the stable graph API (max.nn +
 # max.graph) and the experimental eager API (max.experimental), sharing
@@ -638,7 +638,7 @@ GRAD_DUMP_DIR_FP8 := build/grad_dump_fp8
 
 $(DUMP_BIN_BF16): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_BF16) $(DUMP_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(DUMP_BIN_BF16) $(DUMP_MOJO_SRC)
 
 $(DUMP_BIN_FP8): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
@@ -1514,7 +1514,7 @@ verify-cpu: | $(PIXI_STAMP)
 # -D LLMM_NO_TF32=1 so this gate keeps checking true IEEE fp32 math at the
 # tight LOSS_STEP_TOL=0.01; see verify-gpu-tf32 below for the TF32 path.
 verify-gpu: | $(PIXI_STAMP)
-	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 test_gpt2.mojo gpu
+	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 $(MOJO_DEFINES) test_gpt2.mojo gpu
 
 # Gates the default (TF32-on) fp32 training path against the same reference.
 # The gradient checks run at full strength (TF32 passes them with 30-100x

@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from tests._dtypes import DTYPE_TOLERANCES, TORCH_DTYPES, from_storage, to_storage
-from tests.kernels import attention
+from tests.kernels import attention, qk_norm
 
 # Attention accumulates softmax statistics across O(T) keys and O(head_dim)
 # FMAs before rounding to the storage dtype, so low-precision dtypes need
@@ -938,3 +938,213 @@ def test_backward_matches_torch(case: Case):
         rtol=tol["rtol"],
         err_msg=f"{case.name}: dv diverged from torch autograd reference",
     )
+
+
+# ---------------------------------------------------------------------------
+# W7: QK-norm + fixed attention scale (llmm/qk_norm.mojo).
+#
+# The chain under test is exactly what attention_fwd / attention_bwd run when
+# qk_norm=True: qk_rows_fwd on the head-layout q, k -> core attention (which
+# still divides by sqrt(hd)) -> core backward -> qk_rows_bwd (pre-norm rows
+# recomputed from the token-layout qkv). The reference is an independent
+# PyTorch autograd graph of  softmax(scale * rmsnorm(q) rmsnorm(k)^T) v  with
+# scale = attn_scale or 1/sqrt(hd). q_mul = attn_scale * sqrt(hd) folds the
+# fixed scale into q so the kernels' built-in 1/sqrt(hd) gives attn_scale.
+#
+# Inputs are drawn with std 3 (and a per-row random gain) so the norm is far
+# from the identity: a missing/extra rstd factor, a forgotten -u*mean(dy*u)
+# term, a wrong eps, or q_mul applied to k all move the result by O(1).
+# ---------------------------------------------------------------------------
+
+QK_NORM_EPS = 1e-6  # must match QK_NORM_EPS in llmm/qk_norm.mojo / train_gpt2.py
+
+
+def _qk_norm_reference(q_np, k_np, v_np, d_out_np, *, do_norm, attn_scale):
+    q = torch.from_numpy(q_np).requires_grad_(True)
+    k = torch.from_numpy(k_np).requires_grad_(True)
+    v = torch.from_numpy(v_np).requires_grad_(True)
+    hd = q.size(-1)
+
+    def rms(x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + QK_NORM_EPS)
+
+    qn, kn = (rms(q), rms(k)) if do_norm else (q, k)
+    scale = attn_scale if attn_scale > 0 else hd**-0.5
+    scores = (qn @ kn.transpose(-2, -1)) * scale
+    t = q.size(-2)
+    mask = torch.tril(torch.ones(t, t)).view(1, 1, t, t)
+    scores = scores.masked_fill(mask == 0, float("-inf"))
+    out = torch.softmax(scores, dim=-1) @ v
+    out.backward(torch.from_numpy(d_out_np))
+    assert q.grad is not None and k.grad is not None and v.grad is not None
+    return (
+        out.detach().numpy(),
+        q.grad.numpy(),
+        k.grad.numpy(),
+        v.grad.numpy(),
+        qn.detach().numpy(),
+    )
+
+
+def _to_token_layout(q_np, k_np, v_np):
+    """(B, NH, T, HD) x3 -> (B, T, 3C) qkv, section 0/1/2 = q/k/v."""
+    parts = [
+        x.transpose(0, 2, 1, 3).reshape(x.shape[0], x.shape[2], -1)
+        for x in (q_np, k_np, v_np)
+    ]
+    return np.concatenate(parts, axis=-1)
+
+
+QK_NORM_CASES: tuple[tuple[Case, bool, float], ...] = (
+    (
+        Case("qkn_small", 2, 4, 16, 32, "float32", 10, prefer_accelerator=True),
+        True,
+        0.0,
+    ),
+    (
+        Case("qkn_small_s012", 2, 4, 16, 32, "float32", 11, prefer_accelerator=True),
+        True,
+        0.12,
+    ),
+    (
+        Case("qkn_hd64_gpt2", 1, 12, 64, 64, "float32", 12, prefer_accelerator=True),
+        True,
+        0.12,
+    ),
+    (
+        Case("qkn_odd_hd", 1, 2, 7, 13, "float32", 13, prefer_accelerator=True),
+        True,
+        0.0,
+    ),
+    # T not a multiple of 8 (the f0da883 alignment regression shape class).
+    (
+        Case("qkn_t_not_x8", 1, 3, 37, 64, "float32", 14, prefer_accelerator=True),
+        True,
+        0.12,
+    ),
+    (Case("qkn_cpu_forced", 2, 2, 16, 32, "float32", 15, force_cpu=True), True, 0.12),
+    # scale only (no norm): the -attn_scale path without -D LLMM_QK_NORM.
+    (
+        Case("scale_only", 2, 4, 16, 32, "float32", 16, prefer_accelerator=True),
+        False,
+        0.12,
+    ),
+    (
+        Case("qkn_bf16", 1, 4, 32, 64, "bfloat16", 17, prefer_accelerator=True),
+        True,
+        0.12,
+    ),
+    # bf16 with T not a multiple of 8: the f0da883 misaligned-address shapes.
+    (
+        Case("qkn_bf16_t9", 1, 4, 9, 64, "bfloat16", 18, prefer_accelerator=True),
+        True,
+        0.12,
+    ),
+    (
+        Case("qkn_bf16_t17", 1, 4, 17, 64, "bfloat16", 19, prefer_accelerator=True),
+        True,
+        0.0,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "case,do_norm,attn_scale",
+    QK_NORM_CASES,
+    ids=lambda x: x.name if isinstance(x, Case) else str(x),
+)
+def test_qk_norm_chain_matches_torch(case: Case, do_norm: bool, attn_scale: float):
+    shape = _shape(case)
+    B, NH, T, HD = shape
+    g = torch.Generator().manual_seed(case.seed)
+    gain = 0.5 + 3 * torch.rand(B, NH, T, 1, generator=g)
+    q = (
+        (3 * torch.randn(shape, generator=g) * gain)
+        .to(TORCH_DTYPES[case.dtype])
+        .float()
+        .numpy()
+    )
+    k = (
+        (3 * torch.randn(shape, generator=g) * gain.flip(0))
+        .to(TORCH_DTYPES[case.dtype])
+        .float()
+        .numpy()
+    )
+    v = torch.randn(shape, generator=g).to(TORCH_DTYPES[case.dtype]).float().numpy()
+    d_out = torch.randn(shape, generator=g).to(TORCH_DTYPES[case.dtype]).float().numpy()
+    q_mul = attn_scale * HD**0.5 if attn_scale > 0 else 1.0
+    dev = _device_for_case(case)
+    kw = dict(batch_size=B, num_heads=NH, seq_len=T, head_dim=HD, dtype_name=case.dtype)
+    sto = lambda x: to_storage(x, case.dtype)  # noqa: E731
+    unsto = lambda x: from_storage(x, case.dtype).reshape(shape)  # noqa: E731
+
+    ref_out, ref_dq, ref_dk, ref_dv, _ = _qk_norm_reference(
+        q, k, v, d_out, do_norm=do_norm, attn_scale=attn_scale
+    )
+
+    qn_s, kn_s = qk_norm.forward(
+        q=sto(q).reshape(shape),
+        k=sto(k).reshape(shape),
+        q_mul=q_mul,
+        do_norm=do_norm,
+        device=dev,
+        **kw,
+    )
+    out_s, l_vec = attention.forward(
+        q=qn_s.reshape(shape),
+        k=kn_s.reshape(shape),
+        v=sto(v).reshape(shape),
+        use_soft_exp=False,
+        use_conditional_rescale=False,
+        device=dev,
+        **kw,
+    )
+    out = unsto(out_s)
+    dq_s, dk_s, dv_s = attention.backward(
+        d_q=np.zeros_like(qn_s).reshape(shape),
+        d_k=np.zeros_like(kn_s).reshape(shape),
+        d_v=np.zeros_like(qn_s).reshape(shape),
+        d_output=sto(d_out).reshape(shape),
+        q=qn_s.reshape(shape),
+        k=kn_s.reshape(shape),
+        v=sto(v).reshape(shape),
+        output=out_s.reshape(shape),
+        l_vec=l_vec,
+        use_soft_exp=False,
+        device=dev,
+        **kw,
+    )
+    qkv_s = sto(_to_token_layout(q, k, v)).reshape(B, T, 3 * NH * HD)
+    dq_s, dk_s = qk_norm.backward(
+        d_q=dq_s.reshape(shape),
+        d_k=dk_s.reshape(shape),
+        qkv=qkv_s,
+        q_mul=q_mul,
+        do_norm=do_norm,
+        device=dev,
+        **kw,
+    )
+
+    tol = (
+        TF32_ATTENTION_TOLERANCE
+        if _runs_on_tf32_accelerator(case)
+        else ATTENTION_TOLERANCES[case.dtype]
+    )
+    # Scale-relative gate for the gradients: atol is a fraction of the tensor's
+    # own magnitude so a near-zero-gradient layout cannot hide a wrong factor.
+    for name, got, want in (
+        ("out", out, ref_out),
+        ("dq", unsto(dq_s), ref_dq),
+        ("dk", unsto(dk_s), ref_dk),
+        ("dv", unsto(dv_s), ref_dv),
+    ):
+        atol = tol["atol"] + 0.02 * float(np.abs(want).max()) * (
+            1.0 if case.dtype != "float32" else 0.0
+        )
+        np.testing.assert_allclose(
+            got,
+            want,
+            atol=atol,
+            rtol=tol["rtol"],
+            err_msg=f"{case.name}: {name} diverged from torch autograd",
+        )

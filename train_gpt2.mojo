@@ -250,6 +250,7 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #   LLMM_OPTIMIZER=adamw|muon  override the -opt optimizer (default adamw).
 #   LLMM_MUON_MOMENTUM=<f>     override -mu, Muon momentum (default 0.95).
 #   LLMM_QK_CLIP=<f>           override -qk_clip, max attention logit (0=off).
+#   LLMM_ATTN_SCALE=<f>        override -attn_scale (0 = 1/sqrt(head_dim)).
 #   LLMM_RECOMPUTE=1           test_gpt2 only: activation-recompute build in
 #                              run_test. Not read by train_gpt2 (see docs).
 # Profiling (out of precision scope): LLMM_ATTN_PROFILE, LLMM_PROFILE_*,
@@ -345,6 +346,9 @@ comptime UNROLL = 4
 # From-scratch init draws the same random numbers as llm.c (and PyTorch) so the
 # initial weights are bit-identical: seed 42, weights ~N(0, 0.02), the residual
 # projections additionally scaled by 1/sqrt(2*L). See gpt_build_from_descriptor.
+# W7: RMS-normalize q and k per head before the attention scores (no affine;
+# llmm/qk_norm.mojo). Opt-in: -D LLMM_QK_NORM=1. Pair with -attn_scale.
+comptime QK_NORM = get_defined_int["LLMM_QK_NORM", 0]() != 0
 comptime INIT_RNG_SEED = get_defined_int["LLMM_INIT_SEED", 42]()
 comptime INIT_WEIGHT_STD = Float32(0.02)
 # GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
@@ -1329,6 +1333,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var head_max_memory: MutMemPtr[DType.float32]
     var head_max_fwd_memory: MutMemPtr[DType.float32]
     var qk_clip_tau: Float32  # <= 0 disables QK-clip
+    # Record the per-head max attention logit (qk_max()) even when no clip is
+    # applied (tau <= 0): the QK-norm measurement. Implied by tau > 0.
+    var qk_track: Bool
+    # q is multiplied by attn_scale * sqrt(head_dim) after the (optional) QK-norm
+    # so the kernels' fixed 1/sqrt(head_dim) yields attn_scale. 1.0 = default.
+    var attn_q_mul: Float32
     # WORLD_SIZE > 1: `head_max_buf` already holds the cross-rank max for this
     # step (set by _qk_sync_head_max, cleared by the backward fold), and the
     # clip was already applied inside the sharded Muon update().
@@ -1538,6 +1548,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.head_max_memory = NULL_MASTER_PTR
         self.head_max_fwd_memory = NULL_MASTER_PTR
         self.qk_clip_tau = 0.0
+        self.qk_track = False
+        self.attn_q_mul = 1.0
         self.qk_head_max_global = False
         self.qk_clip_applied = False
         self.acts_memory = NULL_DTYPE_PTR
@@ -2865,8 +2877,20 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.has_allocated_grads = True
 
+    def set_attn_scale(mut self, attn_scale: Float32):
+        """Fixed attention scale (replaces 1/sqrt(head_dim)); <= 0 keeps the
+        default. Folded into q (see llmm/qk_norm.mojo)."""
+        if attn_scale <= 0.0:
+            self.attn_q_mul = 1.0
+        else:
+            var hd = Float32(self.config.channels // self.config.num_heads)
+            self.attn_q_mul = attn_scale * sqrt(hd)
+
     def enable_qk_clip(
-        mut self, tau: Float32, planted_head_max_only: Bool = False
+        mut self,
+        tau: Float32,
+        planted_head_max_only: Bool = False,
+        track_only: Bool = False,
     ) raises:
         """Track per-(layer, head) max attention logits during forward and
         allow `qk_clip_step` to rescale Q/K rows. tau <= 0 disables.
@@ -2874,7 +2898,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         `planted_head_max_only` (tests) lifts the CPU-target raise: the CPU
         attention path records no logits, so the caller must plant
         `head_max_memory` itself or the clip never fires."""
-        if tau <= 0.0:
+        if tau <= 0.0 and not track_only:
             self.qk_clip_tau = 0.0
             return
         # The logit max is recorded only by the GPU causal-softmax kernel; the
@@ -2910,7 +2934,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.head_max_fwd_memory = rebind_mut_mem[DType.float32](
             self.head_max_fwd_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-        self.qk_clip_tau = tau
+        self.qk_clip_tau = tau if tau > 0.0 else 0.0
+        self.qk_track = True
 
     def qk_clip_step(mut self) raises:
         """Call after the optimizer step: rescale Q/K projection rows (and
@@ -2950,7 +2975,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         forwards in between do not change it). Syncs the device. At
         WORLD_SIZE > 1 this is the GLOBAL max (a collective: every rank must
         call it)."""
-        if self.qk_clip_tau <= 0.0:
+        if not self.qk_track:
             return 0.0
         self._qk_sync_head_max()
         var n = self.config.num_layer * self.config.num_heads
@@ -3608,7 +3633,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx,
         )
 
-        if self.qk_clip_tau > 0.0:
+        if self.qk_track:
             # Each forward records its own per-head logit maxima from zero.
             self.head_max_fwd_buf.enqueue_fill(Scalar[DType.float32](0.0))
 
@@ -3829,7 +3854,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
-            attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
+            attention_fwd[
+                GPT2_DTYPE, Self.target, use_soft_exp=True, qk_norm=QK_NORM
+            ](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](l_q),
                 as_mut_kernel[GPT2_DTYPE](l_k),
@@ -3849,8 +3876,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                             layer * num_heads
                         )
                     )
-                ) if self.qk_clip_tau
-                > 0.0 else None,
+                ) if self.qk_track else None,
+                q_mul=self.attn_q_mul,
             )
 
             # Matmul Attn Proj. Always bf16 under fp4 (same rationale as the
@@ -4415,7 +4442,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # accumulate over the gradient-accumulation loop.
         self.zero_gradients(zero_param_grads=(micro_step == 0))
 
-        if self.qk_clip_tau > 0.0:
+        if self.qk_track:
             # QK-clip: fold this micro-step's forward logit maxima into the
             # optimizer-step max (overwrite on micro-step 0). Done here, not in
             # forward, so eval/generation forwards never count toward the clip.
@@ -5236,7 +5263,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
-            attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
+            attention_bwd[
+                GPT2_DTYPE, Self.target, use_soft_exp=True, qk_norm=QK_NORM
+            ](
                 as_mut_kernel[GPT2_DTYPE](d_l_qkv),
                 as_mut_kernel[GPT2_DTYPE](d_l_q),
                 as_mut_kernel[GPT2_DTYPE](d_l_k),
@@ -5254,6 +5283,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 Int64(head_dim),
                 self.ctx,
                 cache=rebind[KVCachePtr](Pointer(to=self.kv_cache)),
+                qkv_ptr=as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv),
+                q_mul=self.attn_q_mul,
             )
 
             # QKV matmul backward.
@@ -7364,6 +7395,8 @@ struct TrainArgs(Copyable, Movable):
     var optimizer: String  # -opt  adamw|muon
     var muon_momentum: Float32  # -mu  Muon momentum
     var qk_clip_tau: Float32  # -qk_clip  max attention logit (0 = off)
+    var attn_scale: Float32  # -attn_scale  fixed attention scale (0 = 1/sqrt(hd))
+    var qk_log: Bool  # -qk_log  record/log max attention logit without clipping
 
 
 def default_train_args() -> TrainArgs:
@@ -7401,6 +7434,8 @@ def default_train_args() -> TrainArgs:
         optimizer="adamw",
         muon_momentum=Float32(0.95),
         qk_clip_tau=Float32(0.0),
+        attn_scale=Float32(0.0),
+        qk_log=False,
     )
 
 
@@ -7608,6 +7643,10 @@ def train[
     printf0(setup_rank, _table_row("weight decay", String(args.weight_decay)))
     printf0(setup_rank, _table_row("optimizer", args.optimizer))
     printf0(setup_rank, _table_row("qk clip tau", String(args.qk_clip_tau)))
+    comptime if QK_NORM:
+        printf0(setup_rank, _table_row("qk norm", "on"))
+    if args.attn_scale > 0.0:
+        printf0(setup_rank, _table_row("attn scale", String(args.attn_scale)))
     if args.optimizer == "muon":
         printf0(
             setup_rank, _table_row("muon momentum", String(args.muon_momentum))
@@ -7638,6 +7677,9 @@ def train[
         model.enable_muon(args.muon_momentum)
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
+    elif args.qk_log or (QK_NORM and not is_cpu[target]()):
+        model.enable_qk_clip(0.0, track_only=True)
+    model.set_attn_scale(args.attn_scale)
 
     printf0(setup_rank, bar)
     printf0(setup_rank, _table_row("weight init method", args.load_filename))
@@ -8155,7 +8197,7 @@ def train[
                 VERBOSE,
             ),
         ]
-        if args.qk_clip_tau > 0:
+        if model.qk_track:
             step_fields.append(num("qk_max", qk_max, VERBOSE))
         run_log.emit(
             "step", NORMAL, step_fields, pretty=step_pretty, plain=step_plain
@@ -8261,6 +8303,11 @@ def _print_usage():
     print("  -opt <str>  optimizer: adamw|muon (default = adamw)")
     print("  -mu <float> Muon momentum (default = 0.95)")
     print("  -qk_clip <float> max attention logit, 0 = off (default = 0)")
+    print(
+        "  -attn_scale <float> fixed attention scale, 0 = 1/sqrt(head_dim)"
+        " (default = 0; speedrun uses 0.12 with -D LLMM_QK_NORM=1)"
+    )
+    print("  -qk_log <0/1> log the max attention logit without clipping")
     print("  -pn <int>   num_processes / world_size (default = 1)")
     print("  -pr <int>   process_rank (default = 0)")
 
@@ -8297,6 +8344,8 @@ def _parse_train_args(
         args.muon_momentum = Float32(atof(getenv("LLMM_MUON_MOMENTUM")))
     if getenv("LLMM_QK_CLIP") != "":
         args.qk_clip_tau = Float32(atof(getenv("LLMM_QK_CLIP")))
+    if getenv("LLMM_ATTN_SCALE") != "":
+        args.attn_scale = Float32(atof(getenv("LLMM_ATTN_SCALE")))
 
     # Parse the flags. Each is "-x" or "-xy" followed by a value, like llm.c.
     var i = 1
@@ -8363,6 +8412,10 @@ def _parse_train_args(
             args.muon_momentum = Float32(atof(val))
         elif flag == "-qk_clip":
             args.qk_clip_tau = Float32(atof(val))
+        elif flag == "-attn_scale":
+            args.attn_scale = Float32(atof(val))
+        elif flag == "-qk_log":
+            args.qk_log = atol(val) != 0
         elif flag == "-pn":
             world_size = atol(val)
         elif flag == "-pr":

@@ -17,6 +17,7 @@ from train_gpt2 import (
     GPT2,
     GPT2_DTYPE,
     ParameterTensors,
+    QK_NORM,
     _ffmt,
 )
 
@@ -371,7 +372,18 @@ def run_test[
 
     # load additional information that we will use for debugging and error checking
 
-    var state_file = open("gpt2_124M_debug_state.bin", "r")
+    # W7: under -D LLMM_QK_NORM=1 the reference is the PyTorch model with
+    # GPT2_QK_NORM=1 (and GPT2_ATTN_SCALE=<f> matching LLMM_ATTN_SCALE=<f>):
+    # a separate debug state, written by train_gpt2.py run in a scratch dir
+    # (see docs/ai/qk_norm_attn_scale.md). Flag off: the file is unchanged.
+    var state_name = String("gpt2_124M_debug_state.bin")
+    comptime if QK_NORM:
+        state_name = "gpt2_124M_debug_state_qknorm.bin"
+    if getenv("LLMM_DEBUG_STATE") != "":
+        state_name = getenv("LLMM_DEBUG_STATE")
+    if getenv("LLMM_ATTN_SCALE") != "":
+        model.set_attn_scale(Float32(atof(getenv("LLMM_ATTN_SCALE"))))
+    var state_file = open(state_name, "r")
 
     var state_header = heap_alloc[Int32](256)
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
@@ -475,6 +487,28 @@ def run_test[
         0.6243725419044495,
         0.37682223320007324,
     ]
+
+    # W7: the trajectory of the QK-norm reference model (default attention
+    # scale), from scripts/gen_expected_losses.py run with GPT2_QK_NORM=1.
+    comptime if QK_NORM:
+        expected_losses = [
+            5.722967147827148,
+            4.701408386230469,
+            3.8904597759246826,
+            3.3262996673583984,
+            2.857145309448242,
+            2.4304096698760986,
+            2.0379016399383545,
+            1.6252261400222778,
+            1.2215285301208496,
+            0.8687400221824646,
+        ]
+    # Any other reference (e.g. -attn_scale 0.12): pass the PyTorch list, as
+    # printed by scripts/gen_expected_losses.py, as comma-separated floats.
+    if getenv("LLMM_EXPECTED_LOSSES") != "":
+        expected_losses = List[Float32]()
+        for tok in getenv("LLMM_EXPECTED_LOSSES").split(","):
+            expected_losses.append(Float32(atof(String(tok))))
 
     # Stale-state guard. Step 0 of the list is a plain forward pass on the debug
     # state's own batch, so the loss stored in the state file must equal it
