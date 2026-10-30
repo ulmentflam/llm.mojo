@@ -1507,11 +1507,21 @@ test-fixtures:
 # DeviceContexts in the same process leads to a MAX multi-context conflict/crash.
 verify: verify-cpu verify-gpu
 
-# Untied-LM-head references (docs/ai/untied_lm_head_design_2026-10-30.md).
-# STUBS until slice S2: they need the untied fixtures from S1 and the untied
-# forward/backward; they fail loudly rather than pass vacuously.
-verify-untied-cpu verify-untied-gpu:
-	@echo "$@: not implemented yet (slice S2 of the untied-head work)" >&2; exit 1
+# Untied-LM-head references (docs/ai/untied_lm_head_design_2026-10-30.md):
+# test_gpt2.mojo built with -D LLMM_UNTIED_HEAD=1 checks 17 tensors against
+# gpt2_124M_untied.bin + gpt2_124M_untied_debug_state.bin, written by
+# `GPT2_UNTIED=1 pixi run python train_gpt2.py` (run it in a scratch dir and
+# copy the gpt2_124M_untied*.bin files here). Until slice S2 the head is idle
+# (the LM head still reads and accumulates into wte), so this gate FAILS by
+# design on dwte (= ref dwte + ref dlm_head) and dlm_head (all zero); the other
+# 15 tensors and the logits/loss pass. The 10-step loss check alone cannot
+# tell tied from untied training (the two reference tables differ by < 0.006,
+# under LOSS_STEP_TOL=0.01): only the 17-tensor gradient check discriminates.
+verify-untied-cpu: | $(PIXI_STAMP)
+	$(PIXI) run mojo -D LLMM_UNTIED_HEAD=1 test_gpt2.mojo cpu
+
+verify-untied-gpu: | $(PIXI_STAMP)
+	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 -D LLMM_UNTIED_HEAD=1 test_gpt2.mojo gpu
 
 # Slice S0 gate: -D LLMM_UNTIED_HEAD=1 with the head idle must reproduce the
 # tied build's 3-step CPU run (see scripts/check_untied_idle.py).
