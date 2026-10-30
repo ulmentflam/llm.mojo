@@ -9,11 +9,11 @@
      active: head must differ from wte after training, the head's AdamW m and v
              must be nonzero and wte's m/v nonzero too (the encoder row-sparse
              gradient is the only writer of dwte).
-     idle  (LLMM_UNTIED_IDLE_HEAD=1, the tie phase): head must equal wte
-             bitwise, and the head's m/v must be exactly zero even though the
+     idle  (LLMM_UNTIED_IDLE_HEAD=1, the tie phase): head must keep its loaded
+             wte copy bitwise while wte trains, and the head's m/v must be exactly zero even though the
              weight decay is > 0 (a head updated while idle would decay).
-The active run additionally checks the 16-tensor body moved (the head update
-did not replace the body update).
+The active run also checks that wte (the encoder's row-sparse gradient is its
+only writer) moved and that no NaN reached the head.
 """
 
 import os
@@ -103,7 +103,11 @@ def main():
             hv = floats(head, 0, 4096)
             check(all(x == x for x in hv), "active: NaN in head")
         else:
-            check(head == wte, "idle: head != wte (head updated while idle)")
+            # Idle: the head block keeps its loaded value (the start .bin's wte
+            # copy) bit for bit while wte itself trains; weight decay > 0 would
+            # have moved it had the optimizer touched it.
+            check(head == start_wte, "idle: head changed (updated while idle)")
+            check(wte != start_wte, "idle: wte never moved")
             check(not any(head_m) and not any(head_v), "idle: head m/v nonzero")
             check(any(wte_m) and any(wte_v), "idle: wte m/v are zero")
         print(f"{name}: n16={n16} H={H} head==wte={head == wte}")

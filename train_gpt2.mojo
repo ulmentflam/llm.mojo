@@ -4644,7 +4644,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             while t0 < vocab_size_padded:
                 var oc = min(lm_tile_rows, vocab_size_padded - t0)
                 if bucketing:
-                    self._set_head_grad_ptr(pool)  # pool[0 : oc*C], recycled per tile
+                    self._set_head_grad_ptr(
+                        pool
+                    )  # pool[0 : oc*C], recycled per tile
                     self._zero_grad_pool(oc * channels)
                 var dw = pool if bucketing else (
                     self._head_grad_ptr().unsafe_offset(t0 * channels)
@@ -4750,7 +4752,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             while t0 < vocab_size_padded:
                 var oc = min(lm_tile_rows, vocab_size_padded - t0)
                 if bucketing:
-                    self._set_head_grad_ptr(pool)  # pool[0 : oc*C], recycled per tile
+                    self._set_head_grad_ptr(
+                        pool
+                    )  # pool[0 : oc*C], recycled per tile
                     self._zero_grad_pool(oc * channels)
                 var dw = pool if bucketing else (
                     self._head_grad_ptr().unsafe_offset(t0 * channels)
