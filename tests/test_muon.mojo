@@ -9,7 +9,13 @@ from std.math import sqrt
 from std.testing import assert_true, assert_almost_equal, TestSuite
 
 from llmm.memory import MutKernelPtr, ImmutKernelPtr
-from llmm.muon import MuonConfig, MuonGroup, muon_update, muon_ns_host
+from llmm.muon import (
+    MuonConfig,
+    MuonGroup,
+    muon_update,
+    muon_ns_host,
+    muon_momentum_at,
+)
 from llmm.vendor import has_nvidia_gpu_accelerator
 from _gpu_test_common import shared_gpu_ctx
 
@@ -235,6 +241,73 @@ def test_momentum_and_update() raises:
             assert_almost_equal[DType.float32](
                 w[i], wh[i], atol=5e-3, rtol=1e-2
             )
+
+
+def test_momentum_ramp_formula() raises:
+    """Speedrun form: frac = min(step/300, 1); mu = (1-frac)*0.85 + frac*0.95.
+    Exact expected values are computed independently here in Float64."""
+    var s0 = Float32(0.85)
+    var s1 = Float32(0.95)
+    for step in [0, 1, 150, 299, 300, 301, 5000]:
+        var frac = min(Float64(step) / 300.0, 1.0)
+        var want = (1.0 - frac) * 0.85 + frac * 0.95
+        var got = muon_momentum_at(step, s0, s1, 300)
+        assert_almost_equal[DType.float32](
+            got, Float32(want), atol=2e-7, rtol=0.0
+        )
+    # Endpoints are exact: step 0 is mu_start, step >= warmup is mu.
+    assert_true(muon_momentum_at(0, s0, s1, 300) == s0)
+    assert_true(muon_momentum_at(300, s0, s1, 300) == s1)
+    assert_true(muon_momentum_at(10**6, s0, s1, 300) == s1)
+    # Midpoint is the planted value 0.90 (not just "something between").
+    assert_almost_equal[DType.float32](
+        muon_momentum_at(150, s0, s1, 300), Float32(0.9), atol=1e-6, rtol=0.0
+    )
+    # warmup == 0 returns mu bit-for-bit at every step, whatever mu_start is.
+    for step in [0, 1, 7, 300]:
+        assert_true(muon_momentum_at(step, Float32(0.5), s1, 0) == s1)
+        assert_true(muon_momentum_at(step, s1, s1, 0) == s1)
+    # Default start == mu: a "ramp" with start == mu is flat even if warmup > 0.
+    for step in [0, 100, 299, 301]:
+        assert_true(muon_momentum_at(step, s1, s1, 300) == s1)
+
+
+def test_ramp_momentum_reaches_kernel() raises:
+    """Planted check: the momentum fed to muon_update changes the momentum
+    buffer. Same params/grads/t, mu from the ramp at step 0 (0.85) vs step 300
+    (0.95), starting from a nonzero buffer: m = mu*m + g must differ, and each
+    must match the closed form, so a trainer that ignored the ramp (always the
+    same mu) would fail."""
+    if not has_nvidia_gpu_accelerator():
+        print("SKIP test_ramp_momentum_reaches_kernel: needs NVIDIA GPU")
+        return
+    var rows = 8
+    var cols = 16
+    var n = rows * cols
+    var groups = List[MuonGroup]()
+    groups.append(MuonGroup(0, rows, cols, 1, n))
+    var g = randn(n, 31)
+    var m0 = randn(n, 32)
+    var w_a = randn(n, 33)
+    var w_b = w_a.copy()
+    var m_a = m0.copy()
+    var m_b = m0.copy()
+    var mu_a = muon_momentum_at(0, Float32(0.85), Float32(0.95), 300)
+    var mu_b = muon_momentum_at(300, Float32(0.85), Float32(0.95), 300)
+    run_muon(
+        groups, w_a, g, m_a, Float32(0.02), mu_a, Float32(0.0), Float32(1.0), 1
+    )
+    run_muon(
+        groups, w_b, g, m_b, Float32(0.02), mu_b, Float32(0.0), Float32(1.0), 1
+    )
+    var max_diff = Float32(0.0)
+    for i in range(n):
+        var want_a = mu_a * m0[i] + g[i]
+        var want_b = mu_b * m0[i] + g[i]
+        assert_almost_equal[DType.float32](m_a[i], want_a, atol=1e-5, rtol=1e-5)
+        assert_almost_equal[DType.float32](m_b[i], want_b, atol=1e-5, rtol=1e-5)
+        max_diff = max(max_diff, abs(m_a[i] - m_b[i]))
+    assert_true(max_diff > 1e-2)
 
 
 def check_owner_layout_matches_flat(rows: Int, cols: Int) raises:
