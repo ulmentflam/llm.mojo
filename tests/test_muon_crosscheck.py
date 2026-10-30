@@ -18,9 +18,13 @@ torch/optim/_muon.py, nothing else is used):
         ortho_grad.div_(ortho_grad.norm().clamp(min=eps))      # norm in bf16, clamp (not +eps)
         per step: G = X @ X.T; GU = torch.addmm(G, G, G, beta=b, alpha=c)
                   X = torch.addmm(X, GU, X, beta=a)            # all bf16 tensors
-    Same op sequence as ours; rounding differs: torch's norm and each addmm
-    output are bf16 with bf16 accumulate-epilogue, ours keeps an fp32 norm and
-    fp32 epilogues (one bf16 rounding per GEMM). Output stays bf16.
+    Same op sequence as ours. On CPU torch's bf16 addmm applies the
+    beta/alpha epilogue in fp32 and rounds ONCE, exactly like ours (measured:
+    fed identical inputs, gram/addmm outputs differ in 0-62 of 65536 elements,
+    1 bf16 ulp each, from fp32 accumulation order; modelling a double-rounded
+    epilogue instead moves the gap from ~1e-2 to 2.0-2.6e-2). The real
+    difference is the norm: torch rounds ||X|| to bf16 (and clamps), ours
+    keeps it fp32. Output stays bf16.
   * adjust_lr_fn in {None/"original", "match_rms_adamw"}; "original" is
     sqrt(max(1, A/B)) (Keller); "match_rms_adamw" is 0.2*sqrt(max(A, B)) ==
     our muon_scale. A, B = param.shape[:2] (rows, cols).
@@ -29,12 +33,19 @@ torch/optim/_muon.py, nothing else is used):
     = W*(1 - lr*wd) - lr*scale*O. Identical (no cross term, since both apply
     the decay to the old W).
   * Constraints: params must be 2D; no grad_scale knob (we pre-multiply grads);
-    torch computes in the param dtype (bf16 params would round param twice per
-    step), so the harness keeps an fp32 param holding storage-dtype values and
-    rounds to storage after each step, matching the kernel's single round.
+    torch computes in the param dtype: a bf16 param would round W twice per
+    step (mul_ then add_) and, since the buffer is zeros_like(grad), would keep
+    momentum in bf16 too, while the kernel keeps M in fp32 and rounds W once.
+    So the harness keeps an fp32 param holding storage-dtype values (fp32
+    grads -> fp32 buffer) and rounds to storage after each step. NS math is
+    unchanged by this: _zeropower_via_newtonschulz casts to bf16 itself.
 
-Residual non-equivalences (documented, not hidden): bf16 norm vs fp32 norm and
-bf16 epilogues in NS. They show up as the NS gap measured below.
+Residual non-equivalences (documented, not hidden): bf16 vs fp32 norm, plus
+1-ulp GEMM accumulation-order flips that 5 NS steps (a=3.44) amplify. Isolated
+(torch 2.13.0 CPU): our NS with a bf16-rounded norm and exactly-rounded (fp64)
+GEMMs reproduces torch bit-for-bit at 48x96 and 96x48 and to 1.1e-3 / 3.7e-3
+rel-Frobenius at 64x64 / 256x768 (our fp32-vs-fp64 accumulation alone differs
+by 8.7e-3 / 5.2e-3 there), so the whole NS gap below is rounding.
 """
 
 from __future__ import annotations
@@ -63,8 +74,9 @@ NS_SHAPES = [(48, 96), (96, 48), (256, 768), (64, 64)]
 # Measured rel-Frobenius 0.0120 / 0.0124 / 0.0153 / 0.0087; max-abs 5.9e-3 /
 # 8.8e-3 / 4.4e-3 / 7.8e-3. 2x rel would exceed the 2e-2 ceiling for 256x768,
 # so the ceiling binds there. The gap is rounding-noise amplified by a=3.44
-# over 5 steps (bf16 norm + bf16 epilogues in torch vs fp32 in ours), the same
-# 0.01-0.015 band reference.muon_direction_tolerance documents vs fp32 NS.
+# over 5 steps (torch's bf16 norm + 1-ulp accumulation-order flips; see the
+# module docstring), the same 0.01-0.015 band reference.muon_direction_tolerance
+# documents vs fp32 NS.
 NS_REL_TOL = {(48, 96): 0.0120, (96, 48): 0.0124, (256, 768): 0.0153, (64, 64): 0.0087}
 NS_ABS_TOL = {(48, 96): 5.9e-3, (96, 48): 8.8e-3, (256, 768): 4.4e-3, (64, 64): 7.8e-3}
 HARD_REL_CEILING = 2e-2

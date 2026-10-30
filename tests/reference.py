@@ -340,8 +340,9 @@ def _torch_muon_run(case: MuonCase, direction_k: int | None = None):
     its buffer is (1-mu)*ours (lerp form) and Nesterov update is (1-mu)*U, a
     constant factor NS normalises away. Grads are pre-multiplied by grad_scale.
     The torch param is fp32 holding storage-dtype values and is rounded to the
-    storage dtype after every step, so a bf16 case rounds once per step like
-    the kernel (torch.optim.Muon on bf16 params would round twice).
+    storage dtype after every step, so a bf16 case rounds once per step and
+    keeps an fp32 momentum buffer like the kernel (torch.optim.Muon on bf16
+    params would round W twice and store the buffer in bf16).
     With `direction_k` set, W is zeroed before that step and its (W1 - 0) is
     returned as the update (wd*W vanishes), else None.
     """
