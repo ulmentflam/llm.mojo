@@ -236,7 +236,8 @@ def test_untied_head_gradient_split_matches_tied() raises:
     True; `make check-untied-idle` proves that equals the tied build's
     process bitwise). Expect:
       * loss bitwise equal (the head reads a bitwise copy of wte);
-      * rows of the batch's INPUT tokens (encoder) are 'present';
+      * rows of the batch's INPUT tokens (encoder) are 'present'; every
+        vocab tile also holds absent rows (a whole-tile misroute is visible);
       * absent rows: untied dwte == 0 exactly and dlm_head == tied dwte;
       * present rows: untied dwte + dlm_head == tied dwte within 1e-6, and
         dwte != 0 so the check is not vacuous.
@@ -252,8 +253,11 @@ def test_untied_head_gradient_split_matches_tied() raises:
     for r in range(VP):
         present[unsafe_offset=r] = 0
     for i in range(GB * GT):
-        # inputs from 8 distinct rows, targets spread over the whole vocab
-        x[unsafe_offset=i] = Int32((i * 7) % 8)
+        # inputs from 16 distinct rows (1, 4, ..., 46), so every 8-row vocab
+        # tile (the default K=8 tiling of V_p=64) holds absent rows: a tile's
+        # head gradient routed into wte must hit an absent row. Targets spread
+        # over the whole vocab.
+        x[unsafe_offset=i] = Int32(i * 3 + 1)
         y[unsafe_offset=i] = Int32((i * 29 + 11) % V)
         present[unsafe_offset=Int(x[unsafe_offset=i])] = 1
     var ctx = DeviceContext(api="cpu")
@@ -297,14 +301,24 @@ def test_untied_head_gradient_split_matches_tied() raises:
             pres_rows += 1
     # Non-vacuity: the planted batch has both kinds of rows, the head gradient
     # is real on absent rows, and the encoder gradient is real on present rows.
-    assert_equal(pres_rows, 8)
+    assert_equal(pres_rows, GB * GT)
+    for t in range(VP // 8):
+        var absent_in_tile = 0
+        for r in range(8 * t, 8 * t + 8):
+            if present[unsafe_offset=r] == 0:
+                absent_in_tile += 1
+        assert_true(absent_in_tile > 0, "a vocab tile has no absent row")
     assert_true(abs_head_nonzero > 100, "head gradient on absent rows is empty")
     var enc_nonzero = 0
-    for r in range(8):
+    for r in range(VP):
+        if present[unsafe_offset=r] == 0:
+            continue
         for c in range(C):
             if gu[unsafe_offset=r * C + c] != 0.0:
                 enc_nonzero += 1
-    assert_true(enc_nonzero > 8 * C // 2, "encoder gradient on wte is empty")
+    assert_true(
+        enc_nonzero > GB * GT * C // 2, "encoder gradient on wte is empty"
+    )
     x.unsafe_free()
     y.unsafe_free()
     present.unsafe_free()
