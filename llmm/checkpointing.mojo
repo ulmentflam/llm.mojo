@@ -279,13 +279,17 @@ def write_state_checkpoint[
     m_memory: MutMemPtr[dtype],
     v_memory: MutMemPtr[dtype],
     shard_num_parameters: Int,
+    v_num_parameters: Int = -1,
 ) raises:
     """Write the optimizer/training state: 256-int header + AdamW m & v moments.
 
     `shard_num_parameters` is the per-rank moment count
     (`GPT2.optimizer_num_parameters`); under ZeRO each rank writes its own shard
     to its own `state_<step>_<rank>.bin`, matching llm.c.
+    `v_num_parameters` is the v blob length; -1 (default) means the same as m.
+    Muon stores a compact v (AdamW-owned ranges only), so it passes less.
     """
+    var n_v = shard_num_parameters if v_num_parameters < 0 else v_num_parameters
     var header = heap_alloc[Int32](CHECKPOINT_HEADER_SIZE)
     for i in range(CHECKPOINT_HEADER_SIZE):
         header.unsafe_store(i, Int32(0))
@@ -309,7 +313,7 @@ def write_state_checkpoint[
     var file = open(path, "w")
     write_buffer[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
     write_buffer[dtype](file, m_memory, shard_num_parameters)
-    write_buffer[dtype](file, v_memory, shard_num_parameters)
+    write_buffer[dtype](file, v_memory, n_v)
     file.close()
     header.unsafe_free()
 
@@ -358,12 +362,14 @@ def read_state_checkpoint[
     m_out: MutMemPtr[dtype],
     v_out: MutMemPtr[dtype],
     shard_num_parameters: Int,
+    v_num_parameters: Int = -1,
     expect_num_processes: Int = -1,
     expect_process_rank: Int = -1,
 ) raises -> TrainingState:
     """Read the optimizer state into `m_out`/`v_out`; return the TrainingState.
 
-    Both buffers must hold at least `shard_num_parameters` elements.
+    `m_out` must hold `shard_num_parameters` elements, `v_out`
+    `v_num_parameters` (-1 = same as m).
 
     A state file is one rank's shard of the AdamW moments, so it is only valid
     for the same world size and rank that wrote it. When `expect_num_processes`
@@ -373,6 +379,7 @@ def read_state_checkpoint[
     silently read a prefix of a larger shard file (read_and_copy only errors on
     a short file). Negative (default) skips the comparison.
     """
+    var n_v = shard_num_parameters if v_num_parameters < 0 else v_num_parameters
     var file = open(path, "r")
     var state = read_state_header(file)
     if (
@@ -397,7 +404,7 @@ def read_state_checkpoint[
             " a different world size"
         )
     read_and_copy[dtype](file, m_out, shard_num_parameters)
-    read_and_copy[dtype](file, v_out, shard_num_parameters)
+    read_and_copy[dtype](file, v_out, n_v)
     # A short file already raises in read_and_copy; a LONG one must too. The
     # header records world size and rank but not the shard length, so a state
     # written at ZeRO-0 (full-size moments) and resumed at ZeRO>=1 with the

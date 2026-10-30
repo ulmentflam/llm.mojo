@@ -1,6 +1,6 @@
 from std.math import sqrt, ceildiv, isnan, isfinite, nan, exp, log
 from std.os import getenv, listdir, makedirs
-from std.os.path import isdir
+from std.os.path import isdir, getsize
 from std.sys import (
     argv,
     has_accelerator,
@@ -38,6 +38,8 @@ from llmm.checkpointing import (
     read_model_checkpoint,
     write_state_checkpoint,
     read_state_checkpoint,
+    read_state_header,
+    CHECKPOINT_HEADER_SIZE,
     make_training_state,
     restore_dataloader_state,
 )
@@ -1298,6 +1300,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var optimizer_kind: Int
     var muon_momentum: Float32
     var muon_groups: List[MuonGroup]
+    # Muon only: v (AdamW second moment) is compact -- just the AdamW-owned
+    # ranges, concatenated. v_compact_bases[k] is range k's offset in v_memory;
+    # v_num_parameters is its length. AdamW: v is full-size (== optimizer_num_parameters).
+    var v_compact_bases: List[Int]
+    var v_num_parameters: Int
 
     # Activations of the model, and their sizes
     var acts: ActivationTensors[GPT2_DTYPE]
@@ -1459,6 +1466,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.optimizer_kind = 0
         self.muon_momentum = Float32(0.95)
         self.muon_groups = List[MuonGroup]()
+        self.v_compact_bases = List[Int]()
+        self.v_num_parameters = 0
         self.head_max_memory = NULL_MASTER_PTR
         self.head_max_fwd_memory = NULL_MASTER_PTR
         self.qk_clip_tau = 0.0
@@ -5282,6 +5291,30 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.muon_groups = groups^
         self.muon_momentum = momentum
         self.optimizer_kind = 1
+        # The constructor already allocated a full-size v; Muon matrices never
+        # read it, so replace it with a compact one covering only the
+        # AdamW-owned ranges (allocating here, not in the constructor, keeps
+        # the AdamW path untouched). Assigning drops the full buffer.
+        var ranges = self._adamw_ranges()
+        var bases = List[Int]()
+        var total = 0
+        for k in range(len(ranges) // 2):
+            bases.append(total)
+            total += max(ranges[2 * k + 1] - ranges[2 * k], 0)
+        self.v_compact_bases = bases^
+        self.v_num_parameters = total
+        self.v_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](total)
+        self.v_buf.enqueue_fill(Scalar[MASTER_DTYPE](0.0))
+        self.ctx.synchronize()
+        self.v_memory = rebind_mut_mem[MASTER_DTYPE](
+            self.v_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+
+    def _v_count(self) -> Int:
+        """Element count of the v blob in state files: compact under Muon."""
+        if self.optimizer_kind == 1:
+            return self.v_num_parameters
+        return self.optimizer_num_parameters
 
     def _adamw_ranges(self) -> List[Int]:
         """[start0, end0, start1, end1, ...] of the flat-buffer ranges AdamW
@@ -5325,7 +5358,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 ),
                 USE_BF16,
                 as_mut_kernel[MASTER_DTYPE](self.m_memory.unsafe_offset(start)),
-                as_mut_kernel[MASTER_DTYPE](self.v_memory.unsafe_offset(start)),
+                as_mut_kernel[MASTER_DTYPE](
+                    self.v_memory.unsafe_offset(self.v_compact_bases[k])
+                ),
                 t,
                 config,
                 self.ctx,
@@ -5983,10 +6018,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # precision, so the state file stores them in fp32 (matching llm.c).
         var n_opt = self.optimizer_num_parameters
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
-        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
+        var n_v = self._v_count()
+        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v)
         self.ctx.synchronize()
         self._copy_device_to_host[MASTER_DTYPE](host_m, self.m_memory, n_opt)
-        self._copy_device_to_host[MASTER_DTYPE](host_v, self.v_memory, n_opt)
+        self._copy_device_to_host[MASTER_DTYPE](host_v, self.v_memory, n_v)
         self.ctx.synchronize()
         write_state_checkpoint[MASTER_DTYPE](
             state_path,
@@ -6003,6 +6039,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 host_v.unsafe_ptr().as_unsafe_any_origin()
             ),
             n_opt,
+            n_v,
         )
 
     def load_checkpoint(
@@ -6093,7 +6130,49 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # AdamW moments are fp32 (MASTER_DTYPE); read them back in fp32.
         var n_opt = self.optimizer_num_parameters
         var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
-        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_opt)
+        var n_v = self._v_count()
+        # Peek the header first: the v blob length depends on optimizer_kind,
+        # so refuse a cross-optimizer resume before reading mis-sized blobs.
+        var peek_file = open(state_path, "r")
+        var peek_kind = read_state_header(peek_file).optimizer_kind
+        peek_file.close()
+        if peek_kind != self.optimizer_kind:
+            raise Error(
+                "Cannot resume: checkpoint was written with optimizer_kind="
+                + String(peek_kind)
+                + " (0=adamw, 1=muon) but this run uses "
+                + String(self.optimizer_kind)
+                + "; pass the matching -opt"
+            )
+        # The header does not record the v length, so check the file size:
+        # reading fewer bytes than the file holds would succeed silently. A
+        # Muon state file written before v went compact holds a full-size v
+        # (zeros at the Muon matrices); accept it and compact it below.
+        var elem = size_of[MASTER_DTYPE]()
+        var head_bytes = CHECKPOINT_HEADER_SIZE * size_of[DType.int32]()
+        var file_bytes = Int(getsize(state_path))
+        var n_v_read = n_v
+        if file_bytes != head_bytes + (n_opt + n_v) * elem:
+            if (
+                self.optimizer_kind == 1
+                and file_bytes == head_bytes + 2 * n_opt * elem
+            ):
+                n_v_read = n_opt  # legacy full-size Muon v
+            else:
+                raise Error(
+                    "Cannot resume: state file "
+                    + state_path
+                    + " is "
+                    + String(file_bytes)
+                    + " bytes, expected "
+                    + String(head_bytes + (n_opt + n_v) * elem)
+                    + " (m="
+                    + String(n_opt)
+                    + ", v="
+                    + String(n_v)
+                    + " fp32 elements)"
+                )
+        var host_v = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](n_v_read)
         self.ctx.synchronize()
         var state = read_state_checkpoint[MASTER_DTYPE](
             state_path,
@@ -6104,9 +6183,20 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 host_v.unsafe_ptr().as_unsafe_any_origin()
             ),
             n_opt,
+            v_num_parameters=n_v_read,
             expect_num_processes=Self.WORLD_SIZE,
             expect_process_rank=self.zero_ctx.rank,
         )
+        if n_v_read != n_v:
+            # Legacy full-size v: gather the AdamW ranges to their compact
+            # bases. bases[k] <= start_k, so an ascending in-place copy never
+            # overwrites an element before it is read.
+            var ranges = self._adamw_ranges()
+            for k in range(len(ranges) // 2):
+                var start = ranges[2 * k]
+                var base = self.v_compact_bases[k]
+                for i in range(ranges[2 * k + 1] - start):
+                    host_v[base + i] = host_v[start + i]
         if state.optimizer_kind != self.optimizer_kind:
             raise Error(
                 "Cannot resume: checkpoint was written with optimizer_kind="
@@ -6116,7 +6206,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 + "; pass the matching -opt"
             )
         self._copy_host_to_device[MASTER_DTYPE](self.m_memory, host_m, n_opt)
-        self._copy_host_to_device[MASTER_DTYPE](self.v_memory, host_v, n_opt)
+        self._copy_host_to_device[MASTER_DTYPE](self.v_memory, host_v, n_v)
         self.ctx.synchronize()
         return state^
 

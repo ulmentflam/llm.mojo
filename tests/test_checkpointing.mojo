@@ -322,6 +322,38 @@ def test_state_checkpoint_shard_size_mismatch_raises() raises:
     )
     assert_equal(ok.step, 5)
 
+
+def test_state_checkpoint_compact_v_roundtrip() raises:
+    """Muon layout: m is full-size, v is compact (fewer elements)."""
+    var path = String("test_ckpt_state_compact.bin")
+    var n = 17
+    var nv = 6
+    var m = heap_alloc[Float32](n)
+    var v = heap_alloc[Float32](nv)
+    _fill_pattern(m, n, 0.1)
+    _fill_pattern(v, nv, 0.3)
+    var state = TrainingState(
+        step=7,
+        num_processes=1,
+        process_rank=0,
+        use_master_weights=0,
+        should_shuffle=0,
+        sampler_rng_state=UInt64(5),
+        shuffle_rng_state=UInt64(6),
+        current_shard_idx=0,
+        current_sample_idx=1,
+        optimizer_kind=1,
+    )
+    write_state_checkpoint(path, state, m, v, n, nv)
+    var m_out = heap_alloc[Float32](n)
+    var v_out = heap_alloc[Float32](nv)
+    var restored = read_state_checkpoint(path, m_out, v_out, n, nv)
+    assert_equal(restored.step, 7)
+    assert_equal(restored.optimizer_kind, 1)
+    for i in range(n):
+        assert_almost_equal(m_out.unsafe_load(i), m.unsafe_load(i), atol=0.0)
+    for i in range(nv):
+        assert_almost_equal(v_out.unsafe_load(i), v.unsafe_load(i), atol=0.0)
     m.unsafe_free()
     v.unsafe_free()
     m_out.unsafe_free()
