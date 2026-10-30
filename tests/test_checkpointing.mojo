@@ -237,22 +237,90 @@ def test_state_checkpoint_world_size_mismatch_raises() raises:
 
     var raised_world = False
     try:
-        _ = read_state_checkpoint(path, m_out, v_out, n, 1, 0)
+        _ = read_state_checkpoint(
+            path, m_out, v_out, n, expect_num_processes=1, expect_process_rank=0
+        )
     except e:
         raised_world = "world size" in String(e)
     assert_equal(raised_world, True)
 
     var raised_rank = False
     try:
-        _ = read_state_checkpoint(path, m_out, v_out, n, 2, 0)
+        _ = read_state_checkpoint(
+            path, m_out, v_out, n, expect_num_processes=2, expect_process_rank=0
+        )
     except e:
         raised_rank = "rank 1 of 2" in String(e)
     assert_equal(raised_rank, True)
 
-    var ok = read_state_checkpoint(path, m_out, v_out, n, 2, 1)
+    var ok = read_state_checkpoint(
+        path, m_out, v_out, n, expect_num_processes=2, expect_process_rank=1
+    )
     assert_equal(ok.step, 5)
     var unchecked = read_state_checkpoint(path, m_out, v_out, n)
     assert_equal(unchecked.num_processes, 2)
+
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
+    _remove(path)
+
+
+def test_state_checkpoint_shard_size_mismatch_raises() raises:
+    # A ZeRO-0 state file (full-size moments) resumed at ZeRO>=1 at the SAME
+    # world size and rank passes the header checks, and used to load a silent
+    # prefix of m and v. The trailing-bytes check must refuse it; a short file
+    # (the reverse direction) already raised in read_and_copy.
+    var path = String("test_ckpt_state_shard.bin")
+    var n = 8
+    var m = heap_alloc[Float32](n)
+    var v = heap_alloc[Float32](n)
+    _fill_pattern(m, n, 0.1)
+    _fill_pattern(v, n, 0.3)
+    var state = TrainingState(
+        step=5,
+        num_processes=2,
+        process_rank=0,
+        use_master_weights=0,
+        should_shuffle=0,
+        sampler_rng_state=UInt64(0),
+        shuffle_rng_state=UInt64(0),
+        current_shard_idx=0,
+        current_sample_idx=0,
+        optimizer_kind=0,
+    )
+    write_state_checkpoint(path, state, m, v, n)
+    # 2n: the short-file probe below reads n + 1 elements of m before the v
+    # read runs out of bytes.
+    var m_out = heap_alloc[Float32](2 * n)
+    var v_out = heap_alloc[Float32](2 * n)
+
+    var raised_long = False
+    try:
+        _ = read_state_checkpoint(
+            path,
+            m_out,
+            v_out,
+            n // 2,
+            expect_num_processes=2,
+            expect_process_rank=0,
+        )
+    except e:
+        raised_long = "different optimizer shard size" in String(e)
+    assert_equal(raised_long, True)
+
+    var raised_short = False
+    try:
+        _ = read_state_checkpoint(path, m_out, v_out, n + 1)
+    except e:
+        raised_short = "Failed to read enough bytes" in String(e)
+    assert_equal(raised_short, True)
+
+    var ok = read_state_checkpoint(
+        path, m_out, v_out, n, expect_num_processes=2, expect_process_rank=0
+    )
+    assert_equal(ok.step, 5)
 
     m.unsafe_free()
     v.unsafe_free()

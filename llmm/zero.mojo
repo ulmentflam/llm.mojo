@@ -701,12 +701,14 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         Raises if a bucket's global flat range leaves the padded vector
         `[0, N*opt)` (the collective would otherwise silently drop the
         out-of-range tail), and returns the largest bucket-shard overlap `S`
-        any bucket has with this rank's shard, which is what the GPU path must
-        stage through `comm_scratch`. Runs BEFORE any barrier so every rank
-        raises (identical lists) instead of stranding peers mid-collective.
+        any bucket has with ANY rank's shard, which bounds what the GPU path
+        must stage through `comm_scratch`. Runs BEFORE any barrier so every
+        rank raises (identical lists) instead of stranding peers
+        mid-collective. The max is over all ranks, not just this one, so the
+        scratch check's verdict is rank-invariant: with a per-rank max one rank
+        could raise while a peer with a smaller overlap walked into the
+        barrier and hung.
         """
-        var lo = self.rank * opt
-        var hi = lo + opt
         var worst = 0
         for b in range(len(dest_starts)):
             var d = dest_starts[b]
@@ -722,7 +724,10 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
                     + String(Self.N * opt)
                     + ")"
                 )
-            worst = max(worst, min(d + lengths[b], hi) - max(d, lo))
+            for p in range(Self.N):
+                var lo = p * opt
+                var hi = lo + opt
+                worst = max(worst, min(d + lengths[b], hi) - max(d, lo))
         return worst
 
     def signal_ptr(self) -> Pointer[Signal, MutUntrackedOrigin]:

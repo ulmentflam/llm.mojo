@@ -398,7 +398,22 @@ def read_state_checkpoint[
         )
     read_and_copy[dtype](file, m_out, shard_num_parameters)
     read_and_copy[dtype](file, v_out, shard_num_parameters)
+    # A short file already raises in read_and_copy; a LONG one must too. The
+    # header records world size and rank but not the shard length, so a state
+    # written at ZeRO-0 (full-size moments) and resumed at ZeRO>=1 with the
+    # same world size passes the checks above and would otherwise load just a
+    # prefix of m and v, silently.
+    var trailing = file.read_bytes(1)
     file.close()
+    if len(trailing) != 0:
+        raise Error(
+            "Cannot resume: state file "
+            + path
+            + " holds more than the expected "
+            + String(shard_num_parameters)
+            + " m + v elements per moment; it was written with a different"
+            " optimizer shard size (ZeRO stage or world size)"
+        )
     return state^
 
 

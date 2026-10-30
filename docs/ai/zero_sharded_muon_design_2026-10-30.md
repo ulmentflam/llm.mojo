@@ -730,6 +730,21 @@ Check binary mtimes. Run the trainer only through `make`.
   `read_state_checkpoint` takes optional `expect_num_processes` /
   `expect_process_rank`. (4) The multi-GPU arms are compile-checked only on
   this 1-GPU box.
+- **Verification (fu/zs0, Opus reviewer):** two defects fixed on top. (a) The
+  `_bucket_overlap_max` scratch bound was the overlap with THIS rank's shard,
+  so with an undersized scratch one rank could raise while a peer walked into
+  the barrier and hung; it is now the max over every rank's shard, so the
+  verdict is rank-invariant. (b) The world-size/rank check does not catch
+  review item 4d's ZeRO-0 state resumed at ZeRO>=1 (same world size, same
+  rank, larger shard): it still read a silent prefix (probe on the 7d68ac1
+  sources: half-size read succeeded, `v[0]` held m's tail).
+  `read_state_checkpoint` now raises if any byte follows v. That composes with
+  fu/vfree's file-size check in `load_checkpoint` (its legacy-Muon path reads
+  the full v, so no trailing bytes remain), and the new arguments are passed
+  by keyword, since fu/vfree adds a positional `v_num_parameters` in the same
+  slot. End to end at WORLD_SIZE=2: a `-z 0` checkpoint resumed with `-z 1`
+  is refused on both ranks; `-z 1` written then resumed with `-z 1` gives step
+  3 = 10.128281, the same as a straight run.
 
 **S1: ownership + owner buffers + ZeRO-1** (llmm/muon.mojo `MuonGroup`
 sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.mojo).
