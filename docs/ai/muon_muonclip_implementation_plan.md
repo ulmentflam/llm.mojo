@@ -1,8 +1,16 @@
 # Muon + MuonClip implementation plan (2026-10-29)
 
-> **Status (2026-10-29):** phases 1 (Muon) and 2 (QK-clip) landed on
-> `muon-int`; phase 3 (sharded Muon, ZeRO >= 1) is open. See
-> [`muon_muonclip_implementation_2026-10-29.md`](muon_muonclip_implementation_2026-10-29.md).
+> **Status (2026-10-30):** phases 1 (Muon), 2 (QK-clip) and 3 (sharded Muon
+> under ZeRO-1/2/3, QK-clip at every stage) have landed on `main` (phase 3
+> merged at `3482c54`). Phase 3 is verified on the threaded CPU multi-rank
+> harness; GPU at WORLD_SIZE > 1 is compile-checked only, and slices S6 (2-GPU
+> verification) and S7 (state trim) are open. Design, per-slice status and
+> verification notes:
+> [`zero_sharded_muon_design_2026-10-30.md`](zero_sharded_muon_design_2026-10-30.md);
+> campaign report (phase 3 is section 8):
+> [`muon_muonclip_implementation_2026-10-29.md`](muon_muonclip_implementation_2026-10-29.md);
+> tuned hyperparameters:
+> [`muon_hparam_sweep_124m_2026-10-30.md`](muon_hparam_sweep_124m_2026-10-30.md).
 > The text below is the original plan, kept intact.
 >
 > Correction: the "~5%" step-time estimate in section 3 was wrong. The NS
