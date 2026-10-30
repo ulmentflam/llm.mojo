@@ -7700,6 +7700,10 @@ def train[
                 + style.dim("resumed from step " + String(start_step)),
                 plain="Resumed from checkpoint at step " + String(start_step),
             )
+            # Barrier: every rank must finish READING its model/state files
+            # before any rank may write. Combined with the no-resave below this
+            # is belt and braces; allreduce_scalar is a no-op at WORLD_SIZE 1.
+            _ = model.zero_ctx.allreduce_scalar(Float64(0.0))
 
     #####################################################################################
     # Training Loop
@@ -7864,6 +7868,11 @@ def train[
         if (
             save_every > 0
             and output_dir != ""
+            # Do not re-save the step we just resumed from (llm.c: `resuming ==
+            # 0`). It already exists on disk and is identical; rewriting it
+            # raced with peer ranks still reading model_k.bin (truncate-then-
+            # write => "Failed to read enough bytes").
+            and not (start_step > 0 and step == start_step)
             and ((step > 0 and step % save_every == 0) or last_step)
         ):
             var model_path = output_dir + "/model_" + String(step) + ".bin"
