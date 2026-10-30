@@ -60,6 +60,7 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
+from llmm.qk_clip import qk_clip_apply, qk_head_max_fold
 from llmm.matmul import (
     fp8_mutex_preseed,
     matmul_fwd,
@@ -1205,6 +1206,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # fp32 master copy of the weights (size #params) for bf16/fp8 training; a
     # size-1 placeholder under fp32, where the params are their own master.
     var master_buf: DeviceBuffer[MASTER_DTYPE]
+    # QK-clip: [L*NH] fp32 per-head max attention logit. `head_max_fwd_buf` is
+    # written by every forward (zeroed at its start); backward folds it into
+    # `head_max_buf`, the max over the current optimizer step's training
+    # micro-steps. Eval/generation forwards never run backward, so they never
+    # reach the step max.
+    var head_max_buf: DeviceBuffer[DType.float32]
+    var head_max_fwd_buf: DeviceBuffer[DType.float32]
     var acts_buf: DeviceBuffer[GPT2_DTYPE]
     var grad_acts_buf: DeviceBuffer[GPT2_DTYPE]
     # fp32 statistics/losses, split out from the main (param-precision) acts.
@@ -1280,6 +1288,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var m_memory: MutMemPtr[MASTER_DTYPE]
     var v_memory: MutMemPtr[MASTER_DTYPE]
     var master_memory: MutMemPtr[MASTER_DTYPE]
+    var head_max_memory: MutMemPtr[DType.float32]
+    var head_max_fwd_memory: MutMemPtr[DType.float32]
+    var qk_clip_tau: Float32  # <= 0 disables QK-clip
 
     # Optimizer selection: 0 = AdamW everywhere, 1 = Muon on the 2-D block
     # matrices (Q/K/V, attn-proj, fc, proj) with AdamW on everything else.
@@ -1448,6 +1459,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.optimizer_kind = 0
         self.muon_momentum = Float32(0.95)
         self.muon_groups = List[MuonGroup]()
+        self.head_max_memory = NULL_MASTER_PTR
+        self.head_max_fwd_memory = NULL_MASTER_PTR
+        self.qk_clip_tau = 0.0
         self.acts_memory = NULL_DTYPE_PTR
         self.grad_acts_memory = NULL_DTYPE_PTR
         self.acts_stats_memory = NULL_MASTER_PTR
@@ -1496,6 +1510,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.m_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.v_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
+        self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
+        self.head_max_fwd_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](1)
@@ -2686,6 +2702,76 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.has_allocated_grads = True
 
+    def enable_qk_clip(mut self, tau: Float32) raises:
+        """Track per-(layer, head) max attention logits during forward and
+        allow `qk_clip_step` to rescale Q/K rows. tau <= 0 disables."""
+        if tau <= 0.0:
+            self.qk_clip_tau = 0.0
+            return
+        # The logit max is recorded only by the GPU causal-softmax kernel; the
+        # CPU attention path has no hook, so QK-clip there would silently never
+        # fire. Multi-rank would need an allreduce-max of the per-head maxima
+        # (each rank sees different data) or ranks' Q/K weights diverge, and
+        # ZeRO>=1 shards the master copy this kernel indexes in full.
+        comptime if is_cpu[Self.target]():
+            raise Error("QK-clip needs a GPU target (no CPU logit-max hook)")
+        comptime if Self.WORLD_SIZE > 1:
+            raise Error("QK-clip supports WORLD_SIZE=1 only")
+        var n = self.config.num_layer * self.config.num_heads
+        self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](n)
+        self.head_max_buf.enqueue_fill(Scalar[DType.float32](0.0))
+        self.head_max_fwd_buf = self.ctx.enqueue_create_buffer[DType.float32](n)
+        self.head_max_fwd_buf.enqueue_fill(Scalar[DType.float32](0.0))
+        self.ctx.synchronize()
+        self.head_max_memory = rebind_mut_mem[DType.float32](
+            self.head_max_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.head_max_fwd_memory = rebind_mut_mem[DType.float32](
+            self.head_max_fwd_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.qk_clip_tau = tau
+
+    def qk_clip_step(mut self) raises:
+        """Call after the optimizer step: rescale Q/K projection rows (and
+        biases) of every head whose step-max logit exceeded tau."""
+        if self.qk_clip_tau <= 0.0:
+            return
+        var w_off = 0
+        for i in range(Parameters.qkv_weight):
+            w_off += self.param_sizes[i]
+        var b_off = 0
+        for i in range(Parameters.qkv_bias):
+            b_off += self.param_sizes[i]
+        qk_clip_apply[GPT2_DTYPE, Self.target](
+            as_mut_kernel[GPT2_DTYPE](self.params_memory),
+            as_mut_kernel[MASTER_DTYPE](self.master_memory),
+            USE_BF16,
+            w_off,
+            b_off,
+            as_immut_kernel_from_mut[DType.float32](self.head_max_memory),
+            self.config.num_layer,
+            self.config.num_heads,
+            self.config.channels,
+            self.qk_clip_tau,
+            self.ctx,
+        )
+
+    def qk_max(mut self) raises -> Float32:
+        """Max attention logit over all (layer, head) and all training
+        micro-steps of the current optimizer step. Valid from the step's last
+        backward until the next step's first backward (eval/generation
+        forwards in between do not change it). Syncs the device."""
+        if self.qk_clip_tau <= 0.0:
+            return 0.0
+        var n = self.config.num_layer * self.config.num_heads
+        var host = self.ctx.enqueue_create_host_buffer[DType.float32](n)
+        self.ctx.enqueue_copy(host, self.head_max_buf)
+        self.ctx.synchronize()
+        var best = Float32(0.0)
+        for i in range(n):
+            best = max(best, host[i])
+        return best
+
     def allocate_optimizer_moments(mut self) raises:
         var n = self.optimizer_num_parameters
         # Adam moments are always fp32 (MASTER_DTYPE), independent of param dtype.
@@ -3236,6 +3322,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx,
         )
 
+        if self.qk_clip_tau > 0.0:
+            # Each forward records its own per-head logit maxima from zero.
+            self.head_max_fwd_buf.enqueue_fill(Scalar[DType.float32](0.0))
+
         for layer in range(num_layers):
             # ZeRO-3 streaming: gather this layer's parameters just-in-time and
             # re-point self.params.* into the per-layer window before the l_*
@@ -3467,6 +3557,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 Int64(head_dim),
                 self.ctx,
                 cache=rebind[KVCachePtr](Pointer(to=self.kv_cache)),
+                head_max=Optional[MutKernelPtr[DType.float32]](
+                    as_mut_kernel[DType.float32](
+                        self.head_max_fwd_memory.unsafe_offset(
+                            layer * num_heads
+                        )
+                    )
+                ) if self.qk_clip_tau
+                > 0.0 else None,
             )
 
             # Matmul Attn Proj. Always bf16 under fp4 (same rationale as the
@@ -4027,6 +4125,20 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # Zero the parameter gradients only at the first micro-step so they
         # accumulate over the gradient-accumulation loop.
         self.zero_gradients(zero_param_grads=(micro_step == 0))
+
+        if self.qk_clip_tau > 0.0:
+            # QK-clip: fold this micro-step's forward logit maxima into the
+            # optimizer-step max (overwrite on micro-step 0). Done here, not in
+            # forward, so eval/generation forwards never count toward the clip.
+            qk_head_max_fold[Self.target](
+                as_mut_kernel[DType.float32](self.head_max_memory),
+                as_immut_kernel_from_mut[DType.float32](
+                    self.head_max_fwd_memory
+                ),
+                self.config.num_layer * self.config.num_heads,
+                micro_step == 0,
+                self.ctx,
+            )
 
         var zero = 0
         var NULL_DTYPE_PTR = MutMemPtr[GPT2_DTYPE](unsafe_from_address=zero)

@@ -4,6 +4,8 @@ from layout.tile_layout import row_major
 from layout.tile_tensor import stack_allocation as tile_stack_allocation
 
 from std.sys import simd_width_of, align_of, is_defined
+from std.atomic import Atomic
+from std.memory import bitcast
 from std.time import global_perf_counter_ns
 from std.utils.index import Index
 from linalg.matmul import matmul
@@ -1275,9 +1277,13 @@ def _attention_softmax_causal_gpu[
     scores_ptr: ImmutKernelPtr[dtype],
     att_ptr: MutKernelPtr[dtype],
     lse_ptr: MutKernelPtr[DType.float32],
+    num_heads_arg: Int64,
+    head_max_ptr: MutKernelPtr[DType.float32],
+    track_head_max: UInt8,
 ) -> None:
     var num_rows = Int(num_rows_arg)
     var seq_len = Int(seq_len_arg)
+    var num_heads = Int(num_heads_arg)
     # One block per scores row (grid-strided). Row r belongs to head r // T and
     # query position i = r % T, so the causal prefix is columns [0, i]. The raw
     # QKᵀ dot products are scaled here (kept out of the GEMM epilogue so Q/K stay
@@ -1334,6 +1340,16 @@ def _attention_softmax_causal_gpu[
 
         if tid == 0:
             lse_ptr[unsafe_offset=row] = m_row + log(s_row)
+            if track_head_max != 0:
+                # Per-head running max of the post-scale logit (QK-clip). The
+                # buffer is zeroed per step, so logits are clamped at 0, which
+                # is harmless: only maxima above tau matter. Non-negative
+                # floats order like their int32 bit patterns.
+                var mm = max(m_row, Scalar[DType.float32](0.0))
+                var ip = head_max_ptr.unsafe_offset(
+                    (row // seq_len) % num_heads
+                ).unsafe_bitcast[Int32]()
+                _ = Atomic.max(ip, bitcast[DType.int32, 1](mm))
 
         # Write only the causal prefix [0, valid); the above-diagonal half of
         # att_ptr is left at its persistent zero (memset once on allocation),
@@ -1572,6 +1588,7 @@ def attention_fwd_gemm[
     head_dim: Int64,
     ctx: DeviceContext,
     cache: Optional[KVCachePtr] = None,
+    head_max: Optional[MutKernelPtr[DType.float32]] = None,
 ) capturing raises:
     var B = Int(batch_size)
     var NH = Int(num_heads)
@@ -1729,6 +1746,13 @@ def attention_fwd_gemm[
     # runtime: this leaves training's fast path byte-for-byte unchanged (T is
     # always width-aligned there) while generation's non-aligned T falls back
     # to the scalar (width=1) kernel, which has no such alignment assumption.
+    # QK-clip: per-head logit max. MAX forbids null pointers, so when disabled
+    # pass a valid stand-in pointer with the flag off.
+    var head_max_arg = log_sum_exp_ptr
+    var track_flag = UInt8(0)
+    if head_max:
+        head_max_arg = head_max.value()
+        track_flag = UInt8(1)
     if T % softmax_width == 0:
         comptime softmax_kernel = _attention_softmax_causal_gpu[
             dtype, BLOCK_SIZE, softmax_width
@@ -1742,6 +1766,9 @@ def attention_fwd_gemm[
             scores_immut,
             att_base,
             log_sum_exp_ptr,
+            Int64(NH),
+            head_max_arg,
+            track_flag,
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )
@@ -1760,6 +1787,9 @@ def attention_fwd_gemm[
             scores_immut,
             att_base,
             log_sum_exp_ptr,
+            Int64(NH),
+            head_max_arg,
+            track_flag,
             grid_dim=(num_blocks,),
             block_dim=(BLOCK_SIZE,),
         )
@@ -1793,6 +1823,7 @@ def attention_fwd[
     head_dim: Int64,
     ctx: DeviceContext,
     cache: Optional[KVCachePtr] = None,
+    head_max: Optional[MutKernelPtr[DType.float32]] = None,
 ) capturing raises:
     var qkv_mut = rebind[MutKernelPtr[dtype]](qkv_ptr)
     var dst_ptrs = List[MutKernelPtr[dtype]]()
@@ -1822,6 +1853,7 @@ def attention_fwd[
         head_dim,
         ctx,
         cache=cache,
+        head_max=head_max,
     )
     merge_fwd[dtype, target](
         attn_ptr,
@@ -1852,6 +1884,7 @@ def attention_fwd[
     head_dim: Int64,
     ctx: DeviceContext,
     cache: Optional[KVCachePtr] = None,
+    head_max: Optional[MutKernelPtr[DType.float32]] = None,
 ) capturing raises:
     comptime if is_cpu[target]():
         comptime simd_width = simd_width_of[dtype]()
@@ -1884,6 +1917,7 @@ def attention_fwd[
                 head_dim,
                 ctx,
                 cache=cache,
+                head_max=head_max,
             )
             return
         comptime simd_width = simd_width_of[dtype]()
