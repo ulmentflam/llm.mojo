@@ -1340,6 +1340,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # Muon reuses `m_memory` as its momentum buffer. See `enable_muon`.
     var optimizer_kind: Int
     var muon_momentum: Float32
+    # Muon only: multiplier on the scheduler lr for the AdamW-managed ranges
+    # (wte, wpe, LayerNorm, biases); the Muon matrices keep the scheduler lr.
+    var adam_lr_mult: Float32
     var muon_groups: List[MuonGroup]
     # Muon only: v (AdamW second moment) is compact -- just the AdamW-owned
     # ranges, concatenated. v_compact_bases[k] is range k's offset in v_memory;
@@ -1524,6 +1527,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.master_memory = NULL_MASTER_PTR
         self.optimizer_kind = 0
         self.muon_momentum = Float32(0.95)
+        self.adam_lr_mult = Float32(1.0)
         self.muon_groups = List[MuonGroup]()
         self.v_compact_bases = List[Int]()
         self.v_num_parameters = 0
@@ -5575,7 +5579,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             off += self.param_sizes[i]
         return off
 
-    def enable_muon(mut self, momentum: Float32) raises:
+    def enable_muon(
+        mut self, momentum: Float32, adam_lr_mult: Float32 = Float32(1.0)
+    ) raises:
         """Switch `update()` to Muon for the 2-D block matrices (AdamW keeps
         embeddings, biases and LayerNorm). Call after the parameter layout and
         `allocate_optimizer_moments` exist.
@@ -5622,6 +5628,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
         self.muon_groups = groups^
         self.muon_momentum = momentum
+        self.adam_lr_mult = adam_lr_mult
         self.optimizer_kind = 1
         # The constructor already allocated a full-size v; Muon matrices never
         # read it, so replace it with a compact one covering only this rank's
@@ -5960,6 +5967,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     ) raises:
         """Muon step: AdamW over the non-matrix ranges, then one muon_update
         over the Muon groups. Whole-buffer (unsharded) layouts only."""
+        var adam_config = self._adam_config(config)
         var ranges = self._adamw_ranges()
         for k in range(len(ranges) // 2):
             var start = ranges[2 * k]
@@ -5983,7 +5991,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     self.v_memory.unsafe_offset(self.v_compact_bases[k])
                 ),
                 t,
-                config,
+                adam_config,
                 self.ctx,
             )
         var muon_config = MuonConfig(
@@ -6004,6 +6012,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             t,
             muon_config,
             self.ctx,
+        )
+
+    def _adam_config(self, config: AdamWConfig) -> AdamWConfig:
+        """AdamW config for the AdamW-managed ranges under Muon: scheduler lr
+        times `adam_lr_mult` (applied after the scheduler; 1.0 is exact)."""
+        return AdamWConfig(
+            learning_rate=config.learning_rate * self.adam_lr_mult,
+            beta1=config.beta1,
+            beta2=config.beta2,
+            eps=config.eps,
+            weight_decay=config.weight_decay,
+            grad_scale=config.grad_scale,
         )
 
     def _muon_config(self, config: AdamWConfig) -> MuonConfig:
@@ -6056,6 +6076,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # The CPU Muon reference reads the packed gradients directly on
             # the host, so the (queued) pack copies must have landed first.
             self.ctx.synchronize()
+            var adam_config = self._adam_config(config)
             var segs = self._adamw_shard_segments()
             for i in range(len(segs)):
                 ref sg = segs[i]
@@ -6081,7 +6102,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.v_memory.unsafe_offset(sg.compact_off)
                     ),
                     t,
-                    config,
+                    adam_config,
                     self.ctx,
                 )
             if len(self.muon_owned_groups) > 0:
@@ -7363,6 +7384,10 @@ struct TrainArgs(Copyable, Movable):
     var zero_stage: Int  # -z
     var optimizer: String  # -opt  adamw|muon
     var muon_momentum: Float32  # -mu  Muon momentum
+    var beta1: Float32  # -b1  AdamW beta1 (AdamW ranges under Muon)
+    var beta2: Float32  # -b2  AdamW beta2
+    var eps: Float32  # -eps  AdamW epsilon
+    var adam_lr_mult: Float32  # -l_adam  lr multiplier, AdamW ranges under Muon
     var qk_clip_tau: Float32  # -qk_clip  max attention logit (0 = off)
 
 
@@ -7400,6 +7425,10 @@ def default_train_args() -> TrainArgs:
         zero_stage=0,
         optimizer="adamw",
         muon_momentum=Float32(0.95),
+        beta1=Float32(0.9),
+        beta2=Float32(0.999),
+        eps=Float32(1e-8),
+        adam_lr_mult=Float32(1.0),
         qk_clip_tau=Float32(0.0),
     )
 
@@ -7612,6 +7641,21 @@ def train[
         printf0(
             setup_rank, _table_row("muon momentum", String(args.muon_momentum))
         )
+        printf0(
+            setup_rank,
+            _table_row("adam lr mult (l_adam)", String(args.adam_lr_mult)),
+        )
+    printf0(
+        setup_rank,
+        _table_row(
+            "adam b1/b2/eps",
+            String(args.beta1)
+            + "/"
+            + String(args.beta2)
+            + "/"
+            + String(args.eps),
+        ),
+    )
     printf0(setup_rank, _table_row("max_steps", String(args.max_steps)))
     printf0(
         setup_rank, _table_row("val_loss_every", String(args.val_loss_every))
@@ -7635,7 +7679,7 @@ def train[
         cpu_coordinator_ptr=cpu_coord,
     )
     if args.optimizer == "muon":
-        model.enable_muon(args.muon_momentum)
+        model.enable_muon(args.muon_momentum, args.adam_lr_mult)
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
 
@@ -7823,6 +7867,10 @@ def train[
         num("weight_decay", args.weight_decay, VERBOSE),
         num("qk_clip", args.qk_clip_tau, VERBOSE),
         num("muon_momentum", args.muon_momentum, VERBOSE),
+        num("adam_lr_mult", args.adam_lr_mult, VERBOSE),
+        num("adam_beta1", args.beta1, VERBOSE),
+        num("adam_beta2", args.beta2, VERBOSE),
+        num("adam_eps", args.eps, VERBOSE),
         num("world_size", WORLD_SIZE, VERBOSE),
         num("zero_stage", zero_stage, VERBOSE),
         text("lr_schedule", args.lr_scheduler_type, VERBOSE),
@@ -8039,6 +8087,9 @@ def train[
         model.update(
             UInt32(step + 1),
             step_learning_rate,
+            beta1=args.beta1,
+            beta2=args.beta2,
+            eps=args.eps,
             weight_decay=args.weight_decay,
             grad_scale=grad_scale,
         )
@@ -8260,6 +8311,13 @@ def _print_usage():
     )
     print("  -opt <str>  optimizer: adamw|muon (default = adamw)")
     print("  -mu <float> Muon momentum (default = 0.95)")
+    print(
+        "  -l_adam <float> lr multiplier for the AdamW ranges (wte, wpe, LN,"
+        " biases) under -opt muon (default = 1.0; refused with -opt adamw)"
+    )
+    print("  -b1 <float> AdamW beta1 (default = 0.9)")
+    print("  -b2 <float> AdamW beta2 (default = 0.999)")
+    print("  -eps <float> AdamW epsilon (default = 1e-8)")
     print("  -qk_clip <float> max attention logit, 0 = off (default = 0)")
     print("  -pn <int>   num_processes / world_size (default = 1)")
     print("  -pr <int>   process_rank (default = 0)")
@@ -8295,6 +8353,8 @@ def _parse_train_args(
         args.optimizer = getenv("LLMM_OPTIMIZER")
     if getenv("LLMM_MUON_MOMENTUM") != "":
         args.muon_momentum = Float32(atof(getenv("LLMM_MUON_MOMENTUM")))
+    if getenv("LLMM_LR_ADAM_MULT") != "":
+        args.adam_lr_mult = Float32(atof(getenv("LLMM_LR_ADAM_MULT")))
     if getenv("LLMM_QK_CLIP") != "":
         args.qk_clip_tau = Float32(atof(getenv("LLMM_QK_CLIP")))
 
@@ -8361,6 +8421,14 @@ def _parse_train_args(
             args.optimizer = val
         elif flag == "-mu":
             args.muon_momentum = Float32(atof(val))
+        elif flag == "-b1":
+            args.beta1 = Float32(atof(val))
+        elif flag == "-b2":
+            args.beta2 = Float32(atof(val))
+        elif flag == "-eps":
+            args.eps = Float32(atof(val))
+        elif flag == "-l_adam":
+            args.adam_lr_mult = Float32(atof(val))
         elif flag == "-qk_clip":
             args.qk_clip_tau = Float32(atof(val))
         elif flag == "-pn":
@@ -8373,6 +8441,15 @@ def _parse_train_args(
         i += 2
     if args.optimizer != "adamw" and args.optimizer != "muon":
         print("Invalid -opt '" + args.optimizer + "': expected adamw or muon")
+        _error_usage()
+    if args.adam_lr_mult != Float32(1.0) and args.optimizer != "muon":
+        print(
+            "-l_adam / LLMM_LR_ADAM_MULT only applies with -opt muon (AdamW"
+            " already uses -l for every parameter); refusing"
+        )
+        _error_usage()
+    if args.adam_lr_mult <= 0.0:
+        print("Invalid -l_adam: must be > 0")
         _error_usage()
     return True
 
