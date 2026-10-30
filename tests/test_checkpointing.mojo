@@ -114,7 +114,7 @@ def test_model_checkpoint_bad_magic() raises:
     for i in range(4):
         m.unsafe_store(i, 1.0)
         v.unsafe_store(i, 2.0)
-    var state = TrainingState(0, 1, 0, 0, 0, 0, 0, 0, 0)
+    var state = TrainingState(0, 1, 0, 0, 0, 0, 0, 0, 0, 0)
     write_state_checkpoint(path, state, m, v, 4)
 
     var out = heap_alloc[Float32](4)
@@ -176,6 +176,7 @@ def test_state_checkpoint_roundtrip() raises:
         shuffle_rng_state=UInt64(0xDEADBEEFCAFEF00D),
         current_shard_idx=3,
         current_sample_idx=11,
+        optimizer_kind=1,
     )
 
     write_state_checkpoint(path, state, m, v, n)
@@ -194,6 +195,7 @@ def test_state_checkpoint_roundtrip() raises:
     assert_equal(restored.shuffle_rng_state, UInt64(0xDEADBEEFCAFEF00D))
     assert_equal(restored.current_shard_idx, 3)
     assert_equal(restored.current_sample_idx, 11)
+    assert_equal(restored.optimizer_kind, 1)
 
     # Moment payloads.
     for i in range(n):
