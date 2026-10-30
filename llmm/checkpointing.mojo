@@ -358,13 +358,44 @@ def read_state_checkpoint[
     m_out: MutMemPtr[dtype],
     v_out: MutMemPtr[dtype],
     shard_num_parameters: Int,
+    expect_num_processes: Int = -1,
+    expect_process_rank: Int = -1,
 ) raises -> TrainingState:
     """Read the optimizer state into `m_out`/`v_out`; return the TrainingState.
 
     Both buffers must hold at least `shard_num_parameters` elements.
+
+    A state file is one rank's shard of the AdamW moments, so it is only valid
+    for the same world size and rank that wrote it. When `expect_num_processes`
+    / `expect_process_rank` are >= 0 the header's `num_processes` /
+    `process_rank` are compared against them BEFORE any payload is read, and a
+    mismatch raises. Without the check a resume at a different world size
+    silently read a prefix of a larger shard file (read_and_copy only errors on
+    a short file). Negative (default) skips the comparison.
     """
     var file = open(path, "r")
     var state = read_state_header(file)
+    if (
+        expect_num_processes >= 0
+        and state.num_processes != expect_num_processes
+    ) or (
+        expect_process_rank >= 0 and state.process_rank != expect_process_rank
+    ):
+        file.close()
+        raise Error(
+            "Cannot resume: state file "
+            + path
+            + " was written by rank "
+            + String(state.process_rank)
+            + " of "
+            + String(state.num_processes)
+            + " process(es) but this run is rank "
+            + String(expect_process_rank)
+            + " of "
+            + String(expect_num_processes)
+            + "; optimizer state is sharded per rank and cannot be resumed at"
+            " a different world size"
+        )
     read_and_copy[dtype](file, m_out, shard_num_parameters)
     read_and_copy[dtype](file, v_out, shard_num_parameters)
     file.close()

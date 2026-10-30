@@ -6104,6 +6104,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 host_v.unsafe_ptr().as_unsafe_any_origin()
             ),
             n_opt,
+            Self.WORLD_SIZE,
+            self.zero_ctx.rank,
         )
         if state.optimizer_kind != self.optimizer_kind:
             raise Error(
