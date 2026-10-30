@@ -2885,17 +2885,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # Multi-rank: the per-head maxima are allreduce-maxed so every rank
         # applies the same clip (docs/ai/zero_sharded_muon_design_*.md, S5).
         # Supported: ZeRO-0 with either optimizer (full-buffer clip) and
-        # ZeRO-1 Muon (clip applied in owner space inside update()). AdamW
-        # with ZeRO >= 1 keeps Q/K rows in flat shards (a third layout), and
-        # sharded Muon is ZeRO-0/1 only so far.
+        # ZeRO-1/2/3 Muon (clip applied in owner space inside update(); the
+        # qkv bias is clipped in the resident params, or the flat shard under
+        # ZeRO-3 streaming). AdamW with ZeRO >= 1 keeps Q/K rows in flat
+        # shards (a third layout), so it stays unsupported.
         comptime if Self.WORLD_SIZE > 1:
             if self.zero_ctx.zero_stage >= 1 and self.optimizer_kind != 1:
                 raise Error(
                     "QK-clip with WORLD_SIZE > 1 and ZeRO >= 1 needs -opt muon"
                     " (AdamW keeps Q/K rows in flat shards)"
                 )
-            if self.zero_ctx.zero_stage >= 2 or self.z3_streaming:
-                raise Error("QK-clip supports ZeRO-0 and ZeRO-1 only so far")
         var n = self.config.num_layer * self.config.num_heads
         self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](n)
         self.head_max_buf.enqueue_fill(Scalar[DType.float32](0.0))
@@ -2987,7 +2986,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.qk_head_max_global = True
 
     def _qk_clip_sharded(mut self) raises:
-        """ZeRO-1 sharded Muon: apply QK-clip where the data lives, between the
+        """ZeRO-1/2/3 sharded Muon: apply QK-clip where the data lives, between the
         local updates and the gathers of `_update_sharded_muon`. Q/K rows of
         the matrices this rank owns are scaled in the owner-space param (and
         master) copy; the qkv-bias entries inside this rank's flat optimizer
@@ -3029,13 +3028,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 var b = min(sg.flat_start + sg.len, b_hi)
                 if b <= a:
                     continue
-                # Full-buffer offset `a`: valid at ZeRO-1/2 only. Under ZeRO-3
-                # streaming params_memory is the flat shard, so lifting
-                # enable_qk_clip's ZeRO-2/3 raise needs `sg.shard_rel +
-                # (a - sg.flat_start)` here (S3 verification note).
+                # ZeRO-1/2 (and non-streaming ZeRO-3): params_memory is the
+                # full buffer, offset `a`. ZeRO-3 streaming: params_memory is
+                # only this rank's flat shard, so index shard-relative.
+                var p_off = a
+                if self.z3_streaming:
+                    p_off = sg.shard_rel + (a - sg.flat_start)
                 qk_clip_bias_range[GPT2_DTYPE, Self.target](
                     as_mut_kernel[GPT2_DTYPE](
-                        self.params_memory.unsafe_offset(a)
+                        self.params_memory.unsafe_offset(p_off)
                     ),
                     as_mut_kernel[MASTER_DTYPE](
                         self.master_memory.unsafe_offset(
