@@ -685,6 +685,49 @@ struct ZeroContext[target: StaticString, N: Int = 1]:
         # it, mirroring the trailing barrier of the other collectives.
         coord_ptr[].barrier2[].wait()
 
+    def allreduce_max_host[
+        dtype: DType
+    ](
+        self,
+        src: Pointer[Scalar[dtype], MutAnyOrigin],
+        dst: Pointer[Scalar[dtype], MutAnyOrigin],
+        size: Int,
+    ) raises:
+        """Elementwise-max reduce a small HOST-resident array across ranks.
+
+        Same shape and contract as `allreduce_or_host` (host-side on every
+        target, `src` never written, result in the distinct buffer `dst`, a
+        plain copy for N == 1 or a missing coordinator), with `max` in place
+        of `|`. It exists for QK-clip: each rank sees different data, so the
+        per-(layer, head) attention-logit maxima must be reduced to the global
+        S_max before any rank rescales Q/K, or the replicas diverge. One call
+        replaces the 2 x L*NH barriers of reducing each head with
+        `allreduce_scalar`.
+        """
+        if Self.N == 1 or not self.cpu_coordinator_ptr:
+            for i in range(size):
+                dst[unsafe_offset=i] = src[unsafe_offset=i]
+            return
+        var coord_ptr = _register_and_sync[dtype, MutAnyOrigin, MutAnyOrigin](
+            self.rank, self.cpu_coordinator_ptr, src, src
+        )
+        for i in range(size):
+            dst[unsafe_offset=i] = src[unsafe_offset=i]
+        for p in range(Self.N):
+            if p == self.rank:
+                continue
+            var peer = rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
+                coord_ptr[]
+                .shared_inputs[unsafe_offset=p]
+                .unsafe_bitcast[Scalar[dtype]]()
+                .as_unsafe_any_origin()
+            )
+            for i in range(size):
+                dst[unsafe_offset=i] = max(
+                    dst[unsafe_offset=i], peer[unsafe_offset=i]
+                )
+        coord_ptr[].barrier2[].wait()
+
     @always_inline
     def _check_scratch[dtype: DType](self, shard_elems: Int) raises:
         if self.comm_scratch_bytes < shard_elems * size_of[Scalar[dtype]]():

@@ -1001,6 +1001,55 @@ sr fields, `muon_apply_gpu`/`_muon_update_cpu`, the register bridge; train_gpt2.
     sequential harness) was not extended; T2 covers the same ground with real
     collectives, and the harness cannot see propagation bugs. The multi-GPU
     arms stay compile-checked only.
+- **Verification (fu/zs1, Opus reviewer):** the implementation conforms to
+  sections 2 to 6. Two defects outside the update path are fixed on top, and
+  one test was added.
+  - **Checks that held.** Ownership, S, `O_r` and `A_r` match an independent
+    Python model at 124M W=2/4/8, d6 and the tiny configs (L=1 W=8 rank 5,
+    L=2 W=8 ranks 4 and 6 have `A_r = 0`). A new test,
+    `test_ownership_sizes_tiny_w8`, pins those values. It also checks the
+    segment invariants: nonempty, ascending, `shard_rel = flat_start - lo`,
+    `compact_off` is the prefix sum. Neither `_update_hybrid` nor
+    `v_compact_bases` is on the sharded path. The SR counter is
+    `sr_offset + mat*sr_stride + i` on both CPU and GPU, and
+    `sr_offset + j*sr_stride` is the flat offset of the owner's j-th matrix.
+    This is confirmed by reading and by a compile of
+    `-D LLMM_BF16=1 -D LLMM_SR_MASTER=1 -D WORLD_SIZE=2`. A bf16 SR
+    W=1-vs-W>1 run is still UNVERIFIED. The ZeRO-1 owners pack the
+    all-reduced `grads_memory` with the same scaled `grad_scale` as AdamW.
+  - **The synchronize after the pack is a real fence.** CPU `adamw_update`
+    and the CPU Muon path run directly on the calling thread, but CPU
+    `enqueue_copy` is queued. Removing the synchronize failed T2 in 8 of 10
+    runs, at W=2, 4 and 8. With it in place, T2 passed 20 of 20 runs.
+  - **T2 mutants.** These were caught: owner gather skipped (all three
+    sizes); `compact_off` not advanced (W=2 and W=4); a wrong `l0` in the
+    owned groups (W=4, plus the ownership-table test). The W=8 L=1 case has
+    at most one AdamW segment per rank, so it cannot see segment-offset bugs.
+    Indexing `m` by `compact_off` instead of `shard_rel` passes, but that is
+    an equivalent mutant under fp32 with no checkpoint: it is a consistent,
+    disjoint relayout. It would break bf16 (`master` seeding is by
+    `shard_rel`) and S4/S7 state files.
+  - **Fixed: sharded Muon failed only at the first save.** With `-n`, the
+    run trained up to the first save step and then raised. With `-y`, it
+    raised at load. `train()` now refuses `-opt muon -z >= 1` at W>1 with
+    `-o` plus `-n > 0` or `-y 1` up front. The method-level raises in
+    `write_checkpoint` and `load_checkpoint` stay.
+  - **Fixed: a failed threaded multi-rank run exited 0.** Both
+    `sync_parallelize` launchers in `main` (CPU and GPU) printed
+    `Rank r failed:`, aborted the coordinator and returned normally, so
+    every exit-code gate passed on a dead W>1 run. This predates S1.
+    `_raise_if_rank_failed` now raises after the join (exit 2).
+  - Gates, rerun at `ce9f12c` with the binary mtime checked after each
+    `make -B build-train`: `make test-mojo` gave `tests result=pass files=26
+    passed=204 skipped=1 failed=0`, with test_zero_muon at 5 passed.
+    `make verify` gave `result gate=cpu status=pass` and
+    `result gate=gpu status=pass`. `make lint` passed, and
+    `tests/test_muon_equivalence.py` gave 89 passed on the GPU. T5 losses
+    reproduced exactly (`-opt muon -z 1` and `-z 0`: 10.865850, 10.716245,
+    10.648577; `-opt adamw -z 1`: 10.865850, 10.369871, 10.128281; AdamW
+    `-z 1` save at step 2 then `-y 1` gives step 3 = 10.128281). W=1 GPU
+    Muon (d6, B=4, T=256, 5 steps) prints the same losses as main's
+    `e4d91d3` binary.
 
 **S2: ZeRO-2** (`backward` per-layer bucket split; `zero_gradients`;
 `calculate_grad_norm` two-term norm; the ZeRO-2 arm of `_update_sharded_muon`).
@@ -1091,6 +1140,78 @@ non-streaming).
   per-rank head maxima (different per rank) vs ZeRO-0 + global max: params
   bit-equal.
 - If S5 slips, keep the raise and document it.
+- **Status (fu/zs5, ZeRO-0/1 implemented; ZeRO-2/3 deferred):**
+  - `ZeroContext.allreduce_max_host` (llmm/zero.mojo) is a host-side copy of
+    `allreduce_or_host` with `max`; one code path for every target (the
+    coordinator's shared-inputs registry or, without a coordinator, a copy).
+    Tested threaded at W=4 and without a coordinator (tests/test_zero.mojo).
+  - `enable_qk_clip(tau, planted_head_max_only=False)`: the WORLD_SIZE > 1 raise
+    is gone for ZeRO-0 (either optimizer) and ZeRO-1 Muon. It still raises for
+    AdamW + ZeRO >= 1 (flat-shard Q/K rows) and for ZeRO-2/3 (sharded Muon
+    itself raises there until S2/S3). The CPU-target raise STAYS: the CPU
+    attention path has no logit-max hook, so `planted_head_max_only=True` is the
+    test-only escape and the caller plants `head_max_memory`.
+  - `_qk_sync_head_max` (all-reduce-max of `head_max_buf`, idempotent per step,
+    flag cleared by the backward fold) is called from `qk_max()`,
+    `qk_clip_step()` and `_qk_clip_sharded`; so `qk_max()` logs the global max
+    and is a collective at W>1 (every rank calls it, as the trainer does).
+  - ZeRO-1 Muon: `_qk_clip_sharded()` is invoked from ONE delimited block in
+    `_update_sharded_muon`, after the `synchronize()` that follows the AdamW and
+    Muon local updates and BEFORE the "Propagate AdamW" gather. It scales (a)
+    the owner's owner-space Q/K C x C blocks (`muon_p_memory`, and
+    `muon_master_memory` under bf16) with the new `qk_clip_matrix`, and (b) the
+    qkv-bias entries inside this rank's flat shard (params + flat master shard)
+    with `qk_clip_bias_range`; the two existing gathers then carry the result.
+    It sets `qk_clip_applied`, which turns the trainer's later `qk_clip_step()`
+    into a no-op. ZeRO-0 at W>1 only runs the sync, then the existing full-buffer
+    `qk_clip_step`. W=1 is untouched.
+  - Merge note for S2/S3: the block is the 3 lines
+    `if self.qk_clip_tau > 0.0: self._qk_clip_sharded()` in
+    `_update_sharded_muon`. For ZeRO-2/3 it must stay after the last local write
+    and before the gathers (ZeRO-3: the owner-space Q/K clip is enough, the next
+    forward's gather carries it, but the bias clip needs the flat shard under
+    the ZeRO-3 params layout, so `_qk_clip_sharded`'s `params_memory.unsafe_offset(a)`
+    must be revisited for streaming), and `enable_qk_clip`'s ZeRO-2/3 raise lifted.
+  - Verified: tests/test_qk_clip.mojo threaded CPU W=2 ZeRO-1, W=4 ZeRO-1 and
+    W=2 ZeRO-0 with per-rank-different planted maxima; every rank's final params
+    are bit-equal to (unclipped step + `qk_clip_apply` with the global maxima).
+    Not run: a multi-GPU run (one GPU here); the W=2 GPU-target build compiles.
+  - **Verification (fu/zs5, Opus reviewer):** one test gap fixed (d076235),
+    no code defects found. Read: `allreduce_max_host` is `allreduce_or_host`
+    with `max` (same barrier1/barrier2 pair, so a rank that raises first is
+    released by the trainer's `CpuCoordinator.abort()`; nothing raises between
+    the barriers); on GPU `_qk_sync_head_max` copies `head_max_buf` to a host
+    buffer and synchronizes before the reduce, then copies back and
+    synchronizes. The clip block sits after the post-update `synchronize()`
+    and before both gathers; Q is group 0 and K group 1 (`enable_muon`), so
+    `sl.k > 1` skips V; bias layer = r // 3C, Q/K = row < 2C. `qk_max()` is
+    called unconditionally on every rank (only the `qk_max` log field is
+    verbose-gated); `planted_head_max_only` has no CLI path. The trainer's step
+    loop is byte-identical to 6fa563b. Gap: with MV=64 every rank's flat shard
+    held all or none of the qkv bias, so `qk_clip_bias_range` only ever ran
+    with `rel_start = 0`, and the mutation `r = i` (drop `rel_start`) PASSED
+    all three multi-rank tests. MV=192 puts the shard boundary at flat 4960
+    inside the bias [4928, 5024) at W=2 and W=4 (asserted in the test). The
+    `qk_max == 20` check moved after the params comparison. Mutations (each
+    applied, run, reverted): collective returns the local copy -> W=4 ZeRO-1
+    and W=2 ZeRO-0 params mismatch (idx 3520), test_multi_cpu_allreduce_max_host
+    fails; `_qk_clip_sharded` skips the sync (clips on local max, `qk_max`
+    still global) -> mismatch idx 1472; bias clip skipped -> idx 2888 (W=2,
+    W=4, pre-MV change); V bias rows scaled -> idx 2920; V matrices scaled
+    (`k > 2`) -> idx 1984; clip moved after the gathers -> idx 1472; `r = i`
+    -> idx 4968 (W=2, W=4) after the MV change. Not covered by any test: the
+    bf16 master offsets in `_qk_clip_sharded` (`sg.shard_rel + (a -
+    sg.flat_start)`, `muon_master_memory + local_off`), since CPU builds are
+    fp32 (has_master=False) and a multi-rank GPU run needs two GPUs; read and
+    consistent with `_update_sharded_muon`'s own AdamW/Muon master indexing.
+    Gates at d076235: `tests result=pass files=26 passed=208 skipped=1
+    failed=0` (test_qk_clip 8/8 incl. the three multi-rank cases, test_zero
+    21 pass incl. the two `allreduce_max_host` tests), `result gate=cpu
+    status=pass`, `result gate=gpu status=pass`, `make lint` and `make
+    build-bf16` clean, W=1 forced clip qk_max 110.63404 / 6.28879 / 5.8591275 / 5.617808 / 5.2096047,
+    W=1 Muon losses 4.287241 / 3.985745 / 4.111457 / 3.619319 / 3.700221, W=2
+    CPU ZeRO-1 Muon 10.865850 / 10.716245 / 10.648577, W=2 CPU `-qk_clip 5`
+    raises "QK-clip needs a GPU target" on both ranks).
 
 **S6: GPU multi-rank verification** (configs `zero/muon_z*_w2.json`, the
 runbook in section 8). No new code paths are expected: S1 to S3 are
@@ -1151,3 +1272,5 @@ The prior-art table was compiled by a research subagent from the cited papers
 and repository source.
 The independent review (generations 1 and 2) was done with AI assistance
 (Claude Code, Opus agents), directed by Evan Owen.
+The S1 implementation (Sonnet agent) and its verification (Opus agent) were
+done with AI assistance (Claude Code), directed by Evan Owen.
