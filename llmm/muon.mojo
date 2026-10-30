@@ -27,7 +27,7 @@ from max.gpu import block_idx, thread_idx
 from max.gpu.primitives import block
 from std.atomic import Atomic
 from std.math import sqrt, ceildiv
-from std.sys import is_defined, get_defined_int
+from std.sys import is_defined, get_defined_int, align_of
 
 from llmm.memory import (
     ImmutKernelPtr,
@@ -45,8 +45,7 @@ comptime NS_C = Float32(2.0315)
 comptime NS_EPS = Float32(1e-7)
 
 comptime BLOCK = 256
-comptime ELEMS = 8  # elements per thread in the per-matrix kernels
-comptime CHUNK = BLOCK * ELEMS
+comptime VEC = 8  # vector width of the elementwise kernels
 
 # Mirrors llmm/adamw.mojo's opt-in stochastic rounding of the low-precision
 # param store (same macros, same seed), but with its own rng_device stream id
@@ -143,7 +142,8 @@ def muon_zero_gpu(ptr: MutKernelPtr[DType.float32], n_arg: Int64):
 
 
 def muon_momentum_gpu[
-    dtype: DType
+    dtype: DType,
+    W: Int,
 ](
     grads_ptr: ImmutKernelPtr[dtype],
     m_ptr: MutKernelPtr[DType.float32],
@@ -155,69 +155,68 @@ def muon_momentum_gpu[
     mu: Scalar[DType.float32],
     nesterov: UInt8,
 ) -> None:
-    """Grid (ceil(n / CHUNK), count). M = mu*M + g; X = bf16(U); accumulates
-    sum(X^2) per matrix into norms (pre-zeroed) with one atomic per block."""
+    """Grid (ceil(n / (BLOCK*W)), count); each thread owns W contiguous
+    elements. M = mu*M + g; X = bf16(U); accumulates sum(X^2) per matrix into
+    norms (pre-zeroed) with one atomic per block. W > 1 requires n, stride
+    and the group offset to be multiples of W (host-checked), so every
+    access is W-element aligned."""
+    comptime al_g = align_of[SIMD[dtype, W]]()
+    comptime al_f = align_of[SIMD[DType.float32, W]]()
+    comptime al_x = align_of[SIMD[DType.bfloat16, W]]()
     var n = Int(n_arg)
     var mat = Int(block_idx.y)
     var tid = Int(thread_idx.x)
-    var base = Int(block_idx.x) * CHUNK
+    var i = (Int(block_idx.x) * BLOCK + tid) * W
     var gp = grads_ptr.unsafe_offset(mat * Int(stride_arg))
     var mp = m_ptr.unsafe_offset(mat * Int(stride_arg))
     var xp = x_ptr.unsafe_offset(mat * n)
     var acc = Float32(0)
-    for j in range(ELEMS):
-        var i = base + j * BLOCK + tid
-        if i < n:
-            var g = grad_scale * gp[unsafe_offset=i].cast[DType.float32]()
-            var mm = mu * mp[unsafe_offset=i] + g
-            mp[unsafe_offset=i] = mm
-            var u = g + mu * mm if nesterov != 0 else mm
-            var xb = u.cast[DType.bfloat16]()
-            xp[unsafe_offset=i] = xb
-            var xf = xb.cast[DType.float32]()
-            acc += xf * xf
+    if i < n:
+        var g = (
+            grad_scale
+            * gp.unsafe_offset(i)
+            .unsafe_load[width=W, alignment=al_g]()
+            .cast[DType.float32]()
+        )
+        var mm = (
+            mu * mp.unsafe_offset(i).unsafe_load[width=W, alignment=al_f]() + g
+        )
+        mp.unsafe_offset(i).unsafe_store[alignment=al_f](mm)
+        var u = g + mu * mm if nesterov != 0 else mm
+        var xb = u.cast[DType.bfloat16]()
+        xp.unsafe_offset(i).unsafe_store[alignment=al_x](xb)
+        var xf = xb.cast[DType.float32]()
+        acc = (xf * xf).reduce_add()
     var s = block.sum[block_size=BLOCK](acc)
     if tid == 0:
         _ = Atomic[Float32].fetch_add(norms_ptr.unsafe_offset(mat), s)
 
 
-def muon_normalize_gpu(
+def muon_normalize_gpu[
+    W: Int
+](
     x_ptr: MutKernelPtr[DType.bfloat16],
     norms_ptr: MutKernelPtr[DType.float32],
     n_arg: Int64,
 ) -> None:
-    """X /= (||X||_F + 1e-7), per matrix (grid = (ceil(n / CHUNK), count))."""
+    """X /= (||X||_F + 1e-7), per matrix (grid = (ceil(n / (BLOCK*W)), count)).
+    """
+    comptime al_x = align_of[SIMD[DType.bfloat16, W]]()
     var n = Int(n_arg)
     var mat = Int(block_idx.y)
-    var tid = Int(thread_idx.x)
-    var base = Int(block_idx.x) * CHUNK
+    var i = (Int(block_idx.x) * BLOCK + Int(thread_idx.x)) * W
     var xp = x_ptr.unsafe_offset(mat * n)
     var inv = Float32(1) / (sqrt(norms_ptr[unsafe_offset=mat]) + NS_EPS)
-    for j in range(ELEMS):
-        var i = base + j * BLOCK + tid
-        if i < n:
-            xp[unsafe_offset=i] = (
-                xp[unsafe_offset=i].cast[DType.float32]() * inv
-            ).cast[DType.bfloat16]()
-
-
-def muon_axpby_gpu(
-    y_ptr: MutKernelPtr[DType.bfloat16],
-    x_ptr: MutKernelPtr[DType.bfloat16],
-    n_arg: Int64,
-    alpha: Scalar[DType.float32],
-    beta: Scalar[DType.float32],
-) -> None:
-    """Flat y = bf16(alpha * y + beta * x)."""
-    var i = Int(block_idx.x * 256 + thread_idx.x)
-    if i < Int(n_arg):
-        var yv = y_ptr[unsafe_offset=i].cast[DType.float32]()
-        var xv = x_ptr[unsafe_offset=i].cast[DType.float32]()
-        y_ptr[unsafe_offset=i] = (alpha * yv + beta * xv).cast[DType.bfloat16]()
+    if i < n:
+        var v = xp.unsafe_offset(i).unsafe_load[width=W, alignment=al_x]()
+        xp.unsafe_offset(i).unsafe_store[alignment=al_x](
+            (v.cast[DType.float32]() * inv).cast[DType.bfloat16]()
+        )
 
 
 def muon_apply_gpu[
-    dtype: DType
+    dtype: DType,
+    W: Int,
 ](
     params_ptr: MutKernelPtr[dtype],
     master_ptr: MutKernelPtr[DType.float32],
@@ -231,30 +230,50 @@ def muon_apply_gpu[
     scale: Scalar[DType.float32],
     t: UInt32,
 ) -> None:
-    """W update from the orthogonalized O (grid = (ceil(n / CHUNK), count)).
-    params_ptr / master_ptr already point at the group's first element."""
+    """W update from the orthogonalized O (grid = (ceil(n / (BLOCK*W)),
+    count)). params_ptr / master_ptr already point at the group's first
+    element. W > 1 requires n, stride, offset % W == 0 (host-checked)."""
+    comptime al_p = align_of[SIMD[dtype, W]]()
+    comptime al_f = align_of[SIMD[DType.float32, W]]()
+    comptime al_x = align_of[SIMD[DType.bfloat16, W]]()
     var n = Int(n_arg)
     var mat = Int(block_idx.y)
-    var tid = Int(thread_idx.x)
-    var base = Int(block_idx.x) * CHUNK
-    var pp = params_ptr.unsafe_offset(mat * Int(stride_arg))
-    var mp = master_ptr.unsafe_offset(mat * Int(stride_arg))
-    var op = o_ptr.unsafe_offset(mat * n)
-    for j in range(ELEMS):
-        var i = base + j * BLOCK + tid
-        if i < n:
-            _muon_store[dtype](
-                i,
-                Int(offset_arg) + mat * Int(stride_arg) + i,
-                pp,
-                mp,
-                has_master != 0,
-                op[unsafe_offset=i].cast[DType.float32](),
-                lr,
-                wd,
-                scale,
-                t,
-            )
+    var i = (Int(block_idx.x) * BLOCK + Int(thread_idx.x)) * W
+    if i >= n:
+        return
+    var pp = params_ptr.unsafe_offset(mat * Int(stride_arg) + i)
+    var mp = master_ptr.unsafe_offset(mat * Int(stride_arg) + i)
+    var o = (
+        o_ptr.unsafe_offset(mat * n + i)
+        .unsafe_load[width=W, alignment=al_x]()
+        .cast[DType.float32]()
+    )
+    var old: SIMD[DType.float32, W]
+    if has_master != 0:
+        old = mp.unsafe_load[width=W, alignment=al_f]()
+    else:
+        old = pp.unsafe_load[width=W, alignment=al_p]().cast[DType.float32]()
+    var param = old - lr * (scale * o + wd * old)
+
+    # Mirrors adamw: RNE cast by default, stochastic rounding under
+    # -D LLMM_SR_MASTER=1 (bf16 stores only).
+    comptime if SR_MASTER_ENABLED:
+        comptime assert dtype == DType.bfloat16, (
+            "LLMM_SR_MASTER=1 requires a bf16 low-precision param store"
+            " (dtype == DType.bfloat16)"
+        )
+        var pidx = Int(offset_arg) + mat * Int(stride_arg) + i
+        var q = SIMD[dtype, W]()
+        comptime for k in range(W):
+            var counter = rng_step_counter(UInt64(t), UInt64(pidx + k))
+            q[k] = sr_cast_bf16(
+                param[k], SR_MASTER_SEED, counter, SR_MUON_STREAM
+            ).cast[dtype]()
+        pp.unsafe_store[alignment=al_p](q)
+    else:
+        pp.unsafe_store[alignment=al_p](param.cast[dtype]())
+    if has_master != 0:
+        mp.unsafe_store[alignment=al_f](param)
 
 
 @always_inline
@@ -280,8 +299,15 @@ def _gemm_bf16(
     stride_b: Int,
     stride_d: Int,
     ctx: DeviceContext,
+    alpha: Float32 = 1.0,
+    beta: Optional[Float32] = None,
+    c: Optional[MutKernelPtr[DType.bfloat16]] = None,
 ) raises:
-    """Batched column-major D[m,n] = op(A) op(B), bf16 in/out, fp32 accum."""
+    """Batched column-major D[m,n] = alpha op(A) op(B) + beta C, bf16 in/out,
+    one fp32 epilogue (C defaults to D; C shares D's layout/stride)."""
+    var c_imm = Optional[ImmutKernelPtr[DType.bfloat16]]()
+    if c:
+        c_imm = Optional(_imm_bf16(c.value()))
     comptime bf = DType.bfloat16
     if trans_a:
         _matmul_cublaslt[bf, True, False](
@@ -300,6 +326,9 @@ def _gemm_bf16(
             stride_a=stride_a,
             stride_b=stride_b,
             stride_d=stride_d,
+            alpha=alpha,
+            beta=beta,
+            c_ptr=c_imm,
         )
     elif trans_b:
         _matmul_cublaslt[bf, False, True](
@@ -318,6 +347,9 @@ def _gemm_bf16(
             stride_a=stride_a,
             stride_b=stride_b,
             stride_d=stride_d,
+            alpha=alpha,
+            beta=beta,
+            c_ptr=c_imm,
         )
     else:
         _matmul_cublaslt[bf, False, False](
@@ -336,7 +368,164 @@ def _gemm_bf16(
             stride_a=stride_a,
             stride_b=stride_b,
             stride_d=stride_d,
+            alpha=alpha,
+            beta=beta,
+            c_ptr=c_imm,
         )
+
+
+def _muon_group_gpu[
+    dtype: DType,
+    W: Int,
+](
+    g: MuonGroup,
+    params_ptr: MutKernelPtr[dtype],
+    grads_ptr: ImmutKernelPtr[dtype],
+    master_ptr: MutKernelPtr[DType.float32],
+    has_master: Bool,
+    m_ptr: MutKernelPtr[DType.float32],
+    t: UInt32,
+    config: MuonConfig,
+    x: MutKernelPtr[DType.bfloat16],
+    y: MutKernelPtr[DType.bfloat16],
+    a: MutKernelPtr[DType.bfloat16],
+    a2: MutKernelPtr[DType.bfloat16],
+    norms: MutKernelPtr[DType.float32],
+    ctx: DeviceContext,
+) raises:
+    var k_zero = ctx.compile_function[muon_zero_gpu]()
+    var k_mom = ctx.compile_function[muon_momentum_gpu[dtype, W]]()
+    var k_norm = ctx.compile_function[muon_normalize_gpu[W]]()
+    var k_apply = ctx.compile_function[muon_apply_gpu[dtype, W]]()
+    var rows = g.rows
+    var cols = g.cols
+    var count = g.count
+    var n = rows * cols
+    var tall = rows > cols
+    var R = min(rows, cols)
+    var C = max(rows, cols)
+    var gs = R * R
+    var chunks = ceildiv(n, BLOCK * W)
+
+    ctx.enqueue_function(
+        k_zero,
+        norms,
+        Int64(count),
+        grid_dim=(ceildiv(count, 256),),
+        block_dim=(256,),
+    )
+    ctx.enqueue_function(
+        k_mom,
+        grads_ptr.unsafe_offset(g.offset),
+        m_ptr.unsafe_offset(g.offset),
+        x,
+        norms,
+        Int64(n),
+        Int64(g.stride),
+        config.grad_scale,
+        config.momentum,
+        UInt8(1) if config.nesterov else UInt8(0),
+        grid_dim=(chunks, count),
+        block_dim=(BLOCK,),
+    )
+    ctx.enqueue_function(
+        k_norm,
+        x,
+        norms,
+        Int64(n),
+        grid_dim=(chunks, count),
+        block_dim=(BLOCK,),
+    )
+
+    # Ping-pong X between x and y: the second GEMM's fp32 epilogue writes
+    # X' = a*X + B@X into the other buffer (C = X), so track which holds X.
+    var xp = x
+    var yp = y
+    for _ in range(config.ns_steps):
+        # A = X X^T  (R x R). Wide/square: memory is the col-major C x R
+        # matrix X^T -> A = op(T)(X^T) * X^T. Tall: memory is the
+        # col-major R x C matrix X' (= X^T) -> A = X' * op(T)(X').
+        _gemm_bf16(a, xp, xp, R, R, C, not tall, tall, count, n, n, gs, ctx)
+        # B = b*A + c*(A A), single fp32 epilogue (D=a2, C=a).
+        _gemm_bf16(
+            a2,
+            a,
+            a,
+            R,
+            R,
+            R,
+            False,
+            False,
+            count,
+            gs,
+            gs,
+            gs,
+            ctx,
+            alpha=NS_C,
+            beta=NS_B,
+            c=a,
+        )
+        # X' = a*X + B X (D=yp, C=xp). Wide/square: Xc * B (C x R); tall:
+        # B * Xc' (R x C).
+        if tall:
+            _gemm_bf16(
+                yp,
+                a2,
+                xp,
+                R,
+                C,
+                R,
+                False,
+                False,
+                count,
+                gs,
+                n,
+                n,
+                ctx,
+                alpha=1.0,
+                beta=NS_A,
+                c=xp,
+            )
+        else:
+            _gemm_bf16(
+                yp,
+                xp,
+                a2,
+                C,
+                R,
+                R,
+                False,
+                False,
+                count,
+                n,
+                gs,
+                n,
+                ctx,
+                alpha=1.0,
+                beta=NS_A,
+                c=xp,
+            )
+        var t_ = xp
+        xp = yp
+        yp = t_
+
+    var scale = Float32(0.2) * sqrt(Float32(C))
+    ctx.enqueue_function(
+        k_apply,
+        params_ptr.unsafe_offset(g.offset),
+        master_ptr.unsafe_offset(g.offset),
+        xp,
+        UInt8(1) if has_master else UInt8(0),
+        Int64(n),
+        Int64(g.stride),
+        Int64(g.offset),
+        config.learning_rate,
+        config.weight_decay,
+        scale,
+        t,
+        grid_dim=(chunks, count),
+        block_dim=(BLOCK,),
+    )
 
 
 def _muon_update_gpu[
@@ -379,104 +568,52 @@ def _muon_update_gpu[
         ctx, "muon_norms_" + String(max_count), max_count
     )
 
-    var k_zero = ctx.compile_function[muon_zero_gpu]()
-    var k_mom = ctx.compile_function[muon_momentum_gpu[dtype]]()
-    var k_norm = ctx.compile_function[muon_normalize_gpu]()
-    var k_axpby = ctx.compile_function[muon_axpby_gpu]()
-    var k_apply = ctx.compile_function[muon_apply_gpu[dtype]]()
-
     for g in groups:
-        var rows = g.rows
-        var cols = g.cols
-        var count = g.count
-        var n = rows * cols
-        var tall = rows > cols
-        var R = min(rows, cols)
-        var C = max(rows, cols)
-        var gs = R * R
-        var chunks = ceildiv(n, CHUNK)
-
-        ctx.enqueue_function(
-            k_zero,
-            norms,
-            Int64(count),
-            grid_dim=(ceildiv(count, 256),),
-            block_dim=(256,),
+        # Width-8 vector kernels need every access 8-element aligned and no
+        # ragged tail; anything else (tests with odd shapes) takes the scalar
+        # W=1 instantiation of the same kernels.
+        var n = g.rows * g.cols
+        var r = min(g.rows, g.cols)
+        var vec = (
+            n % VEC == 0
+            and g.stride % VEC == 0
+            and g.offset % VEC == 0
+            and (r * r) % VEC == 0
         )
-        ctx.enqueue_function(
-            k_mom,
-            grads_ptr.unsafe_offset(g.offset),
-            m_ptr.unsafe_offset(g.offset),
-            x,
-            norms,
-            Int64(n),
-            Int64(g.stride),
-            config.grad_scale,
-            config.momentum,
-            UInt8(1) if config.nesterov else UInt8(0),
-            grid_dim=(chunks, count),
-            block_dim=(BLOCK,),
-        )
-        ctx.enqueue_function(
-            k_norm,
-            x,
-            norms,
-            Int64(n),
-            grid_dim=(chunks, count),
-            block_dim=(BLOCK,),
-        )
-
-        for _ in range(config.ns_steps):
-            # A = X X^T  (R x R). Wide/square: memory is the col-major C x R
-            # matrix X^T -> A = op(T)(X^T) * X^T. Tall: memory is the
-            # col-major R x C matrix X' (= X^T) -> A = X' * op(T)(X').
-            _gemm_bf16(a, x, x, R, R, C, not tall, tall, count, n, n, gs, ctx)
-            _gemm_bf16(a2, a, a, R, R, R, False, False, count, gs, gs, gs, ctx)
-            # A = b*A + c*A2 (this is the "B" polynomial matrix).
-            ctx.enqueue_function(
-                k_axpby,
-                a,
-                a2,
-                Int64(count * gs),
-                NS_B,
-                NS_C,
-                grid_dim=(ceildiv(count * gs, 256),),
-                block_dim=(256,),
-            )
-            # Y = B X. Wide/square: Xc * B (C x R); tall: B * Xc' (R x C).
-            if tall:
-                _gemm_bf16(y, a, x, R, C, R, False, False, count, gs, n, n, ctx)
-            else:
-                _gemm_bf16(y, x, a, C, R, R, False, False, count, n, gs, n, ctx)
-            # X = a*X + Y
-            ctx.enqueue_function(
-                k_axpby,
+        if vec:
+            _muon_group_gpu[dtype, VEC](
+                g,
+                params_ptr,
+                grads_ptr,
+                master_ptr,
+                has_master,
+                m_ptr,
+                t,
+                config,
                 x,
                 y,
-                Int64(count * n),
-                NS_A,
-                Float32(1),
-                grid_dim=(ceildiv(count * n, 256),),
-                block_dim=(256,),
+                a,
+                a2,
+                norms,
+                ctx,
             )
-
-        var scale = Float32(0.2) * sqrt(Float32(C))
-        ctx.enqueue_function(
-            k_apply,
-            params_ptr.unsafe_offset(g.offset),
-            master_ptr.unsafe_offset(g.offset),
-            x,
-            UInt8(1) if has_master else UInt8(0),
-            Int64(n),
-            Int64(g.stride),
-            Int64(g.offset),
-            config.learning_rate,
-            config.weight_decay,
-            scale,
-            t,
-            grid_dim=(chunks, count),
-            block_dim=(BLOCK,),
-        )
+        else:
+            _muon_group_gpu[dtype, 1](
+                g,
+                params_ptr,
+                grads_ptr,
+                master_ptr,
+                has_master,
+                m_ptr,
+                t,
+                config,
+                x,
+                y,
+                a,
+                a2,
+                norms,
+                ctx,
+            )
 
 
 # ===----------------------------------------------------------------------=== #

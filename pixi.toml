@@ -42,6 +42,7 @@ pyrefly = ">=0.16"
 # Drives the git hooks (make lint / make check) via `pixi run pre-commit`, so
 # contributors get it from `make install` without a separate global install.
 pre-commit = ">=4.6"
+muon-optimizer = { git = "https://github.com/KellerJordan/Muon" }
 
 [environments]
 cuda = ["cuda"]

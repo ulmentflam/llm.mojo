@@ -30,3 +30,7 @@ matplotlib>=3.11.0,<4
 # Testing (optional; needed for pytest equivalence tests)
 # pytest>=8.0
 # pytest-xdist>=3
+
+# Muon cross-check tests (tests/test_muon_crosscheck_keller.py): Keller Jordan's
+# reference Muon package, pinned in pixi.lock to a git revision.
+muon-optimizer @ git+https://github.com/KellerJordan/Muon
