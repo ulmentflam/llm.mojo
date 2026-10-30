@@ -1,3 +1,5 @@
+from std.os.path import getsize
+from std.sys import size_of
 from llmm.io import read_and_copy, write_buffer
 from llmm.memory import MutMemPtr, heap_alloc
 from llmm.dataloader import DataLoader, RNG_SEED
@@ -116,7 +118,6 @@ struct ModelHeader(Copyable, Movable):
     var version: Int
 
 
-@fieldwise_init
 struct TrainingState(Copyable, Movable):
     """Resumable bookkeeping persisted in the state-checkpoint header.
 
@@ -134,6 +135,44 @@ struct TrainingState(Copyable, Movable):
     var current_shard_idx: Int  # Dataloader shard position.
     var current_sample_idx: Int  # Dataloader intra-shard sample position.
     var optimizer_kind: Int  # 0 = AdamW, 1 = Muon (header slot 40).
+    # Sharded Muon (ZeRO>=1, W>1) only; all 0 otherwise, so AdamW and
+    # ZeRO-0/W=1 Muon files stay byte-identical to before S4.
+    var zero_stage: Int  # header slot 41 (informational).
+    # Slot 42: 0 = no owner payload, 1 = matrix-granular round-robin
+    # owner(k, l) = (k*L + l) mod W. A nonzero value means a `muon_m`
+    # blob of `muon_shard_elems` fp32 elements follows m and v.
+    var muon_ownership_version: Int
+    var muon_shard_elems: Int  # slot 43: S, the per-rank owner shard.
+
+    def __init__(
+        out self,
+        step: Int,
+        num_processes: Int,
+        process_rank: Int,
+        use_master_weights: Int,
+        should_shuffle: Int,
+        sampler_rng_state: UInt64,
+        shuffle_rng_state: UInt64,
+        current_shard_idx: Int,
+        current_sample_idx: Int,
+        optimizer_kind: Int,
+        zero_stage: Int = 0,
+        muon_ownership_version: Int = 0,
+        muon_shard_elems: Int = 0,
+    ):
+        self.step = step
+        self.num_processes = num_processes
+        self.process_rank = process_rank
+        self.use_master_weights = use_master_weights
+        self.should_shuffle = should_shuffle
+        self.sampler_rng_state = sampler_rng_state
+        self.shuffle_rng_state = shuffle_rng_state
+        self.current_shard_idx = current_shard_idx
+        self.current_sample_idx = current_sample_idx
+        self.optimizer_kind = optimizer_kind
+        self.zero_stage = zero_stage
+        self.muon_ownership_version = muon_ownership_version
+        self.muon_shard_elems = muon_shard_elems
 
 
 # ===----------------------------------------------------------------------=== #
@@ -280,8 +319,13 @@ def write_state_checkpoint[
     v_memory: MutMemPtr[dtype],
     shard_num_parameters: Int,
     v_num_parameters: Int = -1,
+    muon_m_memory: Optional[MutMemPtr[dtype]] = None,
 ) raises:
     """Write the optimizer/training state: 256-int header + AdamW m & v moments.
+
+    When `state.muon_ownership_version != 0`, `muon_m_memory` (required) holds
+    this rank's owner-local Muon momentum, `state.muon_shard_elems` elements,
+    appended after v. Masters are not saved (rebuilt from params on resume).
 
     `shard_num_parameters` is the per-rank moment count
     (`GPT2.optimizer_num_parameters`); under ZeRO each rank writes its own shard
@@ -301,6 +345,9 @@ def write_state_checkpoint[
     header.unsafe_store(5, Int32(state.should_shuffle))
     header.unsafe_store(10, Int32(state.step))
     header.unsafe_store(40, Int32(state.optimizer_kind))
+    header.unsafe_store(41, Int32(state.zero_stage))
+    header.unsafe_store(42, Int32(state.muon_ownership_version))
+    header.unsafe_store(43, Int32(state.muon_shard_elems))
 
     # 64-bit fields share the same buffer; an aligned UInt64 view writes pairs
     # of Int32 slots (index k => slots 2k, 2k+1), matching llm.c's byte offsets.
@@ -314,6 +361,15 @@ def write_state_checkpoint[
     write_buffer[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
     write_buffer[dtype](file, m_memory, shard_num_parameters)
     write_buffer[dtype](file, v_memory, n_v)
+    if state.muon_ownership_version != 0:
+        if not muon_m_memory:
+            file.close()
+            header.unsafe_free()
+            raise Error(
+                "Checkpoint error: muon_ownership_version set but no"
+                " muon_m_memory given"
+            )
+        write_buffer[dtype](file, muon_m_memory.value(), state.muon_shard_elems)
     file.close()
     header.unsafe_free()
 
@@ -350,6 +406,9 @@ def read_state_header(mut file: FileHandle) raises -> TrainingState:
         current_shard_idx=Int(u64_view.unsafe_load(15)),
         current_sample_idx=Int(u64_view.unsafe_load(16)),
         optimizer_kind=Int(header.unsafe_load(40)),
+        zero_stage=Int(header.unsafe_load(41)),
+        muon_ownership_version=Int(header.unsafe_load(42)),
+        muon_shard_elems=Int(header.unsafe_load(43)),
     )
     header.unsafe_free()
     return state^
@@ -365,6 +424,8 @@ def read_state_checkpoint[
     v_num_parameters: Int = -1,
     expect_num_processes: Int = -1,
     expect_process_rank: Int = -1,
+    muon_m_out: Optional[MutMemPtr[dtype]] = None,
+    expect_muon_shard_elems: Int = 0,
 ) raises -> TrainingState:
     """Read the optimizer state into `m_out`/`v_out`; return the TrainingState.
 
@@ -378,6 +439,15 @@ def read_state_checkpoint[
     mismatch raises. Without the check a resume at a different world size
     silently read a prefix of a larger shard file (read_and_copy only errors on
     a short file). Negative (default) skips the comparison.
+
+    Sharded Muon: pass `muon_m_out` (and `expect_muon_shard_elems` = S) to read
+    the owner-local momentum blob. The header's ownership version must be 1 and
+    its S must match; a file with no owner payload (ZeRO-0 / W=1 Muon, AdamW)
+    is refused when `muon_m_out` is given, and an owner file is refused when it
+    is not. The file length must equal header + m + v (+ muon_m) exactly: a
+    longer or shorter file raises with both byte counts (the header does not
+    record the m/v lengths, so this is what catches a ZeRO-0 file resumed at
+    ZeRO>=1, or a different world size, in either direction).
     """
     var n_v = shard_num_parameters if v_num_parameters < 0 else v_num_parameters
     var file = open(path, "r")
@@ -403,13 +473,65 @@ def read_state_checkpoint[
             + "; optimizer state is sharded per rank and cannot be resumed at"
             " a different world size"
         )
+    var want_owner = Bool(muon_m_out)
+    var have_owner = state.muon_ownership_version != 0
+    if want_owner != have_owner:
+        file.close()
+        raise Error(
+            "Cannot resume: state file "
+            + path
+            + (
+                " has no owner-local Muon momentum (written by AdamW, or by Muon at ZeRO-0 / one process) but this run is sharded Muon (ZeRO>=1, W>1)" if want_owner else " holds owner-local Muon momentum (sharded Muon, ZeRO>=1) but this run expects the replicated layout (ZeRO-0 or one process)"
+            )
+            + "; resume with the same -z and world size that wrote it"
+        )
+    if want_owner and (
+        state.muon_ownership_version != 1
+        or state.muon_shard_elems != expect_muon_shard_elems
+    ):
+        file.close()
+        raise Error(
+            "Cannot resume: state file "
+            + path
+            + " has muon_ownership_version="
+            + String(state.muon_ownership_version)
+            + " shard_elems="
+            + String(state.muon_shard_elems)
+            + " but this run needs version 1 shard_elems="
+            + String(expect_muon_shard_elems)
+            + " (different ownership rule, model shape or world size)"
+        )
+    var n_mu = expect_muon_shard_elems if want_owner else 0
+    var elem = size_of[dtype]()
+    var head_bytes = CHECKPOINT_HEADER_SIZE * size_of[DType.int32]()
+    var expect_bytes = head_bytes + (shard_num_parameters + n_v + n_mu) * elem
+    var file_bytes = Int(getsize(path))
+    if file_bytes != expect_bytes:
+        file.close()
+        raise Error(
+            "Cannot resume: state file "
+            + path
+            + " is "
+            + String(file_bytes)
+            + " bytes, expected "
+            + String(expect_bytes)
+            + " (m="
+            + String(shard_num_parameters)
+            + ", v="
+            + String(n_v)
+            + ", muon_m="
+            + String(n_mu)
+            + " elements); it was written with a different optimizer shard"
+            " layout (ZeRO stage or world size)"
+        )
     read_and_copy[dtype](file, m_out, shard_num_parameters)
     read_and_copy[dtype](file, v_out, n_v)
-    # A short file already raises in read_and_copy; a LONG one must too. The
-    # header records world size and rank but not the shard length, so a state
-    # written at ZeRO-0 (full-size moments) and resumed at ZeRO>=1 with the
-    # same world size passes the checks above and would otherwise load just a
-    # prefix of m and v, silently.
+    if want_owner:
+        read_and_copy[dtype](file, muon_m_out.value(), n_mu)
+    # Backstop only: the exact getsize() check above already rejects a short
+    # or long file (e.g. a ZeRO-0 state resumed at ZeRO>=1 at the same world
+    # size, which would otherwise load a prefix of m and v silently). This
+    # catches a file that grew between the size check and the read.
     var trailing = file.read_bytes(1)
     file.close()
     if len(trailing) != 0:
