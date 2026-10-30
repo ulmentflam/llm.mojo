@@ -110,6 +110,22 @@ otherwise they print the compact `pretty` layout the demo above shows.
 A failing check or test file prints its full detail at every level. `scripts/train_log.py` reads a
 training log back from any of the four formats.
 
+Optimizer: AdamW is the default and its path is unchanged. `-opt muon` (env `LLMM_OPTIMIZER`) is
+opt-in and switches the attention and MLP weight matrices to Muon (Newton-Schulz-orthogonalized
+momentum, Moonlight scaling, so `-l` and `-c` are shared with AdamW; `-mu` sets the momentum,
+default 0.95) and keeps embeddings, biases and LayerNorm on AdamW. Muon is single-GPU/ZeRO-0 (it
+raises with WORLD_SIZE > 1 and ZeRO >= 1) and its GPU path needs cuBLASLt (NVIDIA); the CPU path is
+a naive reference (~124 s/step at 30M params), not for training. `-qk_clip <tau>` (env
+`LLMM_QK_CLIP`, 0 = off) rescales any attention head whose max logit exceeds `tau`, with either
+optimizer; it is GPU-only and WORLD_SIZE 1, and `qk_max=` is printed only at verbose level. The
+pretrained GPT-2 124M already exceeds `tau=100` (max logit ~110), so it clips on step 1 of a
+fine-tune. A checkpoint cannot be resumed with the other optimizer. The overhead is a fixed cost per
+step: ~1% at 131k tokens/step (29% only at the 4k-token smoke config). Implementation, verification
+against three references and the perf pass:
+[`docs/ai/muon_muonclip_implementation_2026-10-29.md`](docs/ai/muon_muonclip_implementation_2026-10-29.md);
+convergence vs AdamW:
+[`docs/ai/muon_vs_adamw_124m_2026-10-29.md`](docs/ai/muon_vs_adamw_124m_2026-10-29.md).
+
 Multi-GPU training: build with `WORLD_SIZE=N` (one rank per GPU, compile-time)
 and choose a ZeRO sharding stage at runtime:
 

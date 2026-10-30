@@ -1,6 +1,16 @@
 # Muon + MuonClip implementation plan (2026-10-29)
 
-Status: **plan only, nothing implemented.** Follow-up to the Tier-B verdict in
+> **Status (2026-10-29):** phases 1 (Muon) and 2 (QK-clip) landed on
+> `muon-int`; phase 3 (sharded Muon, ZeRO >= 1) is open. See
+> [`muon_muonclip_implementation_2026-10-29.md`](muon_muonclip_implementation_2026-10-29.md).
+> The text below is the original plan, kept intact.
+>
+> Correction: the "~5%" step-time estimate in section 3 was wrong. The NS
+> GEMMs are 1.6 TFLOP/step, not 1.2, and the GB10 reaches ~57 TFLOP/s on them,
+> not 150 to 200; measured overhead was +30% at the 4k-token smoke config
+> (about 1% at 131k tokens/step). See section 6 of the report above.
+
+Status at writing: **plan only, nothing implemented.** Follow-up to the Tier-B verdict in
 [`speedrun_techniques_research.md`](speedrun_techniques_research.md) (B1: Muon
 is the single biggest speedrun win, but it breaks the llm.c AdamW-parity
 benchmark). The resolution here: Muon ships as an **opt-in** optimizer
