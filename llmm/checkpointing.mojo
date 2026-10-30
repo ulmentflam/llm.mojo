@@ -38,6 +38,12 @@ comptime CHECKPOINT_HEADER_SIZE = 256  # Number of Int32 slots in every header.
 comptime MODEL_MAGIC = 20240520
 comptime VERSION_FP32 = 3
 comptime VERSION_BF16 = 5
+# Untied-LM-head model files (-D LLMM_UNTIED_HEAD=1): the tied version + 10. The
+# blob is the 16-tensor tied blob followed by one [padded_vocab, C] head block.
+# New version numbers (not a header flag) so every reader that only knows 3/5
+# refuses the file loudly instead of loading it as tied and dropping the head.
+comptime VERSION_FP32_UNTIED = 13
+comptime VERSION_BF16_UNTIED = 15
 
 # State checkpoint header. 20240527 is llm.c's `save_state` magic.
 comptime STATE_MAGIC = 20240527
@@ -51,7 +57,6 @@ comptime AUTO_VERSION = -1  # Sentinel: derive the version from the param dtype.
 # ===----------------------------------------------------------------------=== #
 
 
-@fieldwise_init
 struct CheckpointConfig(Copyable, Movable):
     """Model shape persisted in the checkpoint header.
 
@@ -65,6 +70,27 @@ struct CheckpointConfig(Copyable, Movable):
     var num_heads: Int  # Number of heads (e.g. 12).
     var channels: Int  # Number of channels (e.g. 768).
     var padded_vocab_size: Int  # Padded vocab size (%128 == 0, e.g. 50304).
+    # 1 when the model carries a separate lm_head [padded_vocab, C] tensor as a
+    # 17th block after ln_f_beta (model-file versions 13/15), else 0 (tied).
+    var untied_head: Int
+
+    def __init__(
+        out self,
+        max_seq_len: Int,
+        vocab_size: Int,
+        num_layer: Int,
+        num_heads: Int,
+        channels: Int,
+        padded_vocab_size: Int,
+        untied_head: Int = 0,
+    ):
+        self.max_seq_len = max_seq_len
+        self.vocab_size = vocab_size
+        self.num_layer = num_layer
+        self.num_heads = num_heads
+        self.channels = channels
+        self.padded_vocab_size = padded_vocab_size
+        self.untied_head = untied_head
 
     def num_parameters(self) -> Int:
         """Total number of model parameters implied by this config.
@@ -94,6 +120,8 @@ struct CheckpointConfig(Copyable, Movable):
         total += L * C  # proj_bias          (L, C)
         total += C  # ln_f_gamma             (C,)
         total += C  # ln_f_beta              (C,)
+        if self.untied_head != 0:
+            total += V_p * C  # lm_head       (V_p, C)
         return total
 
     def __eq__(self, other: Self) -> Bool:
@@ -104,6 +132,7 @@ struct CheckpointConfig(Copyable, Movable):
             and self.num_heads == other.num_heads
             and self.channels == other.channels
             and self.padded_vocab_size == other.padded_vocab_size
+            and self.untied_head == other.untied_head
         )
 
     def __ne__(self, other: Self) -> Bool:
@@ -181,10 +210,10 @@ struct TrainingState(Copyable, Movable):
 
 
 @always_inline
-def _version_for_dtype(dtype: DType) -> Int:
+def _version_for_dtype(dtype: DType, untied_head: Int = 0) -> Int:
     if dtype == DType.bfloat16 or dtype == DType.float16:
-        return VERSION_BF16
-    return VERSION_FP32
+        return VERSION_BF16_UNTIED if untied_head != 0 else VERSION_BF16
+    return VERSION_FP32_UNTIED if untied_head != 0 else VERSION_FP32
 
 
 # ===----------------------------------------------------------------------=== #
@@ -210,7 +239,7 @@ def write_model_checkpoint[
     """
     var resolved_version = version
     if resolved_version == AUTO_VERSION:
-        resolved_version = _version_for_dtype(dtype)
+        resolved_version = _version_for_dtype(dtype, config.untied_head)
 
     var header = heap_alloc[Int32](CHECKPOINT_HEADER_SIZE)
     for i in range(CHECKPOINT_HEADER_SIZE):
@@ -244,7 +273,10 @@ def read_model_header(mut file: FileHandle) raises -> ModelHeader:
             "Checkpoint error: bad model magic number in header: "
             + String(magic)
         )
-    if version != VERSION_FP32 and version != VERSION_BF16:
+    var untied = (
+        version == VERSION_FP32_UNTIED or version == VERSION_BF16_UNTIED
+    )
+    if version != VERSION_FP32 and version != VERSION_BF16 and not untied:
         header.unsafe_free()
         raise Error(
             "Checkpoint error: unsupported model version in header: "
@@ -258,6 +290,7 @@ def read_model_header(mut file: FileHandle) raises -> ModelHeader:
         num_heads=Int(header.unsafe_load(5)),
         channels=Int(header.unsafe_load(6)),
         padded_vocab_size=Int(header.unsafe_load(7)),
+        untied_head=1 if untied else 0,
     )
     header.unsafe_free()
     return ModelHeader(config^, version)
@@ -286,7 +319,9 @@ def read_model_checkpoint[
 
     `capacity` is the number of elements `params_out` can hold and must be at
     least `header.config.num_parameters()` (call `peek_model_header` first to
-    size the buffer).
+    size the buffer). The file must be exactly header + `num_parameters()`
+    elements long: trailing bytes mean a layout this reader does not know (for
+    example an untied blob behind a tied header) and are refused, not ignored.
     """
     var file = open(path, "r")
     var header = read_model_header(file)
@@ -298,6 +333,26 @@ def read_model_checkpoint[
             + String(num_parameters)
             + ", got "
             + String(capacity)
+            + ")"
+        )
+    var expect_bytes = (
+        CHECKPOINT_HEADER_SIZE * size_of[DType.int32]()
+        + num_parameters * size_of[dtype]()
+    )
+    var file_bytes = Int(getsize(path))
+    if file_bytes != expect_bytes:
+        file.close()
+        raise Error(
+            "Checkpoint error: model file "
+            + path
+            + " is "
+            + String(file_bytes)
+            + " bytes, expected "
+            + String(expect_bytes)
+            + " (header version "
+            + String(header.version)
+            + ", num_parameters="
+            + String(num_parameters)
             + ")"
         )
     read_and_copy[dtype](file, params_out, num_parameters)

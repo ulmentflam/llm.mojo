@@ -36,6 +36,7 @@ from llmm.checkpointing import (
     TrainingState,
     write_model_checkpoint,
     read_model_checkpoint,
+    peek_model_header,
     write_state_checkpoint,
     read_state_checkpoint,
     read_state_header,
@@ -177,7 +178,12 @@ comptime Z3_WTE_ONDEMAND = is_defined["LLMM_Z3_WTE_ONDEMAND"]()
 
 comptime MUON_OWNERSHIP_VERSION = 1  # state header slot 42: (k*L + l) mod W
 
-comptime NUM_PARAMETER_TENSORS = 16
+# Untied LM head (docs/ai/untied_lm_head_design_2026-10-30.md): -D
+# LLMM_UNTIED_HEAD=1 appends a 17th parameter tensor `lm_head` [V_p, C] after
+# ln_f_beta. In the tied build (default) `Parameters.lm_head` aliases `wte`, so
+# head-addressing code resolves to the same integers the tied build always used.
+comptime UNTIED_HEAD = get_defined_int["LLMM_UNTIED_HEAD", 0]() != 0
+comptime NUM_PARAMETER_TENSORS = 17 if UNTIED_HEAD else 16
 comptime NUM_ACTIVATION_TENSORS = 26
 
 
@@ -230,6 +236,11 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #   LLMM_SR_SEED=<int>         shared SR seed, default 1746221221 (adamw +
 #                              nvfp4; decorrelated by stream id, see
 #                              llmm/rng_device.mojo's stream registry).
+# Model layout
+#   LLMM_UNTIED_HEAD=1         17th parameter tensor `lm_head` [V_p, C] (separate
+#                              from wte); model files version 13 (fp32) / 15
+#                              (bf16). Slice S0: head idle (LM head still reads
+#                              wte, optimizer skips the head).
 # Numerics / dispatch
 #   LLMM_NO_TF32=1             true IEEE fp32 GEMMs (llmm/vendor.mojo).
 #   LLMM_FORCE_PORTABLE_GPU=1  vendor-neutral GPU path (llmm/vendor.mojo).
@@ -479,6 +490,8 @@ struct Parameters:
     comptime proj_bias = 13
     comptime ln_f_gamma = 14
     comptime ln_f_beta = 15
+    # Untied build: tensor 16. Tied build: alias of wte (see UNTIED_HEAD).
+    comptime lm_head = 16 if UNTIED_HEAD else 0
 
 
 def _parameter_name(t: Int) -> StaticString:
@@ -515,6 +528,8 @@ def _parameter_name(t: Int) -> StaticString:
         return "ln_f_gamma"
     elif t == Parameters.ln_f_beta:
         return "ln_f_beta"
+    elif UNTIED_HEAD and t == Parameters.lm_head:
+        return "lm_head"
     else:
         return "unknown"
 
@@ -552,6 +567,13 @@ struct ParameterTensors[
     var ln_f_gamma: MutMemPtr[Self.dtype]  # (C, )
     var ln_f_beta: MutMemPtr[Self.dtype]  # (C, )
 
+    # LM head (V_p, C). Untied build: its own tensor, last in the flat layout.
+    # Tied build: never set (null). It is deliberately NOT a copied alias of
+    # `wte`: params.wte / grads.wte are re-pointed at ZeRO-3 windows and the
+    # gradient pool, so a copy would go stale. Consumers go through
+    # GPT2._head_param_ptr / _head_grad_ptr, which read the live field.
+    var lm_head: MutMemPtr[Self.dtype]
+
     def __init__(out self):
         var zero = 0
         self.params_memory = MutMemPtr[Self.dtype](unsafe_from_address=zero)
@@ -572,6 +594,7 @@ struct ParameterTensors[
         self.proj_bias = MutMemPtr[Self.dtype](unsafe_from_address=zero)
         self.ln_f_gamma = MutMemPtr[Self.dtype](unsafe_from_address=zero)
         self.ln_f_beta = MutMemPtr[Self.dtype](unsafe_from_address=zero)
+        self.lm_head = MutMemPtr[Self.dtype](unsafe_from_address=zero)
 
     def point_parameters(
         mut self,
@@ -600,6 +623,8 @@ struct ParameterTensors[
         ptrs.append(ParamPtrPtr(to=self.proj_bias))
         ptrs.append(ParamPtrPtr(to=self.ln_f_gamma))
         ptrs.append(ParamPtrPtr(to=self.ln_f_beta))
+        comptime if UNTIED_HEAD:
+            ptrs.append(ParamPtrPtr(to=self.lm_head))
 
         var params_memory_iterator = self.params_memory
 
@@ -1414,6 +1439,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var enc_bitmap_union: MutMemPtr[DType.uint32]
     var enc_row_of_token: MutMemPtr[DType.int32]
     var enc_row_sparse: Bool
+    # True when the LM head reads `wte` (always, in the tied build). Slice S0 of
+    # the untied-head work keeps this True in the untied build too: the 17th
+    # tensor exists, is loaded, saved and sharded, but is idle (no forward, no
+    # gradient, no optimizer update). See `_head_t`.
+    var head_tied: Bool
+    # The model .bin being loaded carries its own head block (version 13/15).
+    var file_untied: Bool
     var enc_num_rows: Int
     var enc_run_first: List[Int]
     var enc_run_len: List[Int]
@@ -1560,6 +1592,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.enc_bitmap_union = NULL_UINT32_PTR
         self.enc_row_of_token = NULL_INT32_PTR
         self.enc_row_sparse = False
+        self.head_tied = True
+        self.file_untied = False
         self.enc_num_rows = 0
         self.enc_run_first = List[Int]()
         self.enc_run_len = List[Int]()
@@ -1668,7 +1702,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 raise Error("GPT2 error: Invalid magic number in header")
             # llm.c's version convention: 3 => fp32 params, 5 => bf16 params.
             comptime EXPECTED_VERSION = 5 if GPT2_DTYPE == DType.bfloat16 else 3
-            if Int(model_header.unsafe_load(1)) != EXPECTED_VERSION:
+            # Untied-head files (version + 10) are accepted only by the untied
+            # build; the tied build refuses them rather than dropping the head.
+            var file_version = Int(model_header.unsafe_load(1))
+            comptime if UNTIED_HEAD:
+                self.file_untied = file_version == EXPECTED_VERSION + 10
+            if file_version != EXPECTED_VERSION and not self.file_untied:
                 print(
                     "Bad version in header: "
                     + String(model_header.unsafe_load(1))
@@ -2173,6 +2212,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         from the current config. Shared by the checkpoint and from-scratch
         allocation paths.
         """
+        comptime if UNTIED_HEAD:
+            comptime assert not Z3_WTE_ONDEMAND, (
+                "LLMM_UNTIED_HEAD=1 is incompatible with LLMM_Z3_WTE_ONDEMAND:"
+                " the on-demand tile gather is designed around the tied wte"
+                " (untied ZeRO-3 gathers the head per tile instead)."
+            )
         var max_T = self.config.max_seq_len
         var L = self.config.num_layer
         var C = self.config.channels
@@ -2194,6 +2239,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.param_sizes[Parameters.proj_bias] = L * C
         self.param_sizes[Parameters.ln_f_gamma] = C
         self.param_sizes[Parameters.ln_f_beta] = C
+        comptime if UNTIED_HEAD:
+            self.param_sizes[Parameters.lm_head] = V_p * C
 
         var num_parameters = 0
         for i in range(NUM_PARAMETER_TENSORS):
@@ -2254,7 +2301,41 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         var temp_ptr = rebind_mut_mem[GPT2_DTYPE](
             temp_host_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-        read_and_copy[GPT2_DTYPE](model_file, temp_ptr, self.num_parameters)
+        # Exact length: a tied file carries N16 elements, an untied file N17;
+        # anything else is a different layout (or truncated), not a short read.
+        var want_elems = self.num_parameters
+        comptime if UNTIED_HEAD:
+            if not self.file_untied:
+                want_elems -= self.param_sizes[Parameters.lm_head]
+        var want_bytes = 256 * 4 + want_elems * size_of[GPT2_DTYPE]()
+        var have_bytes = Int(getsize(self.checkpoint_path))
+        if have_bytes != want_bytes:
+            raise Error(
+                "GPT2 error: model file "
+                + self.checkpoint_path
+                + " is "
+                + String(have_bytes)
+                + " bytes, expected "
+                + String(want_bytes)
+            )
+        comptime if UNTIED_HEAD:
+            var head_n = self.param_sizes[Parameters.lm_head]
+            var body_n = self.num_parameters - head_n
+            if self.file_untied:
+                read_and_copy[GPT2_DTYPE](
+                    model_file, temp_ptr, self.num_parameters
+                )
+            else:
+                # Tied file (version 3/5): read the 16-tensor blob and
+                # initialize the head as a copy of wte (padding rows are zero
+                # in both).
+                read_and_copy[GPT2_DTYPE](model_file, temp_ptr, body_n)
+                for i in range(head_n):
+                    temp_ptr[unsafe_offset=body_n + i] = temp_ptr[
+                        unsafe_offset=i
+                    ]
+        else:
+            read_and_copy[GPT2_DTYPE](model_file, temp_ptr, self.num_parameters)
         model_file.close()
 
         self._z3_finalize_params(
@@ -2519,6 +2600,19 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             "transformer.ln_f.bias", hp.unsafe_offset(base)
         )
         base += C
+
+        comptime if UNTIED_HEAD:
+            # Head block: HF's `lm_head.weight` (V real rows; padding rows stay
+            # zero) when the export carries one, else a copy of wte. GPT-2
+            # exports tie it to wte, so both give the same bytes there.
+            if "lm_head.weight" in st.tensors:
+                st.read_tensor[GPT2_DTYPE](
+                    "lm_head.weight", hp.unsafe_offset(base)
+                )
+            else:
+                for i in range(V_p * C):
+                    hp[unsafe_offset=base + i] = hp[unsafe_offset=i]
+            base += V_p * C
 
         self._z3_finalize_params(
             rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
@@ -5908,7 +6002,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
     def _adamw_shard_segments(self) -> List[AdamSeg]:
         """Nonempty intersections of this rank's flat optimizer shard
-        [lo, hi) with the 5 AdamW ranges, ascending. `compact_off` is the
+        [lo, hi) with the AdamW ranges (5; 6 in the untied build), ascending. `compact_off` is the
         prefix sum of the lengths (the compact Muon `v` layout). At W=1 or
         ZeRO-0, [lo, hi) = [0, N) and these are exactly `_adamw_ranges()`."""
         var lo = 0
@@ -5950,8 +6044,80 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         r.append(self.param_offset(Parameters.fc_bias))
         r.append(self.param_offset(Parameters.proj_weight))
         r.append(self.param_offset(Parameters.proj_bias))
+        comptime if UNTIED_HEAD:
+            # Body tail [proj_bias, head) and the head [head, N) are separate
+            # ranges so the head can get its own treatment; concatenation order
+            # (and therefore every compact-v offset of the other ranges) is the
+            # same as the tied layout's.
+            r.append(self.param_offset(Parameters.lm_head))
+            r.append(self.param_offset(Parameters.lm_head))
         r.append(self.num_parameters)
         return r^
+
+    @always_inline
+    def _head_t(self) -> Int:
+        """Index of the parameter tensor the LM head reads: always `wte` in
+        slice S0 (the untied head tensor exists but is idle). `Parameters.
+        lm_head` is returned only once a later slice clears `head_tied`."""
+        comptime if UNTIED_HEAD:
+            if not self.head_tied:
+                return Parameters.lm_head
+        return Parameters.wte
+
+    @always_inline
+    def _head_param_ptr(self) -> MutMemPtr[GPT2_DTYPE]:
+        """Live pointer to the weights the LM head multiplies by."""
+        comptime if UNTIED_HEAD:
+            if not self.head_tied:
+                return self.params.lm_head
+        return self.params.wte
+
+    @always_inline
+    def _head_grad_ptr(self) -> MutMemPtr[GPT2_DTYPE]:
+        """Live pointer to where the LM head's weight gradient accumulates."""
+        comptime if UNTIED_HEAD:
+            if not self.head_tied:
+                return self.grads.lm_head
+        return self.grads.wte
+
+    def _head_idle_from(self, flat_start: Int) -> Bool:
+        """True when a flat range starting at `flat_start` lies in the untied
+        head and the head is not being trained (tied phase / slice S0). The
+        tied build has no head range, so this is constant False there."""
+        comptime if UNTIED_HEAD:
+            return self.head_tied and flat_start >= self.param_offset(
+                Parameters.lm_head
+            )
+        else:
+            return False
+
+    def _adamw_flat(
+        mut self,
+        n: Int,
+        p: MutKernelPtr[GPT2_DTYPE],
+        g: MutKernelPtr[GPT2_DTYPE],
+        master: MutKernelPtr[MASTER_DTYPE],
+        m: MutKernelPtr[MASTER_DTYPE],
+        v: MutKernelPtr[MASTER_DTYPE],
+        flat_lo: Int,
+        t: UInt32,
+        config: AdamWConfig,
+    ) raises:
+        """One AdamW call over `n` elements of the flat parameter vector
+        starting at flat index `flat_lo`; p/g/master/m/v already point at that
+        slice. Tied build: exactly the single whole-slice `adamw_update` the
+        five update() sites always made. Untied build: the slice is cut at the
+        head offset and only the body part is updated (the head is idle until
+        slice S2 gives it its own config and step counter)."""
+        var n_use = n
+        comptime if UNTIED_HEAD:
+            var head_off = self.param_offset(Parameters.lm_head)
+            n_use = min(n, max(head_off - flat_lo, 0))
+        if n_use <= 0:
+            return
+        adamw_update[GPT2_DTYPE, Self.target](
+            n_use, p, g, master, USE_BF16, m, v, t, config, self.ctx
+        )
 
     def _update_hybrid(
         mut self,
@@ -5964,7 +6130,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         for k in range(len(ranges) // 2):
             var start = ranges[2 * k]
             var n = ranges[2 * k + 1] - start
-            if n <= 0:
+            if n <= 0 or self._head_idle_from(start):
                 continue
             adamw_update[GPT2_DTYPE, Self.target](
                 n,
@@ -6059,6 +6225,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var segs = self._adamw_shard_segments()
             for i in range(len(segs)):
                 ref sg = segs[i]
+                if self._head_idle_from(sg.flat_start):
+                    continue
                 var g_seg = self.grads_memory.unsafe_offset(sg.flat_start)
                 if bucketed:
                     g_seg = self.grad_shard_memory.unsafe_offset(sg.shard_rel)
@@ -6195,6 +6363,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var p_ptr: MutMemPtr[GPT2_DTYPE] = self.params_memory
             var g_ptr: MutMemPtr[GPT2_DTYPE] = self.grads_memory
             var update_num_params = self.num_parameters
+            var update_flat_lo = 0
 
             comptime if Self.WORLD_SIZE > 1:
                 if self.zero_ctx.zero_stage >= 1:
@@ -6222,6 +6391,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     if self._use_bucketing():
                         g_ptr = self.grad_shard_memory
                     update_num_params = local_num_params
+                    update_flat_lo = offset
 
             var hybrid_done = False
             if self.optimizer_kind == 1:
@@ -6229,17 +6399,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 hybrid_done = True
             if update_num_params > 0 and not hybrid_done:
                 comptime simd_w = simd_width_of[GPT2_DTYPE]()
-                adamw_update[GPT2_DTYPE, Self.target, width=simd_w](
+                self._adamw_flat(
                     update_num_params,
-                    p_ptr.as_unsafe_any_origin(),
-                    g_ptr.as_unsafe_any_origin(),
-                    self.master_memory.as_unsafe_any_origin(),
-                    USE_BF16,
-                    self.m_memory.as_unsafe_any_origin(),
-                    self.v_memory.as_unsafe_any_origin(),
+                    as_mut_kernel[GPT2_DTYPE](p_ptr),
+                    as_mut_kernel[GPT2_DTYPE](g_ptr),
+                    as_mut_kernel[MASTER_DTYPE](self.master_memory),
+                    as_mut_kernel[MASTER_DTYPE](self.m_memory),
+                    as_mut_kernel[MASTER_DTYPE](self.v_memory),
+                    update_flat_lo,
                     t,
                     config,
-                    self.ctx,
                 )
 
             self.ctx.synchronize()
@@ -6267,17 +6436,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     if self.optimizer_kind == 1:
                         self._update_hybrid(t, config)
                     else:
-                        adamw_update[GPT2_DTYPE, Self.target](
+                        self._adamw_flat(
                             self.num_parameters,
                             as_mut_kernel[GPT2_DTYPE](self.params_memory),
                             as_mut_kernel[GPT2_DTYPE](self.grads_memory),
                             as_mut_kernel[MASTER_DTYPE](self.master_memory),
-                            USE_BF16,
                             as_mut_kernel[MASTER_DTYPE](self.m_memory),
                             as_mut_kernel[MASTER_DTYPE](self.v_memory),
+                            0,
                             t,
                             config,
-                            self.ctx,
                         )
                 elif self.zero_ctx.zero_stage == 1:
                     # ZeRO-1: grads were allreduced — read shard from grads_memory + offset.
@@ -6289,7 +6457,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         self.optimizer_num_parameters,
                     )
                     if local_num_params > 0:
-                        adamw_update[GPT2_DTYPE, Self.target](
+                        self._adamw_flat(
                             local_num_params,
                             as_mut_kernel[GPT2_DTYPE](
                                 self.params_memory.unsafe_offset(offset)
@@ -6298,12 +6466,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                                 self.grads_memory.unsafe_offset(offset)
                             ),
                             as_mut_kernel[MASTER_DTYPE](self.master_memory),
-                            USE_BF16,
                             as_mut_kernel[MASTER_DTYPE](self.m_memory),
                             as_mut_kernel[MASTER_DTYPE](self.v_memory),
+                            offset,
                             t,
                             config,
-                            self.ctx,
                         )
                     self.ctx.synchronize()
                     # Allgather so params_memory is consistent before the next forward.
@@ -6334,19 +6501,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     # index the shard at rank*opt inside the full param buffer.
                     var p_off = 0 if self.z3_streaming else offset
                     if local_num_params > 0:
-                        adamw_update[GPT2_DTYPE, Self.target](
+                        self._adamw_flat(
                             local_num_params,
                             as_mut_kernel[GPT2_DTYPE](
                                 self.params_memory.unsafe_offset(p_off)
                             ),
                             as_mut_kernel[GPT2_DTYPE](g_shard),
                             as_mut_kernel[MASTER_DTYPE](self.master_memory),
-                            USE_BF16,
                             as_mut_kernel[MASTER_DTYPE](self.m_memory),
                             as_mut_kernel[MASTER_DTYPE](self.v_memory),
+                            offset,
                             t,
                             config,
-                            self.ctx,
                         )
                     self.ctx.synchronize()
                     # ZeRO-2 allgathers here so params_memory is immediately consistent.
@@ -6362,17 +6528,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 if self.optimizer_kind == 1:
                     self._update_hybrid(t, config)
                 else:
-                    adamw_update[GPT2_DTYPE, Self.target](
+                    self._adamw_flat(
                         self.num_parameters,
                         as_mut_kernel[GPT2_DTYPE](self.params_memory),
                         as_mut_kernel[GPT2_DTYPE](self.grads_memory),
                         as_mut_kernel[MASTER_DTYPE](self.master_memory),
-                        USE_BF16,
                         as_mut_kernel[MASTER_DTYPE](self.m_memory),
                         as_mut_kernel[MASTER_DTYPE](self.v_memory),
+                        0,
                         t,
                         config,
-                        self.ctx,
                     )
 
     def calculate_grad_norm(mut self) raises -> Float32:
@@ -6400,6 +6565,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         effective mean gradient to unit norm exactly like llm.c.
         """
         var n = self.num_parameters
+        # The idle untied head has no gradient; reduce over the body only so
+        # the CPU chunk partition (global_norm_squared_cpu splits n by core
+        # count) is the tied build's and the norm is bit-identical to it.
+        comptime if UNTIED_HEAD:
+            if self.head_tied:
+                n = self.param_offset(Parameters.lm_head)
         var grads_src = self.grads_memory
         var sharded = False
         comptime if Self.WORLD_SIZE > 1:
@@ -6714,6 +6885,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             num_heads=self.config.num_heads,
             channels=self.config.channels,
             padded_vocab_size=self.config.padded_vocab_size,
+            untied_head=1 if UNTIED_HEAD else 0,
         )
 
     def _copy_device_to_host[
@@ -6877,6 +7049,24 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.num_parameters
         )
         self.ctx.synchronize()
+        # The checkpoint's layout must be this build's layout: a tied file in an
+        # untied build (or the reverse) would leave the head unset or drop it.
+        var ck_header = peek_model_header(model_path)
+        if ck_header.config.untied_head != (1 if UNTIED_HEAD else 0):
+            raise Error(
+                "Cannot resume: model file "
+                + model_path
+                + " has "
+                + (
+                    "an untied" if ck_header.config.untied_head
+                    != 0 else "a tied"
+                )
+                + " LM head (version "
+                + String(ck_header.version)
+                + ") but this build is "
+                + ("untied" if UNTIED_HEAD else "tied")
+                + " (-D LLMM_UNTIED_HEAD)"
+            )
         _ = read_model_checkpoint(
             model_path,
             rebind_mut_mem[GPT2_DTYPE](
