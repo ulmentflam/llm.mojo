@@ -7347,18 +7347,6 @@ def train[
     )
     if args.optimizer == "muon":
         model.enable_muon(args.muon_momentum)
-        # Sharded Muon (W > 1, ZeRO >= 1) cannot write or read a state file
-        # until the owner-space momentum is in it (slice S4). Refuse up front:
-        # write_checkpoint would otherwise raise only at the first save step,
-        # after all the training before it.
-        comptime if WORLD_SIZE > 1:
-            if model.zero_ctx.zero_stage >= 1 and args.output_log_dir != "":
-                if args.checkpoint_every > 0 or args.resume == 1:
-                    raise Error(
-                        "-opt muon with -z >= 1 at WORLD_SIZE > 1 cannot"
-                        " checkpoint or resume yet (sharded-Muon state is"
-                        " not in the state file); drop -n / -y, or use -z 0"
-                    )
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
 
