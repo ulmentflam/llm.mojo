@@ -173,7 +173,7 @@ $(PIXI_STAMP):
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
-        build-infer build-infer-bf16 build-infer-fp8 infer-max-graph infer-max-eager data-hellaswag eval eval-cpu benchmark-eval \
+        build-infer build-infer-bf16 build-infer-fp8 build-infer-untied infer-untied verify-untied-dump infer-max-graph infer-max-eager data-hellaswag eval eval-cpu benchmark-eval \
         verify-fp8-grads verify-fp8-static-grads calibrate-fp8-scales \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal benchmark-zero \
         figure-blindness figure-breakeven figures-wte benchmark-vocab-tiles \
@@ -597,13 +597,28 @@ build-infer: $(INFER_BIN)
 
 $(INFER_BIN): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN) $(INFER_MOJO_SRC)
 
 build-infer-bf16: $(INFER_BIN_BF16)
 
 $(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
+
+# Untied-head (W9) bf16 inference binary. A separate output name because make
+# does not rebuild on a flag change: build/infer_gpt2_bf16 stays the tied build.
+# Generate from an untied (version 13/15) checkpoint, e.g.
+#   make infer-untied CHECKPOINT=gpt2_124M_untied_bf16.bin ARGS=16
+INFER_BIN_UNTIED := build/infer_gpt2_bf16_untied
+
+build-infer-untied: $(INFER_BIN_UNTIED)
+
+$(INFER_BIN_UNTIED): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 -D LLMM_UNTIED_HEAD=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN_UNTIED) $(INFER_MOJO_SRC)
+
+infer-untied: $(INFER_BIN_UNTIED)
+	./$(INFER_BIN_UNTIED) $(CHECKPOINT) $(ARGS)
 
 # GPT-2 inference on MAX's Python APIs: the stable graph API (max.nn +
 # max.graph) and the experimental eager API (max.experimental), sharing
@@ -622,7 +637,7 @@ build-infer-fp8: $(INFER_BIN_FP8)
 
 $(INFER_BIN_FP8): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_FP8) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN_FP8) $(INFER_MOJO_SRC)
 
 # Chunk F gradient gate (docs/ai/fp8_training_design.md Chunk F / gotchas E5):
 # dump all 148 param-gradient tensors after one fwd+bwd step on the fixed
@@ -653,6 +668,21 @@ verify-fp8-grads: $(DUMP_BIN_BF16) $(DUMP_BIN_FP8)
 	./$(DUMP_BIN_BF16) $(GRAD_DUMP_DIR_BF16)
 	./$(DUMP_BIN_FP8) $(GRAD_DUMP_DIR_FP8)
 	$(PIXI) run -e cuda python3 tests/compare_grad_dumps.py $(GRAD_DUMP_DIR_FP8) $(GRAD_DUMP_DIR_BF16)
+
+# W9 untied head: dump the 17th gradient (lm_head) from an fp32 untied GPU
+# build and compare it with the untied reference debug state
+# (test_gpt2's per-tensor criterion). GPU-only; run under the GPU lock.
+DUMP_BIN_UNTIED := build/dump_grads_gpt2_untied
+GRAD_DUMP_DIR_UNTIED := build/grad_dump_untied
+
+$(DUMP_BIN_UNTIED): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_NO_TF32=1 -D LLMM_UNTIED_HEAD=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_UNTIED) $(DUMP_MOJO_SRC)
+
+verify-untied-dump: $(DUMP_BIN_UNTIED)
+	@mkdir -p $(GRAD_DUMP_DIR_UNTIED)
+	./$(DUMP_BIN_UNTIED) $(GRAD_DUMP_DIR_UNTIED)
+	python3 -I scripts/check_dump_lm_head.py $(GRAD_DUMP_DIR_UNTIED)
 
 # A1 static-scales variant of the same gate (docs/ai/speedrun_techniques_
 # research.md A1): dumps under `-D LLMM_PRECISION=fp8 -D

@@ -1053,6 +1053,65 @@ in `_head_adam_step`, so S5 must not fold it into the config); the sharded
 Muon path (`_update_sharded_muon`) has the offset but is untested at W>1;
 the memory report does not yet print `untie_step`.
 
+## S7 implementation notes (2026-10-30)
+
+Tooling and docs. Branch mn/w9s7, gated on the tree after merging mn/w9 (S4).
+
+- Label and MFU: `flops_params = num_parameters - V_p*C` in the untied build
+  (train_gpt2.mojo main). The model label (`gpt2-124M`) and `estimate_mfu` use
+  it; the `params=` field stays the true stored count (163,109,376). Formula:
+  flops/token = 6*N16 + 6*L*C*T, because the LM-head GEMM is one V_p*C matmul
+  whether its weight is wte or lm_head, and the untied wte is lookup-only.
+  Per-step FLOPs are therefore identical tied vs untied. Old formula (6*N17)
+  would inflate by 1.288x at 124M/T=1024 (1,035.3M vs 803.5M flops/token).
+  5-step bf16 smoke, B=4 T=1024, GB10: tied `mfu_pct` 5.5 18.5 17.8 18.3 17.6,
+  untied 5.6 18.2 18.1 18.2 18.1 (step times 142-150 ms both); the old formula
+  would have shown ~23.3 for the untied step 5. Label before: `gpt2-163M`,
+  after: `gpt2-124M`.
+- Memory report: untied builds add `untied_head`, `untie_step`, `head_tied` to
+  the schema-3 line (tied line unchanged).
+- nanscan probe: slot 4 = `lm_head` (fifth whole-tensor class), per-layer
+  slots start at `N_WHOLE`; in the untied build the backward order is
+  lm_head first and `wte` (encoder only) beside `wpe` last. The probe only runs
+  at WORLD_SIZE > 1 (the call is inside the multi-rank branch), so it was
+  compile-verified (`WORLD_SIZE=2 -D LLMM_UNTIED_HEAD=1 -D
+  LLMM_DEBUG_TENSOR_NANSCAN=1`) but NOT run: this box has one GPU.
+- `dump_grads_gpt2`: under the flag it loads `gpt2_124M_untied{_bf16}.bin` and
+  the untied debug state and writes `lm_head.bin` ([V_p, C], 149 files).
+  `make verify-untied-dump` builds an fp32 untied dump and
+  `scripts/check_dump_lm_head.py` compares dlm_head with the reference using
+  test_gpt2's criterion: maxdiff 3.2e-4 against threshold 0.51, l2_ratio
+  1.0000. Planted check: copying `wte.bin` (the encoder-only gradient) over
+  `lm_head.bin` fails (maxdiff 10.06, l2_ratio 0.027). The checker's first
+  version read the grads as the file tail and failed on garbage: the debug
+  state carries 98 MB after the gradients, so it now reads exactly N floats.
+- Makefile: `$(MOJO_DEFINES)` on all three `build-infer*` (W8 already had it
+  on bf16; same text), `build-infer-untied` / `infer-untied` (separate binary
+  `build/infer_gpt2_bf16_untied`, because make does not rebuild on a flag
+  change). Generation from the untied checkpoint that the 5-step untied smoke
+  wrote (`model_5.bin`, version 15): `make infer-untied CHECKPOINT=... ARGS='16
+  1337'` printed 16 tokens of text.
+- Refusals: `scripts/export_to_hf.py` (SystemExit, rc 1, message names version
+  and why), `scripts/check_checkpoint_biases.py`, `max_gpt2_common.py`
+  (ValueError) refuse version 13/15. Tied path unchanged: export of
+  `gpt2_124M_bf16.bin` before/after produces a byte-identical
+  `model.safetensors` and the same log modulo temp dir names;
+  `check_checkpoint_biases.py` output on the tied file diffs empty. Full
+  untied export (`lm_head.weight`, `tie_word_embeddings: false`) NOT done.
+- Log levels (finding of the S2 verifier): `Log._field_level` makes a QUIET
+  event show its NORMAL-level fields, so verdict lines keep their keys.
+  Before: `result` (test_gpt2 at `LLMM_LOG_LEVEL=quiet`); after: `result
+  gate=gpu status=pass`. The trainer's `done steps=.. tok_s=..` line benefits
+  the same way. VERBOSE-level fields stay hidden at quiet.
+  `scripts/test_log.py` has no per-field levels, so no mirror change.
+- Gates (all on the merged tree): tied 3-step CPU d6 AdamW `cmp` of model and
+  state against the fe3312a-era base binary: identical. `make verify-cpu` and
+  `make verify-untied-cpu`: `result gate=cpu status=pass`. In one gpu_slot
+  chain: `make verify-gpu`, `make verify-untied-gpu` (also at quiet), both
+  `result gate=gpu status=pass`; `make test-mojo` tied and with
+  `TEST_DEFINES="-D LLMM_UNTIED_HEAD=1"`: `tests result=pass files=30 passed=271
+  skipped=1 failed=0` both.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Opus agent), directed by Evan Owen.

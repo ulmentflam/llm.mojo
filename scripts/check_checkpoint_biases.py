@@ -55,6 +55,12 @@ def check(path):
         header = struct.unpack(f"<{HEADER_INTS}i", f.read(HEADER_INTS * 4))
         magic, version, maxT, V, L, H, C = header[:7]
         Vp = header[7]
+        if version in (13, 15):
+            raise SystemExit(
+                f"{path}: untied-head checkpoint (version {version}: a separate "
+                "lm_head tensor follows ln_f). This checker derives the "
+                "16-tensor total and would misread the blob; refusing."
+            )
         payload = f.read()
 
     total = sum(n for _, n in tensor_layout(maxT, V, L, C, Vp))
