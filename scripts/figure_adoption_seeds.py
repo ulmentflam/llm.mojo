@@ -418,9 +418,7 @@ def render(runs, summ, mode: str, out: Path) -> None:
         fontweight="bold",
     )
     d2.set_title(
-        f"step time {summ['ms_delta_pct']:+.1f}% (median of runs)"
-        if ps
-        else "median ms/step",
+        f"step time, median: {summ['ms_delta_pct']:+.1f}%" if ps else "median ms/step",
         loc="left",
         fontsize=10.5,
         color=th["ink"],
