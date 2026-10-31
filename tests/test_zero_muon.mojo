@@ -25,7 +25,7 @@ from llmm.memory import MutMemPtr, heap_alloc
 from llmm.muon import muon_momentum_at
 from llmm.zero import CpuCoordinator
 
-from train_gpt2 import GPT2, GPT2_DTYPE
+from train_gpt2 import GPT2, GPT2_DTYPE, ROTARY
 
 comptime TT = 16
 comptime BB = 1
@@ -673,7 +673,18 @@ def _sizes_w8(
         assert_equal(got[unsafe_offset=4 * r], exp_s)
         assert_equal(got[unsafe_offset=4 * r + 1], exp_opt)
         assert_equal(got[unsafe_offset=4 * r + 2], exp_o[r])
-        assert_equal(got[unsafe_offset=4 * r + 3], exp_a[r])
+        var want_a = exp_a[r]
+        comptime if ROTARY:
+            # -D LLMM_ROTARY=1 leaves wpe out of the AdamW ranges: subtract its
+            # overlap with this rank's shard [r*opt, (r+1)*opt). wpe is the
+            # [maxT=TT, C=16] block right after wte ([VOCAB, 16]), derived here
+            # independently of the trainer.
+            var wpe_lo = VOCAB * 16
+            var wpe_hi = wpe_lo + TT * 16
+            var lo = max(wpe_lo, r * exp_opt)
+            var hi = min(wpe_hi, (r + 1) * exp_opt)
+            want_a -= max(0, hi - lo)
+        assert_equal(got[unsafe_offset=4 * r + 3], want_a)
     got.unsafe_free()
 
 

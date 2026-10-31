@@ -21,6 +21,39 @@ from torch.distributed import destroy_process_group, init_process_group
 
 
 """
+Rotary position embeddings (GPT2_ROTARY=1), the reference for the Mojo
+-D LLMM_ROTARY=1 build. modded-nanogpt's half-truncated form: per head of size
+hd, `(1/1024) ** linspace(0, 1, hd/4)` on the first hd/2 dims (rotate-half
+pairs (i, i + hd/2)), zero frequency (identity) on the second half. `wpe` is
+kept as a parameter (same dump layout) but is not added to the embeddings, so
+its gradient is exactly zero. The cos/sin table is built in float64 and rounded
+to float32 once, matching llmm/rotary.mojo's host table.
+"""
+
+ROTARY = os.environ.get("GPT2_ROTARY", "0") == "1"
+
+
+def rotary_cos_sin(
+    seq_len: int, head_dim: int, device: Any = None
+) -> tuple[Tensor, Tensor]:
+    """float32 [T, hd/2] cos and sin tables (second half identity)."""
+    n = head_dim // 4
+    expo = torch.linspace(0, 1, n, dtype=torch.float64)
+    freq = (1.0 / 1024.0) ** expo  # [n]
+    freq = torch.cat([freq, torch.zeros(head_dim // 2 - n, dtype=torch.float64)])
+    theta = torch.outer(torch.arange(seq_len, dtype=torch.float64), freq)
+    return theta.cos().float().to(device), theta.sin().float().to(device)
+
+
+def apply_rotary(x: Tensor) -> Tensor:
+    """x: [B, nh, T, hd]; rotate-half over the first hd/2 / last hd/2 split."""
+    T, hd = x.shape[-2], x.shape[-1]
+    cos, sin = rotary_cos_sin(T, hd, x.device)
+    x1, x2 = x[..., : hd // 2], x[..., hd // 2 :]
+    return torch.cat([x1 * cos + x2 * sin, x2 * cos - x1 * sin], dim=-1)
+
+
+"""
 Print Helper
 """
 
@@ -205,6 +238,27 @@ class GeLU(nn.Module):
         )
 
 
+class ReLU2(nn.Module):
+    """relu(x)^2, the modded-nanogpt MLP activation (GPT2_ACT=relu2)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.relu(x).square()
+
+
+def mlp_activation() -> nn.Module:
+    """MLP activation selected by GPT2_ACT=gelu|relu2 (default gelu), the
+    reference counterpart of the Mojo build constant -D LLMM_MLP_ACT."""
+    act = os.environ.get("GPT2_ACT", "gelu")
+    if act == "gelu":
+        return GeLU()
+    if act == "relu2":
+        return ReLU2()
+    raise ValueError(f"GPT2_ACT must be gelu or relu2, got {act!r}")
+
+
 class Sequential(nn.Module):
     def __init__(self, *args) -> None:
         super().__init__()
@@ -268,7 +322,7 @@ class MLP(nn.Module):
         self.out_dim = out_dim
         ordered_layers: list[nn.Module] = [
             Linear(input_dim, hidden_dim),
-            GeLU(),
+            mlp_activation(),
             Linear(hidden_dim, input_dim),
         ]
         if dropout:
@@ -296,7 +350,7 @@ class KarpathyMLP(nn.Module):
         self.hidden_dim = hidden_dim
         self.out_dim = out_dim
         self.c_fc = Linear(input_dim, hidden_dim)
-        self.gelu = GeLU()
+        self.gelu = mlp_activation()
         self.c_proj = Linear(hidden_dim, out_dim)
         setattr(
             self.c_proj, "LLMC_RESIDUAL_SCALE_FLAG", 1
@@ -426,8 +480,13 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(
             1, 2
         )  # (B, nh, T, hs)
+        # Order as in modded-nanogpt: QK-norm first, then rotary. (rms_norm
+        # commutes with the orthogonal per-pair rotation, so the Mojo side,
+        # which rotates l_qkv before the norm kernel, is the same function.)
         if QK_NORM:
             q, k = qk_rms_norm(q), qk_rms_norm(k)
+        if ROTARY:
+            q, k = apply_rotary(q), apply_rotary(k)
         scale = ATTN_SCALE if ATTN_SCALE > 0 else 1.0 / math.sqrt(k.size(-1))
         if FLASH:
             # Flash Attention via PyTorch
@@ -581,9 +640,19 @@ class GPT(nn.Module):
             )
             # We skip initilizing lm_head that shares params with wte
             if not hasattr(module, "LLMC_SKIP_INIT"):
+                # GPT2_ZERO_INIT_PROJ (mirrors the Mojo build constant
+                # -D LLMM_ZERO_INIT_PROJ): 0 = GPT-2 scaled normal (default),
+                # 1 = zero the residual projections, 2 = N(0, 0.02*0.1). The
+                # draw happens in every mode so the RNG stream of every later
+                # tensor is unchanged; only the written value differs.
+                zero_mode = int(os.environ.get("GPT2_ZERO_INIT_PROJ", "0"))
+                if hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG") and zero_mode == 2:
+                    std = 0.02 * 0.1
                 torch.nn.init.normal_(
                     module.weight, mean=0.0, std=std, generator=self.init_rng
                 )
+                if hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG") and zero_mode == 1:
+                    torch.nn.init.zeros_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -605,11 +674,14 @@ class GPT(nn.Module):
         token_emb = self.transformer.wte(
             idx
         )  # Token embeddings of shape [B, T, n_embd]
-        position_emb = self.transformer.wpe(
-            pos
-        )  # Positioning embeddings pf shape [t, n_embd]
+        if ROTARY:
+            x = token_emb  # positions enter through rotary on q/k instead
+        else:
+            position_emb = self.transformer.wpe(
+                pos
+            )  # Positioning embeddings pf shape [t, n_embd]
 
-        x = token_emb + position_emb
+            x = token_emb + position_emb
 
         for block in self.transformer.h:
             x = block(x)
@@ -1623,6 +1695,10 @@ def write_state(
         for name, param in model.named_parameters()
         if param.grad is not None
     }
+    if ROTARY:
+        # wpe is unused under rotary: autograd leaves its .grad as None, but the
+        # dump layout is unchanged and its gradient is exactly zero.
+        grads["transformer.wpe.weight"] = torch.zeros_like(model.transformer.wpe.weight)
     # Pad the vocab grads here as well, to mirror write_model
     wte_grad = grads["transformer.wte.weight"]  # [V, C]
     wte_grad_padded = pad_vocab(wte_grad, value=0)  # [V_p, C]
@@ -1697,9 +1773,10 @@ def capture_activations(model: GPT) -> tuple[dict[str, Tensor], list]:
 
     targets: dict[str, nn.Module] = {
         "transformer.wte": model.transformer.wte,
-        "transformer.wpe": model.transformer.wpe,
         "transformer.ln_f": model.transformer.ln_f,
     }
+    if not ROTARY:  # unused (no graph, no grad) under rotary
+        targets["transformer.wpe"] = model.transformer.wpe
     for i, block in enumerate(model.transformer.h):
         kblock = cast(KarpathyBlock, block)
         targets[f"transformer.h.{i}.ln_1"] = kblock.ln_1
@@ -2149,10 +2226,17 @@ if __name__ == "__main__":
         }
         model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
         model_size_str = model_to_size[args.model]  # e.g. "124M", or "d12"
-        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
-        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
-        write_model(model, f"gpt2_{model_size_str}_fp16.bin", dtype="float16")
-        write_model(model, f"gpt2_{model_size_str}_fp8.bin", dtype="float8")
+        # Rotary shares the exact same initial weights, so the model files are
+        # left alone (flag-off files stay byte-identical) and only the debug
+        # state, which holds rotary logits/grads, gets its own name.
+        if not ROTARY:
+            write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
+            write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
+            write_model(model, f"gpt2_{model_size_str}_fp16.bin", dtype="float16")
+            write_model(model, f"gpt2_{model_size_str}_fp8.bin", dtype="float8")
+        # Suffixes compose in this order: _rotary, _qknorm, _relu2 (an
+        # attn-scale run is renamed by hand, e.g. _qknorm_s012).
+        state_suffix = ("_rotary" if ROTARY else "") + ("_qknorm" if QK_NORM else "")
         # Save x, y, logits, loss, and parameter gradients, for debugging C
         # Always store these in fp32 to have an accurate reference (?)
         write_state(
@@ -2162,7 +2246,12 @@ if __name__ == "__main__":
             logits,
             loss,
             activations,
-            f"gpt2_{model_size_str}_debug_state.bin",
+            # Rotary and a non-default activation each get their own debug state
+            # (the pretrained weights files are independent of both and keep
+            # their names); the suffixes compose: _rotary, _qknorm, _relu2.
+            f"gpt2_{model_size_str}{state_suffix}"
+            + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
+            + "_debug_state.bin",
         )
         # Reset the train_loader for the optimization below
         train_loader.reset()

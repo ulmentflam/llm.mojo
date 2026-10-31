@@ -12,15 +12,26 @@ from llmm.memory import MutMemPtr, heap_alloc
 from llmm.log import Field, Log, num, text, DEBUG, NORMAL, QUIET, VERBOSE
 from llmm.term import pad_right
 from llmm.vendor import HAS_CUBLAS, USE_TF32
+from llmm.gelu import MLP_RELU2
 
 from train_gpt2 import (
     GPT2,
     GPT2_DTYPE,
+    ROTARY,
     ParameterTensors,
     QK_NORM,
     _ffmt,
 )
 
+# -D LLMM_MLP_ACT=relu2 swaps the MLP activation, so the reference state and the
+# loss trajectory come from the PyTorch reference run with GPT2_ACT=relu2
+# (train_gpt2.py writes gpt2_124M_relu2_debug_state.bin; the trajectory is
+# scripts/gen_expected_losses.py's output under the same env var).
+# -D LLMM_ROTARY=1 reads the rotary reference (same weights, rotary q/k, no wpe
+# add; written by `make rotary-reference`). Rotary and relu2 together have no
+# PyTorch trajectory here, so that combination is refused at compile time.
+# -D LLMM_QK_NORM=1 reads gpt2_124M_qknorm_debug_state.bin (GPT2_QK_NORM=1), and
+# with ROTARY gpt2_124M_rotary_qknorm_debug_state.bin; QK-norm + relu2 is refused.
 comptime SIZEOF_INT = size_of[DType.int32]()
 comptime SIZEOF_FLOAT = size_of[DType.float32]()
 
@@ -372,13 +383,26 @@ def run_test[
 
     # load additional information that we will use for debugging and error checking
 
-    # W7: under -D LLMM_QK_NORM=1 the reference is the PyTorch model with
-    # GPT2_QK_NORM=1 (and GPT2_ATTN_SCALE=<f> matching LLMM_ATTN_SCALE=<f>):
-    # a separate debug state, written by train_gpt2.py run in a scratch dir
-    # (see docs/ai/qk_norm_attn_scale.md). Flag off: the file is unchanged.
-    var state_name = String("gpt2_124M_debug_state.bin")
+    comptime assert not (
+        ROTARY and MLP_RELU2
+    ), "test_gpt2 has no reference for LLMM_ROTARY=1 with LLMM_MLP_ACT=relu2"
+    comptime assert not (
+        QK_NORM and MLP_RELU2
+    ), "test_gpt2 has no reference for LLMM_QK_NORM=1 with LLMM_MLP_ACT=relu2"
+
+    # The reference state is selected by build flag; the suffixes compose in the
+    # same order as train_gpt2.py writes them: _rotary, _qknorm, _relu2. They are
+    # written by train_gpt2.py run in a scratch dir with GPT2_ROTARY / GPT2_QK_NORM /
+    # GPT2_ACT (see docs/ai/qk_norm_attn_scale_2026-10-30.md). Flag off: the
+    # file is gpt2_124M_debug_state.bin, unchanged.
+    var state_name = String("gpt2_124M")
+    comptime if ROTARY:
+        state_name += "_rotary"
     comptime if QK_NORM:
-        state_name = "gpt2_124M_debug_state_qknorm.bin"
+        state_name += "_qknorm"
+    comptime if MLP_RELU2:
+        state_name += "_relu2"
+    state_name += "_debug_state.bin"
     if getenv("LLMM_DEBUG_STATE") != "":
         state_name = getenv("LLMM_DEBUG_STATE")
     if getenv("LLMM_ATTN_SCALE") != "":
@@ -475,22 +499,42 @@ def run_test[
     # reference file said 5.2678394, so every one of these ten steps reported
     # LOSS MISMATCH on every commit, and `make verify-gpu` exited 1 for
     # everyone. See scripts/gen_expected_losses.py for the full story.
-    var expected_losses: List[Float32] = [
-        5.26998233795166,
-        4.059586048126221,
-        3.374852418899536,
-        2.8005142211914062,
-        2.315274715423584,
-        1.8489989042282104,
-        1.3946499824523926,
-        0.9988086223602295,
-        0.6243725419044495,
-        0.37682223320007324,
-    ]
-
-    # W7: the trajectory of the QK-norm reference model (default attention
-    # scale), from scripts/gen_expected_losses.py run with GPT2_QK_NORM=1.
-    comptime if QK_NORM:
+    var expected_losses: List[Float32]
+    comptime if ROTARY and QK_NORM:
+        # QK-norm + rotary (norm first, then rotary, as modded-nanogpt), from
+        # scripts/gen_expected_losses.py run with GPT2_QK_NORM=1 GPT2_ROTARY=1.
+        expected_losses = [
+            9.654528617858887,
+            6.919290065765381,
+            6.292367458343506,
+            5.832812309265137,
+            5.480686187744141,
+            5.140079498291016,
+            4.795904636383057,
+            4.4713287353515625,
+            4.176088333129883,
+            3.879225492477417,
+        ]
+    elif ROTARY:
+        # PyTorch with GPT2_ROTARY=1 (same weights, rotary q/k, no wpe add),
+        # from `make rotary-reference`; step 0 is the rotary debug state's
+        # stored loss. Pretrained GPT-2 weights are not trained for rotary,
+        # hence the high start.
+        expected_losses = [
+            9.35813045501709,
+            6.650364875793457,
+            5.8415021896362305,
+            5.305992603302002,
+            4.834591388702393,
+            4.441601753234863,
+            4.0521063804626465,
+            3.70202374458313,
+            3.3840603828430176,
+            3.0682621002197266,
+        ]
+    elif QK_NORM:
+        # W7: the QK-norm reference model (default attention scale), from
+        # scripts/gen_expected_losses.py run with GPT2_QK_NORM=1.
         expected_losses = [
             5.722967147827148,
             4.701408386230469,
@@ -503,6 +547,41 @@ def run_test[
             1.2215285301208496,
             0.8687400221824646,
         ]
+    elif MLP_RELU2:
+        # relu2 trajectory: torch FLOAT64 (GPT2_ACT=relu2 scripts/gen_expected_losses.py
+        # --dtype float64), not fp32. relu2 on GELU-pretrained weights is
+        # ill-conditioned (residual stream ~1.2e5 from layer 3), and torch's own fp32
+        # run drifts from its fp64 run by 0.0126 at step 9 (3.367974 vs 3.380598),
+        # more than LOSS_STEP_TOL. Mojo fp32 (GPU 3.37966, CPU 3.38055) lands within
+        # 1e-3 of fp64, so the gate keeps the full-strength 0.01 against the true
+        # trajectory. Step 0 differs from the debug state's fp32 loss by 1e-5 (the
+        # stale-state guard allows 1e-3). See docs/ai/w5_w6_zero_init_proj_and_relu2_2026-10-30.md.
+        expected_losses = [
+            7.184733928491164,
+            6.57912622894239,
+            6.156180415699619,
+            5.7834021372001345,
+            5.452741764643019,
+            5.0208772006836355,
+            4.616522495663473,
+            4.157646495279576,
+            3.7607664251102446,
+            3.380597985334229,
+        ]
+    else:
+        expected_losses = [
+            5.26998233795166,
+            4.059586048126221,
+            3.374852418899536,
+            2.8005142211914062,
+            2.315274715423584,
+            1.8489989042282104,
+            1.3946499824523926,
+            0.9988086223602295,
+            0.6243725419044495,
+            0.37682223320007324,
+        ]
+
     # Any other reference (e.g. -attn_scale 0.12): pass the PyTorch list, as
     # printed by scripts/gen_expected_losses.py, as comma-separated floats.
     if getenv("LLMM_EXPECTED_LOSSES") != "":
@@ -542,11 +621,22 @@ def run_test[
         print("=========================================================")
         return False
 
+    # LLMM_TRAJECTORY_STEPS=N gates only the first N steps (default all 10). For
+    # references where the GPU trainer and torch part ways after a few steps for
+    # a reason that is not the code under test (attn_scale 0.5, see
+    # docs/ai/qk_norm_attn_scale_2026-10-30.md), the step-0 loss and the 16
+    # gradient tensors are the gate and the early steps a sanity check.
+    var n_steps = 10
+    if getenv("LLMM_TRAJECTORY_STEPS") != "":
+        n_steps = Int(atol(getenv("LLMM_TRAJECTORY_STEPS")))
+        if n_steps < 1 or n_steps > 10:
+            print("LLMM_TRAJECTORY_STEPS must be in 1..10")
+            return False
     var steps_failed = 0
     var last_step_line = String()
     var last_loss = Float32(0.0)
     var last_ref = Float32(0.0)
-    for step in range(10):
+    for step in range(n_steps):
         var start = perf_counter_ns()
         model.forward(
             rebind[MutMemPtr[DType.int32]](x),
@@ -1007,7 +1097,7 @@ def run_test[
         text("gate", gate),
         text("check", "steps"),
         text("status", "ok" if steps_ok else "fail"),
-        num("steps", 10),
+        num("steps", n_steps),
         num("failed", steps_failed),
         num("loss", last_loss),
         num("ref", last_ref),

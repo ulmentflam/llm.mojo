@@ -37,9 +37,9 @@ state is written from a scratch directory (it also writes `gpt2_124M*.bin`, whic
 are symlinks to shared weights in a worktree):
 `GPT2_QK_NORM=1 [GPT2_ATTN_SCALE=0.12] python train_gpt2.py --device cpu
 --num_iterations 0 --input_bin <tiny_shakespeare_val.bin>`, renamed to
-`gpt2_124M_debug_state_qknorm[_s012].bin` (gitignored, 647 MB). Trajectories from
+`gpt2_124M_qknorm[_s012|_s05]_debug_state.bin` (gitignored, 647 MB; train_gpt2.py now writes the `_qknorm` suffix itself, the `_s012`/`_s05` ones are renamed by hand). Trajectories from
 `scripts/gen_expected_losses.py --state-file ...` with the same env. `test_gpt2.mojo`
-under `-D LLMM_QK_NORM=1` reads the qknorm state and an embedded trajectory;
+under `-D LLMM_QK_NORM=1` reads the qknorm state (`gpt2_124M_qknorm_debug_state.bin`) and an embedded trajectory;
 `LLMM_DEBUG_STATE`, `LLMM_ATTN_SCALE`, `LLMM_EXPECTED_LOSSES` select the 0.12 arm.
 The stock `make test-fixtures` is the optimizer fixture set and is not involved.
 Caveat: the pretrained weights were not trained with QK-norm, so every logit is
@@ -67,8 +67,11 @@ W8 rotary (not yet on main when this was written).
 
 ## Ranking jobs
 
-`w7_qknorm.sh` (QK-norm, default scale) and `w7_qknorm_s012.sh` (QK-norm,
-`-attn_scale 0.12`): base recipe plus `-qk_log 1`; logs `sweeps/w7_qknorm*.jsonl`,
+`w7_qknorm.sh` (QK-norm, default scale), `w7_qknorm_s012.sh` (QK-norm,
+`-attn_scale 0.12`) and `w7_off_qklog.sh` (flag off, the off arm for the max-logit
+comparison): base recipe plus `-qk_log 1`; the QK-norm jobs repeat
+`MOJO_DEFINES="-D LLMM_QK_NORM=1"` on the `make train-bf16` line so a source change
+cannot silently rebuild without the flag; logs `sweeps/w7_qknorm*.jsonl`,
 per-step `qk_max` in the verbose log. Results to be added after the runs.
 
 ## Independent verification (verifier, 2026-10-30)
@@ -108,6 +111,43 @@ is unexamined. The ranking arms (default, 0.12) stay at or below 8.
 Deviations found: `F.rms_norm`'s default eps is fp32 epsilon (1.19e-7, also for
 bf16 inputs; checked on torch 2.13), not 1e-6. Immaterial for rows of O(1)
 RMS. `make verify-cpu` and `make test-mojo` do not forward `MOJO_DEFINES`.
+
+## Merge with main (W8 rotary, W5/W6) and the combined arm
+
+Merged main 78c0806 into `mn/w7`. Conflicts: `Makefile` (main's `verify-init`
+block vs nothing: kept main's), `train_gpt2.mojo` forward/backward attention calls
+(rotary on `l_qkv` first, then `attention_fwd[..., use_soft_exp=ATTN_SOFT_EXP,
+qk_norm=QK_NORM]`; backward likewise, with the inverse rotation of `d_qkv`
+after it), `test_gpt2.mojo` (one comptime selection of state file and
+trajectory with arms rotary+qknorm, rotary, qknorm, relu2, default; rotary+relu2
+and qknorm+relu2 are refused by `comptime assert` inside `run_test`),
+`train_gpt2.py` (QK-norm first, then rotary, as modded-nanogpt; state-file
+suffixes compose `_rotary`, `_qknorm`, `_relu2`, also in
+`scripts/gen_expected_losses.py`). The Mojo side rotates before the norm kernel;
+rmsnorm(R x) = R rmsnorm(x) because R is orthogonal per pair, and the backward
+recomputes rstd from the already-rotated `acts.qkv`, so both orders are the same
+function.
+
+Combined fixture: `GPT2_QK_NORM=1 GPT2_ROTARY=1 python train_gpt2.py --device cpu
+--num_iterations 0 --input_bin ...` in a scratch dir gives
+`gpt2_124M_rotary_qknorm_debug_state.bin`; `GPT2_QK_NORM=1 GPT2_ROTARY=1 python
+scripts/gen_expected_losses.py --state-file <it>` gives the embedded list
+(9.6545286, 6.9192901, 6.2923675, 5.8328123, 5.4806862, 5.1400795, 4.7959046,
+4.4713287, 4.1760883, 3.8792255).
+
+## Scale-0.5 gate and known limits
+
+`make verify-gpu-qknorm-scale` runs QK-norm at `attn_scale` 0.5 (q_mul = 4), where
+a backward that ignores `q_mul` fails 13/16 gradient tensors; at 0.12 (q_mul 0.96)
+it cannot. It gates the step-0 loss, the 16 gradients and the first 7 trajectory
+steps (`LLMM_TRAJECTORY_STEPS=7`), because the GPU trajectory leaves torch's at
+step 7 for an unexplained reason (logit range above about 8; see the verifier
+notes). That divergence is a recorded limit, not explained. The fixture and the
+loss list regeneration commands are in the Makefile comment above the target.
+
+Other limits: eps is 1e-6 here vs `F.rms_norm`'s default of fp32 epsilon (immaterial
+for O(1) rows); QK-clip is a no-op under QK-norm (logits are bounded by
+`attn_scale * head_dim`).
 
 ## AI use statement
 

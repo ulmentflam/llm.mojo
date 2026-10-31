@@ -113,3 +113,64 @@ def test_input_survives_both_passes(case: Case) -> None:
     np.testing.assert_array_equal(x_storage, pristine)
     gelu.backward(x=x_storage, dtype_name=case.dtype)
     np.testing.assert_array_equal(x_storage, pristine)
+
+
+# --- relu2 (relu(x)^2, -D LLMM_MLP_ACT=relu2's activation) -------------------
+# The relu2_{fwd,bwd} ops are always compiled, so they are covered here in the
+# default build. Reference: torch relu(x).square(), derivative via autograd.
+
+
+def _relu2(xt: torch.Tensor) -> torch.Tensor:
+    return torch.relu(xt).square()
+
+
+@pytest.mark.parametrize("case", CASES, ids=_ids)
+def test_relu2_forward_matches_torch(case: Case) -> None:
+    x = _make_input(case)
+    out = gelu.forward(
+        x=to_storage(x, case.dtype), dtype_name=case.dtype, kernel_name="relu2_fwd"
+    )
+    expected = _relu2(torch.from_numpy(x))
+    tol = DTYPE_TOLERANCES[case.dtype]
+    np.testing.assert_allclose(
+        from_storage(out, case.dtype),
+        expected.numpy(),
+        atol=tol["atol"],
+        rtol=tol["rtol"],
+    )
+    # Not gelu: a relu2 kernel that fell back to gelu would be off by O(0.1).
+    assert (
+        np.abs(
+            from_storage(out, case.dtype)
+            - torch.nn.functional.gelu(torch.from_numpy(x), approximate="tanh").numpy()
+        ).max()
+        > 0.05
+    )
+
+
+@pytest.mark.parametrize("case", CASES, ids=_ids)
+def test_relu2_backward_matches_torch(case: Case) -> None:
+    x = _make_input(case)
+    xt = torch.from_numpy(x).requires_grad_(True)
+    _relu2(xt).backward(gradient=torch.ones_like(xt))
+    assert xt.grad is not None
+    out = gelu.backward(
+        x=to_storage(x, case.dtype), dtype_name=case.dtype, kernel_name="relu2_bwd"
+    )
+    tol = DTYPE_TOLERANCES[case.dtype]
+    np.testing.assert_allclose(
+        from_storage(out, case.dtype),
+        xt.grad.numpy(),
+        atol=BWD_ATOL.get(case.dtype, tol["atol"]),
+        rtol=tol["rtol"],
+    )
+
+
+@pytest.mark.parametrize("case", CASES, ids=_ids)
+def test_relu2_input_survives_both_passes(case: Case) -> None:
+    x_storage = to_storage(_make_input(case), case.dtype)
+    pristine = x_storage.copy()
+    gelu.forward(x=x_storage, dtype_name=case.dtype, kernel_name="relu2_fwd")
+    np.testing.assert_array_equal(x_storage, pristine)
+    gelu.backward(x=x_storage, dtype_name=case.dtype, kernel_name="relu2_bwd")
+    np.testing.assert_array_equal(x_storage, pristine)
