@@ -448,6 +448,7 @@ To be filled by the item owners. One row per arm.
 | W5 | base + `-D LLMM_ZERO_INIT_PROJ=2` (N(0, 0.002) projections, record 64's "small nonzero") | 5.0274 | | 4012 | -0.007 vs base (inside noise), 0.016 better than exact zero: init scale of the residual projections is not a lever at 124M/300 steps on its own |
 | W9 | base + `-D LLMM_UNTIED_HEAD=1 -untie_at 0` (zero head from scratch, params 163M) | 5.1503 | | 4023 | +0.116 vs the tied base: a zero head gives the body no gradient at step 0 and the head starts from nothing, so untying from scratch loses at a 300-step horizon; this is the reason the speedrun retied (record 51) and now unties at 2/3 of training (record 53); the `-untie_at 0.667` arm is queued |
 | W9 | untied from scratch + `-l_head 0.125` (head at 6e-4, body AdamW ranges at 4.8e-3) | 5.5097 | | 4022 | +0.359 vs untied-from-scratch, +0.475 vs tied: a zero-initialized head cannot afford a low rate, it has everything to learn; the speedrun's low head rate (0.008 vs 0.6 for embeddings) only makes sense once the head starts from the trained wte, i.e. with `-untie_at` |
+| W9 | base + `-D LLMM_UNTIED_HEAD=1 -untie_at 0.667` (tied to step 200, head := wte, then 100 untied steps) | 5.0351 | | 3968 | equal to the tied base (+0.0004): the late untie neither helps nor hurts at a 300-step horizon; its value, if any, needs the plan's 2000-step comparison, where the head has thousands of steps to specialize |
 
 ## 7. Not in scope (so nobody re-litigates)
 
