@@ -1547,8 +1547,11 @@ verify: verify-cpu verify-gpu
 # 15 tensors and the logits/loss pass. The 10-step loss check alone cannot
 # tell tied from untied training (the two reference tables differ by < 0.006,
 # under LOSS_STEP_TOL=0.01): only the 17-tensor gradient check discriminates.
+# Extra defines for the untied verify builds, e.g.
+# `make verify-untied-cpu UNTIED_VERIFY_DEFINES="-D LLMM_LM_HEAD_VOCAB_TILES=1"`.
+UNTIED_VERIFY_DEFINES ?=
 verify-untied-cpu: | $(PIXI_STAMP)
-	$(PIXI) run mojo -D LLMM_UNTIED_HEAD=1 test_gpt2.mojo cpu
+	$(PIXI) run mojo -D LLMM_UNTIED_HEAD=1 $(UNTIED_VERIFY_DEFINES) test_gpt2.mojo cpu
 
 verify-untied-gpu: | $(PIXI_STAMP)
 	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 -D LLMM_UNTIED_HEAD=1 test_gpt2.mojo gpu
