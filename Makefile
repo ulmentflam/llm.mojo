@@ -167,12 +167,13 @@ $(PIXI_STAMP):
 
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
+        verify-untied-cpu verify-untied-gpu check-untied-idle check-untied-head check-untie-at \
         typecheck check compile-rest clean figures figure-precision figure-muon build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
         profile-metal \
-        build-infer build-infer-bf16 build-infer-fp8 infer-max-graph infer-max-eager data-hellaswag eval eval-cpu benchmark-eval \
+        build-infer build-infer-bf16 build-infer-fp8 build-infer-untied infer-untied verify-untied-dump infer-max-graph infer-max-eager data-hellaswag eval eval-cpu benchmark-eval \
         verify-fp8-grads verify-fp8-static-grads calibrate-fp8-scales \
         build-llmc build-llmc-cpu build-llmc-gpu benchmark benchmark-cpu benchmark-gpu benchmark-metal benchmark-zero \
         figure-blindness figure-breakeven figures-wte benchmark-vocab-tiles \
@@ -599,13 +600,28 @@ build-infer: $(INFER_BIN)
 
 $(INFER_BIN): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN) $(INFER_MOJO_SRC)
 
 build-infer-bf16: $(INFER_BIN_BF16)
 
 $(INFER_BIN_BF16): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
 	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN_BF16) $(INFER_MOJO_SRC)
+
+# Untied-head (W9) bf16 inference binary. A separate output name because make
+# does not rebuild on a flag change: build/infer_gpt2_bf16 stays the tied build.
+# Generate from an untied (version 13/15) checkpoint, e.g.
+#   make infer-untied CHECKPOINT=gpt2_124M_untied_bf16.bin ARGS=16
+INFER_BIN_UNTIED := build/infer_gpt2_bf16_untied
+
+build-infer-untied: $(INFER_BIN_UNTIED)
+
+$(INFER_BIN_UNTIED): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 -D LLMM_UNTIED_HEAD=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN_UNTIED) $(INFER_MOJO_SRC)
+
+infer-untied: $(INFER_BIN_UNTIED)
+	./$(INFER_BIN_UNTIED) $(CHECKPOINT) $(ARGS)
 
 # GPT-2 inference on MAX's Python APIs: the stable graph API (max.nn +
 # max.graph) and the experimental eager API (max.experimental), sharing
@@ -624,7 +640,7 @@ build-infer-fp8: $(INFER_BIN_FP8)
 
 $(INFER_BIN_FP8): $(INFER_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(INFER_BIN_FP8) $(INFER_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_PRECISION=fp8 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(INFER_BIN_FP8) $(INFER_MOJO_SRC)
 
 # Chunk F gradient gate (docs/ai/fp8_training_design.md Chunk F / gotchas E5):
 # dump all 148 param-gradient tensors after one fwd+bwd step on the fixed
@@ -655,6 +671,21 @@ verify-fp8-grads: $(DUMP_BIN_BF16) $(DUMP_BIN_FP8)
 	./$(DUMP_BIN_BF16) $(GRAD_DUMP_DIR_BF16)
 	./$(DUMP_BIN_FP8) $(GRAD_DUMP_DIR_FP8)
 	$(PIXI) run -e cuda python3 tests/compare_grad_dumps.py $(GRAD_DUMP_DIR_FP8) $(GRAD_DUMP_DIR_BF16)
+
+# W9 untied head: dump the 17th gradient (lm_head) from an fp32 untied GPU
+# build and compare it with the untied reference debug state
+# (test_gpt2's per-tensor criterion). GPU-only; run under the GPU lock.
+DUMP_BIN_UNTIED := build/dump_grads_gpt2_untied
+GRAD_DUMP_DIR_UNTIED := build/grad_dump_untied
+
+$(DUMP_BIN_UNTIED): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
+	@mkdir -p build
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_NO_TF32=1 -D LLMM_UNTIED_HEAD=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_UNTIED) $(DUMP_MOJO_SRC)
+
+verify-untied-dump: $(DUMP_BIN_UNTIED)
+	@mkdir -p $(GRAD_DUMP_DIR_UNTIED)
+	./$(DUMP_BIN_UNTIED) $(GRAD_DUMP_DIR_UNTIED)
+	python3 -I scripts/check_dump_lm_head.py $(GRAD_DUMP_DIR_UNTIED)
 
 # A1 static-scales variant of the same gate (docs/ai/speedrun_techniques_
 # research.md A1): dumps under `-D LLMM_PRECISION=fp8 -D
@@ -1361,6 +1392,12 @@ endif
 # NVIDIA-gated early returns as skipped; a failing file prints its full output.
 # LLMM_LOG_LEVEL=verbose lists every test case; LLMM_LOG=plain passes the raw
 # TestSuite output through.
+# Extra comptime defines for every test build, e.g.
+# `make test-mojo TEST_DEFINES="-D LLMM_UNTIED_HEAD=1"` builds the whole suite
+# against the untied-LM-head trainer. Defaults to MOJO_DEFINES, so either spelling works
+# (TEST_DEFINES wins when both are set); empty by default (command line unchanged).
+TEST_DEFINES ?= $(MOJO_DEFINES)
+
 test-mojo: | $(PIXI_STAMP)
 	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
 		fail=0; \
@@ -1372,7 +1409,7 @@ test-mojo: | $(PIXI_STAMP)
 			bin="$$bindir/$$(basename "$$f" .mojo)"; \
 			if ! $(PIXI) run python scripts/test_log.py --build "$$f" -- \
 				timeout $(TEST_FILE_TIMEOUT) mojo build \
-				$(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o "$$bin" "$$f"; then \
+				$(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(TEST_DEFINES) -o "$$bin" "$$f"; then \
 				fail=1; \
 				continue; \
 			fi; \
@@ -1518,6 +1555,49 @@ rotary-reference:
 # We run them as separate processes because initializing both CPU and GPU standard
 # DeviceContexts in the same process leads to a MAX multi-context conflict/crash.
 verify: verify-cpu verify-gpu
+
+# Untied-LM-head references (docs/ai/untied_lm_head_design_2026-10-30.md):
+# test_gpt2.mojo built with -D LLMM_UNTIED_HEAD=1 checks 17 tensors against
+# gpt2_124M_untied.bin + gpt2_124M_untied_debug_state.bin, written by
+# `GPT2_UNTIED=1 pixi run python train_gpt2.py` (run it in a scratch dir and
+# copy the gpt2_124M_untied*.bin files here). Until slice S2 the head is idle
+# (the LM head still reads and accumulates into wte), so this gate FAILS by
+# design on dwte (= ref dwte + ref dlm_head) and dlm_head (all zero); the other
+# 15 tensors and the logits/loss pass. The 10-step loss check alone cannot
+# tell tied from untied training (the two reference tables differ by < 0.006,
+# under LOSS_STEP_TOL=0.01): only the 17-tensor gradient check discriminates.
+# Extra defines for the untied verify builds, e.g.
+# `make verify-untied-cpu UNTIED_VERIFY_DEFINES="-D LLMM_LM_HEAD_VOCAB_TILES=1"`.
+UNTIED_VERIFY_DEFINES ?=
+verify-untied-cpu: | $(PIXI_STAMP)
+	$(PIXI) run mojo -D LLMM_UNTIED_HEAD=1 $(UNTIED_VERIFY_DEFINES) test_gpt2.mojo cpu
+
+verify-untied-gpu: | $(PIXI_STAMP)
+	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 -D LLMM_UNTIED_HEAD=1 test_gpt2.mojo gpu
+
+# Slice S0 gate: -D LLMM_UNTIED_HEAD=1 with the head idle must reproduce the
+# tied build's 3-step CPU run (see scripts/check_untied_idle.py).
+check-untied-idle: | $(PIXI_STAMP)
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_tiedchk
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_untiedchk MOJO_DEFINES="-D LLMM_UNTIED_HEAD=1"
+	$(PIXI) run python scripts/check_untied_idle.py build/train_gpt2_tiedchk build/train_gpt2_untiedchk
+
+# Slice S2 gate: the untied head trains (differs from wte, nonzero m/v) and
+# stays equal to wte with m/v == 0 while idle, from a .bin with weight decay.
+check-untied-head: | $(PIXI_STAMP)
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_tiedchk
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_untiedchk MOJO_DEFINES="-D LLMM_UNTIED_HEAD=1"
+	$(PIXI) run python scripts/check_untied_head.py build/train_gpt2_tiedchk build/train_gpt2_untiedchk
+
+# Slice S4 gate: -untie_at transition, tied-phase files (head := wte), exact
+# resume across the untie point, refusals. S2_UNTIED_BIN = an untied-build
+# binary from before S4 (the -untie_at 0 run must equal it bit for bit);
+# default `-` compares with this build's own no-flag run.
+S2_UNTIED_BIN ?= -
+check-untie-at: | $(PIXI_STAMP)
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_tiedchk
+	$(MAKE) build-train TRAIN_BIN=build/train_gpt2_untiedchk MOJO_DEFINES="-D LLMM_UNTIED_HEAD=1"
+	$(PIXI) run python scripts/check_untie_at.py build/train_gpt2_untiedchk build/train_gpt2_tiedchk $(S2_UNTIED_BIN)
 
 verify-cpu: | $(PIXI_STAMP)
 	$(PIXI) run mojo $(MOJO_DEFINES) test_gpt2.mojo cpu

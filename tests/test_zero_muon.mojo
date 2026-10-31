@@ -25,7 +25,7 @@ from llmm.memory import MutMemPtr, heap_alloc
 from llmm.muon import muon_momentum_at
 from llmm.zero import CpuCoordinator
 
-from train_gpt2 import GPT2, GPT2_DTYPE, ROTARY
+from train_gpt2 import GPT2, GPT2_DTYPE, ROTARY, UNTIED_HEAD
 
 comptime TT = 16
 comptime BB = 1
@@ -81,6 +81,7 @@ def _train[
     accum: Int = 1,
     same_batch: Bool = False,
     mu_ramp: Bool = False,
+    idle_head: Bool = False,
 ) raises:
     """Run `steps` steps on W threaded ranks at `stage`; rank r's final params
     go to result[r*n : (r+1)*n]. `accum` micro-steps per step (gradient
@@ -105,6 +106,17 @@ def _train[
                     Pointer[CpuCoordinator, MutUntrackedOrigin]
                 ](coord),
             )
+            comptime if UNTIED_HEAD:
+                # S2 refuses ZeRO-2/3 while the head trains (S6 adds the head
+                # bucketing/streaming). These ZeRO-2/3 checks exercise the
+                # tied-phase layout: head block present in the 17-tensor
+                # buffer but idle (neither reduced, updated nor read).
+                model.head_tied = idle_head
+                # The model really carries the 17-tensor layout (head block
+                # after the 16 tied tensors), so the shard map differs from the
+                # tied build's even with the head idle.
+                assert_equal(model.num_parameters, n + model.param_sizes[0])
+                assert_equal(model.param_sizes[16], model.param_sizes[0])
             model.enable_muon(Scalar[DType.float32](0.95))
             var x = heap_alloc[SIMD[DType.int32, 1]](BB * TT)
             var y = heap_alloc[SIMD[DType.int32, 1]](BB * TT)
@@ -151,7 +163,10 @@ def _train[
                 # vector (collective: every rank) and check that the owner
                 # space and the next forward's gathered windows agree
                 # bit-exactly for the Muon matrices.
-                var full = model.ctx.enqueue_create_buffer[GPT2_DTYPE](n)
+                # Sized to the live model: an untied build gathers N16 + head.
+                var full = model.ctx.enqueue_create_buffer[GPT2_DTYPE](
+                    model.num_parameters
+                )
                 model.ctx.synchronize()
                 var fp = rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
                     full.unsafe_ptr().as_unsafe_any_origin()
@@ -294,10 +309,10 @@ def _t2_z2[W: Int](L: Int, NH: Int, C: Int, stage: Int = 2) raises:
     var ref3 = heap_alloc[Float32](W * n)
     var got3 = heap_alloc[Float32](W * n)
     try:
-        _train[W](path, n, 0, 1, ref1)
-        _train[W](path, n, stage, 1, got1)
-        _train[W](path, n, 0, STEPS, ref3)
-        _train[W](path, n, stage, STEPS, got3)
+        _train[W](path, n, 0, 1, ref1, idle_head=True)
+        _train[W](path, n, stage, 1, got1, idle_head=True)
+        _train[W](path, n, 0, STEPS, ref3, idle_head=True)
+        _train[W](path, n, stage, STEPS, got3, idle_head=True)
     except e:
         _remove(path)
         raise e^
@@ -395,8 +410,12 @@ def _t2_z2_same[W: Int](L: Int, NH: Int, C: Int) raises:
     var ref_p = heap_alloc[Float32](W * n)
     var got = heap_alloc[Float32](W * n)
     try:
-        _train[W](path, n, 0, STEPS, ref_p, accum=2, same_batch=True)
-        _train[W](path, n, 2, STEPS, got, accum=2, same_batch=True)
+        _train[W](
+            path, n, 0, STEPS, ref_p, accum=2, same_batch=True, idle_head=True
+        )
+        _train[W](
+            path, n, 2, STEPS, got, accum=2, same_batch=True, idle_head=True
+        )
     except e:
         _remove(path)
         ref_p.unsafe_free()
@@ -691,6 +710,13 @@ def _sizes_w8(
 def test_ownership_sizes_tiny_w8() raises:
     """The review-flagged tiny W=8 configs: L=1 has ranks owning no matrix
     (O_r = 0) and S > opt; both L=1 and L=2 have a rank with A_r = 0."""
+    # The expected per-rank sizes are for the 16-tensor layout. The untied
+    # build appends a head block, which shifts opt and every A_r; the generic
+    # invariants (ascending disjoint segments, prefix-sum compact_off, sum ==
+    # v_num_parameters) are still checked by the other ownership tests there.
+    comptime if UNTIED_HEAD:
+        print("SKIP test_ownership_sizes_tiny_w8: 16-tensor expectations")
+        return
     _sizes_w8(
         1,
         1024,

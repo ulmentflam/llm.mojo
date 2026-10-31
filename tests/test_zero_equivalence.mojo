@@ -1,4 +1,4 @@
-from std.testing import assert_almost_equal, TestSuite
+from std.testing import assert_almost_equal, assert_equal, TestSuite
 from std.sys.info import size_of
 
 from max.gpu.host import DeviceContext
@@ -6,7 +6,7 @@ from std.python import Python
 
 from llmm.memory import MutMemPtr, heap_alloc
 
-from train_gpt2 import GPT2, GPT2_DTYPE
+from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD
 
 comptime NUM_PARAMS = 4592
 comptime B = 2
@@ -139,6 +139,10 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
             zero_stage=0,
             ctx=ctx,
         )
+        comptime if UNTIED_HEAD:
+            # Stage >= 2 runs below use the idle head (S2 refuses a training
+            # head there until S6); the baseline must match them.
+            baseline_model.head_tied = stage >= 2
 
         baseline_model.forward(
             rebind[MutMemPtr[DType.int32]](x),
@@ -194,6 +198,13 @@ def run_zero_equivalence_test[N: Int](stage: Int) raises:
             ctx=ctx,
             cpu_coordinator_ptr=None,
         )
+        comptime if UNTIED_HEAD:
+            model.head_tied = stage >= 2  # see baseline above
+            # 17-tensor layout: the shard map is the untied one, head idle.
+            assert_equal(
+                model.num_parameters, NUM_PARAMS + model.param_sizes[0]
+            )
+            assert_equal(model.param_sizes[16], model.param_sizes[0])
         model.forward(
             rebind[MutMemPtr[DType.int32]](x),
             rebind[MutMemPtr[DType.int32]](y),

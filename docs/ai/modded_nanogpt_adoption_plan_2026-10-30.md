@@ -327,6 +327,12 @@ never runs rotary without QK-norm). Also a generation smoke
 
 ### W9. Untied LM head, with "tie early, untie late" as a variant
 
+**Status (2026-10-30): designed, not implemented.** Inventory, design, memory
+accounting and slices S0 to S8 are in
+[`untied_lm_head_design_2026-10-30.md`](untied_lm_head_design_2026-10-30.md).
+Note its finding 1: the head costs +589.5 MiB at W=1 (16 B per element in
+fp32 and bf16), not the +147 MiB stated below.
+
 **What.** A separate `lm_head` weight `[V_p, C]` so the head and the
 embedding can have different learning rates (W1's 0.6 vs 0.008) and the head
 can be zero-initialized (W5). The variant: train tied for the first two

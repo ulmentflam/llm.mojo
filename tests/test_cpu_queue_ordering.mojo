@@ -34,10 +34,13 @@ from std.python import Python
 from max.gpu.host import DeviceContext
 
 from llmm.memory import MutMemPtr, heap_alloc, stall_cpu_queue
-from train_gpt2 import GPT2, GPT2_DTYPE
+from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD
 
 comptime CKPT = "gpt2_tiny_queue_ordering.bin"
 comptime NUM_PARAMS = 4592  # tiny config below: L=1, C=16, V=V_p=64, maxT=16
+# The tied .bin written here is 16 tensors; an LLMM_UNTIED_HEAD build loads it
+# by copying wte into a 17th head block (V_p * C = 64 * 16 more elements).
+comptime MODEL_PARAMS = NUM_PARAMS + (64 * 16 if UNTIED_HEAD else 0)
 comptime B = 2
 comptime T = 8
 
@@ -99,9 +102,9 @@ def _run_two_steps(
     var y = heap_alloc[Scalar[DType.int32]](B * T)
     _fill_batch(x, y)
     var model = GPT2["cpu", 1](CKPT, rank=0, zero_stage=0, ctx=ctx)
-    assert_true(model.num_parameters == NUM_PARAMS, "unexpected param count")
+    assert_true(model.num_parameters == MODEL_PARAMS, "unexpected param count")
     model.debug_stall_cpu_queue = stall
-    var host = ctx.enqueue_create_host_buffer[GPT2_DTYPE](NUM_PARAMS)
+    var host = ctx.enqueue_create_host_buffer[GPT2_DTYPE](MODEL_PARAMS)
     for step in range(2):
         model.forward(x, y, B, T)
         model.zero_gradients()

@@ -152,6 +152,12 @@ def load_checkpoint(path: Path) -> tuple[GPT2Config, dict[str, np.ndarray]]:
     magic, version = int(header[0]), int(header[1])
     if magic not in MODEL_MAGICS:
         raise ValueError(f"{path}: bad magic {magic}, want one of {MODEL_MAGICS}")
+    if version in (13, 15):
+        raise ValueError(
+            f"{path}: untied-head checkpoint (version {version}: a separate"
+            " lm_head tensor follows ln_f); the MAX graphs build the tied"
+            " 16-tensor GPT-2 and do not support it"
+        )
     if version not in (VERSION_FP32, VERSION_BF16):
         raise ValueError(
             f"{path}: unsupported version {version} (want {VERSION_FP32} fp32"
