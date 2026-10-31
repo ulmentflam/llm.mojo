@@ -179,6 +179,31 @@ run already showed 300-step orderings narrow with length. The next steps are
 the three-seed combined run and the tokens-to-3.28 headline run the plan
 calls for.
 
+## Three-seed confirmation of the combined recipe
+
+Six 600-step runs on the same setup as the Muon three-seed table in the README
+(GPT-2 124M, bf16, FineWeb, 131k tokens/step, init seeds 42, 1, 2 via
+`LLMM_INIT_SEED`, same data order). Arm `base` is the campaign base
+(`-opt muon -l 4.8e-3 -mu 0.9 -c 0.1 -gc 1.0 -u 50`, cosine to 0). Arm
+`combined` is the recommended recipe above, built with
+`-D LLMM_ROTARY=1 -D LLMM_QK_NORM=1` and run with
+`-k wsd -u 0 -cooldown 0.4 -decay_shape linear -q 0.1 -mu_start 0.85 -mu 0.95 -mu_warmup 300`
+(schedule, momentum ramp, rotary, QK-norm; not relu2 or zero-init). Note the
+README's Muon table uses `-c 0 -gc 0`, so its 4.36 mean is not this base
+(`-c 0.1 -gc 1.0`); compare within this table. Logs:
+`docs/ai/data/adoption_seed_<arm>_s<seed>_600.jsonl`.
+
+<!-- adoption-seeds:start -->
+pending
+<!-- adoption-seeds:end -->
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../figures/modded_nanogpt_adoption_seeds_2026-10-31_dark.png">
+  <img alt="Three-seed confirmation: val loss per seed and arm, paired step-600 values, gain by step, train loss and step time" src="../../figures/modded_nanogpt_adoption_seeds_2026-10-31.png">
+</picture>
+
+Findings: pending the six runs.
+
 ## Incidents and lessons
 
 - **Broken keep-both merge.** Resolving the W2 merge by keeping both sides of
@@ -244,6 +269,7 @@ run already showed that 300-step orderings narrow with length.
 ```
 make figure-adoption-collect   # copy finished logs from the item worktrees into docs/ai/data
 make figure-adoption           # PNG (light + dark), JSON sidecar, and the tables above
+make figure-adoption-seeds-collect figure-adoption-seeds   # the three-seed section's logs, table, figure
 ```
 
 Collection reads the worktree `sweeps/` directories; rendering reads only

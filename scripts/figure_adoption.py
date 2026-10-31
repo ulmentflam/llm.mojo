@@ -281,6 +281,8 @@ def load_all() -> tuple[dict[str, dict], dict[str, dict]]:
     arms, timing = {}, {}
     for p in sorted(DATA.glob(PREFIX + "*.jsonl")):
         stem = p.name[len(PREFIX) : -len(".jsonl")]
+        if stem.startswith("seed_"):  # three-seed run: scripts/figure_adoption_seeds.py
+            continue
         if stem.startswith("timing_"):
             timing[stem] = load(p)
         elif "_600_" in stem:
