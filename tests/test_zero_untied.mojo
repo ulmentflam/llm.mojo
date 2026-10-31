@@ -38,6 +38,14 @@ Coverage:
      exact" argument holds for W=2, 4 only; test_zero_muon covers W=8 at its
      tolerance.
 
+  5. The -untie_at transition (`untie_head()`) at ZeRO-1/2/3 (W=2; ZeRO-2/3 also
+     W=4), AdamW and Muon: 1 tied step, untie, 2 trained steps == ZeRO-0 on all
+     17 tensors, and right after `untie_head()` the head is a bitwise copy of wte
+     on every rank (ZeRO-3 via the full gather). The direct check matters:
+     ZeRO-0/1/2 share the local-copy branch, so a broken copy there is equal in
+     reference and candidate (measured: a mutant skipping that copy passed every
+     ZeRO-2 transition test before the check existed).
+
 Finding 6 as measured: see the S6 section of the design doc (the ZeRO-2/3
 step-1 different-batch check now runs here).
 """
@@ -191,6 +199,44 @@ def _train[
                     if untie_after > 0 and step == untie_after:
                         model.untie_head()
                         model.ctx.synchronize()
+                        # Right after the transition the head must be a
+                        # bitwise copy of wte on every rank and stage (S4
+                        # spec). Checked here, not only via ZeRO-k == ZeRO-0,
+                        # because ZeRO-0/1/2 share the local-copy branch: a
+                        # broken copy there is identical in reference and
+                        # candidate and only this check sees it.
+                        var hn = model.param_sizes[16]
+                        var ho = model.param_offset(16)
+                        if model.z3_streaming:
+                            var hfull = model.ctx.enqueue_create_buffer[
+                                GPT2_DTYPE
+                            ](model.num_parameters)
+                            model.ctx.synchronize()
+                            model._z3_gather_full(
+                                rebind[
+                                    Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]
+                                ](hfull.unsafe_ptr().as_unsafe_any_origin())
+                            )
+                            model.ctx.synchronize()
+                            for i in range(hn):
+                                if hfull.unsafe_ptr()[unsafe_offset=ho + i] != (
+                                    hfull.unsafe_ptr()[unsafe_offset=i]
+                                ):
+                                    raise Error(
+                                        "after untie_head (ZeRO-3) head != wte"
+                                        " at "
+                                        + String(i)
+                                    )
+                        else:
+                            for i in range(hn):
+                                if (
+                                    model.params_memory[unsafe_offset=ho + i]
+                                    != model.params_memory[unsafe_offset=i]
+                                ):
+                                    raise Error(
+                                        "after untie_head head != wte at "
+                                        + String(i)
+                                    )
                 for ms in range(accum):
                     for i in range(BB * TT):
                         x[unsafe_offset=i] = Int32(
@@ -917,6 +963,18 @@ def _untie_transition[
     got.unsafe_free()
     init.unsafe_free()
     scratch.unsafe_free()
+
+
+def test_untie_transition_zero1_adamw_w2() raises:
+    if _skip_tied("test_untie_transition_zero1_adamw_w2"):
+        return
+    _untie_transition[2](2, 2, 16, 1, False)
+
+
+def test_untie_transition_zero1_muon_w2() raises:
+    if _skip_tied("test_untie_transition_zero1_muon_w2"):
+        return
+    _untie_transition[2](2, 2, 16, 1, True)
 
 
 def test_untie_transition_zero2_adamw_w2() raises:
