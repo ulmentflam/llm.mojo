@@ -415,6 +415,21 @@ class MultiHeadAttention(nn.Module):
 # Using a global to toggle flash-attention
 FLASH = 0
 
+# W7 (modded-nanogpt QK-norm + fixed attention scale), opt-in, default off:
+#   GPT2_QK_NORM=1     q, k <- rms_norm(q), rms_norm(k) over head_dim (no affine,
+#                      eps=QK_NORM_EPS, fp32 math) before the attention scores.
+#   GPT2_ATTN_SCALE=f  scores = (q @ k^T) * f instead of 1/sqrt(head_dim) (f > 0).
+# Mirrors -D LLMM_QK_NORM=1 and -attn_scale in train_gpt2.mojo / llmm/qk_norm.mojo.
+QK_NORM = int(os.environ.get("GPT2_QK_NORM", "0")) != 0
+ATTN_SCALE = float(os.environ.get("GPT2_ATTN_SCALE", "0"))
+QK_NORM_EPS = 1e-6
+
+
+def qk_rms_norm(x: Tensor) -> Tensor:
+    xf = x.float()
+    y = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + QK_NORM_EPS)
+    return y.to(x.dtype)
+
 
 # The purpose if this class is to name match the attention class vars for GPT-2
 class CausalSelfAttention(nn.Module):
@@ -465,14 +480,20 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(
             1, 2
         )  # (B, nh, T, hs)
+        # Order as in modded-nanogpt: QK-norm first, then rotary. (rms_norm
+        # commutes with the orthogonal per-pair rotation, so the Mojo side,
+        # which rotates l_qkv before the norm kernel, is the same function.)
+        if QK_NORM:
+            q, k = qk_rms_norm(q), qk_rms_norm(k)
         if ROTARY:
             q, k = apply_rotary(q), apply_rotary(k)
+        scale = ATTN_SCALE if ATTN_SCALE > 0 else 1.0 / math.sqrt(k.size(-1))
         if FLASH:
             # Flash Attention via PyTorch
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = (q @ k.transpose(-2, -1)) * scale
             att = att.masked_fill(
                 self.bias[:, :, :T, :T] == 0, float("-inf")
             )  # Karpathy's Causal Masking, not-preferred but will work fine.
@@ -2213,7 +2234,9 @@ if __name__ == "__main__":
             write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
             write_model(model, f"gpt2_{model_size_str}_fp16.bin", dtype="float16")
             write_model(model, f"gpt2_{model_size_str}_fp8.bin", dtype="float8")
-        state_suffix = "_rotary" if ROTARY else ""
+        # Suffixes compose in this order: _rotary, _qknorm, _relu2 (an
+        # attn-scale run is renamed by hand, e.g. _qknorm_s012).
+        state_suffix = ("_rotary" if ROTARY else "") + ("_qknorm" if QK_NORM else "")
         # Save x, y, logits, loss, and parameter gradients, for debugging C
         # Always store these in fp32 to have an accurate reference (?)
         write_state(
@@ -2225,7 +2248,7 @@ if __name__ == "__main__":
             activations,
             # Rotary and a non-default activation each get their own debug state
             # (the pretrained weights files are independent of both and keep
-            # their names); the suffixes compose: _rotary, _relu2, _rotary_relu2.
+            # their names); the suffixes compose: _rotary, _qknorm, _relu2.
             f"gpt2_{model_size_str}{state_suffix}"
             + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
             + "_debug_state.bin",

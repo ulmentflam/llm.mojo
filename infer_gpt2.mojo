@@ -1,4 +1,5 @@
 from std.sys import argv, exit, has_accelerator
+from std.os import getenv
 from max.gpu.host import DeviceContext
 
 
@@ -64,6 +65,10 @@ def run_infer[
         zero_stage=0,
         ctx=ctx,
     )
+    # W7: a model trained with -attn_scale needs the same scale here
+    # (LLMM_ATTN_SCALE=<f>); with -D LLMM_QK_NORM=1 the norm itself is baked in.
+    if getenv("LLMM_ATTN_SCALE") != "":
+        model.set_attn_scale(Float32(atof(getenv("LLMM_ATTN_SCALE"))))
     print("[infer] target:", target)
     print("[infer] checkpoint:", checkpoint_path)
     print("[infer] gen_max_length:", gen_max_length)
@@ -125,6 +130,8 @@ def run_eval[
         zero_stage=0,
         ctx=ctx,
     )
+    if getenv("LLMM_ATTN_SCALE") != "":
+        model.set_attn_scale(Float32(atof(getenv("LLMM_ATTN_SCALE"))))
     print("[eval] target:", target)
     print("[eval] checkpoint:", checkpoint_path)
     print("[eval] eval file:", eval_path)

@@ -87,7 +87,7 @@ import torch
 # train_gpt2.py guards its training driver behind `if __name__ == "__main__"`,
 # so importing it for the model definition is side-effect free.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from train_gpt2 import GPT, ROTARY  # noqa: E402
+from train_gpt2 import GPT, QK_NORM, ROTARY  # noqa: E402
 
 # GPT2_ACT=relu2 (the reference's MLP activation switch, mirroring the Mojo build
 # constant -D LLMM_MLP_ACT=relu2) reads/produces the *_relu2_debug_state.bin
@@ -96,10 +96,12 @@ from train_gpt2 import GPT, ROTARY  # noqa: E402
 # GPT2_ROTARY=1 selects the rotary reference: the same weights, rotary on q/k,
 # no wpe add, and the rotary debug state written by `GPT2_ROTARY=1 python
 # train_gpt2.py` (the list is then pasted as `expected_losses` under ROTARY).
-# The suffixes compose exactly as in train_gpt2.py: _rotary then _relu2.
+# GPT2_QK_NORM=1 selects the QK-norm reference (_qknorm suffix).
+# The suffixes compose exactly as in train_gpt2.py: _rotary, _qknorm, _relu2.
 STATE_FILE = (
     "gpt2_124M"
     + ("_rotary" if ROTARY else "")
+    + ("_qknorm" if QK_NORM else "")
     + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
     + "_debug_state.bin"
 )
