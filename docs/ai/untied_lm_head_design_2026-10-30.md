@@ -1201,10 +1201,117 @@ Tooling and docs. Branch mn/w9s7, gated on the tree after merging mn/w9 (S4).
   `TEST_DEFINES="-D LLMM_UNTIED_HEAD=1"`: `tests result=pass files=30 passed=271
   skipped=1 failed=0` both.
 
+## S3/S4/S6/S7 final verification (2026-10-30, separate Opus agent, rebuilt and rerun)
+
+Tree: `mn/w9` at `b4b8383` (S3 `1384818`, S4 `32b2a9b`, S7 `a602274`, S6 `b4b8383`).
+Diff reviewed: `c83b85d..b4b8383` over train_gpt2.mojo, llmm/, Makefile, scripts/, tests/.
+All binaries rebuilt through `build_slot.sh` from b4b8383 (tied/untied fp32 W=1 and
+W=2, tied/untied bf16; mtimes 22:25-22:33, source 22:22).
+
+**Bug found (not fixed here, outside a test-only remit): bf16 + sharded Muon + `-untie_at`
+writes the head's fp32 master at the wrong offset.** `_untie_apply_range` indexes the
+master shard-relative (`a - rank*opt`). Under sharded Muon (W > 1, ZeRO >= 1, `-opt
+muon`) `_trim_flat_m_master` makes the master compact (`A_r` elements, AdamW segment k
+at `compact_off`), and `_update_sharded_muon` and `load_checkpoint` both index it by
+`compact_off`. The head is the last segment on rank W-1, whose shard-relative offset is
+past the end of the compact buffer (124M, W=2: head at shard_rel about 43M, buffer about
+39M elements), so the copy writes out of bounds and the head's real master slot keeps
+its load-time value; the first post-untie update then writes `bf16(stale master +
+update)` into the head. fp32 has no master and every multi-rank gate here is fp32 CPU,
+so nothing can catch it on this box. Fix: under `_sharded_muon()` map `[a, b)` through
+`_adamw_shard_segments()` to `compact_off + (x - flat_start)` (or refuse `-untie_at`
+with bf16 sharded Muon until then). W=1 and AdamW ZeRO >= 1 are correct (master
+shard-sized there).
+
+Other review results:
+- Tied build: every new branch is `comptime if UNTIED_HEAD` or reduces to the old
+  operation (`_lm_head_tile(0, V_p)` is `params.wte` when no gather is compiled in;
+  `flops_params == num_parameters`; `load_checkpoint` now reads the state header first
+  and refuses `untied_layout != 0`, which tied files never set). `llmm/log.mojo`
+  `_field_level` returns `self.level` for every level >= NORMAL, so only QUIET output
+  changes.
+- Stale pointers: `grads.lm_head` is re-pointed to the pool by `_set_head_grad_ptr`
+  in all three Bucket 1 branches before any write; the encoder bucket re-points
+  `grads.wte` itself; under ZeRO-3 on-demand `params.lm_head` stays the (stale) layout
+  pointer but is only read when no gather happens, i.e. never while streaming and
+  untied; with `LLMM_Z3_HEAD_RESIDENT` it is re-pointed every `_z3_stream_embed`.
+- Head Adam step `t - s_u`: all three head sites (`_adamw_flat`, `_update_hybrid`,
+  `_update_sharded_muon`); every AdamW call goes through one of them.
+- README still says ZeRO-2/3 with a trained head are refused; S6 lifted that. It also
+  does not mention `-untie_at`.
+
+Gates rerun (verdict lines):
+- Tied byte identity vs the fe3312a binary, `LLMM_USE_CPU=1`, d6, 3 steps: AdamW gc 1,
+  AdamW gc 1e-3, Muon gc 1e-3: `model_3.bin` and `state_3_0.bin` identical (`cmp`).
+- Log: tied binary vs an S2-era tied binary (pre-S7 log.mojo), same run: verbose and
+  normal output identical modulo timing fields; quiet differs only in `done` gaining
+  `steps= tok_s=`.
+- `make verify-cpu` `result gate=cpu status=pass` (16 tensors); `make verify-untied-cpu`
+  K=8 and K=1 `status=pass` (17 tensors); `check-untied-idle`, `check-untied-head`
+  pass; AdamW half of `check-untie-at` `result gate=untie-at status=pass` (bias-corr
+  5.7e-9, t=4 would be 1.3e-4). The Muon half was not run (about 50 min of CPU).
+- GPU (one `gpu_slot.sh` chain): `verify-gpu`, `verify-untied-gpu` (17 tensors) and
+  `LLMM_LOG_LEVEL=quiet make verify-untied-gpu` all `result gate=gpu status=pass` (the
+  quiet run prints exactly that line); `verify-untied-dump` maxdiff 3.2e-4, rel L2 error
+  2.2e-5 (rerun of the new checker on the same dump); `make test-mojo` tied and
+  `TEST_DEFINES="-D LLMM_UNTIED_HEAD=1"` both `tests result=pass files=30 passed=295
+  skipped=1 failed=0` (test_zero_untied 42 passed, its new version).
+- bf16 smokes (B=4, T=1024, 5 steps, `gpt2_124M_bf16.bin`, one data shard, `-l 3e-4
+  -c 0.1`): tied 3.067284 3.688934 3.423465 3.907678 3.904594 (repeat identical);
+  untied 3.067284 3.688591 3.423657 3.903446 3.906831; `-untie_at 0.6` 3.067284
+  3.688934 3.423465 3.907678 3.898768 (repeat identical), `untie ... step=3` printed
+  between step 3 and step 4, model_3 head == wte, model_4/5 head != wte. MFU tied
+  18.2, untied 17.7-17.9; label `gpt2-124M` in both, `params=163109376` untied. bf16
+  W=1 `untied_head` memory object sums to 589.5 MiB (design 5.1).
+- `make infer-untied` from the untied smoke's `model_5.bin` printed 16 tokens.
+- Threaded CPU `tests/test_zero_untied.mojo` (after the commit below): 42/42 in the
+  default untied build, with `-D LLMM_Z3_HEAD_RESIDENT=1` and with
+  `-D LLMM_LM_HEAD_VOCAB_TILES=1`.
+- Memory, d6 W=2 fp32 CPU, `LLMM_MEM_REPORT`, recomputed with an independent script
+  (section 8 rescaled, comm excluded on CPU): params, m+v and window deltas match at
+  ZeRO-0..3 on both ranks; ZeRO-3 embed window tied 78,842,880 B, untied 88,673,280 B,
+  `head_tile_buf` 9,830,400 B = one 6400-row tile (the only off-model bytes are the
+  4-byte stub at ZeRO-0..2, which S6 documented).
+
+Mutants (scratch copies, reverted):
+- (a) ZeRO-3 head tile gathered from the wte offset: 12 of 40 tests in
+  test_zero_untied fail (8 ZeRO-3 equivalence, 4 ZeRO-3 transition).
+- (b) `untie_head()` skips the bf16 master promotion: only the bf16 smoke sees it
+  (step 5 3.881948 vs 3.898768; the correct run reproduces exactly). No CPU fp32 test
+  can: fp32 has no master.
+- (c) `_adamw_flat` head step `t` instead of `t - s_u`: test_zero_untied 40/40 pass
+  (reference and candidate share `_adamw_flat`); `check-untie-at` (AdamW) fails on the
+  bias-correction check (0.000127 vs 5.4e-9). Same mutant in `_update_sharded_muon`:
+  5 Muon transition tests fail (ZeRO-0 uses `_update_hybrid`).
+- (d) MFU from `num_parameters`: untied MFU 22.0-23.1 vs 17.7-17.9 (1.29x), losses
+  identical.
+- (e) local `head := wte` copy skipped (ZeRO-0/1/2 branch): the S6 tests passed all 4
+  ZeRO-2 transition cases (reference and candidate share the branch; only ZeRO-3
+  failed). Fixed by the test commit below: all 10 transition tests fail.
+- Planted `lm_head.bin` with vocab tile 5 zeroed, or one median row zeroed: the S7
+  checker passed both (50145 of 50257 rows lie under its 0.51 threshold). Fixed below.
+
+Commits: `124630c` (test_zero_untied: head == wte asserted right after `untie_head()`
+on every rank and stage, ZeRO-1 transition cases, 42 tests), `b78058a`
+(check_dump_lm_head: global rel L2 <= 1e-3 and per-row rel L2 <= 0.25).
+
+Merge into main (`git merge-tree mn/w9 main` at 7c8ba22): text conflicts in Makefile,
+README.md, llmm/checkpointing.mojo, scripts/gen_expected_losses.py, test_gpt2.mojo,
+tests/test_checkpointing.mojo, tests/test_qk_clip.mojo, tests/test_zero_muon.mojo,
+train_gpt2.mojo, train_gpt2.py. Semantic: main's W8 already uses **state header slot
+44** for architecture flags (`STATE_FLAGS_SLOT`, bit 0 rotary, state version 2 when
+nonzero); W9 writes `untied_layout = 1` there, which a merged reader would take as the
+rotary bit. W9's slots must move (or become an `ARCH_FLAG` bit). `_adamw_ranges`
+auto-merges correctly (rotary wpe skip plus the head split). test_gpt2 has no untied
+reference for rotary, relu2 or QK-norm; those combinations need a compile-time refusal
+like the existing rotary+relu2 one.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Opus agent), directed by Evan Owen.
 The inventory anchors were read from the code at `fe3312a` by the same agent;
 the memory figures come from a Python model it wrote and checked against the
 published tied-build figures. The S4 slice was implemented by a Claude Code
-(Sonnet) agent under the same direction.
+(Sonnet) agent under the same direction. The S3/S4/S6/S7 final verification
+section was written by a separate Claude Code (Opus) agent under the same
+direction, from builds and runs it made itself.
