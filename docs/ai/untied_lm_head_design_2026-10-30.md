@@ -1103,7 +1103,7 @@ Mutants (temporary, reverted): tile gather from `_z3_param_offset(wte)`: the 8
 ZeRO-3 tests fail, ZeRO-2 unaffected. Bucket 1 K>1 destination `flat_base[wte]`
 instead of the head: all 8 ZeRO-2 and 8 ZeRO-3 tests fail. `-untie_at` tile
 gather from the head offset instead of wte: the 4 ZeRO-3 transition tests fail.
-Variants: the file also passes with `-D LLMM_Z3_HEAD_RESIDENT=1`,
+Variants (32 tests, before the transition tests): the file also passes with `-D LLMM_Z3_HEAD_RESIDENT=1`,
 `-D LLMM_LM_HEAD_VOCAB_TILES=1` (K=1 through `_lm_head_tile`) and
 `-D LLMM_LM_HEAD_CHUNKED_CE=1`. The default tests run K=8 (tile = 8 rows of the
 64-row toy vocab), so the on-demand branch walks 8 tiles per pass.
@@ -1129,7 +1129,11 @@ ZeRO-3 window: tied 78,842,880 B (wte+wpe+ln_f), untied 88,673,280 B; growth is
 exactly one tile (the whole head would have been 77,266,944 B). The 4-byte
 entries are the 1-element placeholder reported as-is.
 
-Gates (merged tree, see the final report for verdict lines): tied 3-step CPU d6
+Gates on the merged tree (mn/w9 at a602274 merged in): see the final report;
+`check-untie-at` was run AdamW half only (the Muon half is S4's and ~1 h of CPU):
+`result gate=untie-at status=pass`.
+
+Gates (earlier list): tied 3-step CPU d6
 `cmp` identical (AdamW, Muon) against the fe3312a binary; `verify-cpu`,
 `verify-untied-cpu` at K=8 and K=1, `check-untied-idle`, `check-untied-head`,
 `check-untie-at`; GPU: `verify-gpu`, `verify-untied-gpu`, `make test-mojo` tied
