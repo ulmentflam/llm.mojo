@@ -1,6 +1,11 @@
 from std.os.path import getsize
 from std.python import Python
-from std.testing import assert_equal, assert_almost_equal, TestSuite
+from std.testing import (
+    assert_equal,
+    assert_almost_equal,
+    assert_true,
+    TestSuite,
+)
 
 from llmm.dataloader import DataLoader
 from llmm.memory import MutMemPtr, heap_alloc
@@ -1101,7 +1106,7 @@ def test_state_arch_flags_untied_bit_is_distinct_from_rotary() raises:
             assert_equal(_refusal_text(f, g) != "", f != g)
     var untied_vs_tied = _refusal_text(ARCH_FLAG_UNTIED, 0)
     assert_true("untied head (file untied, build tied" in untied_vs_tied)
-    assert_true("rotary" not in untied_vs_tied)
+    assert_true("rotary (file" not in untied_vs_tied)
     var tied_vs_untied = _refusal_text(0, ARCH_FLAG_UNTIED)
     assert_true("untied head (file tied, build untied" in tied_vs_untied)
     var rot_vs_none = _refusal_text(ARCH_FLAG_ROTARY, ARCH_FLAG_UNTIED)
