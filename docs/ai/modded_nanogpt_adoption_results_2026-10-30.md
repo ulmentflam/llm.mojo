@@ -170,14 +170,109 @@ Base Muon recipe plus, as candidate flags:
 ```
 
 Leave relu2/zero-init, the AdamW-range multiplier and the untied head at
-their defaults for now. **Caveats: these are single-seed, 300-step rankings,
-each measured one at a time; the combination has not been run, and effects
-are not guaranteed to add (QK-norm and rotary both act on attention). Nothing
-becomes a default until a combined run has three init seeds
-(`-D LLMM_INIT_SEED=42|1|2`) and a longer horizon**, since the 2000-step Muon
-run already showed 300-step orderings narrow with length. The next steps are
-the three-seed combined run and the tokens-to-3.28 headline run the plan
-calls for.
+their defaults for now. **Three-seed status: confirmed at 600 steps.** The
+combined recipe beat the base on every seed (mean 0.250, per-seed 0.246 to
+0.256, against seed spreads of 0.010 and 0.003; see the section below), but it
+costs about 14% step time on an idle GPU (rotary and QK-norm are unfused), and
+the gains are sub-additive (the 300-step single-item gains overstate it by
+about 2x at 600 steps). The headline tokens-to-3.28 run uses this recipe; it
+becomes the default only after that longer-horizon run.
+
+## Three-seed confirmation of the combined recipe
+
+Six 600-step runs on the same setup as the Muon three-seed table in the README
+(GPT-2 124M, bf16, FineWeb, 131k tokens/step, init seeds 42, 1, 2 via
+`LLMM_INIT_SEED`, same data order). Arm `base` is the campaign base
+(`-opt muon -l 4.8e-3 -mu 0.9 -c 0.1 -gc 1.0 -u 50`, cosine to 0). Arm
+`combined` is the recommended recipe above, built with
+`-D LLMM_ROTARY=1 -D LLMM_QK_NORM=1` and run with
+`-k wsd -u 0 -cooldown 0.4 -decay_shape linear -q 0.1 -mu_start 0.85 -mu 0.95 -mu_warmup 300`
+(schedule, momentum ramp, rotary, QK-norm; not relu2 or zero-init). Note the
+README's Muon table uses `-c 0 -gc 0`, so its 4.36 mean is not this base
+(`-c 0.1 -gc 1.0`); compare within this table. Logs:
+`docs/ai/data/adoption_seed_<arm>_s<seed>_600.jsonl`.
+
+<!-- adoption-seeds:start -->
+| run | val@100 | val@200 | val@300 | val@400 | val@500 | val@600 | train last-50 | ms/step |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| base s42 | 6.0156 | 5.2669 | 4.7984 | 4.5134 | 4.3815 | 4.3507 | 4.3272 | 4003 |
+| base s1 | 6.0065 | 5.2727 | 4.7986 | 4.5119 | 4.3779 | 4.3464 | 4.3228 | 4301 |
+| base s2 | 6.0034 | 5.2690 | 4.8009 | 4.5066 | 4.3711 | 4.3403 | 4.3177 | 4285 |
+| **base mean** | 6.0085 | 5.2695 | 4.7993 | 4.5106 | 4.3769 | 4.3458 | 4.3226 | 4197 |
+| base spread (max-min) | 0.0122 | 0.0057 | 0.0025 | 0.0068 | 0.0104 | 0.0104 | | |
+| combined s42 | 5.6409 | 5.0320 | 4.6012 | 4.4005 | 4.2242 | 4.0950 | 4.1025 | 4567 |
+| combined s1 | 5.6286 | 5.0326 | 4.6121 | 4.4035 | 4.2253 | 4.0972 | 4.1047 | 4547 |
+| combined s2 | 5.6395 | 5.0360 | 4.5970 | 4.4006 | 4.2209 | 4.0942 | 4.1004 | 4542 |
+| **combined mean** | 5.6363 | 5.0335 | 4.6034 | 4.4015 | 4.2235 | 4.0955 | 4.1026 | 4552 |
+| combined spread (max-min) | 0.0124 | 0.0040 | 0.0152 | 0.0031 | 0.0044 | 0.0029 | | |
+| gain s42 (base - combined) | +0.3746 | +0.2349 | +0.1971 | +0.1129 | +0.1574 | +0.2556 | | |
+| gain s1 (base - combined) | +0.3780 | +0.2401 | +0.1865 | +0.1084 | +0.1526 | +0.2493 | | |
+| gain s2 (base - combined) | +0.3639 | +0.2330 | +0.2039 | +0.1060 | +0.1502 | +0.2460 | | |
+| **mean gain** | +0.3722 | +0.2360 | +0.1958 | +0.1091 | +0.1534 | +0.2503 | | +6.1% (median) |
+| gain min to max | +0.3639 to +0.3780 | +0.2330 to +0.2401 | +0.1865 to +0.2039 | +0.1060 to +0.1129 | +0.1502 to +0.1574 | +0.2460 to +0.2556 | | |
+
+`*` step time unstable in the log (another job probably shared the GPU): upper bound.
+<!-- adoption-seeds:end -->
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../figures/modded_nanogpt_adoption_seeds_2026-10-31_dark.png">
+  <img alt="Three-seed confirmation: val loss per seed and arm, paired step-600 values, gain by step, train loss and step time" src="../../figures/modded_nanogpt_adoption_seeds_2026-10-31.png">
+</picture>
+
+Findings (three init seeds, same data order, 600 steps; all numbers from the
+table above).
+
+1. **The combined gain is real and far outside the seed spread.** Val@600 is
+   4.346 for base and 4.095 for combined, a mean gain of 0.250 with per-seed
+   gains 0.256, 0.249 and 0.246 (range 0.010). The seed spread of val@600 is
+   0.010 for base and 0.003 for combined, so the mean gain is about 24
+   times the base spread, and even the worst combined seed beats the best base
+   seed by 0.243. The gain is positive on every seed at every one of the six eval steps
+   (smallest 0.106, seed 2 at step 400). The seeds vary the init only; the
+   data order is fixed, so this bounds init noise, not data-order noise.
+2. **The per-item gains do not add up.** The schedule alone is worth 0.093 at
+   600 steps (the W3 pair above), so rotary, QK-norm and the momentum ramp
+   together account for about 0.157 of the 0.250, assuming the schedule's gain
+   carries over. Their single-item 300-step gains sum to 0.318 (rotary 0.232,
+   QK-norm 0.069, ramp 0.017), so they deliver roughly half of that at twice
+   the horizon, the same shrinkage the schedule showed (0.276 at 300 steps,
+   0.093 at 600). Without a leave-one-out arm at 600 steps the split between
+   rotary, QK-norm and the ramp is not measured; the 300-step sum is an upper
+   bound, not a prediction (QK-norm and rotary both act on attention).
+3. **When the advantage opens (panel c).** The gain is largest early (0.372 at
+   step 100, rotary and QK-norm help from the first steps), falls to 0.109 at
+   step 400 while the cosine base is decaying and the WSD arm is still near
+   its full rate, then reopens to 0.250 after the cooldown starts at step 360.
+   The momentum ramp ends at step 300 and shows no feature of its own. This
+   is the shape the 600-step W3 control already showed (panel g).
+4. **The combined recipe is slower per step, and the cost is not pinned
+   down.** Median step time is 4567, 4547 and 4542 ms for combined and 4003,
+   4301 and 4285 ms for base. Against the idle-GPU base run (seed 42) the cost
+   is **+14.1%**; the median-of-runs delta is +6.1%, but the identical-config
+   base runs differ by 7% between seeds and base seeds 1 and 2 ran at 4.29 s
+   against the campaign's 3.92 to 3.98 s idle base, so they most likely
+   shared the GPU (no spike was flagged: the slowdown was steady). Read the
+   cost as about +14%, and +6% as a lower bound. It is a real cost: rotary and
+   QK-norm add separate passes over Q and K (kernels not fused into the QKV
+   projection or the attention kernel; not profiled here) (the same story as relu2 in the
+   timing table). The follow-up is fusing rotary and the QK-norm into one
+   pass over Q and K, or into the QKV matmul epilogue. Even at +14%, the
+   combined arm's val@500 (4.224) is already below the base's final
+   value (4.346), so the gain is well worth the step time at this horizon.
+5. **Binary check.** All three combined logs carry `qk_max` fields (rotary and
+   QK-norm build); none of the base logs do. Base s42 was adopted from the
+   first driver (the default binary, which is exactly base s42).
+
+Where this sits next to the README's Muon table: that table's tuned-Muon arm
+(`-c 0 -gc 0`, 4.361 mean at 600 steps over the same three seeds) is a
+different base from this one (`-c 0.1 -gc 1.0`, 4.346);
+the combined recipe's 4.095 is 0.266 below the README's tuned Muon mean, and
+its seed spread (0.003) is smaller than the Muon arms' (under 0.015).
+
+What it means for the recommended recipe: it passes the three-seed gate at
+600 steps, so it is the recipe to carry into the headline run. It is not yet
+a default: the horizon is still 600 steps, relu2 and zero-init are untested
+in combination, and the individual contributions at 600 steps are unmeasured.
 
 ## Incidents and lessons
 
@@ -229,28 +324,242 @@ calls for.
 - W9 untied head: run the plan's 2000-step tied vs `-untie_at 0.667`
   comparison; 300 steps cannot show its value.
 
-## Recommended recipe going forward
-
-Adopt rotary (W8) and QK-norm (W7) as the candidate architecture flags, keep
-the AdamW-range rate at the shared rate, and use the 0.85 to 0.95 momentum
-ramp with relu2, zero-init and the WSD shape only if the pending rows and the
-timing table say so. **Caveat: these are single-seed, 300-step rankings.
-Nothing here becomes a default until it has three init seeds
-(`-D LLMM_INIT_SEED=42|1|2`) and a longer horizon**, since the 2000-step Muon
-run already showed that 300-step orderings narrow with length.
-
 ## Reproducing
 
 ```
 make figure-adoption-collect   # copy finished logs from the item worktrees into docs/ai/data
 make figure-adoption           # PNG (light + dark), JSON sidecar, and the tables above
+make figure-adoption-seeds-collect figure-adoption-seeds   # the three-seed section's logs, table, figure
 ```
 
 Collection reads the worktree `sweeps/` directories; rendering reads only
 `docs/ai/data/adoption_*.jsonl` and `scripts/train_log.py`, no GPU.
 
+## Headline run design: tokens to val 3.28 (designed, not yet run)
+
+Plan section 5 calls for one full-batch run of the recommended recipe, scored
+by the tokens it takes to reach val 3.28. This section fixes that design
+before launch so the number cannot be tuned after the fact. The job script is
+`$S/jobs/headline/run.sh` (session scratchpad), and its report is
+`$S/jobs/headline/report.py`. The log will be committed as
+`docs/ai/data/adoption_headline_tokens_to_328.jsonl`.
+
+### The baseline: what the AdamW 524k run actually reached
+
+The in-house AdamW run ([`gpt2_124m_fineweb_training_run.md`](gpt2_124m_fineweb_training_run.md))
+used:
+
+- `-b 32 -t 1024 -d 524288` (16 grad-accumulation steps)
+- cosine schedule, `-l 6e-4 -u 700 -q 0.0 -c 0.1`
+- `-v 250 -m 20`
+- 19,552 steps, which is one epoch of 10,251,184,259 train tokens
+
+Its val curve was read from `.autosentry/logs/process.log` by pairing each
+`val loss` line with the step line before it. **It never reached val <= 3.28.**
+
+| AdamW 524k baseline (`-m 20`) | step | tokens | val |
+|---|---:|---:|---:|
+| first val <= 3.29 | 17250 | 9.04B | 3.28825 |
+| first val <= 3.285 | 18000 | 9.44B | 3.28461 |
+| lowest val (after the step-19000 resume) | 19250 | 10.09B | 3.28068 |
+| final | 19552 | 10.25B | 3.28070 |
+
+"The AdamW run reached 3.28" (plan section 5, the Muon doc) is therefore a
+two-decimal rounding of a curve that flattens at 3.2807.
+
+The resumes are visible in the curve:
+
+- Step 19500 read 3.28173 before incident 3 and 3.28075 after the resume from
+  step 19000.
+- The bf16 resume rebuilds the fp32 master copy from the bf16 params. The
+  documented resume gap is about 3e-5 in train loss, and these val readings
+  move by about 1e-3 across a resume.
+
+### What the other figures measure
+
+- **modded-nanogpt.** Its target is val <= 3.28 on the first 10,485,760 tokens
+  of `fineweb_val_000000.bin` from the `kjj0/fineweb10B-gpt2` cached shards.
+  Those shards are llm.c's `fineweb.py` output: FineWeb `sample-10BT`, GPT-2
+  BPE, with the first 100M-token shard as val. The README reports wall time,
+  so tokens follow from steps times batch. The plan quotes "under 0.7B tokens
+  with Muon plus the record 5 architecture" and under 330M tokens today.
+- **llm.c.** "10B tokens" is the length of Karpathy's 124M reproduction
+  (one epoch of the same 10B sample); its final val is about 3.28.
+- **Our data.** `data/.fineweb10B` holds 103 train shards and
+  `fineweb_val_000000.bin` (200,001,024 bytes, 100M tokens). They come from our
+  port of the same script, but byte identity with kjj0's val shard has not been
+  checked.
+- **Val set for this run.** The val loader reads sequentially from the start
+  of the val shard. **`-m 320` at B=32, T=1024 is exactly 10,485,760 tokens**,
+  the same val set as modded-nanogpt's. The baseline's `-m 20` (655,360 tokens)
+  is a prefix of it. Whether that prefix is biased has not been measured.
+  `$S/jobs/headline/baseline_eval.sh` (about 5 GPU-minutes, optional) scores
+  `log124M/model_19552.bin` at both `-m 20` and `-m 320` so that the baseline
+  can be quoted on the headline's val set.
+
+### Recipe
+
+The command is the base Muon recipe plus the campaign's recommended flags:
+
+```
+build:  make build-bf16 TRAIN_BIN_BF16=build/train_gpt2_bf16_headline MOJO_DEFINES="-D LLMM_ROTARY=1 -D LLMM_QK_NORM=1"
+run:    BIN=build/train_gpt2_bf16_headline LLMM_LOG_LEVEL=verbose LLMM_LOG_FILE=docs/ai/data/adoption_headline_tokens_to_328.jsonl \
+        make train-bf16 TRAIN_BIN_BF16=build/train_gpt2_bf16_headline MOJO_DEFINES="-D LLMM_ROTARY=1 -D LLMM_QK_NORM=1" ARGS="\
+        -e d12 -i 'data/.fineweb10B/fineweb_train_*.bin' -j 'data/.fineweb10B/fineweb_val_*.bin' \
+        -b 32 -t 1024 -d 524288 -x 3800 -v 100 -m 320 -s 0 -qk_clip 0 \
+        -opt muon -l 4.8e-3 -c 0.1 -gc 1.0 -k wsd -u 0 -cooldown 0.4 -decay_shape linear -q 0.1 \
+        -mu_start 0.85 -mu 0.95 -mu_warmup 300 -o checkpoints/headline_328 -n 500 -y 1"
+```
+
+- **`BIN=` is required.** `scripts/run_train_gpt2_bf16.sh` runs `$BIN` and
+  ignores `TRAIN_BIN_BF16`. The first three-seed driver left `BIN=` out, so
+  every one of its arms would have run the default `build/train_gpt2_bf16`;
+  this was caught while that driver was running.
+- **Learning rate.** It stays at 4.8e-3, which was tuned at 131k tokens per
+  step. Muon's update is orthogonalized, so its size does not scale with
+  gradient noise; a 4x batch is not an obvious reason to change the rate.
+  This is untested at 524k and is listed as a risk.
+- **Batch.** 524,288 tokens per step, as the AdamW run used and as
+  modded-nanogpt's January 2025 records used (8x64x1024). The 300-step
+  momentum ramp is therefore the speedrun's ramp in tokens as well as in
+  steps.
+- **Excluded: ReLU², zero-init projections, untied head and `-attn_scale`.**
+  - ReLU² plus zero-init was worth 0.026 at 300 steps, one seed, just outside
+    noise. ReLU² costs 3.2% per step on an idle GPU, and it has a CPU and
+    fixture path that is not combined with rotary or QK-norm
+    (`test_gpt2.mojo` refuses rotary+relu2 by `comptime assert`), so the
+    headline binary would run without a verify gate for that combination.
+  - The untied head is neutral at 300 steps.
+  - `-attn_scale 0.12` does nothing at head_dim 64.
+
+### Horizon and cooldown: `-x 3800`
+
+- **Token budget.** 3800 x 524,288 = 1,992,294,400 tokens (1.99B). That is
+  about 2.8x the 0.7B modded-nanogpt needed with a fuller architecture, and
+  about 1/5 of the AdamW run.
+- **Schedule.** The WSD decay starts at floor(3800 x 0.6) = **step 2280
+  (1.195B tokens)**. The rate then falls linearly to 0.1x by step 3800. The
+  momentum ramp ends at step 300 (157M tokens).
+- **The cooldown moves the crossing.** At 600 steps the cooldown arm trailed
+  cosine until the last 240 steps and then finished 0.093 lower. So the
+  tokens-to-3.28 figure belongs to the (recipe, `-x`) pair, not to the
+  recipe alone.
+- **The stable phase does not depend on `-x`.** The learning rate is
+  constant, there is no warmup and the momentum ramp is fixed, so the
+  trajectory up to step 2280 is identical for any horizon that long or
+  longer. A crossing at or before step 2280 would therefore hold for every
+  `-x >= 3800`.
+- **Reporting rule.**
+  1. The headline is the first eval with val <= 3.28 exactly (no rounding).
+  2. Report it in tokens (step x 524,288), with the bracket from the
+     previous eval.
+  3. Say whether it fell in the stable phase (step <= 2280) or in the
+     cooldown.
+  4. A cooldown crossing is quoted as "at `-x 3800`". It is an upper bound on
+     what this recipe can do, because a shorter horizon would start its
+     cooldown earlier.
+  5. Also give the first evals at or below 3.285 and 3.29, next to the
+     baseline's 9.44B and 9.04B, and the minimum val.
+- **If 3.28 is not reached by 1.99B.** Report "not reached at 1.99B" with
+  the final val and the gap. The next run would be `-x 5700` (2.99B), not a
+  continuation, because a continued run would re-enter the cooldown from a
+  run that has already decayed.
+- **Val cadence.** Every 100 steps (52.4M tokens) at `-m 320`, 39 evals in
+  all. This brackets the crossing to 52M tokens. 50-step evals would double
+  the val cost for a resolution that is finer than the val-set noise.
+- **Checkpoints.** Every 500 steps plus the final one, 8 files, so a crash
+  costs at most 500 steps (about 2.2 h). Each pair is at most about 1.25 GB:
+  model 249 MB plus a state that is no larger than AdamW's 996 MB m+v. That
+  is about 10 GB in total against 2.2 TB free.
+
+### Wall clock (estimate)
+
+| part | arithmetic | time |
+|---|---|---:|
+| train | 3800 steps x 4 x 3.92 s (base at 131k, idle) = 59,600 s | 16.6 h |
+| rotary + QK-norm | +3 to 7% (the W7 0.12 arm ran at 4186 vs 3922 ms; the W8 figure is an upper bound) | +0.5 to 1.2 h |
+| val | 39 evals x 320 forwards x about 0.33 s (a forward is about 1/3 of the 0.98 s fwd+bwd micro-step) | about 1.1 h |
+| smoke, build, checkpoints | | under 0.2 h |
+| **total** | | **about 18 to 19 h** |
+
+- The AdamW run measured 15.6 s per step at 524k, which agrees with 4 x 3.92 s.
+- Muon's optimizer cost is about 0.25% at this batch.
+- The combined arms of the three-seed run will replace the rotary and
+  QK-norm row with a measured figure: the wall clock is 3800 x 4 x their
+  median ms/step.
+- The val time is an estimate. It was not measured.
+
+### Memory
+
+- The resident seed-42 base run (B=32, Muon, bf16) uses 43,457 MiB in
+  `nvidia-smi`.
+- Gradient accumulation does not change the per-micro-batch footprint, so
+  524k tokens per step at B=32 has the same footprint as 131k.
+- Rotary adds a 256 KB cos/sin table and rotates the qkv activation in place.
+- QK-norm normalizes the head buffers in place, and its backward recomputes
+  the statistics from `acts.qkv`, so it adds no activation buffers.
+- Val reuses the same B=32 forward.
+- Expected total: about 44 GB of the 120 GB unified memory. Check
+  `nvidia-smi` for other tenants before launch, because an 87 GB vLLM tenant
+  slows tensor-core kernels about 1.3x.
+
+### Risks, and what run.sh does about them
+
+- **The combination has not run at this scale.** The three-seed 600-step
+  run (base vs combined, 131k) is the go/no-go. Go means:
+  1. The combined arm beats base at val@600 in all three seeds.
+  2. No non-finite loss.
+  3. `qk_max` is present in the combined logs (proof that the right binary
+     ran) and stays at or below 8.0.
+- **The learning rate was tuned at 131k.** If the run diverges, the 0.1 floor
+  will not rescue it. Watch train loss over the first 300 steps.
+- **QK-norm logits over a long run.** At the default scale the logit is
+  bounded by head_dim x scale = 8; the logged `qk_max` shows how close it
+  gets. The unexplained divergence at `attn_scale` 0.5 (logit range 32) does
+  not apply at the default scale.
+- **bf16 resume is not bit-exact** (the fp32 master is rebuilt). Resumes are
+  counted in the report and logged in `decisions.txt`.
+- **Log size.** Verbose logging is about 200 bytes per step, about 1 MB for
+  the whole run. Verbose is required for `qk_max` and the per-step `ms` the
+  figure script uses.
+- **Other jobs.** The run takes the shared GPU lock and refuses to start
+  while any other trainer process is on the GPU.
+
+run.sh behaviour, in order:
+
+1. Exit 0 at once if `run.exit` is 0.
+2. Preflight: refuse if another trainer is running, if there are not 103
+   train shards plus the val shard, if less than 30 GB of disk is free, if
+   the trainer sources are dirty, or if HEAD differs from the first launch.
+3. Build through `build_slot` and check the binary's mtime against the
+   newest source.
+4. Before the first real step, run a 5-step smoke on the exact binary and
+   flags. It asserts finite losses, `qk_max` present, and batch 524288 with
+   grad_accum 16.
+5. Before every launch, move an incomplete newest checkpoint pair aside (the
+   trainer resumes from the highest `model_N.bin` even if its state file is
+   missing).
+6. Run with `-y 1`, resuming automatically up to 3 times after a crash.
+7. Require a val event at step 3800, write `report.txt` and `run.exit`.
+
+The log is appended across resumes. `report.py` keeps the last occurrence of
+each step and reads the log through `scripts/train_log.py`:
+
+```
+python3 $S/jobs/headline/report.py   # defaults to docs/ai/data/adoption_headline_tokens_to_328.jsonl
+```
+
+It prints:
+
+- every eval as step, tokens and val
+- `first_val_le_3.28`, `first_val_le_3.285` and `first_val_le_3.29`, each with
+  its bracket and the AdamW figure next to it
+- the minimum val
+- median ms per step and training hours
+- the largest `qk_max`
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Sonnet 5.5 results agent; item
 implementations by Sonnet agents and independent verification by Opus agents),
-directed by Evan Owen.
+directed by Evan Owen. The headline-run design section was written by a Claude Code Opus 5.5 design agent, also directed by Evan Owen.

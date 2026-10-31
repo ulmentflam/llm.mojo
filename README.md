@@ -182,6 +182,13 @@ Val loss vs step for the three arms (left: 600 steps x 3 seeds; middle: 2000 ste
 
 The follow-up campaign ranked nine modded-nanogpt ideas on the tuned-Muon recipe at 300 steps (single seed, so differences under about 0.02 are noise): a zero-warmup linear-cooldown (WSD) schedule is the largest gain, rotary embeddings are second, QK-norm helps and bounds the attention logit, the AdamW-range learning rate has to stay at the shared rate, and the rest sit inside the noise band. Nothing becomes a default without three seeds. Details in [`docs/ai/modded_nanogpt_adoption_results_2026-10-30.md`](docs/ai/modded_nanogpt_adoption_results_2026-10-30.md); reproduce with `make figure-adoption`.
 
+Three-seed confirmation of the recommended recipe (WSD cooldown, momentum ramp, rotary, QK-norm; 600 steps, init seeds 42/1/2, same setup as the table above but with `-c 0.1 -gc 1.0`): val loss at step 600 is 4.346 for the campaign base and 4.095 for the combined recipe, a gain of 0.250 (per seed 0.246 to 0.256) against seed spreads of 0.010 (base) and 0.003 (combined). The gain is smaller than the sum of the 300-step single-item gains, and the recipe costs about 14% step time on an idle GPU (rotary and QK-norm are not yet fused). Reproduce with `make figure-adoption-seeds`; details and per-seed table in the [results doc](docs/ai/modded_nanogpt_adoption_results_2026-10-30.md).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="figures/modded_nanogpt_adoption_seeds_2026-10-31_dark.png">
+  <img alt="Three-seed confirmation of the combined adoption recipe: val loss per seed, paired step-600 values, gain by step, train loss and step time" src="figures/modded_nanogpt_adoption_seeds_2026-10-31.png">
+</picture>
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="figures/modded_nanogpt_adoption_2026-10-30_dark.png">
   <img alt="modded-nanogpt adoption campaign: val loss per arm, delta vs base, W1 ladder, QK-norm logit, loss vs step time" src="figures/modded_nanogpt_adoption_2026-10-30.png">

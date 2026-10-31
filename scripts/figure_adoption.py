@@ -12,10 +12,10 @@ Override the search root with ADOPTION_WORKTREES. After that, rendering reads
 docs/ai/data/adoption_*.jsonl only (no GPU, no worktree paths), so a fresh
 checkout of the committed data reproduces the figure.
 
-A new arm needs no code change to appear in the plots: an unknown
-adoption_<stem>.jsonl is picked up with its item taken from the w<N> prefix.
-Add it to ARMS only to give it a readable label, flags and note. Arms listed in
-ARMS with no log yet are rendered as "pending" rows in the report table.
+Only stems listed in ARMS (300-step arms), w3_600_* (the 600-step control) and
+timing_* are read; other adoption_*.jsonl files (seed_*, headline_*) belong to
+their own figure scripts. A new 300-step arm must be added to ARMS. Arms listed
+in ARMS with no log yet are rendered as "pending" rows in the report table.
 
 Writes figures/modded_nanogpt_adoption_2026-10-30.png (light surface),
 ..._dark.png, and a .json sidecar of every plotted number, and rewrites the
@@ -283,10 +283,11 @@ def load_all() -> tuple[dict[str, dict], dict[str, dict]]:
         stem = p.name[len(PREFIX) : -len(".jsonl")]
         if stem.startswith("timing_"):
             timing[stem] = load(p)
-        elif "_600_" in stem:
+        elif stem.startswith("w3_600_"):
             LONG[stem] = load(p)
-        else:
+        elif stem in ARMS:
             arms[stem] = load(p)
+        # anything else (seed_*, headline_*) belongs to another figure script
     return arms, timing
 
 

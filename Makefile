@@ -168,7 +168,7 @@ $(PIXI_STAMP):
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
         verify-untied-cpu verify-untied-gpu check-untied-idle check-untied-head check-untie-at \
-        typecheck check compile-rest clean figures figure-precision figure-muon figure-adoption figure-adoption-collect build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
+        typecheck check compile-rest clean figures figure-precision figure-muon figure-adoption figure-adoption-collect figure-adoption-seeds figure-adoption-seeds-collect build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
@@ -284,6 +284,7 @@ help:
 	@echo "                   memory + step time, fp32 vs bf16, JSON into zero/bench/, chart into figures/"
 	@echo "  figure-muon      Muon vs AdamW val-loss figure (600/2000 steps + lr sweep), no GPU"
 	@echo "  figure-adoption  modded-nanogpt adoption figure + report tables from docs/ai/data/adoption_*.jsonl, no GPU"
+	@echo "  figure-adoption-seeds  three-seed combined-recipe confirmation figure + table (no GPU); -collect copies finished logs first"
 	@echo "  figure-adoption-collect  copy finished ranking logs from the item worktrees into docs/ai/data (run first)"
 	@echo "  figures-wte      tied-wte campaign figures (no GPU, renders committed data):"
 	@echo "                   figure-blindness  exact accounting vs nvidia-smi on the 256 MiB commit grid"
@@ -1047,7 +1048,17 @@ figure-adoption:
 figure-adoption-collect:
 	$(PIXI) run python scripts/figure_adoption.py --collect
 
-figures: figure-precision figure-muon figure-adoption figures-wte
+# Three-seed confirmation of the combined adoption recipe (6 panels worth of
+# runs: base vs combined x seeds 42/1/2, 600 steps): figure + seed table in the
+# adoption results doc, from the committed docs/ai/data/adoption_seed_*.jsonl.
+# collect copies finished logs from the main checkout (ADOPTION_SEEDS_SRC).
+figure-adoption-seeds:
+	$(PIXI) run python scripts/figure_adoption_seeds.py
+
+figure-adoption-seeds-collect:
+	$(PIXI) run python scripts/figure_adoption_seeds.py --collect
+
+figures: figure-precision figure-muon figure-adoption figure-adoption-seeds figures-wte
 
 # Vocabulary-tiling cost sweep (figure 3). NEEDS A GPU AND A QUIET BOX:
 # the collector refuses to run if `make test`/pytest are live or the load
