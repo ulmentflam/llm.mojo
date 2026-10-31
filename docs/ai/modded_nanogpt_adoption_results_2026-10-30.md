@@ -170,14 +170,13 @@ Base Muon recipe plus, as candidate flags:
 ```
 
 Leave relu2/zero-init, the AdamW-range multiplier and the untied head at
-their defaults for now. **Caveats: these are single-seed, 300-step rankings,
-each measured one at a time; the combination has not been run, and effects
-are not guaranteed to add (QK-norm and rotary both act on attention). Nothing
-becomes a default until a combined run has three init seeds
-(`-D LLMM_INIT_SEED=42|1|2`) and a longer horizon**, since the 2000-step Muon
-run already showed 300-step orderings narrow with length. The next steps are
-the three-seed combined run and the tokens-to-3.28 headline run the plan
-calls for.
+their defaults for now. **Three-seed status: confirmed at 600 steps.** The
+combined recipe beat the base on every seed (mean 0.250, per-seed 0.246 to
+0.256, against seed spreads of 0.010 and 0.003; see the section below), but it
+costs about 14% step time on an idle GPU (rotary and QK-norm are unfused), and
+the gains are sub-additive (the 300-step single-item gains overstate it by
+about 2x at 600 steps). The headline tokens-to-3.28 run uses this recipe; it
+becomes the default only after that longer-horizon run.
 
 ## Three-seed confirmation of the combined recipe
 
@@ -197,18 +196,20 @@ README's Muon table uses `-c 0 -gc 0`, so its 4.36 mean is not this base
 | run | val@100 | val@200 | val@300 | val@400 | val@500 | val@600 | train last-50 | ms/step |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | base s42 | 6.0156 | 5.2669 | 4.7984 | 4.5134 | 4.3815 | 4.3507 | 4.3272 | 4003 |
-| base s1 | pending | pending | pending | pending | pending | pending | | |
-| base s2 | pending | pending | pending | pending | pending | pending | | |
-| **base mean** | 6.0156 | 5.2669 | 4.7984 | 4.5134 | 4.3815 | 4.3507 | 4.3272 | 4003 |
-| base spread (max-min) | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | | |
+| base s1 | 6.0065 | 5.2727 | 4.7986 | 4.5119 | 4.3779 | 4.3464 | 4.3228 | 4301 |
+| base s2 | 6.0034 | 5.2690 | 4.8009 | 4.5066 | 4.3711 | 4.3403 | 4.3177 | 4285 |
+| **base mean** | 6.0085 | 5.2695 | 4.7993 | 4.5106 | 4.3769 | 4.3458 | 4.3226 | 4197 |
+| base spread (max-min) | 0.0122 | 0.0057 | 0.0025 | 0.0068 | 0.0104 | 0.0104 | | |
 | combined s42 | 5.6409 | 5.0320 | 4.6012 | 4.4005 | 4.2242 | 4.0950 | 4.1025 | 4567 |
-| combined s1 | pending | pending | pending | pending | pending | pending | | |
-| combined s2 | pending | pending | pending | pending | pending | pending | | |
-| **combined mean** | 5.6409 | 5.0320 | 4.6012 | 4.4005 | 4.2242 | 4.0950 | 4.1025 | 4567 |
-| combined spread (max-min) | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | | |
+| combined s1 | 5.6286 | 5.0326 | 4.6121 | 4.4035 | 4.2253 | 4.0972 | 4.1047 | 4547 |
+| combined s2 | 5.6395 | 5.0360 | 4.5970 | 4.4006 | 4.2209 | 4.0942 | 4.1004 | 4542 |
+| **combined mean** | 5.6363 | 5.0335 | 4.6034 | 4.4015 | 4.2235 | 4.0955 | 4.1026 | 4552 |
+| combined spread (max-min) | 0.0124 | 0.0040 | 0.0152 | 0.0031 | 0.0044 | 0.0029 | | |
 | gain s42 (base - combined) | +0.3746 | +0.2349 | +0.1971 | +0.1129 | +0.1574 | +0.2556 | | |
-| **mean gain** | +0.3746 | +0.2349 | +0.1971 | +0.1129 | +0.1574 | +0.2556 | | +14.1% |
-| gain min to max | +0.3746 to +0.3746 | +0.2349 to +0.2349 | +0.1971 to +0.1971 | +0.1129 to +0.1129 | +0.1574 to +0.1574 | +0.2556 to +0.2556 | | |
+| gain s1 (base - combined) | +0.3780 | +0.2401 | +0.1865 | +0.1084 | +0.1526 | +0.2493 | | |
+| gain s2 (base - combined) | +0.3639 | +0.2330 | +0.2039 | +0.1060 | +0.1502 | +0.2460 | | |
+| **mean gain** | +0.3722 | +0.2360 | +0.1958 | +0.1091 | +0.1534 | +0.2503 | | +6.1% (median) |
+| gain min to max | +0.3639 to +0.3780 | +0.2330 to +0.2401 | +0.1865 to +0.2039 | +0.1060 to +0.1129 | +0.1502 to +0.1574 | +0.2460 to +0.2556 | | |
 
 `*` step time unstable in the log (another job probably shared the GPU): upper bound.
 <!-- adoption-seeds:end -->
@@ -218,7 +219,60 @@ README's Muon table uses `-c 0 -gc 0`, so its 4.36 mean is not this base
   <img alt="Three-seed confirmation: val loss per seed and arm, paired step-600 values, gain by step, train loss and step time" src="../../figures/modded_nanogpt_adoption_seeds_2026-10-31.png">
 </picture>
 
-Findings: pending the six runs.
+Findings (three init seeds, same data order, 600 steps; all numbers from the
+table above).
+
+1. **The combined gain is real and far outside the seed spread.** Val@600 is
+   4.346 for base and 4.095 for combined, a mean gain of 0.250 with per-seed
+   gains 0.256, 0.249 and 0.246 (range 0.010). The seed spread of val@600 is
+   0.010 for base and 0.003 for combined, so the mean gain is about 24
+   times the base spread, and even the worst combined seed beats the best base
+   seed by 0.243. The gain is positive on every seed at every one of the six eval steps
+   (smallest 0.106, seed 2 at step 400). The seeds vary the init only; the
+   data order is fixed, so this bounds init noise, not data-order noise.
+2. **The per-item gains do not add up.** The schedule alone is worth 0.093 at
+   600 steps (the W3 pair above), so rotary, QK-norm and the momentum ramp
+   together account for about 0.157 of the 0.250, assuming the schedule's gain
+   carries over. Their single-item 300-step gains sum to 0.318 (rotary 0.232,
+   QK-norm 0.069, ramp 0.017), so they deliver roughly half of that at twice
+   the horizon, the same shrinkage the schedule showed (0.276 at 300 steps,
+   0.093 at 600). Without a leave-one-out arm at 600 steps the split between
+   rotary, QK-norm and the ramp is not measured; the 300-step sum is an upper
+   bound, not a prediction (QK-norm and rotary both act on attention).
+3. **When the advantage opens (panel c).** The gain is largest early (0.372 at
+   step 100, rotary and QK-norm help from the first steps), falls to 0.109 at
+   step 400 while the cosine base is decaying and the WSD arm is still near
+   its full rate, then reopens to 0.250 after the cooldown starts at step 360.
+   The momentum ramp ends at step 300 and shows no feature of its own. This
+   is the shape the 600-step W3 control already showed (panel g).
+4. **The combined recipe is slower per step, and the cost is not pinned
+   down.** Median step time is 4567, 4547 and 4542 ms for combined and 4003,
+   4301 and 4285 ms for base. Against the idle-GPU base run (seed 42) the cost
+   is **+14.1%**; the median-of-runs delta is +6.1%, but the identical-config
+   base runs differ by 7% between seeds and base seeds 1 and 2 ran at 4.29 s
+   against the campaign's 3.92 to 3.98 s idle base, so they most likely
+   shared the GPU (no spike was flagged: the slowdown was steady). Read the
+   cost as about +14%, and +6% as a lower bound. It is a real cost: rotary and
+   QK-norm add separate passes over Q and K (kernels not fused into the QKV
+   projection or the attention kernel; not profiled here) (the same story as relu2 in the
+   timing table). The follow-up is fusing rotary and the QK-norm into one
+   pass over Q and K, or into the QKV matmul epilogue. Even at +14%, the
+   combined arm's val@500 (4.224) is already below the base's final
+   value (4.346), so the gain is well worth the step time at this horizon.
+5. **Binary check.** All three combined logs carry `qk_max` fields (rotary and
+   QK-norm build); none of the base logs do. Base s42 was adopted from the
+   first driver (the default binary, which is exactly base s42).
+
+Where this sits next to the README's Muon table: that table's tuned-Muon arm
+(`-c 0 -gc 0`, 4.361 mean at 600 steps over the same three seeds) is a
+different base from this one (`-c 0.1 -gc 1.0`, 4.346);
+the combined recipe's 4.095 is 0.266 below the README's tuned Muon mean, and
+its seed spread (0.003) is smaller than the Muon arms' (under 0.015).
+
+What it means for the recommended recipe: it passes the three-seed gate at
+600 steps, so it is the recipe to carry into the headline run. It is not yet
+a default: the horizon is still 600 steps, relu2 and zero-init are untested
+in combination, and the individual contributions at 600 steps are unmeasured.
 
 ## Incidents and lessons
 

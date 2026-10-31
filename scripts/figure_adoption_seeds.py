@@ -128,9 +128,14 @@ def summary(runs) -> dict:
             min(g),
             max(g),
         )
+        med = {a: statistics.median(r["ms"] for r in runs[a].values()) for a in ARMS}
         out["ms_delta_pct"] = (
-            out["combined"]["ms_mean"] / out["base"]["ms_mean"] - 1
-        ) * 100
+            med["combined"] / med["base"] - 1
+        ) * 100  # median of runs
+        if 42 in ps:
+            out["ms_delta_pct_s42"] = (
+                runs["combined"][42]["ms"] / runs["base"][42]["ms"] - 1
+            ) * 100
     return out
 
 
@@ -413,7 +418,9 @@ def render(runs, summ, mode: str, out: Path) -> None:
         fontweight="bold",
     )
     d2.set_title(
-        f"step time {summ['ms_delta_pct']:+.1f}%" if ps else "median ms/step",
+        f"step time {summ['ms_delta_pct']:+.1f}% (median of runs)"
+        if ps
+        else "median ms/step",
         loc="left",
         fontsize=10.5,
         color=th["ink"],
@@ -494,7 +501,7 @@ def table(runs, summ) -> str:
         L.append(
             "| **mean gain** | "
             + " | ".join(f"{statistics.mean(gb[k]):+.4f}" for k in STEPS)
-            + f" | | {summ['ms_delta_pct']:+.1f}% |"
+            + f" | | {summ['ms_delta_pct']:+.1f}% (median) |"
         )
         L.append(
             "| gain min to max | "
@@ -540,6 +547,7 @@ def main() -> None:
                 train_last50=r["train_last50"],
                 ms_median=r["ms"],
                 ms_unstable=fa.unstable(r["ms_all"], r["ms"]),
+                qk_max_logged=bool(r["qk"]),
             )
             for a in ARMS
             for s, r in runs[a].items()
