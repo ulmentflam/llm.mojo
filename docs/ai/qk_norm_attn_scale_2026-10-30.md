@@ -71,6 +71,44 @@ W8 rotary (not yet on main when this was written).
 `-attn_scale 0.12`): base recipe plus `-qk_log 1`; logs `sweeps/w7_qknorm*.jsonl`,
 per-step `qk_max` in the verbose log. Results to be added after the runs.
 
+## Independent verification (verifier, 2026-10-30)
+
+Rebuilt and rerun on `mn/w7` at 8579b1e (the merge of main c680f17), fp32 gates
+with `-D LLMM_NO_TF32=1`. Fixtures were regenerated from `train_gpt2.py` in a
+scratch dir: both qknorm states are byte-identical (`cmp`) to the implementer's,
+and both embedded/env trajectories reproduce exactly from
+`scripts/gen_expected_losses.py`.
+
+| check | result |
+|---|---|
+| flag-off bit identity: main c680f17 (scratch `git archive`) vs `mn/w7` `make build`, CPU d6 `-x 3 -o`, AdamW and Muon | `model_3.bin` and `state_3_0.bin` identical (`cmp`) for both optimizers |
+| flag-off `make verify-gpu`, twice on `mn/w7`, once on c680f17 | pass; step-10 loss 0.37649527 / 0.3764964 (w7), 0.37649608 (main). The 0.37649453 vs 0.37649515 gap in the table above is run-to-run GPU nondeterminism, not the change |
+| `make verify-gpu MOJO_DEFINES="-D LLMM_QK_NORM=1"`, default scale and the 0.12 arm | pass, same numbers as above |
+| `make verify-cpu` off; `mojo -D LLMM_QK_NORM=1 test_gpt2.mojo cpu` | pass / pass (loss 5.7232 vs 5.722967, 16/16, step 9 0.86924 vs 0.86874) |
+| `make test-mojo` (after the merge) | `tests result=pass files=28 passed=240 skipped=1` |
+| `make test-mojo` under the flag (`MOJO_INCLUDES="-I . -D LLMM_QK_NORM=1"`; the recipe ignores `MOJO_DEFINES`) | 239/240: only `test_gpt2_qk_clip_end_to_end`, whose planted hot head cannot exist under QK-norm; now skipped there (12/12 pass both ways) |
+| pytest attention + split/merge on GPU | 66 passed |
+| bf16 generation, flag-on infer build, seeds 1-8, default and `LLMM_ATTN_SCALE=0.12`, 40 tokens | 16/16 exit 0, no `CUDA_ERROR` |
+| mutant: norm backward without `-u*mean(dy*u)` | pytest 9/9 norm cases fail; verify-gpu (qknorm) 11/16 gradient tensors and 5/10 steps fail |
+| mutant: k backward reads q's pre-norm row | pytest 9/9 norm cases fail; verify-gpu (qknorm) 13/16 gradient tensors and 6/10 steps fail |
+| mutant: backward ignores `q_mul` | pytest fails the 4 fp32 scaled cases + `scale_only`; **passes** both bf16 0.12 cases and **passes** verify-gpu at 0.12 (q_mul = 0.12*8 = 0.96, a 4% error). Caught by verify-gpu at `attn_scale` 0.5 (13 tensors fail, with and without the norm) |
+
+Gate notes. At head_dim 64, 0.12 is within 4% of the default 1/8, so the 0.12
+arm cannot see a dropped q_mul in the trainer's call site; the 0.5 fixtures
+(`GPT2_ATTN_SCALE=0.5`, with and without `GPT2_QK_NORM=1`) can, through the step-0
+gradient check. Their 10-step trajectories are not a usable gate: the PyTorch
+reference itself moves by 0.02-0.03 between fp32 and fp64 by step 6 (0.0003
+at the default scale), and the GPU trainer is deterministic but jumps from
+0.0016 off at step 6 to 0.226 off at step 7 (CPU: 0.049; scale-only GPU:
+0.05). Step-0 loss and all 16 gradients match at 0.5 in every arm, so the
+excursion is not the W7 math; a logit range above about 8 (attn_scale *
+head_dim) reaching an attention-kernel accuracy limit is the leading guess and
+is unexamined. The ranking arms (default, 0.12) stay at or below 8.
+
+Deviations found: `F.rms_norm`'s default eps is fp32 epsilon (1.19e-7, also for
+bf16 inputs; checked on torch 2.13), not 1e-6. Immaterial for rows of O(1)
+RMS. `make verify-cpu` and `make test-mojo` do not forward `MOJO_DEFINES`.
+
 ## AI use statement
 
-Written with AI assistance (Claude Code, Sonnet 5.5 implementation agent), directed by Evan Owen.
+Written with AI assistance (Claude Code, Sonnet 5.5 implementation agent; independent verification section by a Claude Code Opus 5.5 verifier agent), directed by Evan Owen.
