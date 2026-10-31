@@ -430,6 +430,7 @@ To be filled by the item owners. One row per arm.
 | W1 | base + `-l_adam 8` | 5.2074 | | 3948 | +0.173; ladder optimum is mult 1, i.e. the shared rate; no separate AdamW-range multiplier needed at 124M/300 steps. The flag stays for W9's `-l_head`. |
 | W2 | base + `-mu_start 0.85 -mu 0.9 -mu_warmup 300` | 5.0259 | | 3983 | -0.009 vs base, inside noise |
 | W2 | base + `-mu_start 0.85 -mu 0.95 -mu_warmup 300` | 5.0174 | | 3941 | -0.017 vs base; the sweep's flat 0.95 scored 5.0732, so the ramp reconciles "low momentum early" with the long-run 0.95: adopt the ramp with mu 0.95 |
+| W8 | base + `-D LLMM_ROTARY=1` (half-truncated rotary, base 1024, wpe zero) | 4.8031 | | 4263 | -0.232 vs base, the largest single gain so far; step time +8% in this run but the GPU was shared with a verifier compile for part of it, re-time on an idle box |
 
 ## 7. Not in scope (so nobody re-litigates)
 
