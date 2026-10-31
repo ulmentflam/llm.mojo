@@ -19,7 +19,13 @@ from llmm.checkpointing import (
     VERSION_FP32,
     VERSION_FP32_UNTIED,
     VERSION_BF16_UNTIED,
+    ARCH_FLAG_ROTARY,
+    ARCH_FLAG_UNTIED,
+    STATE_FLAGS_SLOT,
+    STATE_UNTIE_STEP_SLOT,
+    MODEL_FLAGS_SLOT,
 )
+from train_gpt2 import check_arch_flags, ARCH_FLAGS
 
 
 # ===----------------------------------------------------------------------=== #
@@ -764,8 +770,10 @@ def test_state_header_plain_files_unchanged() raises:
 
 
 def test_state_untie_fields_round_trip() raises:
-    """Slots 44/45 (untied layout, untie step) round trip, including the
-    negative "never untie" value, and default to 0 in a plain state."""
+    """Slots 44/45 (untied flag bit, untie step) round trip, including the
+    negative "never untie" value, and default to 0 in a plain state. An untied
+    state is a version-2 file with flags == ARCH_FLAG_UNTIED (bit 1); the untie
+    step lives in slot 45 and does not by itself make a file version 2."""
     var path = String("test_ckpt_state_untie.bin")
     var n = 6
     var m = heap_alloc[Float32](n)
@@ -782,18 +790,22 @@ def test_state_untie_fields_round_trip() raises:
         var st = _owner_state(0, 0, 0)
         st.muon_ownership_version = 0
         st.num_processes = 1
-        st.untied_layout = 1
+        st.flags = ARCH_FLAG_UNTIED
         st.untie_step = steps[i]
         write_state_checkpoint(path, st, m, v, n)
         var r = read_state_checkpoint(path, m_out, v_out, n)
-        assert_equal(r.untied_layout, 1)
+        assert_equal(r.flags, ARCH_FLAG_UNTIED)
+        assert_equal(_header_word(path, 1), 2)
+        assert_equal(_header_word(path, STATE_FLAGS_SLOT), ARCH_FLAG_UNTIED)
         assert_equal(r.untie_step, steps[i])
     var plain = _owner_state(0, 0, 0)
     plain.muon_ownership_version = 0
     plain.num_processes = 1
     write_state_checkpoint(path, plain, m, v, n)
     var r0 = read_state_checkpoint(path, m_out, v_out, n)
-    assert_equal(r0.untied_layout, 0)
+    assert_equal(r0.flags, 0)
+    assert_equal(_header_word(path, 1), 1)
+    assert_equal(_header_word(path, STATE_UNTIE_STEP_SLOT), 0)
     assert_equal(r0.untie_step, 0)
     m.unsafe_free()
     v.unsafe_free()
@@ -954,6 +966,151 @@ def test_dataloader_capture_restore_shuffled() raises:
     v_out.unsafe_free()
     loader.close()
     resumed.close()
+    _remove(path)
+
+
+# ===----------------------------------------------------------------------=== #
+# Architecture flags word (rotary): state header slot 44 / model header slot 20
+# ===----------------------------------------------------------------------=== #
+
+
+def _header_word(path: String, slot: Int) raises -> Int:
+    var np = Python.import_module("numpy")
+    var h = np.fromfile(path, dtype=np.int32, count=256)
+    return Int(py=h[slot])
+
+
+def _tiny_state(flags: Int) raises -> TrainingState:
+    return TrainingState(
+        step=7,
+        num_processes=1,
+        process_rank=0,
+        use_master_weights=0,
+        should_shuffle=0,
+        sampler_rng_state=UInt64(1),
+        shuffle_rng_state=UInt64(2),
+        current_shard_idx=0,
+        current_sample_idx=0,
+        optimizer_kind=0,
+        flags=flags,
+    )
+
+
+def test_state_flags_roundtrip_and_default_stays_version_1() raises:
+    var path = String("test_ckpt_state_flags.bin")
+    var n = 5
+    var m = heap_alloc[Float32](n)
+    var v = heap_alloc[Float32](n)
+    _fill_pattern(m, n, 0.1)
+    _fill_pattern(v, n, 0.2)
+    var m_out = heap_alloc[Float32](n)
+    var v_out = heap_alloc[Float32](n)
+
+    # Flagged: version 2, slot 44 carries the bit, and it reads back.
+    write_state_checkpoint(path, _tiny_state(ARCH_FLAG_ROTARY), m, v, n)
+    assert_equal(_header_word(path, 1), 2)
+    assert_equal(_header_word(path, STATE_FLAGS_SLOT), ARCH_FLAG_ROTARY)
+    var restored = read_state_checkpoint(path, m_out, v_out, n)
+    assert_equal(restored.flags, ARCH_FLAG_ROTARY)
+    assert_equal(restored.step, 7)
+
+    # Default (flags 0): still the version-1 header with slot 44 untouched, so
+    # default-build files are byte-compatible with files from before the word.
+    write_state_checkpoint(path, _tiny_state(0), m, v, n)
+    assert_equal(_header_word(path, 1), 1)
+    assert_equal(_header_word(path, STATE_FLAGS_SLOT), 0)
+    assert_equal(read_state_checkpoint(path, m_out, v_out, n).flags, 0)
+
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
+    _remove(path)
+
+
+def test_model_flags_roundtrip() raises:
+    var path = String("test_ckpt_model_flags.bin")
+    var cfg = _tiny_config()
+    var n = cfg.num_parameters()
+    var params = heap_alloc[Float32](n)
+    _fill_pattern(params, n, 0.5)
+
+    write_model_checkpoint(path, cfg, params, n, arch_flags=ARCH_FLAG_ROTARY)
+    assert_equal(_header_word(path, MODEL_FLAGS_SLOT), ARCH_FLAG_ROTARY)
+    assert_equal(peek_model_header(path).arch_flags, ARCH_FLAG_ROTARY)
+
+    write_model_checkpoint(path, cfg, params, n)
+    assert_equal(_header_word(path, MODEL_FLAGS_SLOT), 0)
+    assert_equal(peek_model_header(path).arch_flags, 0)
+
+    params.unsafe_free()
+    _remove(path)
+
+
+def _refused(got: Int, strict: Bool) -> Bool:
+    try:
+        check_arch_flags("x", got, strict)
+    except:
+        return True
+    return False
+
+
+def test_arch_flag_mismatch_is_refused_for_this_build() raises:
+    # `ARCH_FLAGS` is this build's flags (1 under -D LLMM_ROTARY=1, else 0), so
+    # the same test file pins both directions when run under either build
+    # (`make test-mojo [MOJO_DEFINES="-D LLMM_ROTARY=1"]`).
+    var other = 1 - ARCH_FLAGS
+    assert_equal(_refused(ARCH_FLAGS, True), False)
+    assert_equal(_refused(ARCH_FLAGS, False), False)
+    # Resume (strict): a flag mismatch is refused in BOTH directions.
+    assert_equal(_refused(other, True), True)
+    # Initialising from a model .bin (non-strict): a flagged file is refused by
+    # a build without the flag; an unflagged (pretrained) file is accepted by a
+    # flagged build.
+    assert_equal(_refused(other, False), ARCH_FLAGS == 0)
+
+
+def _refusal_text(got: Int, expected: Int) raises -> String:
+    try:
+        check_arch_flags("x", got, True, expected=expected)
+    except e:
+        return String(e)
+    return String("")
+
+
+def test_state_arch_flags_untied_bit_is_distinct_from_rotary() raises:
+    """The untied-head bit (2) and the rotary bit (1) are independent in the
+    state flags word: all four combinations round trip as version 2 (except
+    0, which stays version 1), match only themselves, and a refusal names the
+    mismatched bit rather than just the numbers."""
+    assert_equal(ARCH_FLAG_UNTIED, 2)
+    assert_equal(ARCH_FLAG_ROTARY & ARCH_FLAG_UNTIED, 0)
+    var path = String("test_ckpt_state_untied_flags.bin")
+    var n = 4
+    var m = heap_alloc[Float32](n)
+    var v = heap_alloc[Float32](n)
+    _fill_pattern(m, n, 0.1)
+    _fill_pattern(v, n, 0.3)
+    var m_out = heap_alloc[Float32](n)
+    var v_out = heap_alloc[Float32](n)
+    for f in range(4):
+        write_state_checkpoint(path, _tiny_state(f), m, v, n)
+        assert_equal(_header_word(path, 1), 1 if f == 0 else 2)
+        assert_equal(read_state_checkpoint(path, m_out, v_out, n).flags, f)
+        for g in range(4):
+            assert_equal(_refusal_text(f, g) != "", f != g)
+    var untied_vs_tied = _refusal_text(ARCH_FLAG_UNTIED, 0)
+    assert_true("untied head (file untied, build tied" in untied_vs_tied)
+    assert_true("rotary" not in untied_vs_tied)
+    var tied_vs_untied = _refusal_text(0, ARCH_FLAG_UNTIED)
+    assert_true("untied head (file tied, build untied" in tied_vs_untied)
+    var rot_vs_none = _refusal_text(ARCH_FLAG_ROTARY, ARCH_FLAG_UNTIED)
+    assert_true("rotary (file on, build off" in rot_vs_none)
+    assert_true("untied head (file tied, build untied" in rot_vs_none)
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
     _remove(path)
 
 

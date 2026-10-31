@@ -38,6 +38,8 @@ from max.gpu import barrier
 
 from llmm.split import split_fwd, split_bwd
 from llmm.merge import merge_fwd, merge_bwd
+from llmm.qk_norm import qk_rows_fwd, qk_rows_bwd
+from llmm.head_layout import null_immut_ptr
 from llmm.matmul import _matmul_cublaslt
 from llmm.profiler import traced_parallelize
 from llmm.memory import ImmutKernelPtr, MutKernelPtr, heap_alloc
@@ -1809,6 +1811,7 @@ def attention_fwd[
     use_soft_exp: Bool = True,
     use_conditional_rescale: Bool = True,
     use_kv_cache: Bool = True,
+    qk_norm: Bool = False,
 ](
     qkv_ptr: ImmutKernelPtr[dtype],
     q_ptr: MutKernelPtr[dtype],
@@ -1824,6 +1827,7 @@ def attention_fwd[
     ctx: DeviceContext,
     cache: Optional[KVCachePtr] = None,
     head_max: Optional[MutKernelPtr[DType.float32]] = None,
+    q_mul: Float32 = 1.0,
 ) capturing raises:
     var qkv_mut = rebind[MutKernelPtr[dtype]](qkv_ptr)
     var dst_ptrs = List[MutKernelPtr[dtype]]()
@@ -1839,6 +1843,32 @@ def attention_fwd[
         Int(head_dim),
         ctx,
     )
+    # QK-norm / fixed attention scale (llmm/qk_norm.mojo): q <- q_mul *
+    # rmsnorm(q), k <- rmsnorm(k) on the head-layout rows; the core kernels
+    # still apply 1/sqrt(hd), so the net scale is q_mul / sqrt(hd).
+    comptime if qk_norm:
+        qk_rows_fwd[dtype, target, True](
+            q_ptr,
+            k_ptr,
+            Int(batch_size),
+            Int(num_heads),
+            Int(seq_len),
+            Int(head_dim),
+            q_mul,
+            ctx,
+        )
+    else:
+        if q_mul != 1.0:
+            qk_rows_fwd[dtype, target, False](
+                q_ptr,
+                k_ptr,
+                Int(batch_size),
+                Int(num_heads),
+                Int(seq_len),
+                Int(head_dim),
+                q_mul,
+                ctx,
+            )
     attention_fwd[
         dtype, target, use_soft_exp, use_conditional_rescale, use_kv_cache
     ](
@@ -3063,6 +3093,7 @@ def attention_bwd[
     target: StaticString,
     use_soft_exp: Bool = True,
     use_kv_cache: Bool = True,
+    qk_norm: Bool = False,
 ](
     d_qkv_ptr: MutKernelPtr[dtype],
     d_q_ptr: MutKernelPtr[dtype],
@@ -3081,6 +3112,8 @@ def attention_bwd[
     head_dim: Int64,
     ctx: DeviceContext,
     cache: Optional[KVCachePtr] = None,
+    qkv_ptr: ImmutKernelPtr[dtype] = null_immut_ptr[dtype](),
+    q_mul: Float32 = 1.0,
 ) capturing raises:
     # 1. Split heads backward: split d_attn_merged into d_attn
     merge_bwd[dtype, target](
@@ -3111,6 +3144,35 @@ def attention_bwd[
         ctx,
         cache=cache,
     )
+
+    # 2b. QK-norm / fixed-scale backward (llmm/qk_norm.mojo): turn the grads
+    # w.r.t. the normalized/scaled q, k into grads w.r.t. the raw qkv rows
+    # (recomputed from the saved pre-norm qkv activation), in place.
+    comptime if qk_norm:
+        qk_rows_bwd[dtype, target, True](
+            d_q_ptr,
+            d_k_ptr,
+            qkv_ptr,
+            Int(batch_size),
+            Int(num_heads),
+            Int(seq_len),
+            Int(head_dim),
+            q_mul,
+            ctx,
+        )
+    else:
+        if q_mul != 1.0:
+            qk_rows_bwd[dtype, target, False](
+                d_q_ptr,
+                d_k_ptr,
+                qkv_ptr,
+                Int(batch_size),
+                Int(num_heads),
+                Int(seq_len),
+                Int(head_dim),
+                q_mul,
+                ctx,
+            )
 
     # 3. Merge QKV backward: merge d_q, d_k, d_v back into d_qkv
     var d_dst_ptrs = List[ImmutKernelPtr[dtype]]()

@@ -72,7 +72,12 @@ Configuration (must stay in sync with ``model.update()`` in test_gpt2.mojo)
     steps          10, all on the SAME batch (deliberate overfit)
     batch          x/y read from gpt2_124M_debug_state.bin (B=4, T=64)
     dtype          float32, TF32 disabled (strict IEEE, matching
-                   `make verify-gpu`'s -D LLMM_NO_TF32=1)
+                   `make verify-gpu`'s -D LLMM_NO_TF32=1); --dtype float64
+                   for an ill-conditioned model where the fp32 reference
+                   itself drifts (GPT2_ACT=relu2: torch fp32 ends 0.0126 below
+                   torch fp64 at step 9, while Mojo fp32 lands within 1e-3 of
+                   fp64), so the list measures Mojo against the true
+                   trajectory rather than against torch's rounding
     init           GPT.from_pretrained("gpt2"), the same initialisation
                    train_gpt2.py uses to write the debug state
 """
@@ -91,10 +96,32 @@ import torch
 # train_gpt2.py guards its training driver behind `if __name__ == "__main__"`,
 # so importing it for the model definition is side-effect free.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from train_gpt2 import GPT, is_untied  # noqa: E402
+from train_gpt2 import GPT, QK_NORM, ROTARY, is_untied  # noqa: E402
 
-STATE_FILE = "gpt2_124M_debug_state.bin"
-UNTIED_STATE_FILE = "gpt2_124M_untied_debug_state.bin"
+# GPT2_ACT=relu2 (the reference's MLP activation switch, mirroring the Mojo build
+# constant -D LLMM_MLP_ACT=relu2) reads/produces the *_relu2_debug_state.bin
+# written by train_gpt2.py under the same env var, and the list it prints is the
+# relu2 trajectory for test_gpt2.mojo.
+# GPT2_ROTARY=1 selects the rotary reference: the same weights, rotary on q/k,
+# no wpe add, and the rotary debug state written by `GPT2_ROTARY=1 python
+# train_gpt2.py` (the list is then pasted as `expected_losses` under ROTARY).
+# GPT2_QK_NORM=1 selects the QK-norm reference (_qknorm suffix).
+# --untied (GPT2_UNTIED=1) selects the untied-head reference (_untied suffix).
+# The suffixes compose exactly as in train_gpt2.py: _untied, _rotary, _qknorm,
+# _relu2.
+
+
+def _state_file(untied: bool) -> str:
+    return (
+        "gpt2_124M"
+        + ("_untied" if untied else "")
+        + ("_rotary" if ROTARY else "")
+        + ("_qknorm" if QK_NORM else "")
+        + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
+        + "_debug_state.bin"
+    )
+
+
 MAGIC_EXPECTED = 20240520
 VERSION_EXPECTED = 3
 NUM_STEPS = 10
@@ -160,11 +187,17 @@ def main() -> int:
         action="store_true",
         help="separate LM head (GPT2_UNTIED=1); reads the untied debug state",
     )
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float64"],
+        default="float32",
+        help="reference precision (default float32; relu2 uses float64)",
+    )
     args = parser.parse_args()
     if args.untied:
         os.environ["GPT2_UNTIED"] = "1"
     if args.state_file is None:
-        args.state_file = UNTIED_STATE_FILE if args.untied else STATE_FILE
+        args.state_file = _state_file(args.untied)
 
     # Strict IEEE fp32. TF32 would drift the trajectory by ~1e-2, which is the
     # same order as the tolerance this list is compared against.
@@ -193,7 +226,7 @@ def main() -> int:
         assert torch.equal(model.lm_head.weight, model.transformer.wte.weight)
     model.to(device)
     model.train()
-    model.float()
+    model.to(getattr(torch, args.dtype))
 
     # Uniform weight decay over every parameter -- deliberately NOT the
     # split decay/no-decay grouping used for real training runs, because the
@@ -234,7 +267,8 @@ def main() -> int:
     print("OK: step 0 reproduces the stored reference loss.")
 
     print("\nPaste into test_gpt2.mojo:\n")
-    print("    var expected_losses: List[Float32] = [")
+    name = "expected_losses_rotary" if ROTARY else "expected_losses"
+    print(f"    var {name}: List[Float32] = [")
     for value in losses:
         print(f"        {value!r},")
     print("    ]")

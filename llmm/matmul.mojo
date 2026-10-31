@@ -142,7 +142,13 @@ from _cublas.cublaslt import (
 )
 from linalg.matmul.vendor.blas import _get_global_handle, Backend
 
-from llmm.gelu import gelu, gelu_grad, gelu_fwd_gpu, bias_gelu_fwd
+from llmm.gelu import (
+    mlp_act,
+    mlp_act_grad,
+    MLP_RELU2,
+    gelu_fwd_gpu,
+    bias_gelu_fwd,
+)
 from llmm.profiler import traced_parallelize
 from llmm.memory import (
     ImmutKernelPtr,
@@ -207,7 +213,10 @@ comptime _CUBLASLT_WS_BYTES = 32 * 1024 * 1024
 # default); False = llm.c's unfused default (plain GEMM + standalone
 # elementwise GELU kernel, both directions). See docs/benchmarks.md item 2
 # (GELU fusion A/B) for the measured verdict on this GPU.
-comptime USE_GELU_FUSION = True
+# The cuBLASLt GELU/DGELU epilogues are GELU-specific: with -D LLMM_MLP_ACT=relu2
+# the unfused branch (plain GEMM + standalone elementwise kernel) is the one
+# that runs; with the default gelu this is True exactly as before.
+comptime USE_GELU_FUSION = not MLP_RELU2
 # Hand-edit A/B knob (not a -D flag); the not-fused branches below are
 # unreachable unless this is flipped.
 
@@ -254,7 +263,7 @@ def _matmul_bias_act_gpu[
         comptime if use_gelu:
             (pre_gelu_ptr.unsafe_offset(idx)).unsafe_store(v.cast[dtype]())
             (out_ptr.unsafe_offset(idx)).unsafe_store(
-                gelu[DType.float32, width](v).cast[dtype]()
+                mlp_act[DType.float32, width](v).cast[dtype]()
             )
         else:
             (out_ptr.unsafe_offset(idx)).unsafe_store(v.cast[dtype]())
@@ -275,7 +284,7 @@ def _matmul_bias_act_gpu[
             comptime if use_gelu:
                 (pre_gelu_ptr.unsafe_offset(i)).unsafe_store(v.cast[dtype]())
                 (out_ptr.unsafe_offset(i)).unsafe_store(
-                    gelu[DType.float32, 1](v).cast[dtype]()
+                    mlp_act[DType.float32, 1](v).cast[dtype]()
                 )
             else:
                 (out_ptr.unsafe_offset(i)).unsafe_store(v.cast[dtype]())
@@ -1500,7 +1509,7 @@ def _launch_gelu_fwd_gpu[
     comptime BLOCK_SIZE = 256
     var num_threads = ceildiv(num_params, width)
     var num_blocks = ceildiv(num_threads, BLOCK_SIZE)
-    comptime gpu_kernel = gelu_fwd_gpu[dtype, width]
+    comptime gpu_kernel = gelu_fwd_gpu[dtype, width, MLP_RELU2]
     var compiled = ctx.compile_function[gpu_kernel]()
     ctx.enqueue_function(
         compiled,
@@ -1598,7 +1607,7 @@ def matmul_fwd[
                 v.cast[elem_dtype]()
             )
             (out_ptr.unsafe_offset(offset)).unsafe_store(
-                gelu[DType.float32, width](v).cast[elem_dtype]()
+                mlp_act[DType.float32, width](v).cast[elem_dtype]()
             )
         else:
             (out_ptr.unsafe_offset(offset)).unsafe_store(v.cast[elem_dtype]())
@@ -1615,7 +1624,7 @@ def matmul_fwd[
                 v.cast[elem_dtype]()
             )
             (out_ptr.unsafe_offset(offset)).unsafe_store(
-                gelu[DType.float32, width](v).cast[elem_dtype]()
+                mlp_act[DType.float32, width](v).cast[elem_dtype]()
             )
         else:
             (out_ptr.unsafe_offset(offset)).unsafe_store(v.cast[elem_dtype]())
@@ -2776,7 +2785,7 @@ def _matmul_gelu_backward_scaling[
         .unsafe_load[width=width]()
         .cast[DType.float32]()
     )
-    var scaled = dy * gelu_grad[DType.float32, width](pre_gelu)
+    var scaled = dy * mlp_act_grad[DType.float32, width](pre_gelu)
     (d_input_ptr.unsafe_offset(idx)).unsafe_store(scaled.cast[dtype]())
 
 
@@ -2865,7 +2874,7 @@ def matmul_d_input_bwd[
                 .unsafe_load[width=width]()
                 .cast[DType.float32]()
             )
-            v *= gelu_grad[DType.float32, width](pre_gelu)
+            v *= mlp_act_grad[DType.float32, width](pre_gelu)
             (d_input_ptr.unsafe_offset(offset)).unsafe_store(
                 v.cast[elem_dtype]()
             )

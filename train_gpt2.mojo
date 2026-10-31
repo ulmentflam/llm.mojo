@@ -34,6 +34,10 @@ from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
 from llmm.checkpointing import (
     CheckpointConfig,
     TrainingState,
+    ARCH_FLAG_ROTARY,
+    ARCH_FLAG_UNTIED,
+    MODEL_FLAGS_SLOT,
+    peek_model_header,
     write_model_checkpoint,
     read_model_checkpoint,
     peek_model_header,
@@ -63,12 +67,14 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
+from llmm.rotary import rotary_qk_rows, rotary_table_host
 from llmm.qk_clip import (
     qk_clip_apply,
     qk_clip_bias_range,
     qk_clip_matrix,
     qk_head_max_fold,
 )
+from llmm.gelu import MLP_RELU2
 from llmm.matmul import (
     fp8_mutex_preseed,
     matmul_fwd,
@@ -243,6 +249,11 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #                              transform. llmm/matmul.mojo.
 # Stochastic rounding
 #   LLMM_INIT_SEED=<int>       from-scratch weight-init seed, default 42.
+#   LLMM_MLP_ACT=gelu|relu2    MLP activation (default gelu). relu2 = relu(x)^2;
+#                              forces the unfused (non-cuBLASLt-epilogue) path.
+#                              llmm/gelu.mojo, llmm/matmul.mojo.
+#   LLMM_ZERO_INIT_PROJ=0|1|2  residual-projection init: 0 GPT-2 scaled normal
+#                              (default), 1 zeros, 2 N(0, 0.02*0.1).
 #   LLMM_SR_MASTER=1           SR on the master->bf16 param store (llmm/adamw.mojo).
 #   LLMM_SR_SEED=<int>         shared SR seed, default 1746221221 (adamw +
 #                              nvfp4; decorrelated by stream id, see
@@ -274,6 +285,7 @@ comptime NUM_ACTIVATION_TENSORS = 26
 #   LLMM_MUON_MOMENTUM_START=<f>  override -mu_start (default: equal to -mu).
 #   LLMM_MUON_MOMENTUM_WARMUP=<n> override -mu_warmup steps (default 0 = off).
 #   LLMM_QK_CLIP=<f>           override -qk_clip, max attention logit (0=off).
+#   LLMM_ATTN_SCALE=<f>        override -attn_scale (0 = 1/sqrt(head_dim)).
 #   LLMM_RECOMPUTE=1           test_gpt2 only: activation-recompute build in
 #                              run_test. Not read by train_gpt2 (see docs).
 # Profiling (out of precision scope): LLMM_ATTN_PROFILE, LLMM_PROFILE_*,
@@ -369,8 +381,103 @@ comptime UNROLL = 4
 # From-scratch init draws the same random numbers as llm.c (and PyTorch) so the
 # initial weights are bit-identical: seed 42, weights ~N(0, 0.02), the residual
 # projections additionally scaled by 1/sqrt(2*L). See gpt_build_from_descriptor.
+# W7: RMS-normalize q and k per head before the attention scores (no affine;
+# llmm/qk_norm.mojo). Opt-in: -D LLMM_QK_NORM=1. Pair with -attn_scale.
+comptime QK_NORM = get_defined_int["LLMM_QK_NORM", 0]() != 0
 comptime INIT_RNG_SEED = get_defined_int["LLMM_INIT_SEED", 42]()
 comptime INIT_WEIGHT_STD = Float32(0.02)
+# Residual-projection init (attn_proj_weight, proj_weight), -D LLMM_ZERO_INIT_PROJ:
+#   0 (default)  N(0, 0.02/sqrt(2L))  -- GPT-2 / llm.c
+#   1            all zeros            -- modded-nanogpt (every block starts as the
+#                                       identity on the residual stream)
+#   2            N(0, 0.02*0.1)       -- "small nonzero" arm
+# The RNG draw is performed in every mode and only the VALUE written changes, so
+# the stream position of every later tensor (and wte/wpe/qkv/fc) is identical
+# across modes. wte (tied LM head) is never touched. See allocate_parameters_random.
+comptime ZERO_INIT_PROJ = get_defined_int["LLMM_ZERO_INIT_PROJ", 0]()
+# Attention exp on the soft-exp targets (CPU, and Metal's attention_fwd_gpu /
+# backward kernels; the cuBLAS GEMM attention path ignores it): the default is
+# the FA4 degree-4 2^f polynomial (llmm/attention.mojo software_emulated_exp),
+# max relative error 7.8e-4. Harmless for the default model (verify-cpu passes),
+# but -D LLMM_MLP_ACT=relu2 on GELU-pretrained GPT-2 weights grows the residual
+# stream to ~1.2e5 by layer 3, and that 7.8e-4 then fails verify-cpu: loss
+# 7.1832 vs 7.1847, 13/16 gradients at l2_ratio ~0.8. With libm exp the same
+# build matches a float64 forward to ~1e-6 per activation and passes all 16
+# gradients. So relu2 builds use exact exp; the default stays bit-identical.
+# See docs/ai/w5_w6_zero_init_proj_and_relu2_2026-10-30.md.
+comptime ATTN_SOFT_EXP = not MLP_RELU2
+# -D LLMM_ROTARY=1: modded-nanogpt half-truncated rotary on q/k, no learned
+# position embedding. `wpe` stays in the parameter layout (descriptor,
+# checkpoint tensor list, ZeRO shards, Muon owner-space unchanged) but is not
+# added in the forward, gets no gradient, is zero in a from-scratch init and is
+# excluded from the AdamW ranges. See docs/ai/rotary_embeddings_w8_2026-10-30.md.
+comptime ROTARY = get_defined_int["LLMM_ROTARY", 0]() != 0
+# Architecture flags word persisted in checkpoint headers (0 = default build).
+# Model files carry the rotary bit only (an untied model file is marked by its
+# version, 13/15); state files additionally carry ARCH_FLAG_UNTIED (bit 1) when
+# written by the untied-LM-head build, so STATE_ARCH_FLAGS is what a state file
+# must match and ARCH_FLAGS what a model file must match.
+comptime ARCH_FLAGS = ARCH_FLAG_ROTARY if ROTARY else 0
+comptime STATE_ARCH_FLAGS = ARCH_FLAGS | (
+    ARCH_FLAG_UNTIED if UNTIED_HEAD else 0
+)
+
+
+def _arch_flag_mismatch(got: Int, expected: Int) -> String:
+    """Name every architecture bit on which `got` and `expected` differ."""
+    var out = String("")
+    var diff = got ^ expected
+    if (diff & ARCH_FLAG_ROTARY) != 0:
+        out += (
+            "rotary (file "
+            + ("on" if (got & ARCH_FLAG_ROTARY) != 0 else "off")
+            + ", build "
+            + ("on" if (expected & ARCH_FLAG_ROTARY) != 0 else "off")
+            + "; -D LLMM_ROTARY); "
+        )
+    if (diff & ARCH_FLAG_UNTIED) != 0:
+        out += (
+            "untied head (file "
+            + ("untied" if (got & ARCH_FLAG_UNTIED) != 0 else "tied")
+            + ", build "
+            + ("untied" if (expected & ARCH_FLAG_UNTIED) != 0 else "tied")
+            + "; -D LLMM_UNTIED_HEAD); "
+        )
+    var rest = diff & ~(ARCH_FLAG_ROTARY | ARCH_FLAG_UNTIED)
+    if rest != 0:
+        out += "unknown flag bits " + String(rest) + "; "
+    return out
+
+
+def check_arch_flags(
+    what: String, got: Int, strict: Bool, expected: Int = ARCH_FLAGS
+) raises:
+    """Refuse a checkpoint whose architecture flags disagree with this build.
+
+    `strict` (resume: state file and the model file saved with it) requires
+    equality in both directions. Non-strict (initializing from a model .bin)
+    refuses only a flagged file in a build without that flag: a flag-0 file is
+    an ordinary pretrained init (the speedrun-style conversion of GPT-2
+    weights), while a rotary-trained file is meaningless without rotary.
+    `expected` is the build's word: ARCH_FLAGS for model files,
+    STATE_ARCH_FLAGS for state files. The error names each mismatched bit.
+    """
+    if got == expected:
+        return
+    if strict or (got & ~expected) != 0:
+        raise Error(
+            "Cannot load "
+            + what
+            + ": it was written with architecture flags="
+            + String(got)
+            + " (1=rotary, 2=untied head) but this binary was built with flags="
+            + String(expected)
+            + "; mismatched: "
+            + _arch_flag_mismatch(got, expected)
+            + "rebuild with the matching -D flags"
+        )
+
+
 # GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
 comptime SCRATCH_VOCAB_SIZE = 50257
 comptime SCRATCH_PADDED_VOCAB_SIZE = 50304
@@ -1406,7 +1513,17 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var master_memory: MutMemPtr[MASTER_DTYPE]
     var head_max_memory: MutMemPtr[DType.float32]
     var head_max_fwd_memory: MutMemPtr[DType.float32]
+    # ROTARY only: fp32 [cos | sin] table, each [rotary_rows, head_dim/4].
+    var rotary_table_buf: DeviceBuffer[DType.float32]
+    var rotary_table: MutMemPtr[DType.float32]
+    var rotary_rows: Int
     var qk_clip_tau: Float32  # <= 0 disables QK-clip
+    # Record the per-head max attention logit (qk_max()) even when no clip is
+    # applied (tau <= 0): the QK-norm measurement. Implied by tau > 0.
+    var qk_track: Bool
+    # q is multiplied by attn_scale * sqrt(head_dim) after the (optional) QK-norm
+    # so the kernels' fixed 1/sqrt(head_dim) yields attn_scale. 1.0 = default.
+    var attn_q_mul: Float32
     # WORLD_SIZE > 1: `head_max_buf` already holds the cross-rank max for this
     # step (set by _qk_sync_head_max, cleared by the backward fold), and the
     # clip was already applied inside the sharded Muon update().
@@ -1633,7 +1750,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.muon_master_memory = NULL_MASTER_PTR
         self.head_max_memory = NULL_MASTER_PTR
         self.head_max_fwd_memory = NULL_MASTER_PTR
+        self.rotary_table = NULL_MASTER_PTR
+        self.rotary_rows = 0
         self.qk_clip_tau = 0.0
+        self.qk_track = False
+        self.attn_q_mul = 1.0
         self.qk_head_max_global = False
         self.qk_clip_applied = False
         self.acts_memory = NULL_DTYPE_PTR
@@ -1696,6 +1817,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.muon_master_buf = self.ctx.enqueue_create_buffer[MASTER_DTYPE](1)
         self.head_max_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.head_max_fwd_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
+        self.rotary_table_buf = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.grad_acts_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](1)
         self.acts_stats_buf = self.ctx.enqueue_create_buffer[StatsDType](1)
@@ -1763,6 +1885,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var model_header = heap_alloc[Int32](256)
             read_and_copy[DType.int32](model_file, model_header, 256)
 
+            var init_flags = Int(model_header.unsafe_load(MODEL_FLAGS_SLOT))
             var model_magic = model_header.unsafe_load(0)
             if model_magic != GPT2_MAGIC and model_magic != GPT2_MAGIC_LEGACY:
                 print("Bad magic number in header: " + String(model_magic))
@@ -1782,6 +1905,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 )
                 model_header.unsafe_free()
                 raise Error("GPT2 error: Invalid version in header")
+            check_arch_flags(self.checkpoint_path, init_flags, False)
 
             self.config = GPT2Config(
                 max_seq_len=Int(model_header.unsafe_load(2)),
@@ -2506,13 +2630,28 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                         layer_offset = l * n
                     # Residual-stream projections get the 1/sqrt(2*L) scaling.
                     var scale = INIT_WEIGHT_STD
-                    if (
+                    var is_proj = (
                         i == Parameters.attn_proj_weight
                         or i == Parameters.proj_weight
-                    ):
+                    )
+                    if is_proj:
                         scale = INIT_WEIGHT_STD * residual_scale
+                        comptime if ZERO_INIT_PROJ == 2:
+                            scale = INIT_WEIGHT_STD * Float32(0.1)
+                    # Always draw, even when the projection is zeroed below, so
+                    # the RNG stream (and every other tensor) is unchanged.
                     normal_(rng, fp32_ptr, n, Float32(0.0), scale)
-                    for j in range(n):
+                    comptime if ZERO_INIT_PROJ == 1:
+                        if is_proj:
+                            for j in range(n):
+                                fp32_ptr[unsafe_offset=j] = Float32(0.0)
+                    # ROTARY: the wpe draw is still consumed so every later
+                    # tensor gets the same values as in a non-rotary build with
+                    # this seed, but the (already zeroed) wpe is left at zero.
+                    var keep = True
+                    comptime if ROTARY:
+                        keep = i != Parameters.wpe
+                    for j in range(n if keep else 0):
                         hp[unsafe_offset=offset + layer_offset + j] = fp32_ptr[
                             unsafe_offset=j
                         ].cast[GPT2_DTYPE]()
@@ -2958,7 +3097,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 seq_len,
                 channels,
                 self.ctx,
-                include_wpe=first_chunk,
+                include_wpe=first_chunk and not ROTARY,
             )
 
             # Map this chunk's compact rows back to flat `wte` ranges. Compact
@@ -3040,8 +3179,20 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
 
         self.has_allocated_grads = True
 
+    def set_attn_scale(mut self, attn_scale: Float32):
+        """Fixed attention scale (replaces 1/sqrt(head_dim)); <= 0 keeps the
+        default. Folded into q (see llmm/qk_norm.mojo)."""
+        if attn_scale <= 0.0:
+            self.attn_q_mul = 1.0
+        else:
+            var hd = Float32(self.config.channels // self.config.num_heads)
+            self.attn_q_mul = attn_scale * sqrt(hd)
+
     def enable_qk_clip(
-        mut self, tau: Float32, planted_head_max_only: Bool = False
+        mut self,
+        tau: Float32,
+        planted_head_max_only: Bool = False,
+        track_only: Bool = False,
     ) raises:
         """Track per-(layer, head) max attention logits during forward and
         allow `qk_clip_step` to rescale Q/K rows. tau <= 0 disables.
@@ -3049,7 +3200,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         `planted_head_max_only` (tests) lifts the CPU-target raise: the CPU
         attention path records no logits, so the caller must plant
         `head_max_memory` itself or the clip never fires."""
-        if tau <= 0.0:
+        if tau <= 0.0 and not track_only:
             self.qk_clip_tau = 0.0
             return
         # The logit max is recorded only by the GPU causal-softmax kernel; the
@@ -3085,7 +3236,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.head_max_fwd_memory = rebind_mut_mem[DType.float32](
             self.head_max_fwd_buf.unsafe_ptr().as_unsafe_any_origin()
         )
-        self.qk_clip_tau = tau
+        self.qk_clip_tau = tau if tau > 0.0 else 0.0
+        self.qk_track = True
 
     def qk_clip_step(mut self) raises:
         """Call after the optimizer step: rescale Q/K projection rows (and
@@ -3125,7 +3277,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         forwards in between do not change it). Syncs the device. At
         WORLD_SIZE > 1 this is the GLOBAL max (a collective: every rank must
         call it)."""
-        if self.qk_clip_tau <= 0.0:
+        if not self.qk_track:
             return 0.0
         self._qk_sync_head_max()
         var n = self.config.num_layer * self.config.num_heads
@@ -3321,6 +3473,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             ](1)
 
         self.has_allocated_optimizer_moments = True
+
+    def _allocate_rotary_table(mut self) raises:
+        """Build the [cos | sin] fp32 table once, sized to the model's max
+        sequence length (the wpe row count), which also covers generation."""
+        if self.rotary_rows > 0:
+            return
+        var T_max = self.config.max_seq_len
+        var hd = self.config.channels // self.config.num_heads
+        var tbl = rotary_table_host(T_max, hd)
+        var host = self.ctx.enqueue_create_host_buffer[DType.float32](len(tbl))
+        for i in range(len(tbl)):
+            host[i] = tbl[i]
+        self.rotary_table_buf = self.ctx.enqueue_create_buffer[DType.float32](
+            len(tbl)
+        )
+        self.ctx.enqueue_copy(self.rotary_table_buf, host)
+        self.ctx.synchronize()
+        self.rotary_table = rebind_mut_mem[DType.float32](
+            self.rotary_table_buf.unsafe_ptr().as_unsafe_any_origin()
+        )
+        self.rotary_rows = T_max
 
     def allocate_activations(mut self, batch_size: Int, seq_len: Int) raises:
         self.batch_size = batch_size
@@ -3558,6 +3731,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.grad_acts_stats_memory,
         )
         self.has_allocated_acts = True
+        comptime if ROTARY:
+            self._allocate_rotary_table()
 
     def build_encoder_buckets(mut self, batch_size: Int, seq_len: Int) raises:
         if self.enc_row_sparse:
@@ -3771,7 +3946,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         #########################################################
 
         var residual: MutMemPtr[GPT2_DTYPE]
-        encoder_fwd[GPT2_DTYPE, Self.target](
+        encoder_fwd[GPT2_DTYPE, Self.target, use_wpe=not ROTARY](
             as_mut_kernel[GPT2_DTYPE](self.acts.encoded),
             as_immut_kernel_from_mut[DType.int32](enc_inputs),
             as_immut_kernel_from_mut[GPT2_DTYPE](self.params.wte),
@@ -3782,7 +3957,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx,
         )
 
-        if self.qk_clip_tau > 0.0:
+        if self.qk_track:
             # Each forward records its own per-head logit maxima from zero.
             self.head_max_fwd_buf.enqueue_fill(Scalar[DType.float32](0.0))
 
@@ -4003,7 +4178,23 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
-            attention_fwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
+            comptime if ROTARY:
+                rotary_qk_rows[GPT2_DTYPE, Self.target, inverse=False](
+                    as_mut_kernel[GPT2_DTYPE](l_qkv),
+                    as_immut_kernel_from_mut[DType.float32](self.rotary_table),
+                    batch_size,
+                    seq_len,
+                    self.rotary_rows,
+                    num_heads,
+                    head_dim,
+                    self.ctx,
+                )
+            attention_fwd[
+                GPT2_DTYPE,
+                Self.target,
+                use_soft_exp=ATTN_SOFT_EXP,
+                qk_norm=QK_NORM,
+            ](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](l_q),
                 as_mut_kernel[GPT2_DTYPE](l_k),
@@ -4023,8 +4214,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                             layer * num_heads
                         )
                     )
-                ) if self.qk_clip_tau
-                > 0.0 else None,
+                ) if self.qk_track else None,
+                q_mul=self.attn_q_mul,
             )
 
             # Matmul Attn Proj. Always bf16 under fp4 (same rationale as the
@@ -4592,7 +4783,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # accumulate over the gradient-accumulation loop.
         self.zero_gradients(zero_param_grads=(micro_step == 0))
 
-        if self.qk_clip_tau > 0.0:
+        if self.qk_track:
             # QK-clip: fold this micro-step's forward logit maxima into the
             # optimizer-step max (overwrite on micro-step 0). Done here, not in
             # forward, so eval/generation forwards never count toward the clip.
@@ -5418,7 +5609,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
-            attention_bwd[GPT2_DTYPE, Self.target, use_soft_exp=True](
+            attention_bwd[
+                GPT2_DTYPE,
+                Self.target,
+                use_soft_exp=ATTN_SOFT_EXP,
+                qk_norm=QK_NORM,
+            ](
                 as_mut_kernel[GPT2_DTYPE](d_l_qkv),
                 as_mut_kernel[GPT2_DTYPE](d_l_q),
                 as_mut_kernel[GPT2_DTYPE](d_l_k),
@@ -5436,7 +5632,23 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 Int64(head_dim),
                 self.ctx,
                 cache=rebind[KVCachePtr](Pointer(to=self.kv_cache)),
+                qkv_ptr=as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv),
+                q_mul=self.attn_q_mul,
             )
+            # ROTARY: d_qkv now holds the gradient w.r.t. the ROTATED q/k;
+            # apply the inverse rotation to its q and k thirds (v untouched)
+            # before the qkv matmul backward.
+            comptime if ROTARY:
+                rotary_qk_rows[GPT2_DTYPE, Self.target, inverse=True](
+                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
+                    as_immut_kernel_from_mut[DType.float32](self.rotary_table),
+                    batch_size,
+                    seq_len,
+                    self.rotary_rows,
+                    num_heads,
+                    head_dim,
+                    self.ctx,
+                )
 
             # QKV matmul backward.
             # fp8 site: C=channels, OC=3*channels; input=l_ln_1,
@@ -5667,6 +5879,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 seq_len,
                 channels,
                 self.ctx,
+                include_wpe=not ROTARY,
             )
 
             if bucketing:
@@ -6126,7 +6339,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         """[start0, end0, start1, end1, ...] of the flat-buffer ranges AdamW
         owns when Muon is enabled: everything except the Muon matrices."""
         var r = List[Int]()
-        r.append(0)
+        comptime if ROTARY:
+            # wpe is unused under rotary: leave it out of the AdamW ranges
+            # (the range split is wte | skip wpe | ln_1.. .. qkv_weight).
+            r.append(0)
+            r.append(self.param_offset(Parameters.wpe))
+            r.append(self.param_offset(Parameters.ln_1_gamma))
+        else:
+            r.append(0)
         r.append(self.param_offset(Parameters.qkv_weight))
         r.append(self.param_offset(Parameters.qkv_bias))
         r.append(self.param_offset(Parameters.attn_proj_weight))
@@ -7317,6 +7537,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     host_params.unsafe_ptr().as_unsafe_any_origin()
                 ),
                 self.num_parameters,
+                arch_flags=ARCH_FLAGS,
             )
 
         # AdamW moments are fp32 (MASTER_DTYPE), independent of the parameter
@@ -7334,7 +7555,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             step,
             sampler_rng_state,
             optimizer_kind=self.optimizer_kind,
-            untied_layout=1 if UNTIED_HEAD else 0,
+            flags=STATE_ARCH_FLAGS,
             untie_step=self.untie_step if UNTIED_HEAD else 0,
         )
         var n_mu = 0
@@ -7382,20 +7603,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         checkpoint (build it from the same base checkpoint first). Each rank
         reads the shared model file plus its own optimizer-state shard.
         """
-        # State-file layout and -untie_at checks first, before any payload.
-        var st_file = open(state_path, "r")
-        var st_head = read_state_header(st_file)
-        st_file.close()
-        if st_head.untied_layout != (1 if UNTIED_HEAD else 0):
-            raise Error(
-                "Cannot resume: state file "
-                + state_path
-                + " was written by "
-                + ("an untied" if st_head.untied_layout != 0 else "a tied")
-                + "-LM-head build but this build is "
-                + ("untied" if UNTIED_HEAD else "tied")
-                + " (-D LLMM_UNTIED_HEAD)"
-            )
+        # Resume must match the architecture flags exactly, in both
+        # directions (rotary bit 0, untied-head bit 1), before any tensor is
+        # read; then the -untie_at step, before any payload.
+        var arch_peek = open(state_path, "r")
+        var st_head = read_state_header(arch_peek)
+        arch_peek.close()
+        check_arch_flags(
+            state_path, st_head.flags, True, expected=STATE_ARCH_FLAGS
+        )
+        check_arch_flags(
+            model_path, peek_model_header(model_path).arch_flags, True
+        )
         comptime if UNTIED_HEAD:
             if st_head.untie_step != self.untie_step:
                 raise Error(
@@ -7998,6 +8217,8 @@ struct TrainArgs(Copyable, Movable):
     var muon_momentum_start: Float32  # -mu_start  (< 0: unset, use -mu)
     var muon_momentum_warmup: Int  # -mu_warmup  ramp steps (0 = off)
     var qk_clip_tau: Float32  # -qk_clip  max attention logit (0 = off)
+    var attn_scale: Float32  # -attn_scale  fixed attention scale (0 = 1/sqrt(hd))
+    var qk_log: Bool  # -qk_log  record/log max attention logit without clipping
 
 
 def default_train_args() -> TrainArgs:
@@ -8045,6 +8266,8 @@ def default_train_args() -> TrainArgs:
         muon_momentum_start=Float32(-1.0),
         muon_momentum_warmup=0,
         qk_clip_tau=Float32(0.0),
+        attn_scale=Float32(0.0),
+        qk_log=False,
     )
 
 
@@ -8279,7 +8502,17 @@ def train[
         >= 0.0 else args.muon_momentum
     )
     printf0(setup_rank, _table_row("optimizer", args.optimizer))
+    comptime if ZERO_INIT_PROJ != 0:
+        printf0(
+            setup_rank, _table_row("zero_init_proj", String(ZERO_INIT_PROJ))
+        )
+    comptime if MLP_RELU2:
+        printf0(setup_rank, _table_row("mlp_act", "relu2"))
     printf0(setup_rank, _table_row("qk clip tau", String(args.qk_clip_tau)))
+    comptime if QK_NORM:
+        printf0(setup_rank, _table_row("qk norm", "on"))
+    if args.attn_scale > 0.0:
+        printf0(setup_rank, _table_row("attn scale", String(args.attn_scale)))
     if args.optimizer == "muon":
         printf0(
             setup_rank, _table_row("muon momentum", String(args.muon_momentum))
@@ -8337,6 +8570,9 @@ def train[
         model.head_lr_mult = args.head_lr_mult
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
+    elif args.qk_log or (QK_NORM and not is_cpu[target]()):
+        model.enable_qk_clip(0.0, track_only=True)
+    model.set_attn_scale(args.attn_scale)
 
     printf0(setup_rank, bar)
     printf0(setup_rank, _table_row("weight init method", args.load_filename))
@@ -8567,6 +8803,12 @@ def train[
         setup_fields.append(num("l_head", args.head_lr_mult, VERBOSE))
         setup_fields.append(num("untie_at", args.untie_at, VERBOSE))
         setup_fields.append(num("untie_step", untie_step, VERBOSE))
+    # Opt-in architecture/init flags are recorded only when non-default so the
+    # default run's setup event stays byte-identical.
+    comptime if ZERO_INIT_PROJ != 0:
+        setup_fields.append(num("zero_init_proj", ZERO_INIT_PROJ))
+    comptime if MLP_RELU2:
+        setup_fields.append(text("mlp_act", "relu2"))
     run_log.emit(
         "setup",
         NORMAL,
@@ -8929,7 +9171,7 @@ def train[
                 VERBOSE,
             ),
         ]
-        if args.qk_clip_tau > 0:
+        if model.qk_track:
             step_fields.append(num("qk_max", qk_max, VERBOSE))
         run_log.emit(
             "step", NORMAL, step_fields, pretty=step_pretty, plain=step_plain
@@ -9061,6 +9303,11 @@ def _print_usage():
         " off)"
     )
     print("  -qk_clip <float> max attention logit, 0 = off (default = 0)")
+    print(
+        "  -attn_scale <float> fixed attention scale, 0 = 1/sqrt(head_dim)"
+        " (default = 0; speedrun uses 0.12 with -D LLMM_QK_NORM=1)"
+    )
+    print("  -qk_log <0/1> log the max attention logit without clipping")
     print("  -pn <int>   num_processes / world_size (default = 1)")
     print("  -pr <int>   process_rank (default = 0)")
 
@@ -9109,6 +9356,8 @@ def _parse_train_args(
         args.muon_momentum_warmup = atol(getenv("LLMM_MUON_MOMENTUM_WARMUP"))
     if getenv("LLMM_QK_CLIP") != "":
         args.qk_clip_tau = Float32(atof(getenv("LLMM_QK_CLIP")))
+    if getenv("LLMM_ATTN_SCALE") != "":
+        args.attn_scale = Float32(atof(getenv("LLMM_ATTN_SCALE")))
 
     # Parse the flags. Each is "-x" or "-xy" followed by a value, like llm.c.
     var i = 1
@@ -9195,6 +9444,10 @@ def _parse_train_args(
             args.muon_momentum_warmup = atol(val)
         elif flag == "-qk_clip":
             args.qk_clip_tau = Float32(atof(val))
+        elif flag == "-attn_scale":
+            args.attn_scale = Float32(atof(val))
+        elif flag == "-qk_log":
+            args.qk_log = atol(val) != 0
         elif flag == "-pn":
             world_size = atol(val)
         elif flag == "-pr":

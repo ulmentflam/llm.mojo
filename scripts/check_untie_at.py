@@ -197,8 +197,8 @@ def main():
             sb = rd(os.path.join(cont, "state_%d_0.bin" % k))
             sh = hdr(sb)
             check(
-                sh[44] == 1 and sh[45] == 3,
-                "state_%d slots 44/45 = %d/%d" % (k, sh[44], sh[45]),
+                sh[1] == 2 and sh[44] == 2 and sh[45] == 3,
+                "state_%d version/slots 44/45 = %d/%d/%d" % (k, sh[1], sh[44], sh[45]),
             )
             m = sb[1024 : 1024 + 4 * n17]
             v = sb[1024 + 4 * n17 :]

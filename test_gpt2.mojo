@@ -12,11 +12,14 @@ from llmm.memory import MutMemPtr, heap_alloc
 from llmm.log import Field, Log, num, text, DEBUG, NORMAL, QUIET, VERBOSE
 from llmm.term import pad_right
 from llmm.vendor import HAS_CUBLAS, USE_TF32
+from llmm.gelu import MLP_RELU2
 
 from train_gpt2 import (
     GPT2,
     GPT2_DTYPE,
+    ROTARY,
     ParameterTensors,
+    QK_NORM,
     _ffmt,
 )
 
@@ -26,13 +29,21 @@ from train_gpt2 import (
 # Redeclared here (same define as train_gpt2.mojo) so the default 16-tensor path
 # is textually untouched. The untied path needs slice S0 (17-tensor layout, the
 # version-13 model reader) to run; the 17th check itself is by buffer offset.
+# Only the plain untied build has a reference: untied + rotary / relu2 / QK-norm
+# is refused at compile time inside run_test.
 comptime UNTIED_HEAD = get_defined_int["LLMM_UNTIED_HEAD", 0]() != 0
 comptime NUM_CHECKED_TENSORS = 17 if UNTIED_HEAD else 16
 comptime MODEL_FILE = "gpt2_124M_untied.bin" if UNTIED_HEAD else "gpt2_124M.bin"
-comptime STATE_FILE = (
-    "gpt2_124M_untied_debug_state.bin" if UNTIED_HEAD else "gpt2_124M_debug_state.bin"
-)
 
+# -D LLMM_MLP_ACT=relu2 swaps the MLP activation, so the reference state and the
+# loss trajectory come from the PyTorch reference run with GPT2_ACT=relu2
+# (train_gpt2.py writes gpt2_124M_relu2_debug_state.bin; the trajectory is
+# scripts/gen_expected_losses.py's output under the same env var).
+# -D LLMM_ROTARY=1 reads the rotary reference (same weights, rotary q/k, no wpe
+# add; written by `make rotary-reference`). Rotary and relu2 together have no
+# PyTorch trajectory here, so that combination is refused at compile time.
+# -D LLMM_QK_NORM=1 reads gpt2_124M_qknorm_debug_state.bin (GPT2_QK_NORM=1), and
+# with ROTARY gpt2_124M_rotary_qknorm_debug_state.bin; QK-norm + relu2 is refused.
 comptime SIZEOF_INT = size_of[DType.int32]()
 comptime SIZEOF_FLOAT = size_of[DType.float32]()
 
@@ -360,6 +371,16 @@ def run_test[
             pretty=log.style.dim("  note: " + tf32_note),
             plain="  note: " + tf32_note,
         )
+    comptime if ROTARY and QK_NORM:
+        # The rotary+QK-norm reference trajectory is ill-conditioned: pretrained
+        # weights without wpe, loss 9.65 at the start, Adam's first steps. Torch
+        # fp32 and torch fp64 differ by 0.031 (step 5), and the CPU and GPU
+        # trainers land 0.01-0.03 from either, so 0.01 is below the reference's
+        # own noise. The list is the fp64 (true) trajectory; the tolerance is
+        # 0.04. The gate that counts here is step 0: loss, logits and all 16
+        # gradient tensors at full strength; the trajectory still catches a
+        # dead or stalled gradient (loss falls 9.65 -> 3.88).
+        LOSS_STEP_TOL = 0.04
     var ctx: DeviceContext
     comptime if is_cpu[target]():
         ctx = DeviceContext(api="cpu")
@@ -384,7 +405,38 @@ def run_test[
 
     # load additional information that we will use for debugging and error checking
 
-    var state_file = open(STATE_FILE, "r")
+    comptime assert not (
+        ROTARY and MLP_RELU2
+    ), "test_gpt2 has no reference for LLMM_ROTARY=1 with LLMM_MLP_ACT=relu2"
+    comptime assert not (
+        QK_NORM and MLP_RELU2
+    ), "test_gpt2 has no reference for LLMM_QK_NORM=1 with LLMM_MLP_ACT=relu2"
+    comptime assert not (UNTIED_HEAD and (ROTARY or MLP_RELU2 or QK_NORM)), (
+        "test_gpt2 has no untied-head reference for LLMM_ROTARY=1,"
+        " LLMM_MLP_ACT=relu2 or LLMM_QK_NORM=1"
+    )
+
+    # The reference state is selected by build flag; the suffixes compose in the
+    # same order as train_gpt2.py writes them: _untied, _rotary, _qknorm,
+    # _relu2. They are
+    # written by train_gpt2.py run in a scratch dir with GPT2_ROTARY / GPT2_QK_NORM /
+    # GPT2_ACT (see docs/ai/qk_norm_attn_scale_2026-10-30.md). Flag off: the
+    # file is gpt2_124M_debug_state.bin, unchanged.
+    var state_name = String("gpt2_124M")
+    comptime if UNTIED_HEAD:
+        state_name += "_untied"
+    comptime if ROTARY:
+        state_name += "_rotary"
+    comptime if QK_NORM:
+        state_name += "_qknorm"
+    comptime if MLP_RELU2:
+        state_name += "_relu2"
+    state_name += "_debug_state.bin"
+    if getenv("LLMM_DEBUG_STATE") != "":
+        state_name = getenv("LLMM_DEBUG_STATE")
+    if getenv("LLMM_ATTN_SCALE") != "":
+        model.set_attn_scale(Float32(atof(getenv("LLMM_ATTN_SCALE"))))
+    var state_file = open(state_name, "r")
 
     var state_header = heap_alloc[Int32](256)
     read_to_dtype_pointer[DType.int32](state_header, state_file, 256)
@@ -395,7 +447,8 @@ def run_test[
             # no activation tensors, so this test can't consume it. The
             # reference files must be regenerated with the PyTorch script.
             print(
-                STATE_FILE + " is llm.c's downloaded debug state,"
+                state_name
+                + " is llm.c's downloaded debug state,"
                 " which lacks the activation tensors this test checks."
                 " Regenerate the reference files with:"
                 " pixi run python train_gpt2.py"
@@ -411,13 +464,15 @@ def run_test[
     if Int(state_header[unsafe_offset=4]) != (1 if UNTIED_HEAD else 0):
         print(
             "Debug state",
-            STATE_FILE,
+            state_name,
             "has header[4] =",
             state_header[unsafe_offset=4],
             "but this build expects",
             1 if UNTIED_HEAD else 0,
-            "(rebuild with/without -D LLMM_UNTIED_HEAD=1, or regenerate the"
-            " state with/without GPT2_UNTIED=1)",
+            (
+                "(rebuild with/without -D LLMM_UNTIED_HEAD=1, or regenerate the"
+                " state with/without GPT2_UNTIED=1)"
+            ),
         )
         exit(1)
 
@@ -490,18 +545,104 @@ def run_test[
     # reference file said 5.2678394, so every one of these ten steps reported
     # LOSS MISMATCH on every commit, and `make verify-gpu` exited 1 for
     # everyone. See scripts/gen_expected_losses.py for the full story.
-    var expected_losses: List[Float32] = [
-        5.26998233795166,
-        4.059586048126221,
-        3.374852418899536,
-        2.8005142211914062,
-        2.315274715423584,
-        1.8489989042282104,
-        1.3946499824523926,
-        0.9988086223602295,
-        0.6243725419044495,
-        0.37682223320007324,
-    ]
+    var expected_losses: List[Float32]
+    comptime if ROTARY and QK_NORM:
+        # QK-norm + rotary (norm first, then rotary, as modded-nanogpt), from
+        # scripts/gen_expected_losses.py --dtype float64 run with GPT2_QK_NORM=1
+        # GPT2_ROTARY=1 (see LOSS_STEP_TOL above for why float64 and 0.04).
+        expected_losses = [
+            9.654558105380437,
+            6.919155526118772,
+            6.293914874300064,
+            5.837668282578282,
+            5.479384253787839,
+            5.170911108197578,
+            4.797532977309014,
+            4.47247907607067,
+            4.1756499389174975,
+            3.8798503087966703,
+        ]
+    elif ROTARY:
+        # PyTorch with GPT2_ROTARY=1 (same weights, rotary q/k, no wpe add),
+        # from `make rotary-reference`; step 0 is the rotary debug state's
+        # stored loss. Pretrained GPT-2 weights are not trained for rotary,
+        # hence the high start.
+        expected_losses = [
+            9.35813045501709,
+            6.650364875793457,
+            5.8415021896362305,
+            5.305992603302002,
+            4.834591388702393,
+            4.441601753234863,
+            4.0521063804626465,
+            3.70202374458313,
+            3.3840603828430176,
+            3.0682621002197266,
+        ]
+    elif QK_NORM:
+        # W7: the QK-norm reference model (default attention scale), from
+        # scripts/gen_expected_losses.py run with GPT2_QK_NORM=1.
+        expected_losses = [
+            5.722967147827148,
+            4.701408386230469,
+            3.8904597759246826,
+            3.3262996673583984,
+            2.857145309448242,
+            2.4304096698760986,
+            2.0379016399383545,
+            1.6252261400222778,
+            1.2215285301208496,
+            0.8687400221824646,
+        ]
+    elif MLP_RELU2:
+        # relu2 trajectory: torch FLOAT64 (GPT2_ACT=relu2 scripts/gen_expected_losses.py
+        # --dtype float64), not fp32. relu2 on GELU-pretrained weights is
+        # ill-conditioned (residual stream ~1.2e5 from layer 3), and torch's own fp32
+        # run drifts from its fp64 run by 0.0126 at step 9 (3.367974 vs 3.380598),
+        # more than LOSS_STEP_TOL. Mojo fp32 (GPU 3.37966, CPU 3.38055) lands within
+        # 1e-3 of fp64, so the gate keeps the full-strength 0.01 against the true
+        # trajectory. Step 0 differs from the debug state's fp32 loss by 1e-5 (the
+        # stale-state guard allows 1e-3). See docs/ai/w5_w6_zero_init_proj_and_relu2_2026-10-30.md.
+        expected_losses = [
+            7.184733928491164,
+            6.57912622894239,
+            6.156180415699619,
+            5.7834021372001345,
+            5.452741764643019,
+            5.0208772006836355,
+            4.616522495663473,
+            4.157646495279576,
+            3.7607664251102446,
+            3.380597985334229,
+        ]
+    else:
+        expected_losses = [
+            5.26998233795166,
+            4.059586048126221,
+            3.374852418899536,
+            2.8005142211914062,
+            2.315274715423584,
+            1.8489989042282104,
+            1.3946499824523926,
+            0.9988086223602295,
+            0.6243725419044495,
+            0.37682223320007324,
+        ]
+
+    # Any other reference (e.g. -attn_scale 0.12): pass the PyTorch list, as
+    # printed by scripts/gen_expected_losses.py, as comma-separated floats.
+    if getenv("LLMM_EXPECTED_LOSSES") != "":
+        expected_losses = List[Float32]()
+        for tok in getenv("LLMM_EXPECTED_LOSSES").split(","):
+            expected_losses.append(Float32(atof(String(tok))))
+    # The trajectory loop indexes expected_losses[0..9]: a short list would read
+    # past the end instead of failing, so reject it here.
+    if len(expected_losses) != 10:
+        print(
+            "LLMM_EXPECTED_LOSSES must hold 10 comma-separated losses, got",
+            len(expected_losses),
+        )
+        return False
 
     comptime if UNTIED_HEAD:
         # Untied head (head := copy of wte at init, then updated separately):
@@ -545,11 +686,22 @@ def run_test[
         print("=========================================================")
         return False
 
+    # LLMM_TRAJECTORY_STEPS=N gates only the first N steps (default all 10). For
+    # references where the GPU trainer and torch part ways after a few steps for
+    # a reason that is not the code under test (attn_scale 0.5, see
+    # docs/ai/qk_norm_attn_scale_2026-10-30.md), the step-0 loss and the 16
+    # gradient tensors are the gate and the early steps a sanity check.
+    var n_steps = 10
+    if getenv("LLMM_TRAJECTORY_STEPS") != "":
+        n_steps = Int(atol(getenv("LLMM_TRAJECTORY_STEPS")))
+        if n_steps < 1 or n_steps > 10:
+            print("LLMM_TRAJECTORY_STEPS must be in 1..10")
+            return False
     var steps_failed = 0
     var last_step_line = String()
     var last_loss = Float32(0.0)
     var last_ref = Float32(0.0)
-    for step in range(10):
+    for step in range(n_steps):
         var start = perf_counter_ns()
         model.forward(
             rebind[MutMemPtr[DType.int32]](x),
@@ -935,7 +1087,8 @@ def run_test[
             var grads_line = _row(
                 log,
                 "gradients",
-                String(NUM_CHECKED_TENSORS) + " tensors "
+                String(NUM_CHECKED_TENSORS)
+                + " tensors "
                 + _ok(log) if grads_ok else log.style.bad(
                     String(NUM_CHECKED_TENSORS - grads_passed)
                     + " of "
@@ -1034,7 +1187,7 @@ def run_test[
         text("gate", gate),
         text("check", "steps"),
         text("status", "ok" if steps_ok else "fail"),
-        num("steps", 10),
+        num("steps", n_steps),
         num("failed", steps_failed),
         num("loss", last_loss),
         num("ref", last_ref),

@@ -409,7 +409,8 @@ loop iteration `s_u` and before its training section (train_gpt2.mojo:7949-7990
    first update would be about `lr * (1-b1)/sqrt(1-b2) ~ 3.2 lr` per element.
 4. `head_tied = False`; emit the `untie` event.
 
-**Checkpoint and resume.** State header slot 44 = 1 (untied layout), slot 45
+**Checkpoint and resume.** (As merged with main's W8, see the final section: slot 44 is
+the architecture-flags word and the untied layout is its bit 1, state version 2.) State header slot 44 = 1 (untied layout), slot 45
 = `s_u` (-1 = never, 0 = untied from construction). Tied-build files write
 zeros, so they stay byte-identical. On resume, the untied build:
 

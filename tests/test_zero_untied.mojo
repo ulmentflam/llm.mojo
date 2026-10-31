@@ -60,7 +60,7 @@ from max.gpu.host import DeviceContext
 from llmm.memory import MutMemPtr, heap_alloc
 from llmm.zero import CpuCoordinator
 
-from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD, master_dst_offset
+from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD, ROTARY, master_dst_offset
 
 comptime TT = 16
 comptime BB = 1
@@ -600,6 +600,13 @@ def _ownership[W: Int](L: Int, NH: Int, C: Int) raises:
     """Run enable_muon on W ZeRO-1 ranks, record opt and the AdamW segments, and
     compare them with values computed here from the layout. Then assert where
     the head lands (see the callers)."""
+    # The expected AdamW ranges below are the non-rotary layout; under rotary
+    # wpe is skipped and every segment offset shifts, so refuse to compile
+    # rather than fail with confusing mismatches.
+    comptime assert not ROTARY, (
+        "test_zero_untied's ownership test hard-codes the non-rotary AdamW"
+        " ranges; build it without -D LLMM_ROTARY=1"
+    )
     var path = String("gpt2_zu_own_w") + String(W) + "_l" + String(L) + ".bin"
     var n = _write_untied_checkpoint(path, L, NH, C)
     var sz = _sizes(L, C)

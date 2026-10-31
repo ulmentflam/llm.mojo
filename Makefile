@@ -168,7 +168,7 @@ $(PIXI_STAMP):
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
         verify-untied-cpu verify-untied-gpu check-untied-idle check-untied-head check-untie-at \
-        typecheck check compile-rest clean figures figure-precision build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
+        typecheck check compile-rest clean figures figure-precision figure-muon build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
@@ -180,9 +180,9 @@ $(PIXI_STAMP):
         benchmark-collectives \
         stage-llmc profile-llmc-ncu profile-llmc-nsys \
         profile-llmc-fp32-ncu profile-llmc-fp32-nsys \
-        test test-cpu test-cuda test-python test-mojo test-fixtures smoke gate \
+        test test-cpu test-cuda test-python test-mojo test-fixtures rotary-reference smoke gate \
         compare-llmc-cpu compare-llmm-cpu \
-        verify verify-cpu verify-gpu verify-gpu-tf32 \
+        verify verify-cpu verify-gpu verify-gpu-tf32 verify-gpu-qknorm-scale verify-init \
         docs docs-clean
 
 .DEFAULT_GOAL := help
@@ -282,6 +282,7 @@ help:
 	@echo "                   (4 arms in one graph, mirroring benchmark-gpu's fp32+bf16 layout)"
 	@echo "  benchmark-zero   ZeRO stages 0-3 at BENCH_ZERO_WORLD GPUs (default 8): per-stage"
 	@echo "                   memory + step time, fp32 vs bf16, JSON into zero/bench/, chart into figures/"
+	@echo "  figure-muon      Muon vs AdamW val-loss figure (600/2000 steps + lr sweep), no GPU"
 	@echo "  figures-wte      tied-wte campaign figures (no GPU, renders committed data):"
 	@echo "                   figure-blindness  exact accounting vs nvidia-smi on the 256 MiB commit grid"
 	@echo "                   figure-breakeven  vocab-parallel communication crossover (modelled)"
@@ -323,8 +324,10 @@ help:
 	@echo "  test-metal       Apple Silicon: Mojo tests + pytest on the Metal GPU (MAX_USE_ACCELERATOR=1)"
 	@echo "  test-fixtures Regenerate tests/fixtures/*.npz from PyTorch reference"
 	@echo "  verify        Verify both CPU and GPU versions against reference state"
+	@echo "  verify-init   From-scratch d12 init vs PyTorch reference (ZERO_INIT_PROJ=0|1|2)"
 	@echo "  verify-cpu    Verify CPU version against reference state"
 	@echo "  verify-gpu    Verify GPU version against reference state (true fp32, TF32 off)"
+	@echo "  verify-gpu-qknorm-scale  QK-norm + attn_scale 0.5 gate (catches a backward that drops q_mul)"
 	@echo "  verify-gpu-tf32  Same gate for the default TF32-on fp32 path (TF32-calibrated loss tol)"
 	@echo ""
 	@echo "Documents:"
@@ -654,7 +657,7 @@ GRAD_DUMP_DIR_FP8 := build/grad_dump_fp8
 
 $(DUMP_BIN_BF16): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
-	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) -o $(DUMP_BIN_BF16) $(DUMP_MOJO_SRC)
+	$(PIXI) run mojo build -D WORLD_SIZE=$(WORLD_SIZE) -D LLMM_BF16=1 $(MOJO_INCLUDES) $(MOJO_LINK_FLAGS) $(MOJO_DEFINES) -o $(DUMP_BIN_BF16) $(DUMP_MOJO_SRC)
 
 $(DUMP_BIN_FP8): $(DUMP_MOJO_SRC) $(TRAIN_MOJO_SRC) $(LLMM_SOURCES)
 	@mkdir -p build
@@ -1025,7 +1028,13 @@ figure-precision:
 # when you re-render it. figure-blindness rewrites only the `rendered`
 # timestamp in its sidecar when the data has not changed, which shows up as
 # diff noise worth reverting rather than committing.
-figures: figure-precision figures-wte
+# Muon vs AdamW result figure (3 panels), rendered from the committed logs in
+# docs/ai/data/muon_*.jsonl and sweeps/muon_*.jsonl; writes a fixed-name PNG
+# plus .json sidecar into figures/.
+figure-muon:
+	$(PIXI) run python scripts/figure_muon.py
+
+figures: figure-precision figure-muon figures-wte
 
 # Vocabulary-tiling cost sweep (figure 3). NEEDS A GPU AND A QUIET BOX:
 # the collector refuses to run if `make test`/pytest are live or the load
@@ -1385,8 +1394,9 @@ endif
 # TestSuite output through.
 # Extra comptime defines for every test build, e.g.
 # `make test-mojo TEST_DEFINES="-D LLMM_UNTIED_HEAD=1"` builds the whole suite
-# against the untied-LM-head trainer. Empty by default (command line unchanged).
-TEST_DEFINES ?=
+# against the untied-LM-head trainer. Defaults to MOJO_DEFINES, so either spelling works
+# (TEST_DEFINES wins when both are set); empty by default (command line unchanged).
+TEST_DEFINES ?= $(MOJO_DEFINES)
 
 test-mojo: | $(PIXI_STAMP)
 	@if ls tests/test_*.mojo >/dev/null 2>&1; then \
@@ -1532,6 +1542,15 @@ smoke: lint build-mojo
 test-fixtures:
 	$(PIXI) run python -m tests.reference dump
 
+# PyTorch reference for the -D LLMM_ROTARY=1 build (GPT2_ROTARY=1): writes
+# gpt2_124M_rotary_debug_state.bin (same weights, rotary q/k, zero wpe grad;
+# the flag-off model/debug-state files are not touched) and prints the 10-step
+# loss list for test_gpt2.mojo's `expected_losses_rotary`. Then gate with
+#   make verify-gpu MOJO_DEFINES="-D LLMM_ROTARY=1"
+rotary-reference:
+	GPT2_ROTARY=1 $(PIXI) run python train_gpt2.py --device cpu --num_iterations 0
+	GPT2_ROTARY=1 $(PIXI) run python scripts/gen_expected_losses.py
+
 # Run verification of activations, losses, and gradients against gpt2_124M_debug_state.bin.
 # We run them as separate processes because initializing both CPU and GPU standard
 # DeviceContexts in the same process leads to a MAX multi-context conflict/crash.
@@ -1581,7 +1600,7 @@ check-untie-at: | $(PIXI_STAMP)
 	$(PIXI) run python scripts/check_untie_at.py build/train_gpt2_untiedchk build/train_gpt2_tiedchk $(S2_UNTIED_BIN)
 
 verify-cpu: | $(PIXI_STAMP)
-	$(PIXI) run mojo test_gpt2.mojo cpu
+	$(PIXI) run mojo $(MOJO_DEFINES) test_gpt2.mojo cpu
 
 # fp32 GEMMs default to TF32 tensor cores (llmm/vendor.mojo's USE_TF32), which
 # is the right choice for training but wrong for a strict-IEEE reference
@@ -1593,7 +1612,40 @@ verify-cpu: | $(PIXI_STAMP)
 # -D LLMM_NO_TF32=1 so this gate keeps checking true IEEE fp32 math at the
 # tight LOSS_STEP_TOL=0.01; see verify-gpu-tf32 below for the TF32 path.
 verify-gpu: | $(PIXI_STAMP)
-	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 test_gpt2.mojo gpu
+	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 $(MOJO_DEFINES) test_gpt2.mojo gpu
+
+# W7: QK-norm at attn_scale 0.5. At head_dim 64 the 0.12 arm has q_mul =
+# 0.12*sqrt(64) = 0.96, so a backward that ignores q_mul is only 4% off and
+# passes; at 0.5 (q_mul = 4) the same mutant fails 13/16 gradient tensors. Only
+# the step-0 loss, the 16 gradient tensors and the first 7 trajectory steps are
+# gated (LLMM_TRAJECTORY_STEPS=7): past that the GPU trainer and torch part ways
+# for a reason that is not the QK-norm math (logit range attn_scale*head_dim =
+# 32, see docs/ai/qk_norm_attn_scale_2026-10-30.md). Fixture, from a scratch dir
+# (train_gpt2.py also writes gpt2_124M*.bin there):
+#   GPT2_QK_NORM=1 GPT2_ATTN_SCALE=0.5 pixi run python <repo>/train_gpt2.py \
+#     --device cpu --num_iterations 0 --input_bin <repo>/data/.tinyshakespeare/tiny_shakespeare_val.bin
+#   mv gpt2_124M_qknorm_debug_state.bin <repo>/gpt2_124M_qknorm_s05_debug_state.bin
+# and the QK_NORM_S05_LOSSES list is `GPT2_QK_NORM=1 GPT2_ATTN_SCALE=0.5 pixi run
+# python scripts/gen_expected_losses.py --state-file <that file>` (comma-joined).
+QK_NORM_S05_LOSSES ?= 6.638791561126709,4.982061386108398,4.194921493530273,3.5213422775268555,2.9567794799804688,2.6112208366394043,2.181741237640381,1.7680350542068481,1.4165663719177246,1.0805416107177734
+verify-gpu-qknorm-scale: | $(PIXI_STAMP)
+	LLMM_DEBUG_STATE=gpt2_124M_qknorm_s05_debug_state.bin LLMM_ATTN_SCALE=0.5 \
+	LLMM_EXPECTED_LOSSES=$(QK_NORM_S05_LOSSES) LLMM_TRAJECTORY_STEPS=7 \
+	$(PIXI) run -e cuda mojo -D LLMM_NO_TF32=1 -D LLMM_QK_NORM=1 $(MOJO_DEFINES) test_gpt2.mojo gpu
+
+# From-scratch init equivalence (the pretrained-weights gates above never run
+# the init code). ZERO_INIT_PROJ selects the residual-projection init on BOTH
+# sides: the reference's GPT2_ZERO_INIT_PROJ env and the Mojo build constant
+# -D LLMM_ZERO_INIT_PROJ. The reference checkpoint is written into build/ref_init
+# (NOT the repo root, whose gpt2_*.bin may be shared symlinks). The reference's
+# init generator is seeded 43 (train_gpt2.py GPT.__init__), the trainer's default
+# LLMM_INIT_SEED is 42 (llm.c's), so the gate pins 43 on the Mojo side.
+ZERO_INIT_PROJ ?= 0
+verify-init: | $(PIXI_STAMP)
+	@mkdir -p build/ref_init
+	cd build/ref_init && GPT2_ZERO_INIT_PROJ=$(ZERO_INIT_PROJ) $(PIXI) run python ../../train_gpt2.py \
+		--model d12 --device cpu --num_iterations 0 --input_bin ../../data/.tinyshakespeare/tiny_shakespeare_val.bin > ref.log 2>&1
+	$(PIXI) run mojo -D LLMM_ZERO_INIT_PROJ=$(ZERO_INIT_PROJ) -D LLMM_INIT_SEED=43 $(MOJO_DEFINES) test_init_gpt2.mojo build/ref_init/gpt2_d12.bin
 
 # Gates the default (TF32-on) fp32 training path against the same reference.
 # The gradient checks run at full strength (TF32 passes them with 30-100x

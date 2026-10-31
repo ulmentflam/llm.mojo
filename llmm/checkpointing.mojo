@@ -19,7 +19,9 @@ from llmm.rand import MT19937
 # 2 num_processes, 3 process_rank, 4 use_master_weights, 5 should_shuffle,
 # 10 step, 20-21 sampler rng, 22-23 shuffle draws, 30-31 shard idx, 32-33
 # sample idx (all llm.c-compatible), and 40 optimizer_kind (0 AdamW, 1 Muon;
-# absent = 0 in files written before Muon). Muon keeps its momentum in the `m`
+# absent = 0 in files written before Muon), 44 architecture flags (bit 0
+# rotary, bit 1 untied head; version-2 files only, see STATE_VERSION_FLAGS), 45
+# untie step (-untie_at; 0 unless set). Muon keeps its momentum in the `m`
 # payload slot and leaves `v` unused for the matrices.
 #
 # Splitting the two means a finished run ships only the model file, while a
@@ -48,6 +50,23 @@ comptime VERSION_BF16_UNTIED = 15
 # State checkpoint header. 20240527 is llm.c's `save_state` magic.
 comptime STATE_MAGIC = 20240527
 comptime STATE_VERSION = 1
+# Version 2 adds the architecture-flags word (header slot 44). A state file is
+# written as version 1 when flags == 0 (byte-identical to before the flags
+# existed) and as version 2 only when a flag is set, so default-build files are
+# unchanged and any older reader refuses a flagged file by its version.
+comptime STATE_VERSION_FLAGS = 2
+# Architecture flags (bit set), stored in state header slot 44 and model
+# header slot 20. Bit 0: rotary position embeddings (-D LLMM_ROTARY=1).
+comptime ARCH_FLAG_ROTARY = 1
+# Bit 1: the state file was written by the untied-LM-head build (17-tensor
+# optimizer layout, -D LLMM_UNTIED_HEAD=1). State files only: untied MODEL files
+# are marked by their version (13/15), not by a model-header flag.
+comptime ARCH_FLAG_UNTIED = 2
+comptime STATE_FLAGS_SLOT = 44
+# The run's untie step s_u (-untie_at); read from every state version, 0 in all
+# files that never set it.
+comptime STATE_UNTIE_STEP_SLOT = 45
+comptime MODEL_FLAGS_SLOT = 20
 
 comptime AUTO_VERSION = -1  # Sentinel: derive the version from the param dtype.
 
@@ -145,6 +164,7 @@ struct ModelHeader(Copyable, Movable):
 
     var config: CheckpointConfig
     var version: Int
+    var arch_flags: Int  # header slot 20; 0 in files without flags.
 
 
 struct TrainingState(Copyable, Movable):
@@ -172,11 +192,13 @@ struct TrainingState(Copyable, Movable):
     # blob of `muon_shard_elems` fp32 elements follows m and v.
     var muon_ownership_version: Int
     var muon_shard_elems: Int  # slot 43: S, the per-rank owner shard.
-    # Slot 44: 1 = the writer was the untied-LM-head build (17-tensor layout),
-    # 0 = tied. Slot 45: that run's untie step s_u (-1 = never untie, 0 =
-    # untied from construction, >0 = untie at that step); always 0 in tied
-    # files, so they stay byte-identical.
-    var untied_layout: Int
+    # Slot 44 (version-2 files): architecture flags, ARCH_FLAG_*. 0 for every
+    # default-build file, which is then still written as version 1. Bit 0 =
+    # rotary, bit 1 = the writer was the untied-LM-head build (17-tensor layout).
+    var flags: Int
+    # Slot 45: that run's untie step s_u (-1 = never untie, 0 = untied from
+    # construction, >0 = untie at that step); always 0 in tied files, so they
+    # stay byte-identical.
     var untie_step: Int
 
     def __init__(
@@ -194,7 +216,7 @@ struct TrainingState(Copyable, Movable):
         zero_stage: Int = 0,
         muon_ownership_version: Int = 0,
         muon_shard_elems: Int = 0,
-        untied_layout: Int = 0,
+        flags: Int = 0,
         untie_step: Int = 0,
     ):
         self.step = step
@@ -210,7 +232,7 @@ struct TrainingState(Copyable, Movable):
         self.zero_stage = zero_stage
         self.muon_ownership_version = muon_ownership_version
         self.muon_shard_elems = muon_shard_elems
-        self.untied_layout = untied_layout
+        self.flags = flags
         self.untie_step = untie_step
 
 
@@ -239,6 +261,7 @@ def write_model_checkpoint[
     params: MutMemPtr[dtype],
     num_parameters: Int,
     version: Int = AUTO_VERSION,
+    arch_flags: Int = 0,
 ) raises:
     """Write a model checkpoint: 256-int header followed by the parameter blob.
 
@@ -262,6 +285,8 @@ def write_model_checkpoint[
     header.unsafe_store(5, Int32(config.num_heads))
     header.unsafe_store(6, Int32(config.channels))
     header.unsafe_store(7, Int32(config.padded_vocab_size))
+    if arch_flags != 0:  # slot stays 0 (byte-identical file) by default
+        header.unsafe_store(MODEL_FLAGS_SLOT, Int32(arch_flags))
 
     var file = open(path, "w")
     write_buffer[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
@@ -302,8 +327,9 @@ def read_model_header(mut file: FileHandle) raises -> ModelHeader:
         padded_vocab_size=Int(header.unsafe_load(7)),
         untied_head=1 if untied else 0,
     )
+    var arch_flags = Int(header.unsafe_load(MODEL_FLAGS_SLOT))
     header.unsafe_free()
-    return ModelHeader(config^, version)
+    return ModelHeader(config^, version, arch_flags)
 
 
 def peek_model_header(path: String) raises -> ModelHeader:
@@ -403,7 +429,10 @@ def write_state_checkpoint[
     for i in range(CHECKPOINT_HEADER_SIZE):
         header.unsafe_store(i, Int32(0))
     header.unsafe_store(0, Int32(STATE_MAGIC))
-    header.unsafe_store(1, Int32(STATE_VERSION))
+    header.unsafe_store(
+        1,
+        Int32(STATE_VERSION_FLAGS if state.flags != 0 else STATE_VERSION),
+    )
     header.unsafe_store(2, Int32(state.num_processes))
     header.unsafe_store(3, Int32(state.process_rank))
     header.unsafe_store(4, Int32(state.use_master_weights))
@@ -413,8 +442,10 @@ def write_state_checkpoint[
     header.unsafe_store(41, Int32(state.zero_stage))
     header.unsafe_store(42, Int32(state.muon_ownership_version))
     header.unsafe_store(43, Int32(state.muon_shard_elems))
-    header.unsafe_store(44, Int32(state.untied_layout))
-    header.unsafe_store(45, Int32(state.untie_step))
+    if state.flags != 0:
+        header.unsafe_store(STATE_FLAGS_SLOT, Int32(state.flags))
+    if state.untie_step != 0:
+        header.unsafe_store(STATE_UNTIE_STEP_SLOT, Int32(state.untie_step))
 
     # 64-bit fields share the same buffer; an aligned UInt64 view writes pairs
     # of Int32 slots (index k => slots 2k, 2k+1), matching llm.c's byte offsets.
@@ -454,7 +485,7 @@ def read_state_header(mut file: FileHandle) raises -> TrainingState:
             "Checkpoint error: bad state magic number in header: "
             + String(magic)
         )
-    if version != STATE_VERSION:
+    if version != STATE_VERSION and version != STATE_VERSION_FLAGS:
         header.unsafe_free()
         raise Error(
             "Checkpoint error: unsupported state version in header: "
@@ -476,8 +507,9 @@ def read_state_header(mut file: FileHandle) raises -> TrainingState:
         zero_stage=Int(header.unsafe_load(41)),
         muon_ownership_version=Int(header.unsafe_load(42)),
         muon_shard_elems=Int(header.unsafe_load(43)),
-        untied_layout=Int(header.unsafe_load(44)),
-        untie_step=Int(header.unsafe_load(45)),
+        flags=Int(header.unsafe_load(STATE_FLAGS_SLOT)) if version
+        == STATE_VERSION_FLAGS else 0,
+        untie_step=Int(header.unsafe_load(STATE_UNTIE_STEP_SLOT)),
     )
     header.unsafe_free()
     return state^
@@ -628,7 +660,7 @@ def make_training_state(
     sampler_rng_state: UInt64 = 0,
     use_master_weights: Int = 0,
     optimizer_kind: Int = 0,
-    untied_layout: Int = 0,
+    flags: Int = 0,
     untie_step: Int = 0,
 ) raises -> TrainingState:
     """Snapshot a DataLoader's position into a `TrainingState` for checkpointing.
@@ -646,7 +678,7 @@ def make_training_state(
         current_shard_idx=loader.current_shard_idx,
         current_sample_idx=loader.current_sample_idx,
         optimizer_kind=optimizer_kind,
-        untied_layout=untied_layout,
+        flags=flags,
         untie_step=untie_step,
     )
 
