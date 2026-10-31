@@ -167,7 +167,7 @@ $(PIXI_STAMP):
 
 .PHONY: help install install-cuda install-with-data install-cuda-with-data install-hooks data update lint lint-python lint-mojo lint-c lint-cuda lint-latex \
         format format-python format-mojo format-c format-cuda format-latex \
-        typecheck check compile-rest clean figures figure-precision build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
+        typecheck check compile-rest clean figures figure-precision figure-muon build         build-mojo build-train build-bf16 build-fp8 build-fp4 train train-cpu train-metal train-bf16 train-fp8 train-fp4 train-zero \
         train-gpt2-124m train-gpt2-124m-fp32 train-gpt2-124m-bf16 train-gpt2-124m-fp8 train-gpt2-124m-fp4 \
         build-profile build-profile-bf16 build-profile-fp8 build-profile-fp8-static build-profile-fp4 profile profile-trace profile-cpu profile-threads-cpu profile-ncu \
         profile-nsys profile-nsys-cpu profile-fp32-ncu profile-fp32-nsys \
@@ -281,6 +281,7 @@ help:
 	@echo "                   (4 arms in one graph, mirroring benchmark-gpu's fp32+bf16 layout)"
 	@echo "  benchmark-zero   ZeRO stages 0-3 at BENCH_ZERO_WORLD GPUs (default 8): per-stage"
 	@echo "                   memory + step time, fp32 vs bf16, JSON into zero/bench/, chart into figures/"
+	@echo "  figure-muon      Muon vs AdamW val-loss figure (600/2000 steps + lr sweep), no GPU"
 	@echo "  figures-wte      tied-wte campaign figures (no GPU, renders committed data):"
 	@echo "                   figure-blindness  exact accounting vs nvidia-smi on the 256 MiB commit grid"
 	@echo "                   figure-breakeven  vocab-parallel communication crossover (modelled)"
@@ -996,7 +997,13 @@ figure-precision:
 # when you re-render it. figure-blindness rewrites only the `rendered`
 # timestamp in its sidecar when the data has not changed, which shows up as
 # diff noise worth reverting rather than committing.
-figures: figure-precision figures-wte
+# Muon vs AdamW result figure (3 panels), rendered from the committed logs in
+# docs/ai/data/muon_*.jsonl and sweeps/muon_*.jsonl; writes a fixed-name PNG
+# plus .json sidecar into figures/.
+figure-muon:
+	$(PIXI) run python scripts/figure_muon.py
+
+figures: figure-precision figure-muon figures-wte
 
 # Vocabulary-tiling cost sweep (figure 3). NEEDS A GPU AND A QUIET BOX:
 # the collector refuses to run if `make test`/pytest are live or the load

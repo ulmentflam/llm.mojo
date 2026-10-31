@@ -38,6 +38,10 @@ LLMM_LOG_LEVEL=verbose LLMM_LOG_FILE=conv_muon.jsonl  make train-bf16 ARGS="... 
 
 Both runs exited 0, no NaN/divergence. Final val loss: **AdamW 5.4690, Muon 5.1115** (Muon 0.358 lower). Muon first reaches AdamW's final val loss at the step-400 eval (5.2565).
 
+![Muon vs AdamW: 600-step seeds, 2000-step run, lr sweep](../../figures/muon_vs_adamw_124m_2026-10-30.png)
+
+Summary figure for this doc (all three panels computed from the committed logs; regenerate with `make figure-muon`).
+
 | step | val AdamW | val Muon | delta (Muon-AdamW) |
 |---:|---:|---:|---:|
 | 0 | 11.0095 | 11.0095 | +0.0000 |

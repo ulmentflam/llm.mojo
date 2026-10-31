@@ -159,6 +159,10 @@ Muon vs AdamW on this box (GPT-2 124M from scratch, FineWeb, bf16, B=32 T=1024 a
 | Muon, AdamW's recipe | `-opt muon -l 6e-4 -c 0.1 -gc 1.0` | 5.112 | 5.107 | 5.120 | 5.113 | step 300-400 |
 | Muon, tuned | `-opt muon -l 4.8e-3 -mu 0.9 -c 0 -gc 0` | 4.364 | 4.358 | 4.361 | 4.361 | step 200 |
 
+![Muon vs AdamW: val loss over 600 and 2000 steps, and the Muon lr sweep](figures/muon_vs_adamw_124m_2026-10-30.png)
+
+Val loss vs step for the three arms (left: 600 steps x 3 seeds; middle: 2000 steps, tuned Muon passes AdamW's final loss by step 800) and the 300-step Muon lr sweep (right). Reproduce with `make figure-muon`.
+
 Step time is within a few percent across arms (median 3.88-4.01 s/step over all twelve runs; at
 600 steps the per-seed Muon-minus-AdamW gap ranges from -1.3% to +2.7% with no consistent sign, at
 2000 steps Muon was 1.4% and 2.9% slower by median, partly contention): the Muon optimizer step is a
