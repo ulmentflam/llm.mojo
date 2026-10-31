@@ -432,6 +432,7 @@ To be filled by the item owners. One row per arm.
 | W2 | base + `-mu_start 0.85 -mu 0.95 -mu_warmup 300` | 5.0174 | | 3941 | -0.017 vs base; the sweep's flat 0.95 scored 5.0732, so the ramp reconciles "low momentum early" with the long-run 0.95: adopt the ramp with mu 0.95 |
 | W8 | base + `-D LLMM_ROTARY=1` (half-truncated rotary, base 1024, wpe zero) | 4.8031 | | 4263 | -0.232 vs base, the largest single gain so far; step time +8% in this run but the GPU was shared with a verifier compile for part of it, re-time on an idle box |
 | W7 | base + `-D LLMM_QK_NORM=1` (default scale 1/sqrt(hd)) | 4.9657 | | 4438 | -0.069 vs base; max attention logit 5.6 at step 1, 7.5-7.7 from step 100 on (bounded near the 8.0 cap that unit-RMS rows give at hd 64); step time shared the GPU with a compile, re-time |
+| W6 | base + `-D LLMM_MLP_ACT=relu2` | 5.0184 | | 4273 | -0.016 vs base, at the single-seed noise edge; relu2 builds lose the cuBLASLt GELU epilogue fusion, so part of the +8% step time is real (re-time on an idle box) |
 
 ## 7. Not in scope (so nobody re-litigates)
 
