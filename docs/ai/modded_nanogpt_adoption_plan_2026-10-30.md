@@ -451,6 +451,7 @@ To be filled by the item owners. One row per arm.
 | W9 | base + `-D LLMM_UNTIED_HEAD=1 -untie_at 0.667` (tied to step 200, head := wte, then 100 untied steps) | 5.0351 | | 3968 | equal to the tied base (+0.0004): the late untie neither helps nor hurts at a 300-step horizon; its value, if any, needs the plan's 2000-step comparison, where the head has thousands of steps to specialize |
 | W3 (600 steps) | base recipe, `-x 600`, cosine to 0, `-u 50` | val@600 4.3470 (val@300 4.7870) | | 3977 | 600-step control, same seed and tokens |
 | W3 (600 steps) | base recipe, `-x 600`, `-k wsd -u 0 -cooldown 0.4 -decay_shape linear -q 0.1` | val@600 4.2541 (val@300 4.8307) | | 3974 | -0.093 vs cosine at 600 steps: the cooldown gain persists at twice the horizon (smaller than the 0.276 at 300, where cosine's own tail is compressed); the cooldown run trails mid-training because it is still at full rate (val@300 4.83 vs 4.79) and overtakes in the last 240 steps |
+| W6 (timing) | gelu vs relu2 bf16 binaries, 30 steps each, alternated twice on an idle cooled GPU | | | gelu 3914 / 3932, relu2 4049 / 4045 | relu2 costs +3.2% per step: the standalone bias+relu2 pass over the 4C activation in both directions, with no cuBLASLt epilogue for relu2 or its gradient. Recoverable only by a fused epilogue outside cuBLASLt (MAX matmul epilogue lambda); the earlier +8% figures were GPU-sharing artifacts |
 
 ## 7. Not in scope (so nobody re-litigates)
 
