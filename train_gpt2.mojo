@@ -7618,6 +7618,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             "optimizer_num_parameters", self.optimizer_num_parameters
         )
         s += "," + _mem_kv("grad_pool_elems", self.grad_pool_elems)
+        # Untied-head builds only (the tied schema stays byte-identical).
+        comptime if UNTIED_HEAD:
+            s += "," + _mem_kv("untied_head", 1)
+            s += "," + _mem_kv("untie_step", self.untie_step)
+            s += "," + _mem_kv("head_tied", 1 if self.head_tied else 0)
 
         s += ',"classes":{'
         s += _mem_kv("params", c_params)
