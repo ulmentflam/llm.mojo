@@ -254,16 +254,6 @@ Findings: pending the six runs.
 - W9 untied head: run the plan's 2000-step tied vs `-untie_at 0.667`
   comparison; 300 steps cannot show its value.
 
-## Recommended recipe going forward
-
-Adopt rotary (W8) and QK-norm (W7) as the candidate architecture flags, keep
-the AdamW-range rate at the shared rate, and use the 0.85 to 0.95 momentum
-ramp with relu2, zero-init and the WSD shape only if the pending rows and the
-timing table say so. **Caveat: these are single-seed, 300-step rankings.
-Nothing here becomes a default until it has three init seeds
-(`-D LLMM_INIT_SEED=42|1|2`) and a longer horizon**, since the 2000-step Muon
-run already showed that 300-step orderings narrow with length.
-
 ## Reproducing
 
 ```
