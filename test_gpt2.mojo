@@ -359,6 +359,16 @@ def run_test[
             pretty=log.style.dim("  note: " + tf32_note),
             plain="  note: " + tf32_note,
         )
+    comptime if ROTARY and QK_NORM:
+        # The rotary+QK-norm reference trajectory is ill-conditioned: pretrained
+        # weights without wpe, loss 9.65 at the start, Adam's first steps. Torch
+        # fp32 and torch fp64 differ by 0.031 (step 5), and the CPU and GPU
+        # trainers land 0.01-0.03 from either, so 0.01 is below the reference's
+        # own noise. The list is the fp64 (true) trajectory; the tolerance is
+        # 0.04. The gate that counts here is step 0: loss, logits and all 16
+        # gradient tensors at full strength; the trajectory still catches a
+        # dead or stalled gradient (loss falls 9.65 -> 3.88).
+        LOSS_STEP_TOL = 0.04
     var ctx: DeviceContext
     comptime if is_cpu[target]():
         ctx = DeviceContext(api="cpu")
@@ -502,18 +512,19 @@ def run_test[
     var expected_losses: List[Float32]
     comptime if ROTARY and QK_NORM:
         # QK-norm + rotary (norm first, then rotary, as modded-nanogpt), from
-        # scripts/gen_expected_losses.py run with GPT2_QK_NORM=1 GPT2_ROTARY=1.
+        # scripts/gen_expected_losses.py --dtype float64 run with GPT2_QK_NORM=1
+        # GPT2_ROTARY=1 (see LOSS_STEP_TOL above for why float64 and 0.04).
         expected_losses = [
-            9.654528617858887,
-            6.919290065765381,
-            6.292367458343506,
-            5.832812309265137,
-            5.480686187744141,
-            5.140079498291016,
-            4.795904636383057,
-            4.4713287353515625,
-            4.176088333129883,
-            3.879225492477417,
+            9.654558105380437,
+            6.919155526118772,
+            6.293914874300064,
+            5.837668282578282,
+            5.479384253787839,
+            5.170911108197578,
+            4.797532977309014,
+            4.47247907607067,
+            4.1756499389174975,
+            3.8798503087966703,
         ]
     elif ROTARY:
         # PyTorch with GPT2_ROTARY=1 (same weights, rotary q/k, no wpe add),
