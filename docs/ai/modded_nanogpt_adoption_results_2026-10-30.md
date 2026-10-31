@@ -173,7 +173,7 @@ Leave relu2/zero-init, the AdamW-range multiplier and the untied head at
 their defaults for now. **Three-seed status: confirmed at 600 steps.** The
 combined recipe beat the base on every seed (mean 0.250, per-seed 0.246 to
 0.256, against seed spreads of 0.010 and 0.003; see the section below), but it
-costs about 14% step time on an idle GPU (rotary and QK-norm are unfused), and
+costs about 6% step time measured interleaved with the base (see finding 4), and
 the gains are sub-additive (the 300-step single-item gains overstate it by
 about 2x at 600 steps). The headline tokens-to-3.28 run uses this recipe; it
 becomes the default only after that longer-horizon run.
@@ -245,18 +245,18 @@ table above).
    its full rate, then reopens to 0.250 after the cooldown starts at step 360.
    The momentum ramp ends at step 300 and shows no feature of its own. This
    is the shape the 600-step W3 control already showed (panel g).
-4. **The combined recipe is slower per step, and the cost is not pinned
-   down.** Median step time is 4567, 4547 and 4542 ms for combined and 4003,
+4. **The combined recipe is slower per step.** Median step time is 4567, 4547 and 4542 ms for combined and 4003,
    4301 and 4285 ms for base. Against the idle-GPU base run (seed 42) the cost
    is **+14.1%**; the median-of-runs delta is +6.1%, but the identical-config
    base runs differ by 7% between seeds and base seeds 1 and 2 ran at 4.29 s
    against the campaign's 3.92 to 3.98 s idle base, so they most likely
-   shared the GPU (no spike was flagged: the slowdown was steady). Read the
-   cost as about +14%, and +6% as a lower bound. It is a real cost: rotary and
-   QK-norm add separate passes over Q and K (kernels not fused into the QKV
-   projection or the attention kernel; not profiled here) (the same story as relu2 in the
-   timing table). The follow-up is fusing rotary and the QK-norm into one
-   pass over Q and K, or into the QKV matmul epilogue. Even at +14%, the
+   shared the GPU (no spike was flagged: the slowdown was steady). Correction: a later interleaved profile
+   (W10, shared with the headline run, so relative only) measured about +6%,
+   so +14% overstated the cost by comparing against one idle base run. A clean
+   idle-GPU timing is still owed. The row passes are about a third of the
+   extra time; fusing them saves about 15 ms/step. Most of the rest appears to
+   be max-logit tracking, not the attention math. See
+   [`fused_qk_rotary_norm_w10_2026-10-31.md`](fused_qk_rotary_norm_w10_2026-10-31.md). Even at +14%, the
    combined arm's val@500 (4.224) is already below the base's final
    value (4.346), so the gain is well worth the step time at this horizon.
 5. **Binary check.** All three combined logs carry `qk_max` fields (rotary and

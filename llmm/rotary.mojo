@@ -75,7 +75,8 @@ def rotate_y1[
     inverse: Bool
 ](x1: Float32, x2: Float32, c: Float32, s: Float32) -> Float32:
     """First output of one rotation pair (shared with the fused q/k row
-    kernels in llmm/qk_norm.mojo so both use bit-identical arithmetic)."""
+    kernels in llmm/qk_norm.mojo so both use the same source arithmetic; FMA contraction may differ by 1 ulp).
+    """
     comptime if inverse:
         return x1 * c - x2 * s
     else:

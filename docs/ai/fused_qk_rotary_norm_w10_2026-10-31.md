@@ -37,11 +37,15 @@ Findings:
   the median-of-runs +6% there matches this measurement.
 * The rest of the +6% is NOT the row passes: `attention_soft` (forward softmax) median goes from
   ~10 ms to ~13.7 ms per layer in the combined build (~+44 ms/step), both before and after this change.
-  It is data dependent (QK-norm with q_mul changes the logit range, probably the conditional-rescale /
-  soft-exp path), so fusion cannot remove it. All GEMMs, layernorm, split/merge, attention_bwd are
+  Correction from the independent verification: this is NOT data dependent. The softmax kernel has no
+  data-dependent control flow. On GPU, QK-norm turns on max-logit tracking
+  (`enable_qk_clip(0.0, track_only=True)`), which adds one `Atomic.max` per row. The same flag-off bf16
+  binary with `-qk_log 0` vs `1` (3 interleaved 5-step pairs, identical loss) gives a median of 9.6 vs
+  13.6 ms/layer, so tracking alone appears to account for it. Same-address serialization is the
+  hypothesized mechanism, not measured. Fusion cannot remove it. All GEMMs, layernorm, split/merge, attention_bwd are
   equal base vs combined within noise (the W7 split/merge layout passes exist in the base build too).
 * Redirect: the plan (fuse the row passes) stands, but its ceiling is ~1.3 ms/layer = ~15 ms/step
-  (0.7% of a step). The softmax slowdown is the larger remaining lever and is a separate item.
+  (0.7% of a step). The max-logit tracking cost is the larger remaining lever and is a separate item.
 
 ## 2. Design
 
@@ -58,7 +62,7 @@ Findings:
 * Single-flag paths use the same kernels with comptime switches (`do_rot` False is the old code path
   verbatim). Flag-off: `comptime if qk_norm or rotary` falls through to the old `q_mul != 1` branch,
   no launch.
-* `rotate_y1/y2` are shared from llmm/rotary.mojo so both users have bit-identical arithmetic.
+* `rotate_y1/y2` are shared from llmm/rotary.mojo so both users have the same source arithmetic. Results are not bit-identical: rotary-only CPU runs differ from main by about 1 ulp (34% of model words after 3 steps, median relative difference 1.1e-7) because LLVM contracts a different product into the FMA in each context.
 
 ## 3. Gates
 
@@ -109,7 +113,8 @@ Flag-off new vs old base: 2247 vs 2263 ms, no regression.
 ## Not verified / open
 
 * A clean (idle GPU) step-time number; the gain is expected ~15 ms per 32k micro-batch.
-* Whether the `attention_soft` slowdown (+44 ms/step in the combined build) can be reduced.
+* Reducing the max-logit tracking cost (about +48 ms/step at 32k tokens): untried ideas are reducing per block before the atomic, or testing against a cached value first.
+* Gaps from verification: no rotary+QK-norm reference at a non-default scale (a mutant scaling only rotated pairs passes verify and is caught only by the unit test); only hd=64 is tested; Metal and fp8/fp4 with the flags are not built.
 * No convergence run with the fused build (numerics changed only by single vs double rounding).
 
 ## AI use statement
