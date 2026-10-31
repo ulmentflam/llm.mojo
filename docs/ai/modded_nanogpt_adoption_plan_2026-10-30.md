@@ -446,6 +446,7 @@ To be filled by the item owners. One row per arm.
 | W3 | base with `-k wsd -u 0 -cooldown 0.45 -decay_shape linear -q 0.1` | 4.7675 | | 4024 | +0.009 vs the 0.40 arm (inside noise): the cooldown fraction is not sensitive between 0.40 and 0.45 at this horizon |
 | W3 | base with `-k wsd -u 50 -cooldown 0.4 -decay_shape linear -q 0.1` | 4.8017 | | 4011 | +0.043 vs the zero-warmup arm: warmup costs under Muon, as the speedrun's "orthogonalized updates need no warmup" intuition predicts; zero warmup is the recipe |
 | W5 | base + `-D LLMM_ZERO_INIT_PROJ=2` (N(0, 0.002) projections, record 64's "small nonzero") | 5.0274 | | 4012 | -0.007 vs base (inside noise), 0.016 better than exact zero: init scale of the residual projections is not a lever at 124M/300 steps on its own |
+| W9 | base + `-D LLMM_UNTIED_HEAD=1 -untie_at 0` (zero head from scratch, params 163M) | 5.1503 | | 4023 | +0.116 vs the tied base: a zero head gives the body no gradient at step 0 and the head starts from nothing, so untying from scratch loses at a 300-step horizon; this is the reason the speedrun retied (record 51) and now unties at 2/3 of training (record 53); the `-untie_at 0.667` arm is queued |
 
 ## 7. Not in scope (so nobody re-litigates)
 
