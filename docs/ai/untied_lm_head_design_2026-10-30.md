@@ -916,9 +916,83 @@ S2 generation 2 (tests and GPU gates):
 - S3 inherits: ZeRO-1 at W>1 with the head active is untested; ZeRO >= 2 is
   refused until S6.
 
+## S4 implementation notes (2026-10-30)
+
+What landed (branch `mn/w9s4`, W=1; ZeRO-0/1 layouts): `-untie_at <frac>` (env
+`LLMM_UNTIE_AT`, untied build only; the tied build refuses the flag). The
+trainer computes `s_u` once from the final step count: `0` (default, also an
+unset flag) = untied from construction, i.e. S2 behaviour with no `wte` copy;
+`0 < f < 1` = `max(1, floor(f * steps))`; `>= 1` = `-1`, never. `GPT2.untie_step`
+holds it and `head_tied = (untie_step != 0)`.
+- Transition (`GPT2.untie_head`) runs at the top of loop iteration `s_u`, after
+  that step's checkpoint write and before its training, so a checkpoint at
+  `s_u` is pre-untie. It copies `wte` into `lm_head` on the device, promotes the
+  head's fp32 master from the copied params (bf16 builds; same promotion as
+  `load_checkpoint`), clears `head_tied` and emits
+  `untie head_from=wte master=promoted moments=fresh step=<s_u>`. m and v are
+  untouched (still exactly zero: the head was skipped).
+- Head Adam counter `t - s_u` via `_head_adam_step`, applied at the three head
+  update sites (`_adamw_flat`, `_update_hybrid`, `_update_sharded_muon`).
+- `write_checkpoint` writes `head := wte` into the model file while `head_tied`
+  (host copy before `write_model_checkpoint`), so `-o` output and every
+  tied-phase checkpoint run as the trained model in infer/eval/export.
+- State slots 44 (untied layout) / 45 (`s_u`) are written and checked at the top
+  of `load_checkpoint`, before any payload: a different `-untie_at` or `-x`, a
+  tied state in the untied build and an untied state in the tied build are all
+  refused with a message. Tied-build files keep zeros in both slots.
+- After a resume `head_tied = False` only if `resume_step > s_u`; otherwise the
+  transition replays from the loaded state. The `resume` event gains
+  `head_tied` and `untie_step`; the setup event gains `untie_at`, `untie_step`
+  (`l_head` as before). The `LLMM_UNTIED_IDLE_HEAD` hook is removed;
+  `-untie_at 1.0` replaces it in `check_untied_idle.py`/`check_untied_head.py`
+  (the idle model file now carries head := wte instead of the stale value).
+- Refused: a tied phase at ZeRO >= 2 (the transition collective lands with
+  S6). bf16 at W > 1 with ZeRO >= 1 raises in `untie_head` (shard-relative
+  master promotion is not written; S3/S6).
+
+Gates (all fp32 CPU unless stated; `scripts/check_untie_at.py`, `make
+check-untie-at`, d6 from scratch, B=2 T=64, `-c 0.1`, 6 steps, `-untie_at 0.5`
+so `s_u = 3`, checkpoint every step; AdamW and Muon):
+- Tied build vs the `fe3312a` binary: model and state files of steps 1-3
+  identical (`cmp`), both optimizers.
+- `-untie_at 0` and the no-flag run equal the S2 binary (built from `e9f4051`):
+  model file identical, state file identical except header slots 44/45, step
+  losses and norms identical.
+- `-untie_at 1.0` model prefix equals the tied build's and the head block equals
+  `wte`; `make check-untied-idle` and `make check-untied-head` pass with the new
+  contract.
+- Tied-phase files: `model_1..3` have head == wte bitwise (version 13);
+  `model_4..6` have head != wte; head m/v exactly zero at step 3 and nonzero at
+  step 6.
+- Bias correction: the step 3 -> 4 head update recomputed in the script from
+  the step-3 head and the step-4 m/v matches an AdamW step with `t = 1`
+  (max abs error 5.7e-9; `t = 4` would be off by 1.3e-4), and `v == (1-b2)g^2`.
+- Resume across the transition (resume at step 2 = before `s_u`, at step 4 =
+  after): every later `model_k.bin` and `state_k_0.bin` is byte-identical to the
+  continuous run, AdamW and Muon (measured gap: 0 differing files of 8 / 4).
+- Refusals (exit 1, message before payload): `-untie_at 0.7`, `-x 8`, no flag on
+  an `s_u = 3` state, tied state into the untied build, untied state into the
+  tied build, and `-untie_at` in the tied build.
+
+GPU (one `gpu_slot.sh` chain): `make test-mojo` tied `tests result=pass
+files=29 passed=251 skipped=1 failed=0`, untied (`TEST_DEFINES="-D
+LLMM_UNTIED_HEAD=1"`) the same counts (+1 new case, the slot 44/45 round trip).
+5-step bf16 smoke (B=4, T=1024, `-untie_at 0.6`, `s_u = 3`): losses 3.609831
+3.668198 3.438826 3.279619 3.624149 (steps 1-4 equal the tied run, step 5
+diverges; S2's tied run had 3.634629 there), `untie head_from=wte
+master=promoted moments=fresh step=3` printed between the step-3 checkpoint and
+step 4; the model files are version 15 with head == wte at steps 1-3 and
+head != wte at 4-5.
+
+S5/S7 inherit: `_head_config` still carries no step counter (the offset lives
+in `_head_adam_step`, so S5 must not fold it into the config); the sharded
+Muon path (`_update_sharded_muon`) has the offset but is untested at W>1;
+the memory report does not yet print `untie_step`.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Opus agent), directed by Evan Owen.
 The inventory anchors were read from the code at `fe3312a` by the same agent;
 the memory figures come from a Python model it wrote and checked against the
-published tied-build figures.
+published tied-build figures. The S4 slice was implemented by a Claude Code
+(Sonnet) agent under the same direction.
