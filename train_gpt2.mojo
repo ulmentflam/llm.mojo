@@ -6169,55 +6169,128 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 return t - UInt32(self.untie_step)
         return t
 
+    def _untie_apply_range(
+        mut self, src: MutMemPtr[GPT2_DTYPE], e0: Int, count: Int, params: Bool
+    ) raises:
+        """Write head elements `[e0, e0+count)` (values at `src[0:count]`, the
+        wte values for the same rows) into THIS rank's slice of the optimizer
+        layout: the ZeRO-3 shard in `params_memory` (when `params`; the other
+        layouts hold full params and were copied wholesale) and, in bf16, the
+        fp32 master (promoted from the same values, as `load_checkpoint` does).
+        Purely local: it clips `[h_off+e0, +count)` to the rank's flat shard
+        `[rank*opt, rank*opt+opt)` (the whole flat vector when unsharded)."""
+        var h_off = self.param_offset(Parameters.lm_head)
+        var lo = 0
+        var hi = self.num_parameters
+        comptime if Self.WORLD_SIZE > 1:
+            if self.zero_ctx.zero_stage >= 1:
+                lo = self.zero_ctx.rank * self.optimizer_num_parameters
+                hi = min(
+                    lo + self.optimizer_num_parameters, self.num_parameters
+                )
+        var a = max(h_off + e0, lo)
+        var b = min(h_off + e0 + count, hi)
+        if b <= a:
+            return
+        var m = b - a
+        var src_off = a - (h_off + e0)
+        var dst_local = a - lo
+        if params:
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.params_memory.unsafe_offset(
+                        dst_local
+                    ).as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                    src.unsafe_offset(src_off).as_unsafe_any_origin()
+                ),
+                size=m,
+            )
+            self.ctx.synchronize()
+        comptime if USE_BF16:
+            var host_h = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](m)
+            var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](m)
+            self.ctx.synchronize()
+            self._copy_device_to_host[GPT2_DTYPE](
+                host_h, src.unsafe_offset(src_off), m
+            )
+            self.ctx.synchronize()
+            for i in range(m):
+                host_m[i] = host_h[i].cast[MASTER_DTYPE]()
+            self._copy_host_to_device[MASTER_DTYPE](
+                self.master_memory.unsafe_offset(dst_local), host_m, m
+            )
+            self.ctx.synchronize()
+
     def untie_head(mut self) raises:
         """The `-untie_at` transition: head := wte (params, and the fp32
         master in bf16 builds, promoted from the copied params exactly as
         `load_checkpoint` does so a resumed and a continuous run agree), then
         `head_tied = False`. m and v are still zero (the head was skipped
         while tied); the head's step counter restarts via `_head_adam_step`.
-        ZeRO >= 2 is refused at startup (the collective lands with S6)."""
+
+        Collective under ZeRO-3 streaming (every rank must call it): params are
+        shard-only there, so wte is all-gathered one vocab tile at a time into
+        the head tile buffer (bounded memory; with LLMM_Z3_HEAD_RESIDENT=1 the
+        embed window is refreshed instead) and each rank keeps the slice that
+        overlaps its own shard. Otherwise params are full on every rank and the
+        copy is local; only the sharded bf16 master needs the per-rank slice."""
         comptime if UNTIED_HEAD:
             var n = self.config.padded_vocab_size * self.config.channels
             var h_off = self.param_offset(Parameters.lm_head)
             var w_off = self.param_offset(Parameters.wte)
             self.ctx.synchronize()
-            self.ctx.enqueue_copy(
-                dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
-                    self.params_memory.unsafe_offset(
-                        h_off
-                    ).as_unsafe_any_origin()
-                ),
-                src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
-                    self.params_memory.unsafe_offset(
-                        w_off
-                    ).as_unsafe_any_origin()
-                ),
-                size=n,
-            )
-            self.ctx.synchronize()
-            comptime if USE_BF16:
-                var master_off = h_off
-                comptime if Self.WORLD_SIZE > 1:
-                    if self.zero_ctx.zero_stage >= 1:
-                        raise Error(
-                            "-untie_at transition with bf16 at W>1 lands with"
-                            " S3/S6"
+            if self.z3_streaming:
+                comptime if Z3_HEAD_RESIDENT:
+                    self._z3_stream_embed()
+                    self.ctx.synchronize()
+                    self._untie_apply_range(self.params.wte, 0, n, True)
+                else:
+                    var c = self.config.channels
+                    var vp = self.config.padded_vocab_size
+                    var tr = self._lm_head_tile_rows()
+                    var tbase = rebind_mut_mem[GPT2_DTYPE](
+                        self.wte_tile_buf.unsafe_ptr().as_unsafe_any_origin()
+                    )
+                    var t0 = 0
+                    while t0 < vp:
+                        var oc = min(tr, vp - t0)
+                        var dst_offsets: List[Int] = [0]
+                        var flat_starts: List[Int] = [w_off + t0 * c]
+                        var lengths: List[Int] = [oc * c]
+                        self.zero_ctx.allgather_ranges[GPT2_DTYPE](
+                            self._z3_shard_ptr(),
+                            self.optimizer_num_parameters,
+                            rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                                tbase.as_unsafe_any_origin()
+                            ),
+                            dst_offsets,
+                            flat_starts,
+                            lengths,
                         )
-                var host_h = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n)
-                var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
-                    n
+                        self.ctx.synchronize()
+                        self._untie_apply_range(tbase, t0 * c, oc * c, True)
+                        t0 += tr
+            else:
+                self.ctx.enqueue_copy(
+                    dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                        self.params_memory.unsafe_offset(
+                            h_off
+                        ).as_unsafe_any_origin()
+                    ),
+                    src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                        self.params_memory.unsafe_offset(
+                            w_off
+                        ).as_unsafe_any_origin()
+                    ),
+                    size=n,
                 )
                 self.ctx.synchronize()
-                self._copy_device_to_host[GPT2_DTYPE](
-                    host_h, self.params.lm_head, n
-                )
-                self.ctx.synchronize()
-                for i in range(n):
-                    host_m[i] = host_h[i].cast[MASTER_DTYPE]()
-                self._copy_host_to_device[MASTER_DTYPE](
-                    self.master_memory.unsafe_offset(master_off), host_m, n
-                )
-                self.ctx.synchronize()
+                comptime if USE_BF16:
+                    self._untie_apply_range(
+                        self.params_memory.unsafe_offset(w_off), 0, n, False
+                    )
             self.head_tied = False
 
     def _head_idle_from(self, flat_start: Int) -> Bool:
@@ -8273,12 +8346,6 @@ def train[
             untie_step = max(
                 1, Int(args.untie_at * Float64(train_num_batches) + 1e-9)
             )
-        if untie_step != 0 and WORLD_SIZE > 1 and zero_stage >= 2:
-            print(
-                "-untie_at with a tied phase needs ZeRO <= 1 (the ZeRO-2/3"
-                " transition lands with slice S6); refusing"
-            )
-            _error_usage()
         model.untie_step = untie_step
         model.head_tied = untie_step != 0
     var val_num_batches = args.val_max_steps

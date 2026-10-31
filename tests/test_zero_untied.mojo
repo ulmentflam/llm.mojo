@@ -145,6 +145,7 @@ def _train[
     idle_head: Bool = False,
     tiles: MutMemPtr[DType.float32] = _nullp(),
     check_tiles: Bool = False,
+    untie_after: Int = 0,
 ) raises:
     """`steps` steps on W threaded ranks at `stage`; rank r's final 17-tensor
     params go to result[r*n:(r+1)*n]; rank 0's initial params to init[0:n].
@@ -170,7 +171,9 @@ def _train[
                 ](coord),
             )
             comptime if UNTIED_HEAD:
-                model.head_tied = idle_head
+                model.head_tied = idle_head or untie_after > 0
+                if untie_after > 0:
+                    model.untie_step = untie_after
             if model.num_parameters != n:
                 raise Error("model has the wrong tensor count")
             if rank == 0:
@@ -184,6 +187,10 @@ def _train[
             var y = heap_alloc[SIMD[DType.int32, 1]](BB * TT)
             var rk = 0 if same_batch else rank
             for step in range(steps):
+                comptime if UNTIED_HEAD:
+                    if untie_after > 0 and step == untie_after:
+                        model.untie_head()
+                        model.ctx.synchronize()
                 for ms in range(accum):
                     for i in range(BB * TT):
                         x[unsafe_offset=i] = Int32(
@@ -829,6 +836,135 @@ def test_zero3_equals_zero0_muon_w8_head_straddles_l1() raises:
     if _skip_tied("test_zero3_equals_zero0_muon_w8_head_straddles_l1"):
         return
     _zero1_vs_zero0[8](1, 1, 16, True, 3)
+
+
+def _untie_transition[
+    W: Int
+](L: Int, NH: Int, C: Int, stage: Int, muon: Bool) raises:
+    """-untie_at transition at ZeRO-`stage`: 1 tied (idle-head) step, then
+    `untie_head()` (head := wte, a collective under ZeRO-3 streaming), then 2
+    trained steps; same batch, accum 2. Must equal the same schedule at ZeRO-0
+    on all 17 tensors, bit-exactly (same-batch + W<=4 is the regime where the
+    tied phase itself is exact, see the idle-head tests)."""
+    var path = (
+        String("gpt2_zu_untie")
+        + String(stage)
+        + ("m" if muon else "a")
+        + "_w"
+        + String(W)
+        + "_l"
+        + String(L)
+        + ".bin"
+    )
+    var n = _write_untied_checkpoint(path, L, NH, C)
+    var sz = _sizes(L, C)
+    var ref_p = heap_alloc[Float32](W * n)
+    var got = heap_alloc[Float32](W * n)
+    var init = heap_alloc[Float32](n)
+    var scratch = heap_alloc[Float32](n)
+    try:
+        _train[W](
+            path,
+            n,
+            0,
+            STEPS,
+            ref_p,
+            init,
+            muon=muon,
+            accum=2,
+            same_batch=True,
+            untie_after=1,
+        )
+        _train[W](
+            path,
+            n,
+            stage,
+            STEPS,
+            got,
+            scratch,
+            muon=muon,
+            accum=2,
+            same_batch=True,
+            untie_after=1,
+        )
+    except e:
+        _remove(path)
+        raise e^
+    _remove(path)
+    var d = _first_diff(ref_p, got, W, n)
+    if d >= 0:
+        raise Error(
+            "untie transition: ZeRO-"
+            + String(stage)
+            + " != ZeRO-0 at W="
+            + String(W)
+            + " rank "
+            + String(d // n)
+            + " "
+            + _tensor_of(d % n, sz)
+            + ": "
+            + String(ref_p[unsafe_offset=d])
+            + " vs "
+            + String(got[unsafe_offset=d])
+        )
+    # The head really was replaced by wte at the transition and then trained:
+    # it differs from its planted init everywhere.
+    var head_off = n - sz[16]
+    for i in range(sz[16]):
+        if got[unsafe_offset=head_off + i] == init[unsafe_offset=head_off + i]:
+            raise Error("head still holds its planted init: " + String(i))
+    ref_p.unsafe_free()
+    got.unsafe_free()
+    init.unsafe_free()
+    scratch.unsafe_free()
+
+
+def test_untie_transition_zero2_adamw_w2() raises:
+    if _skip_tied("test_untie_transition_zero2_adamw_w2"):
+        return
+    _untie_transition[2](2, 2, 16, 2, False)
+
+
+def test_untie_transition_zero2_adamw_w4() raises:
+    if _skip_tied("test_untie_transition_zero2_adamw_w4"):
+        return
+    _untie_transition[4](2, 2, 16, 2, False)
+
+
+def test_untie_transition_zero2_muon_w2() raises:
+    if _skip_tied("test_untie_transition_zero2_muon_w2"):
+        return
+    _untie_transition[2](2, 2, 16, 2, True)
+
+
+def test_untie_transition_zero2_muon_w4() raises:
+    if _skip_tied("test_untie_transition_zero2_muon_w4"):
+        return
+    _untie_transition[4](2, 2, 16, 2, True)
+
+
+def test_untie_transition_zero3_adamw_w2() raises:
+    if _skip_tied("test_untie_transition_zero3_adamw_w2"):
+        return
+    _untie_transition[2](2, 2, 16, 3, False)
+
+
+def test_untie_transition_zero3_adamw_w4() raises:
+    if _skip_tied("test_untie_transition_zero3_adamw_w4"):
+        return
+    _untie_transition[4](2, 2, 16, 3, False)
+
+
+def test_untie_transition_zero3_muon_w2() raises:
+    if _skip_tied("test_untie_transition_zero3_muon_w2"):
+        return
+    _untie_transition[2](2, 2, 16, 3, True)
+
+
+def test_untie_transition_zero3_muon_w4() raises:
+    if _skip_tied("test_untie_transition_zero3_muon_w4"):
+        return
+    _untie_transition[4](2, 2, 16, 3, True)
 
 
 def _idle_head_same_batch[W: Int](L: Int, NH: Int, C: Int, stage: Int) raises:
