@@ -1463,6 +1463,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # -l_head: lr multiplier of the untied head's AdamW range; < 0 = same as
     # `adam_lr_mult` (the other AdamW ranges).
     var head_lr_mult: Float32
+    # -untie_at: step s_u at which the head is untied (> 0: tied phase until
+    # then; 0: untied from construction; -1: never). The head's Adam step
+    # counter is `t - untie_step` (see `_head_adam_step`).
+    var untie_step: Int
     # The model .bin being loaded carries its own head block (version 13/15).
     var file_untied: Bool
     var enc_num_rows: Int
@@ -1616,6 +1620,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # (-untie_at, S4) and the idle-head test hook set this True again.
         self.head_tied = not UNTIED_HEAD
         self.head_lr_mult = Float32(-1.0)
+        self.untie_step = 0
         self.file_untied = False
         self.enc_num_rows = 0
         self.enc_run_first = List[Int]()
@@ -6141,7 +6146,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         """AdamW config for the untied head range: the scheduler lr times
         `-l_head` (sentinel < 0: same multiplier as the other AdamW ranges,
         `adam_lr_mult`). Betas, eps, weight decay and grad_scale are shared
-        with the body. Step counter: `t` (no tie phase yet; S4 offsets it)."""
+        with the body. The step counter is offset separately (`_head_adam_step`).
+        """
         var mult = self.head_lr_mult
         if mult < Float32(0.0):
             mult = self.adam_lr_mult
@@ -6153,6 +6159,66 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             weight_decay=config.weight_decay,
             grad_scale=config.grad_scale,
         )
+
+    def _head_adam_step(self, t: UInt32) -> UInt32:
+        """Adam step counter for the head range: `t - s_u` after an untie at
+        s_u > 0 (fresh bias correction, like a parameter newly added to an
+        optimizer), plain `t` when untied from construction."""
+        comptime if UNTIED_HEAD:
+            if self.untie_step > 0:
+                return t - UInt32(self.untie_step)
+        return t
+
+    def untie_head(mut self) raises:
+        """The `-untie_at` transition: head := wte (params, and the fp32
+        master in bf16 builds, promoted from the copied params exactly as
+        `load_checkpoint` does so a resumed and a continuous run agree), then
+        `head_tied = False`. m and v are still zero (the head was skipped
+        while tied); the head's step counter restarts via `_head_adam_step`.
+        ZeRO >= 2 is refused at startup (the collective lands with S6)."""
+        comptime if UNTIED_HEAD:
+            var n = self.config.padded_vocab_size * self.config.channels
+            var h_off = self.param_offset(Parameters.lm_head)
+            var w_off = self.param_offset(Parameters.wte)
+            self.ctx.synchronize()
+            self.ctx.enqueue_copy(
+                dst_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](
+                    self.params_memory.unsafe_offset(
+                        h_off
+                    ).as_unsafe_any_origin()
+                ),
+                src_ptr=rebind[Pointer[Scalar[GPT2_DTYPE], ImmutAnyOrigin]](
+                    self.params_memory.unsafe_offset(
+                        w_off
+                    ).as_unsafe_any_origin()
+                ),
+                size=n,
+            )
+            self.ctx.synchronize()
+            comptime if USE_BF16:
+                var master_off = h_off
+                comptime if Self.WORLD_SIZE > 1:
+                    if self.zero_ctx.zero_stage >= 1:
+                        raise Error(
+                            "-untie_at transition with bf16 at W>1 lands with"
+                            " S3/S6"
+                        )
+                var host_h = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](n)
+                var host_m = self.ctx.enqueue_create_host_buffer[MASTER_DTYPE](
+                    n
+                )
+                self.ctx.synchronize()
+                self._copy_device_to_host[GPT2_DTYPE](
+                    host_h, self.params.lm_head, n
+                )
+                self.ctx.synchronize()
+                for i in range(n):
+                    host_m[i] = host_h[i].cast[MASTER_DTYPE]()
+                self._copy_host_to_device[MASTER_DTYPE](
+                    self.master_memory.unsafe_offset(master_off), host_m, n
+                )
+                self.ctx.synchronize()
+            self.head_tied = False
 
     def _head_idle_from(self, flat_start: Int) -> Bool:
         """True when a flat range starting at `flat_start` lies in the untied
@@ -6200,7 +6266,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     USE_BF16,
                     m.unsafe_offset(head_skip),
                     v.unsafe_offset(head_skip),
-                    t,
+                    self._head_adam_step(t),
                     self._head_config(config),
                     self.ctx,
                 )
@@ -6225,9 +6291,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             if n <= 0 or self._head_idle_from(start):
                 continue
             var range_config = self._adam_config(config)
+            var range_t = t
             comptime if UNTIED_HEAD:
                 if start >= self.param_offset(Parameters.lm_head):
                     range_config = self._head_config(config)
+                    range_t = self._head_adam_step(t)
             adamw_update[GPT2_DTYPE, Self.target](
                 n,
                 as_mut_kernel[GPT2_DTYPE](
@@ -6244,7 +6312,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 as_mut_kernel[MASTER_DTYPE](
                     self.v_memory.unsafe_offset(self.v_compact_bases[k])
                 ),
-                t,
+                range_t,
                 range_config,
                 self.ctx,
             )
@@ -6340,9 +6408,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 if bucketed:
                     g_seg = self.grad_shard_memory.unsafe_offset(sg.shard_rel)
                 var seg_config = self._adam_config(config)
+                var seg_t = t
                 comptime if UNTIED_HEAD:
                     if sg.flat_start >= self.param_offset(Parameters.lm_head):
                         seg_config = self._head_config(config)
+                        seg_t = self._head_adam_step(t)
                 adamw_update[GPT2_DTYPE, Self.target](
                     sg.len,
                     as_mut_kernel[GPT2_DTYPE](
@@ -6361,7 +6431,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     as_mut_kernel[MASTER_DTYPE](
                         self.v_memory.unsafe_offset(sg.compact_off)
                     ),
-                    t,
+                    seg_t,
                     seg_config,
                     self.ctx,
                 )
@@ -7088,6 +7158,18 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 host_params, snap_src, self.num_parameters
             )
             self.ctx.synchronize()
+            comptime if UNTIED_HEAD:
+                if self.head_tied:
+                    # Tied phase of -untie_at (or -untie_at 1): the head block
+                    # is idle and stale; write the live tied weights (wte) so
+                    # infer/eval/export of this file run the model that trained.
+                    var hn = (
+                        self.config.padded_vocab_size * self.config.channels
+                    )
+                    var ho = self.param_offset(Parameters.lm_head)
+                    var wo = self.param_offset(Parameters.wte)
+                    for i in range(hn):
+                        host_params[ho + i] = host_params[wo + i]
             write_model_checkpoint(
                 model_path,
                 self._checkpoint_config(),
@@ -7112,6 +7194,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             step,
             sampler_rng_state,
             optimizer_kind=self.optimizer_kind,
+            untied_layout=1 if UNTIED_HEAD else 0,
+            untie_step=self.untie_step if UNTIED_HEAD else 0,
         )
         var n_mu = 0
         if self._sharded_muon():
@@ -7158,6 +7242,31 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         checkpoint (build it from the same base checkpoint first). Each rank
         reads the shared model file plus its own optimizer-state shard.
         """
+        # State-file layout and -untie_at checks first, before any payload.
+        var st_file = open(state_path, "r")
+        var st_head = read_state_header(st_file)
+        st_file.close()
+        if st_head.untied_layout != (1 if UNTIED_HEAD else 0):
+            raise Error(
+                "Cannot resume: state file "
+                + state_path
+                + " was written by "
+                + ("an untied" if st_head.untied_layout != 0 else "a tied")
+                + "-LM-head build but this build is "
+                + ("untied" if UNTIED_HEAD else "tied")
+                + " (-D LLMM_UNTIED_HEAD)"
+            )
+        comptime if UNTIED_HEAD:
+            if st_head.untie_step != self.untie_step:
+                raise Error(
+                    "Cannot resume: state file "
+                    + state_path
+                    + " was written with untie step "
+                    + String(st_head.untie_step)
+                    + " (-1 never, 0 from start) but this run has "
+                    + String(self.untie_step)
+                    + "; pass the same -untie_at and -x as the original run"
+                )
         var host_params = self.ctx.enqueue_create_host_buffer[GPT2_DTYPE](
             self.num_parameters
         )
@@ -7740,7 +7849,7 @@ struct TrainArgs(Copyable, Movable):
     var eps: Float32  # -eps  AdamW epsilon
     var adam_lr_mult: Float32  # -l_adam  lr multiplier, AdamW ranges under Muon
     var head_lr_mult: Float32  # -l_head  untied head lr multiplier (< 0: l_adam)
-    var idle_head: Bool  # LLMM_UNTIED_IDLE_HEAD=1 test hook: head stays tied/idle
+    var untie_at: Float64  # -untie_at  fraction of -x trained tied (-1: unset)
     var muon_momentum_start: Float32  # -mu_start  (< 0: unset, use -mu)
     var muon_momentum_warmup: Int  # -mu_warmup  ramp steps (0 = off)
     var qk_clip_tau: Float32  # -qk_clip  max attention logit (0 = off)
@@ -7787,7 +7896,7 @@ def default_train_args() -> TrainArgs:
         eps=Float32(1e-8),
         adam_lr_mult=Float32(1.0),
         head_lr_mult=Float32(-1.0),
-        idle_head=False,
+        untie_at=-1.0,
         muon_momentum_start=Float32(-1.0),
         muon_momentum_warmup=0,
         qk_clip_tau=Float32(0.0),
@@ -8081,9 +8190,6 @@ def train[
         model.enable_muon(args.muon_momentum, args.adam_lr_mult)
     comptime if UNTIED_HEAD:
         model.head_lr_mult = args.head_lr_mult
-        # Test hook (superseded by -untie_at in a later slice): keep the head
-        # tied to wte and idle, so the untied build must reproduce the tied one.
-        model.head_tied = args.idle_head
     if args.qk_clip_tau > 0:
         model.enable_qk_clip(args.qk_clip_tau)
 
@@ -8157,6 +8263,24 @@ def train[
     var train_num_batches = args.max_steps
     if train_num_batches <= 0:
         train_num_batches = train_loader.num_tokens // total_batch_size
+    # -untie_at: step s_u of the head transition (see GPT2.untie_step). The
+    # head is tied (idle) while step < s_u; -1 never unties, 0 starts untied.
+    var untie_step = 0
+    comptime if UNTIED_HEAD:
+        if args.untie_at >= 1.0:
+            untie_step = -1
+        elif args.untie_at > 0.0:
+            untie_step = max(
+                1, Int(args.untie_at * Float64(train_num_batches) + 1e-9)
+            )
+        if untie_step != 0 and WORLD_SIZE > 1 and zero_stage >= 2:
+            print(
+                "-untie_at with a tied phase needs ZeRO <= 1 (the ZeRO-2/3"
+                " transition lands with slice S6); refusing"
+            )
+            _error_usage()
+        model.untie_step = untie_step
+        model.head_tied = untie_step != 0
     var val_num_batches = args.val_max_steps
     if val_loader.num_tokens // tokens_per_fwdbwd < val_num_batches:
         val_num_batches = val_loader.num_tokens // tokens_per_fwdbwd
@@ -8215,6 +8339,11 @@ def train[
                 + ".bin"
             )
             var resumed = model.load_checkpoint(model_path, state_path)
+            comptime if UNTIED_HEAD:
+                # Past the untie point the head was loaded from the files and
+                # trains; at or before it the transition replays in the loop.
+                if untie_step > 0 and resumed.step > untie_step:
+                    model.head_tied = False
             restore_dataloader_state(train_loader, resumed)
             rng_state = resumed.sampler_rng_state
             start_step = resumed.step
@@ -8222,6 +8351,11 @@ def train[
                 num("step", start_step),
                 text("path", model_path),
             ]
+            comptime if UNTIED_HEAD:
+                resume_fields.append(
+                    num("head_tied", 1 if model.head_tied else 0)
+                )
+                resume_fields.append(num("untie_step", untie_step))
             run_log.emit(
                 "resume",
                 NORMAL,
@@ -8286,9 +8420,8 @@ def train[
     comptime if UNTIED_HEAD:
         setup_fields.append(num("untied_head", 1, VERBOSE))
         setup_fields.append(num("l_head", args.head_lr_mult, VERBOSE))
-        setup_fields.append(
-            num("head_idle", 1 if args.idle_head else 0, VERBOSE)
-        )
+        setup_fields.append(num("untie_at", args.untie_at, VERBOSE))
+        setup_fields.append(num("untie_step", untie_step, VERBOSE))
     run_log.emit(
         "setup",
         NORMAL,
@@ -8445,6 +8578,26 @@ def train[
 
         if last_step:
             break
+
+        # -untie_at transition: after the checkpoint above (so the checkpoint
+        # at s_u is pre-untie) and before this step trains.
+        comptime if UNTIED_HEAD:
+            if untie_step > 0 and step == untie_step and model.head_tied:
+                model.untie_head()
+                var untie_fields: List[Field] = [
+                    text("head_from", "wte"),
+                    text("master", "promoted"),
+                    text("moments", "fresh"),
+                    num("step", step),
+                ]
+                run_log.emit(
+                    "untie",
+                    NORMAL,
+                    untie_fields,
+                    pretty="  "
+                    + style.dim("untie  head := wte at step " + String(step)),
+                    plain="Untied LM head at step " + String(step),
+                )
 
         # --------------- TRAINING SECTION -------------------
         # If overfitting a single batch for debugging, reset the loader so every
@@ -8743,6 +8896,11 @@ def _print_usage():
         " biases) under -opt muon (default = 1.0; refused with -opt adamw)"
     )
     print(
+        "  -untie_at <float> untied build only: train with the head tied to"
+        " wte for this fraction of -x, then untie (0 = untied from start,"
+        " >= 1 = never; default 0)"
+    )
+    print(
         "  -l_head <float> lr multiplier for the untied LM head, needs a build"
         " with -D LLMM_UNTIED_HEAD=1 (default = same as -l_adam)"
     )
@@ -8794,8 +8952,8 @@ def _parse_train_args(
         args.muon_momentum = Float32(atof(getenv("LLMM_MUON_MOMENTUM")))
     if getenv("LLMM_LR_HEAD_MULT") != "":
         args.head_lr_mult = Float32(atof(getenv("LLMM_LR_HEAD_MULT")))
-    if getenv("LLMM_UNTIED_IDLE_HEAD") == "1":
-        args.idle_head = True
+    if getenv("LLMM_UNTIE_AT") != "":
+        args.untie_at = atof(getenv("LLMM_UNTIE_AT"))
     if getenv("LLMM_LR_ADAM_MULT") != "":
         args.adam_lr_mult = Float32(atof(getenv("LLMM_LR_ADAM_MULT")))
     if getenv("LLMM_MUON_MOMENTUM_START") != "":
@@ -8882,6 +9040,8 @@ def _parse_train_args(
             args.eps = Float32(atof(val))
         elif flag == "-l_adam":
             args.adam_lr_mult = Float32(atof(val))
+        elif flag == "-untie_at":
+            args.untie_at = atof(val)
         elif flag == "-l_head":
             args.head_lr_mult = Float32(atof(val))
         elif flag == "-mu_start":
@@ -8908,12 +9068,15 @@ def _parse_train_args(
         )
         _error_usage()
     comptime if not UNTIED_HEAD:
-        if args.head_lr_mult != Float32(-1.0) or args.idle_head:
+        if args.head_lr_mult != Float32(-1.0) or args.untie_at != -1.0:
             print(
-                "-l_head / LLMM_LR_HEAD_MULT / LLMM_UNTIED_IDLE_HEAD need the"
-                " untied-head build (-D LLMM_UNTIED_HEAD=1); refusing"
+                "-l_head / -untie_at (LLMM_LR_HEAD_MULT / LLMM_UNTIE_AT) need"
+                " the untied-head build (-D LLMM_UNTIED_HEAD=1); refusing"
             )
             _error_usage()
+    if args.untie_at < 0.0 and args.untie_at != -1.0:
+        print("Invalid -untie_at: expected a fraction in [0, 1]")
+        _error_usage()
     if args.head_lr_mult < 0.0 and args.head_lr_mult != Float32(-1.0):
         print("Invalid -l_head: must be >= 0 (0 freezes the head)")
         _error_usage()

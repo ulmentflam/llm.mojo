@@ -9,8 +9,8 @@
      active: head must differ from wte after training, the head's AdamW m and v
              must be nonzero and wte's m/v nonzero too (the encoder row-sparse
              gradient is the only writer of dwte).
-     idle  (LLMM_UNTIED_IDLE_HEAD=1, the tie phase): head must keep its loaded
-             wte copy bitwise while wte trains, and the head's m/v must be exactly zero even though the
+     idle  (-untie_at 1.0, the tie phase): the model file's head block must be
+             head := wte (the trained wte) while wte trains, and the head's m/v must be exactly zero even though the
              weight decay is > 0 (a head updated while idle would decay).
 The active run also checks that wte (the encoder's row-sparse gradient is its
 only writer) moved and that no NaN reached the head.
@@ -37,6 +37,7 @@ def env_for(extra):
 
 
 def train(binary, out, start, steps, extra=None, wd="0.1"):
+    extra = extra or []
     os.makedirs(out, exist_ok=True)
     data = os.path.join(ROOT, "data/.fineweb10B/fineweb_train_000001.bin")
     args = [
@@ -44,9 +45,9 @@ def train(binary, out, start, steps, extra=None, wd="0.1"):
         "-n", str(steps), "-b", "2", "-t", "64", "-d", "128",
         "-l", "3e-4", "-c", wd, "-gc", "1.0", "-v", "0", "-s", "0", "-g", "0",
         "-x", str(steps),
-    ]  # fmt: skip
+    ] + extra  # fmt: skip
     subprocess.run(
-        args, cwd=ROOT, env=env_for(extra or {}), check=True, stdout=subprocess.DEVNULL
+        args, cwd=ROOT, env=env_for({}), check=True, stdout=subprocess.DEVNULL
     )
 
 
@@ -72,7 +73,7 @@ def main():
             print("FAIL:", msg)
             ok = False
 
-    for name, extra in (("active", {}), ("idle", {"LLMM_UNTIED_IDLE_HEAD": "1"})):
+    for name, extra in (("active", []), ("idle", ["-untie_at", "1.0"])):
         out = os.path.join(work, name)
         train(untied, out, start, STEPS, extra)
         mb = open(os.path.join(out, f"model_{STEPS}.bin"), "rb").read()
@@ -103,10 +104,9 @@ def main():
             hv = floats(head, 0, 4096)
             check(all(x == x for x in hv), "active: NaN in head")
         else:
-            # Idle: the head block keeps its loaded value (the start .bin's wte
-            # copy) bit for bit while wte itself trains; weight decay > 0 would
-            # have moved it had the optimizer touched it.
-            check(head == start_wte, "idle: head changed (updated while idle)")
+            # Idle: the optimizer never touched the head (m/v exactly zero below,
+            # even with weight decay > 0); the file carries head := wte.
+            check(head == wte, "idle: tied-phase file head != trained wte")
             check(wte != start_wte, "idle: wte never moved")
             check(not any(head_m) and not any(head_v), "idle: head m/v nonzero")
             check(any(wte_m) and any(wte_v), "idle: wte m/v are zero")
