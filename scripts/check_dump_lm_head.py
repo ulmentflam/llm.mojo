@@ -36,9 +36,10 @@ def main():
         f.seek(B * T * 4 * 2, 1)  # x, y
         V, V_p, C = 50257, 50304, 768
         f.seek(B * T * V * 4 + 4, 1)  # logits + loss
-        # untied layout: 16 tied tensors (padded wte) then lm_head, the tail
-        ref_all = array.array("f")
-        ref_all.frombytes(f.read())
+        # grads follow the loss: the 16 tied tensors (padded wte) then lm_head.
+        # The file carries more after them, so read exactly N floats.
+        n_total = 163109376 if len(sys.argv) < 4 else int(sys.argv[3])
+        ref_all = read_f32(f, n_total)
     n_head = V_p * C
     ref = ref_all[len(ref_all) - n_head :]
     ours = read_f32(open(f"{dump_dir}/lm_head.bin", "rb"), n_head)
