@@ -144,8 +144,10 @@ embedding and the output projection. `-D LLMM_UNTIED_HEAD=1` (`MOJO_DEFINES="-D 
 adds a separate 17th tensor `lm_head` ([V_p, C], after `ln_f`), so the embedding becomes lookup-only and
 the head trains on its own; `-l_head <mult>` scales the head's AdamW learning rate. It costs one extra
 V_p x C matrix of params, grads, m, v and master: +589.5 MiB per rank at 124M, bf16 or fp32, W=1 (the
-per-ZeRO table is in the design doc; ZeRO-2 and 3 with a trained head are refused until their head
-paths land). Untied checkpoints are version 13 (fp32) and 15 (bf16) and load only into an untied build;
+per-ZeRO table is in the design doc; ZeRO-1, 2 and 3 all support the trained head, the ZeRO-3 head is
+gathered one vocab tile at a time). `-untie_at <fraction>` trains tied (head := wte) for that fraction
+of `-x` steps, then untied (head copied from wte, m and v zero, a fresh Adam bias correction for the
+head); a resumed run must pass the same `-untie_at` and `-x`. Untied checkpoints are version 13 (fp32) and 15 (bf16) and load only into an untied build;
 the HF export and the MAX graphs refuse them with a clear message. The step time and MFU count the
 same head GEMM as the tied model (the setup line's `gpt2-124M` label and the MFU use the 16-tensor
 parameter count; `params=` shows the stored 163M). Verify with `make verify-untied-cpu` (and
