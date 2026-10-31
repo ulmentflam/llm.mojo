@@ -194,7 +194,23 @@ README's Muon table uses `-c 0 -gc 0`, so its 4.36 mean is not this base
 `docs/ai/data/adoption_seed_<arm>_s<seed>_600.jsonl`.
 
 <!-- adoption-seeds:start -->
-pending
+| run | val@100 | val@200 | val@300 | val@400 | val@500 | val@600 | train last-50 | ms/step |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| base s42 | 6.0156 | 5.2669 | 4.7984 | 4.5134 | 4.3815 | 4.3507 | 4.3272 | 4003 |
+| base s1 | pending | pending | pending | pending | pending | pending | | |
+| base s2 | pending | pending | pending | pending | pending | pending | | |
+| **base mean** | 6.0156 | 5.2669 | 4.7984 | 4.5134 | 4.3815 | 4.3507 | 4.3272 | 4003 |
+| base spread (max-min) | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | | |
+| combined s42 | 5.6409 | 5.0320 | 4.6012 | 4.4005 | 4.2242 | 4.0950 | 4.1025 | 4567 |
+| combined s1 | pending | pending | pending | pending | pending | pending | | |
+| combined s2 | pending | pending | pending | pending | pending | pending | | |
+| **combined mean** | 5.6409 | 5.0320 | 4.6012 | 4.4005 | 4.2242 | 4.0950 | 4.1025 | 4567 |
+| combined spread (max-min) | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | | |
+| gain s42 (base - combined) | +0.3746 | +0.2349 | +0.1971 | +0.1129 | +0.1574 | +0.2556 | | |
+| **mean gain** | +0.3746 | +0.2349 | +0.1971 | +0.1129 | +0.1574 | +0.2556 | | +14.1% |
+| gain min to max | +0.3746 to +0.3746 | +0.2349 to +0.2349 | +0.1971 to +0.1971 | +0.1129 to +0.1129 | +0.1574 to +0.1574 | +0.2556 to +0.2556 | | |
+
+`*` step time unstable in the log (another job probably shared the GPU): upper bound.
 <!-- adoption-seeds:end -->
 
 <picture>

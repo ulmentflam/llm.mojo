@@ -210,7 +210,8 @@ def render(runs, summ, mode: str, out: Path) -> None:
                 color=th["ink"],
             )
     a.set_xlim(50, 690)
-    a.set_ylim(4.15, 6.15)
+    lo6 = min((r["val"][600] for arm in ARMS for r in runs[arm].values()), default=4.2)
+    a.set_ylim(lo6 - 0.1, 6.15)
     a.set_xlabel("step")
     a.set_ylabel("val loss (lower is better)")
     handles = [Line2D([], [], color=col[k], lw=3, label=ARMS[k][0]) for k in ARMS]
@@ -352,7 +353,7 @@ def render(runs, summ, mode: str, out: Path) -> None:
             color=th["sub"],
         )
         c.set_xlim(50, 680)
-        c.legend(loc="lower left", fontsize=8, frameon=False, labelcolor=th["ink"])
+        c.legend(loc="best", fontsize=8, frameon=False, labelcolor=th["ink"])
         c.set_xlabel("step")
         c.set_ylabel("gain = base minus combined val loss")
     else:
@@ -412,9 +413,7 @@ def render(runs, summ, mode: str, out: Path) -> None:
         fontweight="bold",
     )
     d2.set_title(
-        f"step time {summ['ms_delta_pct']:+.1f}% for combined"
-        if ps
-        else "median ms/step",
+        f"step time {summ['ms_delta_pct']:+.1f}%" if ps else "median ms/step",
         loc="left",
         fontsize=10.5,
         color=th["ink"],
@@ -434,12 +433,12 @@ def render(runs, summ, mode: str, out: Path) -> None:
         0.01,
         0.008,
         "FineWeb, bf16, B=32 T=1024 (131k tokens/step), Muon lr 4.8e-3; seeds 42, 1, 2 via LLMM_INIT_SEED, same data order; single GB10. "
-        "Horizontal ticks in (b), (d) are means; * unstable step time."
-        + (f"  PENDING runs: {', '.join(summ['pending'])}." if n_pend else ""),
+        "\nHorizontal ticks in (b), (d) are means; * unstable step time."
+        + (f"  PENDING: {', '.join(summ['pending'])}." if n_pend else ""),
         fontsize=7.5,
         color=th["sub"],
     )
-    fig.tight_layout(rect=(0, 0.02, 1, 0.97))
+    fig.tight_layout(rect=(0, 0.035, 1, 0.97))
     out.parent.mkdir(exist_ok=True)
     fig.savefig(out, dpi=200, facecolor=th["bg"])
     plt.close(fig)
