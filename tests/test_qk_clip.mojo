@@ -22,7 +22,7 @@ from llmm.attention import attention_fwd
 from llmm.qk_clip import qk_clip_apply
 from llmm.zero import CpuCoordinator
 from _gpu_test_common import shared_gpu_ctx
-from train_gpt2 import GPT2, GPT2_DTYPE
+from train_gpt2 import GPT2, GPT2_DTYPE, QK_NORM
 
 
 def has_gpu_accelerator() -> Bool:
@@ -402,6 +402,14 @@ def test_gpt2_qk_clip_end_to_end() raises:
     comptime if has_accelerator():
         if not has_gpu_accelerator():
             print("SKIP test_gpt2_qk_clip_end_to_end: needs a GPU")
+            return
+        # -D LLMM_QK_NORM=1 (W7): every q/k row is RMS-normalized, so the
+        # planted Q/K row scale below cannot make one head hot (logits are
+        # bounded by attn_scale * head_dim regardless of weight scale), and
+        # rescaling Q/K rows (the clip) cannot change any logit. The premise of
+        # this test does not exist under the flag.
+        comptime if QK_NORM:
+            print("SKIP test_gpt2_qk_clip_end_to_end: QK-norm build")
             return
         comptime TAU = Float32(1.0)
         _write_tiny_checkpoint()
