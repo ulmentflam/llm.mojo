@@ -1053,6 +1053,91 @@ in `_head_adam_step`, so S5 must not fold it into the config); the sharded
 Muon path (`_update_sharded_muon`) has the offset but is untested at W>1;
 the memory report does not yet print `untie_step`.
 
+## S6 implementation notes (2026-10-30)
+
+What S6 landed (train_gpt2.mojo, tests/test_zero_untied.mojo, Makefile):
+- The S2 refusal of ZeRO >= 2 with a trained head is gone. Bucket 1 already
+  wrote `_head_grad_ptr()` (re-pointed to the pool by `_set_head_grad_ptr()`) and
+  reduce-scattered to `flat_base[_head_t()] + t0*C`; nothing else was needed for
+  ZeRO-2 (the encoder's row-sparse wte bucket is untouched, the pool bound is
+  unchanged: `grad_pool_elems` is identical tied/untied at d6).
+- ZeRO-3 streaming: the head is not in the embed window. `_lm_head_tile` gathers
+  one vocab tile (`flat_starts = [_z3_param_offset(lm_head) + t0*C]`) into
+  `wte_tile_buf` (the pre-existing on-demand buffer, now allocated in the untied
+  build with `Z3_HEAD_ONDEMAND = UNTIED_HEAD and not Z3_HEAD_RESIDENT`). Used by
+  the forward, the chunked-CE recompute and the backward weight-gradient GEMM.
+  The K=1 paths (single GEMM) now also go through `_lm_head_tile(0, V_p)`; in the
+  tied build that is the same pointer, so the tied binary is unchanged. Only a
+  trained head is gathered: with `head_tied` the head reads the resident wte.
+  `LLMM_Z3_WTE_ONDEMAND` stays comptime-refused in the untied build.
+- `-D LLMM_Z3_HEAD_RESIDENT=1`: head appended to the embed window
+  (`params.lm_head` re-pointed in `_z3_stream_embed`), no per-tile collective.
+  The whole test file passes in this build too (the post-update tile check is
+  skipped there: the window is only refreshed by the next forward).
+- `-untie_at` under ZeRO-2/3 (merged from S4, whose startup refusal is lifted):
+  `untie_head()` is now `_untie_apply_range`-based. ZeRO-3 streaming gathers wte
+  tile by tile (bounded by the tile buffer) and each rank keeps the overlap with
+  its shard (params and bf16 master); ZeRO-1/2 keep full params, copy locally and
+  set the master slice; the old "bf16 at W>1" error is gone. The bf16 multi-rank
+  master path is NOT exercised by any gate (single GPU; bf16 CPU codegen is
+  unsupported on this aarch64 host): it reuses the fp32-tested index logic and
+  the W=1 bf16 promotion code.
+- Memory report: `head_tile_buf` joins `buffers` and `classes.z3_windows` (only
+  when a tile gather is compiled in, so the tied report is byte-identical), and an
+  `untied_head` object (head_elems, flat offset, elements in this rank's shard,
+  params/grads/m/v/(master) bytes, tile rows and bytes, resident-window bytes) is
+  emitted in the untied build. Like `tensors` it is a breakdown of buffers already
+  counted, not additive.
+
+Finding 6, measured: step 1 AND step 3 are bit-exact (`==`, zero residual) on all
+17 tensors, wte included, for ZeRO-2 and ZeRO-3 against ZeRO-0, different batch
+per rank, AdamW and Muon, W=2/4/8 (L=2) and W=8 L=1 (head straddling ranks 6/7).
+The prediction held; there was nothing to explain. (The tied build's step-1 wte
+exemption exists because wte there carries lm + encoder parts reduced in a
+different order.) After the last ZeRO-3 update `_z3_gather_full` equals each
+rank's flat shard (sharded Muon: outside the four matrix tensors, whose owner
+space is checked via the ZeRO-0 comparison) and every gathered head tile equals
+the ZeRO-0 head, bit-exactly.
+
+Mutants (temporary, reverted): tile gather from `_z3_param_offset(wte)`: the 8
+ZeRO-3 tests fail, ZeRO-2 unaffected. Bucket 1 K>1 destination `flat_base[wte]`
+instead of the head: all 8 ZeRO-2 and 8 ZeRO-3 tests fail. `-untie_at` tile
+gather from the head offset instead of wte: the 4 ZeRO-3 transition tests fail.
+Variants: the file also passes with `-D LLMM_Z3_HEAD_RESIDENT=1`,
+`-D LLMM_LM_HEAD_VOCAB_TILES=1` (K=1 through `_lm_head_tile`) and
+`-D LLMM_LM_HEAD_CHUNKED_CE=1`. The default tests run K=8 (tile = 8 rows of the
+64-row toy vocab), so the on-demand branch walks 8 tiles per pass.
+
+Untie transition tests (new): tied step, `untie_head()`, two trained steps at
+ZeRO-2/3 == ZeRO-0, same batch per rank, accum 2, W=2/4, AdamW and Muon. W=8 is
+not included: same-batch tied phase at W=8 is 1 ulp off in wte (the known harness
+property noted under S3), unrelated to the transition.
+
+Memory (d6: L=6, C=384, V_p=50304, T=1024, fp32, W=2, AdamW, `LLMM_MEM_REPORT`
+steady phase, rank 0, bytes). Delta = untied minus tied; model = section 8
+script rescaled to d6 (tile 6400 rows = 9,830,400 B). Every delta matches exactly:
+
+| ZeRO | params_buf | grads (full+shard) | m+v | z3 window + tile buf |
+|---|---|---|---|---|
+| 0 | +77,266,944 | +77,266,944 | +154,533,888 | +4 (stub) |
+| 1 | +77,266,944 | +77,266,944 | +77,266,944 | +4 (stub) |
+| 2 | +77,266,944 | +38,633,472 | +77,266,944 | +4 (stub) |
+| 3 | +38,633,472 | +38,633,472 | +77,266,944 | +9,830,400 |
+
+grad pool, param window and comm scratch are identical tied/untied at every stage.
+ZeRO-3 window: tied 78,842,880 B (wte+wpe+ln_f), untied 88,673,280 B; growth is
+exactly one tile (the whole head would have been 77,266,944 B). The 4-byte
+entries are the 1-element placeholder reported as-is.
+
+Gates (merged tree, see the final report for verdict lines): tied 3-step CPU d6
+`cmp` identical (AdamW, Muon) against the fe3312a binary; `verify-cpu`,
+`verify-untied-cpu` at K=8 and K=1, `check-untied-idle`, `check-untied-head`,
+`check-untie-at`; GPU: `verify-gpu`, `verify-untied-gpu`, `make test-mojo` tied
+and untied.
+
+Not verified: multi-rank on real GPUs (one GB10; threaded CPU is the proof of
+the collectives' logic), bf16 multi-rank untie master slice, Metal.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Opus agent), directed by Evan Owen.
