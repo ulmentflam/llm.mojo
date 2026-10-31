@@ -445,6 +445,7 @@ To be filled by the item owners. One row per arm.
 | W5+W6 | base + `-D LLMM_ZERO_INIT_PROJ=1 -D LLMM_MLP_ACT=relu2` | 5.0088 | | 4138 | -0.026 vs base, just outside the noise band and better than either alone (relu2 5.0184, zero-init 5.0436): the record-5 bundle effect is real but small at 124M/300 steps; needs three seeds before it becomes a default |
 | W3 | base with `-k wsd -u 0 -cooldown 0.45 -decay_shape linear -q 0.1` | 4.7675 | | 4024 | +0.009 vs the 0.40 arm (inside noise): the cooldown fraction is not sensitive between 0.40 and 0.45 at this horizon |
 | W3 | base with `-k wsd -u 50 -cooldown 0.4 -decay_shape linear -q 0.1` | 4.8017 | | 4011 | +0.043 vs the zero-warmup arm: warmup costs under Muon, as the speedrun's "orthogonalized updates need no warmup" intuition predicts; zero warmup is the recipe |
+| W5 | base + `-D LLMM_ZERO_INIT_PROJ=2` (N(0, 0.002) projections, record 64's "small nonzero") | 5.0274 | | 4012 | -0.007 vs base (inside noise), 0.016 better than exact zero: init scale of the residual projections is not a lever at 124M/300 steps on its own |
 
 ## 7. Not in scope (so nobody re-litigates)
 
