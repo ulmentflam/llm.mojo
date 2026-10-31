@@ -1307,6 +1307,94 @@ auto-merges correctly (rotary wpe skip plus the head split). test_gpt2 has no un
 reference for rotary, relu2 or QK-norm; those combinations need a compile-time refusal
 like the existing rotary+relu2 one.
 
+## Fix-and-merge into main (2026-10-30, Claude Code Sonnet agent)
+
+Branch `mn/w9`: the Opus verification's fixes, then `git merge main` (main at
+`d8be93e`: W1 W2 W3 W5 W6 W7 W8 and docs).
+
+**Fix 1: `untie_head()` master offset under sharded Muon.** `_untie_apply_range`
+indexed the fp32 master shard-relative (`a - rank*opt`); under sharded Muon the
+master is compact (`_trim_flat_m_master`, each AdamW segment at `compact_off`).
+The new pure helper `master_dst_offset(segs, a, b, lo, compact, cap)` maps `[a, b)`
+through `_adamw_shard_segments()` to `compact_off + (a - flat_start)` and raises on
+a range outside every segment or a write past `cap` elements, so an out-of-bounds
+device write cannot recur silently. `tests/test_zero_untied.mojo`'s ownership tests
+now call it on the real segments and compare with the expected offset computed in
+the test from the layout (sum of earlier segment lengths), at W=2/4/8 (L=2, whole
+head on rank W-1) and W=8 (L=1, ranks 6 and 7 straddle), and assert that for L=2 the
+old shard-relative index would have overrun the compact buffer. Not verifiable end to
+end here: bf16 CPU codegen is unsupported on this aarch64 host and there is one GPU,
+so a bf16 sharded-Muon `-untie_at` run cannot be executed; the mapping test is the
+gate. Mutant (copy of the tree, helper reverted to `dst = a - lo`): 38 of 42 pass, the
+four `test_head_ownership_*` tests fail; the unmutated tree passes 42 of 42.
+
+**Fix 2: README** said ZeRO-2/3 with a trained head are refused (S6 lifted that) and
+never mentioned `-untie_at`; both fixed.
+
+**Merge: slot-44 collision.** Main's W8 uses state header slot 44 as the
+architecture-flags word (`STATE_FLAGS_SLOT`, bit 0 rotary, state version 2 when
+nonzero). W9 had written `untied_layout = 1` there. Resolution: the untied layout is
+`ARCH_FLAG_UNTIED = 2`, bit 1 of that word; `untie_step` stays in slot 45
+(`STATE_UNTIE_STEP_SLOT`, written only when nonzero, read from every version);
+`TrainingState.untied_layout` is gone. Every untied state file therefore has a nonzero
+flags word and is version 2; tied non-rotary files stay version 1 and byte-identical
+(proved below). Model files keep rotary-only flags in header slot 20 (untied model
+files are marked by version 13/15). A state file must match `STATE_ARCH_FLAGS`
+(rotary | untied of this build) exactly in both directions; a model file is checked
+against `ARCH_FLAGS` (rotary only). `check_arch_flags` takes the build's expected word
+and its refusal names each mismatched bit, e.g. `mismatched: untied head (file tied,
+build untied; -D LLMM_UNTIED_HEAD)`. `load_checkpoint` order: read the state header
+once, arch flags (state, then model), then the untie step.
+
+Other conflicts: Makefile (one passthrough: `test-mojo` uses `TEST_DEFINES`, which
+defaults to `MOJO_DEFINES`), README (both paragraphs), `train_gpt2.py` and
+`scripts/gen_expected_losses.py` (names compose `_untied`, `_rotary`, `_qknorm`,
+`_relu2`), `test_gpt2.mojo` (state name composes `_untied`; new `comptime assert`
+refusing `UNTIED_HEAD` with `ROTARY`, `MLP_RELU2` or `QK_NORM`, because no untied
+reference exists for them), `tests/test_checkpointing.mojo` (untie round trip on the
+flags bit, new independence/naming test), `tests/test_zero_untied.mojo` (ownership test
+`comptime assert not ROTARY`), `scripts/check_untie_at.py` (version 2, slot 44 == 2).
+`_adamw_ranges` auto-merged correctly: rotary's wpe skip, then the body ranges, then the
+body tail and head as separate ranges.
+
+**Verification of the merged tree** (merge commit `c82a1c7`, then the test fix
+`b82c62b`; binaries built through `build_slot.sh` from sources last modified 23:12-23:14,
+`train_gpt2` 23:20:51, `train_gpt2_bf16` 23:22:08, `train_gpt2_bf16_untied` 23:23:34,
+`train_gpt2_rotary` 23:25:14, `train_gpt2_untiedchk` 23:26:20, `train_gpt2_tiedchk`
+23:42:13; scripts in the session scratchpad `w9fm/`):
+
+- Tied byte identity vs the `fe3312a` binary, `LLMM_USE_CPU=1`, d6, 3 steps: AdamW
+  gc 1e-3 and Muon gc 1e-3, `model_3.bin` and `state_3_0.bin` `cmp`-identical (121431040
+  / 242861056 B AdamW, 121431040 / 200393728 B Muon).
+- CPU gates: `make verify-cpu` and `verify-untied-cpu` `result gate=cpu status=pass`;
+  `check-untied-idle`, `check-untied-head` pass; `make verify-cpu MOJO_DEFINES="-D
+  LLMM_MLP_ACT=relu2"` passes; AdamW half of `check-untie-at` (the script changed:
+  version 2, slot 44 == 2) `result gate=untie-at status=pass` (bias-corr 5.7e-9; resume
+  at 2 and 4 byte-identical; all five refusals fire). The Muon half was not run (about
+  50 min of CPU).
+- `tests/test_zero_untied.mojo` standalone, untied build: 42 passed. With the mapping
+  mutant: 38 passed, the four ownership tests fail. `tests/test_checkpointing.mojo`:
+  22/22 in the tied, untied and rotary builds.
+- State-file refusal matrix, real fp32 CPU binaries (tied v1 file; rotary v2 file,
+  slot 44 = 1; untied v2 file, slot 44 = 2): each reader loads only its own file and
+  refuses the other two, naming the mismatched bit (for example `mismatched: untied
+  head (file tied, build untied; -D LLMM_UNTIED_HEAD)`).
+- GPU, one `gpu_slot.sh` chain: `verify-gpu`, `verify-untied-gpu` (17 tensors),
+  `verify-gpu MOJO_DEFINES="-D LLMM_ROTARY=1"`, `verify-gpu MOJO_DEFINES="-D
+  LLMM_QK_NORM=1"` all `result gate=gpu status=pass`; `make test-mojo` tied and
+  `TEST_DEFINES="-D LLMM_UNTIED_HEAD=1"`: `tests result=pass files=31 passed=303
+  skipped=1 failed=0` (the first tied run had test_checkpointing failing to compile,
+  fixed in `b82c62b`, rerun clean).
+- bf16 5-step smokes (B=4, T=1024): tied 3.067284 3.688934 3.423465 3.907678 3.904594;
+  untied 3.067284 3.688591 3.423657 3.903446 3.906831; `-untie_at 0.6` 3.067284
+  3.688934 3.423465 3.907678 3.898768 with `untie head_from=wte master=promoted
+  moments=fresh step=3` between steps 3 and 4 (all equal to the pre-merge verifier's
+  numbers). Default Muon fp32 smoke 4.287241 3.985713 4.111456 3.619318 3.700262.
+- Main-checkout tied fixtures: `gpt2_124M.bin` sha256 7e55b060...0574 and
+  `gpt2_124M_debug_state.bin` 0cb72408...8321, unchanged.
+- Not verified: the bf16 sharded-Muon `-untie_at` path end to end (no bf16 CPU codegen on
+  this host, one GPU), Muon half of `check-untie-at`, Metal.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Opus agent), directed by Evan Owen.
@@ -1315,4 +1403,6 @@ the memory figures come from a Python model it wrote and checked against the
 published tied-build figures. The S4 slice was implemented by a Claude Code
 (Sonnet) agent under the same direction. The S3/S4/S6/S7 final verification
 section was written by a separate Claude Code (Opus) agent under the same
+direction, from builds and runs it made itself.
+The fix-and-merge section was written by a Claude Code (Sonnet) agent under the same
 direction, from builds and runs it made itself.
