@@ -444,6 +444,7 @@ To be filled by the item owners. One row per arm.
 | W7 | base + `-D LLMM_QK_NORM=1 -attn_scale 0.12` | 4.9790 | | 4186 | +0.013 vs the default-scale QK-norm arm (inside noise): at hd 64 the speedrun's 0.12 is 0.96x of 1/sqrt(hd), so there is nothing to gain; max logit 7.3-7.4 (cap 7.68). Keep the default scale |
 | W5+W6 | base + `-D LLMM_ZERO_INIT_PROJ=1 -D LLMM_MLP_ACT=relu2` | 5.0088 | | 4138 | -0.026 vs base, just outside the noise band and better than either alone (relu2 5.0184, zero-init 5.0436): the record-5 bundle effect is real but small at 124M/300 steps; needs three seeds before it becomes a default |
 | W3 | base with `-k wsd -u 0 -cooldown 0.45 -decay_shape linear -q 0.1` | 4.7675 | | 4024 | +0.009 vs the 0.40 arm (inside noise): the cooldown fraction is not sensitive between 0.40 and 0.45 at this horizon |
+| W3 | base with `-k wsd -u 50 -cooldown 0.4 -decay_shape linear -q 0.1` | 4.8017 | | 4011 | +0.043 vs the zero-warmup arm: warmup costs under Muon, as the speedrun's "orthogonalized updates need no warmup" intuition predicts; zero warmup is the recipe |
 
 ## 7. Not in scope (so nobody re-litigates)
 
