@@ -47,6 +47,15 @@ Usage
 -----
     pixi run python scripts/gen_expected_losses.py
     pixi run python scripts/gen_expected_losses.py --device cuda
+    pixi run python scripts/gen_expected_losses.py --untied
+
+``--untied`` (GPT2_UNTIED=1) builds the model with a separate LM head. The head
+starts as a copy of wte (GPT.from_pretrained copies HF's ``lm_head.weight``), so
+step 0 equals the tied loss; the trajectory then diverges because the head and
+wte are updated separately. It reads ``gpt2_124M_untied_debug_state.bin``
+(written by ``GPT2_UNTIED=1 pixi run python train_gpt2.py ...``) and prints the
+table for ``test_gpt2.mojo``'s ``-D LLMM_UNTIED_HEAD=1`` path. The optimizer is
+the same AdamW (uniform weight decay over all 17 tensors).
 
 It prints a ready-to-paste Mojo list literal.
 
@@ -87,7 +96,7 @@ import torch
 # train_gpt2.py guards its training driver behind `if __name__ == "__main__"`,
 # so importing it for the model definition is side-effect free.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from train_gpt2 import GPT, QK_NORM, ROTARY  # noqa: E402
+from train_gpt2 import GPT, QK_NORM, ROTARY, is_untied  # noqa: E402
 
 # GPT2_ACT=relu2 (the reference's MLP activation switch, mirroring the Mojo build
 # constant -D LLMM_MLP_ACT=relu2) reads/produces the *_relu2_debug_state.bin
@@ -97,14 +106,22 @@ from train_gpt2 import GPT, QK_NORM, ROTARY  # noqa: E402
 # no wpe add, and the rotary debug state written by `GPT2_ROTARY=1 python
 # train_gpt2.py` (the list is then pasted as `expected_losses` under ROTARY).
 # GPT2_QK_NORM=1 selects the QK-norm reference (_qknorm suffix).
-# The suffixes compose exactly as in train_gpt2.py: _rotary, _qknorm, _relu2.
-STATE_FILE = (
-    "gpt2_124M"
-    + ("_rotary" if ROTARY else "")
-    + ("_qknorm" if QK_NORM else "")
-    + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
-    + "_debug_state.bin"
-)
+# --untied (GPT2_UNTIED=1) selects the untied-head reference (_untied suffix).
+# The suffixes compose exactly as in train_gpt2.py: _untied, _rotary, _qknorm,
+# _relu2.
+
+
+def _state_file(untied: bool) -> str:
+    return (
+        "gpt2_124M"
+        + ("_untied" if untied else "")
+        + ("_rotary" if ROTARY else "")
+        + ("_qknorm" if QK_NORM else "")
+        + ("" if os.environ.get("GPT2_ACT", "gelu") == "gelu" else "_relu2")
+        + "_debug_state.bin"
+    )
+
+
 MAGIC_EXPECTED = 20240520
 VERSION_EXPECTED = 3
 NUM_STEPS = 10
@@ -164,7 +181,12 @@ def main() -> int:
         default="cpu",
         help="torch device (default: cpu, for reproducibility across boxes)",
     )
-    parser.add_argument("--state-file", default=STATE_FILE)
+    parser.add_argument("--state-file", default=None)
+    parser.add_argument(
+        "--untied",
+        action="store_true",
+        help="separate LM head (GPT2_UNTIED=1); reads the untied debug state",
+    )
     parser.add_argument(
         "--dtype",
         choices=["float32", "float64"],
@@ -172,6 +194,10 @@ def main() -> int:
         help="reference precision (default float32; relu2 uses float64)",
     )
     args = parser.parse_args()
+    if args.untied:
+        os.environ["GPT2_UNTIED"] = "1"
+    if args.state_file is None:
+        args.state_file = _state_file(args.untied)
 
     # Strict IEEE fp32. TF32 would drift the trajectory by ~1e-2, which is the
     # same order as the tolerance this list is compared against.
@@ -195,6 +221,9 @@ def main() -> int:
     y = torch.from_numpy(y_np.astype(np.int64)).to(device)
 
     model = GPT.from_pretrained("gpt2")
+    if args.untied:
+        assert is_untied(model), "GPT2_UNTIED=1 did not produce an untied model"
+        assert torch.equal(model.lm_head.weight, model.transformer.wte.weight)
     model.to(device)
     model.train()
     model.to(getattr(torch, args.dtype))

@@ -8,10 +8,9 @@ the Muon baseline it builds on is
 [`muon_vs_adamw_124m_2026-10-29.md`](muon_vs_adamw_124m_2026-10-29.md) and
 [`muon_hparam_sweep_124m_2026-10-30.md`](muon_hparam_sweep_124m_2026-10-30.md).
 
-**Status: partial.** The table and figure below render from whatever ranking
-logs exist (`make figure-adoption`). Rows marked `pending` had not finished
-when this was written; they refill by re-running the pipeline (see
-"Reproducing"). Every number here is single-seed at 300 steps.
+**Status: complete for the planned ranking queue.** Every arm below finished;
+the table and figure render from the committed logs (`make figure-adoption`).
+Every number here is single-seed, 300 steps unless a 600-step control says so.
 
 ## How the campaign ran
 
@@ -46,7 +45,7 @@ when this was written; they refill by re-running the pipeline (see
 | W8 rotary | aeabaf4 | whole `test-mojo` passes under the flag; AdamW and Muon runs are byte-identical to the pre-campaign commit on CPU; three mutants caught ([rotary doc](rotary_embeddings_w8_2026-10-30.md)) |
 | W5/W6 zero-init, ReLU^2 | 78c0806 | new `make verify-init` gate; flag-off fixtures byte-identical; a CPU relu2 gradient failure root-caused and fixed (below) ([W5/W6 doc](w5_w6_zero_init_proj_and_relu2_2026-10-30.md)) |
 | W7 QK-norm | 841ea95 | gradients 16/16 on GPU and CPU with the flag on; backward mutants caught by `verify-gpu` and pytest, one scale-only mutant needed a dedicated gate ([W7 doc](qk_norm_attn_scale_2026-10-30.md)) |
-| W9 untied head | not merged at writing | design and S0/S1 slices verified; a bf16 + sharded-Muon + `-untie_at` master-shard bug found statically and fixed on the branch; the W=1 path was merge-ready (see the W9 design doc on `mn/w9`) |
+| W9 untied head | f882464 | design and S0/S1 slices verified; a bf16 + sharded-Muon + `-untie_at` master-shard bug found statically and fixed before merge; W=1 path merge-ready ([design](untied_lm_head_design_2026-10-30.md)) |
 
 ## Results
 
@@ -63,19 +62,19 @@ written by `scripts/figure_adoption.py` between the markers.
 | W1 adam x8 | `-l_adam 8` | 6.2294 | 5.4482 | 5.2074 | +0.1727 | 5.1651 | 3917 |  |
 | W2 ramp .85-.90 | `-mu_start 0.85 -mu 0.9 -mu_warmup 300` | 6.0079 | 5.2399 | 5.0259 | -0.0087 | 4.9868 | 3977 |  |
 | W2 ramp .85-.95 | `-mu_start 0.85 -mu 0.95 -mu_warmup 300` | 6.0063 | 5.2398 | 5.0174 | -0.0172 | 4.9770 | 3925 | flat 0.95 was 5.0732 in the sweep |
-| W3 wsd u0 c.40 | `-k wsd -u 0 -cooldown 0.4 -decay_shape linear` | pending | pending | pending | | | | queued |
-| W3 wsd u0 c.45 | `-k wsd -u 0 -cooldown 0.45 -decay_shape linear` | pending | pending | pending | | | | queued |
-| W3 wsd u50 c.40 | `-k wsd -u 50 -cooldown 0.4 -decay_shape linear` | pending | pending | pending | | | | queued |
-| W3 wsd u0 c.40 sqrt | `-k wsd -u 0 -cooldown 0.4 -decay_shape sqrt` | pending | pending | pending | | | | queued |
+| W3 wsd u0 c.40 | `-k wsd -u 0 -cooldown 0.4 -decay_shape linear` | 5.9740 | 5.2500 | 4.7588 | -0.2759 | 4.8022 | 4036 |  |
+| W3 wsd u0 c.45 | `-k wsd -u 0 -cooldown 0.45 -decay_shape linear` | 5.9711 | 5.2399 | 4.7675 | -0.2671 | 4.8096 | 4025 |  |
+| W3 wsd u50 c.40 | `-k wsd -u 50 -cooldown 0.4 -decay_shape linear` | 6.0171 | 5.2655 | 4.8017 | -0.2330 | 4.8475 | 4005 |  |
+| W9 untie at 2/3 | `-D LLMM_UNTIED_HEAD=1 -untie_at 0.667` | 5.9931 | 5.2314 | 5.0351 | +0.0004 | 4.9961 | 3966 | equal to the tied base at 300 steps |
 | W6 relu2 | `-D LLMM_MLP_ACT=relu2` | 6.0008 | 5.2207 | 5.0184 | -0.0162 | 4.9780 | 4229 | at the noise edge alone |
-| W5 zero-init proj | `-D LLMM_ZERO_INIT_PROJ=1` | pending | pending | pending | | | | queued |
-| W5+W6 both | `-D LLMM_ZERO_INIT_PROJ=1 -D LLMM_MLP_ACT=relu2` | pending | pending | pending | | | | queued |
-| W5 small-init proj | `-D LLMM_ZERO_INIT_PROJ=2` | pending | pending | pending | | | | queued |
+| W5 zero-init proj | `-D LLMM_ZERO_INIT_PROJ=1` | 6.0260 | 5.2580 | 5.0436 | +0.0090 | 5.0007 | 3994 |  |
+| W5+W6 both | `-D LLMM_ZERO_INIT_PROJ=1 -D LLMM_MLP_ACT=relu2` | 5.9983 | 5.2228 | 5.0088 | -0.0259 | 4.9693 | 4141 |  |
+| W5 small-init proj | `-D LLMM_ZERO_INIT_PROJ=2` | 5.9996 | 5.2329 | 5.0274 | -0.0072 | 4.9850 | 4007 |  |
 | W7 QK-norm | `-D LLMM_QK_NORM=1` | 5.9282 | 5.1637 | 4.9657 | -0.0689 | 4.9276 | 4492* | default attention scale |
-| W7 QK-norm s0.12 | `-D LLMM_QK_NORM=1 -attn_scale 0.12` | pending | pending | pending | | | | queued |
+| W7 QK-norm s0.12 | `-D LLMM_QK_NORM=1 -attn_scale 0.12` | 5.9321 | 5.1749 | 4.9790 | -0.0557 | 4.9402 | 4190 |  |
 | W8 rotary | `-D LLMM_ROTARY=1` | 5.7416 | 5.0032 | 4.8031 | -0.2316 | 4.7635 | 4201* | largest single gain |
-| W9 untied head | `-D LLMM_UNTIED_HEAD=1 -untie_at 0` | pending | pending | pending | | | | queued |
-| W9 untied, head x0.125 | `-D LLMM_UNTIED_HEAD=1 -untie_at 0 -l_head 0.125` | pending | pending | pending | | | | queued |
+| W9 untied head | `-D LLMM_UNTIED_HEAD=1 -untie_at 0` | 6.1237 | 5.3820 | 5.1503 | +0.1156 | 5.1041 | 4014 | tied arm is the base |
+| W9 untied, head x0.125 | `-D LLMM_UNTIED_HEAD=1 -untie_at 0 -l_head 0.125` | 6.4503 | 5.7214 | 5.5097 | +0.4751 | 5.4606 | 4026 |  |
 
 `*` ms/step unstable in the log (spikes above 1.15x the median, or a step above 1.5x): another job probably shared the GPU, so read it as an upper bound.
 <!-- adoption-table:end -->
@@ -102,31 +101,83 @@ idle before it starts, built to separate binaries) answers how much of the
 step-time cost of relu2 is real.
 
 <!-- adoption-timing:start -->
-Timing runs pending.
+| run | median ms/step | min | max | steps |
+|---|---:|---:|---:|---:|
+| timing_gelu_r1 | 3914.1 | 3884.3 | 3935.9 | 30 |
+| timing_gelu_r2 | 3931.9 | 3900.1 | 3945.4 | 30 |
+| timing_relu2_r1 | 4048.6 | 4014.2 | 4057.3 | 30 |
+| timing_relu2_r2 | 4044.7 | 4004.4 | 4054.5 | 30 |
+| **mean of run medians** | gelu 3923, relu2 4047 | | | +3.2% |
 <!-- adoption-timing:end -->
+
+### W3 at 600 steps
+
+Same seed and tokens, run separately from the 300-step ranking (the cosine control
+and the best W3 recipe at `-x 600`); it is not mixed into the 300-step panels.
+
+<!-- adoption-long:start -->
+| run | val@100 | val@200 | val@300 | val@400 | val@500 | val@600 | ms/step |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| w3_600_cosine_u50 | 6.0157 | 5.2574 | 4.7870 | 4.5110 | 4.3781 | 4.3470 | 3976 |
+| w3_600_wsd_u0_c040_lin | 5.9704 | 5.2706 | 4.8307 | 4.5973 | 4.3912 | 4.2541 | 3968 |
+| **wsd minus cosine at 600** | | | | | | -0.0929 | |
+<!-- adoption-long:end -->
 
 ## Findings
 
-- **Rotary is the largest gain by a wide margin**, an order of magnitude
-  above the noise band, at a step-time cost that the table only upper-bounds.
-- **QK-norm helps outside the noise band** and bounds the max attention logit
-  near 7.7, just under the 8.0 that unit-RMS rows give at head dim 64. It is
-  flat from step 100 on (panel d). Its step-time cost is not yet separated
-  from contention.
-- **The AdamW-range learning rate must stay at the shared rate.** Every
-  multiplier other than 1 is worse, and 0.125 is far worse: part of the
-  earlier Muon sweep win came from the 300-step sweep running the AdamW ranges
-  at a high rate. The `-l_adam` flag stays for W9's `-l_head`, not as a recipe
-  knob.
-- **The momentum ramp reconciles the sweep.** A flat 0.95 lost to 0.9 in the
-  sweep, but ramping 0.85 to 0.95 matches or edges the 0.9 base: low momentum
-  early, high late. Both ramps are inside the noise band, so this is
-  "no harm, plausible long-run benefit", not a measured win.
-- **ReLU^2 alone is at the noise edge** and costs step time; the cuBLASLt
-  epilogue fusion that GELU gets does not exist for relu2.
-- **Zero-init, both, and small-init (W5), the W3 WSD arms, the 0.12-scale
-  QK-norm arm and the W9 untied arms** are pending in the table above; read
-  their verdicts from it once they land rather than from this prose.
+Ordered by size of effect; every effect is single-seed (noise about 0.02).
+
+1. **W3 is the largest gain: zero-warmup WSD with a linear cooldown to a 0.1
+   floor** (`-k wsd -u 0 -cooldown 0.4 -decay_shape linear -q 0.1`). It beats
+   cosine by 0.276 at 300 steps and by 0.093 at 600 steps, so the gain
+   persists at twice the horizon but shrinks, since at 300 steps cosine's own
+   tail is compressed. The cooldown fraction is insensitive between 0.40 and
+   0.45, and a 50-step warmup costs 0.043 under Muon, so zero warmup is the
+   recipe. The cooldown run trails mid-training because it sits at the full
+   rate, then overtakes in the last steps (panel g).
+2. **Rotary embeddings are second, 0.232 at 300 steps**, about ten times the
+   noise band. The step-time cost in the table is an upper bound because that
+   run shared the GPU with a verifier compile.
+3. **QK-norm gives 0.069** and bounds the max attention logit near 7.7, just
+   under the 8.0 that unit-RMS rows give at head dim 64 (panel d). The
+   speedrun's 0.12 attention scale is a no-op at head dim 64 (it is 0.96x of
+   1/sqrt(hd)), so keep the default scale.
+4. **Zero-init and relu2 only help together: 0.026**, just outside the noise
+   band. Each alone is within noise (zero-init projections, small-init
+   projections, and relu2 alone). relu2 costs 3.2% step time on an idle GPU
+   (the table above), with no cuBLASLt epilogue to hide the extra pass.
+5. **The momentum ramp is worth 0.017**, inside the noise band but
+   directionally right: a flat 0.95 lost in the earlier sweep, while ramping
+   0.85 to 0.95 matches or edges the 0.9 base (low momentum early, high late).
+6. **The AdamW-range learning rate must stay at the shared rate.** The W1
+   ladder's optimum is the multiplier 1 (panel c); the earlier Muon sweep win
+   was partly the AdamW ranges running at a high rate. The `-l_adam` flag
+   stays for W9's `-l_head`, not as a recipe knob.
+7. **W9 (untied head) does not pay at 300 steps.** Untying from scratch is
+   0.116 worse (a zero head gives the body no gradient at step 0), a low head
+   rate on top is 0.475 worse in total, and untying at two thirds of training
+   is neutral. Its value, if any, awaits the plan's 2000-step comparison.
+
+## Recommended recipe going forward
+
+Base Muon recipe plus, as candidate flags:
+
+```
+-k wsd -u 0 -cooldown 0.4 -decay_shape linear -q 0.1
+-D LLMM_ROTARY=1
+-D LLMM_QK_NORM=1
+-mu_start 0.85 -mu 0.95 -mu_warmup 300
+```
+
+Leave relu2/zero-init, the AdamW-range multiplier and the untied head at
+their defaults for now. **Caveats: these are single-seed, 300-step rankings,
+each measured one at a time; the combination has not been run, and effects
+are not guaranteed to add (QK-norm and rotary both act on attention). Nothing
+becomes a default until a combined run has three init seeds
+(`-D LLMM_INIT_SEED=42|1|2`) and a longer horizon**, since the 2000-step Muon
+run already showed 300-step orderings narrow with length. The next steps are
+the three-seed combined run and the tokens-to-3.28 headline run the plan
+calls for.
 
 ## Incidents and lessons
 
@@ -175,8 +226,8 @@ Timing runs pending.
   default path should too is open.
 - cuBLASLt epilogue: no relu2 epilogue exists. If the timing table shows a
   real cost, the full-fusion route is a MAX-matmul epilogue lambda.
-- W9 untied head: merge `mn/w9` after its fix agent's gates, then re-run the
-  CPU byte-identity comparison.
+- W9 untied head: run the plan's 2000-step tied vs `-untie_at 0.667`
+  comparison; 300 steps cannot show its value.
 
 ## Recommended recipe going forward
 

@@ -25,7 +25,7 @@ from max.gpu.host import DeviceContext
 from llmm.memory import MutMemPtr, heap_alloc
 from llmm.zero import CpuCoordinator
 
-from train_gpt2 import GPT2, GPT2_DTYPE
+from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD
 
 comptime TT = 16
 comptime BB = 1
@@ -60,7 +60,9 @@ def _write_checkpoint(path: String) raises -> Int:
     _ = f.write(header.tobytes())
     _ = f.write(weights.tobytes())
     f.close()
-    return n
+    # The model holds n parameters, plus the head block in an untied build; the
+    # callers size every comparison buffer by the model's count.
+    return n + (VOCAB * C if UNTIED_HEAD else 0)
 
 
 def _remove(path: String) raises:

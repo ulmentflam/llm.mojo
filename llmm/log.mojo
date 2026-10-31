@@ -187,6 +187,18 @@ struct Log(Copyable, Movable):
         var tenths = Int((perf_counter_ns() - self.start_ns) // 100_000_000)
         return String(tenths // 10) + "." + String(tenths % 10)
 
+    def _field_level(self, event_level: Int) -> Int:
+        """The highest field level an event printed at `event_level` shows.
+
+        A QUIET event is a verdict or a failure (`result`, `done`, a failing
+        `tensor`): it keeps every NORMAL-level field (gate, status, steps,
+        tok_s), so `quiet` still reads `result gate=fp32 status=pass` instead
+        of a bare `result`. VERBOSE and DEBUG extras stay hidden there.
+        """
+        if event_level == QUIET:
+            return max(self.level, NORMAL)
+        return self.level
+
     def _json_line(
         self, kind: String, fields: List[Field], level: Int
     ) -> String:
@@ -218,13 +230,13 @@ struct Log(Copyable, Movable):
         if level > self.level:
             return
         if self.json():
-            print(self._json_line(kind, fields, self.level))
+            print(self._json_line(kind, fields, self._field_level(level)))
         elif self.llm():
             var out = kind
             if self.timestamps:
                 out += " t=" + self._seconds()
             for f in fields:
-                if f.level <= self.level:
+                if f.level <= self._field_level(level):
                     out += " " + f.key + "=" + _llm_value(f)
             print(out)
         else:

@@ -1,0 +1,32 @@
+{"event": "setup", "model": "gpt2-124M", "params": 124475904, "data": "fineweb", "B": 32, "T": 1024, "steps": 30, "lr": 0.0048, "opt": "muon", "device": "NVIDIA GB10", "precision": "bf16", "batch": 131072, "grad_accum": 4, "grad_clip": 1.0, "weight_decay": 0.1, "qk_clip": 0.0, "muon_momentum": 0.9, "adam_lr_mult": 1.0, "adam_beta1": 0.9, "adam_beta2": 0.999, "adam_eps": 1e-08, "muon_momentum_start": 0.9, "muon_momentum_warmup": 0, "world_size": 1, "zero_stage": 0, "lr_schedule": "cosine", "cooldown": 0.2, "decay_shape": "sqrt", "mlp_act": "relu2"}
+{"event": "step", "step": 1, "steps": 30, "loss": 11.003254, "ms": 4687.97, "tok_s": 27959, "norm": 14.0212, "lr": 9.6e-05, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 18.0}
+{"event": "step", "step": 2, "steps": 30, "loss": 10.852240, "ms": 4014.20, "tok_s": 32652, "norm": 13.4033, "lr": 0.00019200001, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 21.0}
+{"event": "step", "step": 3, "steps": 30, "loss": 10.565248, "ms": 4016.96, "tok_s": 32641, "norm": 11.7308, "lr": 0.000288, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 21.0}
+{"event": "step", "step": 4, "steps": 30, "loss": 10.182547, "ms": 4019.57, "tok_s": 32629, "norm": 8.5613, "lr": 0.000384, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 21.0}
+{"event": "step", "step": 5, "steps": 30, "loss": 9.779547, "ms": 4021.07, "tok_s": 32620, "norm": 6.4014, "lr": 0.00048000002, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 21.0}
+{"event": "step", "step": 6, "steps": 30, "loss": 9.357986, "ms": 4025.93, "tok_s": 32606, "norm": 4.8557, "lr": 0.000576, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.9}
+{"event": "step", "step": 7, "steps": 30, "loss": 8.908044, "ms": 4030.02, "tok_s": 32591, "norm": 4.1261, "lr": 0.00067200005, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.9}
+{"event": "step", "step": 8, "steps": 30, "loss": 8.474664, "ms": 4033.64, "tok_s": 32575, "norm": 4.1486, "lr": 0.000768, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.9}
+{"event": "step", "step": 9, "steps": 30, "loss": 8.107386, "ms": 4032.68, "tok_s": 32564, "norm": 6.5401, "lr": 0.000864, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.9}
+{"event": "step", "step": 10, "steps": 30, "loss": 7.679416, "ms": 4033.48, "tok_s": 32555, "norm": 5.3893, "lr": 0.00096000003, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.9}
+{"event": "step", "step": 11, "steps": 30, "loss": 7.677040, "ms": 4043.35, "tok_s": 32538, "norm": 10.5317, "lr": 0.0010560001, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 12, "steps": 30, "loss": 7.517673, "ms": 4038.54, "tok_s": 32528, "norm": 12.8031, "lr": 0.001152, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.9}
+{"event": "step", "step": 13, "steps": 30, "loss": 7.454062, "ms": 4044.22, "tok_s": 32515, "norm": 6.5148, "lr": 0.0012480001, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 14, "steps": 30, "loss": 7.425760, "ms": 4054.18, "tok_s": 32496, "norm": 10.6614, "lr": 0.0013440001, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 15, "steps": 30, "loss": 7.617043, "ms": 4049.07, "tok_s": 32484, "norm": 10.0873, "lr": 0.0014400001, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 16, "steps": 30, "loss": 7.416841, "ms": 4049.57, "tok_s": 32473, "norm": 7.6844, "lr": 0.001536, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 17, "steps": 30, "loss": 7.309055, "ms": 4053.40, "tok_s": 32461, "norm": 7.4668, "lr": 0.0016320001, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 18, "steps": 30, "loss": 7.306737, "ms": 4051.76, "tok_s": 32451, "norm": 5.2540, "lr": 0.001728, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 19, "steps": 30, "loss": 7.131604, "ms": 4046.44, "tok_s": 32446, "norm": 6.8213, "lr": 0.001824, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 20, "steps": 30, "loss": 7.536123, "ms": 4053.62, "tok_s": 32437, "norm": 7.1837, "lr": 0.0019200001, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 21, "steps": 30, "loss": 7.097460, "ms": 4052.42, "tok_s": 32430, "norm": 7.8086, "lr": 0.0020160002, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 22, "steps": 30, "loss": 7.064337, "ms": 4054.66, "tok_s": 32422, "norm": 3.6249, "lr": 0.0021120002, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 23, "steps": 30, "loss": 7.048859, "ms": 4048.59, "tok_s": 32419, "norm": 5.2987, "lr": 0.002208, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 24, "steps": 30, "loss": 7.067513, "ms": 4050.89, "tok_s": 32414, "norm": 3.8962, "lr": 0.002304, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 25, "steps": 30, "loss": 6.873975, "ms": 4048.52, "tok_s": 32411, "norm": 4.4058, "lr": 0.0024000001, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 26, "steps": 30, "loss": 6.729982, "ms": 4051.75, "tok_s": 32407, "norm": 2.3566, "lr": 0.0024960002, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 27, "steps": 30, "loss": 6.865325, "ms": 4049.50, "tok_s": 32405, "norm": 3.2537, "lr": 0.0025920002, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 28, "steps": 30, "loss": 6.969668, "ms": 4051.86, "tok_s": 32401, "norm": 3.2896, "lr": 0.0026880002, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 29, "steps": 30, "loss": 6.783195, "ms": 4050.98, "tok_s": 32398, "norm": 3.1623, "lr": 0.002784, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "step", "step": 30, "steps": 30, "loss": 6.766582, "ms": 4057.30, "tok_s": 32392, "norm": 2.8353, "lr": 0.0028800003, "muon_mu": 0.9, "zloss": null, "zgrad": null, "mfu_pct": 20.8}
+{"event": "done", "steps": 30, "tok_s": 32392}

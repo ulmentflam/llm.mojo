@@ -22,7 +22,7 @@ from llmm.attention import attention_fwd
 from llmm.qk_clip import qk_clip_apply
 from llmm.zero import CpuCoordinator
 from _gpu_test_common import shared_gpu_ctx
-from train_gpt2 import GPT2, GPT2_DTYPE, QK_NORM
+from train_gpt2 import GPT2, GPT2_DTYPE, QK_NORM, UNTIED_HEAD
 
 
 def has_gpu_accelerator() -> Bool:
@@ -341,6 +341,9 @@ comptime NUM_PARAMS = (
     + GL * GC
     + 2 * GC
 )
+# Parameters in the live model: the tied .bin above plus, in an
+# LLMM_UNTIED_HEAD build, the head block the loader copies from wte.
+comptime MODEL_PARAMS = NUM_PARAMS + (GV * GC if UNTIED_HEAD else 0)
 comptime HOT_L = 1
 comptime HOT_H = 1
 
@@ -422,11 +425,11 @@ def test_gpt2_qk_clip_end_to_end() raises:
         var ctx = shared_gpu_ctx()
         var model = GPT2["gpu", 1](CKPT, rank=0, zero_stage=0, ctx=ctx)
         _remove_tiny_checkpoint()
-        assert_equal(model.num_parameters, NUM_PARAMS)
+        assert_equal(model.num_parameters, MODEL_PARAMS)
         model.enable_qk_clip(TAU)
         comptime NHM = GL * GNH
         var hm = ctx.enqueue_create_host_buffer[DType.float32](NHM)
-        var params = ctx.enqueue_create_host_buffer[GPT2_DTYPE](NUM_PARAMS)
+        var params = ctx.enqueue_create_host_buffer[GPT2_DTYPE](MODEL_PARAMS)
         ctx.synchronize()
 
         @__parameter
@@ -641,6 +644,17 @@ def _mclip_train[
                     Pointer[CpuCoordinator, MutUntrackedOrigin]
                 ](coord),
             )
+            comptime if UNTIED_HEAD:
+                # S2 refuses ZeRO-2/3 while the head trains (S6 adds the head
+                # bucketing/streaming). These ZeRO-2/3 checks exercise the
+                # tied-phase layout: head block present in the 17-tensor
+                # buffer but idle (neither reduced, updated nor read).
+                model.head_tied = stage >= 2
+                # The model really carries the 17-tensor layout (head block
+                # after the 16 tied tensors), so the shard map differs from the
+                # tied build's even with the head idle.
+                assert_equal(model.num_parameters, n + model.param_sizes[0])
+                assert_equal(model.param_sizes[16], model.param_sizes[0])
             model.enable_muon(Scalar[DType.float32](0.95))
             if clip:
                 model.enable_qk_clip(MTAU, True)
@@ -677,7 +691,10 @@ def _mclip_train[
             if stage == 3:
                 # Streaming: params_memory is only the flat shard. Gather the
                 # full vector (collective) and export the owner-space copies.
-                var full = model.ctx.enqueue_create_buffer[GPT2_DTYPE](n)
+                # Sized to the live model: an untied build gathers N16 + head.
+                var full = model.ctx.enqueue_create_buffer[GPT2_DTYPE](
+                    model.num_parameters
+                )
                 model.ctx.synchronize()
                 model._z3_gather_full(
                     rebind[Pointer[Scalar[GPT2_DTYPE], MutAnyOrigin]](

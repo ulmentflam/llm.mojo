@@ -22,7 +22,7 @@ Writes figures/modded_nanogpt_adoption_2026-10-30.png (light surface),
 tables between the <!-- adoption-*:start/end --> markers in
 docs/ai/modded_nanogpt_adoption_results_2026-10-30.md.
 
-Panels: (a) val loss vs step per arm, (b) val@300 delta vs the base with the
+Panels (g: 600-step W3 control, kept separate): (a) val loss vs step per arm, (b) val@300 delta vs the base with the
 single-seed noise band, (c) W1 AdamW-range lr multiplier ladder, (d) QK-norm max
 attention logit against the cap, (e) train loss vs step time, (f) gelu vs relu2
 step time. Logs are read with scripts/train_log.py only.
@@ -104,11 +104,11 @@ ARMS: dict[str, tuple[str, str, str, str]] = {
         "`-k wsd -u 50 -cooldown 0.4 -decay_shape linear`",
         "",
     ),
-    "w3_wsd_u0_c040_sqrt": (
-        "W3",
-        "W3 wsd u0 c.40 sqrt",
-        "`-k wsd -u 0 -cooldown 0.4 -decay_shape sqrt`",
-        "",
+    "w9_untie_at_0667": (
+        "W9",
+        "W9 untie at 2/3",
+        "`-D LLMM_UNTIED_HEAD=1 -untie_at 0.667`",
+        "equal to the tied base at 300 steps",
     ),
     "w56_relu2": (
         "W56",
@@ -274,12 +274,17 @@ def _setup(path: Path) -> dict:
     return {}
 
 
+LONG: dict[str, dict] = {}  # 600-step controls, kept out of the 300-step panels
+
+
 def load_all() -> tuple[dict[str, dict], dict[str, dict]]:
     arms, timing = {}, {}
     for p in sorted(DATA.glob(PREFIX + "*.jsonl")):
         stem = p.name[len(PREFIX) : -len(".jsonl")]
         if stem.startswith("timing_"):
             timing[stem] = load(p)
+        elif "_600_" in stem:
+            LONG[stem] = load(p)
         else:
             arms[stem] = load(p)
     return arms, timing
@@ -290,6 +295,19 @@ def contaminated(stem: str, a: dict) -> bool:
 
 
 # -------------------------------------------------------------------- plot
+
+
+# panel (e) labels only the arms the reader needs; the rest read from colour/marker
+E_LABELED = {
+    "w1_base",
+    "w8_rotary",
+    "w7_qknorm",
+    "w56_relu2",
+    "w56_both",
+    "w3_wsd_u0_c040_lin",
+    "w9_untied0_lhead0.125",
+    "w1_mult0.125",
+}
 
 
 def render(arms: dict, timing: dict, mode: str, out: Path) -> None:
@@ -314,11 +332,13 @@ def render(arms: dict, timing: dict, mode: str, out: Path) -> None:
         ax.xaxis.label.set_color(th["sub"])
         ax.yaxis.label.set_color(th["sub"])
 
-    fig, axes = plt.subplots(3, 2, figsize=(13, 15), dpi=200)
+    fig = plt.figure(figsize=(13, 19), dpi=200)
+    gs = fig.add_gridspec(4, 2)
     fig.patch.set_facecolor(th["bg"])
-    for ax in axes.flat:
+    a, b, c, d, e, f = (fig.add_subplot(gs[i // 2, i % 2]) for i in range(6))
+    g6 = fig.add_subplot(gs[3, :])
+    for ax in (a, b, c, d, e, f, g6):
         style(ax)
-    (a, b), (c, d), (e, f) = axes
     base300: float = arms[BASE]["val"][300]
 
     def label(stem):
@@ -368,7 +388,7 @@ def render(arms: dict, timing: dict, mode: str, out: Path) -> None:
             )
     a.set_xlim(80, 390)
     a.set_xticks([100, 200, 300])
-    a.set_ylim(4.65, 6.35)
+    a.set_ylim(4.65, 7.0)
     a.set_xlabel("step")
     a.set_ylabel("val loss (lower is better)")
     title(a, "(a) Validation loss, every arm (step 0, val ~11.0, omitted)")
@@ -489,11 +509,12 @@ def render(arms: dict, timing: dict, mode: str, out: Path) -> None:
             markeredgewidth=0,
             zorder=4,
         )
+        below = stem.endswith("s012")
         for w, v in wins:
             d.annotate(
                 f"{v:.2f}",
                 (w, v),
-                xytext=(0, 8),
+                xytext=(0, -15 if below else 8),
                 textcoords="offset points",
                 ha="center",
                 fontsize=8,
@@ -502,7 +523,7 @@ def render(arms: dict, timing: dict, mode: str, out: Path) -> None:
         d.annotate(
             label(stem),
             (xs[-1], ys_[-1]),
-            xytext=(-4, -14),
+            xytext=(-4, -30 if below else -14),
             textcoords="offset points",
             ha="right",
             fontsize=8,
@@ -537,6 +558,8 @@ def render(arms: dict, timing: dict, mode: str, out: Path) -> None:
             linewidths=1.5,
             zorder=3,
         )
+        if stem not in E_LABELED:
+            continue
         e.annotate(
             label(stem) + ("*" if bad else ""),
             (arm["ms"], arm["train_last50"]),
@@ -596,11 +619,15 @@ def render(arms: dict, timing: dict, mode: str, out: Path) -> None:
                     alpha=0.6,
                     zorder=4,
                 )
-        med = [statistics.median(x) for x in data_]
+        run_med = [
+            statistics.mean(statistics.median(ms_) for _, ms_ in groups[g_])
+            for g_ in groups
+        ]
+        med = run_med
         f.set_title("", loc="left")
         title(
             f,
-            f"(f) Step time, gelu vs relu2 ({(med[1] / med[0] - 1) * 100:+.1f}% median)",
+            f"(f) Step time, gelu vs relu2 ({(med[1] / med[0] - 1) * 100:+.1f}%, mean of run medians)",
         )
         f.set_ylabel("ms/step (30-step runs, 2 repeats each)")
     else:
@@ -617,6 +644,44 @@ def render(arms: dict, timing: dict, mode: str, out: Path) -> None:
         title(f, "(f) Step time, gelu vs relu2")
         f.set_xticks([])
         f.set_yticks([])
+
+    # (g) 600-step control, separate from the 300-step panels
+    for stem, arm in sorted(LONG.items()):
+        wsd = "wsd" in stem
+        xs = sorted(s for s in arm["val"] if s > 0)
+        g6.plot(
+            xs,
+            [arm["val"][s] for s in xs],
+            color=colors["W3"],
+            ls="-" if wsd else "--",
+            marker="D" if wsd else "o",
+            ms=6,
+            lw=1.6,
+            markeredgewidth=0,
+        )
+        g6.annotate(
+            f"{'WSD u0 c.40 linear' if wsd else 'cosine u50'}  {arm['val'][xs[-1]]:.3f}",
+            (xs[-1], arm["val"][xs[-1]]),
+            xytext=(-6, -16 if wsd else 10),
+            textcoords="offset points",
+            ha="right",
+            fontsize=8,
+            color=th["ink"],
+        )
+    g6.set_ylim(4.2, 5.6)
+    g6.set_xlabel("step")
+    g6.set_ylabel("val loss")
+    if not LONG:
+        g6.text(
+            0.5,
+            0.5,
+            "pending: 600-step control",
+            ha="center",
+            va="center",
+            transform=g6.transAxes,
+            color=th["sub"],
+        )
+    title(g6, "(g) W3 at 600 steps: the cooldown gain persists at twice the horizon")
 
     fig.suptitle(
         "modded-nanogpt adoption campaign, GPT-2 124M, 300-step Muon rankings (seed 42)",
@@ -692,6 +757,33 @@ def timing_table(timing: dict) -> str:
         lines.append(
             f"| {s} | {t['ms']:.1f} | {min(m):.1f} | {max(m):.1f} | {len(m) + 1} |"
         )
+    gm = [t["ms"] for s, t in timing.items() if "gelu" in s]
+    rm = [t["ms"] for s, t in timing.items() if "relu2" in s]
+    if gm and rm:
+        a, b = statistics.mean(gm), statistics.mean(rm)
+        lines.append(
+            f"| **mean of run medians** | gelu {a:.0f}, relu2 {b:.0f} | | | {(b / a - 1) * 100:+.1f}% |"
+        )
+    return "\n".join(lines)
+
+
+def long_table(arms: dict) -> str:
+    if not LONG:
+        return "600-step control pending."
+    lines = [
+        "| run | val@100 | val@200 | val@300 | val@400 | val@500 | val@600 | ms/step |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for s, x in sorted(LONG.items()):
+        v = x["val"]
+        cells = " | ".join(fmt(v[k]) if k in v else "" for k in range(100, 601, 100))
+        lines.append(f"| {s} | {cells} | {x['ms']:.0f} |")
+    c = next((x for s, x in LONG.items() if "cosine" in s), None)
+    w = next((x for s, x in LONG.items() if "wsd" in s), None)
+    if c and w and 600 in c["val"] and 600 in w["val"]:
+        lines.append(
+            f"| **wsd minus cosine at 600** | | | | | | {w['val'][600] - c['val'][600]:+.4f} | |"
+        )
     return "\n".join(lines)
 
 
@@ -711,6 +803,7 @@ def update_doc(arms: dict, timing: dict) -> None:
     t = DOC.read_text()
     t = splice(t, "table", results_table(arms))
     t = splice(t, "timing", timing_table(timing))
+    t = splice(t, "long", long_table(arms))
     DOC.write_text(t)
     print(f"updated tables in {DOC.relative_to(ROOT)}")
 
@@ -753,6 +846,7 @@ def main() -> None:
             for s, t in timing.items()
         },
         "pending": [s for s in ARMS if s not in arms],
+        "long_600": {s: dict(val=x["val"], ms_median=x["ms"]) for s, x in LONG.items()},
     }
     FIG.with_suffix(".json").write_text(json.dumps(side, indent=2) + "\n")
     print(f"wrote {FIG.with_suffix('.json')}")

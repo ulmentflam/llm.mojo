@@ -1,6 +1,6 @@
 from std.collections import Array, List
 from std.time import perf_counter_ns
-from std.sys import exit, argv, has_accelerator
+from std.sys import exit, argv, has_accelerator, get_defined_int
 from std.os import getenv
 from std.sys.info import size_of
 
@@ -22,6 +22,18 @@ from train_gpt2 import (
     QK_NORM,
     _ffmt,
 )
+
+# Untied LM head (docs/ai/untied_lm_head_design_2026-10-30.md, slice S1/S2):
+# -D LLMM_UNTIED_HEAD=1 compares 17 tensors (the 17th is `lm_head`, [V_p, C])
+# against the untied reference files written by `GPT2_UNTIED=1 train_gpt2.py`.
+# Redeclared here (same define as train_gpt2.mojo) so the default 16-tensor path
+# is textually untouched. The untied path needs slice S0 (17-tensor layout, the
+# version-13 model reader) to run; the 17th check itself is by buffer offset.
+# Only the plain untied build has a reference: untied + rotary / relu2 / QK-norm
+# is refused at compile time inside run_test.
+comptime UNTIED_HEAD = get_defined_int["LLMM_UNTIED_HEAD", 0]() != 0
+comptime NUM_CHECKED_TENSORS = 17 if UNTIED_HEAD else 16
+comptime MODEL_FILE = "gpt2_124M_untied.bin" if UNTIED_HEAD else "gpt2_124M.bin"
 
 # -D LLMM_MLP_ACT=relu2 swaps the MLP activation, so the reference state and the
 # loss trajectory come from the PyTorch reference run with GPT2_ACT=relu2
@@ -379,7 +391,7 @@ def run_test[
     # this reference check also guards the recompute path, which must produce
     # the same logits/loss/gradients as the default run.
     var model = GPT2[target, 1, recompute](
-        "gpt2_124M.bin",
+        MODEL_FILE,
         rank=0,
         zero_stage=0,
         ctx=ctx,
@@ -399,13 +411,20 @@ def run_test[
     comptime assert not (
         QK_NORM and MLP_RELU2
     ), "test_gpt2 has no reference for LLMM_QK_NORM=1 with LLMM_MLP_ACT=relu2"
+    comptime assert not (UNTIED_HEAD and (ROTARY or MLP_RELU2 or QK_NORM)), (
+        "test_gpt2 has no untied-head reference for LLMM_ROTARY=1,"
+        " LLMM_MLP_ACT=relu2 or LLMM_QK_NORM=1"
+    )
 
     # The reference state is selected by build flag; the suffixes compose in the
-    # same order as train_gpt2.py writes them: _rotary, _qknorm, _relu2. They are
+    # same order as train_gpt2.py writes them: _untied, _rotary, _qknorm,
+    # _relu2. They are
     # written by train_gpt2.py run in a scratch dir with GPT2_ROTARY / GPT2_QK_NORM /
     # GPT2_ACT (see docs/ai/qk_norm_attn_scale_2026-10-30.md). Flag off: the
     # file is gpt2_124M_debug_state.bin, unchanged.
     var state_name = String("gpt2_124M")
+    comptime if UNTIED_HEAD:
+        state_name += "_untied"
     comptime if ROTARY:
         state_name += "_rotary"
     comptime if QK_NORM:
@@ -428,7 +447,8 @@ def run_test[
             # no activation tensors, so this test can't consume it. The
             # reference files must be regenerated with the PyTorch script.
             print(
-                "gpt2_124M_debug_state.bin is llm.c's downloaded debug state,"
+                state_name
+                + " is llm.c's downloaded debug state,"
                 " which lacks the activation tensors this test checks."
                 " Regenerate the reference files with:"
                 " pixi run python train_gpt2.py"
@@ -438,6 +458,22 @@ def run_test[
         exit(1)
     if state_header[unsafe_offset=1] != 3:
         print("Bad version in model file:", state_header[unsafe_offset=1])
+        exit(1)
+
+    # header[4] flags the 17th (lm_head) gradient tensor; 0 in the tied state.
+    if Int(state_header[unsafe_offset=4]) != (1 if UNTIED_HEAD else 0):
+        print(
+            "Debug state",
+            state_name,
+            "has header[4] =",
+            state_header[unsafe_offset=4],
+            "but this build expects",
+            1 if UNTIED_HEAD else 0,
+            (
+                "(rebuild with/without -D LLMM_UNTIED_HEAD=1, or regenerate the"
+                " state with/without GPT2_UNTIED=1)"
+            ),
+        )
         exit(1)
 
     var B: Int = Int(state_header[unsafe_offset=2])  # batch size, e.g. 4
@@ -607,6 +643,24 @@ def run_test[
             len(expected_losses),
         )
         return False
+
+    comptime if UNTIED_HEAD:
+        # Untied head (head := copy of wte at init, then updated separately):
+        # step 0 equals the tied loss, later steps diverge from the tied list.
+        # From PyTorch only: `pixi run python scripts/gen_expected_losses.py
+        # --untied` (reads gpt2_124M_untied_debug_state.bin).
+        expected_losses = [
+            5.269983291625977,
+            4.057551383972168,
+            3.3713181018829346,
+            2.7962911128997803,
+            2.310581922531128,
+            1.843754529953003,
+            1.3888646364212036,
+            0.9932988882064819,
+            0.6189228296279907,
+            0.3735603094100952,
+        ]
 
     # Stale-state guard. Step 0 of the list is a plain forward pass on the debug
     # state's own batch, so the loss stored in the state file must equal it
@@ -792,7 +846,7 @@ def run_test[
             model.backward()
 
             # finally check all the gradients
-            var gradoks = Array[Bool, 16](fill=False)
+            var gradoks = Array[Bool, NUM_CHECKED_TENSORS](fill=False)
 
             gradoks[0] = check_tensor(
                 ctx,
@@ -1003,26 +1057,51 @@ def run_test[
                 checked,
             )
 
+            comptime if UNTIED_HEAD:
+                # lm_head is the LAST tensor (index 16, design section 3.3), so
+                # its gradient is the tail of the contiguous buffers. Addressed
+                # by offset so this file needs no `Parameters.lm_head` field and
+                # the tied build compiles unchanged. Requires S0 to make
+                # model.num_parameters count the head (it does by construction).
+                var head_off = model.num_parameters - V_p * C
+                gradoks[16] = check_tensor(
+                    ctx,
+                    model.grads_memory.unsafe_offset(head_off),
+                    expected_grads_memory.unsafe_offset(head_off),
+                    V * C,
+                    "dlm_head",
+                    GRAD_ATOL,
+                    GRAD_RTOL,
+                    GRAD_L2_FACTOR,
+                    log,
+                    gate,
+                    checked,
+                )
+
             var grads_passed = 0
-            for i in range(16):
+            for i in range(NUM_CHECKED_TENSORS):
                 allok = allok and gradoks[i]
                 if gradoks[i]:
                     grads_passed += 1
-            var grads_ok = grads_passed == 16
+            var grads_ok = grads_passed == NUM_CHECKED_TENSORS
             var grads_line = _row(
                 log,
                 "gradients",
-                "16 tensors "
+                String(NUM_CHECKED_TENSORS)
+                + " tensors "
                 + _ok(log) if grads_ok else log.style.bad(
-                    String(16 - grads_passed) + " of 16 tensors FAILED"
+                    String(NUM_CHECKED_TENSORS - grads_passed)
+                    + " of "
+                    + String(NUM_CHECKED_TENSORS)
+                    + " tensors FAILED"
                 ),
             )
             var grads_fields: List[Field] = [
                 text("gate", gate),
                 text("check", "grads"),
                 text("status", "ok" if grads_ok else "fail"),
-                num("tensors", 16),
-                num("failed", 16 - grads_passed),
+                num("tensors", NUM_CHECKED_TENSORS),
+                num("failed", NUM_CHECKED_TENSORS - grads_passed),
             ]
             # In pretty on a terminal this replaces the counter line.
             log.emit(
