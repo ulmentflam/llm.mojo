@@ -12,10 +12,14 @@
 #     backward, or the norm backward applied against the wrong row),
 #   * fused vs the old two-kernel composition (rotary_qk_rows on qkv, split,
 #     qk_rows_fwd; backward qk_rows_bwd against the ROTATED qkv then inverse
-#     rotary): proves the reordering is a pure refactor up to fp32 rounding,
+#     rotary): proves the reordering is a pure refactor up to fp32 rounding.
+#     Norm and q_mul commute with an orthogonal rotation, so this check (and
+#     everything else here) cannot see the order itself: q_mul moved after the
+#     rotation is an equivalent mutant and passes, correctly,
 #   * CPU target vs GPU target, do_norm in {True, False}, q_mul != 1 (a wrong
 #     q_mul fold shows as a q-vs-k asymmetry),
 #   * v and the identity half of each head are never touched by the rotation.
+#   * bf16 on the GPU target against the float64 model (the training dtype).
 # ===----------------------------------------------------------------------=== #
 
 from std.math import cos, sin, sqrt
@@ -86,33 +90,33 @@ def _with_ctx[target: StaticString]() raises -> DeviceContext:
 
 
 def _fwd[
-    target: StaticString, do_norm: Bool, do_rot: Bool
+    target: StaticString, do_norm: Bool, do_rot: Bool, E: DType = DType.float32
 ](q: List[Float32], k: List[Float32], tbl: List[Float32]) raises -> Tuple[
     List[Float32], List[Float32]
 ]:
     var ctx = _with_ctx[target]()
-    var hq = ctx.enqueue_create_host_buffer[DType.float32](NH_ELEMS)
-    var hk = ctx.enqueue_create_host_buffer[DType.float32](NH_ELEMS)
+    var hq = ctx.enqueue_create_host_buffer[E](NH_ELEMS)
+    var hk = ctx.enqueue_create_host_buffer[E](NH_ELEMS)
     var ht = ctx.enqueue_create_host_buffer[DType.float32](len(tbl))
-    var dq = ctx.enqueue_create_buffer[DType.float32](NH_ELEMS)
-    var dk = ctx.enqueue_create_buffer[DType.float32](NH_ELEMS)
+    var dq = ctx.enqueue_create_buffer[E](NH_ELEMS)
+    var dk = ctx.enqueue_create_buffer[E](NH_ELEMS)
     var dt = ctx.enqueue_create_buffer[DType.float32](len(tbl))
     ctx.synchronize()
     for i in range(NH_ELEMS):
-        hq[i] = q[i]
-        hk[i] = k[i]
+        hq[i] = q[i].cast[E]()
+        hk[i] = k[i].cast[E]()
     for i in range(len(tbl)):
         ht[i] = tbl[i]
     ctx.enqueue_copy(dq, hq)
     ctx.enqueue_copy(dk, hk)
     ctx.enqueue_copy(dt, ht)
     ctx.synchronize()
-    qk_rows_fwd[DType.float32, target, do_norm, do_rot](
-        as_mut_kernel[DType.float32](
-            MutMemPtr[DType.float32](unsafe_from_address=Int(dq.unsafe_ptr()))
+    qk_rows_fwd[E, target, do_norm, do_rot](
+        as_mut_kernel[E](
+            MutMemPtr[E](unsafe_from_address=Int(dq.unsafe_ptr()))
         ),
-        as_mut_kernel[DType.float32](
-            MutMemPtr[DType.float32](unsafe_from_address=Int(dk.unsafe_ptr()))
+        as_mut_kernel[E](
+            MutMemPtr[E](unsafe_from_address=Int(dk.unsafe_ptr()))
         ),
         B,
         H,
@@ -131,13 +135,13 @@ def _fwd[
     var oq = List[Float32](length=NH_ELEMS, fill=Float32(0.0))
     var ok = List[Float32](length=NH_ELEMS, fill=Float32(0.0))
     for i in range(NH_ELEMS):
-        oq[i] = hq[i]
-        ok[i] = hk[i]
+        oq[i] = hq[i].cast[DType.float32]()
+        ok[i] = hk[i].cast[DType.float32]()
     return (oq^, ok^)
 
 
 def _bwd[
-    target: StaticString, do_norm: Bool, do_rot: Bool
+    target: StaticString, do_norm: Bool, do_rot: Bool, E: DType = DType.float32
 ](
     gq: List[Float32],
     gk: List[Float32],
@@ -145,20 +149,20 @@ def _bwd[
     tbl: List[Float32],
 ) raises -> Tuple[List[Float32], List[Float32]]:
     var ctx = _with_ctx[target]()
-    var hq = ctx.enqueue_create_host_buffer[DType.float32](NH_ELEMS)
-    var hk = ctx.enqueue_create_host_buffer[DType.float32](NH_ELEMS)
-    var hx = ctx.enqueue_create_host_buffer[DType.float32](NQKV)
+    var hq = ctx.enqueue_create_host_buffer[E](NH_ELEMS)
+    var hk = ctx.enqueue_create_host_buffer[E](NH_ELEMS)
+    var hx = ctx.enqueue_create_host_buffer[E](NQKV)
     var ht = ctx.enqueue_create_host_buffer[DType.float32](len(tbl))
-    var dq = ctx.enqueue_create_buffer[DType.float32](NH_ELEMS)
-    var dk = ctx.enqueue_create_buffer[DType.float32](NH_ELEMS)
-    var dx = ctx.enqueue_create_buffer[DType.float32](NQKV)
+    var dq = ctx.enqueue_create_buffer[E](NH_ELEMS)
+    var dk = ctx.enqueue_create_buffer[E](NH_ELEMS)
+    var dx = ctx.enqueue_create_buffer[E](NQKV)
     var dt = ctx.enqueue_create_buffer[DType.float32](len(tbl))
     ctx.synchronize()
     for i in range(NH_ELEMS):
-        hq[i] = gq[i]
-        hk[i] = gk[i]
+        hq[i] = gq[i].cast[E]()
+        hk[i] = gk[i].cast[E]()
     for i in range(NQKV):
-        hx[i] = qkv[i]
+        hx[i] = qkv[i].cast[E]()
     for i in range(len(tbl)):
         ht[i] = tbl[i]
     ctx.enqueue_copy(dq, hq)
@@ -166,15 +170,15 @@ def _bwd[
     ctx.enqueue_copy(dx, hx)
     ctx.enqueue_copy(dt, ht)
     ctx.synchronize()
-    qk_rows_bwd[DType.float32, target, do_norm, do_rot](
-        as_mut_kernel[DType.float32](
-            MutMemPtr[DType.float32](unsafe_from_address=Int(dq.unsafe_ptr()))
+    qk_rows_bwd[E, target, do_norm, do_rot](
+        as_mut_kernel[E](
+            MutMemPtr[E](unsafe_from_address=Int(dq.unsafe_ptr()))
         ),
-        as_mut_kernel[DType.float32](
-            MutMemPtr[DType.float32](unsafe_from_address=Int(dk.unsafe_ptr()))
+        as_mut_kernel[E](
+            MutMemPtr[E](unsafe_from_address=Int(dk.unsafe_ptr()))
         ),
-        as_immut_kernel_from_mut[DType.float32](
-            MutMemPtr[DType.float32](unsafe_from_address=Int(dx.unsafe_ptr()))
+        as_immut_kernel_from_mut[E](
+            MutMemPtr[E](unsafe_from_address=Int(dx.unsafe_ptr()))
         ),
         B,
         H,
@@ -193,8 +197,8 @@ def _bwd[
     var oq = List[Float32](length=NH_ELEMS, fill=Float32(0.0))
     var ok = List[Float32](length=NH_ELEMS, fill=Float32(0.0))
     for i in range(NH_ELEMS):
-        oq[i] = hq[i]
-        ok[i] = hk[i]
+        oq[i] = hq[i].cast[DType.float32]()
+        ok[i] = hk[i].cast[DType.float32]()
     return (oq^, ok^)
 
 
@@ -437,6 +441,47 @@ def test_position_zero_and_identity_half_are_norm_only() raises:
                     o[1][r * HD + d] == k[r * HD + d],
                     "identity element of k changed",
                 )
+
+
+def _round_bf16(x: List[Float32]) -> List[Float32]:
+    var out = x.copy()
+    for i in range(len(x)):
+        out[i] = x[i].cast[DType.bfloat16]().cast[DType.float32]()
+    return out^
+
+
+def test_bf16_gpu_vs_float64_model() raises:
+    # The training build is bf16, every other case here is fp32. GPU only (a
+    # bf16 "cpu" instantiation crashes AArch64 codegen). The model sees the same
+    # bf16-rounded inputs the kernel reads; 0.03 is about two ulps of the
+    # largest outputs (magnitude < 4, ulp 2^-6 at [2, 4)), far below a wrong sign
+    # or a wrong row, which move elements by order 1.
+    var tbl = rotary_table_host(TMAX, HD)
+    var qkv = _fill(NQKV, 61)
+    var q = _split(qkv, 0)
+    var k = _split(qkv, 1)
+    var f = _fwd["gpu", True, True, DType.bfloat16](q, k, tbl)
+    assert_true(
+        _maxdiff(f[0], _ref_fwd(_round_bf16(q), True, True)) < 0.03,
+        "bf16 fused forward q != float64 model",
+    )
+    assert_true(
+        _maxdiff(f[1], _ref_fwd(_round_bf16(k), False, True)) < 0.03,
+        "bf16 fused forward k != float64 model",
+    )
+    var gq = _fill(NH_ELEMS, 62)
+    var gk = _fill(NH_ELEMS, 63)
+    var b = _bwd["gpu", True, True, DType.bfloat16](gq, gk, qkv, tbl)
+    assert_true(
+        _maxdiff(b[0], _ref_bwd(_round_bf16(gq), _round_bf16(q), True, True))
+        < 0.03,
+        "bf16 fused backward dq != float64 model",
+    )
+    assert_true(
+        _maxdiff(b[1], _ref_bwd(_round_bf16(gk), _round_bf16(k), False, True))
+        < 0.03,
+        "bf16 fused backward dk != float64 model",
+    )
 
 
 def main() raises:
