@@ -176,6 +176,17 @@ comptime LM_HEAD_CHUNKED_CE = (
 # embeddings, not fail loudly — do not enable it standalone.
 comptime Z3_WTE_ONDEMAND = is_defined["LLMM_Z3_WTE_ONDEMAND"]()
 
+# Untied LM head under ZeRO-3 streaming (LLMM_UNTIED_HEAD=1). The head has one
+# consumer, the LM-head GEMM, so by default it is NOT part of the streamed
+# embed window: `_lm_head_tile` all-gathers one vocab tile of it into
+# `wte_tile_buf` right before each tile GEMM (forward, chunked-CE recompute and
+# the backward weight gradient). `wte` stays resident because the encoder still
+# indexes arbitrary rows. -D LLMM_Z3_HEAD_RESIDENT=1 keeps the whole head in the
+# embed window instead (design Q5 escape hatch): bigger window, no per-tile
+# collective. Both are no-ops in the tied build.
+comptime Z3_HEAD_RESIDENT = is_defined["LLMM_Z3_HEAD_RESIDENT"]()
+comptime Z3_HEAD_ONDEMAND = UNTIED_HEAD and not Z3_HEAD_RESIDENT
+
 comptime MUON_OWNERSHIP_VERSION = 1  # state header slot 42: (k*L + l) mod W
 
 # Untied LM head (docs/ai/untied_lm_head_design_2026-10-30.md): -D
@@ -1941,10 +1952,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         # because the encoder still indexes arbitrary rows out of it.
         comptime if not Z3_WTE_ONDEMAND:
             embed_win += self.param_sizes[Parameters.wte]
+        comptime if UNTIED_HEAD and Z3_HEAD_RESIDENT:
+            embed_win += self.param_sizes[Parameters.lm_head]
         self.embed_window_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
             embed_win
         )
-        comptime if Z3_WTE_ONDEMAND:
+        comptime if Z3_WTE_ONDEMAND or Z3_HEAD_ONDEMAND:
             self.wte_tile_buf = self.ctx.enqueue_create_buffer[GPT2_DTYPE](
                 self._lm_head_tile_rows() * self.config.channels
             )
@@ -1962,6 +1975,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         idxs.append(Parameters.wpe)
         idxs.append(Parameters.ln_f_gamma)
         idxs.append(Parameters.ln_f_beta)
+        comptime if UNTIED_HEAD and Z3_HEAD_RESIDENT:
+            idxs.append(Parameters.lm_head)
         var dst_offsets = List[Int]()
         var flat_starts = List[Int]()
         var lengths = List[Int]()
@@ -1993,6 +2008,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         self.params.wpe = wbase.unsafe_offset(dst_offsets[b])
         self.params.ln_f_gamma = wbase.unsafe_offset(dst_offsets[b + 1])
         self.params.ln_f_beta = wbase.unsafe_offset(dst_offsets[b + 2])
+        comptime if UNTIED_HEAD and Z3_HEAD_RESIDENT:
+            self.params.lm_head = wbase.unsafe_offset(dst_offsets[b + 3])
 
     def _lm_head_tile(
         mut self, tile_start: Int, tile_rows: Int
@@ -2005,8 +2022,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         all-gathers exactly that flat range into `wte_tile_buf` first. The range
         is a pure function of the tile index, which every rank walks
         identically, so the collective's range lists stay rank-invariant."""
-        comptime if Z3_WTE_ONDEMAND:
-            if self.z3_streaming:
+        comptime if Z3_WTE_ONDEMAND or Z3_HEAD_ONDEMAND:
+            # Untied build: only a trained head is gathered per tile. The idle
+            # head (tied phase) reads the resident `wte` in the embed window.
+            var gather = self.z3_streaming
+            comptime if Z3_HEAD_ONDEMAND:
+                gather = gather and not self.head_tied
+            if gather:
                 var c = self.config.channels
                 var dst_offsets: List[Int] = [0]
                 var flat_starts: List[Int] = [
@@ -3585,19 +3607,6 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             or self.v_memory == NULL_MASTER_PTR
         ):
             raise Error("GPT2 error: Optimizer moments not allocated")
-        comptime if UNTIED_HEAD and Self.WORLD_SIZE > 1:
-            # Slice S2 routes the head's forward/gradient/update for the
-            # unsharded layouts only. At ZeRO-2/3 the gradient bucketing and the
-            # ZeRO-3 window/streaming pointers are not yet head-aware (S6), so a
-            # trained head would silently read or reduce garbage. The idle head
-            # (tied phase) is unaffected.
-            if not self.head_tied and self.zero_ctx.zero_stage >= 2:
-                raise Error(
-                    "GPT2 error: the untied LM head supports ZeRO stages 0 and"
-                    " 1 only for now (ZeRO-2/3 head bucketing and streaming"
-                    " land in a later slice); use -z 0/1 or the tied build"
-                )
-
         var vocab_size = self.config.vocab_size
         var vocab_size_padded = self.config.padded_vocab_size
         var num_layers = self.config.num_layer
@@ -4245,11 +4254,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 first = False
                 t0 += lm_tile_rows
         elif self._lm_head_num_tiles() == 1:
+            # K=1: the single "tile" is the whole head (a plain pointer unless
+            # ZeRO-3 streams the untied head, see `_lm_head_tile`).
+            var w_head = self._lm_head_tile(0, vocab_size_padded)
             matmul_fwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
                 as_mut_kernel[GPT2_DTYPE](self.acts.logits),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
-                as_immut_kernel_from_mut[GPT2_DTYPE](self._head_param_ptr()),
+                as_immut_kernel_from_mut[GPT2_DTYPE](w_head),
                 as_immut_kernel_from_mut[GPT2_DTYPE](NULL_DTYPE_PTR),
                 Int64(batch_size),
                 Int64(seq_len),
@@ -4714,13 +4726,14 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self._zero_grad_pool(wte_size)
 
             # LM head matmul backward (wte has no bias).
+            var w_head = self._lm_head_tile(0, vocab_size_padded)
             matmul_bwd[GPT2_DTYPE, Self.target, use_gelu=False, has_bias=False](
                 as_mut_kernel[GPT2_DTYPE](self.grad_acts.ln_f),
                 as_mut_kernel[GPT2_DTYPE](self._head_grad_ptr()),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](self.acts.logits),
                 as_mut_kernel[GPT2_DTYPE](self.acts.ln_f),
-                as_immut_kernel_from_mut[GPT2_DTYPE](self._head_param_ptr()),
+                as_immut_kernel_from_mut[GPT2_DTYPE](w_head),
                 as_mut_kernel[GPT2_DTYPE](NULL_DTYPE_PTR),
                 as_mut_kernel[GPT2_DTYPE](self.grad_acts.logits),
                 Int64(batch_size),
@@ -7384,6 +7397,59 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     # Exact in-process memory accounting (LLMM_MEM_REPORT)
     # ===------------------------------------------------------------------=== #
 
+    def _untied_head_mem_json(self) -> String:
+        """The `untied_head` key of the memory report: how many bytes of each
+        long-lived buffer the head tensor occupies. Like `tensors`, these are
+        slices of buffers already counted in `classes` (broken out, not added).
+        `shard` means the buffer holds only this rank's flat shard, so the head
+        contributes its overlap with `[rank*opt, rank*opt+opt)`; otherwise the
+        buffer is full-size and holds all `H` head elements. The per-tile
+        gather buffer and the resident-head escape hatch are separate keys,
+        because they are the ZeRO-3 cost of the head."""
+        var h = self.param_sizes[Parameters.lm_head]
+        var h_off = self._z3_param_offset(Parameters.lm_head)
+        var sharded = Self.WORLD_SIZE > 1 and self.zero_ctx.zero_stage >= 1
+        var lo = self.zero_ctx.rank * self.optimizer_num_parameters
+        var in_shard = max(
+            0,
+            min(h_off + h, lo + self.optimizer_num_parameters) - max(h_off, lo),
+        )
+        var p = size_of[GPT2_DTYPE]()
+        var f = size_of[MASTER_DTYPE]()
+        var opt_elems = in_shard if sharded else h
+        var grad_elems = h
+        if Self.WORLD_SIZE > 1 and self.zero_ctx.zero_stage >= 2:
+            grad_elems = in_shard
+        var param_elems = h
+        if self.z3_streaming:
+            param_elems = in_shard
+        var tile_rows = 0
+        var tile_bytes = 0
+        comptime if Z3_HEAD_ONDEMAND:
+            if self.z3_streaming:
+                tile_rows = self._lm_head_tile_rows()
+                tile_bytes = _mem_bytes(self.wte_tile_buf)
+        var resident_win = 0
+        comptime if Z3_HEAD_RESIDENT:
+            if self.z3_streaming:
+                resident_win = h * p
+        var s = String('"untied_head":{')
+        s += _mem_kv("head_tied", 1 if self.head_tied else 0)
+        s += "," + _mem_kv("head_elems", h)
+        s += "," + _mem_kv("head_flat_offset", h_off)
+        s += "," + _mem_kv("head_elems_in_rank_shard", in_shard)
+        s += "," + _mem_kv("params_bytes", param_elems * p)
+        s += "," + _mem_kv("grads_bytes", grad_elems * p)
+        s += "," + _mem_kv("m_bytes", opt_elems * f)
+        s += "," + _mem_kv("v_bytes", opt_elems * f)
+        comptime if USE_BF16:
+            s += "," + _mem_kv("master_bytes", opt_elems * f)
+        s += "," + _mem_kv("z3_head_tile_rows", tile_rows)
+        s += "," + _mem_kv("z3_head_tile_buf_bytes", tile_bytes)
+        s += "," + _mem_kv("z3_head_resident_window_bytes", resident_win)
+        s += "}"
+        return s
+
     def memory_report_json(self, phase: String) raises -> String:
         """This rank's exact device-memory footprint as one JSON object.
 
@@ -7447,6 +7513,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             + b_muon_master
         )
         var c_z3_windows = b_param_window + b_embed_window
+        # The per-tile gather buffer is only a real allocation when a tile
+        # gather is compiled in; elsewhere it is a 1-element stub that the
+        # report has never counted (keeps the tied report byte-identical).
+        var b_tile = 0
+        comptime if Z3_WTE_ONDEMAND or Z3_HEAD_ONDEMAND:
+            b_tile = _mem_bytes(self.wte_tile_buf)
+            c_z3_windows += b_tile
         var c_activations = (
             b_acts + b_acts_stats + b_grad_acts + b_grad_acts_stats + b_ce_stats
         )
@@ -7519,6 +7592,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         s += "," + _mem_kv("muon_master_buf", b_muon_master)
         s += "," + _mem_kv("param_window_buf", b_param_window)
         s += "," + _mem_kv("embed_window_buf", b_embed_window)
+        comptime if Z3_WTE_ONDEMAND or Z3_HEAD_ONDEMAND:
+            s += "," + _mem_kv("head_tile_buf", b_tile)
         s += "," + _mem_kv("acts_buf", b_acts)
         s += "," + _mem_kv("acts_stats_buf", b_acts_stats)
         s += "," + _mem_kv("grad_acts_buf", b_grad_acts)
@@ -7549,6 +7624,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         _mem_mark(inactive, self.muon_master_buf, "muon_master_buf")
         _mem_mark(inactive, self.param_window_buf, "param_window_buf")
         _mem_mark(inactive, self.embed_window_buf, "embed_window_buf")
+        comptime if Z3_WTE_ONDEMAND or Z3_HEAD_ONDEMAND:
+            _mem_mark(inactive, self.wte_tile_buf, "head_tile_buf")
         _mem_mark(inactive, self.acts_buf, "acts_buf")
         _mem_mark(inactive, self.acts_stats_buf, "acts_stats_buf")
         _mem_mark(inactive, self.grad_acts_buf, "grad_acts_buf")
@@ -7591,6 +7668,9 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         s += "," + _mem_kv("att_probs", t_att_probs)
         s += "," + _mem_kv("fch_gelu", t_fch_gelu)
         s += "}"
+
+        comptime if UNTIED_HEAD:
+            s += "," + self._untied_head_mem_json()
 
         s += "," + _mem_kv("exact_total_bytes", total)
         s += "," + _mem_kv("driver_used_bytes", driver_used)

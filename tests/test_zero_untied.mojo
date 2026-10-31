@@ -22,8 +22,14 @@ Coverage:
      layout, independently of the trainer. The tests assert where the head
      lands: L=2 (N16 > H) puts the whole head on rank W-1 at W=2, 4, 8; W=8
      with L=1 straddles ranks 6 and 7.
-  3. ZeRO-2/3 with the head active are REFUSED (S6 adds head bucketing and
-     streaming): the error must fire on every rank.
+  3. ZeRO-2 (bucketed reduce-scatter, head as its own Bucket-1 segment) and
+     ZeRO-3 (streaming; the head is gathered one vocab tile at a time) with the
+     head ACTIVE equal ZeRO-0 on all 17 tensors, `==` per element, different
+     batch per rank, 1 and 3 steps, AdamW and Muon, W=2/4/8 (L=2) and W=8
+     (L=1, head straddles ranks 6/7). Step 1 includes wte with no exemption:
+     finding 6's prediction. After the last ZeRO-3 update `_z3_gather_full`
+     must equal each rank's flat shard, and every gathered head tile
+     (`_lm_head_tile`) must equal the ZeRO-0 head rows, bit-exactly.
   4. ZeRO-2/3 (W=2, 4) with the idle head (`head_tied = True`) equal ZeRO-0 with the idle
      head bit-exactly (same batch, accumulation, 3 steps), and the idle head's
      planted values do not move. W=8 is not run here: with 8 identical
@@ -32,15 +38,13 @@ Coverage:
      exact" argument holds for W=2, 4 only; test_zero_muon covers W=8 at its
      tolerance.
 
-Finding 6 as measured: the ZeRO-2/3 half of the prediction (bucketed
-reduce-scatter keeps lm and encoder parts separate) cannot run until S6,
-because ZeRO >= 2 with a trained head is refused. What runs now is the ZeRO-1
-all-reduce of the full flat gradient against ZeRO-0 with different batches.
+Finding 6 as measured: see the S6 section of the design doc (the ZeRO-2/3
+step-1 different-batch check now runs here).
 """
 
 from std.testing import assert_equal, assert_true, TestSuite
 from std.python import Python
-from std.sys import simd_width_of
+from std.sys import simd_width_of, is_defined
 
 from max.algorithm import sync_parallelize
 from max.gpu.host import DeviceContext
@@ -121,6 +125,11 @@ def _remove(path: String) raises:
         pass
 
 
+def _nullp() -> MutMemPtr[DType.float32]:
+    var zero = 0
+    return MutMemPtr[DType.float32](unsafe_from_address=zero)
+
+
 def _train[
     W: Int
 ](
@@ -134,10 +143,14 @@ def _train[
     accum: Int = 1,
     same_batch: Bool = False,
     idle_head: Bool = False,
+    tiles: MutMemPtr[DType.float32] = _nullp(),
+    check_tiles: Bool = False,
 ) raises:
     """`steps` steps on W threaded ranks at `stage`; rank r's final 17-tensor
     params go to result[r*n:(r+1)*n]; rank 0's initial params to init[0:n].
-    `idle_head` sets head_tied (required for stage >= 2 until S6)."""
+    `idle_head` sets head_tied. At stage 3 with the head active, `tiles` (W*H
+    floats) receives each rank's gathered head tiles, and the full gather is
+    checked against the rank's own flat shard."""
     var coord = heap_alloc[CpuCoordinator](1)
     coord[] = CpuCoordinator(W)
     var errors = heap_alloc[Int](W)
@@ -213,6 +226,54 @@ def _train[
                 )
                 model._z3_gather_full(fp)
                 model.ctx.synchronize()
+                if not model.z3_streaming:
+                    raise Error("ZeRO-3 test is not streaming")
+                # The gather must reproduce this rank's own flat shard.
+                var opt = model.optimizer_num_parameters
+                var lo = rank * opt
+                for j in range(min(opt, n - lo)):
+                    if muon:
+                        # Sharded Muon keeps the four matrix tensors in the
+                        # owner space; their flat-shard slots are not live.
+                        var live = True
+                        for t in range(N_TENSORS):
+                            if t == 4 or t == 6 or t == 10 or t == 12:
+                                var o = model._z3_param_offset(t)
+                                if (
+                                    lo + j >= o
+                                    and lo + j < o + model.param_sizes[t]
+                                ):
+                                    live = False
+                        if not live:
+                            continue
+                    if full.unsafe_ptr()[unsafe_offset=lo + j] != (
+                        model.params_memory[unsafe_offset=j]
+                    ):
+                        raise Error(
+                            "gather_full != flat shard at rank "
+                            + String(rank)
+                            + " elem "
+                            + String(j)
+                        )
+                comptime if UNTIED_HEAD:
+                    if (
+                        check_tiles
+                        and not idle_head
+                        and not is_defined["LLMM_Z3_HEAD_RESIDENT"]()
+                    ):
+                        var c = model.config.channels
+                        var vp = model.config.padded_vocab_size
+                        var tr = model._lm_head_tile_rows()
+                        var t0 = 0
+                        while t0 < vp:
+                            var oc = min(tr, vp - t0)
+                            var wt = model._lm_head_tile(t0, oc)
+                            model.ctx.synchronize()
+                            for j in range(oc * c):
+                                tiles[
+                                    unsafe_offset=rank * vp * c + t0 * c + j
+                                ] = wt[unsafe_offset=j].cast[DType.float32]()
+                            t0 += tr
                 for i in range(n):
                     result[unsafe_offset=rank * n + i] = full.unsafe_ptr()[
                         unsafe_offset=i
@@ -276,13 +337,24 @@ def _tensor_of(i: Int, sz: List[Int]) -> String:
     return "?"
 
 
-def _zero1_vs_zero0[W: Int](L: Int, NH: Int, C: Int, muon: Bool) raises:
-    """Different batch per rank; ZeRO-1 == ZeRO-0 element-for-element for all
-    17 tensors after 1 step and after 3 steps; ranks agree; the head and wte
-    have moved from their planted init (every element)."""
+def _zero1_vs_zero0[
+    W: Int
+](L: Int, NH: Int, C: Int, muon: Bool, stage: Int = 1) raises:
+    """Different batch per rank; ZeRO-`stage` == ZeRO-0 element-for-element for
+    all 17 tensors after 1 step and after 3 steps (step 1 includes wte: finding
+    6); ranks agree; the head and wte have moved from their planted init (every
+    element). At stage 3 the gathered head tiles equal the ZeRO-0 head."""
     var tag = String("m") if muon else String("a")
     var path = (
-        String("gpt2_zu_") + tag + "_w" + String(W) + "_l" + String(L) + ".bin"
+        String("gpt2_zu_")
+        + tag
+        + "_s"
+        + String(stage)
+        + "_w"
+        + String(W)
+        + "_l"
+        + String(L)
+        + ".bin"
     )
     var n = _write_untied_checkpoint(path, L, NH, C)
     var sz = _sizes(L, C)
@@ -292,11 +364,22 @@ def _zero1_vs_zero0[W: Int](L: Int, NH: Int, C: Int, muon: Bool) raises:
     var r1b = heap_alloc[Float32](W * n)
     var init = heap_alloc[Float32](n)
     var scratch = heap_alloc[Float32](n)
+    var tiles = heap_alloc[Float32](W * sz[16])
     try:
         _train[W](path, n, 0, 1, r0a, init, muon=muon)
-        _train[W](path, n, 1, 1, r1a, scratch, muon=muon)
+        _train[W](path, n, stage, 1, r1a, scratch, muon=muon)
         _train[W](path, n, 0, STEPS, r0b, scratch, muon=muon)
-        _train[W](path, n, 1, STEPS, r1b, scratch, muon=muon)
+        _train[W](
+            path,
+            n,
+            stage,
+            STEPS,
+            r1b,
+            scratch,
+            muon=muon,
+            tiles=tiles,
+            check_tiles=True,
+        )
     except e:
         _remove(path)
         raise e^
@@ -304,7 +387,9 @@ def _zero1_vs_zero0[W: Int](L: Int, NH: Int, C: Int, muon: Bool) raises:
     var d1 = _first_diff(r0a, r1a, W, n)
     if d1 >= 0:
         raise Error(
-            "step 1: ZeRO-1 != ZeRO-0 at W="
+            "step 1: ZeRO-"
+            + String(stage)
+            + " != ZeRO-0 at W="
             + String(W)
             + " rank "
             + String(d1 // n)
@@ -318,7 +403,9 @@ def _zero1_vs_zero0[W: Int](L: Int, NH: Int, C: Int, muon: Bool) raises:
     var d3 = _first_diff(r0b, r1b, W, n)
     if d3 >= 0:
         raise Error(
-            "step 3: ZeRO-1 != ZeRO-0 at W="
+            "step 3: ZeRO-"
+            + String(stage)
+            + " != ZeRO-0 at W="
             + String(W)
             + " rank "
             + String(d3 // n)
@@ -333,7 +420,9 @@ def _zero1_vs_zero0[W: Int](L: Int, NH: Int, C: Int, muon: Bool) raises:
         for i in range(n):
             if r1b[unsafe_offset=r * n + i] != r1b[unsafe_offset=i]:
                 raise Error(
-                    "ZeRO-1 ranks disagree at W="
+                    "ZeRO-"
+                    + String(stage)
+                    + " ranks disagree at W="
                     + String(W)
                     + " rank "
                     + String(r)
@@ -366,6 +455,24 @@ def _zero1_vs_zero0[W: Int](L: Int, NH: Int, C: Int, muon: Bool) raises:
                     + ": "
                     + _tensor_of(head_off + i, sz)
                 )
+    if stage == 3 and not is_defined["LLMM_Z3_HEAD_RESIDENT"]():
+        # (With the head resident the window is refreshed by the next forward,
+        # so after the last update it is legitimately stale: not checked.)
+        # Every gathered head tile (rank-local copy) is the ZeRO-0 head.
+        var hn = sz[16]
+        for r in range(W):
+            for i in range(hn):
+                if (
+                    tiles[unsafe_offset=r * hn + i]
+                    != r0b[unsafe_offset=head_off + i]
+                ):
+                    raise Error(
+                        "gathered head tile != ZeRO-0 head at rank "
+                        + String(r)
+                        + " elem "
+                        + String(i)
+                    )
+    tiles.unsafe_free()
     r0a.unsafe_free()
     r1a.unsafe_free()
     r0b.unsafe_free()
@@ -624,79 +731,104 @@ def test_head_ownership_w8_l1_straddles_ranks_6_and_7() raises:
 
 
 # --------------------------------------------------------------------------
-# ZeRO-2/3 with the head active are refused; the idle head works.
+# ZeRO-2/3 with the head ACTIVE (S6): bit-exact against ZeRO-0.
 # --------------------------------------------------------------------------
 
 
-def _refusal[W: Int](stage: Int) raises:
-    """Every rank's first forward() must raise the S2 refusal (no collective
-    is entered, so no rank can hang)."""
-    var path = String("gpt2_zu_ref_w") + String(W) + ".bin"
-    var n = _write_untied_checkpoint(path, 2, 2, 16)
-    _ = n
-    var coord = heap_alloc[CpuCoordinator](1)
-    coord[] = CpuCoordinator(W)
-    var refused = heap_alloc[Int](W)
-    for r in range(W):
-        refused[unsafe_offset=r] = 0
-
-    def _run_rank(rank: Int) {imm}:
-        try:
-            var ctx = DeviceContext(api="cpu")
-            var model = GPT2["cpu", W](
-                path,
-                rank,
-                stage,
-                ctx,
-                cpu_coordinator_ptr=Optional[
-                    Pointer[CpuCoordinator, MutUntrackedOrigin]
-                ](coord),
-            )
-            comptime if UNTIED_HEAD:
-                model.head_tied = False
-            var x = heap_alloc[SIMD[DType.int32, 1]](BB * TT)
-            var y = heap_alloc[SIMD[DType.int32, 1]](BB * TT)
-            for i in range(BB * TT):
-                x[unsafe_offset=i] = Int32((i * 31 + 5) % VOCAB)
-                y[unsafe_offset=i] = Int32((i * 5 + 1) % VOCAB)
-            try:
-                model.forward(
-                    rebind[MutMemPtr[DType.int32]](x),
-                    rebind[MutMemPtr[DType.int32]](y),
-                    BB,
-                    TT,
-                    1,
-                )
-            except e:
-                if "supports ZeRO stages 0 and 1 only" in String(e):
-                    refused[unsafe_offset=rank] = 1
-                else:
-                    print("rank", rank, "wrong error:", e)
-            x.unsafe_free()
-            y.unsafe_free()
-        except e:
-            print("rank", rank, "setup failed:", e)
-            coord[].abort()
-
-    sync_parallelize(_run_rank, W)
-    coord[].free()
-    coord.unsafe_free()
-    _remove(path)
-    for r in range(W):
-        assert_equal(refused[unsafe_offset=r], 1)
-    refused.unsafe_free()
-
-
-def test_zero2_head_active_is_refused() raises:
-    if _skip_tied("test_zero2_head_active_is_refused"):
+def test_zero2_equals_zero0_adamw_w2() raises:
+    if _skip_tied("test_zero2_equals_zero0_adamw_w2"):
         return
-    _refusal[2](2)
+    _zero1_vs_zero0[2](2, 2, 16, False, 2)
 
 
-def test_zero3_head_active_is_refused() raises:
-    if _skip_tied("test_zero3_head_active_is_refused"):
+def test_zero2_equals_zero0_adamw_w4() raises:
+    if _skip_tied("test_zero2_equals_zero0_adamw_w4"):
         return
-    _refusal[2](3)
+    _zero1_vs_zero0[4](2, 2, 16, False, 2)
+
+
+def test_zero2_equals_zero0_adamw_w8() raises:
+    if _skip_tied("test_zero2_equals_zero0_adamw_w8"):
+        return
+    _zero1_vs_zero0[8](2, 2, 16, False, 2)
+
+
+def test_zero2_equals_zero0_adamw_w8_head_straddles_l1() raises:
+    if _skip_tied("test_zero2_equals_zero0_adamw_w8_head_straddles_l1"):
+        return
+    _zero1_vs_zero0[8](1, 1, 16, False, 2)
+
+
+def test_zero2_equals_zero0_muon_w2() raises:
+    if _skip_tied("test_zero2_equals_zero0_muon_w2"):
+        return
+    _zero1_vs_zero0[2](2, 2, 16, True, 2)
+
+
+def test_zero2_equals_zero0_muon_w4() raises:
+    if _skip_tied("test_zero2_equals_zero0_muon_w4"):
+        return
+    _zero1_vs_zero0[4](2, 2, 16, True, 2)
+
+
+def test_zero2_equals_zero0_muon_w8() raises:
+    if _skip_tied("test_zero2_equals_zero0_muon_w8"):
+        return
+    _zero1_vs_zero0[8](2, 2, 16, True, 2)
+
+
+def test_zero2_equals_zero0_muon_w8_head_straddles_l1() raises:
+    if _skip_tied("test_zero2_equals_zero0_muon_w8_head_straddles_l1"):
+        return
+    _zero1_vs_zero0[8](1, 1, 16, True, 2)
+
+
+def test_zero3_equals_zero0_adamw_w2() raises:
+    if _skip_tied("test_zero3_equals_zero0_adamw_w2"):
+        return
+    _zero1_vs_zero0[2](2, 2, 16, False, 3)
+
+
+def test_zero3_equals_zero0_adamw_w4() raises:
+    if _skip_tied("test_zero3_equals_zero0_adamw_w4"):
+        return
+    _zero1_vs_zero0[4](2, 2, 16, False, 3)
+
+
+def test_zero3_equals_zero0_adamw_w8() raises:
+    if _skip_tied("test_zero3_equals_zero0_adamw_w8"):
+        return
+    _zero1_vs_zero0[8](2, 2, 16, False, 3)
+
+
+def test_zero3_equals_zero0_adamw_w8_head_straddles_l1() raises:
+    if _skip_tied("test_zero3_equals_zero0_adamw_w8_head_straddles_l1"):
+        return
+    _zero1_vs_zero0[8](1, 1, 16, False, 3)
+
+
+def test_zero3_equals_zero0_muon_w2() raises:
+    if _skip_tied("test_zero3_equals_zero0_muon_w2"):
+        return
+    _zero1_vs_zero0[2](2, 2, 16, True, 3)
+
+
+def test_zero3_equals_zero0_muon_w4() raises:
+    if _skip_tied("test_zero3_equals_zero0_muon_w4"):
+        return
+    _zero1_vs_zero0[4](2, 2, 16, True, 3)
+
+
+def test_zero3_equals_zero0_muon_w8() raises:
+    if _skip_tied("test_zero3_equals_zero0_muon_w8"):
+        return
+    _zero1_vs_zero0[8](2, 2, 16, True, 3)
+
+
+def test_zero3_equals_zero0_muon_w8_head_straddles_l1() raises:
+    if _skip_tied("test_zero3_equals_zero0_muon_w8_head_straddles_l1"):
+        return
+    _zero1_vs_zero0[8](1, 1, 16, True, 3)
 
 
 def _idle_head_same_batch[W: Int](L: Int, NH: Int, C: Int, stage: Int) raises:
