@@ -6975,7 +6975,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var n_classes = Parameters.proj_bias - Parameters.ln_1_gamma + 1
             # Slot layout: 0 wte, 1 wpe, 2 ln_f_gamma, 3 ln_f_beta, then
             # 4 + k*L + layer for per-layer class k = t - ln_1_gamma.
-            var n_slots = 4 + n_classes * L
+            # Untied build: slot 4 is the separate lm_head gradient (a
+            # fifth whole-tensor class) and the per-layer slots start at 5.
+            comptime N_WHOLE = 5 if UNTIED_HEAD else 4
+            var n_slots = N_WHOLE + n_classes * L
 
             # Flat base (prefix sums of param_sizes) — the tensor-major
             # grads_memory layout point_parameters established.
@@ -7016,6 +7019,8 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             whole.append(Parameters.wpe)
             whole.append(Parameters.ln_f_gamma)
             whole.append(Parameters.ln_f_beta)
+            comptime if UNTIED_HEAD:
+                whole.append(Parameters.lm_head)
             for s in range(len(whole)):
                 var t = whole[s]
                 var n = self.param_sizes[t]
@@ -7041,7 +7046,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 self.ctx.enqueue_function(
                     compiled_scan,
                     as_mut_kernel[DType.float32](
-                        (out_ptr.unsafe_offset(4)).unsafe_offset(k * L)
+                        (out_ptr.unsafe_offset(N_WHOLE)).unsafe_offset(k * L)
                     ),
                     as_immut_kernel_from_mut[GPT2_DTYPE](
                         self.grads_memory.unsafe_offset(flat_base[t])
@@ -7077,9 +7082,16 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             var order_slot = List[Int]()
             var order_class = List[Int]()
             var order_layer = List[Int]()  # -1 = not a per-layer tensor
-            order_slot.append(0)
-            order_class.append(Parameters.wte)
-            order_layer.append(-1)
+            comptime if UNTIED_HEAD:
+                # The head wgrad runs first and is its own tensor; wte only
+                # sees the encoder (placed with wpe at the end).
+                order_slot.append(4)
+                order_class.append(Parameters.lm_head)
+                order_layer.append(-1)
+            else:
+                order_slot.append(0)
+                order_class.append(Parameters.wte)
+                order_layer.append(-1)
             order_slot.append(2)
             order_class.append(Parameters.ln_f_gamma)
             order_layer.append(-1)
@@ -7090,9 +7102,13 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 for si in range(len(bwd_sites)):
                     var t = bwd_sites[si]
                     var k = t - Parameters.ln_1_gamma
-                    order_slot.append(4 + k * L + layer)
+                    order_slot.append(N_WHOLE + k * L + layer)
                     order_class.append(t)
                     order_layer.append(layer)
+            comptime if UNTIED_HEAD:
+                order_slot.append(0)
+                order_class.append(Parameters.wte)
+                order_layer.append(-1)
             order_slot.append(1)
             order_class.append(Parameters.wpe)
             order_layer.append(-1)
@@ -7616,8 +7632,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             if self.z3_streaming:
                 resident_win = h * p
         var s = String('"untied_head":{')
-        s += _mem_kv("head_tied", 1 if self.head_tied else 0)
-        s += "," + _mem_kv("head_elems", h)
+        s += _mem_kv("head_elems", h)
         s += "," + _mem_kv("head_flat_offset", h_off)
         s += "," + _mem_kv("head_elems_in_rank_shard", in_shard)
         s += "," + _mem_kv("params_bytes", param_elems * p)
@@ -7748,6 +7763,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             "optimizer_num_parameters", self.optimizer_num_parameters
         )
         s += "," + _mem_kv("grad_pool_elems", self.grad_pool_elems)
+        # Untied-head builds only (the tied schema stays byte-identical). The
+        # `untied_head` object (S6) is emitted further down; its presence is
+        # the untied-build flag.
+        comptime if UNTIED_HEAD:
+            s += "," + _mem_kv("untie_step", self.untie_step)
+            s += "," + _mem_kv("head_tied", 1 if self.head_tied else 0)
 
         s += ',"classes":{'
         s += _mem_kv("params", c_params)
@@ -8451,9 +8472,15 @@ def train[
     comptime if is_gpu[target]():
         device_name = ctx.name()
 
-    var model_size = (
-        String(Int(Float64(model.num_parameters) / 1e6 + 0.5)) + "M"
-    )
+    # Model label and MFU count the tied-equivalent parameters (flops_params):
+    # the LM-head GEMM is one V_p*C matmul whether its weight is wte (tied)
+    # or a separate lm_head (untied), so the untied head's extra V_p*C stored
+    # parameters must not be counted again (6*N would add 6*V_p*C FLOPs per
+    # token for a lookup-only wte). `params` stays the true stored count.
+    var flops_params = model.num_parameters
+    comptime if UNTIED_HEAD:
+        flops_params -= model.config.padded_vocab_size * model.config.channels
+    var model_size = String(Int(Float64(flops_params) / 1e6 + 0.5)) + "M"
     var dataset = _dataset_label(train_data_pattern)
     var setup_fields: List[Field] = [
         text("model", "gpt2-" + model_size),
@@ -8761,7 +8788,7 @@ def train[
             bias_corrected_ema = ema_tokens_per_second / bias_correction
 
         var mfu = estimate_mfu(
-            model.num_parameters,
+            flops_params,
             model.config.num_layer,
             model.config.channels,
             T,
