@@ -5,7 +5,9 @@
 #
 # Loads the SAME fixed reference batch `test_gpt2.mojo` uses
 # (gpt2_124M_debug_state.bin's B=4,T=64 x/y), runs exactly one forward+
-# backward step, then dumps every one of the 16 named gradient tensors to
+# backward step, then dumps every one of the 16 named gradient tensors (17 with
+# -D LLMM_UNTIED_HEAD=1: the extra `lm_head` file is the full [V_p, C] padded
+# head gradient, and the untied checkpoint/debug state are loaded) to
 # `<out_dir>/`, split per transformer layer for the 12 per-layer tensor
 # classes (ln_1_gamma/beta, qkv_weight/bias, attn_proj_weight/bias,
 # ln_2_gamma/beta, fc_weight/bias, proj_weight/bias -- L files each) and as a
@@ -33,7 +35,7 @@ from max.gpu.host import DeviceContext
 from llmm.memory import MutMemPtr, heap_alloc
 from llmm.io import write_buffer, read_and_copy
 
-from train_gpt2 import GPT2, Parameters, GPT2_DTYPE
+from train_gpt2 import GPT2, Parameters, GPT2_DTYPE, UNTIED_HEAD
 
 
 def dump_tensor[
@@ -114,7 +116,13 @@ def main() raises:
     # LLMM_PRECISION=fp8/bf16 builds must load the bf16 checkpoint
     # (EXPECTED_VERSION=5, train_gpt2.mojo); the plain fp32 build loads the
     # fp32 one (matches test_gpt2.mojo's own "gpt2_124M.bin" convention).
-    comptime checkpoint = "gpt2_124M_bf16.bin" if GPT2_DTYPE == DType.bfloat16 else "gpt2_124M.bin"
+    comptime checkpoint = (
+        "gpt2_124M_untied_bf16.bin" if GPT2_DTYPE
+        == DType.bfloat16 else "gpt2_124M_untied.bin"
+    ) if UNTIED_HEAD else (
+        "gpt2_124M_bf16.bin" if GPT2_DTYPE == DType.bfloat16 else "gpt2_124M.bin"
+    )
+    comptime state_path = "gpt2_124M_untied_debug_state.bin" if UNTIED_HEAD else "gpt2_124M_debug_state.bin"
     var model = GPT2["gpu", 1, False](
         checkpoint,
         rank=0,
@@ -127,7 +135,7 @@ def main() raises:
 
     # Same fixed reference batch test_gpt2.mojo uses -- "identical step-1
     # data" across the fp8 and bf16 builds this tool is run against.
-    var state_file = open("gpt2_124M_debug_state.bin", "r")
+    var state_file = open(state_path, "r")
     var state_header = heap_alloc[Int32](256)
     read_and_copy[DType.int32](
         state_file,
@@ -180,7 +188,8 @@ def main() raises:
     model.backward()
     ctx.synchronize()
 
-    print("dumping 148 gradient tensors to " + out_dir)
+    comptime n_files = 149 if UNTIED_HEAD else 148
+    print("dumping " + String(n_files) + " gradient tensors to " + out_dir)
 
     # Global tensors (4).
     dump_global(
@@ -199,6 +208,16 @@ def main() raises:
     )
     dump_global(ctx, model.grads.ln_f_gamma, C, out_dir, "ln_f_gamma")
     dump_global(ctx, model.grads.ln_f_beta, C, out_dir, "ln_f_beta")
+    comptime if UNTIED_HEAD:
+        # The head's own gradient (head is trained, so _head_grad_ptr() is
+        # grads.lm_head); the full padded [V_p, C] block.
+        dump_global(
+            ctx,
+            model.grads.lm_head,
+            model.param_sizes[Parameters.lm_head],
+            out_dir,
+            "lm_head",
+        )
 
     # Per-layer tensors (12 * L).
     dump_per_layer(ctx, model.grads.ln_1_gamma, L, C, out_dir, "ln_1_gamma")

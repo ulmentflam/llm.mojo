@@ -112,11 +112,27 @@ def verify_export(output: Path) -> bool:
     return ok
 
 
+# Version + 10 marks an untied head (docs/ai/untied_lm_head_design_2026-10-30.md).
+UNTIED_VERSIONS = (13, 15)
+
+
 def make_llmc_compatible_copy(src: Path, dst: Path) -> None:
     """Copy `src` to `dst`, then patch only the first int32 (the magic
     number) from LLM_MOJO_MAGIC to LLM_C_MAGIC. The source file is opened
     read-only and is never written to; only `dst` is modified.
     """
+    with open(src, "rb") as f:
+        head = f.read(8)
+    if len(head) == 8:
+        _, version = struct.unpack("<ii", head)
+        if version in UNTIED_VERSIONS:
+            raise SystemExit(
+                f"[export_to_hf] refusing {src}: untied-head checkpoint "
+                f"(version {version}: a separate lm_head tensor follows ln_f). "
+                "The llm.c/HF 16-tensor layout has no lm_head, so the export "
+                "would drop the head and misread the blob. Untied export is "
+                "not supported; use a tied (version 3/5/7/9) checkpoint."
+            )
     shutil.copyfile(src, dst)
 
     with open(dst, "r+b") as f:
