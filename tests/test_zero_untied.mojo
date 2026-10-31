@@ -60,7 +60,7 @@ from max.gpu.host import DeviceContext
 from llmm.memory import MutMemPtr, heap_alloc
 from llmm.zero import CpuCoordinator
 
-from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD
+from train_gpt2 import GPT2, GPT2_DTYPE, UNTIED_HEAD, master_dst_offset
 
 comptime TT = 16
 comptime BB = 1
@@ -686,7 +686,7 @@ def _ownership[W: Int](L: Int, NH: Int, C: Int) raises:
     var coord = heap_alloc[CpuCoordinator](1)
     coord[] = CpuCoordinator(W)
     var errors = heap_alloc[Int](W)
-    var got = heap_alloc[Int](W * (3 + 16))
+    var got = heap_alloc[Int](W * 20)
     for r in range(W):
         errors[unsafe_offset=r] = 0
 
@@ -706,13 +706,24 @@ def _ownership[W: Int](L: Int, NH: Int, C: Int) raises:
                 model.head_tied = False
             model.enable_muon(Scalar[DType.float32](0.95))
             var segs = model._adamw_shard_segments()
-            var b = rank * (3 + 16)
+            var b = rank * 20
             got[unsafe_offset=b] = model.optimizer_num_parameters
             got[unsafe_offset=b + 1] = model.param_offset(16)
             got[unsafe_offset=b + 2] = len(segs)
             for i in range(min(len(segs), 8)):
                 got[unsafe_offset=b + 3 + 2 * i] = segs[i].flat_start
                 got[unsafe_offset=b + 3 + 2 * i + 1] = segs[i].len
+            # S8 fix: master index of the head's overlap with this shard
+            # under the compact (sharded Muon) layout; -1 when no overlap.
+            var hlo = rank * model.optimizer_num_parameters
+            var hhi = min(hlo + model.optimizer_num_parameters, n16 + head_n)
+            var ha = max(n16, hlo)
+            var hb = hhi
+            got[unsafe_offset=b + 19] = -1
+            if hb > ha:
+                got[unsafe_offset=b + 19] = master_dst_offset(
+                    segs, ha, hb, hlo, True, model.v_num_parameters
+                )
             # Planted: the head block of the loaded params is the file's head
             # (nonzero, != wte) at the offset the layout says.
             var seen = 0
@@ -740,7 +751,7 @@ def _ownership[W: Int](L: Int, NH: Int, C: Int) raises:
     errors.unsafe_free()
     assert_equal(bad, 0)
     for r in range(W):
-        var b = r * (3 + 16)
+        var b = r * 20
         assert_equal(got[unsafe_offset=b], opt)
         assert_equal(got[unsafe_offset=b + 1], n16)
         assert_equal(got[unsafe_offset=b + 2], exp_nseg[r])
@@ -756,6 +767,32 @@ def _ownership[W: Int](L: Int, NH: Int, C: Int) raises:
             if got[unsafe_offset=b + 3 + 2 * i] >= n16:
                 head_got += got[unsafe_offset=b + 3 + 2 * i + 1]
         assert_equal(head_got, exp_head[r])
+        # Compact master offset of the head overlap, from the expected layout:
+        # the lengths of every earlier segment plus the offset in the head.
+        if exp_head[r] > 0:
+            var before = 0
+            var first_head = -1
+            for i in range(exp_nseg[r]):
+                if exp_seg[(r * 8 + i) * 2] >= n16:
+                    first_head = i
+                    break
+                before += exp_seg[(r * 8 + i) * 2 + 1]
+            assert_true(first_head >= 0, "head segment missing")
+            var ha = exp_seg[(r * 8 + first_head) * 2]
+            assert_equal(got[unsafe_offset=b + 19], before)
+            # The write [ha, ha+len) must end inside the compact buffer: the
+            # old shard-relative index (ha - r*opt) exceeded it for rank W-1.
+            var tot = 0
+            for i in range(exp_nseg[r]):
+                tot += exp_seg[(r * 8 + i) * 2 + 1]
+            assert_true(before + exp_head[r] <= tot, "compact write past end")
+            if L == 2 and r == W - 1:
+                assert_true(
+                    ha - r * opt + exp_head[r] > tot,
+                    "planted bug not reproduced: shard-relative index fits",
+                )
+        else:
+            assert_equal(got[unsafe_offset=b + 19], -1)
     got.unsafe_free()
 
 

@@ -1270,6 +1270,46 @@ struct AdamSeg(Copyable, Movable):
     var compact_off: Int
 
 
+def master_dst_offset(
+    segs: List[AdamSeg],
+    a: Int,
+    b: Int,
+    lo: Int,
+    compact: Bool,
+    cap: Int,
+) raises -> Int:
+    """Index in the fp32 master buffer of flat parameter `a`, for a write of
+    `[a, b)` that must stay inside one AdamW segment. Shard-relative `a - lo`
+    unless the master is compact (sharded Muon, `_trim_flat_m_master`): then
+    `compact_off + (a - flat_start)` of the segment holding `[a, b)`. Raises
+    if no segment holds the range or the write would pass `cap` elements, so
+    an out-of-bounds device write cannot happen silently."""
+    var dst = a - lo
+    if compact:
+        var found = False
+        for k in range(len(segs)):
+            if (
+                a >= segs[k].flat_start
+                and b <= segs[k].flat_start + segs[k].len
+            ):
+                dst = segs[k].compact_off + (a - segs[k].flat_start)
+                found = True
+                break
+        if not found:
+            raise Error("master_dst_offset: range not inside an AdamW segment")
+    if dst < 0 or dst + (b - a) > cap:
+        raise Error(
+            "master_dst_offset: master write out of bounds (dst="
+            + String(dst)
+            + " n="
+            + String(b - a)
+            + " cap="
+            + String(cap)
+            + ")"
+        )
+    return dst
+
+
 struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
     var ctx: DeviceContext
     var config: GPT2Config
@@ -6218,8 +6258,19 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.ctx.synchronize()
             for i in range(m):
                 host_m[i] = host_h[i].cast[MASTER_DTYPE]()
+            # Sharded Muon keeps the master compact (`compact_off` layout):
+            # the shard-relative `dst_local` is out of bounds for the head.
+            var compact = self._sharded_muon()
+            var mdst = master_dst_offset(
+                self._adamw_shard_segments(),
+                a,
+                b,
+                lo,
+                compact,
+                self.v_num_parameters if compact else (hi - lo),
+            )
             self._copy_host_to_device[MASTER_DTYPE](
-                self.master_memory.unsafe_offset(dst_local), host_m, m
+                self.master_memory.unsafe_offset(mdst), host_m, m
             )
             self.ctx.synchronize()
 
