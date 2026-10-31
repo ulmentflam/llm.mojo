@@ -517,6 +517,13 @@ def main() -> None:
     if not any(runs.values()):
         sys.exit("no adoption_seed_*_600.jsonl logs; run --collect first")
     summ = summary(runs)
+    # qk_max in the step log is proof the rotary + QK-norm binary ran
+    for arm, want in (("base", False), ("combined", True)):
+        for seed, r in runs[arm].items():
+            if bool(r["qk"]) != want:
+                sys.exit(
+                    f"{arm} s{seed}: qk_max {'missing' if want else 'present'} in log: wrong binary"
+                )
     if DOC.exists():
         t = DOC.read_text()
         t = fa.splice(t, "seeds", table(runs, summ))
