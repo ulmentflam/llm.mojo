@@ -67,7 +67,7 @@ from llmm.layernorm import (
     residual_grad_broadcast,
 )
 from llmm.attention import attention_fwd, attention_bwd, KVCache, KVCachePtr
-from llmm.rotary import rotary_qk_rows, rotary_table_host
+from llmm.rotary import rotary_table_host
 from llmm.qk_clip import (
     qk_clip_apply,
     qk_clip_bias_range,
@@ -4178,22 +4178,12 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             self.kv_cache.att_probs_stride = (
                 batch_size * num_heads * seq_len * seq_len
             )
-            comptime if ROTARY:
-                rotary_qk_rows[GPT2_DTYPE, Self.target, inverse=False](
-                    as_mut_kernel[GPT2_DTYPE](l_qkv),
-                    as_immut_kernel_from_mut[DType.float32](self.rotary_table),
-                    batch_size,
-                    seq_len,
-                    self.rotary_rows,
-                    num_heads,
-                    head_dim,
-                    self.ctx,
-                )
             attention_fwd[
                 GPT2_DTYPE,
                 Self.target,
                 use_soft_exp=ATTN_SOFT_EXP,
                 qk_norm=QK_NORM,
+                rotary=ROTARY,
             ](
                 as_mut_kernel[GPT2_DTYPE](l_qkv),
                 as_mut_kernel[GPT2_DTYPE](l_q),
@@ -4216,6 +4206,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                     )
                 ) if self.qk_track else None,
                 q_mul=self.attn_q_mul,
+                rot_table=as_immut_kernel_from_mut[DType.float32](
+                    self.rotary_table
+                ),
+                rot_rows=self.rotary_rows,
             )
 
             # Matmul Attn Proj. Always bf16 under fp4 (same rationale as the
@@ -5614,6 +5608,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 Self.target,
                 use_soft_exp=ATTN_SOFT_EXP,
                 qk_norm=QK_NORM,
+                rotary=ROTARY,
             ](
                 as_mut_kernel[GPT2_DTYPE](d_l_qkv),
                 as_mut_kernel[GPT2_DTYPE](d_l_q),
@@ -5634,21 +5629,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 cache=rebind[KVCachePtr](Pointer(to=self.kv_cache)),
                 qkv_ptr=as_immut_kernel_from_mut[GPT2_DTYPE](l_qkv),
                 q_mul=self.attn_q_mul,
+                rot_table=as_immut_kernel_from_mut[DType.float32](
+                    self.rotary_table
+                ),
+                rot_rows=self.rotary_rows,
             )
-            # ROTARY: d_qkv now holds the gradient w.r.t. the ROTATED q/k;
-            # apply the inverse rotation to its q and k thirds (v untouched)
-            # before the qkv matmul backward.
-            comptime if ROTARY:
-                rotary_qk_rows[GPT2_DTYPE, Self.target, inverse=True](
-                    as_mut_kernel[GPT2_DTYPE](d_l_qkv),
-                    as_immut_kernel_from_mut[DType.float32](self.rotary_table),
-                    batch_size,
-                    seq_len,
-                    self.rotary_rows,
-                    num_heads,
-                    head_dim,
-                    self.ctx,
-                )
 
             # QKV matmul backward.
             # fp8 site: C=channels, OC=3*channels; input=l_ln_1,

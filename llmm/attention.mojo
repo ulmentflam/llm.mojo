@@ -1812,6 +1812,7 @@ def attention_fwd[
     use_conditional_rescale: Bool = True,
     use_kv_cache: Bool = True,
     qk_norm: Bool = False,
+    rotary: Bool = False,
 ](
     qkv_ptr: ImmutKernelPtr[dtype],
     q_ptr: MutKernelPtr[dtype],
@@ -1828,6 +1829,8 @@ def attention_fwd[
     cache: Optional[KVCachePtr] = None,
     head_max: Optional[MutKernelPtr[DType.float32]] = None,
     q_mul: Float32 = 1.0,
+    rot_table: ImmutKernelPtr[DType.float32] = null_immut_ptr[DType.float32](),
+    rot_rows: Int = 0,
 ) capturing raises:
     var qkv_mut = rebind[MutKernelPtr[dtype]](qkv_ptr)
     var dst_ptrs = List[MutKernelPtr[dtype]]()
@@ -1843,11 +1846,13 @@ def attention_fwd[
         Int(head_dim),
         ctx,
     )
-    # QK-norm / fixed attention scale (llmm/qk_norm.mojo): q <- q_mul *
-    # rmsnorm(q), k <- rmsnorm(k) on the head-layout rows; the core kernels
-    # still apply 1/sqrt(hd), so the net scale is q_mul / sqrt(hd).
-    comptime if qk_norm:
-        qk_rows_fwd[dtype, target, True](
+    # QK-norm / fixed attention scale / rotary (llmm/qk_norm.mojo): q <- q_mul *
+    # rmsnorm(q), k <- rmsnorm(k), then (rotary) the half-truncated rotation,
+    # all in ONE pass over the head-layout rows. The core kernels still apply
+    # 1/sqrt(hd), so the net scale is q_mul / sqrt(hd). acts.qkv keeps the raw
+    # pre-norm, pre-rotation rows (the backward recomputes rstd from them).
+    comptime if qk_norm or rotary:
+        qk_rows_fwd[dtype, target, qk_norm, rotary](
             q_ptr,
             k_ptr,
             Int(batch_size),
@@ -1856,6 +1861,8 @@ def attention_fwd[
             Int(head_dim),
             q_mul,
             ctx,
+            rot_table,
+            rot_rows,
         )
     else:
         if q_mul != 1.0:
@@ -3094,6 +3101,7 @@ def attention_bwd[
     use_soft_exp: Bool = True,
     use_kv_cache: Bool = True,
     qk_norm: Bool = False,
+    rotary: Bool = False,
 ](
     d_qkv_ptr: MutKernelPtr[dtype],
     d_q_ptr: MutKernelPtr[dtype],
@@ -3114,6 +3122,8 @@ def attention_bwd[
     cache: Optional[KVCachePtr] = None,
     qkv_ptr: ImmutKernelPtr[dtype] = null_immut_ptr[dtype](),
     q_mul: Float32 = 1.0,
+    rot_table: ImmutKernelPtr[DType.float32] = null_immut_ptr[DType.float32](),
+    rot_rows: Int = 0,
 ) capturing raises:
     # 1. Split heads backward: split d_attn_merged into d_attn
     merge_bwd[dtype, target](
@@ -3145,11 +3155,12 @@ def attention_bwd[
         cache=cache,
     )
 
-    # 2b. QK-norm / fixed-scale backward (llmm/qk_norm.mojo): turn the grads
-    # w.r.t. the normalized/scaled q, k into grads w.r.t. the raw qkv rows
-    # (recomputed from the saved pre-norm qkv activation), in place.
-    comptime if qk_norm:
-        qk_rows_bwd[dtype, target, True](
+    # 2b. QK-norm / fixed-scale / rotary backward (llmm/qk_norm.mojo), one
+    # pass in place: inverse rotation of the grads w.r.t. the rotated q, k, then
+    # the norm backward against the raw qkv rows (recomputed rstd), giving the
+    # grads w.r.t. the raw qkv rows.
+    comptime if qk_norm or rotary:
+        qk_rows_bwd[dtype, target, qk_norm, rotary](
             d_q_ptr,
             d_k_ptr,
             qkv_ptr,
@@ -3159,6 +3170,8 @@ def attention_bwd[
             Int(head_dim),
             q_mul,
             ctx,
+            rot_table,
+            rot_rows,
         )
     else:
         if q_mul != 1.0:

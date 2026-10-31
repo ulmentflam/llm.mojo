@@ -71,6 +71,29 @@ def rotary_table_host(max_seq_len: Int, head_dim: Int) -> List[Float32]:
 
 
 @always_inline
+def rotate_y1[
+    inverse: Bool
+](x1: Float32, x2: Float32, c: Float32, s: Float32) -> Float32:
+    """First output of one rotation pair (shared with the fused q/k row
+    kernels in llmm/qk_norm.mojo so both use bit-identical arithmetic)."""
+    comptime if inverse:
+        return x1 * c - x2 * s
+    else:
+        return x1 * c + x2 * s
+
+
+@always_inline
+def rotate_y2[
+    inverse: Bool
+](x1: Float32, x2: Float32, c: Float32, s: Float32) -> Float32:
+    """Second output of one rotation pair; see `rotate_y1`."""
+    comptime if inverse:
+        return x1 * s + x2 * c
+    else:
+        return x2 * c - x1 * s
+
+
+@always_inline
 def _rotate_pair[
     dtype: DType, inverse: Bool
 ](
@@ -85,14 +108,8 @@ def _rotate_pair[
     var s = table[unsafe_offset=ts]
     var x1 = qkv[unsafe_offset=base].cast[DType.float32]()
     var x2 = qkv[unsafe_offset=base + half].cast[DType.float32]()
-    var y1: Float32
-    var y2: Float32
-    comptime if inverse:
-        y1 = x1 * c - x2 * s
-        y2 = x1 * s + x2 * c
-    else:
-        y1 = x1 * c + x2 * s
-        y2 = x2 * c - x1 * s
+    var y1 = rotate_y1[inverse](x1, x2, c, s)
+    var y2 = rotate_y2[inverse](x1, x2, c, s)
     qkv[unsafe_offset=base] = y1.cast[dtype]()
     qkv[unsafe_offset=base + half] = y2.cast[dtype]()
 
