@@ -425,6 +425,8 @@ at the full batch and record tokens-to-3.28 in the README table.
 
 ## 6. Results
 
+Full report with the figure, every arm and the incidents: [`modded_nanogpt_adoption_results_2026-10-30.md`](modded_nanogpt_adoption_results_2026-10-30.md). The rows below are the item owners' running notes.
+
 To be filled by the item owners. One row per arm.
 
 | item | flag(s) | val@300 seed 42 | three-seed mean | step time | verdict |

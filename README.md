@@ -180,6 +180,13 @@ Muon vs AdamW on this box (GPT-2 124M from scratch, FineWeb, bf16, B=32 T=1024 a
 
 Val loss vs step for the three arms (left: 600 steps x 3 seeds; middle: 2000 steps, tuned Muon passes AdamW's final loss by step 800) and the 300-step Muon lr sweep (right). Reproduce with `make figure-muon`.
 
+The follow-up campaign ranked nine modded-nanogpt ideas on the tuned-Muon recipe at 300 steps (single seed, so differences under about 0.02 are noise): a zero-warmup linear-cooldown (WSD) schedule is the largest gain, rotary embeddings are second, QK-norm helps and bounds the attention logit, the AdamW-range learning rate has to stay at the shared rate, and the rest sit inside the noise band. Nothing becomes a default without three seeds. Details in [`docs/ai/modded_nanogpt_adoption_results_2026-10-30.md`](docs/ai/modded_nanogpt_adoption_results_2026-10-30.md); reproduce with `make figure-adoption`.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="figures/modded_nanogpt_adoption_2026-10-30_dark.png">
+  <img alt="modded-nanogpt adoption campaign: val loss per arm, delta vs base, W1 ladder, QK-norm logit, loss vs step time" src="figures/modded_nanogpt_adoption_2026-10-30.png">
+</picture>
+
 Step time is within a few percent across arms (median 3.88-4.01 s/step over all twelve runs; at
 600 steps the per-seed Muon-minus-AdamW gap ranges from -1.3% to +2.7% with no consistent sign, at
 2000 steps Muon was 1.4% and 2.9% slower by median, partly contention): the Muon optimizer step is a
