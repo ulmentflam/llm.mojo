@@ -428,6 +428,8 @@ To be filled by the item owners. One row per arm.
 | W1 | base + `-l_adam 2` | 5.0665 | | 3922 | +0.032, just outside single-seed noise |
 | W1 | base + `-l_adam 4` | 5.1987 | | 4029 | +0.164 |
 | W1 | base + `-l_adam 8` | 5.2074 | | 3948 | +0.173; ladder optimum is mult 1, i.e. the shared rate; no separate AdamW-range multiplier needed at 124M/300 steps. The flag stays for W9's `-l_head`. |
+| W2 | base + `-mu_start 0.85 -mu 0.9 -mu_warmup 300` | 5.0259 | | 3983 | -0.009 vs base, inside noise |
+| W2 | base + `-mu_start 0.85 -mu 0.95 -mu_warmup 300` | 5.0174 | | 3941 | -0.017 vs base; the sweep's flat 0.95 scored 5.0732, so the ramp reconciles "low momentum early" with the long-run 0.95: adopt the ramp with mu 0.95 |
 
 ## 7. Not in scope (so nobody re-litigates)
 
