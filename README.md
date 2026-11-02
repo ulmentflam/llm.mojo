@@ -169,8 +169,8 @@ existed records rotary only, so a QK-norm build refuses to resume it). A `.bin` 
 e.g. pretrained GPT-2, still initialises a flagged run (`-e`) and `infer_gpt2` runs it with the
 build's architecture after printing a note, as the trainer's `-e` does (the verify gates rely on this);
 `infer_gpt2` refuses a stock-`gpt2` safetensors in a flagged build. Checkpoints written
-before the QK-norm bit existed record rotary only (the published headline files were corrected, and the
-originals remain in that repo's git history); write a corrected copy with `scripts/set_checkpoint_arch_flags.py`. The MAX graphs refuse any flagged file.
+before the QK-norm bit existed record rotary only (the published headline files were corrected and that
+repo's history squashed, though the originals can still be fetched by their old commit IDs); write a corrected copy with `scripts/set_checkpoint_arch_flags.py`. The MAX graphs refuse any flagged file.
 Default-build checkpoints are byte-identical to before.
 Reference (`GPT2_ROTARY=1` in `train_gpt2.py`), gates and results:
 [`docs/ai/rotary_embeddings_w8_2026-10-30.md`](docs/ai/rotary_embeddings_w8_2026-10-30.md).
