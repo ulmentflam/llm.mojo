@@ -600,13 +600,6 @@ def _ownership[W: Int](L: Int, NH: Int, C: Int) raises:
     """Run enable_muon on W ZeRO-1 ranks, record opt and the AdamW segments, and
     compare them with values computed here from the layout. Then assert where
     the head lands (see the callers)."""
-    # The expected AdamW ranges below are the non-rotary layout; under rotary
-    # wpe is skipped and every segment offset shifts, so refuse to compile
-    # rather than fail with confusing mismatches.
-    comptime assert not ROTARY, (
-        "test_zero_untied's ownership test hard-codes the non-rotary AdamW"
-        " ranges; build it without -D LLMM_ROTARY=1"
-    )
     var path = String("gpt2_zu_own_w") + String(W) + "_l" + String(L) + ".bin"
     var n = _write_untied_checkpoint(path, L, NH, C)
     var sz = _sizes(L, C)
@@ -628,7 +621,14 @@ def _ownership[W: Int](L: Int, NH: Int, C: Int) raises:
     # AdamW ranges: everything but the four Muon matrix tensors (4, 6, 10, 12),
     # with the tail split at the head (so the head is its own range).
     var ranges = List[Int]()
-    ranges.append(0)
+    comptime if ROTARY:
+        # -D LLMM_ROTARY=1 leaves wpe (tensor 1) out of the AdamW ranges, so
+        # the leading range splits into wte | ln_1.. (see _adamw_ranges).
+        ranges.append(0)
+        ranges.append(off[1])
+        ranges.append(off[2])
+    else:
+        ranges.append(0)
     ranges.append(off[4])
     ranges.append(off[5])
     ranges.append(off[6])
