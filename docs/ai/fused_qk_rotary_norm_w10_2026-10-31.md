@@ -110,9 +110,25 @@ the expected gain from the kernel numbers is -15 ms/step (-0.6%). Per-kernel, mi
 
 Flag-off new vs old base: 2247 vs 2263 ms, no regression.
 
+## 5. Clean timing, idle GPU (2026-11-02)
+
+Measured while the GPU was otherwise idle, at 131k tokens/step (4 micro-batches), combined recipe
+(rotary + QK-norm), median of steps 2-30 of each 30-step run, two runs per build, run in the order old, fused, old, fused with 90 s gaps (`pre.sh`). Raw logs:
+`$S/jobs/headline_x5700/timing_{old,new}_r{1,2}.{log,jsonl}` (session scratchpad).
+
+| build | run 1 | run 2 |
+|---|---|---|
+| old (21a2e4c, unfused) | 4198 ms | 4176 ms |
+| fused | 4114 ms | 4114 ms |
+
+Fused is 73 ms/step faster (4187 to 4114 on the means), -1.7%. The kernel numbers predicted about
+60 ms per step (15 ms per 32k micro-batch x 4), so the measurement is at or a little above the
+prediction. Section 4's -0.5 to -1.2% was from a contended window with 5-step medians; this
+supersedes it. The max-logit tracking cost is unchanged by fusion.
+
 ## Not verified / open
 
-* A clean (idle GPU) step-time number; the gain is expected ~15 ms per 32k micro-batch.
+* ~~A clean (idle GPU) step-time number~~: measured, see section 5. The earlier "~15 ms" was per 32k micro-batch, so about 60 ms per 131k-token step was predicted.
 * Reducing the max-logit tracking cost (about +48 ms/step at 32k tokens): untried ideas are reducing per block before the atomic, or testing against a cached value first.
 * Gaps from verification: no rotary+QK-norm reference at a non-default scale (a mutant scaling only rotated pairs passes verify and is caught only by the unit test); only hd=64 is tested; Metal and fp8/fp4 with the flags are not built.
 * No convergence run with the fused build (numerics changed only by single vs double rounding).

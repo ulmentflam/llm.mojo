@@ -173,10 +173,15 @@ Leave relu2/zero-init, the AdamW-range multiplier and the untied head at
 their defaults for now. **Three-seed status: confirmed at 600 steps.** The
 combined recipe beat the base on every seed (mean 0.250, per-seed 0.246 to
 0.256, against seed spreads of 0.010 and 0.003; see the section below), but it
-costs about 6% step time measured interleaved with the base (see finding 4), and
+costs about 6% step time measured interleaved with the base before fusing the
+row passes (see finding 4; fusing saves about 1.7%), and
 the gains are sub-additive (the 300-step single-item gains overstate it by
-about 2x at 600 steps). The headline tokens-to-3.28 run uses this recipe; it
-becomes the default only after that longer-horizon run.
+about 2x at 600 steps). The headline run (see "Headline result" below) used
+this recipe on the pre-fusion kernels, one seed: it passes AdamW's final
+value on the same val set at 2.88B tokens and ends at 3.2704 at 2.99B, so the
+recipe holds up at a 4.5x longer horizon and 4x the batch. It becomes the
+default only after a second seed and a convergence run of the fused build, which
+has none yet.
 
 ## Three-seed confirmation of the combined recipe
 
@@ -252,9 +257,14 @@ table above).
    against the campaign's 3.92 to 3.98 s idle base, so they most likely
    shared the GPU (no spike was flagged: the slowdown was steady). Correction: a later interleaved profile
    (W10, shared with the headline run, so relative only) measured about +6%,
-   so +14% overstated the cost by comparing against one idle base run. A clean
-   idle-GPU timing is still owed. The row passes are about a third of the
-   extra time; fusing them saves about 15 ms/step. Most of the rest appears to
+   so +14% overstated the cost by comparing against one idle base run. There
+   is still no fresh idle base run in the same session as a combined run. What
+   exists: on an idle GPU at 131k tokens/step the fused combined build runs at
+   4114 ms against 4176 to 4198 ms for the unfused one (-1.7%, 73 ms; the W10
+   doc's section 5), and 4114 ms against the earlier 3.92 to 3.98 s idle base is
+   +3% to +5%, but those are different sessions, so treat that as an estimate.
+   The row passes are about a third of the extra time (about 15 ms per 32k
+   micro-batch, so about 60 ms per 131k step, which fusion removed). Most of the rest appears to
    be max-logit tracking, not the attention math. See
    [`fused_qk_rotary_norm_w10_2026-10-31.md`](fused_qk_rotary_norm_w10_2026-10-31.md). Even at +14%, the
    combined arm's val@500 (4.224) is already below the base's final
@@ -270,8 +280,8 @@ the combined recipe's 4.095 is 0.266 below the README's tuned Muon mean, and
 its seed spread (0.003) is smaller than the Muon arms' (under 0.015).
 
 What it means for the recommended recipe: it passes the three-seed gate at
-600 steps, so it is the recipe to carry into the headline run. It is not yet
-a default: the horizon is still 600 steps, relu2 and zero-init are untested
+600 steps, so it is the recipe that was carried into the headline run (below). It is not yet
+a default: the three-seed evidence is still 600 steps (the headline run is one seed), relu2 and zero-init are untested
 in combination, and the individual contributions at 600 steps are unmeasured.
 
 ## Incidents and lessons
@@ -330,19 +340,23 @@ in combination, and the individual contributions at 600 steps are unmeasured.
 make figure-adoption-collect   # copy finished logs from the item worktrees into docs/ai/data
 make figure-adoption           # PNG (light + dark), JSON sidecar, and the tables above
 make figure-adoption-seeds-collect figure-adoption-seeds   # the three-seed section's logs, table, figure
+make figure-adoption-headline  # headline figure + table (committed logs and the AdamW baseline JSON)
 ```
 
 Collection reads the worktree `sweeps/` directories; rendering reads only
 `docs/ai/data/adoption_*.jsonl` and `scripts/train_log.py`, no GPU.
 
-## Headline run design: tokens to val 3.28 (designed, not yet run)
+## Headline run design: tokens to val 3.28 (run: see the result section below)
 
 Plan section 5 calls for one full-batch run of the recommended recipe, scored
-by the tokens it takes to reach val 3.28. This section fixes that design
-before launch so the number cannot be tuned after the fact. The job script is
+by the tokens it takes to reach val 3.28. This section fixed that design
+before launch so the number could not be tuned after the fact. It was run, with
+one deviation (the second horizon was a branch, not a fresh run; see the
+result section). The text below is the design as written, with corrections marked. The job script is
 `$S/jobs/headline/run.sh` (session scratchpad), and its report is
-`$S/jobs/headline/report.py`. The log will be committed as
-`docs/ai/data/adoption_headline_tokens_to_328.jsonl`.
+`$S/jobs/headline/report.py`. The `-x 3800` log is
+`docs/ai/data/adoption_headline_tokens_to_328.jsonl` and the `-x 5700` log
+`docs/ai/data/adoption_headline_x5700.jsonl`.
 
 ### The baseline: what the AdamW 524k run actually reached
 
@@ -359,10 +373,14 @@ Its val curve was read from `.autosentry/logs/process.log` by pairing each
 
 | AdamW 524k baseline (`-m 20`) | step | tokens | val |
 |---|---:|---:|---:|
-| first val <= 3.29 | 17250 | 9.04B | 3.28825 |
+| first val <= 3.29 | 17000 | 8.91B | 3.28986 |
 | first val <= 3.285 | 18000 | 9.44B | 3.28461 |
 | lowest val (after the step-19000 resume) | 19250 | 10.09B | 3.28068 |
 | final | 19552 | 10.25B | 3.28070 |
+
+Correction: the first draft of this table gave step 17250 (9.04B) for the first
+val <= 3.29; the extracted curve reads 3.28986 at step 17000 (8.91B), which
+already satisfies the exact rule, so the row is 17000.
 
 "The AdamW run reached 3.28" (plan section 5, the Muon doc) is therefore a
 two-decimal rounding of a curve that flattens at 3.2807.
@@ -393,9 +411,10 @@ The resumes are visible in the curve:
   of the val shard. **`-m 320` at B=32, T=1024 is exactly 10,485,760 tokens**,
   the same val set as modded-nanogpt's. The baseline's `-m 20` (655,360 tokens)
   is a prefix of it. Whether that prefix is biased has not been measured.
-  `$S/jobs/headline/baseline_eval.sh` (about 5 GPU-minutes, optional) scores
-  `log124M/model_19552.bin` at both `-m 20` and `-m 320` so that the baseline
-  can be quoted on the headline's val set.
+  `$S/jobs/headline/baseline_eval.sh` scored
+  `log124M/model_19552.bin` at both `-m 20` and `-m 320`: **3.2806964 and
+  3.2900271**. The 20-batch val reads 0.0093 below the 320-batch val at that
+  checkpoint; the bias at earlier checkpoints is unmeasured.
 
 ### Recipe
 
@@ -459,11 +478,16 @@ run:    BIN=build/train_gpt2_bf16_headline LLMM_LOG_LEVEL=verbose LLMM_LOG_FILE=
      what this recipe can do, because a shorter horizon would start its
      cooldown earlier.
   5. Also give the first evals at or below 3.285 and 3.29, next to the
-     baseline's 9.44B and 9.04B, and the minimum val.
+     baseline's 9.44B and 8.91B, and the minimum val.
 - **If 3.28 is not reached by 1.99B.** Report "not reached at 1.99B" with
-  the final val and the gap. The next run would be `-x 5700` (2.99B), not a
-  continuation, because a continued run would re-enter the cooldown from a
-  run that has already decayed.
+  the final val and the gap. The next run would be `-x 5700` (2.99B). It
+  was not run as a continuation of the finished `-x 3800` run (that run had
+  already decayed), but as a branch: resumed from the step-2000 checkpoint of the
+  `-x 3800` run, which is before either cooldown starts, with the schedule
+  recomputed for `-x 5700`. The stable phase is identical at both horizons, so
+  this is the same trajectory a fresh `-x 5700` run would follow to step 2000
+  (up to the non-bit-exact bf16 resume), and it was done at the user's choice to
+  save the 2000 steps (about 9 h).
 - **Val cadence.** Every 100 steps (52.4M tokens) at `-m 320`, 39 evals in
   all. This brackets the crossing to 52M tokens. 50-step evals would double
   the val cost for a resolution that is finer than the val-set noise.
@@ -558,8 +582,112 @@ It prints:
 - median ms per step and training hours
 - the largest `qk_max`
 
+## Headline result: tokens to val 3.28
+
+The design above was run at two horizons. Primary result, on the same
+10.5M-token val set (`-m 320`): AdamW after 10.25B tokens scores **3.2900**.
+The combined recipe passes that value by **2.88B tokens** (step 5500, 3.28924;
+step 5400 read 3.30137), about **3.6x fewer tokens**, and ends at **3.27035 at
+2.99B**, 0.0197 below AdamW's final checkpoint on that val set. Under the same
+`-m 320` rule AdamW's final checkpoint has not reached 3.28 either (3.2900), so
+there is no AdamW tokens-to-3.28 and this doc computes no ratio to it.
+
+![Headline run: val loss vs tokens for the recipe at two horizons and the AdamW baseline, the crossing zoomed with both cooldowns, the learning rate, and the max attention logit](../../figures/modded_nanogpt_adoption_headline_2026-11-02.png)
+
+Reproduce with `make figure-adoption-headline`. The table below is generated by
+it from the committed logs and `docs/ai/data/adoption_adamw_baseline_val_m20.json`
+(the AdamW curve extracted from its training log, `--extract-baseline`, kept
+so rendering needs no ignored file).
+
+<!-- adoption-headline:start -->
+| run | val set | first <= 3.29 (step / tokens / val) | first <= 3.285 | first <= 3.28 | final | lowest |
+|---|---|---|---|---|---|---|
+| recipe `-x 5700` | 10.5M tokens (`-m 320`) | 5500 / 2.884B / 3.28924 | 5600 / 2.936B / 3.27953 | 5600 / 2.936B / 3.27953 | 5700 / 2.988B / 3.27035 | 5700 / 2.988B / 3.27035 |
+| recipe `-x 3800` | 10.5M tokens (`-m 320`) | not reached | not reached | not reached | 3800 / 1.992B / 3.32488 | 3800 / 1.992B / 3.32488 |
+| AdamW 524k, 19,552 steps | 655k tokens (`-m 20`) | 17000 / 8.913B / 3.28986 | 18000 / 9.437B / 3.28461 | not reached | 19552 / 10.251B / 3.28070 | 19250 / 10.093B / 3.28068 |
+| AdamW final checkpoint, re-evaluated | 10.5M tokens (`-m 320`) | not measured | not measured | not measured (final 3.29003) | 19552 / 10.251B / 3.29003 | n/a |
+| AdamW final checkpoint, re-evaluated | 655k tokens (`-m 20`) | | | | 19552 / 10.251B / 3.28070 | |
+
+Same-val comparison: the recipe's first eval at or below AdamW's final 320-batch value (3.2900) is step 5500 (2.884B, 3.28924); the eval before it, step 5400, read 3.30137. That is 3.55x fewer tokens than AdamW's 10.25B. The recipe's final value is -0.0197 against AdamW's final checkpoint on that val set. The 20-batch val reads 0.0093 below the 320-batch val at AdamW's final checkpoint; the bias at earlier checkpoints is unmeasured, so the AdamW crossing rows are on a different val set from the recipe rows.
+<!-- adoption-headline:end -->
+
+### What ran
+
+- **`-x 3800`** (`adoption_headline_tokens_to_328.jsonl`): the design's command,
+  1.99B tokens, 18.0 h. Final val 3.32488; **never crossed 3.28** (nor 3.285 or
+  3.29).
+- **`-x 5700`** (`adoption_headline_x5700.jsonl`): the design's "next run".
+  It resumed from the step-2000 checkpoint of the `-x 3800` run (before either
+  cooldown) with the schedule recomputed, and ran steps 2001-5700, 17.21 h, median
+  16,687 ms/step. Val at step 2000 reproduced 3.5833. First val <= 3.29 at step
+  5500 (2.884B, 3.28924); first <= 3.285 and <= 3.28 at step 5600 (2.936B,
+  3.27953; bracket 2.884B to 2.936B); final 3.27035 at step 5700 (2.988B). Peak
+  `qk_max` 7.906 (the `-x 3800` run peaked at 7.938), under the 8.0 cap
+  throughout; the shared 0-2000 prefix is the first run's.
+- The `-x 3800` run's steps 2001-3800 are discarded for this comparison; the
+  tokens-to-target counts the shared 0-2000 prefix plus the branch.
+- Both used the pre-fusion kernels (commit `21a2e4c`).
+
+### Findings
+
+1. **Same-val comparison (primary).** AdamW's final checkpoint
+   (`log124M/model_19552.bin`, 10.25B tokens) evaluated by this repo's trainer:
+   3.2806964 at `-m 20`, **3.2900271 at `-m 320`**. The recipe's first
+   320-batch eval at or below 3.2900 is step 5500 (2.884B); the eval before it
+   (step 5400, 2.831B) read 3.30137. So the recipe passes AdamW's final value
+   with about 3.6x fewer tokens (10.25B / 2.884B = 3.55; the crossing lies in
+   (2.831B, 2.884B], so at least 3.55x), and its final value is 0.0197 lower.
+2. **AdamW's own curve is on a different val set, and the bias is only known at
+   the end.** The baseline log used `-m 20` (655,360 tokens, a prefix of the
+   10.5M-token set). At the final checkpoint that val reads 0.0093 below the
+   320-batch val. At earlier checkpoints the bias is unmeasured, so the AdamW
+   crossing rows in the table (<= 3.29 at 8.91B, <= 3.285 at 9.44B, lowest
+   3.28068 at 10.09B, final 3.28070) are on the 20-batch val and the ratios
+   against them are not same-val. If the bias were constant, AdamW's
+   320-batch curve would sit about 0.009 higher and cross each level
+   later than the table says, but that is an assumption.
+3. **The crossing is in the cooldown, so it is a (recipe, horizon) figure.** The
+   `-x 5700` cooldown starts at step 3420 (1.79B tokens) and ends at 5700; every
+   level was crossed inside it. The design's reporting rule applies: quote the
+   crossing as "at `-x 5700`". The `-x 3800` run, whose cooldown started at
+   step 2280 (1.19B), ended at 3.325 and did not cross at 1.99B, so horizon
+   matters. Horizons between 3800 and 5700, and shorter cooldown fractions, are
+   untested; this run does not say where the best horizon is.
+4. **The branch is on the same trajectory until the cooldowns diverge.** The two
+   runs share steps 0-2000 and run at the same constant learning rate to step 2280.
+   Their evals differ by 6e-4 at step 2100 (3.57181 vs 3.57242), which is the
+   bf16 resume (the fp32 master is rebuilt from bf16 params), and by 1e-4 at
+   step 2300. They then separate because the `-x 3800` rate decays from 2280 and the
+   `-x 5700` rate holds until 3420 (panels b and c). The `-x 3800` curve is
+   lower throughout steps 2400-3800, as expected for the faster decay, and
+   the `-x 5700` curve catches up and passes the `-x 3800` final value (3.3249) around step 5200.
+5. **QK-norm held the logit bound for 5700 steps** (panel d): the max attention
+   logit sits at 7.8 to 7.94 after the first 200 steps, under the 8.0 cap.
+6. **modded-nanogpt's "under 0.7B tokens" is not like-for-like.** It uses a
+   larger architecture stack (record 5 and later), and our val shard has not
+   been compared byte-for-byte with theirs, so the two token counts are context,
+   not a ranking.
+
+### Caveats
+
+- **One seed per horizon.** The three-seed confirmation was 600 steps at 131k
+  tokens/step; this run is 5700 steps at 524k and was not repeated. Seed spread at
+  this horizon is unmeasured (it was 0.003 to 0.010 at 600 steps).
+- **(Recipe, horizon) pair.** See finding 3; the 0.4 cooldown fraction was not
+  re-tuned.
+- **Branch, not a fresh run.** The `-x 5700` run resumed from step 2000; the
+  pre-cooldown schedule is identical at both horizons, and the resume is not
+  bit-exact (finding 4).
+- **Pre-fusion kernels.** The fused-kernel build (W10) has no convergence run;
+  its numerics differ only by single versus double rounding, but this is
+  not measured here.
+- **Learning rate 4.8e-3 was tuned at 131k tokens/step** and was not re-tuned at 524k.
+- **Val-set equivalence with modded-nanogpt** is assumed, not checked
+  (design section).
+- **AdamW baseline bias** is measured at one checkpoint only (finding 2).
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Sonnet 5.5 results agent; item
 implementations by Sonnet agents and independent verification by Opus agents),
-directed by Evan Owen. The headline-run design section was written by a Claude Code Opus 5.5 design agent, also directed by Evan Owen.
+directed by Evan Owen. The headline-run design section was written by a Claude Code Opus 5.5 design agent, also directed by Evan Owen. The headline-result section, figure and script were written by a Claude Code Sonnet 5.5 agent, directed by Evan Owen.

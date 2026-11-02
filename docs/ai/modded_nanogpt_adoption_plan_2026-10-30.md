@@ -419,8 +419,10 @@ carries "first eval at or below AdamW's step-600 val". For this track the
 headline is **tokens to val 3.28 on FineWeb**, which makes llm.mojo comparable
 to both llm.c (10B tokens) and modded-nanogpt (under 0.7B tokens with Muon
 plus the record 5 architecture in January 2025; under 330M today with
-everything). The existing 524k-token AdamW run that reached 3.28 is the
-baseline. Once W1 to W3 are in, schedule a single full run of the best recipe
+everything). The existing 524k-token AdamW run is the
+baseline; it did not reach 3.28: it ended at 3.2807 on its own 20-batch val and
+3.2900 on the 320-batch val that modded-nanogpt's target uses (see the results
+doc's headline section). Once W1 to W3 are in, schedule a single full run of the best recipe
 at the full batch and record tokens-to-3.28 in the README table.
 
 ## 6. Results
