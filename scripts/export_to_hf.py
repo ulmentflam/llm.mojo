@@ -44,7 +44,23 @@ architecture) instead of loading it as GPT-2. Layout notes:
     attention scale and the llm.mojo flags word `llm_mojo_arch_flags`.
 Files written before QK-norm had a flag bit record rotary only; correct a copy
 first with scripts/set_checkpoint_arch_flags.py (the exporter only believes the
-header).
+header). Because of that, a file whose flags word is exactly rotary (1) cannot be
+told apart from a pre-QK-bit rotary+QK-norm file, so the exporter REFUSES it
+unless `--flags-confirmed` says the flags are right. The same limit applies the
+other way round and cannot be detected at all: a flags=0 file takes the stock
+GPT-2 path (llm.c's exporter, a stock config), so a QK-norm-only model written
+before the bit existed (flags 0) would export as stock GPT-2 and compute the
+wrong model there. State the architecture you trained with, correct the copy
+with scripts/set_checkpoint_arch_flags.py, and check the export with
+scripts/check_hf_export.py --expect-loss.
+
+`--attn-scale` is the attention scale the model was trained with (llm.mojo's
+`-attn_scale`, a run-time argument that no checkpoint records). The default is
+1/sqrt(head_dim), what a run without `-attn_scale` uses; it is written to
+config.json as `attn_scale` and the Mojo loader applies it. Pass the value you
+trained with, or the export computes a different model silently. It cannot be
+recorded in a stock export (flags 0), where a non-default value is refused.
+Dropout: llm.mojo's trainer has no dropout, so the config says 0.0.
 
 This is a thin wrapper; the real conversion logic (header parsing, tensor
 reshaping, bf16/fp32 handling) lives in
@@ -301,7 +317,9 @@ def llm_mojo_state_dict(w: dict, header: list[int], kind: str, widen: bool = Fal
     return t, wpe_omitted
 
 
-def llm_mojo_config(header: list[int], kind: str, wpe_omitted: bool) -> dict:
+def llm_mojo_config(
+    header: list[int], kind: str, wpe_omitted: bool, attn_scale: float | None = None
+) -> dict:
     """config.json for an llm_mojo_gpt2 export: a GPT2Config's fields (so the
     shape keys the Mojo loader reads are the same) with the stock-attention keys
     that would mislead removed and the architecture spelled out."""
@@ -351,29 +369,71 @@ def llm_mojo_config(header: list[int], kind: str, wpe_omitted: bool) -> dict:
         cfg["rotary_type"] = "half_truncated"
         cfg["rotary_base"] = ROTARY_BASE
         cfg["rotary_note"] = (
-            f"per head (head_dim {hd}, n = head_dim/4 = {hd // 4}): freq[i] = "
-            "rotary_base ** -(i/(n-1)) for i < n, rotating the pair "
-            "(x[i], x[i + head_dim/2]); every other dim is unrotated; applied "
-            "to q and k after QK-norm, no learned position embedding"
+            f"per head (head_dim {hd}, n = head_dim/4 = {hd // 4}): "
+            "freq[i] = rotary_base ** -(i/(n-1)) for i < n (1 when n == 1); "
+            "theta = pos * freq[i]; for each i < n rotate the pair "
+            "(x1, x2) = (x[i], x[i + head_dim/2]): "
+            "x1' = x1 cos(theta) + x2 sin(theta); "
+            "x2' = x2 cos(theta) - x1 sin(theta); "
+            "every other dim is unrotated; applied to q and k "
+            "after QK-norm, no learned position embedding"
         )
         cfg["wpe_omitted"] = wpe_omitted
     cfg["qk_norm"] = bool(flags & ARCH_FLAG_QK_NORM)
     if flags & ARCH_FLAG_QK_NORM:
         cfg["qk_norm_eps"] = QK_NORM_EPS
         cfg["qk_norm_affine"] = False
-    # Effective scale of q.k (the default 1/sqrt(head_dim); llm.mojo takes it at
-    # run time and the headline run used the default).
-    cfg["attn_scale"] = 1.0 / (hd**0.5)
+    # Effective scale of q.k: llm.mojo takes it at run time (-attn_scale) and no
+    # checkpoint records it, so the exporter is told (--attn-scale); the default
+    # is what a run without the argument uses.
+    cfg["attn_scale"] = attn_scale if attn_scale is not None else 1.0 / (hd**0.5)
+    # llm.mojo has no dropout anywhere (grep -i dropout over *.mojo is empty; the
+    # trainer's forward is deterministic), so the model as trained used none.
+    # GPT2Config's 0.1 defaults would claim otherwise.
+    for k in ("attn_pdrop", "embd_pdrop", "resid_pdrop"):
+        cfg[k] = 0.0
     return cfg
 
 
-def export_llm_mojo(src: Path, output: Path, dtype: str, tokenizer_from: Path | None):
+def parse_attn_scale(text: str | None, head_dim: int) -> float | None:
+    """--attn-scale: a positive finite number, else refuse (None = default)."""
+    import math
+
+    if text is None:
+        return None
+    try:
+        v = float(text)
+    except ValueError:
+        raise SystemExit(f"--attn-scale {text!r} is not a number") from None
+    if not math.isfinite(v) or v <= 0:
+        raise SystemExit(f"--attn-scale {text!r} must be a positive finite number")
+    return v
+
+
+def export_llm_mojo(
+    src: Path,
+    output: Path,
+    dtype: str,
+    tokenizer_from: Path | None,
+    attn_scale: float | None = None,
+    flags_confirmed: bool = False,
+):
     from safetensors.torch import save_file
 
     header = read_header(src)
     flags = header[MODEL_FLAGS_SLOT]
     if flags & ~KNOWN_MODEL_FLAGS or flags == 0:
         raise SystemExit(f"{src}: flags {flags} are not rotary/QK-norm model flags")
+    if flags == ARCH_FLAG_ROTARY and not flags_confirmed:
+        raise SystemExit(
+            f"{src}: flags = {flags} (rotary only). Files written before QK-norm had a "
+            "flag bit also record rotary only, so this file cannot be told apart "
+            "from a rotary+QK-norm model written before the bit existed: exporting "
+            "it unchecked would write a config that omits QK-norm and computes the "
+            "wrong model. If this file really was trained WITHOUT QK-norm, pass "
+            "--flags-confirmed; if it was trained with it, correct a copy first with "
+            "scripts/set_checkpoint_arch_flags.py --flags rotary,qk-norm."
+        )
     w, kind = read_bin_tensors(src, header)
     want = {"auto": kind, "bfloat16": "bf16", "float32": "fp32"}[dtype]
     if want == "bf16" and kind == "fp32":
@@ -388,7 +448,7 @@ def export_llm_mojo(src: Path, output: Path, dtype: str, tokenizer_from: Path | 
         kind = "fp32"
     output.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(output / "model.safetensors"), metadata={"format": "pt"})
-    cfg = llm_mojo_config(header, kind, wpe_omitted)
+    cfg = llm_mojo_config(header, kind, wpe_omitted, attn_scale)
     (output / "config.json").write_text(
         json.dumps(cfg, indent=2, sort_keys=True) + "\n"
     )
@@ -455,18 +515,54 @@ def main() -> int:
         help="rotary/QK-norm export: copy tokenizer.json and tokenizer_config.json "
         "from this directory instead of building them from the `gpt2` tokenizer",
     )
+    parser.add_argument(
+        "--flags-confirmed",
+        action="store_true",
+        help="rotary-only files (flags = 1): confirm the model was trained without "
+        "QK-norm. Pre-QK-bit rotary+QK-norm files record the same word and would "
+        "export as a wrong model; without this flag the exporter refuses them",
+    )
+    parser.add_argument(
+        "--attn-scale",
+        default=None,
+        help="attention scale the model was trained with (-attn_scale); default "
+        "1/sqrt(head_dim). Written to config.json and applied by the Mojo loader. "
+        "Not recordable in a stock (flags 0) export, where a non-default value "
+        "is refused",
+    )
     args = parser.parse_args()
 
     if not args.input.is_file():
         parser.error(f"input checkpoint not found: {args.input}")
-    flags = read_header(args.input)[MODEL_FLAGS_SLOT]
+    header = read_header(args.input)
+    flags = header[MODEL_FLAGS_SLOT]
+    head_dim = header[6] // header[5]
+    attn_scale = parse_attn_scale(args.attn_scale, head_dim)
     if flags:
         if flags & ~KNOWN_MODEL_FLAGS:
             raise SystemExit(f"{args.input}: unknown architecture flag bits {flags}")
         export_llm_mojo(
-            args.input, args.output, args.dtype or "auto", args.tokenizer_from
+            args.input,
+            args.output,
+            args.dtype or "auto",
+            args.tokenizer_from,
+            attn_scale,
+            args.flags_confirmed,
         )
         return 0 if (not args.verify or verify_export(args.output)) else 1
+    if attn_scale is not None and abs(attn_scale - head_dim**-0.5) > 1e-12:
+        raise SystemExit(
+            f"{args.input}: --attn-scale {attn_scale} cannot be recorded in a stock "
+            "GPT-2 export (flags 0): a stock config has no such key, so the export "
+            "would compute a different model"
+        )
+    print(
+        "[export_to_hf] flags = 0: exporting as STOCK GPT-2. A model trained with "
+        "QK-norm before the checkpoint recorded it also has flags 0 and cannot be "
+        "detected; if this was one, correct a copy with "
+        "scripts/set_checkpoint_arch_flags.py first. Check the result with "
+        "scripts/check_hf_export.py --expect-loss."
+    )
     if args.dtype == "auto":
         args.dtype = None
     args.dtype = args.dtype or "bfloat16"

@@ -15,6 +15,8 @@ from llmm.checkpointing import (
     write_model_checkpoint,
     read_model_checkpoint,
     peek_model_header,
+    peek_model_arch_flags,
+    MODEL_MAGIC_LEGACY,
     write_state_checkpoint,
     read_state_checkpoint,
     make_training_state,
@@ -31,8 +33,11 @@ from llmm.checkpointing import (
     STATE_UNTIE_STEP_SLOT,
     MODEL_FLAGS_SLOT,
 )
+from llmm.safetensors import read_hf_arch
 from train_gpt2 import (
     check_arch_flags,
+    check_hf_arch,
+    unflagged_init_note,
     ARCH_FLAGS,
     STATE_ARCH_FLAGS,
     ROTARY,
@@ -1211,6 +1216,173 @@ def test_state_arch_flags_untied_bit_is_distinct_from_rotary() raises:
     m_out.unsafe_free()
     v_out.unsafe_free()
     _remove(path)
+
+
+def _plant_magic(path: String, magic: Int) raises:
+    var builtins = Python.import_module("builtins")
+    var struct_ = Python.import_module("struct")
+    var f = builtins.open(path, "r+b")
+    _ = f.seek(0)
+    _ = f.write(struct_.pack("<i", magic))
+    f.close()
+
+
+def test_peek_model_arch_flags_accepts_the_legacy_llm_c_magic() raises:
+    """Regression: `infer_gpt2` looked at the flags word through the strict
+    `peek_model_header` (magic 20240520 only) before constructing the model, so
+    a legacy-magic (20240326, llm.c) copy of a pretrained file that GPT2.__init__
+    loads exited 1 in generate, --eval and --loss. The pre-constructor look must
+    accept both magics and still refuse a third."""
+    var path = String("test_ckpt_legacy_magic.bin")
+    var cfg = _tiny_config()
+    var n = cfg.num_parameters()
+    var params = heap_alloc[Float32](n)
+    _fill_pattern(params, n, 0.5)
+    write_model_checkpoint(
+        path, cfg, params, n, arch_flags=ARCH_FLAG_ROTARY | ARCH_FLAG_QK_NORM
+    )
+    assert_equal(peek_model_arch_flags(path), 5)
+    _plant_magic(path, MODEL_MAGIC_LEGACY)
+    assert_equal(peek_model_arch_flags(path), 5)
+    # the strict peek is for files this trainer wrote; it must keep refusing
+    assert_equal(_raises_peek_header(path), True)
+    _plant_magic(path, 12345)
+    var refused = False
+    try:
+        _ = peek_model_arch_flags(path)
+    except:
+        refused = True
+    assert_equal(refused, True)
+    params.unsafe_free()
+    _remove(path)
+
+
+def _raises_peek_header(path: String) -> Bool:
+    try:
+        _ = peek_model_header(path)
+    except:
+        return True
+    return False
+
+
+def test_unflagged_init_note_names_the_missing_bits() raises:
+    assert_equal(unflagged_init_note("f.bin", 5, expected=5), "")
+    assert_equal(unflagged_init_note("f.bin", 7 & ~2, expected=1), "")
+    assert_equal(unflagged_init_note("f.bin", 0, expected=0), "")
+    for e in range(8):
+        if (e & ARCH_FLAG_UNTIED) != 0:
+            continue
+        for g in range(8):
+            if (g & ARCH_FLAG_UNTIED) != 0:
+                continue
+            var note = unflagged_init_note("f.bin", g, expected=e)
+            assert_equal(note != "", (e & ~g) != 0)
+            if note != "":
+                assert_true("f.bin records " + String(g) in note)
+
+
+def _write_text(path: String, text: String) raises:
+    var f = open(path, "w")
+    f.write(text)
+    f.close()
+
+
+def _hf_arch_refusal(config_text: String, expected: Int) raises -> String:
+    """check_hf_arch's error for a planted config.json, "" when accepted."""
+    var path = String("test_hf_arch_config.json")
+    _write_text(path, config_text)
+    var out = String("")
+    try:
+        check_hf_arch(path, read_hf_arch(path), expected=expected)
+    except e:
+        out = String(e)
+    _remove(path)
+    return out
+
+
+def _llm_mojo_cfg(flags: String, rotary: String, qk: String) -> String:
+    var text = String('{"model_type": "llm_mojo_gpt2"')
+    if flags != "":
+        text += ', "llm_mojo_arch_flags": ' + flags
+    if rotary != "":
+        text += ', "rotary": ' + rotary
+    if qk != "":
+        text += ', "qk_norm": ' + qk
+    return text + ', "n_layer": 12}'
+
+
+def test_read_hf_arch_planted_configs() raises:
+    var path = String("test_hf_arch_read.json")
+    _write_text(path, _llm_mojo_cfg("5", "true", "false"))
+    var a = read_hf_arch(path)
+    assert_equal(a.model_type, "llm_mojo_gpt2")
+    assert_equal(a.arch_flags, 5)
+    assert_equal(a.rotary, 1)
+    assert_equal(a.qk_norm, 0)
+    _write_text(path, '{"model_type": "gpt2", "n_layer": 12}')
+    var b = read_hf_arch(path)
+    assert_equal(b.arch_flags, 0)
+    assert_equal(b.rotary, -1)
+    assert_equal(b.qk_norm, -1)
+    _remove(path)
+
+
+def test_hf_arch_accepts_a_consistent_flagged_config() raises:
+    var ok = _llm_mojo_cfg("5", "true", "true")
+    assert_equal(_hf_arch_refusal(ok, 5), "")
+    # a build with more flags than the file is allowed (non-strict init) ...
+    assert_equal(_hf_arch_refusal(_llm_mojo_cfg("1", "true", "false"), 5), "")
+    # ... and a stock export loads in any build (the init path)
+    assert_equal(_hf_arch_refusal('{"model_type": "gpt2"}', 0), "")
+    assert_equal(_hf_arch_refusal('{"model_type": "gpt2"}', 5), "")
+
+
+def test_hf_arch_refuses_missing_flags() raises:
+    var text = _hf_arch_refusal(_llm_mojo_cfg("", "true", "true"), 5)
+    assert_true("without llm_mojo_arch_flags" in text)
+    assert_true(
+        "without llm_mojo_arch_flags"
+        in _hf_arch_refusal(_llm_mojo_cfg("0", "false", "false"), 5)
+    )
+
+
+def test_hf_arch_refuses_flags_the_build_lacks() raises:
+    var five = _llm_mojo_cfg("5", "true", "true")
+    for e in [0, ARCH_FLAG_ROTARY, ARCH_FLAG_QK_NORM]:
+        assert_true("mismatched" in _hf_arch_refusal(five, e))
+    assert_true("QK-norm (file on, build off" in _hf_arch_refusal(five, 1))
+    assert_true("rotary (file on, build off" in _hf_arch_refusal(five, 4))
+
+
+def test_hf_arch_refuses_flags_on_a_non_llm_mojo_model_type() raises:
+    var t1 = _hf_arch_refusal(
+        '{"model_type": "gpt2", "llm_mojo_arch_flags": 5}', 5
+    )
+    assert_true("neither a stock gpt2 nor an llm_mojo_gpt2" in t1)
+    var t2 = _hf_arch_refusal(
+        '{"model_type": "llama", "llm_mojo_arch_flags": 0}', 5
+    )
+    assert_true("neither a stock gpt2 nor an llm_mojo_gpt2" in t2)
+    var t3 = _hf_arch_refusal('{"model_type": "gpt2", "rotary": true}', 5)
+    assert_true("stock gpt2 config that says rotary/qk_norm true" in t3)
+
+
+def test_hf_arch_refuses_keys_that_disagree_with_the_flags() raises:
+    """The mutants a flags-only loader passes: flags 5 with qk_norm false (the
+    shipped-by-hand case that ran silently), rotary false, a key missing, a key
+    that is not a boolean, and a key true that the flags do not carry."""
+    var bad = List[String]()
+    bad.append(_llm_mojo_cfg("5", "true", "false"))
+    bad.append(_llm_mojo_cfg("5", "false", "true"))
+    bad.append(_llm_mojo_cfg("5", "false", "false"))
+    bad.append(_llm_mojo_cfg("5", "true", ""))
+    bad.append(_llm_mojo_cfg("5", "", "true"))
+    bad.append(_llm_mojo_cfg("5", "true", "yes"))
+    bad.append(_llm_mojo_cfg("1", "true", "true"))
+    bad.append(_llm_mojo_cfg("4", "true", "true"))
+    for text in bad:
+        var got = _hf_arch_refusal(text, 5)
+        assert_true("disagrees with the config's own rotary" in got)
 
 
 def _cleanup_loader_data():

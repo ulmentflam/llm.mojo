@@ -10,6 +10,23 @@ checkpoint it came from.
       (train_gpt2.py, GPT2_ROTARY / GPT2_QK_NORM set from the config) and print
       the loss and first per-position losses of a real batch, for comparison
       with `infer_gpt2 --loss` on the same file and tokens.
+  (c) config coherence: llm_mojo_arch_flags equals the .bin header's flags and
+      the config's own `rotary` / `qk_norm` booleans agree with it (the Mojo
+      loader refuses the same contradiction).
+
+  --expect-loss V --loss-tol T   the reference forward's loss must be within T of
+                                 V (e.g. the loss the checkpoint is known to
+                                 score on this shard and batch), else status=fail.
+                                 Without it a wrong-architecture export that
+                                 round-trips bit-exactly (the tensors are right,
+                                 the config is wrong) still reports pass; a
+                                 forward at 8.55 instead of 3.29 is the case this
+                                 catches.
+  --mojo-loss M                  also compare against `infer_gpt2 --loss` output M
+                                 on the same shard/B/T (tolerance --loss-tol).
+  Shape checks in the Mojo loader cannot see a SQUARE matrix stored transposed
+  (c_attn is not square, but attn.c_proj is C x C); this script's round trip and
+  forward are the gate for that.
 
   python scripts/check_hf_export.py --bin model_5700.bin --dir out/ \
       --data data/.fineweb10B/fineweb_val_000000.bin [--mutant c_attn|attn_c_proj|c_fc|mlp_c_proj]
@@ -179,11 +196,42 @@ def round_trip(bin_path: Path, st: dict) -> bool:
     return ok
 
 
-def reference_forward(st: dict, cfg: dict, data: Path, B: int, T: int) -> None:
+def check_config(bin_path: Path, cfg: dict) -> bool:
+    """llm_mojo_arch_flags == the .bin's header flags; rotary / qk_norm booleans
+    agree with the word (same rule as check_hf_arch in train_gpt2.mojo)."""
+    h, _ = raw_bin(bin_path)
+    bin_flags = int(h[20])
+    flags = cfg.get("llm_mojo_arch_flags")
+    ok = True
+    if cfg.get("model_type") != "llm_mojo_gpt2":
+        print(f"config_error model_type={cfg.get('model_type')!r}")
+        ok = False
+    if flags != bin_flags:
+        print(
+            f"config_error llm_mojo_arch_flags={flags!r} bin_header_flags={bin_flags}"
+        )
+        ok = False
+    if cfg.get("rotary") is not bool(bin_flags & 1) or cfg.get("qk_norm") is not bool(
+        bin_flags & 4
+    ):
+        print(
+            f"config_error rotary={cfg.get('rotary')!r} qk_norm={cfg.get('qk_norm')!r} "
+            f"disagree with bin flags {bin_flags}"
+        )
+        ok = False
+    print(
+        f"config_check flags={flags} bin_flags={bin_flags} status={'pass' if ok else 'fail'}"
+    )
+    return ok
+
+
+def reference_forward(st: dict, cfg: dict, data: Path, B: int, T: int) -> float:
     flags = int(cfg.get("llm_mojo_arch_flags", 0))
     os.environ["GPT2_ROTARY"] = "1" if flags & 1 else "0"
     os.environ["GPT2_QK_NORM"] = "1" if flags & 4 else "0"
-    os.environ["GPT2_ATTN_SCALE"] = "0"  # default 1/sqrt(hd) == config attn_scale
+    # the config's own scale (the reference takes f > 0 as an override; the
+    # default 1/sqrt(hd) is what 0 means and what attn_scale records by default)
+    os.environ["GPT2_ATTN_SCALE"] = repr(float(cfg["attn_scale"]))
     import torch
 
     sys.path.insert(0, str(REPO))
@@ -248,6 +296,7 @@ def reference_forward(st: dict, cfg: dict, data: Path, B: int, T: int) -> None:
         f"reference_loss={lp.mean().item():.8f} B={B} T={T} rotary={ref.ROTARY} qk_norm={ref.QK_NORM}"
     )
     print("reference_row0_losses=" + " ".join(f"{v:.6f}" for v in lp[:8].tolist()))
+    return float(lp.mean().item())
 
 
 def main() -> int:
@@ -259,7 +308,22 @@ def main() -> int:
     ap.add_argument("--T", type=int, default=1024)
     ap.add_argument("--mutant", choices=["c_attn", "attn_c_proj", "c_fc", "mlp_c_proj"])
     ap.add_argument("--no-forward", action="store_true")
+    ap.add_argument("--expect-loss", type=float, help="expected reference loss")
+    ap.add_argument(
+        "--loss-tol", type=float, default=None, help="tolerance for the loss checks"
+    )
+    ap.add_argument(
+        "--mojo-loss", type=float, help="`infer_gpt2 --loss` value to compare"
+    )
     args = ap.parse_args()
+    if (args.expect_loss is not None or args.mojo_loss is not None) and (
+        args.loss_tol is None or args.loss_tol <= 0
+    ):
+        ap.error("--expect-loss / --mojo-loss need a positive --loss-tol")
+    if (args.expect_loss is not None or args.mojo_loss is not None) and (
+        not args.data or args.no_forward
+    ):
+        ap.error("--expect-loss / --mojo-loss need --data and the forward check")
 
     directory = args.dir
     if args.mutant:
@@ -274,19 +338,40 @@ def main() -> int:
 
         setattr(ex, "conv1d", broken)
         tmp = tempfile.mkdtemp(prefix="hf_mutant_")
-        ex.export_llm_mojo(args.bin, Path(tmp), "auto", args.dir)
+        ex.export_llm_mojo(args.bin, Path(tmp), "auto", args.dir, None, True)
         directory = Path(tmp)
         print(f"mutant={args.mutant} (that Conv1D transpose forgotten) dir={tmp}")
 
     st = load_st(directory / "model.safetensors")
     cfg = json.loads((directory / "config.json").read_text())
     ok = round_trip(args.bin, st)
+    ok &= check_config(args.bin, cfg)
     if args.data and not args.no_forward:
         try:
-            reference_forward(st, cfg, args.data, args.B, args.T)
+            ref_loss = reference_forward(st, cfg, args.data, args.B, args.T)
         except AssertionError as e:
             print(f"reference_forward status=fail ({e!r})")
             ok = False
+            ref_loss = None
+        if args.expect_loss is not None:
+            good = (
+                ref_loss is not None
+                and abs(ref_loss - args.expect_loss) <= args.loss_tol
+            )
+            print(
+                f"expect_loss reference={ref_loss} expected={args.expect_loss} "
+                f"tol={args.loss_tol} status={'pass' if good else 'fail'}"
+            )
+            ok &= good
+        if args.mojo_loss is not None:
+            good = (
+                ref_loss is not None and abs(ref_loss - args.mojo_loss) <= args.loss_tol
+            )
+            print(
+                f"mojo_loss reference={ref_loss} mojo={args.mojo_loss} "
+                f"tol={args.loss_tol} status={'pass' if good else 'fail'}"
+            )
+            ok &= good
     print(f"result check=hf_export status={'pass' if ok else 'fail'}")
     return 0 if ok else 1
 

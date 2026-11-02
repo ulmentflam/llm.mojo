@@ -34,6 +34,7 @@ from llmm.safetensors import (
     SafetensorsFile,
     read_hf_gpt2_config,
     read_hf_arch,
+    HfArch,
     HF_MODEL_TYPE_STOCK,
     HF_MODEL_TYPE_LLM_MOJO,
 )
@@ -497,6 +498,101 @@ def check_arch_flags(
             + _arch_flag_mismatch(got, expected)
             + "rebuild with the matching -D flags"
         )
+
+
+def unflagged_init_note(
+    what: String, got: Int, expected: Int = ARCH_FLAGS
+) -> String:
+    """The note printed when a model is initialised (trainer `-e`, infer_gpt2,
+    test_gpt2, profile) from a file that records fewer architecture flags than
+    the build has, or "" when there is nothing to say.
+
+    Allowed, not refused: files written before QK-norm had a flag bit record
+    rotary only, and the verify gates and bf16 smoke tests start flagged builds
+    from the unflagged pretrained gpt2_124M*.bin on purpose. Silence was the
+    failure mode (a published rotary+QK-norm model ran at loss 6.97 in a
+    rotary-only build with nothing printed), so say it.
+    """
+    var missing = expected & ~got
+    if missing == 0:
+        return String("")
+    return (
+        "[note] this build has architecture flags "
+        + String(expected)
+        + " (1=rotary, 4=QK-norm) but "
+        + what
+        + " records "
+        + String(got)
+        + ": it is a stock/pretrained init or predates the flag. Running it"
+        " with"
+        " the build's architecture; if it was trained with the missing flags,"
+        " write a corrected copy with scripts/set_checkpoint_arch_flags.py"
+        " (an unflagged file cannot be told apart from a stock one)."
+    )
+
+
+def check_hf_arch(
+    config_path: String, arch: HfArch, expected: Int = ARCH_FLAGS
+) raises:
+    """Refuse a config.json whose architecture this build cannot honour.
+
+    A stock "gpt2" config must carry no flags and no rotary/qk_norm true. An
+    "llm_mojo_gpt2" config must carry a nonzero known-bits `llm_mojo_arch_flags`
+    AND `rotary` / `qk_norm` booleans that agree with it (the two are written
+    together; a hand-edited or mutant config where they differ is not a file
+    this loader can vouch for), then goes through `check_arch_flags`.
+    Shapes are checked per tensor at load; a square matrix stored transposed
+    cannot be seen from shape, scripts/check_hf_export.py is the gate for it.
+    """
+    if arch.model_type == HF_MODEL_TYPE_LLM_MOJO:
+        if arch.arch_flags == 0:
+            raise Error(
+                "Cannot load "
+                + config_path
+                + ": model_type llm_mojo_gpt2 without llm_mojo_arch_flags"
+            )
+        var want_rotary = 1 if (arch.arch_flags & ARCH_FLAG_ROTARY) != 0 else 0
+        var want_qk = 1 if (arch.arch_flags & ARCH_FLAG_QK_NORM) != 0 else 0
+        if arch.rotary != want_rotary or arch.qk_norm != want_qk:
+            raise Error(
+                "Cannot load "
+                + config_path
+                + ": llm_mojo_arch_flags="
+                + String(arch.arch_flags)
+                + " disagrees with the config's own rotary / qk_norm keys ("
+                + "rotary="
+                + _hf_bool_text(arch.rotary)
+                + ", qk_norm="
+                + _hf_bool_text(arch.qk_norm)
+                + "); refusing a config that contradicts itself"
+            )
+    elif arch.model_type != HF_MODEL_TYPE_STOCK or arch.arch_flags != 0:
+        raise Error(
+            "Cannot load "
+            + config_path
+            + ": model_type '"
+            + arch.model_type
+            + "' with arch flags "
+            + String(arch.arch_flags)
+            + " is neither a stock gpt2 nor an llm_mojo_gpt2 export"
+        )
+    elif arch.rotary == 1 or arch.qk_norm == 1:
+        raise Error(
+            "Cannot load "
+            + config_path
+            + ": a stock gpt2 config that says rotary/qk_norm true"
+        )
+    check_arch_flags(config_path, arch.arch_flags, False, expected=expected)
+
+
+def _hf_bool_text(v: Int) -> String:
+    if v == -1:
+        return String("absent")
+    if v == 0:
+        return String("false")
+    if v == 1:
+        return String("true")
+    return String("not a boolean")
 
 
 # GPT-2 / GPT-3 share the 50257-token tokenizer, padded to a multiple of 128.
@@ -1927,6 +2023,10 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 model_header.unsafe_free()
                 raise Error("GPT2 error: Invalid version in header")
             check_arch_flags(self.checkpoint_path, init_flags, False)
+            if self.zero_ctx.rank == 0:
+                var note = unflagged_init_note(self.checkpoint_path, init_flags)
+                if note != "":
+                    print(note)
 
             self.config = GPT2Config(
                 max_seq_len=Int(model_header.unsafe_load(2)),
@@ -1965,27 +2065,11 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             # refusal as a flagged .bin. Anything else is not ours to load.
             var hf_cfg = config_dir + "/config.json"
             var hf_arch = read_hf_arch(hf_cfg)
-            if hf_arch.model_type == HF_MODEL_TYPE_LLM_MOJO:
-                if hf_arch.arch_flags == 0:
-                    raise Error(
-                        "Cannot load "
-                        + hf_cfg
-                        + ": model_type llm_mojo_gpt2 without"
-                        " llm_mojo_arch_flags"
-                    )
-            elif hf_arch.model_type != HF_MODEL_TYPE_STOCK or (
-                hf_arch.arch_flags != 0
-            ):
-                raise Error(
-                    "Cannot load "
-                    + hf_cfg
-                    + ": model_type '"
-                    + hf_arch.model_type
-                    + "' with arch flags "
-                    + String(hf_arch.arch_flags)
-                    + " is neither a stock gpt2 nor an llm_mojo_gpt2 export"
-                )
-            check_arch_flags(hf_cfg, hf_arch.arch_flags, False)
+            check_hf_arch(hf_cfg, hf_arch)
+            if self.zero_ctx.rank == 0:
+                var note = unflagged_init_note(hf_cfg, hf_arch.arch_flags)
+                if note != "":
+                    print(note)
             self.allocate_parameters_from_safetensors(
                 safetensors_path, hf_arch.arch_flags
             )
@@ -2751,6 +2835,27 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
             hp[unsafe_offset=i] = Scalar[GPT2_DTYPE](0.0)
 
         var st = SafetensorsFile(safetensors_path)
+
+        # Shapes against config.json before any read: a config that does not
+        # describe these tensors would otherwise copy the wrong amount into
+        # the wrong block. (The transposed matrices are shape-checked inside
+        # read_tensor; a SQUARE one stored the wrong way round cannot be seen
+        # from shape -- scripts/check_hf_export.py is the gate for that.)
+        st.expect_shape("transformer.wte.weight", V, C)
+        if "transformer.wpe.weight" in st.tensors:
+            st.expect_shape("transformer.wpe.weight", max_T, C)
+        for l in range(L):
+            var lp = "transformer.h." + String(l)
+            st.expect_shape(lp + ".ln_1.weight", C)
+            st.expect_shape(lp + ".ln_1.bias", C)
+            st.expect_shape(lp + ".attn.c_attn.bias", 3 * C)
+            st.expect_shape(lp + ".attn.c_proj.bias", C)
+            st.expect_shape(lp + ".ln_2.weight", C)
+            st.expect_shape(lp + ".ln_2.bias", C)
+            st.expect_shape(lp + ".mlp.c_fc.bias", 4 * C)
+            st.expect_shape(lp + ".mlp.c_proj.bias", C)
+        st.expect_shape("transformer.ln_f.weight", C)
+        st.expect_shape("transformer.ln_f.bias", C)
 
         # wte: HF export drops the (V_p - V) padding rows entirely (see
         # export_to_hf.py's `w[key][:(V-Vp), :]` slice) — read the real V

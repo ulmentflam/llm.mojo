@@ -324,6 +324,35 @@ struct SafetensorsFile:
             raise Error("safetensors error: tensor not found: " + name)
         return self.tensors[name].copy()
 
+    def expect_shape(self, name: String, *dims: Int) raises:
+        """Refuse tensor `name` unless its declared shape is exactly `dims`.
+        A transposed read checks this itself; a square matrix stored the wrong
+        way round cannot be told from shape alone (scripts/check_hf_export.py
+        is the gate for that)."""
+        var info = self.get_info(name)
+        var ok = len(info.shape) == len(dims)
+        if ok:
+            for i in range(len(dims)):
+                if info.shape[i] != dims[i]:
+                    ok = False
+        if not ok:
+            var want = String("[")
+            for i in range(len(dims)):
+                want += (", " if i > 0 else "") + String(dims[i])
+            want += "]"
+            var got = String("[")
+            for i in range(len(info.shape)):
+                got += (", " if i > 0 else "") + String(info.shape[i])
+            got += "]"
+            raise Error(
+                "safetensors error: tensor '"
+                + name
+                + "' has shape "
+                + got
+                + " but the config's dimensions need "
+                + want
+            )
+
     def read_tensor[
         dtype: DType
     ](
@@ -386,6 +415,7 @@ struct SafetensorsFile:
 
         # Source is (transpose_cols, transpose_rows) row-major; write dest as
         # (transpose_rows, transpose_cols) row-major: dest[r, c] = src[c, r].
+        self.expect_shape(name, transpose_cols, transpose_rows)
         if transpose_rows * transpose_cols != n:
             raise Error(
                 "safetensors error: transpose dims ("
@@ -495,13 +525,25 @@ struct HfArch(Copyable, Movable):
     var model_type: String
     var arch_flags: Int
     var attn_scale: Float64
+    # The config's own `rotary` / `qk_norm` booleans, which must agree with the
+    # flags word (the loader cross-checks): -1 absent, 0 false, 1 true, 2 not a
+    # JSON boolean.
+    var rotary: Int
+    var qk_norm: Int
 
     def __init__(
-        out self, model_type: String, arch_flags: Int, attn_scale: Float64
+        out self,
+        model_type: String,
+        arch_flags: Int,
+        attn_scale: Float64,
+        rotary: Int = -1,
+        qk_norm: Int = -1,
     ):
         self.model_type = model_type
         self.arch_flags = arch_flags
         self.attn_scale = attn_scale
+        self.rotary = rotary
+        self.qk_norm = qk_norm
 
 
 def _find_hf_config_token(text: String, key: String) -> String:
@@ -538,6 +580,16 @@ def _find_hf_config_token(text: String, key: String) -> String:
     return String()
 
 
+def _hf_bool_token(tok: String) -> Int:
+    if tok == "":
+        return -1
+    if tok == "true":
+        return 1
+    if tok == "false":
+        return 0
+    return 2
+
+
 def read_hf_arch(config_json_path: String) raises -> HfArch:
     """Read model_type, llm_mojo_arch_flags and attn_scale from config.json."""
     var file = open(config_json_path, "r")
@@ -554,4 +606,10 @@ def read_hf_arch(config_json_path: String) raises -> HfArch:
     var scale_tok = _find_hf_config_token(text, "attn_scale")
     if scale_tok != "":
         scale = atof(scale_tok)
-    return HfArch(model_type, flags, scale)
+    return HfArch(
+        model_type,
+        flags,
+        scale,
+        _hf_bool_token(_find_hf_config_token(text, "rotary")),
+        _hf_bool_token(_find_hf_config_token(text, "qk_norm")),
+    )

@@ -22,7 +22,15 @@ both file kinds and checked by every reader.
 | `scripts/check_checkpoint_biases.py` | prints the flags; bias statistics do not depend on the architecture | |
 
 `infer_gpt2` with an unflagged file in a QK-norm build: allowed with a note, not
-refused. Every checkpoint written before this change (including the published
+refused. The note now comes from the `GPT2` constructor (`unflagged_init_note`), so
+the trainer's `-e`, `infer_gpt2`, `test_gpt2` and profile all print it, for a `.bin`
+and for a `.safetensors` (a stock export in a flagged build). `infer_gpt2` alone goes
+further for a stock `model_type: gpt2` safetensors in a flagged build: it refuses
+(`refuse_stock_safetensors_in_flagged_build`), because nothing in that path is an
+intentional init (a stock export is plain GPT-2 by construction, and a rotary/QK-norm
+checkpoint exports as `llm_mojo_gpt2`); the trainer's `-e` from the same file stays
+allowed, with the note, since fine-tuning a pretrained stock model in a flagged build
+is the same init as the `.bin` case. Every checkpoint written before this change (including the published
 `model_5700.bin`, flags = rotary only) is "unflagged" for bit 2, and refusing would
 make the published file unusable until it is rewritten; the verify gates and bf16
 generation smoke tests also run flagged builds on the unflagged pretrained
@@ -85,6 +93,56 @@ transposes undone) and (b) loads the safetensors into the PyTorch reference
 (`train_gpt2.py` with `GPT2_ROTARY=1 GPT2_QK_NORM=1`, fp32, run from a scratch dir).
 `--mutant NAME` re-exports with one Conv1D transpose forgotten; all four fail.
 Numbers are in the commit message and the session report.
+
+### Review fixes (Opus verifier, 2026-11-02)
+
+- Regression: `note_flag_mismatch` in `infer_gpt2` called `peek_model_header`, which
+  accepts only llm.mojo's magic 20240520, while `GPT2.__init__` also accepts llm.c's
+  20240326. A legacy-magic copy of `gpt2_124M_bf16.bin` ran on main but exited 1 in
+  generate, `--eval` and `--loss` on the default build ("bad model magic number in
+  header: 20240326"; reproduced with the pre-fix binary, fixed binary generates and
+  reports loss 3.5096061). The pre-constructor peek is gone from infer (the
+  constructor does the check and the note); `peek_model_arch_flags` accepts both
+  magics for any future pre-constructor look. The other `peek_model_header` call
+  sites are the resume path (`load_state`, model file written by this trainer, so
+  the strict peek is right there) and tests. Test:
+  `test_peek_model_arch_flags_accepts_the_legacy_llm_c_magic` (planted legacy magic
+  with flags 5; mutant restoring the strict magic fails it).
+- Exporter: a flags = 1 file is refused without `--flags-confirmed`, because pre-QK-bit
+  rotary+QK-norm files record the same word. A flags = 0 file takes the stock path and
+  that cannot be detected (a QK-norm-only model written before the bit also has flags
+  0 and would export as stock GPT-2); the exporter prints that limit, the check script
+  with `--expect-loss` is the defence.
+- Exporter `--attn-scale` (default 1/sqrt(head_dim)) is written to `config.json`; a
+  non-numeric, non-finite or non-positive value is refused, and a non-default value is
+  refused on the stock path (a stock config cannot record it). The loader applies the
+  config's scale.
+- `config.json`: `rotary_note` gives the exact rotation, theta = pos * freq,
+  x1' = x1 cos + x2 sin, x2' = x2 cos - x1 sin (sign checked against
+  `llmm/rotary.mojo` `rotate_y1`/`rotate_y2`, `inverse=False`).
+  `attn_pdrop`/`embd_pdrop`/`resid_pdrop` are 0.0: llm.mojo's Mojo trainer has no
+  dropout anywhere (`grep -ril dropout *.mojo llmm/ tests/*.mojo` finds one comment in `llmm/safetensors.mojo` and no code); the PyTorch
+  reference `train_gpt2.py` has an optional, default-off one. GPT2Config's 0.1
+  defaults would have claimed otherwise.
+- Loader cross-checks (`check_hf_arch`): for `llm_mojo_gpt2`, `rotary` and `qk_norm`
+  must be present booleans that agree with `llm_mojo_arch_flags` (the mutant
+  `qk_norm: false` with flags 5 loaded before); a stock config may not say rotary or
+  qk_norm true. `scripts/check_hf_export.py` checks the same against the `.bin` header.
+- Shape checks in the Mojo loader: every non-matrix tensor, `wte`, `wpe`, and the
+  transposed matrices are checked against config.json dimensions before reading. A
+  SQUARE matrix stored the wrong way round (`attn.c_proj`) is invisible to shape, so
+  `check_hf_export.py` (bit-exact round trip + forward) is the gate for that, not the
+  loader.
+- `check_hf_export.py --expect-loss V --loss-tol T` fails a wrong-model export (a
+  flags = 1 export run under the rotary-only reference scores 8.5543 against 3.2880
+  expected: status=fail), and `--mojo-loss M` compares against `infer_gpt2 --loss`.
+- Tests (`tests/test_checkpointing.mojo`): `read_hf_arch` and `check_hf_arch` on planted
+  config files: missing flags, flags the build lacks, flags on a non-llm_mojo
+  model_type, key disagreement (eight planted variants), a stock config saying
+  rotary; and `unflagged_init_note` over all flag pairs. Mutants (each applied alone,
+  each fails exactly its test): strict magic in `peek_model_arch_flags`; the
+  key-agreement check removed; the missing-flags check removed; the final
+  `check_arch_flags` removed; the stock-with-flags check removed.
 
 ## AI use statement
 

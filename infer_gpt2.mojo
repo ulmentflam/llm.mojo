@@ -9,7 +9,7 @@ from llmm.tokenizer import Tokenizer, safe_print
 from llmm.eval_dataloader import EvalDataLoader, eval_stat_correct
 from llmm.hf_download import fetch_hf_checkpoint
 
-from llmm.checkpointing import peek_model_header
+from llmm.safetensors import read_hf_arch, HF_MODEL_TYPE_STOCK
 from train_gpt2 import GPT2, GPT2_DTYPE, ARCH_FLAGS
 
 # Lean inference-only harness: load a checkpoint, and either (a) run
@@ -67,33 +67,39 @@ from train_gpt2 import GPT2, GPT2_DTYPE, ARCH_FLAGS
 #         max_seq_len=1024, to avoid needlessly forwarding padding)
 
 
-def note_flag_mismatch(checkpoint_path: String) raises -> None:
-    """Say so when this build has architecture flags the .bin does not record.
+def refuse_stock_safetensors_in_flagged_build(checkpoint_path: String) raises:
+    """A stock `model_type: gpt2` .safetensors in a rotary or QK-norm build.
 
-    Policy: infer accepts an unflagged file in a flagged build (same rule as the
-    trainer's `-e` init) and does not refuse. Files written before QK-norm had a
-    flag bit (every checkpoint up to the published headline_x5700) record rotary
-    only, and the verify gates and bf16 smoke tests run flagged builds on the
-    unflagged pretrained gpt2_124M*.bin on purpose. Refusing would make the
-    published file unusable until it is rewritten. The reverse (file flags this
-    build lacks) is refused by the GPT2 constructor. Silence is the failure
-    mode, so print a note instead.
+    Unlike a .bin (where an unflagged file in a flagged build is allowed with a
+    note: the trainer's `-e` and the verify gates start flagged runs from the
+    unflagged pretrained gpt2_124M*.bin on purpose, and the GPT2 constructor
+    prints that note), inference of a stock export in a flagged build is
+    always the wrong model for the weights: the stock export is plain GPT-2 by
+    construction (a rotary/QK-norm checkpoint exports as llm_mojo_gpt2). Refuse.
+    The trainer's `-e` from such a file stays allowed (it is an init).
     """
-    if not checkpoint_path.endswith(".bin"):
+    if ARCH_FLAGS == 0 or not checkpoint_path.endswith(".safetensors"):
         return
-    var got = peek_model_header(checkpoint_path).arch_flags
-    var missing = ARCH_FLAGS & ~got
-    if missing != 0:
-        print(
-            "[infer] note: this build has architecture flags",
-            ARCH_FLAGS,
-            "(1=rotary, 4=QK-norm) but",
-            checkpoint_path,
-            "records",
-            got,
-            "- it predates the flag or was not trained with it; running it"
-            " with the build's architecture. Fix a copy with"
-            " scripts/set_checkpoint_arch_flags.py if it was trained with it.",
+    var slash_idx = checkpoint_path.rfind("/")
+    var config_dir = String(
+        checkpoint_path[byte=0:slash_idx]
+    ) if slash_idx >= 0 else String(".")
+    var cfg = config_dir + "/config.json"
+    var arch = read_hf_arch(cfg)
+    if arch.model_type == HF_MODEL_TYPE_STOCK and ARCH_FLAGS != 0:
+        raise Error(
+            "Cannot run "
+            + checkpoint_path
+            + " for inference: its config ("
+            + cfg
+            + ") records architecture flags "
+            + String(arch.arch_flags)
+            + " but this build has "
+            + String(ARCH_FLAGS)
+            + " (1=rotary, 4=QK-norm). A stock gpt2 export is plain GPT-2, so"
+            " this build would compute a different model from the weights. Use"
+            " a build without the flags (or the export of a file trained with"
+            " them)."
         )
 
 
@@ -101,7 +107,7 @@ def run_infer[
     target: StaticString,
 ](checkpoint_path: String, gen_max_length: Int, seed: UInt64) raises -> None:
     var ctx = DeviceContext()
-    note_flag_mismatch(checkpoint_path)
+    refuse_stock_safetensors_in_flagged_build(checkpoint_path)
 
     var model = GPT2[target, 1](
         checkpoint_path,
@@ -167,7 +173,7 @@ def run_eval[
     checkpoint_path: String, eval_path: String, batch_size: Int, seq_len: Int
 ) raises -> None:
     var ctx = DeviceContext()
-    note_flag_mismatch(checkpoint_path)
+    refuse_stock_safetensors_in_flagged_build(checkpoint_path)
 
     var model = GPT2[target, 1](
         checkpoint_path,
@@ -216,7 +222,7 @@ def run_loss[
     checkpoint_path: String, data_path: String, batch_size: Int, seq_len: Int
 ) raises -> None:
     var ctx = DeviceContext()
-    note_flag_mismatch(checkpoint_path)
+    refuse_stock_safetensors_in_flagged_build(checkpoint_path)
     var model = GPT2[target, 1](
         checkpoint_path,
         rank=0,

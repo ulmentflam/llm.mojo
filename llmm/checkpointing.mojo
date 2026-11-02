@@ -38,6 +38,12 @@ comptime CHECKPOINT_HEADER_SIZE = 256  # Number of Int32 slots in every header.
 # Model checkpoint header. Matches GPT2_MAGIC in train_gpt2.mojo (20240520) and
 # the version convention from llm.c: 3 => fp32 params, 5 => bf16 params.
 comptime MODEL_MAGIC = 20240520
+# llm.c's own model magic (the pretrained gpt2_124M*.bin starter pack; same
+# header layout). GPT2.__init__ accepts it, so any reader that only wants to
+# look at the flags word before that constructor must too
+# (`peek_model_arch_flags`): `peek_model_header` is strict and is for files this
+# trainer wrote.
+comptime MODEL_MAGIC_LEGACY = 20240326
 comptime VERSION_FP32 = 3
 comptime VERSION_BF16 = 5
 # Untied-LM-head model files (-D LLMM_UNTIED_HEAD=1): the tied version + 10. The
@@ -347,6 +353,29 @@ def peek_model_header(path: String) raises -> ModelHeader:
     var header = read_model_header(file)
     file.close()
     return header^
+
+
+def peek_model_arch_flags(path: String) raises -> Int:
+    """The architecture flags word (header slot 20) of a model `.bin`, accepting
+    either llm.mojo's or llm.c's magic like `GPT2.__init__` does. Reads only the
+    two header words it needs to judge the file (magic) and the flags; version,
+    shape and size validation stay with the constructor. Use this, not
+    `peek_model_header`, for a pre-constructor look at a file the user supplied:
+    `peek_model_header` refuses the legacy magic, which made `infer_gpt2` exit 1
+    on a legacy-magic copy of a pretrained file that the constructor loads."""
+    var file = open(path, "r")
+    var header = heap_alloc[Int32](CHECKPOINT_HEADER_SIZE)
+    read_and_copy[DType.int32](file, header, CHECKPOINT_HEADER_SIZE)
+    file.close()
+    var magic = Int(header.unsafe_load(0))
+    var flags = Int(header.unsafe_load(MODEL_FLAGS_SLOT))
+    header.unsafe_free()
+    if magic != MODEL_MAGIC and magic != MODEL_MAGIC_LEGACY:
+        raise Error(
+            "Checkpoint error: bad model magic number in header: "
+            + String(magic)
+        )
+    return flags
 
 
 def read_model_checkpoint[

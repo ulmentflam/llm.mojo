@@ -18,6 +18,8 @@ from .checkpointing import (
     write_model_checkpoint,
     read_model_checkpoint,
     peek_model_header,
+    peek_model_arch_flags,
+    MODEL_MAGIC_LEGACY,
     read_model_header,
     write_state_checkpoint,
     read_state_checkpoint,
