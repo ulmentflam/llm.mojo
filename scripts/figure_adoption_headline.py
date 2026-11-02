@@ -60,6 +60,8 @@ ADAMW_FINAL = dict(
     m320=3.2900271,
     note="log124M/model_19552.bin evaluated with this repo's trainer at -m 20 and -m 320",
 )
+# The later AdamW run (gpt2-124m-fineweb-mojo model.safetensors, 7 GPUs, 458,752 tokens/step).
+ADAMW_RERUN = dict(tokens_B=22345 * 458752 / 1e9, m320=3.2784467)
 RUNS = {
     "x5700": ("recipe, -x 5700", 0),
     "x3800": ("recipe, -x 3800", 1),
@@ -277,7 +279,7 @@ def render(R, S, mode: str, out: Path) -> None:
         zorder=7,
     )
     a.annotate(
-        f"AdamW final checkpoint on the same val set\n(-m 320): {m320:.4f} at 10.25B",
+        f"AdamW 524k run's final checkpoint, same val set\n(-m 320): {m320:.4f} at 10.25B",
         (tok_b(ADAMW_FINAL["step"]), m320),
         xytext=(3.0, 3.92),
         textcoords="data",
@@ -300,7 +302,7 @@ def render(R, S, mode: str, out: Path) -> None:
     )
     a.annotate(
         f"-x 5700 reaches {f90['val']:.4f} at {f90['tokens_B']:.2f}B,\n"
-        f"below AdamW's 10.25B value ({pas['token_ratio_vs_adamw_final']:.1f}x fewer tokens);\n"
+        f"below the 524k AdamW run's 10.25B value ({pas['token_ratio_vs_adamw_final']:.1f}x fewer tokens);\n"
         f"first <= 3.28 at {f28['tokens_B']:.2f}B ({f28['val']:.4f}),\n"
         f"final {S['runs']['x5700']['final']['val']:.4f} at {S['runs']['x5700']['final']['tokens_B']:.2f}B",
         (pas["tokens_B"], pas["val"]),
@@ -325,12 +327,32 @@ def render(R, S, mode: str, out: Path) -> None:
     )
     la = S["runs"]["adamw"]["final"]
     a.annotate(
-        "AdamW, its own 20-batch val: lowest 3.2807 at 10.09B,\nnever <= 3.28; this val reads 0.0093 below the 320-batch val",
+        "AdamW 524k run, its own 20-batch val: lowest 3.2807 at 10.09B;\nthis val reads 0.0093 below the 320-batch val",
         (la["tokens_B"], la["val"]),
         xytext=(3.0, 4.19),
         textcoords="data",
         ha="left",
         va="top",
+        fontsize=8.5,
+        color=ink,
+    )
+    a.scatter(
+        [ADAMW_RERUN["tokens_B"]],
+        [ADAMW_RERUN["m320"]],
+        marker="s",
+        s=70,
+        facecolor="none",
+        edgecolor=ink,
+        linewidths=1.6,
+        zorder=6,
+    )
+    a.annotate(
+        f"later AdamW run, same val set:\n{ADAMW_RERUN['m320']:.4f} at 10.25B (square, behind the diamond)",
+        (ADAMW_RERUN["tokens_B"], ADAMW_RERUN["m320"]),
+        xytext=(5.2, 3.21),
+        textcoords="data",
+        ha="left",
+        va="center",
         fontsize=8.5,
         color=ink,
     )
@@ -386,7 +408,7 @@ def render(R, S, mode: str, out: Path) -> None:
     )
     title(
         a,
-        "(a) Val loss vs tokens: the recipe passes AdamW's final 320-batch value at 2.88B tokens",
+        "(a) Val loss vs tokens: the recipe passes both AdamW runs' same-val finals by 2.99B tokens",
     )
 
     # ---- (b) zoom
@@ -408,7 +430,7 @@ def render(R, S, mode: str, out: Path) -> None:
     b.text(
         lo + 40,
         m320 + 0.0025,
-        "3.2900: AdamW final checkpoint, same val set",
+        "3.2900: AdamW 524k final checkpoint, same val set",
         fontsize=8,
         color=ink,
         va="bottom",
@@ -552,7 +574,7 @@ def render(R, S, mode: str, out: Path) -> None:
         0.01,
         0.006,
         "One seed per horizon. Recipe: WSD cooldown 0.4, momentum ramp, rotary, QK-norm, Muon lr 4.8e-3, pre-fusion kernels (21a2e4c). -x 5700 resumed from step 2000 of the -x 3800 run\n"
-        "(its steps 2001-3800 are discarded). Only the diamond in (a) compares on the same val set; AdamW's earlier points use a 20-batch val whose bias there is unmeasured. Single GB10.",
+        "(its steps 2001-3800 are discarded). Only the diamond and square in (a) compare on the same val set; AdamW's earlier points use a 20-batch val whose bias there is unmeasured. Single GB10.",
         fontsize=7.5,
         color=sub,
     )

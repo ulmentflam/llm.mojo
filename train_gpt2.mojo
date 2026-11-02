@@ -510,7 +510,7 @@ def unflagged_init_note(
     Allowed, not refused: files written before QK-norm had a flag bit record
     rotary only, and the verify gates and bf16 smoke tests start flagged builds
     from the unflagged pretrained gpt2_124M*.bin on purpose. Silence was the
-    failure mode (a published rotary+QK-norm model ran at loss 6.97 in a
+    failure mode (a published rotary+QK-norm model ran at loss 8.55 in a
     rotary-only build with nothing printed), so say it.
     """
     var missing = expected & ~got

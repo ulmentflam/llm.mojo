@@ -590,7 +590,19 @@ The combined recipe passes that value by **2.88B tokens** (step 5500, 3.28924;
 step 5400 read 3.30137), about **3.6x fewer tokens**, and ends at **3.27035 at
 2.99B**, 0.0197 below AdamW's final checkpoint on that val set. Under the same
 `-m 320` rule AdamW's final checkpoint has not reached 3.28 either (3.2900), so
-there is no AdamW tokens-to-3.28 and this doc computes no ratio to it.
+that run has no tokens-to-3.28 and this doc computes no ratio to it.
+
+**Correction: there is a better AdamW run.** The comparison above is against the
+524k-token run this headline was designed around. `gpt2-124m-fineweb-mojo`'s
+current `model.safetensors` (sha256 prefix 824e4085) is a different AdamW run,
+7 GPUs at 458,752 tokens/step, 22,345 steps, also 10.25B tokens. Scored the same
+way (`-m 320`, default bf16 build, one measurement) it reaches **3.2784**, so
+AdamW *can* reach 3.28 on this val set by 10.25B tokens, and any statement here
+that AdamW did not applies only to `model_19552.bin`. The recipe still ends
+lower: step 5600 read 3.27953 and step 5700 read 3.27035, so it passes 3.2784
+in (2.936B, 2.988B], about **3.4x** fewer tokens than that run's total. That run's
+own crossing point on this val set is not known, so 3.4x compares against its
+endpoint, and so does the 3.6x above.
 
 ![Headline run: val loss vs tokens for the recipe at two horizons and the AdamW baseline, the crossing zoomed with both cooldowns, the learning rate, and the max attention logit](../../figures/modded_nanogpt_adoption_headline_2026-11-02.png)
 

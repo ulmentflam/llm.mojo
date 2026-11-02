@@ -422,7 +422,8 @@ plus the record 5 architecture in January 2025; under 330M today with
 everything). The existing 524k-token AdamW run is the
 baseline; it did not reach 3.28: it ended at 3.2807 on its own 20-batch val and
 3.2900 on the 320-batch val that modded-nanogpt's target uses (see the results
-doc's headline section). Once W1 to W3 are in, schedule a single full run of the best recipe
+doc's headline section). A second AdamW run, the current weights of
+`gpt2-124m-fineweb-mojo`, does reach 3.2784 on the 320-batch val. Once W1 to W3 are in, schedule a single full run of the best recipe
 at the full batch and record tokens-to-3.28 in the README table.
 
 ## 6. Results

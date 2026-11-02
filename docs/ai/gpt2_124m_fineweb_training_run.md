@@ -67,7 +67,8 @@ current, generalized equivalents.
   decaying to zero. That val loss is on the run's own 20-batch val (`-m 20`,
   655,360 tokens). The same checkpoint scores 3.2900271 on the full
   320-batch, 10.5M-token val set (`-m 320`), so the run reached 3.2807 on its
-  val and 3.2900 on the larger one; it did not reach 3.28 on either rule.
+  val and 3.2900 on the larger one; it did not reach 3.28 on either rule. A later AdamW re-run, now the main weights of
+  `gpt2-124m-fineweb-mojo`, scores 3.2784 on the 320-batch val.
 - **Steady-state throughput:** ~33.6k tok/s (~15.5–15.6 s/step at B=32,
   T=1024), **~21.6% bf16 MFU**, confirmed directly from the training log
   (`step 19552/19552 | loss 3.345018 | ... | 15572.90 ms | 21.6% bf16 MFU | 33659
