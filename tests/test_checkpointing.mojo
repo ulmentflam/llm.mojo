@@ -31,7 +31,14 @@ from llmm.checkpointing import (
     STATE_UNTIE_STEP_SLOT,
     MODEL_FLAGS_SLOT,
 )
-from train_gpt2 import check_arch_flags, ARCH_FLAGS
+from train_gpt2 import (
+    check_arch_flags,
+    ARCH_FLAGS,
+    STATE_ARCH_FLAGS,
+    ROTARY,
+    QK_NORM,
+    UNTIED_HEAD,
+)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1059,6 +1066,23 @@ def _refused(got: Int, strict: Bool) -> Bool:
     except:
         return True
     return False
+
+
+def test_build_flags_word_follows_the_defines() raises:
+    """ARCH_FLAGS is written into every model file and STATE_ARCH_FLAGS into
+    every state file, so pin them against the -D defines with literals: the
+    sweep below is self-consistent for ANY value of ARCH_FLAGS and would pass
+    with the QK-norm bit dropped from the build's word."""
+    var want = 0
+    comptime if ROTARY:
+        want += 1
+    comptime if QK_NORM:
+        want += 4
+    assert_equal(ARCH_FLAGS, want)
+    var want_state = want
+    comptime if UNTIED_HEAD:
+        want_state += 2
+    assert_equal(STATE_ARCH_FLAGS, want_state)
 
 
 def test_arch_flag_mismatch_is_refused_for_this_build() raises:
