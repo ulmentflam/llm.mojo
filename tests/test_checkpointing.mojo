@@ -26,6 +26,7 @@ from llmm.checkpointing import (
     VERSION_BF16_UNTIED,
     ARCH_FLAG_ROTARY,
     ARCH_FLAG_UNTIED,
+    ARCH_FLAG_QK_NORM,
     STATE_FLAGS_SLOT,
     STATE_UNTIE_STEP_SLOT,
     MODEL_FLAGS_SLOT,
@@ -1061,23 +1062,92 @@ def _refused(got: Int, strict: Bool) -> Bool:
 
 
 def test_arch_flag_mismatch_is_refused_for_this_build() raises:
-    # `ARCH_FLAGS` is this build's flags (1 under -D LLMM_ROTARY=1, else 0), so
-    # the same test file pins both directions when run under either build
-    # (`make test-mojo [MOJO_DEFINES="-D LLMM_ROTARY=1"]`).
-    var other = 1 - ARCH_FLAGS
+    # `ARCH_FLAGS` is this build's flags (bit 0 under -D LLMM_ROTARY=1, bit 2
+    # under -D LLMM_QK_NORM=1), so the same test file pins every direction when
+    # run under any of the four builds (`make test-mojo [MOJO_INCLUDES=...]`).
     assert_equal(_refused(ARCH_FLAGS, True), False)
     assert_equal(_refused(ARCH_FLAGS, False), False)
-    # Resume (strict): a flag mismatch is refused in BOTH directions.
-    assert_equal(_refused(other, True), True)
-    # Initialising from a model .bin (non-strict): a flagged file is refused by
-    # a build without the flag; an unflagged (pretrained) file is accepted by a
-    # flagged build.
-    assert_equal(_refused(other, False), ARCH_FLAGS == 0)
+    for got in range(8):
+        if (got & ARCH_FLAG_UNTIED) != 0:
+            continue  # model files never carry the untied bit
+        # Resume (strict): a flag mismatch is refused in BOTH directions.
+        assert_equal(_refused(got, True), got != ARCH_FLAGS)
+        # Initialising from a model .bin (non-strict): a file with a flag this
+        # build lacks is refused; a file missing a flag the build has (the
+        # pretrained gpt2 weights, or a checkpoint older than the QK-norm bit)
+        # is accepted.
+        assert_equal(_refused(got, False), (got & ~ARCH_FLAGS) != 0)
+
+
+def test_qk_norm_bit_in_model_and_state_files() raises:
+    """Bit 2 round-trips through planted model and state files, and a build
+    without it refuses a file that carries it, naming QK-norm."""
+    assert_equal(ARCH_FLAG_QK_NORM, 4)
+    assert_equal(ARCH_FLAG_QK_NORM & (ARCH_FLAG_ROTARY | ARCH_FLAG_UNTIED), 0)
+    var cfg = _tiny_config()
+    var n = cfg.num_parameters()
+    var params = heap_alloc[Float32](n)
+    _fill_pattern(params, n, 0.5)
+    var path = String("test_ckpt_qk_flags.bin")
+    var both = ARCH_FLAG_ROTARY | ARCH_FLAG_QK_NORM
+    for f in [ARCH_FLAG_QK_NORM, both]:
+        write_model_checkpoint(path, cfg, params, n, arch_flags=f)
+        assert_equal(_header_word(path, MODEL_FLAGS_SLOT), f)
+        assert_equal(peek_model_header(path).arch_flags, f)
+    # A planted rotary+QK-norm model file against explicit builds.
+    write_model_checkpoint(path, cfg, params, n, arch_flags=both)
+    var got = peek_model_header(path).arch_flags
+    for e in range(8):
+        if (e & ARCH_FLAG_UNTIED) != 0:
+            continue
+        var text = _refusal_text_nonstrict(got, e)
+        assert_equal(text != "", (got & ~e) != 0)
+        if (e & ARCH_FLAG_QK_NORM) == 0:
+            # the QK-norm bit is named, with the direction and the -D flag
+            assert_true("QK-norm (file on, build off; -D LLMM_QK_NORM)" in text)
+        else:
+            assert_true("QK-norm (file" not in text)
+    # An unflagged model file stays allowed in a QK-norm build (non-strict),
+    # and a rotary-only one (the published pre-bit files) too; resume is strict.
+    for old in [0, ARCH_FLAG_ROTARY]:
+        assert_equal(_refusal_text_nonstrict(old, both), "")
+        assert_true(
+            "QK-norm (file off, build on; -D LLMM_QK_NORM)"
+            in _refusal_text(old, both)
+        )
+    # State files: all eight combinations of the three bits, version 2 unless 0.
+    var m = heap_alloc[Float32](4)
+    var v = heap_alloc[Float32](4)
+    _fill_pattern(m, 4, 0.1)
+    _fill_pattern(v, 4, 0.3)
+    var m_out = heap_alloc[Float32](4)
+    var v_out = heap_alloc[Float32](4)
+    for f in range(8):
+        write_state_checkpoint(path, _tiny_state(f), m, v, 4)
+        assert_equal(_header_word(path, 1), 1 if f == 0 else 2)
+        assert_equal(_header_word(path, STATE_FLAGS_SLOT), f)
+        assert_equal(read_state_checkpoint(path, m_out, v_out, 4).flags, f)
+        for g in range(8):
+            assert_equal(_refusal_text(f, g) != "", f != g)
+    m.unsafe_free()
+    v.unsafe_free()
+    m_out.unsafe_free()
+    v_out.unsafe_free()
+    params.unsafe_free()
+    _remove(path)
 
 
 def _refusal_text(got: Int, expected: Int) raises -> String:
     try:
         check_arch_flags("x", got, True, expected=expected)
+    except e:
+        return String(e)
+    return String("")
+
+
+def _refusal_text_nonstrict(got: Int, expected: Int) raises -> String:
+    try:
+        check_arch_flags("x", got, False, expected=expected)
     except e:
         return String(e)
     return String("")

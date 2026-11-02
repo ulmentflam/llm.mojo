@@ -62,6 +62,11 @@ comptime ARCH_FLAG_ROTARY = 1
 # optimizer layout, -D LLMM_UNTIED_HEAD=1). State files only: untied MODEL files
 # are marked by their version (13/15), not by a model-header flag.
 comptime ARCH_FLAG_UNTIED = 2
+# Bit 2: QK-norm (-D LLMM_QK_NORM=1), model and state files. Added after the
+# first rotary+QK-norm checkpoints existed: those carry bit 0 only (see
+# scripts/set_checkpoint_arch_flags.py). The attention scale is not a flag; it
+# stays a run-time argument (-attn_scale / LLMM_ATTN_SCALE).
+comptime ARCH_FLAG_QK_NORM = 4
 comptime STATE_FLAGS_SLOT = 44
 # The run's untie step s_u (-untie_at); read from every state version, 0 in all
 # files that never set it.

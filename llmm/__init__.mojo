@@ -9,6 +9,8 @@ from .attention import (
 )
 from .checkpointing import (
     ARCH_FLAG_ROTARY,
+    ARCH_FLAG_UNTIED,
+    ARCH_FLAG_QK_NORM,
     MODEL_FLAGS_SLOT,
     CheckpointConfig,
     ModelHeader,

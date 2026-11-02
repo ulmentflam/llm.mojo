@@ -28,6 +28,9 @@ from llmm_pkg import ensure_llmm_package
 # Model checkpoint magic written by train_gpt2.mojo / train_gpt2.py. llm.c's
 # own starter-pack magic (20240326) uses the identical layout, so accept both.
 MODEL_MAGICS = (20240520, 20240326)
+# Header slot 20: architecture flags (llmm/checkpointing.mojo ARCH_FLAG_*).
+MODEL_FLAGS_SLOT = 20
+ARCH_FLAG_NAMES = {1: "rotary", 2: "untied head", 4: "QK-norm"}
 VERSION_FP32 = 3
 VERSION_BF16 = 5
 HEADER_INTS = 256
@@ -157,6 +160,16 @@ def load_checkpoint(path: Path) -> tuple[GPT2Config, dict[str, np.ndarray]]:
             f"{path}: untied-head checkpoint (version {version}: a separate"
             " lm_head tensor follows ln_f); the MAX graphs build the tied"
             " 16-tensor GPT-2 and do not support it"
+        )
+    flags = int(header[MODEL_FLAGS_SLOT])
+    if flags != 0:
+        bits = [n for b, n in ARCH_FLAG_NAMES.items() if flags & b]
+        raise ValueError(
+            f"{path}: architecture flags {flags} ({', '.join(bits) or 'unknown'}):"
+            " the MAX graphs build stock GPT-2 (learned wpe, 1/sqrt(hd) scores)"
+            " and would silently compute the wrong model for a rotary / QK-norm"
+            " checkpoint; run it with an infer_gpt2 build with the matching"
+            " -D LLMM_ROTARY / -D LLMM_QK_NORM flags"
         )
     if version not in (VERSION_FP32, VERSION_BF16):
         raise ValueError(

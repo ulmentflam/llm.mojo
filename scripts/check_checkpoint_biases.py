@@ -55,6 +55,8 @@ def check(path):
         header = struct.unpack(f"<{HEADER_INTS}i", f.read(HEADER_INTS * 4))
         magic, version, maxT, V, L, H, C = header[:7]
         Vp = header[7]
+        flags = header[20]  # architecture flags; informational here: the bias
+        # statistics do not depend on the architecture, only on the layout
         if version in (13, 15):
             raise SystemExit(
                 f"{path}: untied-head checkpoint (version {version}: a separate "
@@ -76,6 +78,7 @@ def check(path):
     print(f"\n=== {path}")
     print(
         f"    magic={magic} version={version} L={L} C={C} Vp={Vp} params={total} {kind}"
+        f" arch_flags={flags} (1=rotary, 4=QK-norm)"
     )
 
     off = 0

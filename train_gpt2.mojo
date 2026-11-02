@@ -30,12 +30,19 @@ from llmm.lowp import (
 )
 from llmm.amax import AmaxState
 from llmm.dataloader import DataLoader, resolve_data_files
-from llmm.safetensors import SafetensorsFile, read_hf_gpt2_config
+from llmm.safetensors import (
+    SafetensorsFile,
+    read_hf_gpt2_config,
+    read_hf_arch,
+    HF_MODEL_TYPE_STOCK,
+    HF_MODEL_TYPE_LLM_MOJO,
+)
 from llmm.checkpointing import (
     CheckpointConfig,
     TrainingState,
     ARCH_FLAG_ROTARY,
     ARCH_FLAG_UNTIED,
+    ARCH_FLAG_QK_NORM,
     MODEL_FLAGS_SLOT,
     peek_model_header,
     write_model_checkpoint,
@@ -413,11 +420,15 @@ comptime ATTN_SOFT_EXP = not MLP_RELU2
 # excluded from the AdamW ranges. See docs/ai/rotary_embeddings_w8_2026-10-30.md.
 comptime ROTARY = get_defined_int["LLMM_ROTARY", 0]() != 0
 # Architecture flags word persisted in checkpoint headers (0 = default build).
-# Model files carry the rotary bit only (an untied model file is marked by its
-# version, 13/15); state files additionally carry ARCH_FLAG_UNTIED (bit 1) when
-# written by the untied-LM-head build, so STATE_ARCH_FLAGS is what a state file
-# must match and ARCH_FLAGS what a model file must match.
-comptime ARCH_FLAGS = ARCH_FLAG_ROTARY if ROTARY else 0
+# Model files carry the rotary bit (0) and the QK-norm bit (2) (an untied model
+# file is marked by its version, 13/15); state files additionally carry
+# ARCH_FLAG_UNTIED (bit 1) when written by the untied-LM-head build, so
+# STATE_ARCH_FLAGS is what a state file must match and ARCH_FLAGS what a model
+# file must match. Files written before bit 2 existed record rotary only; fix a
+# copy with scripts/set_checkpoint_arch_flags.py.
+comptime ARCH_FLAGS = (ARCH_FLAG_ROTARY if ROTARY else 0) | (
+    ARCH_FLAG_QK_NORM if QK_NORM else 0
+)
 comptime STATE_ARCH_FLAGS = ARCH_FLAGS | (
     ARCH_FLAG_UNTIED if UNTIED_HEAD else 0
 )
@@ -443,7 +454,15 @@ def _arch_flag_mismatch(got: Int, expected: Int) -> String:
             + ("untied" if (expected & ARCH_FLAG_UNTIED) != 0 else "tied")
             + "; -D LLMM_UNTIED_HEAD); "
         )
-    var rest = diff & ~(ARCH_FLAG_ROTARY | ARCH_FLAG_UNTIED)
+    if (diff & ARCH_FLAG_QK_NORM) != 0:
+        out += (
+            "QK-norm (file "
+            + ("on" if (got & ARCH_FLAG_QK_NORM) != 0 else "off")
+            + ", build "
+            + ("on" if (expected & ARCH_FLAG_QK_NORM) != 0 else "off")
+            + "; -D LLMM_QK_NORM); "
+        )
+    var rest = diff & ~(ARCH_FLAG_ROTARY | ARCH_FLAG_UNTIED | ARCH_FLAG_QK_NORM)
     if rest != 0:
         out += "unknown flag bits " + String(rest) + "; "
     return out
@@ -458,7 +477,8 @@ def check_arch_flags(
     equality in both directions. Non-strict (initializing from a model .bin)
     refuses only a flagged file in a build without that flag: a flag-0 file is
     an ordinary pretrained init (the speedrun-style conversion of GPT-2
-    weights), while a rotary-trained file is meaningless without rotary.
+    weights; the verify gates start rotary and QK-norm builds from it), while a
+    rotary- or QK-norm-trained file is meaningless without that flag.
     `expected` is the build's word: ARCH_FLAGS for model files,
     STATE_ARCH_FLAGS for state files. The error names each mismatched bit.
     """
@@ -470,7 +490,8 @@ def check_arch_flags(
             + what
             + ": it was written with architecture flags="
             + String(got)
-            + " (1=rotary, 2=untied head) but this binary was built with flags="
+            + " (1=rotary, 2=untied head, 4=QK-norm) but this binary was built"
+            " with flags="
             + String(expected)
             + "; mismatched: "
             + _arch_flag_mismatch(got, expected)
@@ -1938,7 +1959,38 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
                 channels=checkpoint_config.channels,
                 padded_vocab_size=checkpoint_config.padded_vocab_size,
             )
-            self.allocate_parameters_from_safetensors(safetensors_path)
+            # Architecture: a stock "gpt2" export is the plain model; the
+            # rotary / QK-norm export says so as model_type "llm_mojo_gpt2"
+            # plus its flags word (header slot 20), and gets the same
+            # refusal as a flagged .bin. Anything else is not ours to load.
+            var hf_cfg = config_dir + "/config.json"
+            var hf_arch = read_hf_arch(hf_cfg)
+            if hf_arch.model_type == HF_MODEL_TYPE_LLM_MOJO:
+                if hf_arch.arch_flags == 0:
+                    raise Error(
+                        "Cannot load "
+                        + hf_cfg
+                        + ": model_type llm_mojo_gpt2 without"
+                        " llm_mojo_arch_flags"
+                    )
+            elif hf_arch.model_type != HF_MODEL_TYPE_STOCK or (
+                hf_arch.arch_flags != 0
+            ):
+                raise Error(
+                    "Cannot load "
+                    + hf_cfg
+                    + ": model_type '"
+                    + hf_arch.model_type
+                    + "' with arch flags "
+                    + String(hf_arch.arch_flags)
+                    + " is neither a stock gpt2 nor an llm_mojo_gpt2 export"
+                )
+            check_arch_flags(hf_cfg, hf_arch.arch_flags, False)
+            self.allocate_parameters_from_safetensors(
+                safetensors_path, hf_arch.arch_flags
+            )
+            if hf_arch.attn_scale > 0.0:
+                self.set_attn_scale(Float32(hf_arch.attn_scale))
         else:
             # Build config from the descriptor and random-init the weights.
             self.config = parse_model_descriptor(self.checkpoint_path)
@@ -2667,7 +2719,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
 
     def allocate_parameters_from_safetensors(
-        mut self, safetensors_path: String
+        mut self, safetensors_path: String, arch_flags: Int = 0
     ) raises:
         """Allocate parameters and populate them from a HuggingFace-exported
         `.safetensors` checkpoint (see `scripts/export_to_hf.py`, which
@@ -2712,9 +2764,15 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         )
         base += V_p * C
 
-        st.read_tensor[GPT2_DTYPE](
-            "transformer.wpe.weight", hp.unsafe_offset(base)
-        )
+        # wpe: a rotary export omits it (the tensor is all zero and never
+        # read, scripts/export_to_hf.py); the block stays zero, as in a
+        # from-scratch rotary init. Any other export must carry it.
+        if (arch_flags & ARCH_FLAG_ROTARY) == 0 or (
+            "transformer.wpe.weight" in st.tensors
+        ):
+            st.read_tensor[GPT2_DTYPE](
+                "transformer.wpe.weight", hp.unsafe_offset(base)
+            )
         base += max_T * C
 
         # ln_1_gamma / ln_1_beta: each layer's C values are concatenated
@@ -7589,7 +7647,7 @@ struct GPT2[target: StaticString, WORLD_SIZE: Int = 1, recompute: Bool = False]:
         reads the shared model file plus its own optimizer-state shard.
         """
         # Resume must match the architecture flags exactly, in both
-        # directions (rotary bit 0, untied-head bit 1), before any tensor is
+        # directions (rotary bit 0, untied-head bit 1, QK-norm bit 2), before any tensor is
         # read; then the -untie_at step, before any payload.
         var arch_peek = open(state_path, "r")
         var st_head = read_state_header(arch_peek)
@@ -8557,7 +8615,10 @@ def train[
         model.enable_qk_clip(args.qk_clip_tau)
     elif args.qk_log or (QK_NORM and not is_cpu[target]()):
         model.enable_qk_clip(0.0, track_only=True)
-    model.set_attn_scale(args.attn_scale)
+    # 0 keeps the model's own scale (a config.json-recorded one, see the
+    # .safetensors branch of GPT2.__init__); q_mul starts at 1.0 either way.
+    if args.attn_scale > 0.0:
+        model.set_attn_scale(args.attn_scale)
 
     printf0(setup_rank, bar)
     printf0(setup_rank, _table_row("weight init method", args.load_filename))
