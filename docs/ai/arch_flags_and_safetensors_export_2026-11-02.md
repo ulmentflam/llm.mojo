@@ -144,6 +144,19 @@ Numbers are in the commit message and the session report.
   key-agreement check removed; the missing-flags check removed; the final
   `check_arch_flags` removed; the stock-with-flags check removed.
 
+Gates on the fix commit (bd8f584): flag-off CPU `cmp` against main c714346 (AdamW and
+Muon, model and state files, `LLMM_USE_CPU=1`) byte-identical; `make build`,
+`make build-bf16`, `make verify-cpu` pass; `make verify-gpu` passes with no flags,
+QK_NORM, ROTARY and both; `make verify-untied-gpu` passes; `make test-mojo` passes
+325 tests flag-off. Under `-D LLMM_ROTARY=1 -D LLMM_QK_NORM=1` `test_zero_untied` does
+not compile (its ownership test deliberately refuses a rotary build, a constraint
+that predates this branch and fails the same on the pre-fix tree); the other 31 files
+pass, including `test_checkpointing` (32 of 32). Re-export of the published corrected
+`model_5700.bin`: `model.safetensors` byte-identical (sha256 540566164813ec7c...);
+`config.json` differs only in `attn_pdrop`, `embd_pdrop`, `resid_pdrop` (0.1 to 0.0)
+and `rotary_note`. `infer --loss` on the 4 x 1024 check batch: 3.2883191 for both
+`.bin` and `.safetensors`; an independent forward (not importing the repo) 3.28799.
+
 ## AI use statement
 
 Written with AI assistance (Claude Code, Sonnet 5.5 agent), directed by Evan Owen.
