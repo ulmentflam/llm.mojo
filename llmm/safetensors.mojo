@@ -472,3 +472,86 @@ def read_hf_gpt2_config(config_json_path: String) raises -> CheckpointConfig:
         channels=channels,
         padded_vocab_size=padded_vocab_size,
     )
+
+
+# ===----------------------------------------------------------------------=== #
+# Architecture of an export (scripts/export_to_hf.py --llm-mojo)
+# ===----------------------------------------------------------------------=== #
+
+comptime HF_MODEL_TYPE_STOCK = "gpt2"
+comptime HF_MODEL_TYPE_LLM_MOJO = "llm_mojo_gpt2"
+
+
+struct HfArch(Copyable, Movable):
+    """What config.json says about the architecture beyond the tensor shapes.
+
+    A stock GPT-2 export has `model_type` "gpt2" and no flags (flags 0). The
+    rotary / QK-norm export is `llm_mojo_gpt2`; its `llm_mojo_arch_flags` is the
+    same word as checkpoint header slot 20 (ARCH_FLAG_*), so the loader reuses
+    the .bin refusal. `attn_scale` is the effective attention scale, 0 when
+    config.json does not record one.
+    """
+
+    var model_type: String
+    var arch_flags: Int
+    var attn_scale: Float64
+
+    def __init__(
+        out self, model_type: String, arch_flags: Int, attn_scale: Float64
+    ):
+        self.model_type = model_type
+        self.arch_flags = arch_flags
+        self.attn_scale = attn_scale
+
+
+def _find_hf_config_token(text: String, key: String) -> String:
+    """The raw value of top-level `"<key>": <value>` with string quotes
+    stripped, or "" when the key is absent. Flat objects only (see
+    `_find_hf_config_field`)."""
+    var bytes = text.as_bytes()
+    var needle_bytes = ('"' + key + '"').as_bytes()
+    var i = 0
+    while i + len(needle_bytes) <= len(bytes):
+        var matched = True
+        for j in range(len(needle_bytes)):
+            if bytes[i + j] != needle_bytes[j]:
+                matched = False
+                break
+        if matched:
+            var pos = i + len(needle_bytes)
+            _skip_ws(text, pos)
+            if pos >= len(bytes) or Int(bytes[pos]) != 58:  # ':'
+                i += 1
+                continue
+            pos += 1
+            _skip_ws(text, pos)
+            var out = String()
+            while pos < len(bytes):
+                var b = Int(bytes[pos])
+                if b == 44 or b == 125 or b == 10 or b == 13 or b == 32:
+                    break
+                if b != 34:  # skip the string quotes
+                    out += chr(b)
+                pos += 1
+            return out^
+        i += 1
+    return String()
+
+
+def read_hf_arch(config_json_path: String) raises -> HfArch:
+    """Read model_type, llm_mojo_arch_flags and attn_scale from config.json."""
+    var file = open(config_json_path, "r")
+    var raw = file.read_bytes()
+    file.close()
+    var text = String(unsafe_from_utf8=raw)
+
+    var model_type = _find_hf_config_token(text, "model_type")
+    var flags = 0
+    var flags_tok = _find_hf_config_token(text, "llm_mojo_arch_flags")
+    if flags_tok != "":
+        flags = atol(flags_tok)
+    var scale = Float64(0.0)
+    var scale_tok = _find_hf_config_token(text, "attn_scale")
+    if scale_tok != "":
+        scale = atof(scale_tok)
+    return HfArch(model_type, flags, scale)
