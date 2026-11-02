@@ -347,7 +347,7 @@ def render(R, S, mode: str, out: Path) -> None:
         zorder=6,
     )
     a.annotate(
-        f"later AdamW run, same val set:\n{ADAMW_RERUN['m320']:.4f} at 10.25B (square, behind the diamond)",
+        f"later AdamW run, same val set:\n{ADAMW_RERUN['m320']:.4f} at 10.25B (square)",
         (ADAMW_RERUN["tokens_B"], ADAMW_RERUN["m320"]),
         xytext=(5.2, 3.21),
         textcoords="data",
@@ -430,7 +430,7 @@ def render(R, S, mode: str, out: Path) -> None:
     b.text(
         lo + 40,
         m320 + 0.0025,
-        "3.2900: AdamW 524k final checkpoint, same val set",
+        "3.2900: AdamW 524k final, same val set",
         fontsize=8,
         color=ink,
         va="bottom",
