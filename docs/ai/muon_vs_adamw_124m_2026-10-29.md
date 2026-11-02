@@ -79,7 +79,7 @@ Timing: step 1 excluded plus step 2 (warmup). The AdamW mean is inflated by 40 s
 ## Caveats
 
 - Single seed per optimizer in this original pair (the "Seed spread" section below repeats it at three init seeds). A 0.36 val-loss gap this large and consistent across all evals and 50-step train windows is unlikely to be seed noise, but it is not quantified.
-- 600 steps / 79M tokens is early training with a cosine schedule compressed to that length. The gap peaked (-0.41 at step 300) and was narrowing (-0.36 at step 600); this says nothing about the converged gap (the AdamW 524k-token run reached val 3.28).
+- 600 steps / 79M tokens is early training with a cosine schedule compressed to that length. The gap peaked (-0.41 at step 300) and was narrowing (-0.36 at step 600); this says nothing about the converged gap (the AdamW 524k-token run ended at val 3.2807 on its 20-batch val and 3.2900 on the 320-batch val; it never reached 3.28 on either).
 - Muon used AdamW's lr and weight decay without tuning; AdamW used the recipe from the earlier full run, scaled down. Neither was tuned for this short horizon.
 - Muon's first 50 steps had higher train loss (+0.22) than AdamW, then crossed over.
 - Step times were measured under GPU contention (vLLM tenant), with bursty slowdowns in the AdamW run.
